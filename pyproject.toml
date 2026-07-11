@@ -2,8 +2,25 @@
 name = "core-agent"
 version = "0.1.0"
 description = "A2A agent runtime and MCP memory service"
+readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "a2a-sdk[http-server]==1.1.0",
+    "mcp==1.28.1",
+    "opentelemetry-exporter-otlp-proto-http==1.43.0",
+    "opentelemetry-sdk==1.43.0",
+]
+
+[project.scripts]
+core-agent-memory = "memory_service.mcp_server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12"]
+build-backend = "uv_build"
 
 [tool.uv]
-package = false
+package = true
+
+[tool.uv.build-backend]
+module-name = ["core_agent", "memory_service"]
+module-root = ""
