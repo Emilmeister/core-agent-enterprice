@@ -128,6 +128,25 @@ AgentConfig в пределах PlatformConfig задаёт один режим:
 
 Approval timeout задаётся хостом. По истечении времени решение трактуется как `deny`, audit получает `approval.resolved`, A2A Task обновляет status, затем agent loop получает отказ.
 
+## A2A pause и resume
+
+Approval не является отдельным transport API. Runtime использует optional A2A extensions `urn:core-agent:approval-request:v1` и `urn:core-agent:approval-response:v1` поверх стандартного `input-required` lifecycle, определённого в [A2A protocol](a2a-protocol.md#hitl-approval-extensions).
+
+Порядок обязателен:
+
+1. записать tool intent, pending call, digest, effective policy version и checkpoint;
+2. убедиться, что tool/process/network side effect ещё не начался;
+3. опубликовать `input-required` request Message;
+4. принять continuation только для той же Task/context и authenticated principal;
+5. атомарно записать approve/deny до возобновления loop;
+6. на approve повторно проверить policy, expiry, revocation и исходный digest;
+7. выполнить call ровно один раз либо вернуть `SIDE_EFFECT_UNKNOWN`, если recovery не может доказать outcome;
+8. на deny не выполнять call и вернуть модели нормализованный denied ToolResult.
+
+Новый model turn не запрашивается между approval request и решением. Suspended context остаётся pinned; клиентский decision не интерпретируется как обычный user prompt и не может менять tool arguments. Следующий model turn происходит только после применения approve/deny result.
+
+Если client не объявил HITL extensions, risky call остаётся неисполненным. Policy MAY вернуть denied ToolResult или завершить Task как rejected; она MUST NOT трактовать отсутствие UI как approval.
+
 ## Grants и отзыв разрешения
 
 Одобренный reusable grant хранит issuer, policy version, normalized scope, issued/expiry timestamps и audit provenance. Перед каждым использованием policy engine повторно проверяет identity, session, tool, action, resource, argument constraints, expiry, usage count и revocation.

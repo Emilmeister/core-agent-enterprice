@@ -126,6 +126,10 @@
 - [ ] Risky call не начинается до действительного approval точных arguments.
 - [ ] Reusable grant ограничен identity/session/action/resource/arguments/expiry/revocation.
 - [ ] Input request не используется как скрытый approval; auth использует отдельный state.
+- [ ] A2A HITL client получает `input-required` с `urn:core-agent:approval-request:v1`, а не failed Task.
+- [ ] Approve/deny Message продолжает ту же task/context через `urn:core-agent:approval-response:v1` и не пересоздаёт RunRequest.
+- [ ] До approve execution count и side effects неизменны; deny возвращает модели denied ToolResult.
+- [ ] Duplicate/stale/wrong-task approval и изменённый argument digest отклоняются без выполнения.
 - [ ] A2A status/Message показывает понятный effect без secret/chain-of-thought.
 
 ## OpenTelemetry
@@ -160,6 +164,7 @@
 9. **Parallel terminals:** main и два child одновременно работают в разных PTY/workspaces, не смешивают output и завершают только свои process groups.
 10. **OTel causality:** Core MCP client и Memory Service indexing spans находятся в одном distributed trace без content leakage.
 11. **Внешнее действие:** MCP write ждёт approval, переживает recovery и выполняется ровно один раз.
+12. **A2A HITL:** risky terminal call даёт `input-required`; approve той же Task выполняет exact argv один раз, deny не запускает process, duplicate decision отклоняется.
 
 ## Definition of Done
 

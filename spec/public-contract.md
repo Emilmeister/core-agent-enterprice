@@ -169,6 +169,10 @@ Approval или новые данные переводят A2A Task в `input-re
 }
 ```
 
+Approval request использует `urn:core-agent:approval-request:v1`; response — `urn:core-agent:approval-response:v1`. Оба URI объявляются optional в Agent Card, но HITL client opt-in перечисляет их в binding service parameters. Response Message сохраняет исходные `taskId` и `contextId`, не повторяет `mcp`/`skills` и не создаёт новый RunRequest.
+
+До response Task остаётся interrupted, а pending tool не стартует. `approve` возобновляет сохранённый exact call после повторной policy/digest проверки; `deny` продолжает тот же loop с denied ToolResult. Approval decision не является prompt и не передаётся модели как пользовательская инструкция.
+
 Повторная или устаревшая decision возвращает stable Core error `APPROVAL_ALREADY_RESOLVED`, отображённую в A2A error/status semantics.
 
 ## Cancellation и passive wait

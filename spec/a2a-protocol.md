@@ -45,6 +45,33 @@ Extension payload содержит ровно:
 
 `prompt` не дублируется в metadata. Auth, tenant, trace context, budgets и policy не становятся extension fields.
 
+## HITL approval extensions
+
+Human approval использует стандартный interrupted lifecycle A2A и две optional structured extensions:
+
+- `urn:core-agent:approval-request:v1` — server status Message с запросом решения;
+- `urn:core-agent:approval-response:v1` — client continuation Message с решением.
+
+Agent Card объявляет обе extensions как optional. HITL-capable HTTP client перечисляет их в `A2A-Extensions`; каждый Message также перечисляет фактически используемый URI в `Message.extensions` и кладёт payload под тем же ключом в `Message.metadata`/structured Part.
+
+Approval request переводит существующую Task в `input-required`, но не завершает её. Status Message содержит `reason: approval_required`, stable `approval_id`, `tool_call_id`, tool, human-readable effect, redacted arguments, risks, `scope_options` и digest нормализованных arguments. Raw secrets, hidden reasoning и unrestricted environment не публикуются.
+
+Client продолжает ровно ту же Task новым Message с теми же `taskId` и `contextId`:
+
+```json
+{
+  "approval_id": "apr_01...",
+  "decision": "approve",
+  "scope": "single_call"
+}
+```
+
+`decision` принимает только `approve` или `deny`. Identity/tenant/authorization берутся из authenticated A2A call context, а не из payload. Capability extension `urn:core-agent:run-capabilities:v1` повторно не передаётся и не может расширить snapshot suspended run.
+
+Valid decision атомарно фиксируется в audit/event log, после чего Task возвращается в `working`. `approve` возобновляет сохранённый точный tool call; `deny` добавляет model-facing denied ToolResult и продолжает loop. Duplicate, stale, чужой tenant/session, неизвестный approval ID, изменённый argument digest или decision после terminal Task отклоняются без side effect.
+
+До публикации `input-required` runtime MUST сохранить pending call, argument digest, context/checkpoint revision, effective capability snapshot и approval expiry. Recovery восстанавливает тот же approval ID. Crash между approval commit и tool completion использует side-effect intent/idempotency contract и не повторяет неизвестный внешний effect автоматически.
+
 ## Task mapping
 
 | Core state | A2A Task state | Дополнительная семантика |
