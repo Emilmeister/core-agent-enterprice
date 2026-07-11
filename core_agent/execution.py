@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import errno
 import ipaddress
-import json
+import os
+import pty
+import shutil
+import signal
+import subprocess
+import threading
+import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from .errors import CoreError
 from .security import redact
@@ -18,6 +25,14 @@ class ExecutionResult:
     stderr: str
     artifacts: tuple
     side_effects: tuple
+    status: str = "succeeded"
+    terminal_session_id: str | None = None
+    process_group_id: int | None = None
+    used_pty: bool = False
+    timed_out: bool = False
+    truncated: bool = False
+    cleanup: str = "process_exited"
+    duration: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -28,51 +43,325 @@ class EnvironmentSpec:
     writable_paths: tuple[str, ...]
     network_allowlist: tuple[str, ...]
     secrets: dict
+    owner_id: str | None = None
     parent_run_id: str | None = None
-    overlay_id: str | None = None
-    host_root_mounted: bool = False
+    durable_root: str | None = None
+    environment_allowlist: tuple[str, ...] = ()
+    max_output_bytes: int = 1_000_000
+    session_id: str | None = None
+    workspace_id: str | None = None
+    isolation_level: str = "process"
+    os_security_boundary: bool = False
     runtime_socket_mounted: bool = False
-    ssh_agent_forwarded: bool = False
-    cloud_metadata_access: bool = False
-    network_mode: str = "deny"
-    privileged: bool = False
+    service_account_token_mounted: bool = False
 
     def hardened(self):
         return replace(
             self,
-            host_root_mounted=False,
+            owner_id=self.owner_id or self.run_id,
+            isolation_level="process",
+            os_security_boundary=False,
             runtime_socket_mounted=False,
-            ssh_agent_forwarded=False,
-            cloud_metadata_access=False,
-            network_mode="allowlist" if self.network_allowlist else "deny",
-            privileged=False,
+            service_account_token_mounted=False,
         )
 
     def checkpoint_dict(self):
         return {
             "tenant_id": self.tenant_id,
             "run_id": self.run_id,
+            "owner_id": self.owner_id,
             "parent_run_id": self.parent_run_id,
             "workspace_snapshot": self.workspace_snapshot,
             "writable_paths": self.writable_paths,
             "network_allowlist": self.network_allowlist,
-            "overlay_id": self.overlay_id,
+            "session_id": self.session_id,
+            "workspace_id": self.workspace_id,
+            "isolation_level": self.isolation_level,
+            "os_security_boundary": self.os_security_boundary,
         }
 
 
-class ExecutionEnvironmentManager:
+@dataclass
+class ProcessHandle:
+    id: str
+    terminal_session_id: str
+    process_group_id: int
+    state: str = "running"
+    _process: subprocess.Popen = field(repr=False, default=None)
+    _master_fd: int = field(repr=False, default=-1)
+    _max_output_bytes: int = field(repr=False, default=1_000_000)
+    _started_at: float = field(repr=False, default_factory=time.monotonic)
+    _timeout: float | None = field(repr=False, default=None)
+    _output: bytearray = field(repr=False, default_factory=bytearray)
+    _done: threading.Event = field(repr=False, default_factory=threading.Event)
+    _lock: threading.Lock = field(repr=False, default_factory=threading.Lock)
+    _truncated: bool = field(repr=False, default=False)
+    _timed_out: bool = field(repr=False, default=False)
+    _cleanup: str = field(repr=False, default="process_exited")
+    _result: ExecutionResult | None = field(repr=False, default=None)
+
+
+class LocalTerminalBackend:
+    local = True
+    capabilities = {
+        "pty",
+        "process_groups",
+        "workspace_separation",
+        "resource_limits",
+        "process_tree_teardown",
+    }
+
+    def __init__(self, root):
+        # Keep the caller-visible path spelling (notably /var vs /private/var on macOS).
+        self.root = Path(root).absolute()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _path_component(value):
+        if (
+            not isinstance(value, str)
+            or not value
+            or value in {".", ".."}
+            or Path(value).name != value
+        ):
+            raise CoreError("TOOL_ARGUMENT_INVALID")
+        return value
+
+    def create(self, spec):
+        workspace = (
+            self.root
+            / self._path_component(spec.tenant_id)
+            / self._path_component(spec.run_id)
+            / self._path_component(spec.workspace_id)
+            / "workspace"
+        )
+        workspace.mkdir(parents=True, exist_ok=False)
+        snapshot = Path(spec.workspace_snapshot)
+        if snapshot.is_dir():
+            shutil.copytree(snapshot, workspace, dirs_exist_ok=True, symlinks=True)
+        return _LocalTerminalSession(spec, workspace)
+
+
+class _LocalTerminalSession:
+    def __init__(self, spec, workspace):
+        self.id = spec.session_id
+        self.spec = spec
+        self.workspace = workspace
+        self._processes = {}
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def _cwd(self, requested):
+        candidate = Path(requested or ".")
+        candidate = candidate if candidate.is_absolute() else self.workspace / candidate
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(self.workspace.resolve())
+        except ValueError:
+            raise CoreError("TOOL_ARGUMENT_INVALID", "cwd escapes workspace") from None
+        if not resolved.is_dir():
+            raise CoreError("TOOL_ARGUMENT_INVALID", "cwd is not a directory")
+        return resolved
+
+    def _environment(self, request):
+        requested = request.get("env", {})
+        if not isinstance(requested, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in requested.items()
+        ):
+            raise CoreError("TOOL_ARGUMENT_INVALID")
+        if set(requested) - set(self.spec.environment_allowlist):
+            raise CoreError("POLICY_DENIED")
+        temporary = self.workspace / ".tmp"
+        temporary.mkdir(exist_ok=True)
+        environment = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(self.workspace),
+            "TMPDIR": str(temporary),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        environment.update(requested)
+        environment.update(request.get("_secret_env", {}))
+        return environment
+
+    def start(self, request):
+        if self._closed:
+            raise CoreError("TASK_TERMINAL")
+        argv = request.get("argv")
+        if (
+            not isinstance(argv, (list, tuple))
+            or not argv
+            or not all(
+                isinstance(value, str) and value and "\0" not in value for value in argv
+            )
+        ):
+            raise CoreError("TOOL_ARGUMENT_INVALID")
+        max_output = request.get("max_output_bytes", self.spec.max_output_bytes)
+        timeout = request.get("timeout")
+        if not isinstance(max_output, int) or max_output <= 0:
+            raise CoreError("TOOL_ARGUMENT_INVALID")
+        if timeout is not None and (
+            not isinstance(timeout, (int, float)) or timeout <= 0
+        ):
+            raise CoreError("TOOL_ARGUMENT_INVALID")
+
+        cwd = self._cwd(request.get("cwd"))
+        environment = self._environment(request)
+        master_fd, slave_fd = pty.openpty()
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                cwd=cwd,
+                env=environment,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except (OSError, ValueError) as error:
+            os.close(master_fd)
+            raise CoreError("TOOL_EXECUTION_FAILED", str(error)) from error
+        finally:
+            os.close(slave_fd)
+
+        handle = ProcessHandle(
+            id=str(uuid.uuid4()),
+            terminal_session_id=self.id,
+            process_group_id=process.pid,
+            _process=process,
+            _master_fd=master_fd,
+            _max_output_bytes=max_output,
+            _timeout=float(timeout) if timeout is not None else None,
+        )
+        with self._lock:
+            self._processes[handle.id] = handle
+        threading.Thread(target=self._drain, args=(handle,), daemon=True).start()
+        return handle
+
+    def _drain(self, handle):
+        try:
+            while True:
+                try:
+                    chunk = os.read(handle._master_fd, 4096)
+                except OSError as error:
+                    if error.errno in {errno.EIO, errno.EBADF}:
+                        break
+                    raise
+                if not chunk:
+                    break
+                with handle._lock:
+                    remaining = handle._max_output_bytes - len(handle._output)
+                    if remaining > 0:
+                        handle._output.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        handle._truncated = True
+        finally:
+            handle._process.wait()
+            if handle.state == "running":
+                handle.state = "exited" if handle._process.returncode == 0 else "failed"
+            handle._done.set()
+
+    def _get(self, process_id):
+        try:
+            return self._processes[process_id]
+        except KeyError:
+            raise CoreError("TASK_NOT_FOUND") from None
+
+    def write(self, process_id, data):
+        handle = self._get(process_id)
+        if handle._done.is_set():
+            raise CoreError("TASK_TERMINAL")
+        encoded = data.encode() if isinstance(data, str) else data
+        if not isinstance(encoded, bytes):
+            raise CoreError("TOOL_ARGUMENT_INVALID")
+        os.write(handle._master_fd, encoded)
+
+    def read(self, process_id):
+        handle = self._get(process_id)
+        with handle._lock:
+            return bytes(handle._output).decode(errors="replace")
+
+    def _terminate(self, handle, *, timed_out=False):
+        if handle._done.is_set():
+            return
+        handle._timed_out = timed_out
+        handle.state = "timed_out" if timed_out else "canceled"
+        handle._cleanup = "process_group_terminated"
+        try:
+            os.killpg(handle.process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        if not handle._done.wait(0.1):
+            try:
+                os.killpg(handle.process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def wait(self, process_id, timeout=None):
+        handle = self._get(process_id)
+        effective_timeout = timeout if timeout is not None else handle._timeout
+        if not handle._done.wait(effective_timeout):
+            self._terminate(handle, timed_out=True)
+            handle._done.wait(1)
+        if handle._result:
+            return handle._result
+        output = self.read(process_id)
+        handle._result = ExecutionResult(
+            exit_code=handle._process.returncode
+            if handle._process.returncode is not None
+            else -1,
+            stdout=output,
+            stderr="",
+            artifacts=(),
+            side_effects=(),
+            status="timed_out"
+            if handle._timed_out
+            else ("succeeded" if handle._process.returncode == 0 else "failed"),
+            terminal_session_id=self.id,
+            process_group_id=handle.process_group_id,
+            used_pty=True,
+            timed_out=handle._timed_out,
+            truncated=handle._truncated,
+            cleanup=handle._cleanup,
+            duration=time.monotonic() - handle._started_at,
+        )
+        try:
+            os.close(handle._master_fd)
+        except OSError:
+            pass
+        return handle._result
+
+    def execute(self, request):
+        handle = self.start(request)
+        return self.wait(handle.id)
+
+    def cancel(self, process_id):
+        self._terminate(self._get(process_id))
+
+    def destroy(self):
+        self._closed = True
+        for handle in tuple(self._processes.values()):
+            self._terminate(handle)
+            handle._done.wait(1)
+            try:
+                os.close(handle._master_fd)
+            except OSError:
+                pass
+        shutil.rmtree(self.workspace.parent, ignore_errors=True)
+
+
+class TerminalSessionManager:
     REQUIRED = {
-        "mount_namespace",
-        "process_namespace",
-        "user_namespace",
-        "network_namespace",
-        "immutable_image",
+        "pty",
+        "process_groups",
+        "workspace_separation",
         "resource_limits",
         "process_tree_teardown",
     }
 
     def __init__(self, backend):
-        if not getattr(backend, "isolated", False) or not self.REQUIRED <= set(
+        if not getattr(backend, "local", False) or not self.REQUIRED <= set(
             getattr(backend, "capabilities", set())
         ):
             raise CoreError("EXECUTION_ENVIRONMENT_UNAVAILABLE")
@@ -81,57 +370,106 @@ class ExecutionEnvironmentManager:
         self.telemetry_records = []
 
     def create(self, spec):
-        hardened = replace(
-            spec.hardened(), overlay_id=spec.overlay_id or str(uuid.uuid4())
+        prepared = replace(
+            spec.hardened(),
+            session_id=spec.session_id or str(uuid.uuid4()),
+            workspace_id=spec.workspace_id or str(uuid.uuid4()),
         )
-        environment = self.backend.create(hardened)
+        environment = self.backend.create(prepared)
         self._environments[environment.id] = environment
         self.telemetry_records.append(
             {
-                "event": "environment.created",
-                "id": environment.id,
+                "event": "terminal.session.created",
+                "session_id": environment.id,
                 "run_id": spec.run_id,
             }
         )
         return environment
 
-    def execute(self, environment_id, request):
+    def _owned(self, environment_id, owner_id):
         try:
             environment = self._environments[environment_id]
         except KeyError:
-            raise CoreError("EXECUTION_ENVIRONMENT_UNAVAILABLE") from None
+            raise CoreError("TASK_NOT_FOUND") from None
+        if owner_id is not None and environment.spec.owner_id != owner_id:
+            raise CoreError("POLICY_DENIED")
+        return environment
+
+    @staticmethod
+    def _materialize(environment, request):
         materialized = dict(request)
         refs = materialized.pop("secret_refs", [])
-        if refs:
-            materialized["secrets"] = {
-                name: environment.spec.secrets[name]
-                for name in refs
-                if name in environment.spec.secrets
-            }
-        result = environment.execute(materialized)
+        materialized["_secret_env"] = {
+            name: environment.spec.secrets[name]
+            for name in refs
+            if name in environment.spec.secrets
+        }
+        return materialized
+
+    def execute(self, environment_id, request, *, owner_id=None):
+        environment = self._owned(environment_id, owner_id)
+        result = environment.execute(self._materialize(environment, request))
         self.telemetry_records.append(
-            {"event": "tool.executed", "environment_id": environment_id}
+            {
+                "event": "terminal.process.completed",
+                "session_id": environment_id,
+                "status": result.status,
+            }
         )
-        return ExecutionResult(
-            result.exit_code,
-            redact(result.stdout, set(environment.spec.secrets.values())),
-            redact(result.stderr, set(environment.spec.secrets.values())),
-            result.artifacts,
-            result.side_effects,
+        return replace(
+            result,
+            stdout=redact(result.stdout, set(environment.spec.secrets.values())),
+            stderr=redact(result.stderr, set(environment.spec.secrets.values())),
         )
+
+    def start(self, environment_id, request, *, owner_id=None):
+        environment = self._owned(environment_id, owner_id)
+        return environment.start(self._materialize(environment, request))
+
+    def read(self, environment_id, process_id, *, owner_id=None):
+        environment = self._owned(environment_id, owner_id)
+        return redact(
+            environment.read(process_id), set(environment.spec.secrets.values())
+        )
+
+    def write(self, environment_id, process_id, data, *, owner_id=None):
+        self._owned(environment_id, owner_id).write(process_id, data)
+
+    def wait(self, environment_id, process_id, *, owner_id=None, timeout=None):
+        environment = self._owned(environment_id, owner_id)
+        result = environment.wait(process_id, timeout)
+        return replace(
+            result,
+            stdout=redact(result.stdout, set(environment.spec.secrets.values())),
+            stderr=redact(result.stderr, set(environment.spec.secrets.values())),
+        )
+
+    def cancel(self, environment_id, process_id, *, owner_id=None):
+        self._owned(environment_id, owner_id).cancel(process_id)
 
     def execute_transient(self, request, run_id):
         environment = self.create(
-            EnvironmentSpec("default", run_id, "runtime", ("/workspace",), (), {})
+            EnvironmentSpec(
+                "default", run_id, "runtime", (".",), (), {}, owner_id=run_id
+            )
         )
         try:
-            return self.execute(environment.id, request)
+            return self.execute(environment.id, request, owner_id=run_id)
         finally:
-            self.destroy(environment.id)
+            self.destroy(environment.id, owner_id=run_id)
 
-    def destroy(self, environment_id):
-        environment = self._environments.pop(environment_id)
+    def destroy(self, environment_id, *, owner_id=None):
+        environment = self._owned(environment_id, owner_id)
         environment.destroy()
+        self._environments.pop(environment_id, None)
+
+    def close(self):
+        for environment_id in tuple(self._environments):
+            self.destroy(environment_id)
+
+
+# Backward-compatible name for integrations built against the initial package.
+ExecutionEnvironmentManager = TerminalSessionManager
 
 
 class EgressPolicy:
@@ -163,64 +501,3 @@ class EgressPolicy:
 
     def follow_redirect(self, source, target, *, resolved_ip):
         return self.allow(target, resolved_ip=resolved_ip)
-
-
-class RemoteExecutionBackend:
-    """Execution-plane adapter; user commands run behind a remote sandbox RPC boundary."""
-
-    isolated = True
-    capabilities = ExecutionEnvironmentManager.REQUIRED
-
-    def __init__(self, endpoint, *, authorization=None, timeout=30):
-        parsed = urlparse(endpoint)
-        if parsed.scheme != "https" or not parsed.hostname:
-            raise CoreError("EXECUTION_ENVIRONMENT_UNAVAILABLE")
-        self.endpoint = endpoint.rstrip("/")
-        self.authorization = authorization
-        self.timeout = timeout
-
-    def _call(self, path, payload):
-        headers = {"Content-Type": "application/json"}
-        if self.authorization:
-            headers["Authorization"] = self.authorization
-        request = Request(
-            self.endpoint + path,
-            data=json.dumps(payload).encode(),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                return json.load(response)
-        except Exception as error:
-            raise CoreError(
-                "EXECUTION_ENVIRONMENT_UNAVAILABLE", str(error), retryable=True
-            ) from error
-
-    def create(self, spec):
-        payload = spec.checkpoint_dict()
-        payload["secret_refs"] = sorted(spec.secrets)
-        response = self._call("/v1/environments", payload)
-        if not response.get("environment_id"):
-            raise CoreError("EXECUTION_ENVIRONMENT_UNAVAILABLE")
-        return _RemoteEnvironment(self, response["environment_id"], spec)
-
-
-class _RemoteEnvironment:
-    def __init__(self, backend, environment_id, spec):
-        self.backend = backend
-        self.id = environment_id
-        self.spec = spec
-
-    def execute(self, request):
-        response = self.backend._call(f"/v1/environments/{self.id}/execute", request)
-        return ExecutionResult(
-            int(response.get("exit_code", 1)),
-            str(response.get("stdout", "")),
-            str(response.get("stderr", "")),
-            tuple(response.get("artifacts", ())),
-            tuple(response.get("side_effects", ())),
-        )
-
-    def destroy(self):
-        self.backend._call(f"/v1/environments/{self.id}/destroy", {})

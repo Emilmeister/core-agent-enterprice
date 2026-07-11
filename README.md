@@ -13,8 +13,8 @@ uvx ruff check core_agent memory_service
 uv build --no-sources
 ```
 
-The specification and acceptance suite were frozen before implementation. `tests/test_spec_lock.py`
-also protects every specification file byte-for-byte.
+The specification and acceptance suite are frozen together before implementation changes.
+`tests/test_spec_lock.py` also protects every specification file byte-for-byte.
 
 ## Memory MCP Service
 
@@ -32,5 +32,8 @@ derived retrieval and entity indexes are rebuilt on startup.
 HTTP+JSON routes, Agent Card, streaming, polling, subscription, and task operations. Production
 deployments should pass their authenticated call-context builder and durable SDK task store.
 
-Terminal commands and skill or stdio-MCP processes belong behind
-`core_agent.execution.RemoteExecutionBackend`; the control plane has no host-execution fallback.
+Terminal commands, skills, and stdio-MCP processes run through
+`core_agent.execution.LocalTerminalBackend`. Each main or child agent gets a separate PTY,
+process group, clean environment, and workspace copy inside the single application container.
+These sessions are operationally separated but share one OS security boundary. An S3-backed mount
+is reserved for durable snapshots, checkpoints, and artifacts rather than active workspaces.
