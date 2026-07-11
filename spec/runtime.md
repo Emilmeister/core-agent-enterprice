@@ -10,15 +10,16 @@
 
 До первого вызова модели ядро MUST:
 
-1. провалидировать RunRequest;
-2. создать `run_id`, event stream и начальный checkpoint;
-3. разрешить skills и MCP descriptors через host policy;
-4. создать lock snapshot skills, MCP capabilities и доступных tools;
-5. построить системные инструкции;
-6. загрузить session working state и релевантную memory;
-7. выбрать primary model route и проверить capabilities;
-8. вычислить доступный контекстный бюджет;
-9. перевести A2A Task в `working` и испустить внутреннее `task.started`.
+1. провалидировать A2A Message/Core extension;
+2. вычислить immutable EffectiveConfig;
+3. создать `run_id`, event stream и начальный checkpoint;
+4. разрешить skills и MCP descriptors через effective policy;
+5. создать lock snapshot skills, MCP capabilities и отфильтрованных tools;
+6. построить system/kernel/capability instructions;
+7. загрузить session working state и, если разрешено, вызвать retrieval MCP включая Memory Service;
+8. выбрать primary model route и проверить capabilities;
+9. вычислить доступный контекстный бюджет;
+10. перевести A2A Task в `working` и испустить внутреннее `task.started`.
 
 Если шаг не выполнен, модель и инструменты MUST NOT вызываться.
 
@@ -27,12 +28,12 @@
 Ядро формирует инструкции в следующем порядке приоритета:
 
 1. неизменяемые safety-инварианты платформы;
-2. DeploymentConfig и host policy;
+2. PlatformConfig, AgentConfig/EffectiveConfig и host policy;
 3. versioned KernelInstructions;
 4. настраиваемый AgentProfilePrompt;
 5. исходный пользовательский prompt/A2A Message;
 6. инструкции активированных skills;
-7. retrieved memory и transcript;
+7. retrieved MCP results и transcript;
 8. данные, полученные от tools/MCP/A2A peers.
 
 Нижний уровень MUST NOT отменять верхний. Memory protocol, обязательные tools, delegation rules, task lifecycle, approvals, sandbox и observability принадлежат KernelInstructions и одновременно enforced runtime-ом. AgentProfilePrompt не может их заменить. Полный contract описан в [Kernel instructions](kernel-instructions.md).
@@ -102,7 +103,7 @@ Long-running tool, indexing job и сабагент запускаются ка�
 
 ## Budgets и защита от зацикливания
 
-DeploymentConfig MUST задавать hard limits минимум для:
+PlatformConfig/AgentConfig MUST задавать hard limits минимум для:
 
 - числа model turns;
 - числа tool calls;

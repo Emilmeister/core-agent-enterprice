@@ -76,6 +76,22 @@ Session/tenant/auth/trace/task delivery принадлежат A2A context и tr
 - catalog фиксируется snapshot-ом; notification меняет revision только на safe boundary;
 - ошибка `required: true` завершает Task, optional descriptor создаёт наблюдаемый warning.
 
+Memory передаётся обычным MCP descriptor с host-validated role:
+
+```json
+{
+  "name": "memory",
+  "role": "memory",
+  "required": false,
+  "transport": {
+    "type": "streamable_http",
+    "url": "https://memory.example.test/mcp"
+  }
+}
+```
+
+`role` не делает server доверенным сама по себе. PlatformConfig/AgentConfig должны подтвердить identity/target. При memory disabled descriptor не попадает в effective catalog: `required: true` завершает validation с `CAPABILITY_DISABLED`, optional descriptor создаёт наблюдаемый filtered-capability warning.
+
 ## `skills`
 
 Массив content-addressed skill package references. Пустой массив означает отсутствие пользовательских runtime skills в конкретной Task.

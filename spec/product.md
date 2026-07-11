@@ -29,7 +29,7 @@ Core Agent MUST владеть следующими обязанностями:
 - регистрация, валидация и исполнение встроенных и MCP-инструментов;
 - оценка риска и approval flow;
 - ограничение вывода инструментов;
-- Markdown-memory, graph/NER indexing и hybrid retrieval;
+- подключение отдельного Memory MCP Service с Markdown, graph/NER и hybrid retrieval;
 - фоновые Tasks, passive wait и делегирование сабагентам;
 - изолированный execution plane;
 - A2A communication и OpenTelemetry observability;
@@ -37,9 +37,9 @@ Core Agent MUST владеть следующими обязанностями:
 
 Клиент MUST NOT быть обязан повторять эту логику. Полнота продукта измеряется не числом встроенных workflow, а тем, насколько надёжно ядро выполняет любой разрешённый workflow через единый контракт.
 
-## Два уровня конфигурации
+## Три уровня конфигурации
 
-### DeploymentConfig
+### PlatformConfig
 
 Настраивается оператором при старте процесса и не входит в запрос запуска:
 
@@ -51,12 +51,15 @@ Core Agent MUST владеть следующими обязанностями:
 - хранилище транскриптов и артефактов;
 - тайм-ауты, денежные и вычислительные бюджеты;
 - A2A bindings, Agent Card и push-notification policy;
-- session, memory и checkpoint stores;
+- session и checkpoint stores;
 - model routing и fallback policy;
 - tenant identity, quotas и data governance;
-- registry и trust policy для skills/MCP.
-- AgentProfilePrompt, который не может заменить KernelInstructions;
+- registry и trust policy для skills/MCP;
 - ExecutionEnvironment backend/images и OTLP endpoints.
+
+### AgentConfig
+
+Создаёт конкретного агента поверх platform runtime: выбирает AgentProfilePrompt, model route, budgets, context thresholds, approval/execution/OTel profiles и effective allowlists built-in tools, MCP и skills. Может полностью отключить memory, terminal, mutations, delegation или background tasks. Полная schema описана в [Конфигурации агента](agent-configuration.md).
 
 ### RunRequest
 
@@ -66,7 +69,7 @@ Core Agent MUST владеть следующими обязанностями:
 - `mcp`;
 - `skills`.
 
-Это разделение MUST сохраняться во всех SDK и A2A adapters.
+Это разделение MUST сохраняться во всех SDK и A2A adapters. Task не может расширить AgentConfig.
 
 ## Продуктовые режимы
 
@@ -76,7 +79,7 @@ Core Agent MUST владеть следующими обязанностями:
 
 ### Stateful session
 
-Последовательность запусков с общей историей, pinned facts, artifacts и разрешённой session memory. Session адресуется transport-ом; тело каждого запуска остаётся `prompt + mcp + skills`.
+Последовательность запусков с общей A2A history и artifacts. Долговременная session memory существует только через переданный и разрешённый Memory MCP. Тело каждого запуска остаётся `prompt + mcp + skills`.
 
 ### Durable autonomous run
 
@@ -100,9 +103,9 @@ Control plane может быть встроен в приложение или 
 6. При заполнении контекста ядро выполняет compaction и продолжает задачу.
 7. Независимая долгая работа уходит в background Task; agent продолжает работу или пассивно ждёт notification.
 8. При необходимости ядро создаёт сабагента с узкой инструкцией и явными tool/MCP/skill allowlists.
-9. Main и child agents читают общую Markdown-memory; write атомарно обновляет BM25/vector/graph/NER revision.
+9. Если AgentConfig и Task подключили Memory MCP, main/child используют его общий namespace; сам Core Agent не хранит Markdown/graph/indexes.
 10. Runtime создаёт checkpoints до и после внешних side effects.
-11. Task завершается Artifact/Message либо типизированной ошибкой; session и memory обновляются атомарно.
+11. Task завершается Artifact/Message либо типизированной ошибкой; подтверждённые Memory MCP commits фиксируются в audit по service revision без ложной cross-service atomicity.
 
 ## Метрики успеха продукта
 

@@ -14,7 +14,7 @@ Arguments MUST валидироваться по schema до risk assessment и 
 
 ## Встроенные capabilities
 
-Ядро MUST предоставлять базовый набор; deployment MAY отключать его части policy:
+Ядро предоставляет базовый набор, но AgentConfig MAY отключить любой model-callable built-in или целую optional feature. Модель видит только EffectiveConfig catalog:
 
 ### `core.terminal.exec`
 
@@ -36,7 +36,7 @@ Arguments MUST валидироваться по schema до risk assessment и 
 
 ### `core.delegate`
 
-Создаёт неблокирующую child-agent A2A Task с явными instruction, tool/MCP/skill allowlists, memory access, budget и result schema. Недоступен, если delegation отключён policy.
+Создаёт неблокирующую child-agent A2A Task с явными instruction, tool/MCP/skill allowlists, budget и result schema. Memory access существует только как явно переданный Memory MCP server/tools. Недоступен, если delegation отключён policy.
 
 ### Task tools
 
@@ -44,7 +44,7 @@ Arguments MUST валидироваться по schema до risk assessment и 
 
 ### Memory tools
 
-`core.memory.search/read/create/update/split/move/delete/history/index_status/entity_resolve` являются единственным способом изменять Markdown memory и её graph/index revision. Правила выбора create/update и лимит 200 строк определены в [Sessions и memory](sessions-and-memory.md).
+Memory tools не являются built-ins Core Agent. Их предоставляет отдельный [Memory MCP Service](memory-service.md) под namespace вроде `memory.search`, `memory.read`, `memory.create`, `memory.update`, `memory.split`. AgentConfig может отключить memory полностью или отфильтровать отдельные tools.
 
 ### Artifact tools
 
@@ -67,7 +67,7 @@ Arguments MUST валидироваться по schema до risk assessment и 
 
 ## Approval modes
 
-DeploymentConfig задаёт один режим:
+AgentConfig в пределах PlatformConfig задаёт один режим:
 
 - `on_risk` — режим по умолчанию; спрашивать только для действий, совпавших с risk policy;
 - `always` — спрашивать перед каждым действием с side effect;

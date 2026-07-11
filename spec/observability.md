@@ -54,27 +54,31 @@ core_agent.a2a.message.send / core_agent.a2a.message.stream
 
 core_agent.task.execute  (linked to submit)
 ├── core_agent.context.assemble
-│   └── core_agent.memory.search
-│       ├── core_agent.memory.bm25
-│       ├── core_agent.memory.embedding_search
-│       ├── core_agent.memory.graph_search
-│       └── core_agent.memory.rerank
+│   └── mcp.client memory.search
 ├── gen_ai model operation
 ├── core_agent.policy.evaluate
 ├── core_agent.tool.execute
 │   ├── core_agent.execution_environment.create
 │   └── mcp operation
-├── core_agent.memory.commit
-│   ├── core_agent.memory.chunk
-│   ├── core_agent.memory.embed
-│   ├── core_agent.memory.ner
-│   ├── core_agent.memory.entity_resolve
-│   └── core_agent.memory.index_publish
 └── core_agent.task.checkpoint
+
+memory_service.mcp.request  (remote child via W3C Trace Context)
+├── memory_service.search.bm25
+├── memory_service.search.vector
+├── memory_service.search.graph
+├── memory_service.search.rerank
+└── memory_service.commit
+    ├── memory_service.chunk
+    ├── memory_service.embed
+    ├── memory_service.ner
+    ├── memory_service.entity_resolve
+    └── memory_service.index_publish
 
 core_agent.subagent.execute  (linked parent/child A2A Tasks)
 core_agent.notification.deliver
 ```
+
+Core Agent MUST NOT создавать fake internal memory spans: он создаёт MCP client span. Memory Service владеет detailed indexing/retrieval spans и продолжает trace через propagated context.
 
 Операция с duration получает span. Point-in-time transition (`approval required`, `task state changed`, `memory revision published`, `compaction completed`) записывается OTel event/log record с timestamp и безопасными attributes.
 
@@ -98,7 +102,7 @@ Content attributes из GenAI conventions, tool definitions/arguments/results, s
 
 ## Metrics
 
-Ядро MUST публиковать минимум:
+Core Agent MUST публиковать минимум:
 
 - A2A request/task count и latency по operation/state/error class;
 - active/queued/waiting/background Tasks и queue age;
@@ -106,12 +110,13 @@ Content attributes из GenAI conventions, tool definitions/arguments/results, s
 - tool/MCP calls, latency, retries, denials и unknown side effects;
 - approvals/input requested, approved, denied и timed out;
 - compaction count, base tokens, working before/after ratio и failures;
-- memory search latency, candidate counts, hit channel и rerank latency;
-- memory write/index/NER/entity-resolution latency и failure/backlog;
+- Memory MCP client latency/outcome и configured/filtered state;
 - background/subagent count, depth, fan-out, duration и budget usage;
 - execution environment create/reuse/cleanup latency, resource saturation и policy denials;
 - checkpoint/recovery/lease/notification delivery outcomes;
 - OTLP export drops/failures и telemetry queue saturation.
+
+Memory Service отдельно MUST публиковать search candidate counts/channels/rerank latency, write validation, 200-line rejections, indexing/NER/entity-resolution latency, revision publication и backlog.
 
 Metric labels MUST иметь bounded cardinality. Task/run/user/tenant IDs, prompt, path, command, entity text, memory ID и raw error message запрещены как labels.
 
@@ -134,7 +139,7 @@ Durable audit хранит:
 - model routes без hidden reasoning;
 - tool intents, safe normalized arguments digests, approvals и outcomes;
 - background/subagent contracts и notifications;
-- memory search candidate IDs/scores/versions и Markdown mutations;
+- Memory MCP request/result IDs, server/index revisions и safe mutation outcomes; полный candidate/mutation audit принадлежит Memory Service;
 - NER/embedding/reranker versions и index publication;
 - compaction mappings, checkpoints, recovery и side-effect reconciliation.
 

@@ -50,8 +50,10 @@ Primary agent при создании сабагента MUST передать �
   "instruction": "Проверь миграции базы и верни риски",
   "tools": ["core.terminal.exec"],
   "skills": ["database-review"],
-  "mcp": ["repo.search"],
-  "memory": {"scope": "session", "write": true},
+  "mcp": {
+    "repo": ["search"],
+    "memory": ["search", "read", "update"]
+  },
   "budget": {"turns": 20, "tool_calls": 40},
   "result_schema": "artifact://schemas/review-result.json"
 }
@@ -60,10 +62,10 @@ Primary agent при создании сабагента MUST передать �
 Требования:
 
 - `instruction` содержит одну узкую цель, ограничения и success criteria;
-- `tools`, `skills` и `mcp` являются allowlists, а не рекомендациями;
+- `tools`, `skills` и server-scoped `mcp` являются allowlists, а не рекомендациями;
 - каждый элемент MUST входить в capability set parent-а;
 - child не видит остальные рабочие tools/skills даже на discovery;
-- обязательные kernel capabilities для memory search/read, собственной task lifecycle, artifact result, audit и safe completion добавляются runtime автоматически и не могут быть удалены parent-ом; memory mutators появляются только при `memory.write: true`;
+- protocol-internal lifecycle, audit и safe completion сохраняются runtime-ом, но model-callable tools определяются EffectiveConfig и delegation allowlist; parent не может передать отключённую capability;
 - budget является частью parent budget и не увеличивается child-ом;
 - result имеет schema, provenance и перечисляет непроверенные assumptions.
 
@@ -71,19 +73,19 @@ Primary agent при создании сабагента MUST передать �
 
 ## Общая память
 
-Main agent и все его сабагенты работают с одним логическим Markdown MemoryStore tenant/session scope:
+Core Agent не имеет собственной общей memory. Main и child разделяют память, только если parent явно перечислил в delegation contract тот же Memory MCP server и namespace:
 
-- чтение видит последнюю committed memory revision;
-- запись возможна только через memory tools;
-- child использует optimistic concurrency с expected file/repository revision;
-- успешный commit запускает общий indexing/NER pipeline;
-- `memory.updated` notification делает новую revision видимой другим agents;
-- конфликт не разрешается last-write-wins: child перечитывает изменения и повторно формирует patch либо возвращает conflict;
-- parent MAY сузить child до read-only или path scope, но по умолчанию session memory является общей.
+- child получает только перечисленные memory tools;
+- чтение видит committed revision Memory Service;
+- запись использует expected file/repository revision;
+- successful commit запускает indexing/NER внутри Memory Service;
+- service revision notification становится доступна parent через MCP/event bridge;
+- conflict не разрешается last-write-wins;
+- если Memory MCP не передан или AgentConfig memory disabled, child работает без memory.
 
 Working scratchpad и незавершённый model context не являются общей памятью. Для передачи результата child публикует Artifact или committed memory change.
 
-В этой спецификации «сабагент» означает managed child Core Agent Task, подключённую к тому же MemoryStore. Произвольный внешний opaque A2A peer не получает прямой shared-memory access: parent передаёт ему только явно выбранные Message Parts/Artifacts и принимает результат как недоверенный внешний input.
+В этой спецификации «сабагент» означает managed child Core Agent Task. Произвольный внешний opaque A2A peer не получает Memory MCP credentials автоматически: parent передаёт ему только явно выбранные Message Parts/Artifacts и принимает результат как недоверенный внешний input.
 
 ## Execution isolation сабагента
 

@@ -70,7 +70,7 @@ Spellcheck и style lint MAY добавляться, если не создаю�
 - Target spec развивается вперёд; release profiles являются историческими snapshots и после релиза меняются только для errata.
 - Backward-compatible public change сохраняет major version.
 - Breaking change требует новой contract version, migration plan и периода совместимости, если безопасность не требует немедленного отключения.
-- Persisted event/checkpoint/memory schema versioned независимо от transport contract и имеет deterministic migrations.
+- Persisted event/checkpoint schema versioned независимо от transport contract и имеет deterministic migrations; Memory Service versioning принадлежит его MCP/profile contract.
 - Security fix MAY опередить обычный цикл, но нормативное изменение и regression criterion добавляются в том же release commit.
 
 ## Commit discipline

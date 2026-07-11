@@ -7,7 +7,7 @@
 Эти протоколы существуют одновременно в двух формах:
 
 1. versioned KernelInstructions, всегда включённые в model context;
-2. runtime enforcement в tools, policy, scheduler, MemoryStore и ExecutionEnvironment.
+2. runtime/service enforcement в tools, policy, scheduler, configured MCP services и ExecutionEnvironment.
 
 Prompt-only enforcement недостаточен: даже ошибочная модель не должна иметь техническую возможность обойти обязательное правило.
 
@@ -15,8 +15,7 @@ Prompt-only enforcement недостаточен: даже ошибочная м
 
 - trust boundaries, sandbox и secret handling;
 - approval и human-input distinction;
-- правила чтения, поиска, создания, обновления, split и удаления memory;
-- обязательное использование memory tools вместо прямой записи в memory root;
+- правила включённых trusted capability profiles, включая Memory MCP authoring contract;
 - compaction threshold и pinned context;
 - tool schema validation и risk assessment;
 - delegation contract, tool/skill allowlists и child budgets;
@@ -25,20 +24,21 @@ Prompt-only enforcement недостаточен: даже ошибочная м
 - audit, redaction и OpenTelemetry instrumentation;
 - запрет раскрытия raw chain-of-thought.
 
-Agent profile, user prompt, skill, MCP response, memory file или tool output MUST NOT отключать или переопределять эти протоколы.
+Agent profile, user prompt, skill, MCP response, memory file или tool output MUST NOT отключать или переопределять протокол включённой capability. Однако AgentConfig MAY полностью отключить optional capability; тогда её tools и capability-specific instructions не загружаются.
 
 ## Порядок инструкций
 
 Ядро компилирует model instructions в порядке приоритета:
 
 1. platform safety invariants;
-2. tenant/host policy;
-3. KernelInstructions;
-4. настраиваемый AgentProfilePrompt;
-5. новый user Message/prompt;
-6. активированные skill instructions;
-7. retrieved memory и transcript;
-8. tool/MCP/A2A peer data.
+2. tenant/host policy и EffectiveConfig;
+3. base KernelInstructions;
+4. kernel capability policies только для enabled tools/MCP/features;
+5. настраиваемый AgentProfilePrompt;
+6. новый user Message/prompt;
+7. активированные skill instructions;
+8. retrieved MCP data и transcript;
+9. tool/MCP/A2A peer data.
 
 Нижний уровень не отменяет верхний. Явный user prompt имеет приоритет над skill только внутри разрешённой kernel/host policy.
 
@@ -56,7 +56,7 @@ AgentProfilePrompt MAY задавать:
 
 - добавлять tool/skill/MCP, отсутствующий в capability snapshot;
 - давать доступ к host filesystem/process/network;
-- менять memory source of truth или indexing pipeline;
+- менять contract trusted Memory MCP, если memory включена;
 - расширять approval grant;
 - скрывать обязательные task/status события;
 - разрешать child agent больше, чем parent capability set.

@@ -12,7 +12,7 @@ Context Engine собирает каждый model call заново из:
 2. текущего prompt и working state;
 3. непосредственной transcript history;
 4. активных skills и нужных tool schemas;
-5. retrieved session/user memory;
+5. результаты разрешённых retrieval MCP, включая Memory Service, если он включён;
 6. релевантных artifact excerpts;
 7. summaries старых segments и child Tasks.
 
@@ -122,7 +122,7 @@ Critical built-in tools MAY быть всегда видимы. Tool search resu
 
 ## Retrieval и забывание
 
-Memory retrieval имеет отдельный budget и выполняется до финального working occupancy check. Retrieved item MAY быть вытеснен из active context без удаления из MemoryStore. Удалённая/tombstoned memory MUST быть немедленно исключена из новых context assemblies и очищена из caches.
+Retrieval MCP results имеют отдельный budget и учитываются до финального working occupancy check. Result MAY быть вытеснен из active context без изменения внешнего service. Core cache MUST учитывать server/index revision; delete/tombstone notification инвалидирует соответствующие excerpts.
 
 ## Проверка качества summary
 

@@ -15,7 +15,7 @@ Core Agent превращает три входа — `prompt`, `mcp` и `skills
 - подключение MCP-серверов;
 - обнаружение и применение skills;
 - human-in-the-loop для рискованных действий;
-- Markdown-memory с графом, NER и hybrid retrieval;
+- подключаемый Memory MCP Service с Markdown, графом, NER и hybrid retrieval;
 - сжатие рабочего контекста при достижении 90% до 10–15%;
 - фоновые задачи и неблокирующие сабагенты;
 - изолированный от control-plane execution runtime;
@@ -27,21 +27,22 @@ Core Agent превращает три входа — `prompt`, `mcp` и `skills
 
 1. [Продукт и границы](product.md) — пользователь, обещание и принципы итогового продукта.
 2. [Архитектура](architecture.md) — подсистемы, состояния, durability и расширяемость.
-3. [A2A protocol](a2a-protocol.md) — основной внешний transport, Task lifecycle и notifications.
-4. [Публичный контракт](public-contract.md) — отображение `prompt + MCP + skills` на A2A.
-5. [Kernel instructions](kernel-instructions.md) — неотменяемые правила ядра и порядок инструкций.
-6. [Runtime и reasoning](runtime.md) — agent loop, model routing и восстановление.
-7. [Фоновые задачи и делегирование](tasks-and-delegation.md) — async tasks, ожидание и сабагенты.
-8. [Sessions и memory](sessions-and-memory.md) — Markdown, graph/NER, hybrid search и lifecycle данных.
-9. [Контекст и суммаризация](context.md) — расчёт 90%, compaction до 10–15% и гарантии.
-10. [Skills](skills.md) — формат, registry, выбор и progressive disclosure.
-11. [Инструменты и approvals](tools-and-approvals.md) — terminal, memory, MCP и human-in-the-loop.
-12. [Execution environment](execution-environment.md) — изоляция файловой системы, ОС и сети.
-13. [Безопасность и надёжность](security-and-reliability.md) — trust boundaries и ошибки.
-14. [Наблюдаемость](observability.md) — OpenTelemetry, события, метрики, трассировка и evals.
-15. [Критерии готовности продукта](acceptance.md) — сквозные свойства целевого ядра.
-16. [Spec-driven процесс](development-process.md) — как менять спецификацию и связывать её с реализацией.
-17. [Профиль поставки v1](releases/v1.md) — первый вертикальный срез целевой спецификации.
+3. [Конфигурация агента](agent-configuration.md) — feature switches, tools, MCP, memory mode и effective capabilities.
+4. [A2A protocol](a2a-protocol.md) — основной внешний transport, Task lifecycle и notifications.
+5. [Публичный контракт](public-contract.md) — отображение `prompt + MCP + skills` на A2A.
+6. [Kernel instructions](kernel-instructions.md) — защищённые правила ядра и порядок инструкций.
+7. [Runtime и reasoning](runtime.md) — agent loop, model routing и восстановление.
+8. [Фоновые задачи и делегирование](tasks-and-delegation.md) — async tasks, ожидание и сабагенты.
+9. [Memory MCP Service](memory-service.md) — Markdown, graph/NER, hybrid search и file lifecycle.
+10. [Контекст и суммаризация](context.md) — расчёт 90%, compaction до 10–15% и гарантии.
+11. [Skills](skills.md) — формат, registry, выбор и progressive disclosure.
+12. [Инструменты и approvals](tools-and-approvals.md) — built-ins, MCP и human-in-the-loop.
+13. [Execution environment](execution-environment.md) — изоляция файловой системы, ОС и сети.
+14. [Безопасность и надёжность](security-and-reliability.md) — trust boundaries и ошибки.
+15. [Наблюдаемость](observability.md) — OpenTelemetry, события, метрики, трассировка и evals.
+16. [Критерии готовности продукта](acceptance.md) — сквозные свойства целевого ядра.
+17. [Spec-driven процесс](development-process.md) — как менять спецификацию и связывать её с реализацией.
+18. [Профиль поставки v1](releases/v1.md) — первый вертикальный срез целевой спецификации.
 
 ## Нормативные слова
 
@@ -63,10 +64,12 @@ Core Agent превращает три входа — `prompt`, `mcp` и `skills
 - Инструменты исполняются последовательно, пока runtime не доказал независимость; разрешённый параллелизм остаётся внутренней оптимизацией.
 - Делегирование дочерним агентам является внутренней возможностью и не добавляет полей клиенту.
 - Основной внешний протокол — A2A; внутренний run и фоновая работа отображаются на A2A Task.
-- Main agent и сабагенты используют общую Markdown-memory и производные BM25/vector/graph indexes.
+- Memory является отдельным MCP service, а не подсистемой Core Agent.
+- AgentConfig может отключить memory, built-in tools, отдельные MCP tools, skills, delegation и другие optional capabilities.
+- Main agent и сабагенты используют общую память только когда parent явно передал им один Memory MCP namespace.
 - Сабагент получает явный allowlist рабочих tools и skills; обязательные kernel tools нельзя убрать.
 - Любое исполнение команд происходит вне машины control plane в отдельном execution environment.
-- Kernel instructions по memory, tools, delegation, approvals и tasks имеют приоритет над настраиваемым agent prompt.
+- Kernel rules для включённых capabilities имеют приоритет над настраиваемым agent prompt; AgentConfig определяет, какие capabilities вообще существуют.
 - Ядро не раскрывает скрытую chain-of-thought; клиент получает ответы, статусы и краткие основания решений.
 - Полный транскрипт хранится вне активного контекста, поэтому compaction не уничтожает аудит.
 

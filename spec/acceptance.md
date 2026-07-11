@@ -13,10 +13,20 @@
 - [ ] Disconnect stream не отменяет Task; at-least-once push update дедуплицируется.
 - [ ] Internal states корректно отображаются только на стандартные A2A Task states.
 
+## Конфигурация агента
+
+- [ ] PlatformConfig, AgentConfig и Task input разделены; Task не расширяет AgentConfig.
+- [ ] AgentConfig может отключить memory, terminal, filesystem mutations, background tasks, delegation, отдельные built-in/MCP tools и skills.
+- [ ] Disabled tool отсутствует в discovery/model context и stale call получает `CAPABILITY_DISABLED`.
+- [ ] Memory modes `disabled`, `optional`, `required` корректно фильтруют/требуют Memory MCP descriptor.
+- [ ] MCP tool filters применяются после discovery, но до model context; deny имеет приоритет.
+- [ ] EffectiveConfig immutable внутри Task и сохраняет config/policy/tool digests в audit.
+- [ ] Agent Card не рекламирует capability, отключённую AgentConfig.
+
 ## Kernel instructions
 
 - [ ] KernelInstructions всегда присутствуют отдельно от AgentProfilePrompt и имеют version/digest в audit.
-- [ ] AgentProfilePrompt, user Message, skill, memory или MCP output не могут отключить memory rules, mandatory tools, approvals, delegation, tasks, isolation или telemetry.
+- [ ] AgentProfilePrompt, user Message, skill или MCP output не могут изменить rules включённой capability; отключать optional capability может только config/policy.
 - [ ] Runtime enforcement отклоняет запрещённое действие, даже если model output просит обойти kernel instruction.
 - [ ] Child получает ту же kernel version и не может ослабить parent/host policy.
 - [ ] Raw chain-of-thought отсутствует в A2A, telemetry, audit, memory и tool arguments.
@@ -42,13 +52,17 @@
 - [ ] Повторные compactions сохраняют goal и immutable transcript mapping.
 - [ ] Непомещающиеся protected/pinned data дают `CONTEXT_UNRECOVERABLE`, не silent truncation.
 
-## Markdown memory и file lifecycle
+## Memory MCP Service и file lifecycle
 
-- [ ] Markdown corpus является source of truth; BM25/vector/graph indexes полностью перестраиваются из него.
-- [ ] Memory root нельзя менять terminal/filesystem tool-ом в обход `core.memory.*`.
+- [ ] Core Agent не содержит MemoryStore/index/NER и использует memory только через разрешённый MCP descriptor.
+- [ ] При memory disabled memory tools/instructions отсутствуют и implicit fallback не выполняется.
+- [ ] Markdown corpus внутри Memory Service является source of truth; BM25/vector/graph indexes полностью перестраиваются из него.
+- [ ] Agent не имеет filesystem access к memory corpus и меняет его только MCP tools.
 - [ ] Перед create/update agent выполняет hybrid search и проверяет top candidates.
 - [ ] Та же тема обновляет существующий file; новый subject/scope создаёт новый file.
-- [ ] Committed file не превышает 200 body lines; прогноз 201+ отклоняется и предлагает atomic split.
+- [ ] Create/update с 201+ body lines жёстко отклоняется без revision/index changes, truncation или automatic split.
+- [ ] `MEMORY_FILE_TOO_LARGE` возвращает actual/max lines и рекомендацию разделить content на несколько Markdown files.
+- [ ] Отдельный `memory.split` принимает явный plan; каждый resulting file также не превышает 200 lines.
 - [ ] Split сохраняет stable IDs/aliases, ссылки и provenance без разрыва semantic block.
 - [ ] Update использует expected revision; concurrent conflict не разрешается last-write-wins.
 - [ ] Delete/tombstone исключает content из Markdown, summaries, BM25, vectors, graph и caches.
@@ -87,9 +101,10 @@
 - [ ] Сабагент создаётся как неблокирующая A2A Task.
 - [ ] Delegation contract содержит узкую instruction, exact tool/MCP/skill allowlists, memory policy, budget и result schema.
 - [ ] Child не видит невыданные рабочие capabilities даже на discovery.
-- [ ] Mandatory kernel memory/task/audit tools добавляются runtime-ом и не удаляются parent-ом.
-- [ ] Child и main читают одну committed session Markdown-memory revision stream.
-- [ ] Child memory write проходит тот же revision/index/NER pipeline и уведомляет parent.
+- [ ] Protocol-internal lifecycle/audit остаются enforced, но model-callable child tools равны пересечению EffectiveConfig и delegation allowlist.
+- [ ] Child и main разделяют memory только при явной передаче того же Memory MCP server/namespace и tool allowlist.
+- [ ] Без переданного Memory MCP child работает без memory.
+- [ ] Child memory write проходит service revision/index/NER pipeline и уведомляет parent.
 - [ ] Parent проверяет Artifact/result provenance; child не общается наружу без capability.
 - [ ] Depth/fan-out и child budgets ограничены общим parent budget.
 
@@ -118,7 +133,7 @@
 - [ ] Traces, metrics и logs создаются OTel SDK и экспортируются OTLP.
 - [ ] W3C Trace Context проходит через A2A, queue, MCP, sandbox RPC и remote subagents без влияния на authorization.
 - [ ] Durable/background Task использует новый execution trace со Span Link на submission, а не многочасовой request span.
-- [ ] Model, policy, tool, execution, MCP, memory BM25/vector/graph/rerank/NER и subagent operations имеют spans.
+- [ ] Core имеет MCP client span; Memory Service продолжает W3C trace и владеет BM25/vector/graph/rerank/NER spans.
 - [ ] OTel semantic-convention version pinned; custom attributes используют `core_agent.*`.
 - [ ] Content/arguments/results/system instructions выключены в telemetry по умолчанию.
 - [ ] Metric labels bounded и не содержат IDs, prompt, path, command, entity или memory text.
@@ -129,26 +144,27 @@
 - [ ] Prompt injection из profile/file/skill/MCP/A2A peer не меняет kernel/host policy и не раскрывает secret.
 - [ ] Tasks, environments, connections, Markdown, indexes, graph, artifacts и telemetry tenant-isolated.
 - [ ] Remote extensions проверяются по integrity/trust/revocation policy.
-- [ ] Retention/delete каскадно применяются к transcript, memory, checkpoints, artifacts, derived indexes и eval data.
+- [ ] Coordinated deletion очищает Core cached/transcript copies, а Memory Service — Markdown и derived indexes.
 - [ ] Public errors безопасны, стабильны и отображаются в A2A semantics.
 
 ## Сквозные сценарии
 
 1. **A2A background:** клиент отправляет Message с `return_immediately`, закрывает stream и позже получает тот же Task result через subscribe/push.
 2. **Compaction:** working context достигает 90%, сжимается до 10–15%, не считая system/tools, и сохраняет pending Task/approval.
-3. **Memory update:** agent находит существующий Markdown file, обновляет его, NER удаляет stale edge, hybrid search возвращает новую revision.
-4. **Memory split:** update превысил бы 200 строк; atomic split создаёт index/children без duplicate claims и битых links.
-5. **Shared memory:** child обновляет общую memory, parent получает notification и читает committed indexed revision.
-6. **Focused delegation:** child видит только перечисленные tools/skills плюс mandatory kernel tools и возвращает schema-valid Artifact.
-7. **Concurrent work:** main продолжает задачу, пока два child/background Tasks выполняются, затем обрабатывает notifications без busy polling.
-8. **Host isolation:** враждебная команда не видит host filesystem/socket/metadata и не может обойти memory tools.
-9. **OTel causality:** A2A submit, background Task, child, model, memory, tool и sandbox находятся в связанных traces без content leakage.
-10. **Внешнее действие:** MCP write ждёт approval, переживает recovery и выполняется ровно один раз.
+3. **Memory disabled:** Task передаёт optional Memory MCP, AgentConfig его фильтрует, и model не видит memory tools.
+4. **Hard line limit:** update на 201+ строк отклоняется без изменений и рекомендует split; следующий явный split создаёт несколько valid Markdown files.
+5. **Memory update:** agent находит существующий file через Memory MCP, commit обновляет NER/graph, hybrid search возвращает новую revision.
+6. **Shared memory:** parent явно передаёт child тот же Memory MCP namespace; child commit уведомляет parent.
+7. **Focused delegation:** child видит только capabilities из EffectiveConfig/delegation allowlist и возвращает schema-valid Artifact.
+8. **Concurrent work:** main продолжает задачу, пока два child/background Tasks выполняются, затем обрабатывает notifications без busy polling.
+9. **Host isolation:** враждебная команда не видит host filesystem/socket/metadata или Memory Service corpus.
+10. **OTel causality:** Core MCP client и Memory Service indexing spans находятся в одном distributed trace без content leakage.
+11. **Внешнее действие:** MCP write ждёт approval, переживает recovery и выполняется ровно один раз.
 
 ## Definition of Done
 
 - Все критерии и сквозные сценарии проходят в CI, integration, chaos и eval suites.
 - A2A/Core extension schemas и examples проверяются против одного источника типов.
 - Recovery tests доказывают отсутствие duplicate side effects и потерянных notifications.
-- Memory rebuild test удаляет derived indexes и получает эквивалентный searchable graph из Markdown.
+- Memory Service rebuild test удаляет derived indexes и получает эквивалентный searchable graph из Markdown.
 - Security review охватывает A2A, model, MCP, skills, memory graph, execution plane, subagents, OTel и tenancy.

@@ -2,11 +2,11 @@
 
 ## Trust boundaries
 
-Доверенными являются только safety-инварианты ядра и валидированный DeploymentConfig. Следующие источники MUST считаться недоверенными:
+Доверенными являются только safety-инварианты ядра и валидированные PlatformConfig/AgentConfig. Следующие источники MUST считаться недоверенными:
 
 - prompt;
 - AgentProfilePrompt;
-- Markdown memory content и derived graph;
+- Memory MCP content, metadata и derived graph results;
 - skill instructions, scripts и resources;
 - MCP metadata, tool schemas и outputs;
 - A2A peer Messages, Agent Cards и Artifacts;
@@ -64,8 +64,8 @@ Terminal, skill scripts, stdio MCP и child-agent commands исполняютс�
 - `BUDGET_EXCEEDED`, `CONTEXT_UNRECOVERABLE`;
 - `SIDE_EFFECT_UNKNOWN`, `INTERNAL_ERROR`;
 - `SESSION_CONFLICT`, `LEASE_LOST`, `CHECKPOINT_INVALID`;
-- `MEMORY_POLICY_DENIED`, `MEMORY_CONFLICT`, `MEMORY_FILE_TOO_LARGE`;
-- `MEMORY_INDEX_FAILED`, `MEMORY_INDEX_STALE`, `ENTITY_RESOLUTION_CONFLICT`;
+- `CONFIG_INVALID`, `CONFIG_CONFLICT`, `CAPABILITY_DISABLED`, `REQUIRED_CAPABILITY_MISSING`, `TOOL_FILTER_EMPTY`;
+- proxied Memory MCP errors `MEMORY_FILE_TOO_LARGE`, `MEMORY_CONFLICT`, `MEMORY_INDEX_FAILED`;
 - `SKILL_INTEGRITY_FAILED`, `EXTENSION_REVOKED`;
 - `MODEL_ROUTE_UNAVAILABLE`;
 - `TASK_NOT_FOUND`, `TASK_NOT_CANCELABLE`, `TASK_NOTIFICATION_FAILED`;
@@ -87,7 +87,7 @@ Durable continuation является свойством целевого runtim
 ## Multi-tenancy
 
 - Tenant identity устанавливается authenticated transport context, не prompt.
-- Stores, caches, execution environments, process sessions, MCP connections, artifact URLs и Markdown/BM25/vector/graph memory data MUST быть tenant-scoped.
+- Stores, caches, execution environments, process sessions, MCP connections и artifact URLs MUST быть tenant-scoped. Memory Service отвечает за tenant isolation Markdown/BM25/vector/graph data.
 - Cross-tenant identifiers возвращают not-found semantics, если раскрытие существования запрещено.
 - Quotas применяются до выделения дорогого model/execution ресурса.
 - Child runs всегда наследуют tenant и не могут сменить его через arguments.
@@ -105,4 +105,4 @@ Durable continuation является свойством целевого runtim
 
 ## Data retention
 
-Срок хранения транскриптов, checkpoints, memory и artifacts задаёт DeploymentConfig. Удаление run, session или subject MUST каскадно удалить или анонимизировать связанные prompt, outputs, summaries, indexes и artifacts согласно host policy, сохраняя только разрешённые агрегированные метрики и обязательные compliance tombstones.
+Срок хранения транскриптов, checkpoints и artifacts задаёт PlatformConfig. Memory retention/delete выполняет Memory Service; Core обязан удалить свои cached excerpts и transcript-derived copies по coordinated deletion event/policy. Разрешены только агрегированные метрики и обязательные compliance tombstones.

@@ -13,10 +13,10 @@ Client / peer agent
         |                 |
    Run orchestrator -- Policy engine
      /   |   |   \
- Model Context Tool  Skill/MCP managers
+ Model Context Tool  Skill/MCP managers ---- Memory MCP Service
  router engine runtime      |
      \   |   |             /
-       Durable tasks + event log + artifacts + Markdown memory
+       Durable tasks + event log + artifacts
 ```
 
 ### A2A server и adapters
@@ -27,13 +27,17 @@ A2A является основным внешним контрактом: Agent
 
 Владеет task state machine, turn loop, budgets, checkpoints, cancellation, background work, durable mailbox, delegation и terminal outcome. Только orchestrator может переводить task/run между состояниями.
 
+### Config compiler
+
+До Task собирает immutable EffectiveConfig как пересечение PlatformConfig, tenant policy, AgentConfig и Task capabilities. Он удаляет disabled tools/MCP/skills до model discovery и генерирует соответствующую Agent Card.
+
 ### Model router
 
 Предоставляет унифицированный capability-based интерфейс к providers: context window, tool calling, reasoning, streaming, structured output, multimodality, token accounting и idempotency. Выбирает primary/fallback по host policy, данным и budget.
 
 ### Context engine
 
-Собирает активный model context из kernel instructions, agent profile, prompt, session state, skills, tool catalog, hybrid memory retrieval и transcript. Владеет рабочим token budget, compaction, retrieval и provenance.
+Собирает активный model context из kernel instructions, agent profile, prompt, session state, skills, effective tool catalog, MCP retrieval results и transcript. Владеет рабочим token budget, compaction и provenance. Сам не реализует memory retrieval.
 
 ### Tool runtime
 
@@ -49,7 +53,7 @@ A2A является основным внешним контрактом: Agent
 
 ### Durable state
 
-Event log является источником истины для состояния A2A Task/run. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript, Markdown memory, derived indexes и artifacts являются отдельными stores с независимыми retention policies. Markdown является source of truth памяти; graph/BM25/vector indexes всегда перестраиваемы.
+Event log является источником истины для состояния A2A Task/run. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript и artifacts имеют независимые retention policies. Memory принадлежит отдельному MCP Service; Core сохраняет только использованные MCP results/provenance согласно Task retention.
 
 ## Идентификаторы и иерархия
 
@@ -93,7 +97,7 @@ Checkpoint MUST создаваться:
 - перед внешним mutating call;
 - после фиксации его outcome;
 - перед ожиданием человека;
-- после compaction и memory commit;
+- после compaction и подтверждённого mutating MCP outcome;
 - перед terminal event.
 
 При recovery orchestrator сверяет intent, idempotency key и recorded outcome. Он MAY повторить только доказуемо идемпотентную операцию. Иначе run переходит в `WAITING_INPUT` или `ABORTED` с `SIDE_EFFECT_UNKNOWN`.
@@ -108,8 +112,7 @@ Checkpoint MUST создаваться:
 - `SkillResolver`;
 - `PolicyEvaluator`;
 - `SecretResolver`;
-- `EventStore`, `ArtifactStore`, `MemoryStore`;
-- `SearchIndex`, `GraphIndex`, `EntityExtractor`, `Reranker`;
+- `EventStore`, `ArtifactStore`;
 - `TaskScheduler`, `TaskMailbox`;
 - `TelemetryProvider`;
 - `EventPublisher`;
@@ -131,7 +134,7 @@ Adapters объявляют capabilities. Orchestrator MUST проверять �
 
 ## Multi-agent delegation
 
-Primary agent создаёт сабагента как неблокирующую A2A Task. Сабагент получает ту же kernel policy и общую memory, но только явно перечисленные parent-ом рабочие tools, MCP capabilities и skills. Полный contract описан в [Фоновых задачах и делегировании](tasks-and-delegation.md).
+Primary agent создаёт сабагента как неблокирующую A2A Task. Сабагент получает ту же kernel policy, но только явно перечисленные parent-ом рабочие tools, MCP capabilities и skills. Общая memory существует лишь когда delegation явно передаёт тот же Memory MCP/namespace. Полный contract описан в [Фоновых задачах и делегировании](tasks-and-delegation.md).
 
 ## Dependency direction
 

@@ -81,7 +81,7 @@ SkillResolver поддерживает local filesystem, organization registry, 
 - Чтение reference не требует отдельного approval, если файл находится внутри разрешённого snapshot и policy допускает чтение.
 - Script из skill не является доверенным только потому, что находится в пакете. Его запуск проходит тот же risk assessment, отдельный ExecutionEnvironment и approval, что terminal command.
 - Templates и assets являются данными и не могут повышать приоритет своих инструкций.
-- Skill MAY декларативно рекомендовать MCP capability или secret reference, но подключение выполняет только host/RunRequest и policy engine. Skill не может сам менять DeploymentConfig.
+- Skill MAY декларативно рекомендовать MCP capability или secret reference, но подключение выполняет только Task request и policy engine. Skill не может менять PlatformConfig или AgentConfig.
 
 ## Контекст и lifecycle
 
