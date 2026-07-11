@@ -1,10 +1,12 @@
 # Публичный контракт
 
-Версия целевого контракта: `v1alpha1` до первой стабильной реализации.
+Версия Core Agent extension: `v1alpha1` до первой стабильной реализации.
 
-Документ задаёт логическую модель. Конкретные HTTP, library и CLI adapters MUST сохранять её семантику.
+Основной внешний protocol — [A2A](a2a-protocol.md). Этот документ определяет Core Agent payload и semantics поверх A2A, а не отдельный HTTP/RPC protocol.
 
-## RunRequest
+## Логический RunRequest
+
+Внутреннее ядро получает ровно три пользовательских входа:
 
 ```json
 {
@@ -14,26 +16,35 @@
 }
 ```
 
-Объект MUST содержать ровно три поля. Неизвестные поля MUST отклоняться с `INVALID_REQUEST`. Session, tenant, auth, trace и delivery semantics принадлежат transport envelope и не дублируются в body.
+A2A adapter строит его так:
 
-### `prompt`
+| Логический input | A2A representation |
+|---|---|
+| `prompt` | входной A2A `Message.parts` |
+| `mcp` | `urn:core-agent:run-capabilities:v1` structured extension data |
+| `skills` | тот же extension payload |
 
-- Непустая UTF-8 строка является обязательным shorthand.
-- Целевой контракт также принимает массив content parts внутри того же поля: `text`, `artifact_ref`, `image_ref`, `audio_ref` и другие versioned modalities. Бинарные данные передаются artifact reference, не inline base64.
-- Содержит один новый пользовательский turn. История stateful session подмешивается ядром, а не клиентом.
-- Максимальный размер задаётся DeploymentConfig; превышение MUST завершаться до вызова модели.
-- Ядро MUST сохранять исходный prompt дословно на всём протяжении запуска.
-- Неподдерживаемая выбранным model route modality должна быть преобразована разрешённым adapter-ом либо отклонена до первого turn.
+Session/tenant/auth/trace/task delivery принадлежат A2A context и transport security. Они не становятся четвёртым полем RunRequest.
 
-### `mcp`
+## `prompt`
 
-Массив MCP connection descriptors. Пустой массив означает отсутствие внешних MCP-инструментов.
+- Непустой text Part является обязательным shorthand.
+- Целевой контракт принимает A2A text, file/artifact reference и structured data Parts согласно advertised media types.
+- Бинарные данные SHOULD передаваться ссылкой/content-addressed artifact, а не inline base64.
+- Message содержит один новый пользовательский turn. История A2A context/session добавляется ядром.
+- Исходные Parts, role, IDs и digests сохраняются на протяжении Task.
+- Неподдерживаемая modality отклоняется стандартной A2A content-type ошибкой до model turn.
 
-Целевой продукт MUST поддерживать stdio и Streamable HTTP; дополнительные MCP transports подключаются adapter-ами:
+## `mcp`
+
+Массив MCP connection descriptors. Пустой массив означает отсутствие MCP capabilities в конкретной Task и ничего не наследует из предыдущей Task context-а.
+
+Целевой продукт поддерживает stdio и Streamable HTTP:
 
 ```json
 {
   "name": "repo-tools",
+  "required": true,
   "transport": {
     "type": "stdio",
     "command": "repo-mcp",
@@ -46,6 +57,7 @@
 ```json
 {
   "name": "issue-tracker",
+  "required": true,
   "transport": {
     "type": "streamable_http",
     "url": "https://mcp.example.test",
@@ -56,19 +68,17 @@
 
 Требования:
 
-- `name` MUST быть уникальным в пределах запуска.
-- Descriptor MAY включать запрошенные MCP capabilities: tools, resources, prompts и elicitation.
-- Секреты MUST передаваться ссылками на host secret store, а не значениями.
-- Descriptor MUST проходить host allowlist и approval policy до подключения.
-- Сервер и список его tools фиксируются snapshot-ом запуска. Изменение списка MAY быть принято только после явного повторного discovery ядром.
-- Descriptor содержит `required` (default `true`). Ошибка обязательного подключения завершает запуск с `MCP_CONNECTION_FAILED`; optional server отключается с наблюдаемым warning event.
-- MCP roots, sampling и elicitation проходят те же policy и human-in-the-loop gates, что локальные аналоги.
+- `name` уникален внутри Task;
+- descriptor MAY запрашивать tools/resources/prompts/sampling/elicitation;
+- secrets передаются ссылками на host secret store;
+- descriptor проходит allowlist, risk/approval и execution isolation до подключения;
+- stdio MCP запускается в ExecutionEnvironment, не на control-plane host;
+- catalog фиксируется snapshot-ом; notification меняет revision только на safe boundary;
+- ошибка `required: true` завершает Task, optional descriptor создаёт наблюдаемый warning.
 
-Массив задаёт полный набор MCP capabilities, разрешённых конкретному run. Пустой массив не наследует MCP server из предыдущего run session.
+## `skills`
 
-### `skills`
-
-Массив content-addressable ссылок на skill packages. Пустой массив означает работу только со встроенными возможностями.
+Массив content-addressed skill package references. Пустой массив означает отсутствие пользовательских runtime skills в конкретной Task.
 
 ```json
 {
@@ -78,109 +88,108 @@
 }
 ```
 
-Требования:
+- `name` уникален внутри Task;
+- source resolver разрешён host policy;
+- remote immutable source имеет integrity/signature provenance;
+- dependency graph фиксируется lock snapshot-ом;
+- package проходит [Skills](skills.md) validation;
+- A2A Agent Skill в Agent Card и этот runtime skill descriptor являются разными сущностями.
 
-- `name` MUST быть уникальным в пределах запуска.
-- `source` MUST использовать resolver, разрешённый host policy. Целевые schemes: `file`, `skill`, `oci` и `git+https`.
-- `integrity` обязателен для immutable remote source; registry resolver MAY получить его из подписанного lock record.
-- Пакет MUST пройти валидацию, описанную в [Skills](skills.md).
-- Содержимое пакета и dependency graph MUST быть зафиксированы lock snapshot-ом на время запуска.
-- Профиль поставки MAY поддерживать только подмножество source schemes.
+## Core extension payload
 
-Массив задаёт полный набор skills, разрешённых конкретному run. Session memory может помнить факт использования skill, но не активирует его без нового descriptor.
-
-## Session transport
-
-Логические операции transport-а:
-
-- `session.create`, `session.get`, `session.close`, `session.export`, `session.delete`;
-- `session.run(RunRequest)`;
-- `run.get`, `run.events`, `run.control`.
-
-SDK MAY представить session как object handle, HTTP — как resource path. Anonymous `run(RunRequest)` создаёт ephemeral session. Независимо от формы transport-а само ядро получает неизменённые три входа и отдельно проверенный execution context.
-
-## Ответ запуска
-
-Запуск возвращает упорядоченный поток `RunEvent`. Каждое событие содержит envelope:
+Message использует required A2A extension; HTTP binding также передаёт URI через `A2A-Extensions`:
 
 ```json
 {
-  "version": "v1alpha1",
-  "run_id": "run_01...",
-  "sequence": 12,
-  "timestamp": "2026-07-10T19:30:00Z",
-  "type": "tool.completed",
-  "data": {}
-}
-```
-
-- `run_id` генерируется ядром.
-- `sequence` начинается с 1 и строго возрастает без повторов внутри запуска.
-- Потребитель MUST иметь возможность восстановить порядок без доверия времени.
-- Неизвестный `type` MUST игнорироваться клиентом ради forward compatibility.
-
-Обязательные типы событий:
-
-- `run.started`;
-- `assistant.delta` и `assistant.message`;
-- `tool.requested`, `tool.started`, `tool.completed`, `tool.failed`;
-- `approval.required`, `approval.resolved`;
-- `input.required`, `input.resolved`;
-- `context.compacted`;
-- `memory.updated`, `checkpoint.created`;
-- `subrun.started`, `subrun.completed`, `subrun.failed`;
-- `run.paused`, `run.resumed`, `run.recovering`;
-- `run.completed`, `run.failed`, `run.cancelled`;
-- `run.aborted`.
-
-Полезные данные событий описаны в [Наблюдаемости](observability.md).
-
-## Control-команды
-
-Approval, дополнительный human input и lifecycle являются командами уже существующему запуску, а не полями RunRequest:
-
-```json
-{
-  "type": "approval.resolve",
-  "run_id": "run_01...",
-  "approval_id": "apr_01...",
-  "decision": "approve"
-}
-```
-
-```json
-{
-  "type": "run.cancel",
-  "run_id": "run_01..."
-}
-```
-
-Допустимые решения: `approve`, `deny`. Approval MAY создать ограниченный grant для повторяющегося scope, если policy и UI явно это поддерживают; default — одно точное действие. Повторная или устаревшая команда возвращает `APPROVAL_ALREADY_RESOLVED`.
-
-Другие control types: `input.resolve`, `run.pause`, `run.resume`, `run.cancel`. Control command содержит idempotency key и ожидаемую run revision для защиты от гонок.
-
-## Терминальные состояния
-
-Ровно одно из событий `run.completed`, `run.failed`, `run.cancelled`, `run.aborted` MUST быть последним событием запуска. После него ядро MUST NOT испускать новые события этого запуска.
-
-`run.aborted` используется только когда ядро не может доказать безопасное продолжение, например при неопределённом side effect после потери worker-а. Обычная ошибка реализации или provider-а должна быть `run.failed`.
-
-`run.completed` содержит:
-
-```json
-{
-  "message": "Итоговый ответ пользователю",
-  "usage": {
-    "input_tokens": 0,
-    "output_tokens": 0,
-    "tool_calls": 0,
-    "compactions": 0
+  "extensions": ["urn:core-agent:run-capabilities:v1"],
+  "metadata": {
+    "urn:core-agent:run-capabilities:v1": {
+      "mcp": [],
+      "skills": []
+    }
   }
 }
 ```
 
+Extension value содержит ровно `mcp` и `skills`. Prompt находится только в Message Parts. Неизвестное обязательное поле требует новой extension version; неизвестное optional поле MAY игнорироваться только по правилам объявленной версии.
+
+## Task и background mode
+
+- Простая безопасная задача без tracking MAY вернуть direct A2A Message.
+- Любая Task с tools, background work, approval, memory write или сабагентом MUST вернуть A2A Task.
+- `return_immediately` включает non-blocking mode: сервер подтверждает Task и продолжает её в фоне.
+- Клиент получает updates через get/list, subscribe/stream или push notifications.
+- Закрытие stream не отменяет Task.
+- Main agent также использует этот lifecycle для внутренних background/subagent tasks.
+
+## Результаты
+
+Основной результат Task — A2A Artifact:
+
+- stable artifact ID и revision;
+- один или несколько typed Parts;
+- media type, size и digest;
+- provenance на Task/tool/memory revision;
+- `append`/`lastChunk` semantics для streaming, если поддерживаются binding version.
+
+User-facing progress и requests передаются Messages/Task status. Critical result не хранится только в transient status Message.
+
+## Human-in-the-loop
+
+Approval или новые данные переводят A2A Task в `input-required` и прикладывают Message:
+
+- `reason: approval_required` содержит approval ID, точный effect, redacted arguments, risks и scope options;
+- `reason: information_required` содержит typed response schema;
+- authentication использует `auth-required`, а не маскируется под approval.
+
+Клиент отвечает новым Message существующей Task. Approval response использует structured Part:
+
+```json
+{
+  "type": "urn:core-agent:approval-response:v1",
+  "approval_id": "apr_01...",
+  "decision": "approve",
+  "scope": "single_call"
+}
+```
+
+Повторная или устаревшая decision возвращает stable Core error `APPROVAL_ALREADY_RESOLVED`, отображённую в A2A error/status semantics.
+
+## Cancellation и passive wait
+
+- Внешняя отмена использует A2A cancel Task operation.
+- Внутренний agent может вызвать `core.task.cancel` для child/background Task.
+- Passive wait не создаёт внешней terminal state: Task остаётся `working`, status metadata сообщает `waiting_task`.
+- Task, ожидающая notification, не удерживает model worker, execution environment или busy loop.
+
+## Ordering и idempotency
+
+Internal event log имеет monotonic revision/sequence. A2A status/artifact updates содержат достаточную version metadata, чтобы:
+
+- восстановить порядок после reconnect;
+- дедуплицировать at-least-once push delivery;
+- не применить stale approval/input;
+- не перепутать artifact chunks;
+- связать внешний Task с внутренним audit.
+
+## Terminal semantics
+
+Каждая Task достигает ровно одного A2A terminal state: `completed`, `failed`, `canceled` или `rejected`. Внутренний `ABORTED` отображается в `failed` с безопасным `unsafe_continuation` reason.
+
+После terminal state новые Messages этой Task отклоняются стандартной A2A terminal-task ошибкой. Продолжение диалога создаёт новую Task в том же `contextId`.
+
+## Embedded SDK
+
+Embedded/local SDK MAY предоставить convenience `run(prompt, mcp, skills)` и typed event iterator. Он MUST:
+
+- использовать ту же A2A Task/message/artifact semantics;
+- отдавать Agent Card/capability metadata;
+- не создавать другой lifecycle или approval contract;
+- позволять поднять A2A binding без изменения domain behavior.
+
 ## Совместимость
 
-- Добавление нового event type является обратно совместимым.
-- Добавление обязательного поля или изменение семантики существующего поля требует новой версии контракта.
-- Экспериментальные поля MUST находиться в `data.experimental` и не могут быть обязательными для корректного клиента.
+- A2A protocol version и Core extension version согласуются независимо.
+- Добавление optional A2A status metadata обратно совместимо.
+- Изменение смысла `mcp`/`skills`, обязательного поля или approval payload требует новой major extension version.
+- Persisted Task хранит обе versions для replay/migration.

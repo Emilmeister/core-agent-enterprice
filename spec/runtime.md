@@ -18,7 +18,7 @@
 6. загрузить session working state и релевантную memory;
 7. выбрать primary model route и проверить capabilities;
 8. вычислить доступный контекстный бюджет;
-9. испустить `run.started`.
+9. перевести A2A Task в `working` и испустить внутреннее `task.started`.
 
 Если шаг не выполнен, модель и инструменты MUST NOT вызываться.
 
@@ -28,12 +28,14 @@
 
 1. неизменяемые safety-инварианты платформы;
 2. DeploymentConfig и host policy;
-3. протокол Core Agent;
-4. исходный пользовательский prompt;
-5. инструкции активированных skills;
-6. данные, полученные от tools.
+3. versioned KernelInstructions;
+4. настраиваемый AgentProfilePrompt;
+5. исходный пользовательский prompt/A2A Message;
+6. инструкции активированных skills;
+7. retrieved memory и transcript;
+8. данные, полученные от tools/MCP/A2A peers.
 
-Нижний уровень MUST NOT отменять верхний. Tool output считается недоверенными данными, даже если содержит текст, похожий на инструкции.
+Нижний уровень MUST NOT отменять верхний. Memory protocol, обязательные tools, delegation rules, task lifecycle, approvals, sandbox и observability принадлежат KernelInstructions и одновременно enforced runtime-ом. AgentProfilePrompt не может их заменить. Полный contract описан в [Kernel instructions](kernel-instructions.md).
 
 Если prompt и skill противоречат друг другу без нарушения уровней 1–3, явный prompt имеет приоритет. Если безопасное разрешение неоднозначно, агент запрашивает уточнение через итоговый ответ, не угадывает.
 
@@ -48,9 +50,10 @@
 5. если модель запросила tool — валидирует имя и arguments;
 6. оценивает риск и при необходимости durable-переходит в `WAITING_APPROVAL`;
 7. исполняет разрешённый tool, нормализует result и добавляет его в контекст;
-8. продолжает цикл.
+8. принимает durable task notifications на safe boundary;
+9. продолжает цикл, другую независимую работу или passive wait.
 
-Последовательность является базовой семантикой. Runtime MAY построить dependency graph и параллельно исполнить доказуемо независимые read-only calls или изолированные child runs. Каждый call всё равно получает отдельные policy decision, lifecycle и audit. Порядок слияния результатов должен быть стабильным.
+Последовательность является базовой семантикой. Runtime MAY построить dependency graph и параллельно исполнить доказуемо независимые read-only calls или изолированные child Tasks. Каждый call всё равно получает отдельные policy decision, lifecycle и audit. Порядок слияния результатов должен быть стабильным.
 
 ## Reasoning
 
@@ -77,18 +80,9 @@ Route описывается требованиями, а не именем мо
 
 Runtime SHOULD объединять связанные вопросы в один запрос и не спрашивать то, что можно безопасно обнаружить доступными read-only tools.
 
-## Делегирование
+## Фоновые задачи и делегирование
 
-Runtime MAY вызвать внутренний `core.delegate`. До запуска child run orchestrator задаёт:
-
-- узкую цель и success criteria;
-- разрешённые tools/MCP/skills;
-- data visibility;
-- token/cost/time budget;
-- максимальные depth и fan-out;
-- формат structured result.
-
-Parent остаётся ответственным за проверку результата. Child summary считается недоверенным результатом tool, а не новым системным правилом.
+Long-running tool, indexing job и сабагент запускаются как неблокирующие Tasks. Parent получает handle, продолжает другую работу или durable-переходит в `WAITING_TASK`. Completion notification возобновляет loop и добавляется в контекст на safe boundary. Delegation MUST передавать явные allowlists tools/MCP/skills; детали определены в [Фоновых задачах и делегировании](tasks-and-delegation.md).
 
 ## Завершение
 
@@ -102,6 +96,8 @@ Parent остаётся ответственным за проверку рез�
 - произошла невосстановимая ошибка;
 - получена команда отмены.
 
+Наличие pending background task не требует держать run активно вычисляющимся. Agent MAY ничего не делать и ждать. Terminal completion допускается только если pending tasks отменены, detached по policy или явно не нужны результату.
+
 Отклонение approval не является автоматической ошибкой: tool result с отказом возвращается модели, чтобы она могла выбрать безопасную альтернативу или объяснить блокировку.
 
 ## Budgets и защита от зацикливания
@@ -113,7 +109,7 @@ DeploymentConfig MUST задавать hard limits минимум для:
 - wall-clock времени;
 - стоимости или токенов, если provider даёт такую метрику;
 - размера одного tool result и суммарного artifact storage.
-- depth/fan-out и суммарного бюджета child runs;
+- depth/fan-out и суммарного бюджета child Tasks;
 - числа compaction/retrieval операций;
 - времени ожидания человека отдельно от active compute time.
 

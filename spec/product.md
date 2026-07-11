@@ -2,7 +2,7 @@
 
 ## Пользователи
 
-- Разработчик продукта встраивает agent core через SDK или service API.
+- Разработчик продукта встраивает agent core через A2A или совместимый embedded SDK.
 - Оператор задаёт модели, policies, budgets, tenancy, data retention и инфраструктуру.
 - Конечный пользователь формулирует задачи, наблюдает ход работы и принимает human-in-the-loop решения.
 - Автор skill или MCP server расширяет возможности без изменения ядра.
@@ -29,6 +29,10 @@ Core Agent MUST владеть следующими обязанностями:
 - регистрация, валидация и исполнение встроенных и MCP-инструментов;
 - оценка риска и approval flow;
 - ограничение вывода инструментов;
+- Markdown-memory, graph/NER indexing и hybrid retrieval;
+- фоновые Tasks, passive wait и делегирование сабагентам;
+- изолированный execution plane;
+- A2A communication и OpenTelemetry observability;
 - стриминг событий, аудит и отмена запуска.
 
 Клиент MUST NOT быть обязан повторять эту логику. Полнота продукта измеряется не числом встроенных workflow, а тем, насколько надёжно ядро выполняет любой разрешённый workflow через единый контракт.
@@ -46,11 +50,13 @@ Core Agent MUST владеть следующими обязанностями:
 - secret store;
 - хранилище транскриптов и артефактов;
 - тайм-ауты, денежные и вычислительные бюджеты;
-- transport для событий и control-команд.
+- A2A bindings, Agent Card и push-notification policy;
 - session, memory и checkpoint stores;
 - model routing и fallback policy;
 - tenant identity, quotas и data governance;
 - registry и trust policy для skills/MCP.
+- AgentProfilePrompt, который не может заменить KernelInstructions;
+- ExecutionEnvironment backend/images и OTLP endpoints.
 
 ### RunRequest
 
@@ -60,7 +66,7 @@ Core Agent MUST владеть следующими обязанностями:
 - `mcp`;
 - `skills`.
 
-Это разделение MUST сохраняться во всех SDK и transport-адаптерах.
+Это разделение MUST сохраняться во всех SDK и A2A adapters.
 
 ## Продуктовые режимы
 
@@ -78,7 +84,7 @@ Core Agent MUST владеть следующими обязанностями:
 
 ### Embedded/local run
 
-Ядро работает в процессе приложения или на машине разработчика, используя локальный workspace и stdio MCP.
+Control plane может быть встроен в приложение или работать локально, но terminal, skill scripts и stdio MCP всё равно исполняются в отдельном ExecutionEnvironment, а не в host process.
 
 ### Managed/multi-tenant run
 
@@ -86,21 +92,23 @@ Core Agent MUST владеть следующими обязанностями:
 
 ## Основной сценарий
 
-1. Клиент запускает агента с prompt и, при необходимости, MCP/skills.
+1. Клиент или peer agent отправляет A2A Message с prompt и Core extension MCP/skills.
 2. Ядро валидирует входы и создаёт неизменяемый snapshot расширений.
-3. Ядро планирует и выполняет шаги, стримя события.
+3. Ядро создаёт A2A Task, планирует шаги и стримит status/artifact updates.
 4. Безопасные действия проходят автоматически.
 5. Для рискованного действия ядро приостанавливается и запрашивает approval.
 6. При заполнении контекста ядро выполняет compaction и продолжает задачу.
-7. При необходимости ядро делегирует изолированный подзапуск, наследующий policy и budget.
-8. Runtime создаёт checkpoints до и после внешних side effects.
-9. Запуск завершается итоговым сообщением либо типизированной ошибкой; session и memory обновляются атомарно.
+7. Независимая долгая работа уходит в background Task; agent продолжает работу или пассивно ждёт notification.
+8. При необходимости ядро создаёт сабагента с узкой инструкцией и явными tool/MCP/skill allowlists.
+9. Main и child agents читают общую Markdown-memory; write атомарно обновляет BM25/vector/graph/NER revision.
+10. Runtime создаёт checkpoints до и после внешних side effects.
+11. Task завершается Artifact/Message либо типизированной ошибкой; session и memory обновляются атомарно.
 
 ## Метрики успеха продукта
 
 Итоговый продукт считается успешным, если:
 
-- интеграция требует одного RunRequest и обработки одного потока событий;
+- интеграция использует стандартные A2A Message/Task/Artifact operations и Core extension;
 - клиентский код не содержит собственного agent loop;
 - длинная задача переживает хотя бы два compaction без потери активной цели;
 - ни одно действие, требующее approval, не исполняется до подтверждения;
@@ -110,6 +118,9 @@ Core Agent MUST владеть следующими обязанностями:
 - после рестарта безопасно продолжается ожидающий или вычислительный run;
 - пользователь может увидеть, исправить и удалить сохранённую о себе память;
 - новая модель, skill или MCP transport подключаются через стабильный adapter contract.
+- background Task не блокирует agent loop и доставляет durable notification;
+- команды main/child agents никогда не исполняются на control-plane host;
+- OTel trace связывает A2A Task, model, memory, tools, sandbox и сабагентов.
 
 ## Границы продукта
 

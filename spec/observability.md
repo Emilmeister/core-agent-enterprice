@@ -1,114 +1,154 @@
-# Наблюдаемость
+# OpenTelemetry observability
 
-## Принцип
+## Нормативная база
 
-Пользователь должен понимать, что делает агент, не получая скрытую chain-of-thought и секреты. Оператор должен восстановить технический ход запуска из аудита.
+Core Agent MUST быть нативно инструментирован OpenTelemetry для traces, metrics и logs и экспортировать их через OTLP. Реализация следует version-pinned [OpenTelemetry specification](https://opentelemetry.io/docs/specs/otel/) и [Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/).
 
-## События для клиента
+Текущие GenAI conventions развиваются отдельно от базовых conventions. Реализация MUST фиксировать используемую semantic-convention version; стандартные attributes имеют приоритет, а отсутствующие Core Agent concepts используют namespace `core_agent.*` до появления совместимого стандарта.
 
-Минимальные payloads:
+Telemetry не заменяет durable audit: sampling или недоступность collector-а не может уничтожить task state/provenance.
 
-| Event | Обязательные данные |
-|---|---|
-| `run.started` | принятая версия контракта, names skills/MCP, effective limits |
-| `assistant.delta` | очередной фрагмент пользовательского текста |
-| `assistant.message` | завершённое пользовательское сообщение |
-| `tool.requested` | tool_call_id, tool name, безопасное summary |
-| `approval.required` | approval_id, точный effect, risks, redacted arguments |
-| `approval.resolved` | approval_id, decision, resolver type |
-| `input.required` | input_id, user-facing question, response schema, timeout |
-| `input.resolved` | input_id, resolver type |
-| `tool.started` | tool_call_id, attempt |
-| `tool.completed` | status, duration, result preview, artifact reference |
-| `tool.failed` | безопасный error code, retryable |
-| `context.compacted` | compaction number, before/after token count, replaced sequence ranges |
-| `memory.updated` | memory id, scope, operation и provenance без sensitive content |
-| `checkpoint.created` | checkpoint id, run revision, reason |
-| `subrun.started/completed/failed` | child run id, contract status и usage |
-| `run.paused/resumed/recovering` | run revision и безопасная причина |
-| `run.completed` | итоговый message и usage |
-| `run.failed` | error code, safe message, correlation_id |
-| `run.cancelled` | reason и известные незавершённые side effects |
-| `run.aborted` | safe reason, reconciliation status и известные side effects |
+## Signals
 
-События tool и approval MUST NOT включать raw secret values или скрытые reasoning data.
+### Traces
 
-## Audit transcript
+Показывают causal path A2A request, Task, model turns, tools, MCP, memory pipeline, background jobs, сабагентов, approvals и execution environments.
 
-Audit хранит append-only записи:
+### Metrics
 
-- исходный RunRequest после redaction;
-- snapshot manifests MCP и skills с digests;
-- model request/response metadata без raw reasoning;
-- tool intent, нормализованные arguments после redaction и results;
-- approvals и identity resolver-а, если её предоставляет host;
-- human inputs, grants, revocations и policy versions;
-- compaction mapping;
-- memory retrieval candidates, выбранные records и memory mutations;
-- model routes, fallbacks, checkpoints, leases и recovery decisions;
-- child run contracts и результаты;
-- terminal state и usage.
+Показывают bounded-cardinality latency, throughput, usage, saturation, errors и quality counters.
 
-Audit sequence MUST совпадать с публичной event sequence либо содержать однозначное отображение на неё.
+### Logs
 
-## Артефакты
+Structured logs описывают operator diagnostics и correlation с trace/span. Prompt, memory content, tool arguments/output и secrets не логируются по умолчанию.
 
-Большие tool outputs хранятся отдельно. Artifact reference содержит:
+## Context propagation
 
-```json
-{
-  "artifact_id": "art_01...",
-  "media_type": "text/plain",
-  "bytes": 123456,
-  "sha256": "...",
-  "truncated_in_context": true
-}
+Core Agent MUST использовать W3C Trace Context через OTel propagators для A2A bindings, MCP HTTP, task queue, sandbox RPC и remote subagents.
+
+- `traceparent`/`tracestate` валидируются при extract.
+- Входной trace context не даёт authorization или tenant identity.
+- Baggage использует allowlist; prompt, user ID, memory text, secrets, paths и tool arguments запрещены.
+- Перед внешним недоверенным MCP/A2A endpoint baggage удаляется по default-deny policy.
+- Invalid remote context не ломает task и создаёт новый local trace с diagnostic counter.
+
+## Async и background traces
+
+Incoming A2A request span завершается после ответа transport-а и не остаётся открытым на часы. Background Task создаёт новый execution trace со `Span Link` на submission span и attributes A2A task/context IDs.
+
+Сабагент, indexing job и notification delivery используют тот же принцип:
+
+- synchronous child operation MAY быть child span;
+- independently scheduled/durable operation получает новый trace + link;
+- retry создаёт новый attempt span, связанный с logical task/tool call;
+- polling/subscription span не становится parent всей Task;
+- push notification delivery имеет отдельный producer/client span и link на task execution.
+
+## Обязательные spans
+
+Минимальная span topology:
+
+```text
+core_agent.a2a.message.send / core_agent.a2a.message.stream
+└── core_agent.task.submit
+
+core_agent.task.execute  (linked to submit)
+├── core_agent.context.assemble
+│   └── core_agent.memory.search
+│       ├── core_agent.memory.bm25
+│       ├── core_agent.memory.embedding_search
+│       ├── core_agent.memory.graph_search
+│       └── core_agent.memory.rerank
+├── gen_ai model operation
+├── core_agent.policy.evaluate
+├── core_agent.tool.execute
+│   ├── core_agent.execution_environment.create
+│   └── mcp operation
+├── core_agent.memory.commit
+│   ├── core_agent.memory.chunk
+│   ├── core_agent.memory.embed
+│   ├── core_agent.memory.ner
+│   ├── core_agent.memory.entity_resolve
+│   └── core_agent.memory.index_publish
+└── core_agent.task.checkpoint
+
+core_agent.subagent.execute  (linked parent/child A2A Tasks)
+core_agent.notification.deliver
 ```
 
-Доступ к artifact применяет те же authorization и retention policy, что доступ к run.
+Операция с duration получает span. Point-in-time transition (`approval required`, `task state changed`, `memory revision published`, `compaction completed`) записывается OTel event/log record с timestamp и безопасными attributes.
 
-## Метрики
+## Span attributes
 
-Ядро MUST публиковать агрегируемые метрики:
+Допустимые high-cardinality IDs на spans/logs, но не metrics: `a2a.task.id`, `a2a.context.id`, `core_agent.run.id`, tool call ID, memory revision, artifact ID и execution environment ID.
 
-- runs по terminal status и error code;
-- latency запуска и model calls;
-- input/output/reasoning token usage, если provider возвращает её;
-- число и latency tool calls по namespace;
-- approvals requested/approved/denied/timed out;
-- compaction count и before/after occupancy;
-- retries и MCP disconnects;
-- sandbox/policy denials;
-- estimated cost, если доступна.
-- queue/lease/checkpoint/recovery latency и outcomes;
-- memory retrieval/write/delete и cache invalidation;
-- child run depth, fan-out, latency и budget usage;
-- model route/fallback outcomes по ограниченному route class.
+Обязательные bounded attributes по применимости:
 
-Labels MUST иметь ограниченную cardinality. `run_id`, prompt, file path, command и tool arguments запрещены как metric labels.
+- service/core version, deployment environment и component;
+- operation name, outcome/error type и retry attempt;
+- model provider/model capability route и token usage;
+- tool namespace/type и risk decision без arguments;
+- task type/state, parent/child depth и detached flag;
+- memory scope/kind, index revision, retriever type и candidate count;
+- compaction base/working tokens и before/after working occupancy;
+- execution backend/resource class/image digest и cleanup outcome;
+- A2A/MCP protocol and extension versions.
 
-## Логи
+Content attributes из GenAI conventions, tool definitions/arguments/results, system instructions, retrieved documents и memory text MUST быть выключены по умолчанию. Их opt-in требует explicit data policy, redaction, sampling и retention limits.
 
-- Structured logs содержат `run_id`, `correlation_id`, component, event type и safe status.
-- Prompt и tool output не логируются по умолчанию.
-- Debug logging не может отключить secret redaction.
-- Пользовательский event stream и operator logs являются разными интерфейсами и имеют разные права доступа.
+## Metrics
 
-## Distributed tracing
+Ядро MUST публиковать минимум:
 
-Один trace связывает API adapter, orchestrator, model, tool, MCP, policy, store и child runs. Span attributes проходят redaction и используют bounded labels. Trace context MAY передаваться MCP server только если tenant policy разрешает раскрытие correlation metadata.
+- A2A request/task count и latency по operation/state/error class;
+- active/queued/waiting/background Tasks и queue age;
+- model calls, latency, first-token latency, token usage и estimated cost;
+- tool/MCP calls, latency, retries, denials и unknown side effects;
+- approvals/input requested, approved, denied и timed out;
+- compaction count, base tokens, working before/after ratio и failures;
+- memory search latency, candidate counts, hit channel и rerank latency;
+- memory write/index/NER/entity-resolution latency и failure/backlog;
+- background/subagent count, depth, fan-out, duration и budget usage;
+- execution environment create/reuse/cleanup latency, resource saturation и policy denials;
+- checkpoint/recovery/lease/notification delivery outcomes;
+- OTLP export drops/failures и telemetry queue saturation.
+
+Metric labels MUST иметь bounded cardinality. Task/run/user/tenant IDs, prompt, path, command, entity text, memory ID и raw error message запрещены как labels.
+
+## Logs
+
+- LogRecord содержит timestamp, severity, service/resource, trace ID, span ID, component, safe event name и error code.
+- Structured error сохраняет exception type/stack только в защищённом operator channel.
+- Debug mode не отключает redaction.
+- Notification/message payload, raw stdout/stderr и Markdown content не логируются автоматически.
+- Tenant data classification определяет exporter, region, retention и access.
+
+## A2A updates и audit
+
+Пользовательская observability идёт через A2A Task status, Messages и Artifact updates. OTel предназначен оператору и не является публичным progress protocol.
+
+Durable audit хранит:
+
+- A2A protocol/extension versions, Message/Task/Artifact revisions;
+- kernel/profile/policy versions;
+- model routes без hidden reasoning;
+- tool intents, safe normalized arguments digests, approvals и outcomes;
+- background/subagent contracts и notifications;
+- memory search candidate IDs/scores/versions и Markdown mutations;
+- NER/embedding/reranker versions и index publication;
+- compaction mappings, checkpoints, recovery и side-effect reconciliation.
+
+Audit record SHOULD хранить trace/span IDs для перехода от product event к telemetry, но остаётся полным при unsampled trace.
+
+## Sampling и failure behavior
+
+- Head/tail sampling policy задаётся deployment-ом и сохраняет errors, policy denials, high latency и recovery traces в пределах privacy policy.
+- Telemetry exporter работает асинхронно с bounded queue и не блокирует agent loop.
+- Переполнение telemetry queue создаёт metric/log, но не раскрывает dropped payload.
+- Collector outage не меняет Task outcome, кроме deployment-а с обязательным compliance audit; тогда блокируется только действие, для которого audit доказуемо обязателен.
 
 ## Evals и quality signals
 
-Ядро предоставляет hooks для offline replay и online evaluation без включения пользовательских данных по умолчанию. Минимальные quality dimensions:
+Versioned eval hooks измеряют task completion, compaction fidelity, hybrid retrieval/rerank quality, NER/entity resolution, tool correctness, false allow/deny, лишние approvals, subagent focus, duplicate side effects и cost/latency.
 
-- task completion и проверяемость результата;
-- сохранность goal/constraints после compaction;
-- корректность tool selection и arguments;
-- false allow/false deny policy decisions;
-- лишние approvals и вопросы пользователю;
-- memory precision, provenance и harmful stale retrieval;
-- recovery без duplicate side effects;
-- cost/latency относительно результата.
-
-Eval datasets версионируются и применяют ту же data classification/retention policy. Evaluation model output не становится частью пользовательской memory.
+Eval data подчиняется тем же ACL/retention. Evaluation output не становится memory без отдельного validated memory write.

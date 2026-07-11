@@ -7,25 +7,25 @@ Core Agent — stateful orchestration kernel с портами для модел
 ## Подсистемы
 
 ```text
-Client / SDK / CLI
+Client / peer agent
         |
-   API adapters ---- Control plane
+     A2A server ---- Control plane
         |                 |
    Run orchestrator -- Policy engine
      /   |   |   \
  Model Context Tool  Skill/MCP managers
  router engine runtime      |
      \   |   |             /
-       Durable state + event log + artifacts + memory
+       Durable tasks + event log + artifacts + Markdown memory
 ```
 
-### API adapters
+### A2A server и adapters
 
-Преобразуют library, HTTP, WebSocket, queue или CLI transport в одинаковые RunRequest, RunEvent и control commands. Transport не содержит agent logic.
+A2A является основным внешним контрактом: Agent Card, Messages, Tasks, Artifacts, streaming, polling и push notifications. Library/CLI adapters MAY существовать, но сохраняют A2A semantics и не создают параллельную state machine. Transport не содержит agent logic.
 
 ### Run orchestrator
 
-Владеет state machine, turn loop, budgets, checkpoints, cancellation, delegation и terminal outcome. Только orchestrator может переводить run между состояниями.
+Владеет task state machine, turn loop, budgets, checkpoints, cancellation, background work, durable mailbox, delegation и terminal outcome. Только orchestrator может переводить task/run между состояниями.
 
 ### Model router
 
@@ -33,11 +33,11 @@ Client / SDK / CLI
 
 ### Context engine
 
-Собирает активный model context из prompt, session state, skills, tool catalog, memory и transcript. Владеет token budget, compaction, retrieval и provenance.
+Собирает активный model context из kernel instructions, agent profile, prompt, session state, skills, tool catalog, hybrid memory retrieval и transcript. Владеет рабочим token budget, compaction, retrieval и provenance.
 
 ### Tool runtime
 
-Регистрирует built-ins и MCP tools, валидирует calls, передаёт их policy engine, исполняет в sandbox, нормализует outputs и фиксирует side effects.
+Регистрирует built-ins и MCP tools, валидирует calls, передаёт их policy engine, исполняет только через изолированный ExecutionEnvironment, нормализует outputs и фиксирует side effects.
 
 ### Skill manager
 
@@ -49,39 +49,38 @@ Client / SDK / CLI
 
 ### Durable state
 
-Event log является источником истины для состояния run. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript, memory и artifacts являются отдельными stores с независимыми retention policies.
+Event log является источником истины для состояния A2A Task/run. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript, Markdown memory, derived indexes и artifacts являются отдельными stores с независимыми retention policies. Markdown является source of truth памяти; graph/BM25/vector indexes всегда перестраиваемы.
 
 ## Идентификаторы и иерархия
 
 ```text
 tenant
 └── session
-    ├── run
+    ├── A2A task / run
     │   ├── turn
     │   ├── tool_call
     │   ├── approval
     │   └── artifact
-    └── child run
+    └── child A2A task / subagent run
 ```
 
-Все IDs непрозрачны, уникальны и не несут секретной информации. Child run хранит `parent_run_id`, наследует tenant/session security context и имеет отдельный budget slice.
+Все IDs непрозрачны, уникальны и не несут секретной информации. Child Task хранит `parent_task_id`, наследует tenant/session security context и имеет отдельный budget slice.
 
 ## State machine
 
 ```text
 CREATED -> VALIDATING -> QUEUED -> RUNNING
-                                |  |  |  \
-                  WAITING_INPUT <-+  |   +-> WAITING_APPROVAL
-                  WAITING_TOOL  <--+  +----> PAUSED
-                                |
-                         CHECKPOINTING
-                                |
-                            RECOVERING
-                                |
-              COMPLETED | FAILED | CANCELLED | ABORTED
+                                |-> WAITING_INPUT
+                                |-> WAITING_APPROVAL
+                                |-> WAITING_AUTH
+                                |-> WAITING_TASK
+                                |-> PAUSED
+                                |-> CHECKPOINTING -> RECOVERING -> RUNNING
+                                `-> COMPLETED | FAILED | CANCELLED | REJECTED | ABORTED
 ```
 
 - `WAITING_*` и `PAUSED` являются durable: worker может освободить ресурсы.
+- `WAITING_TASK` означает пассивное ожидание background task без busy polling и без занятого model worker.
 - `ABORTED` означает, что continuation невозможно доказать безопасным.
 - Переход записывается в event log до публикации соответствующего события.
 - Ровно один actor владеет lease на изменение run; истёкший lease не даёт права повторять внешний side effect.
@@ -110,6 +109,9 @@ Checkpoint MUST создаваться:
 - `PolicyEvaluator`;
 - `SecretResolver`;
 - `EventStore`, `ArtifactStore`, `MemoryStore`;
+- `SearchIndex`, `GraphIndex`, `EntityExtractor`, `Reranker`;
+- `TaskScheduler`, `TaskMailbox`;
+- `TelemetryProvider`;
 - `EventPublisher`;
 - `Tokenizer`.
 
@@ -129,16 +131,7 @@ Adapters объявляют capabilities. Orchestrator MUST проверять �
 
 ## Multi-agent delegation
 
-Primary agent MAY создать child run через внутренний `core.delegate`, если policy разрешает и делегирование уменьшает latency или контекстную нагрузку. Child run:
-
-- получает узкий prompt, выбранные MCP/skills и budget;
-- не получает секреты, approvals и memory автоматически;
-- не может ослабить parent policy;
-- возвращает structured result с provenance;
-- не общается с конечным пользователем напрямую;
-- имеет ограничение depth/fan-out.
-
-Делегирование является implementation capability, а не требованием к клиенту строить multi-agent topology.
+Primary agent создаёт сабагента как неблокирующую A2A Task. Сабагент получает ту же kernel policy и общую memory, но только явно перечисленные parent-ом рабочие tools, MCP capabilities и skills. Полный contract описан в [Фоновых задачах и делегировании](tasks-and-delegation.md).
 
 ## Dependency direction
 

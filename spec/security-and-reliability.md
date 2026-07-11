@@ -5,29 +5,24 @@
 Доверенными являются только safety-инварианты ядра и валидированный DeploymentConfig. Следующие источники MUST считаться недоверенными:
 
 - prompt;
+- AgentProfilePrompt;
+- Markdown memory content и derived graph;
 - skill instructions, scripts и resources;
 - MCP metadata, tool schemas и outputs;
+- A2A peer Messages, Agent Cards и Artifacts;
 - terminal output;
 - содержимое файлов workspace;
 - текст, полученный из сети.
 
 Недоверенный текст не может менять policy, выдавать approval или получать секреты только через prompt injection.
 
-## Sandbox
+## Execution isolation
 
-Terminal и skill scripts MUST исполняться с:
-
-- ограниченными filesystem roots;
-- минимальным environment allowlist;
-- ограничениями процессов и времени;
-- network policy хоста;
-- отдельной идентичностью, если платформа её поддерживает.
-
-Запрет sandbox не компенсируется предупреждением модели. Если policy требует изоляцию, а runtime не может её обеспечить, запуск завершается `SANDBOX_UNAVAILABLE`.
+Terminal, skill scripts, stdio MCP и child-agent commands исполняются только через отдельный [ExecutionEnvironment](execution-environment.md). Control-plane host subprocess запрещён. Недоступность среды даёт `EXECUTION_ENVIRONMENT_UNAVAILABLE`; fallback на host невозможен.
 
 ## Секреты
 
-- RunRequest содержит только ссылки на секреты.
+- Core extension содержит только ссылки на секреты.
 - Secret resolver работает после policy check и непосредственно перед использованием.
 - Значения секретов MUST NOT попадать в model context, events, logs, errors или artifacts.
 - Output проходит redaction известных значений и распространённых credential patterns.
@@ -65,13 +60,16 @@ Terminal и skill scripts MUST исполняться с:
 - `SKILL_INVALID`, `SKILL_RESOURCE_MISSING`;
 - `TOOL_NAME_COLLISION`, `TOOL_ARGUMENT_INVALID`, `TOOL_EXECUTION_FAILED`;
 - `POLICY_DENIED`, `APPROVAL_ALREADY_RESOLVED`;
-- `SANDBOX_UNAVAILABLE`;
+- `EXECUTION_ENVIRONMENT_UNAVAILABLE`, `EXECUTION_ENVIRONMENT_COMPROMISED`;
 - `BUDGET_EXCEEDED`, `CONTEXT_UNRECOVERABLE`;
 - `SIDE_EFFECT_UNKNOWN`, `INTERNAL_ERROR`;
 - `SESSION_CONFLICT`, `LEASE_LOST`, `CHECKPOINT_INVALID`;
-- `MEMORY_POLICY_DENIED`, `MEMORY_CONFLICT`;
+- `MEMORY_POLICY_DENIED`, `MEMORY_CONFLICT`, `MEMORY_FILE_TOO_LARGE`;
+- `MEMORY_INDEX_FAILED`, `MEMORY_INDEX_STALE`, `ENTITY_RESOLUTION_CONFLICT`;
 - `SKILL_INTEGRITY_FAILED`, `EXTENSION_REVOKED`;
-- `MODEL_ROUTE_UNAVAILABLE`.
+- `MODEL_ROUTE_UNAVAILABLE`;
+- `TASK_NOT_FOUND`, `TASK_NOT_CANCELABLE`, `TASK_NOTIFICATION_FAILED`;
+- `A2A_VERSION_UNSUPPORTED`, `A2A_EXTENSION_REQUIRED`.
 
 Stack traces, raw provider errors и секретные arguments MUST NOT попадать в публичный message. Они MAY сохраняться в защищённом operator log по correlation ID.
 
@@ -89,7 +87,7 @@ Durable continuation является свойством целевого runtim
 ## Multi-tenancy
 
 - Tenant identity устанавливается authenticated transport context, не prompt.
-- Stores, caches, process sessions, MCP connections, artifact URLs и memory indexes MUST быть tenant-scoped.
+- Stores, caches, execution environments, process sessions, MCP connections, artifact URLs и Markdown/BM25/vector/graph memory data MUST быть tenant-scoped.
 - Cross-tenant identifiers возвращают not-found semantics, если раскрытие существования запрещено.
 - Quotas применяются до выделения дорогого model/execution ресурса.
 - Child runs всегда наследуют tenant и не могут сменить его через arguments.

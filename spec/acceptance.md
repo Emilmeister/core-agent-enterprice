@@ -1,120 +1,154 @@
 # Критерии готовности целевого продукта
 
-Этот документ проверяет итоговую спецификацию. Поставка может реализовать подмножество только через явный [release profile](releases/v1.md); реализованное поведение не может противоречить этим критериям.
+Поставка может реализовать подмножество только через явный [release profile](releases/v1.md); реализованное поведение не может противоречить этим критериям.
 
-## Публичный контракт и sessions
+## A2A и публичный контракт
 
-- [ ] Любой run принимает только `prompt`, `mcp`, `skills`; execution context передаётся отдельно.
-- [ ] Stateless и stateful режимы используют один RunRequest и одинаковую event semantics.
-- [ ] Session поддерживает create/get/close/export/delete и optimistic concurrency.
-- [ ] Event stream упорядочен, resumable и заканчивается ровно одним terminal event.
-- [ ] Control-команды idempotent, revision-aware и не расширяют RunRequest.
+- [ ] Core Agent публикует валидную Agent Card с protocol/binding versions, auth, media types, skills и capabilities.
+- [ ] Внешнее общение использует A2A Message/Task/Artifact; отдельная публичная task state machine отсутствует.
+- [ ] Message Parts отображаются на `prompt`, required Core extension — только на `mcp`/`skills`.
+- [ ] Неподдерживаемая required extension/version возвращает стандартно отображаемую A2A ошибку до model turn.
+- [ ] A2A `contextId` сохраняет session, но MCP/skills не наследуются в новую Task неявно.
+- [ ] Blocking, `return_immediately`, polling, subscription/streaming и push видят одну durable Task history.
+- [ ] Disconnect stream не отменяет Task; at-least-once push update дедуплицируется.
+- [ ] Internal states корректно отображаются только на стандартные A2A Task states.
 
-## Runtime и модели
+## Kernel instructions
+
+- [ ] KernelInstructions всегда присутствуют отдельно от AgentProfilePrompt и имеют version/digest в audit.
+- [ ] AgentProfilePrompt, user Message, skill, memory или MCP output не могут отключить memory rules, mandatory tools, approvals, delegation, tasks, isolation или telemetry.
+- [ ] Runtime enforcement отклоняет запрещённое действие, даже если model output просит обойти kernel instruction.
+- [ ] Child получает ту же kernel version и не может ослабить parent/host policy.
+- [ ] Raw chain-of-thought отсутствует в A2A, telemetry, audit, memory и tool arguments.
+
+## Runtime и durability
 
 - [ ] Capability negotiation отклоняет несовместимый model/adapter до первого turn.
-- [ ] Router выбирает только models, разрешённые data, region, capability и budget policy.
-- [ ] Fallback не повторяет tool call и compacts context перед переходом на меньшее окно.
-- [ ] Pause/resume освобождают worker и продолжают run из checkpoint.
-- [ ] Hard limits останавливают зацикливание, включая суммарный budget child runs.
-- [ ] Raw chain-of-thought отсутствует в events, logs, audit, memory и tool arguments.
+- [ ] Model fallback не повторяет tool call и compacts context перед меньшим окном.
+- [ ] Pause/passive wait освобождают model worker и продолжаются из checkpoint/notification.
+- [ ] Lease не позволяет двум workers одновременно изменить Task.
+- [ ] Pending approval, input и task notifications восстанавливаются с прежними IDs/revisions.
+- [ ] Idempotent operation можно продолжить; неоднозначная мутация не повторяется.
+- [ ] Hard limits включают parent и все child/background Tasks.
 
-## Durable execution
+## Context и compaction
 
-- [ ] Run восстанавливается после crash из event log/checkpoint с той же revision.
-- [ ] Pending approval и input восстанавливаются с прежними IDs.
-- [ ] Idempotent call можно безопасно продолжить; неоднозначная мутация не повторяется.
-- [ ] Lease не позволяет двум workers одновременно изменить один run.
-- [ ] Checkpoints создаются на всех границах внешнего side effect и durable wait.
+- [ ] Base tokens считаются как system/kernel/profile + selected tool schemas + output reserve.
+- [ ] Working occupancy учитывает только prompt/history/summaries/memory/notifications/artifact excerpts относительно оставшейся working capacity.
+- [ ] System prompt и tool schemas не входят в 90%/10–15% threshold.
+- [ ] Ниже 90% working occupancy compaction не запускается; при 90% и выше происходит до model call.
+- [ ] После compaction working occupancy находится в диапазоне 10–15%.
+- [ ] Prompt, policy, approvals, task contracts, active constraints, artifact refs и memory provenance остаются pinned.
+- [ ] Повторные compactions сохраняют goal и immutable transcript mapping.
+- [ ] Непомещающиеся protected/pinned data дают `CONTEXT_UNRECOVERABLE`, не silent truncation.
 
-## Контекст
+## Markdown memory и file lifecycle
 
-- [ ] Прогноз occupancy учитывает input, selected tool schemas и output reserve.
-- [ ] При 80% compaction происходит до model call и снижает occupancy до 60% или ниже.
-- [ ] Prompt, policy, approvals, active constraints, artifact refs и provenance остаются pinned.
-- [ ] Два и более hierarchical compaction сохраняют goal и полный immutable transcript.
-- [ ] Большой tool catalog раскрывает schemas прогрессивно, а не целиком.
-- [ ] Непомещающиеся pinned data дают `CONTEXT_UNRECOVERABLE`, не silent truncation.
+- [ ] Markdown corpus является source of truth; BM25/vector/graph indexes полностью перестраиваются из него.
+- [ ] Memory root нельзя менять terminal/filesystem tool-ом в обход `core.memory.*`.
+- [ ] Перед create/update agent выполняет hybrid search и проверяет top candidates.
+- [ ] Та же тема обновляет существующий file; новый subject/scope создаёт новый file.
+- [ ] Committed file не превышает 200 body lines; прогноз 201+ отклоняется и предлагает atomic split.
+- [ ] Split сохраняет stable IDs/aliases, ссылки и provenance без разрыва semantic block.
+- [ ] Update использует expected revision; concurrent conflict не разрешается last-write-wins.
+- [ ] Delete/tombstone исключает content из Markdown, summaries, BM25, vectors, graph и caches.
 
-## Sessions и memory
+## Indexing, NER и graph
 
-- [ ] Transcript, working state, session memory и user memory хранятся раздельно.
-- [ ] Retrieval соблюдает ACL, scope, TTL, tombstones и token budget.
-- [ ] Каждый retrieved/written fact имеет provenance и воспроизводимый selection record.
-- [ ] Конфликтующие facts не склеиваются молча.
-- [ ] Пользователь может увидеть, исправить, экспортировать и удалить memory.
-- [ ] Удаление инвалидирует indexes/caches и не позволяет записи снова попасть в context.
-- [ ] Sensitive data и model speculation не становятся долгосрочной memory.
+- [ ] Create/update/split/delete обновляет chunking, BM25, embeddings, NER, entity resolution и graph до atomic publication revision.
+- [ ] Изменённый chunk удаляет stale mentions/relations; неизменённый сохраняет stable chunk ID/index data.
+- [ ] Partial index failure не делает staging Markdown видимым обычному search.
+- [ ] NER/relation edges имеют evidence line/chunk, confidence, extractor version и source revision.
+- [ ] Low-confidence entity merge остаётся candidate; manual correction переживает full reindex.
+- [ ] Изменение extractor/taxonomy строит новую revision в фоне и атомарно переключает её.
 
-## Skills
+## Hybrid search и rerank
 
-- [ ] Discovery загружает metadata, activation — полный `SKILL.md`, resources — только по необходимости.
-- [ ] Resolver фиксирует version, transitive dependencies, digests и signatures в lock snapshot.
-- [ ] Изменение или yank package не меняет активный run.
-- [ ] Capability/permission conflict обнаруживается до исполнения.
-- [ ] Script проходит обычные sandbox, policy и approval checks.
-- [ ] Path traversal, symlink escape и invalid signature отклоняются.
+- [ ] Candidate generation независимо получает BM25, embedding и bounded graph candidates.
+- [ ] Query NER/entity linking выполняется до graph traversal.
+- [ ] Raw scores разных retrievers не складываются без calibration/RRF.
+- [ ] Reranker получает text, heading, все component scores/ranks, graph paths, recency и provenance.
+- [ ] Search result возвращает component/final scores, revision и provenance.
+- [ ] Недоступный channel явно помечает degraded search; конфликтующие claims не скрываются ranking-ом.
+- [ ] Candidate set, model/index/reranker versions позволяют воспроизвести retrieval decision.
 
-## Tools и MCP
+## Background Tasks
 
-- [ ] Tool arguments валидируются до policy и execution; незарегистрированный tool невозможен.
-- [ ] Terminal ограничивает cwd, env, output, process tree и timeout.
-- [ ] Filesystem mutations атомарны и не уничтожают чужие изменения.
-- [ ] MCP согласует protocol capabilities и поддерживает tools/resources/prompts/sampling/elicitation через local policy.
-- [ ] Catalog revision меняет snapshot только на safe point.
-- [ ] Secret refs разрешаются adapter-ом и не видны модели или MCP сверх необходимого.
-- [ ] Параллельные calls имеют доказанные зависимости/isolation и детерминированное merge.
+- [ ] `task.start` возвращает handle сразу, пока main agent продолжает независимую работу.
+- [ ] Completion/failure/artifact/input notifications durable, versioned и at-least-once.
+- [ ] Notification попадает в model context только на safe boundary и дедуплицируется.
+- [ ] `task.wait` не создаёт busy polling и не удерживает model worker/execution environment.
+- [ ] Agent может ничего не делать до notification или timeout.
+- [ ] Cancel/timeout завершает process tree; orphan policy обрабатывает Task после terminal parent.
+- [ ] Parent не завершает зависимый итог, пока required Task pending.
 
-## Human-in-the-loop
+## Сабагенты
 
-- [ ] Risky call не начинается до действительного approval.
-- [ ] Approval связан с digest точных arguments; изменение требует новой оценки.
-- [ ] Reusable grant ограничен identity, session, action, resource, arguments, expiry и revocation.
-- [ ] Новая deny policy инвалидирует подходящий grant до следующего использования.
-- [ ] `deny`/timeout возвращаются модели как результат, не маскируются под execution failure.
-- [ ] Input request типизирован и не используется как скрытый approval.
-- [ ] UI получает понятный фактический effect без секретов и chain-of-thought.
+- [ ] Сабагент создаётся как неблокирующая A2A Task.
+- [ ] Delegation contract содержит узкую instruction, exact tool/MCP/skill allowlists, memory policy, budget и result schema.
+- [ ] Child не видит невыданные рабочие capabilities даже на discovery.
+- [ ] Mandatory kernel memory/task/audit tools добавляются runtime-ом и не удаляются parent-ом.
+- [ ] Child и main читают одну committed session Markdown-memory revision stream.
+- [ ] Child memory write проходит тот же revision/index/NER pipeline и уведомляет parent.
+- [ ] Parent проверяет Artifact/result provenance; child не общается наружу без capability.
+- [ ] Depth/fan-out и child budgets ограничены общим parent budget.
 
-## Delegation
+## Execution environment
 
-- [ ] Child run получает минимальные data/tools/skills и отдельный budget slice.
-- [ ] Parent policy нельзя ослабить; tenant identity нельзя сменить.
-- [ ] Depth/fan-out ограничены и учитываются в общем budget.
-- [ ] Parent проверяет structured result с provenance до использования.
-- [ ] Cancel parent корректно отменяет или orphan-policy обрабатывает children.
+- [ ] Ни одна terminal command, skill script, stdio MCP или child command не запускается control-plane host subprocess-ом.
+- [ ] Environment имеет отдельные filesystem/process/user/network boundaries, immutable image и resource limits.
+- [ ] Host root, runtime socket, SSH agent, metadata endpoint и control-plane credentials недоступны.
+- [ ] Parent/child получают отдельные copy-on-write overlays; merge использует base revision/conflict detection.
+- [ ] Egress default-deny проверяет DNS, resolved IP и redirect.
+- [ ] Secret инжектируется только в разрешённый call и не попадает в image/checkpoint/telemetry/artifact.
+- [ ] Недоступность isolation даёт `EXECUTION_ENVIRONMENT_UNAVAILABLE`; host fallback отсутствует.
+- [ ] Teardown уничтожает process tree/writable layer или фиксирует cleanup failure.
 
-## Security, tenancy и lifecycle данных
+## Tools, MCP и human-in-the-loop
 
-- [ ] Prompt injection из file, skill или MCP не меняет host policy и не раскрывает secret.
-- [ ] Files, processes, connections, stores, caches и artifact URLs tenant-isolated.
-- [ ] Remote extensions проверяются по integrity/trust policy и поддерживают revocation.
-- [ ] Retention/delete каскадно применяются к transcript, memory, checkpoints, artifacts и indexes.
-- [ ] Все public errors безопасны, стабильны и имеют correlation ID.
+- [ ] Tool arguments валидируются до policy и execution.
+- [ ] MCP tools/resources/prompts/sampling/elicitation проходят local policy независимо от server metadata.
+- [ ] Risky call не начинается до действительного approval точных arguments.
+- [ ] Reusable grant ограничен identity/session/action/resource/arguments/expiry/revocation.
+- [ ] Input request не используется как скрытый approval; auth использует отдельный state.
+- [ ] A2A status/Message показывает понятный effect без secret/chain-of-thought.
 
-## Observability и качество
+## OpenTelemetry
 
-- [ ] Audit восстанавливает model routes, tools, policy decisions, approvals, compactions, memory и recovery.
-- [ ] Метрики имеют bounded cardinality и не содержат prompt/paths/arguments/IDs пользователя.
-- [ ] Distributed trace связывает parent/child runs без утечки tenant data.
-- [ ] Replay/eval измеряет task completion, compaction fidelity, tool correctness, policy errors, memory quality и duplicate side effects.
-- [ ] Debug mode не отключает redaction.
+- [ ] Traces, metrics и logs создаются OTel SDK и экспортируются OTLP.
+- [ ] W3C Trace Context проходит через A2A, queue, MCP, sandbox RPC и remote subagents без влияния на authorization.
+- [ ] Durable/background Task использует новый execution trace со Span Link на submission, а не многочасовой request span.
+- [ ] Model, policy, tool, execution, MCP, memory BM25/vector/graph/rerank/NER и subagent operations имеют spans.
+- [ ] OTel semantic-convention version pinned; custom attributes используют `core_agent.*`.
+- [ ] Content/arguments/results/system instructions выключены в telemetry по умолчанию.
+- [ ] Metric labels bounded и не содержат IDs, prompt, path, command, entity или memory text.
+- [ ] Collector outage не повреждает Task/audit; telemetry drops наблюдаемы.
+
+## Security, tenancy и data lifecycle
+
+- [ ] Prompt injection из profile/file/skill/MCP/A2A peer не меняет kernel/host policy и не раскрывает secret.
+- [ ] Tasks, environments, connections, Markdown, indexes, graph, artifacts и telemetry tenant-isolated.
+- [ ] Remote extensions проверяются по integrity/trust/revocation policy.
+- [ ] Retention/delete каскадно применяются к transcript, memory, checkpoints, artifacts, derived indexes и eval data.
+- [ ] Public errors безопасны, стабильны и отображаются в A2A semantics.
 
 ## Сквозные сценарии
 
-1. **Локальная задача:** prompt без extensions безопасно изменяет workspace, запускает проверку и возвращает итог.
-2. **Длинная session:** несколько runs и compactions сохраняют decisions, но удалённая memory больше не извлекается.
-3. **Внешнее действие:** MCP call ждёт approval, переживает restart и выполняется ровно один раз.
-4. **Fallback:** provider падает, route меняется без потери tool state и дублирования side effect.
-5. **Delegation:** parent распределяет независимое исследование, проверяет результаты и укладывается в общий budget.
-6. **Враждебное расширение:** skill/MCP пытается повысить права и извлечь secret; policy блокирует это с полным audit.
-7. **Multi-tenant:** конкурентные runs двух tenants не видят sessions, processes, artifacts, memory или events друг друга.
-8. **Удаление:** subject deletion очищает все производные данные и retrieval indexes в пределах SLA.
+1. **A2A background:** клиент отправляет Message с `return_immediately`, закрывает stream и позже получает тот же Task result через subscribe/push.
+2. **Compaction:** working context достигает 90%, сжимается до 10–15%, не считая system/tools, и сохраняет pending Task/approval.
+3. **Memory update:** agent находит существующий Markdown file, обновляет его, NER удаляет stale edge, hybrid search возвращает новую revision.
+4. **Memory split:** update превысил бы 200 строк; atomic split создаёт index/children без duplicate claims и битых links.
+5. **Shared memory:** child обновляет общую memory, parent получает notification и читает committed indexed revision.
+6. **Focused delegation:** child видит только перечисленные tools/skills плюс mandatory kernel tools и возвращает schema-valid Artifact.
+7. **Concurrent work:** main продолжает задачу, пока два child/background Tasks выполняются, затем обрабатывает notifications без busy polling.
+8. **Host isolation:** враждебная команда не видит host filesystem/socket/metadata и не может обойти memory tools.
+9. **OTel causality:** A2A submit, background Task, child, model, memory, tool и sandbox находятся в связанных traces без content leakage.
+10. **Внешнее действие:** MCP write ждёт approval, переживает recovery и выполняется ровно один раз.
 
-## Definition of Done целевого продукта
+## Definition of Done
 
-- Все критерии и сквозные сценарии проходят в CI/системных evals.
-- Public schemas и examples проверяются против единого источника типов.
-- Каждая capability имеет failure-mode, policy и observability contract.
-- Recovery/chaos tests доказывают отсутствие duplicate side effects.
-- Security review охватывает model, MCP, skill, sandbox, tenancy и data lifecycle boundaries.
-- Документация и последний стабильный release profile совпадают с реальным поведением.
+- Все критерии и сквозные сценарии проходят в CI, integration, chaos и eval suites.
+- A2A/Core extension schemas и examples проверяются против одного источника типов.
+- Recovery tests доказывают отсутствие duplicate side effects и потерянных notifications.
+- Memory rebuild test удаляет derived indexes и получает эквивалентный searchable graph из Markdown.
+- Security review охватывает A2A, model, MCP, skills, memory graph, execution plane, subagents, OTel и tenancy.

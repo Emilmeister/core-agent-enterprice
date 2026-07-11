@@ -14,33 +14,40 @@ Context Engine собирает каждый model call заново из:
 4. активных skills и нужных tool schemas;
 5. retrieved session/user memory;
 6. релевантных artifact excerpts;
-7. summaries старых segments и child runs.
+7. summaries старых segments и child Tasks.
 
 Каждый элемент имеет source, priority, token cost, freshness и provenance. Наличие данных в transcript не гарантирует включение в следующий model call.
 
-## Расчёт заполнения
+## Разделение окна
 
-Для выбранной модели ядро получает эффективное окно `C` от provider adapter. Перед каждым model call вычисляется:
+Для выбранной модели ядро получает полное окно `C` и отдельно считает fixed/base и working части:
 
 ```text
-occupancy = (active_input_tokens + required_tool_schema_tokens + output_reserve) / C
+base_tokens = system_and_kernel_tokens + required_tool_schema_tokens + output_reserve
+working_capacity = C - base_tokens
+working_occupancy = active_working_tokens / working_capacity
 ```
 
 Где:
 
-- `active_input_tokens` — все выбранные сообщения, memory, excerpts и активные инструкции следующего вызова;
+- `system_and_kernel_tokens` — platform/host policy, KernelInstructions и AgentProfilePrompt;
 - `required_tool_schema_tokens` — schemas, которые будут переданы модели;
-- `output_reserve` — гарантированное место для следующего ответа модели.
+- `output_reserve` — гарантированное место для следующего ответа модели;
+- `active_working_tokens` — prompt, transcript, summaries, retrieved memory, task notifications и artifact excerpts.
 
 Ядро MUST использовать tokenizer выбранной модели либо консервативную оценку с запасом, если tokenizer недоступен.
 
-## Порог 80%
+System prompt и tool schemas MUST NOT учитываться в 90%/10–15% working threshold. Они всё равно физически занимают `C`, поэтому сначала вычитаются вместе с output reserve. Если `base_tokens` не оставляет минимальную working capacity, model route отклоняется.
 
-Compaction MUST запускаться до model call, если прогнозируемый `occupancy >= 0.80`.
+## Порог 90%
+
+Compaction MUST запускаться до model call, если прогнозируемый `working_occupancy >= 0.90`.
 
 Дополнительно ядро SHOULD оценивать размер нового tool result до добавления в активный контекст. Большой result сначала переводится в artifact и краткое представление, чтобы не пересечь hard limit внезапно.
 
-После compaction целевой `occupancy` MUST быть не выше 0.60. Thresholds являются стабильными defaults продукта; host MAY сделать их строже, но не выше 80% без capability-specific доказательства безопасного output reserve.
+После compaction активный working context MUST занимать от 10% до 15% `working_capacity`. Runtime целится в 15% и MAY снижать до 10%, если иначе не сохраняется безопасный запас или ожидается большой tool result.
+
+Ниже 10% сжимать SHOULD NOT: чрезмерная компрессия повышает риск потери полезной локальной истории. Выше 15% compaction считается неуспешным и повторяется с более строгим budget.
 
 ## Что нельзя суммаризировать
 
@@ -54,9 +61,9 @@ Compaction MUST запускаться до model call, если прогноз�
 - незавершённые tool calls и их идентификаторы;
 - текущие hard limits;
 - точные пути изменённых файлов и ссылки на созданные artifacts;
-- последние сообщения, без которых следующий шаг теряет непосредственный смысл.
+- последние сообщения, без которых следующий шаг теряет непосредственный смысл;
 - provenance и revision извлечённых memory records, влияющих на текущее решение;
-- parent/child run contracts и ещё не проверенные child results.
+- parent/child Task contracts и ещё не проверенные child results.
 
 Если pinned data вместе с `output_reserve` не помещается в окно, запуск MUST завершиться с `CONTEXT_UNRECOVERABLE`. Ядро MUST NOT молча обрезать pinned data.
 
@@ -67,7 +74,7 @@ Compaction MUST запускаться до model call, если прогноз�
 1. завершённые tool outputs;
 2. старые промежуточные объяснения модели;
 3. завершённые ветви исследования;
-4. предыдущая summary вместе с новым отрезком истории.
+4. предыдущая summary вместе с новым отрезком истории;
 5. неактуальные retrieved memories и tool schemas, не нужные следующему шагу.
 
 Полные outputs остаются в artifact store и audit transcript. В активном контексте остаются ссылка, тип, размер, digest и краткое релевантное содержание.
@@ -94,7 +101,7 @@ Summary MUST различать подтверждённые факты, выв�
 2. Выбрать самый старый непрерывный summarizable segment.
 3. Построить новую summary с учётом предыдущей.
 4. Проверить наличие pinned facts и структурных секций.
-5. Пересчитать токены.
+5. Пересчитать base/working tokens отдельно.
 6. Атомарно заменить segment на summary в активном контексте.
 7. Сохранить mapping summary -> исходные event sequence ranges.
 8. Испустить `context.compacted` без содержимого приватных данных.
@@ -115,7 +122,7 @@ Critical built-in tools MAY быть всегда видимы. Tool search resu
 
 ## Retrieval и забывание
 
-Memory retrieval имеет отдельный budget и выполняется до финального occupancy check. Retrieved item MAY быть вытеснен из active context без удаления из MemoryStore. Удалённая/tombstoned memory MUST быть немедленно исключена из новых context assemblies и очищена из caches.
+Memory retrieval имеет отдельный budget и выполняется до финального working occupancy check. Retrieved item MAY быть вытеснен из active context без удаления из MemoryStore. Удалённая/tombstoned memory MUST быть немедленно исключена из новых context assemblies и очищена из caches.
 
 ## Проверка качества summary
 
@@ -128,3 +135,4 @@ Memory retrieval имеет отдельный budget и выполняется 
 - Ссылки на изменённые файлы и artifacts не теряются.
 - После compaction runtime может объяснить, какие sequence ranges были заменены.
 - Полный audit transcript не изменяется при compaction.
+- Metrics/event показывают base tokens, working tokens, working capacity и before/after working occupancy раздельно.

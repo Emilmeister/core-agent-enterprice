@@ -18,7 +18,7 @@ Arguments MUST валидироваться по schema до risk assessment и 
 
 ### `core.terminal.exec`
 
-Запускает процесс в sandbox с явными `argv`, рабочей директорией, environment allowlist и timeout. Shell-строка MAY поддерживаться adapter-ом, но должна считаться более рискованной, чем `argv`.
+Запускает процесс в отдельном [ExecutionEnvironment](execution-environment.md) с явными `argv`, рабочей директорией, environment allowlist и timeout. Shell-строка MAY поддерживаться adapter-ом, но должна считаться более рискованной, чем `argv`.
 
 Возвращает `exit_code`, ограниченные `stdout`/`stderr`, duration и session identifier для продолжающегося процесса.
 
@@ -36,7 +36,15 @@ Arguments MUST валидироваться по schema до risk assessment и 
 
 ### `core.delegate`
 
-Создаёт ограниченный child run с явным contract, budget и набором capabilities. Недоступен, если delegation отключён policy.
+Создаёт неблокирующую child-agent A2A Task с явными instruction, tool/MCP/skill allowlists, memory access, budget и result schema. Недоступен, если delegation отключён policy.
+
+### Task tools
+
+`core.task.start/get/list/wait/cancel` управляют background Tasks. `wait` является passive durable wait, не busy loop. Полная semantics описана в [Фоновых задачах и делегировании](tasks-and-delegation.md).
+
+### Memory tools
+
+`core.memory.search/read/create/update/split/move/delete/history/index_status/entity_resolve` являются единственным способом изменять Markdown memory и её graph/index revision. Правила выбора create/update и лимит 200 строк определены в [Sessions и memory](sessions-and-memory.md).
 
 ### Artifact tools
 
@@ -89,11 +97,11 @@ DeploymentConfig задаёт один режим:
 
 ## Approval request
 
-Перед ожиданием ядро испускает:
+Перед ожиданием ядро переводит A2A Task в `input-required` с `reason: approval_required` и прикладывает Message с нормализованным payload:
 
 ```json
 {
-  "type": "approval.required",
+  "type": "urn:core-agent:approval-request:v1",
   "data": {
     "approval_id": "apr_01...",
     "tool_call_id": "call_01...",
@@ -118,7 +126,7 @@ DeploymentConfig задаёт один режим:
 - `deny` возвращается модели как tool result;
 - отмена запуска автоматически отклоняет все ожидающие approvals.
 
-Approval timeout задаётся хостом. По истечении времени решение трактуется как `deny`, испускается `approval.resolved`, затем agent loop получает отказ.
+Approval timeout задаётся хостом. По истечении времени решение трактуется как `deny`, audit получает `approval.resolved`, A2A Task обновляет status, затем agent loop получает отказ.
 
 ## Grants и отзыв разрешения
 
@@ -128,7 +136,7 @@ Approval timeout задаётся хостом. По истечении врем
 
 ## Elicitation и дополнительные вопросы
 
-MCP elicitation и `core.input.request` нормализуются в `input.required`. MCP server не общается с пользователем напрямую и не выбирает UI. Запрос секретного значения MUST быть преобразован в secret-reference flow, а не обычное текстовое поле.
+MCP elicitation и `core.input.request` нормализуются в A2A `input-required`. MCP server не общается с пользователем напрямую и не выбирает UI. Запрос секретного значения MUST быть преобразован в secret-reference flow, а не обычное текстовое поле.
 
 ## MCP lifecycle
 
@@ -152,10 +160,10 @@ MCP output всегда считается недоверенным. Server не
 
 ## Отмена
 
-При `run.cancel` ядро MUST:
+При A2A cancel Task ядро MUST:
 
 1. прекратить новые model/tool calls;
 2. отправить cancellation активному tool, если transport поддерживает;
-3. после grace period завершить локальный процесс;
+3. после grace period завершить process tree в ExecutionEnvironment;
 4. закрыть MCP connections;
-5. испустить `run.cancelled` с описанием возможных незавершённых side effects.
+5. перевести A2A Task в `canceled` с описанием возможных незавершённых side effects.
