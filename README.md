@@ -9,9 +9,14 @@ approvals, isolation, durability, context management, tasks, and telemetry remai
 ```bash
 uv sync
 uv run python -m unittest discover -s tests -v
+uv run python -m unittest tests.test_end_to_end -v
 uvx ruff check core_agent memory_service
 uv build --no-sources
 ```
+
+The end-to-end suite runs without external credentials. It crosses the official A2A HTTP binding,
+an OpenAI-compatible model server, real local PTYs, background tasks, focused child agents,
+Streamable HTTP Memory MCP, Markdown indexing/NER/graph search, and explicit skill activation.
 
 ## Run the agent
 
