@@ -25,13 +25,11 @@ from core_agent.tools import (
 
 
 class RecordingBackend:
-    isolated = True
+    local = True
     capabilities = {
-        "mount_namespace",
-        "process_namespace",
-        "user_namespace",
-        "network_namespace",
-        "immutable_image",
+        "pty",
+        "process_groups",
+        "workspace_separation",
         "resource_limits",
         "process_tree_teardown",
     }
@@ -60,8 +58,8 @@ class RecordingBackend:
         return ExecutionResult(exit_code=0, stdout="ok", stderr="", artifacts=(), side_effects=())
 
 
-class HostBackend:
-    isolated = False
+class MissingTerminalBackend:
+    local = True
     capabilities = set()
 
 
@@ -327,13 +325,13 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(hasattr(request, "argument_digest"))
 
 
-class ExecutionIsolationTests(unittest.TestCase):
-    def test_host_backend_is_rejected_without_fallback(self):
+class TerminalSessionContractTests(unittest.TestCase):
+    def test_backend_without_terminal_primitives_is_rejected(self):
         with self.assertRaises(CoreError) as caught:
-            ExecutionEnvironmentManager(HostBackend())
+            ExecutionEnvironmentManager(MissingTerminalBackend())
         self.assertEqual(caught.exception.code, "EXECUTION_ENVIRONMENT_UNAVAILABLE")
 
-    def test_parent_and_child_get_separate_overlays_and_environment_ids(self):
+    def test_parent_and_child_get_separate_sessions_and_workspace_ids(self):
         backend = RecordingBackend()
         manager = ExecutionEnvironmentManager(backend)
         parent = manager.create(
@@ -358,10 +356,11 @@ class ExecutionIsolationTests(unittest.TestCase):
             )
         )
         self.assertNotEqual(parent.id, child.id)
-        self.assertNotEqual(parent.spec.overlay_id, child.spec.overlay_id)
+        self.assertNotEqual(parent.spec.session_id, child.spec.session_id)
+        self.assertNotEqual(parent.spec.workspace_id, child.spec.workspace_id)
         self.assertEqual(parent.spec.workspace_snapshot, child.spec.workspace_snapshot)
 
-    def test_environment_spec_denies_host_mounts_runtime_socket_metadata_and_default_network(self):
+    def test_environment_spec_declares_process_separation_without_os_sandbox_claim(self):
         spec = EnvironmentSpec(
             tenant_id="tenant-1",
             run_id="run-1",
@@ -370,12 +369,10 @@ class ExecutionIsolationTests(unittest.TestCase):
             network_allowlist=(),
             secrets={},
         ).hardened()
-        self.assertFalse(spec.host_root_mounted)
+        self.assertEqual(spec.isolation_level, "process")
+        self.assertFalse(spec.os_security_boundary)
         self.assertFalse(spec.runtime_socket_mounted)
-        self.assertFalse(spec.ssh_agent_forwarded)
-        self.assertFalse(spec.cloud_metadata_access)
-        self.assertEqual(spec.network_mode, "deny")
-        self.assertFalse(spec.privileged)
+        self.assertFalse(spec.service_account_token_mounted)
 
     def test_secret_is_injected_for_one_call_but_absent_from_result_and_telemetry(self):
         backend = RecordingBackend()

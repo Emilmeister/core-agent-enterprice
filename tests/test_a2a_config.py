@@ -93,7 +93,7 @@ def agent_config(**changes):
             "compact_to_working_ratio": 0.15,
         },
         "approval": {"mode": "on_risk"},
-        "execution": {"environment_profile": "isolated-test"},
+        "execution": {"environment_profile": "local-pty-test"},
         "observability": {"otel_profile": "test"},
     }
     for key, value in changes.items():

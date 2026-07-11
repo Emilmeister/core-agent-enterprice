@@ -18,13 +18,11 @@ from memory_service.service import MemoryService
 
 
 class IsolatedBackend:
-    isolated = True
+    local = True
     capabilities = {
-        "mount_namespace",
-        "process_namespace",
-        "user_namespace",
-        "network_namespace",
-        "immutable_image",
+        "pty",
+        "process_groups",
+        "workspace_separation",
         "resource_limits",
         "process_tree_teardown",
     }
@@ -88,7 +86,7 @@ def agent_config(memory="optional", *, max_turns=10):
             "skills": {"default": "deny", "allow": []},
             "context": {"compact_at_working_ratio": 0.90, "compact_to_working_ratio": 0.15},
             "approval": {"mode": "on_risk"},
-            "execution": {"environment_profile": "isolated-test"},
+            "execution": {"environment_profile": "local-pty-test"},
             "observability": {"otel_profile": "test"},
             "budgets": {"model_turns": max_turns, "tool_calls": 10},
         }
