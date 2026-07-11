@@ -15,6 +15,9 @@ from a2a.types import (
     AgentInterface as SdkAgentInterface,
     AgentSkill as SdkAgentSkill,
     Part as SdkPart,
+    Task as SdkTask,
+    TaskState as SdkTaskState,
+    TaskStatus as SdkTaskStatus,
 )
 from starlette.applications import Starlette
 
@@ -77,7 +80,15 @@ class CoreAgentExecutor(AgentExecutor):
 
     async def execute(self, context, event_queue):
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
-        await updater.submit()
+        if context.current_task is None:
+            await event_queue.enqueue_event(
+                SdkTask(
+                    id=context.task_id,
+                    context_id=context.context_id,
+                    status=SdkTaskStatus(state=SdkTaskState.TASK_STATE_SUBMITTED),
+                    history=[context.message] if context.message else [],
+                )
+            )
         await updater.start_work()
         try:
             request = parse_run_request(

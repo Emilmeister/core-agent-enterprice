@@ -210,6 +210,14 @@ class CompatibleHttpModel:
             raise CoreError("MODEL_UNAVAILABLE", "tool arguments must be an object")
         return value
 
+    @staticmethod
+    def _public_text(value):
+        value = re.sub(r"(?is)<think>.*?</think>\s*", "", value)
+        value = re.sub(r"(?is)<think>.*$", "", value).strip()
+        if not value:
+            raise CoreError("MODEL_UNAVAILABLE", "model returned no public text")
+        return value
+
     def _parse_openai(self, response, reverse):
         try:
             message = response["choices"][0]["message"]
@@ -240,7 +248,7 @@ class CompatibleHttpModel:
             return ModelResponse(tool_requests=tuple(calls))
         if not isinstance(content, str):
             raise CoreError("MODEL_UNAVAILABLE", "model returned no text")
-        return ModelResponse(message=content)
+        return ModelResponse(message=self._public_text(content))
 
     def _parse_anthropic(self, response, reverse):
         content = response.get("content")
@@ -269,7 +277,7 @@ class CompatibleHttpModel:
                 )
         if calls:
             return ModelResponse(tool_requests=tuple(calls))
-        return ModelResponse(message="".join(text))
+        return ModelResponse(message=self._public_text("".join(text)))
 
     def generate(self, *, context, tools, instructions):
         body, headers, reverse = self._request(context, instructions, tools)
