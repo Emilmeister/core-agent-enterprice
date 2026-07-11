@@ -16,9 +16,9 @@
 
 Недоверенный текст не может менять policy, выдавать approval или получать секреты только через prompt injection.
 
-## Execution isolation
+## Local process trust boundary
 
-Terminal, skill scripts, stdio MCP и child-agent commands исполняются только через отдельный [ExecutionEnvironment](execution-environment.md). Control-plane host subprocess запрещён. Недоступность среды даёт `EXECUTION_ENVIRONMENT_UNAVAILABLE`; fallback на host невозможен.
+Terminal, skill scripts, stdio MCP и child-agent commands исполняются в одном managed container через owned [TerminalSessions](execution-environment.md). Main и child имеют отдельные PTY, process groups, environment allowlists и workspace directories, но общий container OS не является security boundary против намеренно враждебного process. Этот риск принят продуктовой моделью; policy запрещает address чужих sessions и не рекламирует mount/PID/network isolation.
 
 ## Секреты
 
@@ -37,7 +37,7 @@ Terminal, skill scripts, stdio MCP и child-agent commands исполняютс�
 
 ## Процессы
 
-- Каждый процесс принадлежит одному `run_id`.
+- Каждый процесс принадлежит одному `run_id`, agent ID и TerminalSession.
 - Output читается без неограниченного накопления в памяти.
 - Тайм-аут завершает process tree, а не только родительский PID, если это поддерживается ОС.
 - Интерактивный stdin адресуется непрозрачным session ID.
@@ -87,7 +87,7 @@ Durable continuation является свойством целевого runtim
 ## Multi-tenancy
 
 - Tenant identity устанавливается authenticated transport context, не prompt.
-- Stores, caches, execution environments, process sessions, MCP connections и artifact URLs MUST быть tenant-scoped. Memory Service отвечает за tenant isolation Markdown/BM25/vector/graph data.
+- Stores, caches, terminal sessions/workspaces, MCP connections и artifact URLs MUST быть tenant-scoped. Memory Service отвечает за tenant isolation Markdown/BM25/vector/graph data.
 - Cross-tenant identifiers возвращают not-found semantics, если раскрытие существования запрещено.
 - Quotas применяются до выделения дорогого model/execution ресурса.
 - Child runs всегда наследуют tenant и не могут сменить его через arguments.

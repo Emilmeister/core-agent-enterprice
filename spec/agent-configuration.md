@@ -52,7 +52,7 @@ context:
 approval:
   mode: on_risk
 execution:
-  environment_profile: isolated-default
+  environment_profile: local-pty
 observability:
   otel_profile: production
 ```
@@ -99,7 +99,7 @@ Built-in и MCP tools фильтруются после discovery, но до mod
 - не наследуется child Task;
 - возвращает `CAPABILITY_DISABLED`, если вызов восстановлен из stale model output.
 
-Protocol-internal A2A state transitions, policy checks, audit/redaction и ExecutionEnvironment isolation не являются model-callable tools и не отключаются tool filters.
+Protocol-internal A2A state transitions, policy checks, audit/redaction и ownership/lifecycle TerminalSession не являются model-callable tools и не отключаются tool filters.
 
 Config validation MUST обнаруживать как минимум:
 
@@ -149,7 +149,7 @@ Snapshot содержит versions/digests profile prompt, kernel policy packs, 
 
 AgentConfig может отключить функциональность, но не может:
 
-- исполнить команду на control-plane host;
+- адресовать TerminalSession или process другого agent/run;
 - отключить schema validation, tenant isolation или secret redaction;
 - раскрыть raw chain-of-thought;
 - обойти policy/approval для оставшегося tool;

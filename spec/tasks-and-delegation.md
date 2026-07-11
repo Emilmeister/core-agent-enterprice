@@ -87,9 +87,11 @@ Working scratchpad и незавершённый model context не являют
 
 В этой спецификации «сабагент» означает managed child Core Agent Task. Произвольный внешний opaque A2A peer не получает Memory MCP credentials автоматически: parent передаёт ему только явно выбранные Message Parts/Artifacts и принимает результат как недоверенный внешний input.
 
-## Execution isolation сабагента
+## TerminalSession сабагента
 
-Каждый child-agent Task получает отдельный [ExecutionEnvironment](execution-environment.md). Он не наследует процессы, shell sessions, writable rootfs или environment variables parent-а. Общий проект передаётся snapshot/volume с copy-on-write overlay; изменения возвращаются patch/artifact и сливаются управляемо.
+Каждый child-agent Task получает отдельную [TerminalSession](execution-environment.md), PTY, process group, environment allowlist и local workspace directory внутри общего container-а. Child не адресует parent/peer sessions через tools. Общий проект копируется из одного immutable base snapshot в отдельные directories; изменения возвращаются patch/artifact и сливаются parent-ом с проверкой base revision.
+
+TerminalSessions дают независимый lifecycle и параллельную работу, но не отдельные OS security namespaces. Сабагенты создаются main agent-ом и считаются частью одной доверенной execution domain.
 
 ## Ожидание человека
 
@@ -98,7 +100,7 @@ Child MAY перейти в `input-required`, но запрос маршрути
 ## Cancellation и завершение
 
 - Cancel parent рекурсивно запрашивает cancel children, кроме явно detached durable tasks с owner/orphan policy.
-- Task cancellation кооперативна до grace period, затем executor принудительно завершает environment.
+- Task cancellation кооперативна до grace period, затем executor завершает process group и закрывает PTY.
 - Parent MUST проверить terminal status и required artifacts до использования результата.
 - Child failure не обязан завершать parent: модель получает structured failure и выбирает fallback.
 - Parent не может объявить итог, зависящий от pending task, не отметив результат как незавершённый.

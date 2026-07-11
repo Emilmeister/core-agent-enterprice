@@ -71,8 +71,8 @@ Session/tenant/auth/trace/task delivery принадлежат A2A context и tr
 - `name` уникален внутри Task;
 - descriptor MAY запрашивать tools/resources/prompts/sampling/elicitation;
 - secrets передаются ссылками на host secret store;
-- descriptor проходит allowlist, risk/approval и execution isolation до подключения;
-- stdio MCP запускается в ExecutionEnvironment, не на control-plane host;
+- descriptor проходит allowlist и risk/approval до подключения;
+- stdio MCP запускается как owned process в TerminalSession текущего agent-а;
 - catalog фиксируется snapshot-ом; notification меняет revision только на safe boundary;
 - ошибка `required: true` завершает Task, optional descriptor создаёт наблюдаемый warning.
 
@@ -176,7 +176,7 @@ Approval или новые данные переводят A2A Task в `input-re
 - Внешняя отмена использует A2A cancel Task operation.
 - Внутренний agent может вызвать `core.task.cancel` для child/background Task.
 - Passive wait не создаёт внешней terminal state: Task остаётся `working`, status metadata сообщает `waiting_task`.
-- Task, ожидающая notification, не удерживает model worker, execution environment или busy loop.
+- Task, ожидающая notification, не удерживает model worker, active terminal process или busy loop.
 
 ## Ordering и idempotency
 

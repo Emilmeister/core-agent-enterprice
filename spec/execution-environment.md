@@ -1,81 +1,106 @@
-# Execution environment
+# Локальные terminal sessions
 
-## Инвариант изоляции
+## Deployment constraint
 
-Команды агента, сабагентов, skill scripts и stdio MCP MUST NOT исполняться на машине или в namespace control plane. Tool Runtime обращается к ExecutionEnvironment adapter, который запускает работу в отдельной изолированной среде.
+Целевой Core Agent запускается как один пользовательский container в managed-платформе Cloud.ru AI Agents. Runtime не имеет Kubernetes API, container runtime socket и возможности создавать вложенные containers, Pods или VM. Main agent, его сабагенты и разрешённые локальные процессы разделяют container OS и базовую файловую систему.
 
-Модель deployment MAY использовать container, microVM, VM или удалённый sandbox service, если выполняет одинаковый security contract. Обычный host subprocess не соответствует спецификации.
+Внешний sandbox service не является обязательной частью продукта. Исполнение внутри этого container является осознанной trust-моделью: сабагентов создаёт основной агент, а локальные команды, skill scripts и stdio MCP считаются разрешёнными policy артефактами. Эта модель предоставляет lifecycle и workspace separation, но не является security boundary против намеренно враждебного process.
 
-## Граница control plane / execution plane
+## TerminalSession
 
-Control plane содержит orchestrator, policy, stores, model/MCP routing и telemetry control. Execution plane содержит пользовательский workspace, процессы и разрешённый network access.
+Main agent и каждый child-agent Task получают отдельную `TerminalSession`:
 
-Между ними передаются только typed requests/results, artifacts и policy decisions. Sandbox не получает control-plane filesystem, service credentials, container runtime socket или unrestricted store connection.
+- stable session ID и owner agent/task ID;
+- отдельный PTY для интерактивного процесса;
+- отдельную process group;
+- отдельные `cwd`, local workspace root и environment allowlist;
+- независимые stdin/stdout/stderr streams и bounded output;
+- собственные timeout, CPU/process/output budgets;
+- lifecycle `created -> running -> exited|timed_out|canceled|failed -> closed`.
 
-## Изоляция среды
+Сессия одного agent MUST NOT адресоваться terminal tools другого agent. Runtime проверяет owner ID на каждом `exec`, `write`, `read`, `signal` и `close`.
 
-ExecutionEnvironment MUST предоставлять:
+## Гарантии и не-гарантии
 
-- отдельные mount, process, PID, user, IPC и network boundaries либо эквивалент удалённой VM;
-- непривилегированного пользователя без host capabilities;
-- immutable base image и ephemeral writable layer;
-- отдельные `/tmp`, home, process table и environment;
-- CPU, memory, process, disk, output и wall-time limits;
-- egress deny-by-default с domain/IP/port policy;
-- отсутствие host root, Docker/container socket, SSH agent и cloud instance metadata;
-- seccomp/syscall или эквивалентную policy, если платформа поддерживает;
-- гарантированный teardown всего process tree.
+Runtime MUST обеспечивать:
 
-Недоступность обязательной изоляции завершает действие с `EXECUTION_ENVIRONMENT_UNAVAILABLE`; fallback на host запрещён.
+- отдельные workspace directories для main и каждого child;
+- отдельные PTY/process groups и независимую отмену;
+- запуск только через typed `argv` по умолчанию; shell string требует отдельной policy;
+- явный `cwd`, очищенный environment и secret allowlist;
+- wall-time, output и доступные OS resource limits;
+- завершение всей известной process group при cancel/timeout/close;
+- отсутствие Docker/container socket, Kubernetes credentials и platform control-plane credentials в command environment;
+- audit и OTel lifecycle без raw command/output по умолчанию.
 
-## Workspace
+Runtime не утверждает, что локальные processes имеют отдельные mount/PID/user/network namespaces. Process в общей container OS технически может видеть доступные тому же Unix user файлы или `/proc`. Это принятый риск целевого deployment, а не скрытая sandbox guarantee.
 
-- Workspace создаётся из immutable artifact/snapshot, а не прямого unrestricted bind mount host project.
-- Writable paths перечислены policy; остальные read-only или отсутствуют.
-- Parent и child получают отдельные copy-on-write overlays по умолчанию.
-- Результат изменений экспортируется как content-addressed snapshot или patch с base revision.
-- Merge выполняется orchestrator-ом с conflict detection и audit.
-- Durable task checkpoint хранит workspace snapshot reference, но не живой host path.
+Если PTY или process-group primitives недоступны, terminal capability фильтруется до model context либо обязательный terminal завершается `EXECUTION_ENVIRONMENT_UNAVAILABLE`.
 
-Shared writable volume допускается только для workflow, где concurrency policy и filesystem locking явно заданы; это не default для сабагентов.
+## Workspace и S3
+
+S3-backed mount используется как durable storage для immutable snapshots, checkpoints, event segments и artifacts. Он не является active workspace для Git, package managers, compilers, SQLite или процессов, которым нужна полная POSIX semantics.
+
+Активный workspace размещается на локальной ephemeral filesystem container-а:
+
+```text
+/tmp/core-agent/runs/<run-id>/agents/<agent-id>/workspace
+```
+
+Lifecycle workspace:
+
+1. скопировать и проверить immutable base snapshot из S3 mount;
+2. создать отдельную local directory main/child;
+3. выполнять процессы только с назначенным `cwd`;
+4. сформировать bounded patch и content-addressed artifacts;
+5. записать новый immutable S3 prefix;
+6. последним опубликовать revision/commit manifest;
+7. удалить local workspace после terminal state или retention timeout.
+
+Parent и child не должны одновременно изменять одну local directory. Каждый получает отдельную копию одного base revision; parent применяет child patch с conflict detection. Shared directory допускается только явной policy для доверенного workflow.
+
+Если несколько replicas используют общий S3 mount, file lock на mount не считается distributed lease. До появления conditional object writes или внешнего lease store stateful run MUST иметь одного active owner.
 
 ## Secrets
 
-- Secret material инжектируется непосредственно adapter-ом только в разрешённый process/call.
-- Lifetime ограничен task/tool call; после завершения environment secret недоступен.
-- Значение не входит в image, checkpoint, command arguments, telemetry или artifact.
-- Child получает только secrets, явно разрешённые delegation contract и host policy.
+- Container-wide environment не должен содержать секреты, доступные всем локальным processes.
+- Tool call передаёт только разрешённые `secret_refs`.
+- Runtime materializes значение непосредственно перед запуском и добавляет только в environment этого process.
+- Значение не входит в command arguments, checkpoint, telemetry или artifact.
+- После завершения process group уничтожается; долговременная TerminalSession не сохраняет secret в своём базовом environment.
+- Child получает только secret refs, явно разрешённые delegation contract и platform policy.
+
+Локальная process isolation не гарантирует защиту секрета от намеренно враждебного process того же Unix user. Поэтому secret-bearing terminal call всегда проходит отдельный risk decision; policy MAY запретить его полностью.
 
 ## Network
 
-- DNS и egress проходят policy gateway с audit.
-- Redirect, resolved IP и повторное DNS resolution проверяются против policy для защиты от SSRF/rebinding.
-- Inbound connections запрещены, кроме brokered port/preview capability с approval.
-- stdio MCP запускается внутри environment; remote MCP вызывается через policy-aware egress proxy.
-- A2A и OTel control traffic идут через control plane, а не доступны произвольному process.
+Локальные процессы наследуют network boundary container-а. Runtime применяет tool/MCP allowlists и MAY использовать application egress proxy, но не рекламирует отдельный network namespace для каждой TerminalSession.
+
+- remote MCP проходит local policy до соединения и каждого call;
+- redirects/resolved IP проверяются, когда соединение проходит через управляемый egress adapter;
+- stdio MCP запускается как owned local process в TerminalSession;
+- inbound listener разрешается только явной tool policy и закрывается вместе с session;
+- A2A и OTel credentials не передаются в child process environment.
 
 ## Lifecycle
 
-1. Resolve immutable image и workspace snapshot.
-2. Применить tenant/run/child policy и resource limits.
-3. Создать environment и attested environment ID.
-4. Выполнить tool/task с heartbeat и cancellation channel.
-5. Собрать bounded outputs, patches и artifacts.
-6. Завершить process tree и сеть.
-7. Уничтожить writable layer либо сохранить encrypted checkpoint snapshot по policy.
-8. Зафиксировать cleanup outcome и telemetry.
+1. Проверить effective terminal capability, owner и budgets.
+2. Создать local workspace и TerminalSession.
+3. Запустить process с новым PTY/process group.
+4. Неблокирующе читать bounded output и принимать input/signal.
+5. На safe boundaries публиковать status/artifacts/notifications.
+6. При cancel/timeout послать graceful signal, затем завершить process group.
+7. Собрать patch/artifacts и опубликовать durable manifest в S3.
+8. Закрыть PTY, удалить local workspace по policy и записать cleanup outcome.
 
-## Reuse
+## Параллельность и reuse
 
-Environment MAY переиспользоваться между tool calls одного run для производительности, если:
+TerminalSession принадлежит ровно одному main/child agent, но несколько sessions MAY работать параллельно в одном container в пределах общего semaphore и aggregate resource budget.
 
-- security context и workspace revision не изменились;
-- нет unresolved side effect или leaked process;
-- reset policy очищает временные credentials и unexpected listeners;
-- reuse не пересекает tenants или parent/child boundary.
+Сессия MAY жить между несколькими tool calls одного agent для REPL, debugger или server process. Обычный `core.terminal.exec` SHOULD запускать отдельный process в той же owned session/workspace; persistent interactive state используется только явно.
 
-После high-risk call, policy change или failed cleanup среда уничтожается.
+После timeout, failed cleanup или terminal agent state session закрывается и не переиспользуется другим agent.
 
 ## Observability без утечки
 
-Execution spans и metrics экспортируются через контролируемый collector. Raw stdout/stderr, commands, file contents и environment variables не являются span attributes по умолчанию. `environment_id`, image digest, resource class и exit status допускаются после cardinality review.
+Spans отражают session ID, owner kind, process state, duration, exit status, timeout/cancel и bounded byte counts. Raw command, stdin/stdout/stderr, file content, environment и S3 paths выключены по умолчанию. Background terminal process получает новый execution trace со Span Link на task submission.

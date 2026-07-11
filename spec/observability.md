@@ -12,7 +12,7 @@ Telemetry не заменяет durable audit: sampling или недоступ�
 
 ### Traces
 
-Показывают causal path A2A request, Task, model turns, tools, MCP, memory pipeline, background jobs, сабагентов, approvals и execution environments.
+Показывают causal path A2A request, Task, model turns, tools, MCP, memory pipeline, background jobs, сабагентов, approvals и terminal sessions/processes.
 
 ### Metrics
 
@@ -24,7 +24,7 @@ Structured logs описывают operator diagnostics и correlation с trace/
 
 ## Context propagation
 
-Core Agent MUST использовать W3C Trace Context через OTel propagators для A2A bindings, MCP HTTP, task queue, sandbox RPC и remote subagents.
+Core Agent MUST использовать W3C Trace Context через OTel propagators для A2A bindings, MCP HTTP и task queue. Локальные background/subagent процессы получают trace context только через runtime, но trace context не становится authorization.
 
 - `traceparent`/`tracestate` валидируются при extract.
 - Входной trace context не даёт authorization или tenant identity.
@@ -58,7 +58,8 @@ core_agent.task.execute  (linked to submit)
 ├── gen_ai model operation
 ├── core_agent.policy.evaluate
 ├── core_agent.tool.execute
-│   ├── core_agent.execution_environment.create
+│   ├── core_agent.terminal.session
+│   ├── core_agent.terminal.process
 │   └── mcp operation
 └── core_agent.task.checkpoint
 
@@ -84,7 +85,7 @@ Core Agent MUST NOT создавать fake internal memory spans: он созд
 
 ## Span attributes
 
-Допустимые high-cardinality IDs на spans/logs, но не metrics: `a2a.task.id`, `a2a.context.id`, `core_agent.run.id`, tool call ID, memory revision, artifact ID и execution environment ID.
+Допустимые high-cardinality IDs на spans/logs, но не metrics: `a2a.task.id`, `a2a.context.id`, `core_agent.run.id`, tool call ID, memory revision, artifact ID и terminal session ID.
 
 Обязательные bounded attributes по применимости:
 
@@ -95,7 +96,7 @@ Core Agent MUST NOT создавать fake internal memory spans: он созд
 - task type/state, parent/child depth и detached flag;
 - memory scope/kind, index revision, retriever type и candidate count;
 - compaction base/working tokens и before/after working occupancy;
-- execution backend/resource class/image digest и cleanup outcome;
+- terminal owner kind/process state/exit status и cleanup outcome;
 - A2A/MCP protocol and extension versions.
 
 Content attributes из GenAI conventions, tool definitions/arguments/results, system instructions, retrieved documents и memory text MUST быть выключены по умолчанию. Их opt-in требует explicit data policy, redaction, sampling и retention limits.
@@ -112,7 +113,7 @@ Core Agent MUST публиковать минимум:
 - compaction count, base tokens, working before/after ratio и failures;
 - Memory MCP client latency/outcome и configured/filtered state;
 - background/subagent count, depth, fan-out, duration и budget usage;
-- execution environment create/reuse/cleanup latency, resource saturation и policy denials;
+- terminal session/process create/reuse/cleanup latency, resource saturation и policy denials;
 - checkpoint/recovery/lease/notification delivery outcomes;
 - OTLP export drops/failures и telemetry queue saturation.
 

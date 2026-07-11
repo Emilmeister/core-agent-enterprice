@@ -31,7 +31,7 @@ Core Agent MUST владеть следующими обязанностями:
 - ограничение вывода инструментов;
 - подключение отдельного Memory MCP Service с Markdown, graph/NER и hybrid retrieval;
 - фоновые Tasks, passive wait и делегирование сабагентам;
-- изолированный execution plane;
+- локальные TerminalSessions с отдельными PTY/process groups/workspaces для main и сабагентов;
 - A2A communication и OpenTelemetry observability;
 - стриминг событий, аудит и отмена запуска.
 
@@ -45,7 +45,7 @@ Core Agent MUST владеть следующими обязанностями:
 
 - модель, provider и credentials;
 - рабочая директория и допустимые filesystem roots;
-- sandbox и сетевые ограничения;
+- local terminal profile, process/resource limits и сетевые ограничения container-а;
 - режим approval и правила риска;
 - secret store;
 - хранилище транскриптов и артефактов;
@@ -55,7 +55,7 @@ Core Agent MUST владеть следующими обязанностями:
 - model routing и fallback policy;
 - tenant identity, quotas и data governance;
 - registry и trust policy для skills/MCP;
-- ExecutionEnvironment backend/images и OTLP endpoints.
+- local workspace/S3 snapshot profiles и OTLP endpoints.
 
 ### AgentConfig
 
@@ -85,9 +85,9 @@ Core Agent MUST владеть следующими обязанностями:
 
 Долгая задача может ждать человека, переживать временные сбои и рестарт worker-а, восстанавливаясь из checkpoint без повтора неподтверждённых side effects.
 
-### Embedded/local run
+### Managed single-container run
 
-Control plane может быть встроен в приложение или работать локально, но terminal, skill scripts и stdio MCP всё равно исполняются в отдельном ExecutionEnvironment, а не в host process.
+Целевой deployment — один пользовательский container Cloud.ru AI Agents без Kubernetes API или nested container runtime. Main и child agents работают параллельно в одном process namespace, но получают отдельные TerminalSessions, process groups и local workspaces. S3-backed mount хранит snapshots/checkpoints/artifacts, а не active POSIX workspace.
 
 ### Managed/multi-tenant run
 
@@ -122,8 +122,8 @@ Control plane может быть встроен в приложение или 
 - пользователь может увидеть, исправить и удалить сохранённую о себе память;
 - новая модель, skill или MCP transport подключаются через стабильный adapter contract.
 - background Task не блокирует agent loop и доставляет durable notification;
-- команды main/child agents никогда не исполняются на control-plane host;
-- OTel trace связывает A2A Task, model, memory, tools, sandbox и сабагентов.
+- команды main/child исполняются только в принадлежащих им TerminalSessions и завершаются вместе с process group;
+- OTel trace связывает A2A Task, model, memory, tools, terminal sessions и сабагентов.
 
 ## Границы продукта
 
@@ -141,7 +141,7 @@ Control plane может быть встроен в приложение или 
 
 ### Safe autonomy
 
-Ядро самостоятельно делает обратимые, локальные и разрешённые действия. Чем выше необратимость, внешний эффект или чувствительность данных, тем сильнее isolation и участие человека.
+Ядро самостоятельно делает обратимые, локальные и разрешённые действия. Чем выше необратимость, внешний эффект или чувствительность данных, тем строже policy и участие человека. Локальная TerminalSession не рекламируется как security sandbox.
 
 ### Progressive disclosure везде
 

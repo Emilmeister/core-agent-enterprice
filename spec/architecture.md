@@ -2,7 +2,7 @@
 
 ## Архитектурная цель
 
-Core Agent — stateful orchestration kernel с портами для моделей, execution environments, MCP, skills, persistence, policy и событий. Бизнес-логика agent loop не должна зависеть от HTTP framework, конкретного provider или операционной системы.
+Core Agent — stateful orchestration kernel с портами для моделей, local terminal sessions, MCP, skills, persistence, policy и событий. Целевой deployment работает в одном managed container без Kubernetes API; бизнес-логика agent loop не зависит от HTTP framework или model provider.
 
 ## Подсистемы
 
@@ -41,7 +41,7 @@ A2A является основным внешним контрактом: Agent
 
 ### Tool runtime
 
-Регистрирует built-ins и MCP tools, валидирует calls, передаёт их policy engine, исполняет только через изолированный ExecutionEnvironment, нормализует outputs и фиксирует side effects.
+Регистрирует built-ins и MCP tools, валидирует calls и передаёт их policy engine. Terminal, skill scripts и stdio MCP запускаются через owned TerminalSession с отдельными PTY/process group/workspace; runtime нормализует outputs и фиксирует side effects.
 
 ### Skill manager
 
@@ -107,7 +107,7 @@ Checkpoint MUST создаваться:
 Стабильные внутренние ports:
 
 - `ModelProvider`;
-- `ExecutionEnvironment`;
+- `TerminalSessionManager`;
 - `McpTransport`;
 - `SkillResolver`;
 - `PolicyEvaluator`;
@@ -125,7 +125,7 @@ Adapters объявляют capabilities. Orchestrator MUST проверять �
 Последовательное выполнение является семантической базой. Runtime MAY параллелить model/tool/subrun операции, только если:
 
 - зависимости представлены явно;
-- targets не пересекаются либо executor обеспечивает isolation;
+- targets не пересекаются либо agents используют отдельные local workspace copies;
 - approval для каждого side effect независим;
 - порядок слияния результатов детерминирован и попадает в audit;
 - отмена одной ветви не оставляет другие без владельца.

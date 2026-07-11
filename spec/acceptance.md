@@ -91,7 +91,7 @@
 - [ ] `task.start` возвращает handle сразу, пока main agent продолжает независимую работу.
 - [ ] Completion/failure/artifact/input notifications durable, versioned и at-least-once.
 - [ ] Notification попадает в model context только на safe boundary и дедуплицируется.
-- [ ] `task.wait` не создаёт busy polling и не удерживает model worker/execution environment.
+- [ ] `task.wait` не создаёт busy polling и не удерживает model worker.
 - [ ] Agent может ничего не делать до notification или timeout.
 - [ ] Cancel/timeout завершает process tree; orphan policy обрабатывает Task после terminal parent.
 - [ ] Parent не завершает зависимый итог, пока required Task pending.
@@ -108,16 +108,16 @@
 - [ ] Parent проверяет Artifact/result provenance; child не общается наружу без capability.
 - [ ] Depth/fan-out и child budgets ограничены общим parent budget.
 
-## Execution environment
+## Local terminal sessions
 
-- [ ] Ни одна terminal command, skill script, stdio MCP или child command не запускается control-plane host subprocess-ом.
-- [ ] Environment имеет отдельные filesystem/process/user/network boundaries, immutable image и resource limits.
-- [ ] Host root, runtime socket, SSH agent, metadata endpoint и control-plane credentials недоступны.
-- [ ] Parent/child получают отдельные copy-on-write overlays; merge использует base revision/conflict detection.
-- [ ] Egress default-deny проверяет DNS, resolved IP и redirect.
-- [ ] Secret инжектируется только в разрешённый call и не попадает в image/checkpoint/telemetry/artifact.
-- [ ] Недоступность isolation даёт `EXECUTION_ENVIRONMENT_UNAVAILABLE`; host fallback отсутствует.
-- [ ] Teardown уничтожает process tree/writable layer или фиксирует cleanup failure.
+- [ ] Main и каждый child получают разные TerminalSession IDs, PTY, process groups и local workspace directories в одном container.
+- [ ] Terminal tool не может адресовать session/process другого agent или run.
+- [ ] Typed `argv` используется по умолчанию; `cwd`, environment и output bounded и валидируются до запуска.
+- [ ] Main и child копируют один immutable base snapshot в разные local directories; merge использует base revision/conflict detection.
+- [ ] S3 mount хранит immutable snapshots/checkpoints/artifacts, но active command не выполняется непосредственно на нём.
+- [ ] Cancel/timeout завершает owned process group, закрывает PTY и фиксирует cleanup outcome.
+- [ ] Secret инжектируется только в environment разрешённого process и не попадает в checkpoint/telemetry/artifact.
+- [ ] Runtime явно сообщает logical/process separation и не рекламирует отдельные OS security namespaces.
 
 ## Tools, MCP и human-in-the-loop
 
@@ -131,7 +131,7 @@
 ## OpenTelemetry
 
 - [ ] Traces, metrics и logs создаются OTel SDK и экспортируются OTLP.
-- [ ] W3C Trace Context проходит через A2A, queue, MCP, sandbox RPC и remote subagents без влияния на authorization.
+- [ ] W3C Trace Context проходит через A2A, queue, MCP и background/subagent tasks без влияния на authorization.
 - [ ] Durable/background Task использует новый execution trace со Span Link на submission, а не многочасовой request span.
 - [ ] Core имеет MCP client span; Memory Service продолжает W3C trace и владеет BM25/vector/graph/rerank/NER spans.
 - [ ] OTel semantic-convention version pinned; custom attributes используют `core_agent.*`.
@@ -142,7 +142,7 @@
 ## Security, tenancy и data lifecycle
 
 - [ ] Prompt injection из profile/file/skill/MCP/A2A peer не меняет kernel/host policy и не раскрывает secret.
-- [ ] Tasks, environments, connections, Markdown, indexes, graph, artifacts и telemetry tenant-isolated.
+- [ ] Tasks, terminal sessions/workspaces, connections, Markdown, indexes, graph, artifacts и telemetry tenant-scoped.
 - [ ] Remote extensions проверяются по integrity/trust/revocation policy.
 - [ ] Coordinated deletion очищает Core cached/transcript copies, а Memory Service — Markdown и derived indexes.
 - [ ] Public errors безопасны, стабильны и отображаются в A2A semantics.
@@ -157,7 +157,7 @@
 6. **Shared memory:** parent явно передаёт child тот же Memory MCP namespace; child commit уведомляет parent.
 7. **Focused delegation:** child видит только capabilities из EffectiveConfig/delegation allowlist и возвращает schema-valid Artifact.
 8. **Concurrent work:** main продолжает задачу, пока два child/background Tasks выполняются, затем обрабатывает notifications без busy polling.
-9. **Host isolation:** враждебная команда не видит host filesystem/socket/metadata или Memory Service corpus.
+9. **Parallel terminals:** main и два child одновременно работают в разных PTY/workspaces, не смешивают output и завершают только свои process groups.
 10. **OTel causality:** Core MCP client и Memory Service indexing spans находятся в одном distributed trace без content leakage.
 11. **Внешнее действие:** MCP write ждёт approval, переживает recovery и выполняется ровно один раз.
 
@@ -167,4 +167,4 @@
 - A2A/Core extension schemas и examples проверяются против одного источника типов.
 - Recovery tests доказывают отсутствие duplicate side effects и потерянных notifications.
 - Memory Service rebuild test удаляет derived indexes и получает эквивалентный searchable graph из Markdown.
-- Security review охватывает A2A, model, MCP, skills, memory graph, execution plane, subagents, OTel и tenancy.
+- Security review охватывает A2A, model, MCP, skills, memory graph, принятую one-container trust model, subagents, OTel и tenancy.

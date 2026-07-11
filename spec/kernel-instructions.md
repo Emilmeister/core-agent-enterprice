@@ -7,13 +7,13 @@
 Эти протоколы существуют одновременно в двух формах:
 
 1. versioned KernelInstructions, всегда включённые в model context;
-2. runtime/service enforcement в tools, policy, scheduler, configured MCP services и ExecutionEnvironment.
+2. runtime/service enforcement в tools, policy, scheduler, configured MCP services и TerminalSession manager.
 
 Prompt-only enforcement недостаточен: даже ошибочная модель не должна иметь техническую возможность обойти обязательное правило.
 
 ## Неотменяемые kernel protocols
 
-- trust boundaries, sandbox и secret handling;
+- trust boundaries, local process ownership и secret handling;
 - approval и human-input distinction;
 - правила включённых trusted capability profiles, включая Memory MCP authoring contract;
 - compaction threshold и pinned context;
@@ -55,7 +55,7 @@ AgentProfilePrompt MAY задавать:
 Он MUST NOT:
 
 - добавлять tool/skill/MCP, отсутствующий в capability snapshot;
-- давать доступ к host filesystem/process/network;
+- адресовать чужую TerminalSession или расширять назначенные workspace/network capabilities;
 - менять contract trusted Memory MCP, если memory включена;
 - расширять approval grant;
 - скрывать обязательные task/status события;

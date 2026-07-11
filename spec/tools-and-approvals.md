@@ -18,13 +18,13 @@ Arguments MUST валидироваться по schema до risk assessment и 
 
 ### `core.terminal.exec`
 
-Запускает процесс в отдельном [ExecutionEnvironment](execution-environment.md) с явными `argv`, рабочей директорией, environment allowlist и timeout. Shell-строка MAY поддерживаться adapter-ом, но должна считаться более рискованной, чем `argv`.
+Запускает process в принадлежащей agent-у [TerminalSession](execution-environment.md) с явными `argv`, local workspace, environment allowlist и timeout. Main и каждый child имеют разные session/process group/workspace. Shell-строка MAY поддерживаться policy, но считается более рискованной, чем `argv`.
 
 Возвращает `exit_code`, ограниченные `stdout`/`stderr`, duration и session identifier для продолжающегося процесса.
 
 ### `core.terminal.write`
 
-Передаёт input существующему процессу или запрашивает его текущее состояние. Не может адресовать процесс другого запуска.
+Передаёт input существующему PTY/process или запрашивает его текущее состояние. Не может адресовать session другого agent/run.
 
 ### `core.fs.apply_patch`
 
@@ -50,7 +50,7 @@ Memory tools не являются built-ins Core Agent. Их предостав
 
 Позволяют сохранить, прочитать релевантный range, проверить digest и передать ссылку на большой output без помещения всего содержимого в context.
 
-Дополнительные native filesystem/search tools SHOULD появляться там, где они дают более строгий sandbox и structured output, чем shell. Terminal остаётся универсальным fallback, а не способом обойти typed tool policy.
+Дополнительные native filesystem/search tools SHOULD появляться там, где они дают более строгую path validation и structured output, чем shell. Terminal остаётся универсальным fallback, а не способом обойти typed tool policy.
 
 ## Нормализация результата
 
@@ -89,7 +89,7 @@ AgentConfig в пределах PlatformConfig задаёт один режим:
 - публикации, отправки сообщения, платежа или иного действия от имени пользователя;
 - чтения секрета либо чувствительных данных, не нужных явно для задачи;
 - запуска нового MCP executable или подключения к host вне allowlist;
-- расширения sandbox или отключения защитного механизма.
+- расширения workspace/session ownership или отключения process limits.
 
 Обычное чтение внутри workspace, поиск, получение metadata и применение обратимого patch внутри workspace MAY проходить без approval, если host policy не строже.
 
@@ -164,6 +164,6 @@ MCP output всегда считается недоверенным. Server не
 
 1. прекратить новые model/tool calls;
 2. отправить cancellation активному tool, если transport поддерживает;
-3. после grace period завершить process tree в ExecutionEnvironment;
+3. после grace period завершить owned process group и закрыть PTY;
 4. закрыть MCP connections;
 5. перевести A2A Task в `canceled` с описанием возможных незавершённых side effects.

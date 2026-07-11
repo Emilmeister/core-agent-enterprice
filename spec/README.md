@@ -18,7 +18,7 @@ Core Agent превращает три входа — `prompt`, `mcp` и `skills
 - подключаемый Memory MCP Service с Markdown, графом, NER и hybrid retrieval;
 - сжатие рабочего контекста при достижении 90% до 10–15%;
 - фоновые задачи и неблокирующие сабагенты;
-- изолированный от control-plane execution runtime;
+- отдельные local PTY/process groups/workspaces main и сабагентов внутри одного managed container;
 - A2A-интерфейс и OpenTelemetry observability.
 
 ## Как читать спецификацию
@@ -37,7 +37,7 @@ Core Agent превращает три входа — `prompt`, `mcp` и `skills
 10. [Контекст и суммаризация](context.md) — расчёт 90%, compaction до 10–15% и гарантии.
 11. [Skills](skills.md) — формат, registry, выбор и progressive disclosure.
 12. [Инструменты и approvals](tools-and-approvals.md) — built-ins, MCP и human-in-the-loop.
-13. [Execution environment](execution-environment.md) — изоляция файловой системы, ОС и сети.
+13. [Local terminal sessions](execution-environment.md) — отдельные PTY/process groups/workspaces main и сабагентов в одном container.
 14. [Безопасность и надёжность](security-and-reliability.md) — trust boundaries и ошибки.
 15. [Наблюдаемость](observability.md) — OpenTelemetry, события, метрики, трассировка и evals.
 16. [Критерии готовности продукта](acceptance.md) — сквозные свойства целевого ядра.
@@ -58,7 +58,7 @@ Core Agent превращает три входа — `prompt`, `mcp` и `skills
 ## Принятые продуктовые решения
 
 - Каждый запуск принимает ровно три поля: `prompt`, `mcp`, `skills`.
-- Модель, credentials, workspace, sandbox, approval policy и лимиты принадлежат хосту и не являются входами запуска.
+- Модель, credentials, S3/local workspace profiles, terminal policy и лимиты принадлежат platform config и не являются входами запуска.
 - Session identity и control-команды передаются transport-ом вне тела запуска, поэтому не размывают трёхполевой контракт.
 - Ядро поддерживает stateless runs, долгоживущие sessions, durable recovery и управляемую долговременную память.
 - Инструменты исполняются последовательно, пока runtime не доказал независимость; разрешённый параллелизм остаётся внутренней оптимизацией.
@@ -68,7 +68,7 @@ Core Agent превращает три входа — `prompt`, `mcp` и `skills
 - AgentConfig может отключить memory, built-in tools, отдельные MCP tools, skills, delegation и другие optional capabilities.
 - Main agent и сабагенты используют общую память только когда parent явно передал им один Memory MCP namespace.
 - Сабагент получает явный allowlist рабочих tools и skills; обязательные kernel tools нельзя убрать.
-- Любое исполнение команд происходит вне машины control plane в отдельном execution environment.
+- Команды main и сабагентов выполняются в разных owned TerminalSessions одного managed container; это lifecycle/workspace separation, а не отдельная OS security boundary.
 - Kernel rules для включённых capabilities имеют приоритет над настраиваемым agent prompt; AgentConfig определяет, какие capabilities вообще существуют.
 - Ядро не раскрывает скрытую chain-of-thought; клиент получает ответы, статусы и краткие основания решений.
 - Полный транскрипт хранится вне активного контекста, поэтому compaction не уничтожает аудит.
