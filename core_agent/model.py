@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
 from dataclasses import dataclass
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from .errors import CoreError
 
@@ -41,6 +48,235 @@ class ScriptedModel:
         if not self._responses:
             raise CoreError("MODEL_UNAVAILABLE")
         return self._responses.pop(0)
+
+
+class CompatibleHttpModel:
+    """Small synchronous adapter for OpenAI-compatible and Anthropic Messages APIs."""
+
+    def __init__(
+        self,
+        *,
+        api_format,
+        model,
+        base_url=None,
+        endpoint=None,
+        api_key=None,
+        timeout=120,
+        max_tokens=4096,
+        headers=None,
+        extra_body=None,
+        anthropic_version="2023-06-01",
+    ):
+        if api_format not in {"openai", "anthropic"} or not model:
+            raise CoreError("CONFIG_INVALID")
+        suffix = "/chat/completions" if api_format == "openai" else "/messages"
+        default = (
+            "https://api.openai.com/v1"
+            if api_format == "openai"
+            else "https://api.anthropic.com/v1"
+        )
+        self.endpoint = endpoint or self._endpoint(base_url or default, suffix)
+        if urlparse(self.endpoint).scheme not in {"http", "https"}:
+            raise CoreError("CONFIG_INVALID")
+        self.api_format = api_format
+        self.model = model
+        self.api_key = api_key
+        self.timeout = float(timeout)
+        self.max_tokens = int(max_tokens)
+        self.headers = dict(headers or {})
+        self.extra_body = dict(extra_body or {})
+        self.anthropic_version = anthropic_version
+
+    @staticmethod
+    def _endpoint(base_url, suffix):
+        base = base_url.rstrip("/")
+        return base if base.endswith(suffix) else base + suffix
+
+    @staticmethod
+    def _wire_name(name):
+        if len(name) <= 64 and re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+            return name
+        stem = re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:54]
+        return f"{stem}_{hashlib.sha256(name.encode()).hexdigest()[:8]}"
+
+    def _tools(self, catalog):
+        definitions = (
+            catalog if isinstance(catalog, dict) else {name: {} for name in catalog}
+        )
+        reverse = {self._wire_name(name): name for name in sorted(definitions)}
+        if len(reverse) != len(definitions):
+            raise CoreError("TOOL_NAME_COLLISION")
+        schemas = []
+        for wire_name in reverse:
+            definition = definitions[reverse[wire_name]]
+            schema = definition.get("input_schema") or {
+                "type": "object",
+                "additionalProperties": True,
+            }
+            description = definition.get("description") or reverse[wire_name]
+            if self.api_format == "openai":
+                schemas.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": wire_name,
+                            "description": description,
+                            "parameters": schema,
+                        },
+                    }
+                )
+            else:
+                schemas.append(
+                    {
+                        "name": wire_name,
+                        "description": description,
+                        "input_schema": schema,
+                    }
+                )
+        return schemas, reverse
+
+    def _request(self, context, instructions, tools):
+        schemas, reverse = self._tools(tools)
+        body = dict(self.extra_body)
+        if self.api_format == "openai":
+            body.update(
+                {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": instructions},
+                        {"role": "user", "content": context},
+                    ],
+                }
+            )
+        else:
+            body.update(
+                {
+                    "model": self.model,
+                    "max_tokens": self.max_tokens,
+                    "system": instructions,
+                    "messages": [{"role": "user", "content": context}],
+                }
+            )
+        if schemas:
+            body["tools"] = schemas
+        headers = {"Content-Type": "application/json", **self.headers}
+        if self.api_format == "openai" and self.api_key:
+            headers.setdefault("Authorization", f"Bearer {self.api_key}")
+        if self.api_format == "anthropic":
+            if self.api_key:
+                headers.setdefault("x-api-key", self.api_key)
+            headers.setdefault("anthropic-version", self.anthropic_version)
+        return body, headers, reverse
+
+    def _post(self, body, headers):
+        request = Request(
+            self.endpoint,
+            data=json.dumps(body).encode(),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                raw = response.read(16_777_217)
+        except HTTPError as error:
+            detail = error.read(4096).decode(errors="replace")
+            retryable = error.code in {408, 409, 429} or error.code >= 500
+            raise CoreError(
+                "MODEL_UNAVAILABLE",
+                f"model HTTP {error.code}: {detail}",
+                retryable=retryable,
+            ) from error
+        except (OSError, TimeoutError, URLError) as error:
+            raise CoreError("MODEL_UNAVAILABLE", str(error), retryable=True) from error
+        if len(raw) > 16_777_216:
+            raise CoreError("MODEL_UNAVAILABLE", "model response is too large")
+        try:
+            return json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise CoreError(
+                "MODEL_UNAVAILABLE", "invalid model JSON response"
+            ) from error
+
+    @staticmethod
+    def _arguments(value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise CoreError(
+                    "MODEL_UNAVAILABLE", "invalid tool arguments"
+                ) from error
+        if not isinstance(value, dict):
+            raise CoreError("MODEL_UNAVAILABLE", "tool arguments must be an object")
+        return value
+
+    def _parse_openai(self, response, reverse):
+        try:
+            message = response["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise CoreError("MODEL_UNAVAILABLE", "invalid chat completion") from error
+        calls = []
+        for call in message.get("tool_calls") or ():
+            function = call.get("function", {})
+            try:
+                name = reverse[function["name"]]
+            except (KeyError, TypeError) as error:
+                raise CoreError("MODEL_UNAVAILABLE", "unknown model tool") from error
+            calls.append(
+                ToolRequest(
+                    call.get("id") or str(uuid.uuid4()),
+                    name,
+                    self._arguments(function.get("arguments", {})),
+                )
+            )
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        if calls:
+            return ModelResponse(tool_requests=tuple(calls))
+        if not isinstance(content, str):
+            raise CoreError("MODEL_UNAVAILABLE", "model returned no text")
+        return ModelResponse(message=content)
+
+    def _parse_anthropic(self, response, reverse):
+        content = response.get("content")
+        if not isinstance(content, list):
+            raise CoreError("MODEL_UNAVAILABLE", "invalid Anthropic message")
+        calls = []
+        text = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text.append(str(block.get("text", "")))
+            elif block.get("type") == "tool_use":
+                try:
+                    name = reverse[block["name"]]
+                except KeyError as error:
+                    raise CoreError(
+                        "MODEL_UNAVAILABLE", "unknown model tool"
+                    ) from error
+                calls.append(
+                    ToolRequest(
+                        block.get("id") or str(uuid.uuid4()),
+                        name,
+                        self._arguments(block.get("input", {})),
+                    )
+                )
+        if calls:
+            return ModelResponse(tool_requests=tuple(calls))
+        return ModelResponse(message="".join(text))
+
+    def generate(self, *, context, tools, instructions):
+        body, headers, reverse = self._request(context, instructions, tools)
+        response = self._post(body, headers)
+        if self.api_format == "openai":
+            return self._parse_openai(response, reverse)
+        return self._parse_anthropic(response, reverse)
 
 
 @dataclass(frozen=True)

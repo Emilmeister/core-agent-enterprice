@@ -13,6 +13,44 @@ uvx ruff check core_agent memory_service
 uv build --no-sources
 ```
 
+## Run the agent
+
+OpenAI-compatible API (OpenAI, vLLM, Ollama, LM Studio, OpenRouter, or another compatible gateway):
+
+```bash
+MODEL_API_FORMAT=openai \
+MODEL_BASE_URL=https://your-provider.example/v1 \
+MODEL_NAME=your-model \
+MODEL_API_KEY=your-key \
+uv run core-agent
+```
+
+Anthropic Messages API:
+
+```bash
+MODEL_API_FORMAT=anthropic \
+MODEL_BASE_URL=https://api.anthropic.com/v1 \
+MODEL_NAME=your-model \
+MODEL_API_KEY=your-key \
+uv run core-agent
+```
+
+`MODEL_ENDPOINT` overrides the complete request URL. Providers with custom authentication can use
+`MODEL_HEADERS_JSON`; optional provider parameters belong in `MODEL_EXTRA_BODY_JSON`. An API key is
+not required for a local OpenAI-compatible server:
+
+```bash
+MODEL_API_FORMAT=openai \
+MODEL_BASE_URL=http://localhost:11434/v1 \
+MODEL_NAME=your-local-model \
+uv run core-agent
+```
+
+The A2A Agent Card is then available at `http://localhost:8000/.well-known/agent-card.json`.
+Terminal execution is trusted by default for the single-container deployment; set
+`CORE_AGENT_TRUST_TERMINAL=0` to require risk approval instead of automatic execution. Workspaces
+default to `/tmp/core-agent/runs` and can be moved with `LOCAL_WORKSPACE_ROOT`.
+
 The specification and acceptance suite are frozen together before implementation changes.
 `tests/test_spec_lock.py` also protects every specification file byte-for-byte.
 

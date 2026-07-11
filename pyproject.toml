@@ -12,6 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
+core-agent = "core_agent.app:main"
 core-agent-memory = "memory_service.mcp_server:main"
 
 [build-system]

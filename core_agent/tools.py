@@ -270,9 +270,12 @@ class ToolRuntime:
     def _execute(self, call, run_id):
         self._emit("tool.started", call_id=call.id)
         self.execution_count += 1
-        result = self.environment_manager.execute_transient(
-            {"tool": call.name, "arguments": call.arguments}, run_id
+        request = (
+            call.arguments
+            if call.name == "core.terminal.exec"
+            else {"tool": call.name, "arguments": call.arguments}
         )
+        result = self.environment_manager.execute_transient(request, run_id)
         self._emit("tool.completed", call_id=call.id)
         return ToolResult(call.id, "succeeded", result)
 

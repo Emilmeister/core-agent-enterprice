@@ -103,7 +103,7 @@ class CoreAgent:
             "prompt", request.prompt, self.token_counter(request.prompt), pinned=True
         )
         context_state = ContextState((prompt_item,), (prompt_item,), (1, 1))
-        instructions = "CORE KERNEL"
+        instructions = "CORE KERNEL\n" + raw["agent"].get("profile_prompt", "")
         if "memory" in effective.enabled_capability_policies:
             instructions += "\nMEMORY POLICY"
         budgets = raw.get("budgets", {})
@@ -122,9 +122,29 @@ class CoreAgent:
                 context_state = self.compactor.maybe_compact(context_state)
             context = "\n".join(item.content for item in context_state.active)
             turns += 1
+            tool_catalog = {}
+            for name in effective.model_tool_catalog:
+                server, separator, remote_tool = name.partition(".")
+                if separator and server in effective.mcp_tools:
+                    tool_catalog[name] = {
+                        "description": name,
+                        "input_schema": discovered.get(server, {}).get(remote_tool, {}),
+                    }
+                else:
+                    try:
+                        definition = self.tool_runtime.registry.get(name)
+                    except CoreError as error:
+                        if error.code != "TOOL_NOT_FOUND":
+                            raise
+                        tool_catalog[name] = {}
+                    else:
+                        tool_catalog[name] = {
+                            "description": definition.description,
+                            "input_schema": definition.input_schema,
+                        }
             response = self.model.generate(
                 context=context,
-                tools=effective.model_tool_catalog,
+                tools=tool_catalog,
                 instructions=instructions,
             )
             for tool_request in response.tool_requests:
