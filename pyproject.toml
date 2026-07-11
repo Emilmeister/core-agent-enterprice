@@ -1,0 +1,9 @@
+[project]
+name = "core-agent"
+version = "0.1.0"
+description = "A2A agent runtime and MCP memory service"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
