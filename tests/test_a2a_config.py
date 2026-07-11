@@ -3,6 +3,8 @@ import time
 import unittest
 
 from core_agent.a2a import (
+    APPROVAL_REQUEST_URI,
+    APPROVAL_RESPONSE_URI,
     CORE_EXTENSION_URI,
     A2AService,
     AgentCard,
@@ -12,10 +14,18 @@ from core_agent.a2a import (
     Task,
     TaskState,
     map_core_state,
+    parse_approval_decision,
     parse_run_request,
 )
-from core_agent.config import AgentConfig, PlatformConfig, RunRequest, compile_effective_config
+from core_agent.config import (
+    AgentConfig,
+    PlatformConfig,
+    RunRequest,
+    compile_effective_config,
+)
 from core_agent.errors import CoreError
+from core_agent.runtime import ApprovalNeeded
+from core_agent.tools import ApprovalRequest
 
 
 def platform_config(**changes):
@@ -121,7 +131,9 @@ def request(*, memory_required=False, extra_mcp=(), skills=("database-review",))
         {
             "prompt": "Do the work",
             "mcp": mcp,
-            "skills": [{"name": name, "source": f"file:///skills/{name}"} for name in skills],
+            "skills": [
+                {"name": name, "source": f"file:///skills/{name}"} for name in skills
+            ],
         }
     )
 
@@ -148,7 +160,9 @@ class RunRequestTests(unittest.TestCase):
         parsed = RunRequest.from_dict({"prompt": "ok", "mcp": [], "skills": []})
         self.assertEqual(parsed.prompt, "ok")
         with self.assertRaises(CoreError) as caught:
-            RunRequest.from_dict({"prompt": "ok", "mcp": [], "skills": [], "session_id": "x"})
+            RunRequest.from_dict(
+                {"prompt": "ok", "mcp": [], "skills": [], "session_id": "x"}
+            )
         self.assertEqual(caught.exception.code, "INVALID_REQUEST")
 
     def test_prompt_must_be_nonempty_and_mcp_names_unique(self):
@@ -175,7 +189,9 @@ class RunRequestTests(unittest.TestCase):
             context_id="context-1",
         )
         parsed = parse_run_request(message, requested_extensions={CORE_EXTENSION_URI})
-        self.assertEqual(parsed.to_dict(), {"prompt": "Fix the test", "mcp": [], "skills": []})
+        self.assertEqual(
+            parsed.to_dict(), {"prompt": "Fix the test", "mcp": [], "skills": []}
+        )
         self.assertNotIn("prompt", message.metadata[CORE_EXTENSION_URI])
 
     def test_required_extension_and_content_type_are_validated_before_work(self):
@@ -194,10 +210,54 @@ class RunRequestTests(unittest.TestCase):
             parse_run_request(unsupported, requested_extensions={CORE_EXTENSION_URI})
         self.assertEqual(caught.exception.code, "CONTENT_TYPE_NOT_SUPPORTED")
 
+    def test_approval_decision_is_a_separate_exact_a2a_extension(self):
+        message = Message(
+            role="user",
+            parts=(Part("data", {"decision": "approve"}),),
+            extensions=(APPROVAL_RESPONSE_URI,),
+            metadata={
+                APPROVAL_RESPONSE_URI: {
+                    "approval_id": "approval-1",
+                    "decision": "approve",
+                    "scope": "single_call",
+                }
+            },
+        )
+        decision = parse_approval_decision(
+            message, requested_extensions={APPROVAL_RESPONSE_URI}
+        )
+        self.assertEqual(decision.approval_id, "approval-1")
+        self.assertEqual(decision.decision, "approve")
+        self.assertNotIn(CORE_EXTENSION_URI, message.metadata)
+        message.metadata[APPROVAL_RESPONSE_URI]["arguments"] = {"changed": True}
+        with self.assertRaises(CoreError) as caught:
+            parse_approval_decision(message, {APPROVAL_RESPONSE_URI})
+        self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+
+    def test_approval_request_redacts_sensitive_arguments(self):
+        request = ApprovalRequest(
+            "approval-1",
+            "call-1",
+            "external.publish",
+            "digest",
+            ("external_write",),
+            {
+                "target": "org/repo",
+                "access_token": "plain-secret",
+                "nested": {"password": "also-secret"},
+            },
+        )
+        payload = ApprovalNeeded("run-1", request).to_payload()
+        self.assertEqual(payload["arguments"]["target"], "org/repo")
+        self.assertEqual(payload["arguments"]["access_token"], "[REDACTED]")
+        self.assertEqual(payload["arguments"]["nested"]["password"], "[REDACTED]")
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_effective_config_is_intersection_with_deny_precedence(self):
-        effective = compile_effective_config(platform_config(), agent_config(), request(), DISCOVERED)
+        effective = compile_effective_config(
+            platform_config(), agent_config(), request(), DISCOVERED
+        )
         self.assertEqual(
             effective.builtin_tools,
             frozenset(
@@ -213,9 +273,12 @@ class ConfigurationTests(unittest.TestCase):
                 }
             ),
         )
-        self.assertEqual(effective.mcp_tools["repo"], frozenset({"search", "read_file"}))
         self.assertEqual(
-            effective.mcp_tools["memory"], frozenset({"search", "read", "create", "update", "split"})
+            effective.mcp_tools["repo"], frozenset({"search", "read_file"})
+        )
+        self.assertEqual(
+            effective.mcp_tools["memory"],
+            frozenset({"search", "read", "create", "update", "split"}),
         )
         self.assertEqual(effective.skills, frozenset({"database-review"}))
         with self.assertRaises(dataclasses.FrozenInstanceError):
@@ -224,22 +287,36 @@ class ConfigurationTests(unittest.TestCase):
     def test_memory_disabled_removes_optional_server_tools_and_policy(self):
         raw = agent_config().to_dict()
         raw["features"]["memory"] = "disabled"
-        effective = compile_effective_config(platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED)
+        effective = compile_effective_config(
+            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
+        )
         self.assertNotIn("memory", effective.mcp_tools)
         self.assertNotIn("memory", effective.enabled_capability_policies)
-        self.assertTrue(any(w.code == "CAPABILITY_FILTERED" and w.capability == "memory" for w in effective.warnings))
+        self.assertTrue(
+            any(
+                w.code == "CAPABILITY_FILTERED" and w.capability == "memory"
+                for w in effective.warnings
+            )
+        )
 
     def test_required_memory_fails_when_disabled_or_missing(self):
         raw = agent_config().to_dict()
         raw["features"]["memory"] = "disabled"
         with self.assertRaises(CoreError) as caught:
-            compile_effective_config(platform_config(), AgentConfig.from_dict(raw), request(memory_required=True), DISCOVERED)
+            compile_effective_config(
+                platform_config(),
+                AgentConfig.from_dict(raw),
+                request(memory_required=True),
+                DISCOVERED,
+            )
         self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
 
         raw["features"]["memory"] = "required"
         no_memory = RunRequest.from_dict({"prompt": "x", "mcp": [], "skills": []})
         with self.assertRaises(CoreError) as caught:
-            compile_effective_config(platform_config(), AgentConfig.from_dict(raw), no_memory, {})
+            compile_effective_config(
+                platform_config(), AgentConfig.from_dict(raw), no_memory, {}
+            )
         self.assertEqual(caught.exception.code, "REQUIRED_CAPABILITY_MISSING")
 
     def test_unknown_config_field_and_conflicting_delegation_are_rejected(self):
@@ -258,15 +335,21 @@ class ConfigurationTests(unittest.TestCase):
     def test_disabled_tool_is_not_discoverable_and_stale_call_is_denied(self):
         raw = agent_config().to_dict()
         raw["tools"]["builtins"]["deny"] = ["core.terminal.exec"]
-        effective = compile_effective_config(platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED)
+        effective = compile_effective_config(
+            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
+        )
         self.assertNotIn("core.terminal.exec", effective.model_tool_catalog)
         with self.assertRaises(CoreError) as caught:
             effective.require_tool("core.terminal.exec")
         self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
 
     def test_effective_digest_is_stable_and_contains_no_secrets(self):
-        effective_a = compile_effective_config(platform_config(), agent_config(), request(), DISCOVERED)
-        effective_b = compile_effective_config(platform_config(), agent_config(), request(), DISCOVERED)
+        effective_a = compile_effective_config(
+            platform_config(), agent_config(), request(), DISCOVERED
+        )
+        effective_b = compile_effective_config(
+            platform_config(), agent_config(), request(), DISCOVERED
+        )
         self.assertEqual(effective_a.digest, effective_b.digest)
         self.assertNotIn("TOKEN", effective_a.audit_snapshot)
         self.assertNotIn("secret", effective_a.audit_snapshot.lower())
@@ -294,13 +377,19 @@ class A2ATests(unittest.TestCase):
     def test_agent_card_reflects_effective_capabilities(self):
         raw = agent_config().to_dict()
         raw["features"]["memory"] = "disabled"
-        effective = compile_effective_config(platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED)
+        effective = compile_effective_config(
+            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
+        )
         card = AgentCard.from_effective_config(effective)
         encoded = card.to_dict()
         self.assertEqual(encoded["supportedInterfaces"][0]["protocolVersion"], "1.0")
         self.assertTrue(encoded["capabilities"]["streaming"])
         self.assertNotIn("memory", encoded["skills"])
         self.assertNotIn("memory", str(encoded["capabilities"]).lower())
+        extensions = {item["uri"]: item["required"] for item in encoded["extensions"]}
+        self.assertTrue(extensions[CORE_EXTENSION_URI])
+        self.assertFalse(extensions[APPROVAL_REQUEST_URI])
+        self.assertFalse(extensions[APPROVAL_RESPONSE_URI])
 
     def test_nonblocking_task_survives_stream_disconnect_and_is_queryable(self):
         def handler(run_request, task_context):
@@ -327,14 +416,23 @@ class A2ATests(unittest.TestCase):
             handler=lambda request, context: Artifact.text("ok"),
             agent_card=AgentCard.minimal("test"),
         )
-        task = service.send_message(Message.from_run_request(request()), return_immediately=True)
+        task = service.send_message(
+            Message.from_run_request(request()), return_immediately=True
+        )
         service.register_push(task.id, delivered.append)
         terminal = service.wait_for_terminal(task.id, timeout=1)
         service.redeliver_push(task.id)
-        unique = {(event.task_id, event.sequence, event.revision) for event in delivered}
+        unique = {
+            (event.task_id, event.sequence, event.revision) for event in delivered
+        }
         self.assertLessEqual(len(unique), len(delivered))
-        self.assertEqual(sorted(event.sequence for event in terminal.history), [event.sequence for event in terminal.history])
-        self.assertEqual(len({event.sequence for event in terminal.history}), len(terminal.history))
+        self.assertEqual(
+            sorted(event.sequence for event in terminal.history),
+            [event.sequence for event in terminal.history],
+        )
+        self.assertEqual(
+            len({event.sequence for event in terminal.history}), len(terminal.history)
+        )
         service.close()
 
     def test_terminal_task_rejects_more_messages_and_cancel_is_idempotent(self):
@@ -342,7 +440,9 @@ class A2ATests(unittest.TestCase):
             handler=lambda request, context: Artifact.text("ok"),
             agent_card=AgentCard.minimal("test"),
         )
-        task = service.send_message(Message.from_run_request(request()), return_immediately=True)
+        task = service.send_message(
+            Message.from_run_request(request()), return_immediately=True
+        )
         terminal = service.wait_for_terminal(task.id, timeout=1)
         with self.assertRaises(CoreError) as caught:
             service.send_to_task(terminal.id, Message.user("more"))

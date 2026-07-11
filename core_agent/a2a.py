@@ -14,6 +14,8 @@ from .config import RunRequest
 from .errors import CoreError
 
 CORE_EXTENSION_URI = "urn:core-agent:run-capabilities:v1"
+APPROVAL_REQUEST_URI = "urn:core-agent:approval-request:v1"
+APPROVAL_RESPONSE_URI = "urn:core-agent:approval-response:v1"
 
 
 class TaskState(str, Enum):
@@ -111,6 +113,39 @@ def parse_run_request(message, requested_extensions):
 
 
 @dataclass(frozen=True)
+class ApprovalDecision:
+    approval_id: str
+    decision: str
+    scope: str
+
+
+def parse_approval_decision(message, requested_extensions):
+    if (
+        APPROVAL_RESPONSE_URI not in requested_extensions
+        or APPROVAL_RESPONSE_URI not in message.extensions
+    ):
+        raise CoreError("A2A_EXTENSION_REQUIRED")
+    payload = message.metadata.get(APPROVAL_RESPONSE_URI)
+    if not isinstance(payload, dict) or set(payload) != {
+        "approval_id",
+        "decision",
+        "scope",
+    }:
+        raise CoreError("INVALID_REQUEST")
+    if (
+        not isinstance(payload["approval_id"], str)
+        or not payload["approval_id"]
+        or payload["decision"] not in {"approve", "deny"}
+        or not isinstance(payload["scope"], str)
+        or not payload["scope"]
+    ):
+        raise CoreError("INVALID_REQUEST")
+    return ApprovalDecision(
+        payload["approval_id"], payload["decision"], payload["scope"]
+    )
+
+
+@dataclass(frozen=True)
 class Artifact:
     id: str
     parts: tuple[Part, ...]
@@ -178,6 +213,10 @@ class AgentCard:
     output_modes: tuple[str, ...] = ("text/plain", "application/json")
     authentication: tuple[str, ...] = ()
     extensions: tuple[str, ...] = (CORE_EXTENSION_URI,)
+    optional_extensions: tuple[str, ...] = (
+        APPROVAL_REQUEST_URI,
+        APPROVAL_RESPONSE_URI,
+    )
 
     @classmethod
     def minimal(cls, name, protocol_versions=("1.0",)):
@@ -206,7 +245,10 @@ class AgentCard:
             "defaultInputModes": list(self.input_modes),
             "defaultOutputModes": list(self.output_modes),
             "securitySchemes": list(self.authentication),
-            "extensions": [{"uri": uri, "required": True} for uri in self.extensions],
+            "extensions": [
+                *({"uri": uri, "required": True} for uri in self.extensions),
+                *({"uri": uri, "required": False} for uri in self.optional_extensions),
+            ],
         }
 
 

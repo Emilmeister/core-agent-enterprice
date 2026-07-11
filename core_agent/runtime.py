@@ -9,9 +9,34 @@ import threading
 from .config import AgentConfig, RunRequest, compile_effective_config
 from .context import ContextItem, ContextState
 from .errors import CoreError
+from .security import redact
 from .skills import SkillResolver
 from .tasks import DelegationContract
 from .tools import ApprovalRequest, ToolCall, ToolResult
+
+
+def _redact_approval_arguments(value):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            normalized = key.lower().replace("-", "_")
+            sensitive = any(
+                marker in normalized
+                for marker in (
+                    "authorization",
+                    "password",
+                    "private_key",
+                    "secret",
+                    "token",
+                )
+            )
+            cleaned[key] = (
+                "[REDACTED]" if sensitive else _redact_approval_arguments(item)
+            )
+        return cleaned
+    if isinstance(value, list):
+        return [_redact_approval_arguments(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -37,6 +62,32 @@ class RunResult:
                 "tool_calls": self.usage.tool_calls,
             },
         }
+
+
+@dataclass(frozen=True)
+class ApprovalNeeded:
+    run_id: str
+    request: ApprovalRequest
+
+    def to_payload(self):
+        arguments = _redact_approval_arguments(redact(self.request.arguments))
+        return {
+            "reason": "approval_required",
+            "approval_id": self.request.id,
+            "tool_call_id": self.request.tool_call_id,
+            "tool": self.request.tool_name,
+            "summary": f"Approve {self.request.tool_name}",
+            "arguments": arguments,
+            "argument_digest": self.request.argument_digest,
+            "risks": list(self.request.risks),
+            "scope_options": list(self.request.scope_options),
+        }
+
+
+@dataclass
+class _SuspendedRun:
+    generator: object
+    approval: ApprovalNeeded
 
 
 class CoreAgent:
@@ -70,7 +121,10 @@ class CoreAgent:
         self.compactor = compactor
         self.token_counter = token_counter or (lambda text: max(1, len(text) // 4))
         self.depth = depth
-        self._current_run = threading.local()
+        self._run_contexts = {}
+        self._suspended = {}
+        self._task_approvals = {}
+        self._suspended_lock = threading.Lock()
         self.tool_runtime.handlers.update(
             {
                 "core.task.start": self._task_start,
@@ -180,7 +234,7 @@ class CoreAgent:
     def _delegate(self, arguments, run_id):
         contract = DelegationContract.from_dict(arguments)
         raw = self.agent_config.to_dict()
-        request, effective = self._current_run.value
+        request, effective = self._run_contexts[run_id]
         parent_budget = {
             "turns": raw.get("budgets", {}).get("model_turns", 100),
             "tool_calls": raw.get("budgets", {}).get("tool_calls", 200),
@@ -284,7 +338,7 @@ class CoreAgent:
         )
         return self._task_snapshot(task)
 
-    def run(self, request):
+    def _run_loop(self, request, identity, session_id):
         if isinstance(request, dict):
             request = RunRequest.from_dict(request)
         if not isinstance(request, RunRequest):
@@ -307,7 +361,6 @@ class CoreAgent:
         effective = compile_effective_config(
             self.platform_config, self.agent_config, request, discovered
         )
-        self._current_run.value = (request, effective)
         skill_resolver = SkillResolver(
             [item for item in request.skills if item.get("name") in effective.skills]
         )
@@ -317,6 +370,7 @@ class CoreAgent:
             if skill.name.lower() in request.prompt.lower()
         ]
         run_id = str(uuid.uuid4())
+        self._run_contexts[run_id] = (request, effective)
         self.audit_log.append(
             run_id,
             "config.snapshot",
@@ -391,19 +445,58 @@ class CoreAgent:
                     )
                     result_text = json.dumps(outcome, sort_keys=True, default=str)
                 else:
+                    call = ToolCall(
+                        tool_request.id, tool_request.name, tool_request.arguments
+                    )
                     outcome = self.tool_runtime.execute(
-                        ToolCall(
-                            tool_request.id, tool_request.name, tool_request.arguments
-                        ),
+                        call,
                         run_id=run_id,
+                        identity=identity,
+                        session_id=session_id,
                     )
                     if isinstance(outcome, ApprovalRequest):
-                        raise CoreError(
-                            "APPROVAL_REQUIRED", data={"approval_id": outcome.id}
+                        self.audit_log.append(
+                            run_id,
+                            "approval.required",
+                            {
+                                "approval_id": outcome.id,
+                                "tool_call_id": outcome.tool_call_id,
+                                "argument_digest": outcome.argument_digest,
+                            },
                         )
+                        self.event_store.append(
+                            run_id,
+                            "approval.required",
+                            {"approval_id": outcome.id},
+                        )
+                        self.checkpoint_store.save(
+                            run_id,
+                            self.event_store.revision(run_id),
+                            {
+                                "state": "waiting_approval",
+                                "approval_id": outcome.id,
+                                "tool_call_id": outcome.tool_call_id,
+                                "argument_digest": outcome.argument_digest,
+                                "effective_config_digest": effective.digest,
+                                "context_sequence_range": context_state.sequence_range,
+                            },
+                        )
+                        decision = yield ApprovalNeeded(run_id, outcome)
+                        if decision == "approve":
+                            outcome = self.tool_runtime.resume_approved(
+                                call, outcome.id, run_id=run_id
+                            )
+                        else:
+                            outcome = ToolResult(call.id, "denied")
                     if isinstance(outcome, ToolResult):
                         result_text = json.dumps(
-                            self._value(outcome.output), sort_keys=True, default=str
+                            {
+                                "tool_call_id": outcome.tool_call_id,
+                                "status": outcome.status,
+                                "output": self._value(outcome.output),
+                            },
+                            sort_keys=True,
+                            default=str,
                         )
                 result_item = ContextItem(
                     "tool_result", result_text, self.token_counter(result_text)
@@ -434,5 +527,86 @@ class CoreAgent:
                 )
         raise CoreError("BUDGET_EXCEEDED")
 
+    def _advance(self, generator, *, task_id=None, decision=None):
+        try:
+            outcome = next(generator) if decision is None else generator.send(decision)
+        except StopIteration as completed:
+            if isinstance(completed.value, RunResult):
+                self._run_contexts.pop(completed.value.run_id, None)
+            if task_id is not None:
+                with self._suspended_lock:
+                    self._suspended.pop(task_id, None)
+            return completed.value
+        if not isinstance(outcome, ApprovalNeeded):
+            generator.close()
+            raise CoreError("INVALID_TASK_STATE")
+        if task_id is None:
+            generator.close()
+            raise CoreError(
+                "APPROVAL_REQUIRED", data={"approval_id": outcome.request.id}
+            )
+        with self._suspended_lock:
+            self._suspended[task_id] = _SuspendedRun(generator, outcome)
+            self._task_approvals[task_id] = outcome.request.id
+        return outcome
+
+    def run(self, request, *, task_id=None, identity=None, session_id=None):
+        return self._advance(
+            self._run_loop(request, identity, session_id), task_id=task_id
+        )
+
+    def resume_approval(
+        self,
+        task_id,
+        approval_id,
+        decision,
+        *,
+        scope="single_call",
+        identity=None,
+        session_id=None,
+    ):
+        if decision not in {"approve", "deny"}:
+            raise CoreError("INVALID_REQUEST")
+        with self._suspended_lock:
+            suspended = self._suspended.get(task_id)
+            if not suspended:
+                if self._task_approvals.get(task_id) == approval_id:
+                    raise CoreError("APPROVAL_ALREADY_RESOLVED")
+                raise CoreError("APPROVAL_NOT_FOUND")
+            if suspended.approval.request.id != approval_id:
+                raise CoreError("APPROVAL_NOT_FOUND")
+            if (
+                suspended.approval.request.identity != identity
+                or suspended.approval.request.session_id != session_id
+            ):
+                raise CoreError("POLICY_DENIED")
+            if scope not in suspended.approval.request.scope_options:
+                raise CoreError("INVALID_REQUEST")
+            self._suspended.pop(task_id)
+        self.tool_runtime.approvals.resolve(approval_id, decision, scope=scope)
+        run_id = suspended.approval.run_id
+        self.audit_log.append(
+            run_id,
+            "approval.resolved",
+            {"approval_id": approval_id, "decision": decision, "scope": scope},
+        )
+        self.event_store.append(
+            run_id,
+            "approval.resolved",
+            {"approval_id": approval_id, "decision": decision},
+        )
+        self.checkpoint_store.save(
+            run_id,
+            self.event_store.revision(run_id),
+            {"state": "working", "approval_id": approval_id},
+        )
+        return self._advance(suspended.generator, task_id=task_id, decision=decision)
+
     def close(self):
+        with self._suspended_lock:
+            for suspended in self._suspended.values():
+                suspended.generator.close()
+            self._suspended.clear()
+            self._task_approvals.clear()
+        self._run_contexts.clear()
         self.task_scheduler.close()

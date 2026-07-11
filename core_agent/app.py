@@ -4,7 +4,7 @@ import atexit
 import json
 import os
 
-from .a2a import AgentCard, Artifact
+from .a2a import APPROVAL_REQUEST_URI, AgentCard, ApprovalDecision, Artifact
 from .a2a_sdk import build_starlette_app
 from .audit import InMemoryAuditLog
 from .config import AgentConfig, PlatformConfig
@@ -14,7 +14,7 @@ from .execution import LocalTerminalBackend, TerminalSessionManager
 from .mcp import StreamableHttpMcpConnector
 from .model import CompatibleHttpModel
 from .observability import RecordingExporter, Telemetry
-from .runtime import CoreAgent
+from .runtime import ApprovalNeeded, CoreAgent
 from .tasks import TaskScheduler
 from .tools import (
     ApprovalManager,
@@ -265,8 +265,39 @@ def create_app(*, model=None, mcp_connector=None, base_url=None):
     model = model or _model()
     agent, telemetry = _agent(model, mcp_connector)
 
-    def handle(request, _context):
-        result = agent.run(request)
+    def handle(request, context):
+        user = context.call_context.user
+        identity = user.user_name if user.is_authenticated else "anonymous"
+        result = (
+            agent.resume_approval(
+                context.task_id,
+                request.approval_id,
+                request.decision,
+                scope=request.scope,
+                identity=identity,
+                session_id=context.context_id,
+            )
+            if isinstance(request, ApprovalDecision)
+            else agent.run(
+                request,
+                task_id=context.task_id,
+                identity=identity,
+                session_id=context.context_id,
+            )
+        )
+        while (
+            isinstance(result, ApprovalNeeded)
+            and APPROVAL_REQUEST_URI not in context.requested_extensions
+        ):
+            result = agent.resume_approval(
+                context.task_id,
+                result.request.id,
+                "deny",
+                identity=identity,
+                session_id=context.context_id,
+            )
+        if isinstance(result, ApprovalNeeded):
+            return result
         return Artifact.text(result.message, {"run_id": result.run_id})
 
     host = os.getenv("CORE_AGENT_HOST", "0.0.0.0")

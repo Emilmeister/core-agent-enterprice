@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 from google.protobuf import json_format
+from google.protobuf.struct_pb2 import Value
 
 from a2a.server.agent_execution import AgentExecutor
 from a2a.server.request_handlers import DefaultRequestHandler
@@ -15,13 +17,24 @@ from a2a.types import (
     AgentInterface as SdkAgentInterface,
     AgentSkill as SdkAgentSkill,
     Part as SdkPart,
+    Message as SdkMessage,
+    Role as SdkRole,
     Task as SdkTask,
     TaskState as SdkTaskState,
     TaskStatus as SdkTaskStatus,
 )
 from starlette.applications import Starlette
 
-from .a2a import Artifact, Message, Part, parse_run_request
+from .a2a import (
+    APPROVAL_REQUEST_URI,
+    APPROVAL_RESPONSE_URI,
+    Artifact,
+    Message,
+    Part,
+    parse_approval_decision,
+    parse_run_request,
+)
+from .runtime import ApprovalNeeded
 
 
 def to_sdk_agent_card(card, *, base_url):
@@ -29,7 +42,11 @@ def to_sdk_agent_card(card, *, base_url):
         streaming=bool(card.capabilities.get("streaming")),
         push_notifications=bool(card.capabilities.get("pushNotifications")),
         extensions=[
-            SdkAgentExtension(uri=uri, required=True) for uri in card.extensions
+            *(SdkAgentExtension(uri=uri, required=True) for uri in card.extensions),
+            *(
+                SdkAgentExtension(uri=uri, required=False)
+                for uri in card.optional_extensions
+            ),
         ],
     )
     return SdkAgentCard(
@@ -65,17 +82,32 @@ class CoreAgentExecutor(AgentExecutor):
     def _message(context):
         message = context.message
         metadata = json_format.MessageToDict(message.metadata) if message else {}
-        parts = tuple(
-            Part.text(part.text)
-            for part in (message.parts if message else ())
-            if part.text
-        )
+        parts = []
+        for part in message.parts if message else ():
+            if part.text:
+                parts.append(Part.text(part.text))
+            elif part.HasField("data"):
+                parts.append(Part("data", json_format.MessageToDict(part.data)))
         return Message(
             role="user",
-            parts=parts,
+            parts=tuple(parts),
             extensions=tuple(message.extensions if message else ()),
             metadata=metadata,
             context_id=context.context_id,
+        )
+
+    @staticmethod
+    def _approval_message(context, approval):
+        payload = approval.to_payload()
+        data = json_format.ParseDict(payload, Value())
+        return SdkMessage(
+            message_id=str(uuid.uuid4()),
+            task_id=context.task_id,
+            context_id=context.context_id,
+            role=SdkRole.ROLE_AGENT,
+            parts=[SdkPart(data=data, media_type="application/json")],
+            metadata={APPROVAL_REQUEST_URI: payload},
+            extensions=[APPROVAL_REQUEST_URI],
         )
 
     async def execute(self, context, event_queue):
@@ -91,10 +123,24 @@ class CoreAgentExecutor(AgentExecutor):
             )
         await updater.start_work()
         try:
-            request = parse_run_request(
-                self._message(context), context.requested_extensions
+            message = self._message(context)
+            command = (
+                parse_approval_decision(message, context.requested_extensions)
+                if APPROVAL_RESPONSE_URI in message.extensions
+                else parse_run_request(message, context.requested_extensions)
             )
-            artifact = await asyncio.to_thread(self.handler, request, context)
+            artifact = await asyncio.to_thread(self.handler, command, context)
+            if isinstance(artifact, ApprovalNeeded):
+                if APPROVAL_REQUEST_URI not in context.requested_extensions:
+                    raise ValueError(
+                        "client did not negotiate approval request extension"
+                    )
+                await updater.update_status(
+                    SdkTaskState.TASK_STATE_INPUT_REQUIRED,
+                    message=self._approval_message(context, artifact),
+                    metadata={"reason": "approval_required"},
+                )
+                return
             if not isinstance(artifact, Artifact):
                 artifact = Artifact.text(str(artifact))
             await updater.add_artifact(

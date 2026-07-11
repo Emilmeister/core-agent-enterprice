@@ -256,7 +256,7 @@ class ToolRuntime:
     def _emit(self, kind, **data):
         self.event_sink(RuntimeEvent(kind, data))
 
-    def execute(self, call, *, run_id):
+    def execute(self, call, *, run_id, identity=None, session_id=None):
         self._emit("tool.requested", call_id=call.id)
         definition = self.registry.get(call.name)
         if _contains_private_reasoning(call.arguments) or not _validate(
@@ -270,7 +270,12 @@ class ToolRuntime:
             return ToolResult(call.id, "denied")
         if decision == "require_approval":
             self._emit("approval.requested", call_id=call.id)
-            return self.approvals.request(call, risks=definition.risk_tags)
+            return self.approvals.request(
+                call,
+                risks=definition.risk_tags,
+                identity=identity,
+                session_id=session_id,
+            )
         self._emit("policy.allowed", call_id=call.id)
         return self._execute(call, run_id)
 
@@ -294,6 +299,13 @@ class ToolRuntime:
         request = self.approvals.get(approval_id)
         if request.decision != "approve":
             raise CoreError("APPROVAL_DENIED")
+        definition = self.registry.get(call.name)
+        if _contains_private_reasoning(call.arguments) or not _validate(
+            definition.input_schema, call.arguments
+        ):
+            raise CoreError("TOOL_ARGUMENT_INVALID")
+        if self.policy.evaluate(definition) == "deny":
+            raise CoreError("POLICY_DENIED")
         if (
             request.tool_call_id != call.id
             or request.tool_name != call.name
