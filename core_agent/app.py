@@ -74,16 +74,33 @@ def _model():
     )
 
 
-def _agent(model):
+def _agent(model, mcp_connector=None):
     servers = set(_csv("CORE_AGENT_ALLOWED_MCP_SERVERS", "memory"))
+    allowed_skills = set(_csv("CORE_AGENT_ALLOWED_SKILLS"))
     mcp_tools = _allowed_mcp_tools(servers)
+    builtin_tools = {
+        "core.terminal.exec",
+        "core.task.start",
+        "core.task.get",
+        "core.task.list",
+        "core.task.wait",
+        "core.task.cancel",
+        "core.delegate",
+    }
     platform = PlatformConfig(
-        allowed_builtin_tools={"core.terminal.exec"},
+        allowed_builtin_tools=builtin_tools,
         denied_builtin_tools=set(),
         allowed_mcp_servers=servers,
         denied_mcp_tools={},
-        allowed_skills=set(),
-        supported_features={"memory", "mcp", "terminal", "filesystem_mutation"},
+        allowed_skills=allowed_skills,
+        supported_features={
+            "memory",
+            "mcp",
+            "terminal",
+            "filesystem_mutation",
+            "background_tasks",
+            "delegation",
+        },
         max_model_turns=int(os.getenv("CORE_AGENT_MAX_MODEL_TURNS", "100")),
         max_tool_calls=int(os.getenv("CORE_AGENT_MAX_TOOL_CALLS", "200")),
     )
@@ -100,18 +117,18 @@ def _agent(model):
             "model": {"route": model.model},
             "features": {
                 "memory": os.getenv("CORE_AGENT_MEMORY", "optional"),
-                "background_tasks": False,
-                "delegation": False,
+                "background_tasks": True,
+                "delegation": True,
                 "terminal": True,
                 "filesystem_mutation": True,
                 "mcp": True,
-                "skills": False,
+                "skills": bool(allowed_skills),
                 "human_input": False,
             },
             "tools": {
                 "builtins": {
                     "default": "deny",
-                    "allow": ["core.terminal.exec"],
+                    "allow": sorted(builtin_tools),
                     "deny": [],
                 },
                 "mcp": {
@@ -120,7 +137,7 @@ def _agent(model):
                     "allow_tools": mcp_tools,
                 },
             },
-            "skills": {"default": "deny", "allow": []},
+            "skills": {"default": "deny", "allow": sorted(allowed_skills)},
             "context": {
                 "compact_at_working_ratio": 0.90,
                 "compact_to_working_ratio": 0.15,
@@ -131,6 +148,7 @@ def _agent(model):
             "budgets": {
                 "model_turns": platform.max_model_turns,
                 "tool_calls": platform.max_tool_calls,
+                "depth": int(os.getenv("CORE_AGENT_MAX_DEPTH", "3")),
             },
         }
     )
@@ -159,6 +177,60 @@ def _agent(model):
             risk_tags=frozenset() if trusted else frozenset({"local_execution"}),
         )
     )
+    task_definitions = {
+        "core.task.start": (
+            "Start allowed tool work in the background and return its task handle.",
+            {
+                "tool": {"type": "string"},
+                "arguments": {"type": "object"},
+                "required": {"type": "boolean"},
+            },
+            ["tool", "arguments"],
+        ),
+        "core.task.get": (
+            "Get an owned background task snapshot.",
+            {"task_id": {"type": "string"}},
+            ["task_id"],
+        ),
+        "core.task.list": ("List background tasks owned by this agent run.", {}, []),
+        "core.task.wait": (
+            "Passively wait for an owned task or timeout.",
+            {"task_id": {"type": "string"}, "timeout": {"type": "number"}},
+            ["task_id"],
+        ),
+        "core.task.cancel": (
+            "Request cancellation of an owned background task.",
+            {"task_id": {"type": "string"}},
+            ["task_id"],
+        ),
+        "core.delegate": (
+            "Start a focused child Core Agent with an exact capability contract.",
+            {
+                "instruction": {"type": "string"},
+                "tools": {"type": "array", "items": {"type": "string"}},
+                "mcp": {"type": "object"},
+                "skills": {"type": "array", "items": {"type": "string"}},
+                "budget": {"type": "object"},
+                "result_schema": {"type": "string"},
+            },
+            ["instruction", "tools", "mcp", "skills", "budget"],
+        ),
+    }
+    for name, (description, properties, required) in task_definitions.items():
+        registry.register(
+            ToolDefinition(
+                name,
+                description,
+                {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+                mutating=False,
+                risk_tags=frozenset(),
+            )
+        )
     sessions = TerminalSessionManager(
         LocalTerminalBackend(os.getenv("LOCAL_WORKSPACE_ROOT", "/tmp/core-agent/runs"))
     )
@@ -178,9 +250,8 @@ def _agent(model):
         agent_config=config,
         model=model,
         tool_runtime=tools,
-        mcp_connector=StreamableHttpMcpConnector(
-            headers=_json("CORE_AGENT_MCP_HEADERS_JSON")
-        ),
+        mcp_connector=mcp_connector
+        or StreamableHttpMcpConnector(headers=_json("CORE_AGENT_MCP_HEADERS_JSON")),
         task_scheduler=TaskScheduler(telemetry),
         event_store=InMemoryEventStore(),
         checkpoint_store=CheckpointStore(),
@@ -190,9 +261,9 @@ def _agent(model):
     return agent, telemetry
 
 
-def create_app():
-    model = _model()
-    agent, telemetry = _agent(model)
+def create_app(*, model=None, mcp_connector=None, base_url=None):
+    model = model or _model()
+    agent, telemetry = _agent(model, mcp_connector)
 
     def handle(request, _context):
         result = agent.run(request)
@@ -200,7 +271,7 @@ def create_app():
 
     host = os.getenv("CORE_AGENT_HOST", "0.0.0.0")
     port = int(os.getenv("CORE_AGENT_PORT", "8000"))
-    base_url = os.getenv("CORE_AGENT_BASE_URL", f"http://localhost:{port}")
+    base_url = base_url or os.getenv("CORE_AGENT_BASE_URL", f"http://localhost:{port}")
     app = build_starlette_app(
         agent_card=AgentCard.minimal(os.getenv("CORE_AGENT_NAME", "core-agent")),
         handler=handle,
@@ -213,6 +284,7 @@ def create_app():
         telemetry.shutdown()
 
     atexit.register(close)
+    app.state.close = close
     app.state.bind = (host, port)
     return app
 

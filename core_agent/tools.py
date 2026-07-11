@@ -237,13 +237,20 @@ class InformationRequest:
 
 class ToolRuntime:
     def __init__(
-        self, registry, policy, approvals, environment_manager, event_sink=None
+        self,
+        registry,
+        policy,
+        approvals,
+        environment_manager,
+        event_sink=None,
+        handlers=None,
     ):
         self.registry = registry
         self.policy = policy
         self.approvals = approvals
         self.environment_manager = environment_manager
         self.event_sink = event_sink or (lambda event: None)
+        self.handlers = dict(handlers or {})
         self.execution_count = 0
 
     def _emit(self, kind, **data):
@@ -270,6 +277,10 @@ class ToolRuntime:
     def _execute(self, call, run_id):
         self._emit("tool.started", call_id=call.id)
         self.execution_count += 1
+        if call.name in self.handlers:
+            result = self.handlers[call.name](call.arguments, run_id)
+            self._emit("tool.completed", call_id=call.id)
+            return ToolResult(call.id, "succeeded", result)
         request = (
             call.arguments
             if call.name == "core.terminal.exec"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import json
 import uuid
 from urllib.parse import urlparse
@@ -167,7 +168,14 @@ class StreamableHttpMcpConnector:
         declaration = self._servers[server]
         endpoint = declaration["transport"]["url"]
         parsed = urlparse(endpoint)
-        if parsed.scheme != "https":
+        loopback = parsed.hostname == "localhost"
+        try:
+            loopback = (
+                loopback or ipaddress.ip_address(parsed.hostname or "").is_loopback
+            )
+        except ValueError:
+            pass
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
             raise CoreError("MCP_CONNECTION_FAILED")
         payload = {"jsonrpc": "2.0", "method": method}
         if not notification:

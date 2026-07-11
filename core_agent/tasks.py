@@ -129,14 +129,20 @@ class TaskScheduler:
         threading.Thread(target=run, daemon=True).start()
         return task
 
-    def get(self, task_id):
+    def get(self, task_id, *, owner_id=None):
         try:
-            return self._tasks[task_id]
+            task = self._tasks[task_id]
         except KeyError:
             raise CoreError("TASK_NOT_FOUND") from None
+        if owner_id is not None and task.owner_id != owner_id:
+            raise CoreError("POLICY_DENIED")
+        return task
 
-    def wait(self, task_id, timeout=None):
-        task = self.get(task_id)
+    def list(self, *, owner_id):
+        return tuple(task for task in self._tasks.values() if task.owner_id == owner_id)
+
+    def wait(self, task_id, timeout=None, *, owner_id=None):
+        task = self.get(task_id, owner_id=owner_id)
         end = None if timeout is None else time.monotonic() + timeout
         with task.condition:
             while task.state not in {"completed", "failed", "canceled"}:
@@ -146,8 +152,8 @@ class TaskScheduler:
                 task.condition.wait(remaining)
         return task
 
-    def cancel(self, task_id):
-        task = self.get(task_id)
+    def cancel(self, task_id, *, owner_id=None):
+        task = self.get(task_id, owner_id=owner_id)
         if (
             task.state in {"completed", "failed", "canceled"}
             or task.cancel_event.is_set()
