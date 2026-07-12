@@ -152,28 +152,15 @@ User-facing progress и requests передаются Messages/Task status. Crit
 
 ## Human-in-the-loop
 
-Approval или новые данные переводят A2A Task в `input-required` и прикладывают Message:
+Remote input и local approval имеют разные contracts:
 
-- `reason: approval_required` содержит approval ID, точный effect, redacted arguments, risks и scope options;
-- `reason: information_required` содержит typed response schema;
-- authentication использует `auth-required`, а не маскируется под approval.
+- новые бизнес-данные от caller используют `input-required` с typed schema;
+- caller-resolvable auth использует `auth-required`;
+- local operator approval оставляет Task в `working` и публикует informational wait Message.
 
-Клиент отвечает новым Message существующей Task. Approval response использует structured Part:
+RemoteCaller не получает approval ID, exact arguments, decision schema, operator URL/token или право продолжить Task approval-сообщением. Optional owner-controlled extension сообщает только `callerActionRequired=false`, `callerCanApprove=false`, `callerCanDeny=false`, отсутствие выполненного side effect и разрешённые tracking/cancel operations.
 
-```json
-{
-  "type": "urn:core-agent:approval-response:v1",
-  "approval_id": "apr_01...",
-  "decision": "approve",
-  "scope": "single_call"
-}
-```
-
-Approval request использует `urn:core-agent:approval-request:v1`; response — `urn:core-agent:approval-response:v1`. Оба URI объявляются optional в Agent Card, но HITL client opt-in перечисляет их в binding service parameters. Response Message сохраняет исходные `taskId` и `contextId`, не повторяет `mcp`/`skills` и не создаёт новый RunRequest.
-
-До response Task остаётся interrupted, а pending tool не стартует. `approve` возобновляет сохранённый exact call после повторной policy/digest проверки; `deny` продолжает тот же loop с denied ToolResult. Approval decision не является prompt и не передаётся модели как пользовательская инструкция.
-
-Повторная или устаревшая decision возвращает stable Core error `APPROVAL_ALREADY_RESOLVED`, отображённую в A2A error/status semantics.
+Protected action frozen и hashed внутри ServingAgent. Только private operator control plane может создать single-use reservation; execution gate повторно проверяет digest. `SendMessage` locked Task отклоняется без изменения proposal, а `CancelTask` участвует в атомарной race до reservation. Полный contract: [Local operator HITL](local-operator-hitl.md).
 
 ## Cancellation и passive wait
 

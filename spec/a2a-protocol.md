@@ -45,40 +45,23 @@ Extension payload содержит ровно:
 
 `prompt` не дублируется в metadata. Auth, tenant, trace context, budgets и policy не становятся extension fields.
 
-## HITL approval extensions
+## Local operator HITL extension
 
-Human approval использует стандартный interrupted lifecycle A2A и две optional structured extensions:
+Protected action разрешает только local operator ServingAgent через private control plane. Remote A2A caller никогда не получает approval request/response capability и не может изменить pending decision сообщением, metadata, extension или credential.
 
-- `urn:core-agent:approval-request:v1` — server status Message с запросом решения;
-- `urn:core-agent:approval-response:v1` — client continuation Message с решением.
+`WAITING_LOCAL_APPROVAL` проецируется как `working`, а не `input-required`/`auth-required`. Current Task status сохраняет понятный text Message: решение принимает local operator; caller не может approve/deny; side effect ещё не выполнен; caller может GetTask/subscribe/push/cancel.
 
-Agent Card объявляет обе extensions как optional. HITL-capable HTTP client перечисляет их в `A2A-Extensions`; каждый Message также перечисляет фактически используемый URI в `Message.extensions` и кладёт payload под тем же ключом в `Message.metadata`/structured Part.
+Agent Card объявляет одну optional informational extension с configurable owner URI `LOCAL_APPROVAL_EXTENSION_URI`. Она сообщает `authorizationOwner=serving_agent_local_operator`, `callerActionRequired=false`, `callerCanApprove=false`, `callerCanDeny=false`, `protectedActionExecuted=false`, allowed tracking/cancel operations, wait timestamp и status version. В extension нет incoming decision schema, approval ID, URL или token. Extension-unaware caller получает тот же core A2A lifecycle и достаточный text status.
 
-Approval request переводит существующую Task в `input-required`, но не завершает её. Status Message содержит `reason: approval_required`, stable `approval_id`, `tool_call_id`, tool, human-readable effect, redacted arguments, risks, `scope_options` и digest нормализованных arguments. Raw secrets, hidden reasoning и unrestricted environment не публикуются.
-
-Client продолжает ровно ту же Task новым Message с теми же `taskId` и `contextId`:
-
-```json
-{
-  "approval_id": "apr_01...",
-  "decision": "approve",
-  "scope": "single_call"
-}
-```
-
-`decision` принимает только `approve` или `deny`. Identity/tenant/authorization берутся из authenticated A2A call context, а не из payload. Capability extension `urn:core-agent:run-capabilities:v1` повторно не передаётся и не может расширить snapshot suspended run.
-
-Valid decision атомарно фиксируется в audit/event log, после чего Task возвращается в `working`. `approve` возобновляет сохранённый точный tool call; `deny` добавляет model-facing denied ToolResult и продолжает loop. Duplicate, stale, чужой tenant/session, неизвестный approval ID, изменённый argument digest или decision после terminal Task отклоняются без side effect.
-
-До публикации `input-required` runtime MUST сохранить pending call, argument digest, context/checkpoint revision, effective capability snapshot и approval expiry. Recovery восстанавливает тот же approval ID. Crash между approval commit и tool completion использует side-effect intent/idempotency contract и не повторяет неизвестный внешний effect автоматически.
+Message, адресованный locked Task, отклоняется с `TASK_LOCKED_AWAITING_LOCAL_OPERATOR` без изменения frozen proposal. Только A2A `CancelTask` может выиграть race до execution reservation. Полный authority, digest, transaction, recovery и audit contract определён в [Local operator HITL](local-operator-hitl.md).
 
 ## Task mapping
 
 | Core state | A2A Task state | Дополнительная семантика |
 |---|---|---|
 | `CREATED`, `QUEUED` | `submitted` | задача принята, worker ещё не выполняет turn |
-| `RUNNING`, `WAITING_TASK`, `PAUSED`, `RECOVERING` | `working` | точная причина доступна в безопасном status metadata |
-| `WAITING_INPUT`, `WAITING_APPROVAL` | `input-required` | `reason` различает input и approval |
+| `RUNNING`, `WAITING_TASK`, `WAITING_LOCAL_APPROVAL`, `APPROVED_RESERVED`, `PAUSED`, `RECOVERING` | `working` | точная причина доступна в безопасном status metadata |
+| `WAITING_INPUT` | `input-required` | caller должен предоставить новые бизнес-данные |
 | `WAITING_AUTH` | `auth-required` | требуется credential/auth flow |
 | `COMPLETED` | `completed` | результаты представлены Artifacts |
 | `FAILED`, `ABORTED` | `failed` | error metadata различает обычную ошибку и unsafe continuation |
@@ -113,7 +96,7 @@ Core Agent MUST поддерживать A2A operations, необходимые 
 ## Artifacts и Messages
 
 - Итоговые и промежуточные результаты задачи публикуются как Artifacts с content parts, media type, digest и provenance.
-- Messages используются для общения, progress summary, input/approval request и ответа человека.
+- Messages используются для общения, progress summary и remote input request; local approval не является A2A Message flow.
 - Partial artifact updates идемпотентны и имеют stable artifact ID/version.
 - Secret, hidden reasoning и raw sensitive tool output MUST NOT попадать в Message или Artifact без явной data policy.
 

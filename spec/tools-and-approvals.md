@@ -95,63 +95,23 @@ AgentConfig в пределах PlatformConfig задаёт один режим:
 
 Явная просьба в prompt выполнить действие учитывается как intent, но MUST NOT автоматически отменять требования host policy.
 
-## Approval request
+## Local operator approval
 
-Перед ожиданием ядро переводит A2A Task в `input-required` с `reason: approval_required` и прикладывает Message с нормализованным payload:
-
-```json
-{
-  "type": "urn:core-agent:approval-request:v1",
-  "data": {
-    "approval_id": "apr_01...",
-    "tool_call_id": "call_01...",
-    "tool": "github.create_issue",
-    "summary": "Создать публичный issue в org/repo",
-    "arguments": {},
-    "risks": ["external_write", "acts_as_user"],
-    "scope_options": ["single_call", "session:github.create_issue:org/repo"]
-  }
-}
-```
-
-Требования:
-
-- summary объясняет эффект понятным языком;
-- arguments редактированы от секретов, но достаточно точны для решения;
-- default scope всегда `single_call`;
-- более широкий grant MUST быть выбран человеком явно и ограничен tool, action, resource, session, expiry и argument constraints;
-- approval связан с digest нормализованных arguments;
-- любое изменение arguments аннулирует approval и требует нового;
-- до `approve` tool MUST NOT начинать side effect;
-- `deny` возвращается модели как tool result;
-- отмена запуска автоматически отклоняет все ожидающие approvals.
-
-Approval timeout задаётся хостом. По истечении времени решение трактуется как `deny`, audit получает `approval.resolved`, A2A Task обновляет status, затем agent loop получает отказ.
-
-## A2A pause и resume
-
-Approval не является отдельным transport API. Runtime использует optional A2A extensions `urn:core-agent:approval-request:v1` и `urn:core-agent:approval-response:v1` поверх стандартного `input-required` lifecycle, определённого в [A2A protocol](a2a-protocol.md#hitl-approval-extensions).
+Risky action создаёт immutable ToolProposal и single-use ApprovalRequest по [Local operator HITL contract](local-operator-hitl.md). A2A Task остаётся `working`; RemoteCaller не видит approval ID/arguments и не может approve, deny или модифицировать proposal. Решение приходит только через private operator control plane.
 
 Порядок обязателен:
 
-1. записать tool intent, pending call, digest, effective policy version и checkpoint;
-2. убедиться, что tool/process/network side effect ещё не начался;
-3. опубликовать `input-required` request Message;
-4. принять continuation только для той же Task/context и authenticated principal;
-5. атомарно записать approve/deny до возобновления loop;
-6. на approve повторно проверить policy, expiry, revocation и исходный digest;
-7. выполнить call ровно один раз либо вернуть `SIDE_EFFECT_UNKNOWN`, если recovery не может доказать outcome;
-8. на deny не выполнять call и вернуть модели нормализованный denied ToolResult.
+1. валидировать call и детерминированно вычислить policy decision;
+2. заморозить proposal и digest, включающий task/tenant/caller/tool/environment/target/arguments/policy;
+3. атомарно сохранить proposal, pending approval, `WAITING_LOCAL_APPROVAL`, durable A2A status и outbox;
+4. опубликовать A2A `working` status без sensitive action details;
+5. принять local `APPROVE_ONCE`/`DENY` только из operator auth context;
+6. на approve атомарно создать единственную execution reservation и consume approval;
+7. перед dispatch повторно проверить policy, active task и digest фактического call;
+8. выполнить call at-most-once в нормальном flow, используя downstream idempotency/reconciliation где возможно;
+9. на deny/expiry/cancel не выполнять call и вернуть безопасный outcome workflow-у.
 
-Новый model turn не запрашивается между approval request и решением. Suspended context остаётся pinned; клиентский decision не интерпретируется как обычный user prompt и не может менять tool arguments. Следующий model turn происходит только после применения approve/deny result.
-
-Если client не объявил HITL extensions, risky call остаётся неисполненным. Policy MAY вернуть denied ToolResult или завершить Task как rejected; она MUST NOT трактовать отсутствие UI как approval.
-
-## Grants и отзыв разрешения
-
-Одобренный reusable grant хранит issuer, policy version, normalized scope, issued/expiry timestamps и audit provenance. Перед каждым использованием policy engine повторно проверяет identity, session, tool, action, resource, argument constraints, expiry, usage count и revocation.
-
-Пользователь или оператор может отозвать grant. Отзыв влияет на новые calls и не отменяет уже завершённый side effect.
+Reusable grants и operator edits отсутствуют в v1. Любое изменение action создаёт новый proposal и approval. Development `ApproveAllControlPlane` допустим только как local-only stub, проходит тот же reservation path и запрещён production policy.
 
 ## Elicitation и дополнительные вопросы
 

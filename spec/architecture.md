@@ -7,11 +7,13 @@ Core Agent — stateful orchestration kernel с портами для модел
 ## Подсистемы
 
 ```text
-Client / peer agent
-        |
-     A2A server ---- Control plane
-        |                 |
-   Run orchestrator -- Policy engine
+Remote caller                 Local operator
+      |                             |
+ A2A server                  Private control plane
+      |                             |
+      +------ Run orchestrator -----+
+                    |
+              Policy/execution gate
      /   |   |   \
  Model Context Tool  Skill/MCP managers ---- Memory MCP Service
  router engine runtime      |
@@ -47,9 +49,9 @@ A2A является основным внешним контрактом: Agent
 
 Разрешает версии, проверяет integrity/signature, строит discovery catalog и лениво загружает инструкции/resources.
 
-### Policy engine
+### Policy и local approval
 
-Принимает нормализованный proposed action и возвращает `allow`, `deny` или `require_approval` с причиной и допустимым scope grant. Его решение нельзя переопределить model output-ом.
+Policy engine принимает нормализованный proposed action и возвращает `AUTO_ALLOW`, `DENY` или `REQUIRE_LOCAL_APPROVAL`. При local approval orchestrator замораживает proposal/digest, durable-переходит в `WAITING_LOCAL_APPROVAL`, а private control plane атомарно создаёт single-use execution reservation. A2A caller не является approver; полный contract определён в [Local operator HITL](local-operator-hitl.md).
 
 ### Durable state
 
@@ -75,7 +77,7 @@ tenant
 ```text
 CREATED -> VALIDATING -> QUEUED -> RUNNING
                                 |-> WAITING_INPUT
-                                |-> WAITING_APPROVAL
+                                |-> WAITING_LOCAL_APPROVAL -> APPROVED_RESERVED
                                 |-> WAITING_AUTH
                                 |-> WAITING_TASK
                                 |-> PAUSED
@@ -83,7 +85,7 @@ CREATED -> VALIDATING -> QUEUED -> RUNNING
                                 `-> COMPLETED | FAILED | CANCELLED | REJECTED | ABORTED
 ```
 
-- `WAITING_*` и `PAUSED` являются durable: worker может освободить ресурсы.
+- `WAITING_*`, `APPROVED_RESERVED` и `PAUSED` являются durable: worker может освободить ресурсы.
 - `WAITING_TASK` означает пассивное ожидание background task без busy polling и без занятого model worker.
 - `ABORTED` означает, что continuation невозможно доказать безопасным.
 - Переход записывается в event log до публикации соответствующего события.

@@ -6,25 +6,26 @@ from pathlib import Path
 SPEC_ROOT = Path(__file__).resolve().parents[1] / "spec"
 
 EXPECTED_SHA256 = {
-    "README.md": "b49c132e19b067cf0b00541fe058c505edd2b99f5c8dd6205854fe2b60e93df7",
-    "a2a-protocol.md": "9d0142c7798bba8ae356c1b2f6abefb128b30c7fbce378906c3adfb8c21c2a37",
-    "acceptance.md": "71c2b6c93c484adabe3590babc4c4ddbda51772ec9a48f9bccaee116bee53fe5",
-    "agent-configuration.md": "980e69d713a3752f19181c55a82384843200911115ff544451d31f14edc3617b",
-    "architecture.md": "07a09535cf5a0385e873dba65376cd96ee2465337b69f8e6cb326cbd73894625",
+    "README.md": "e478bcddb3da73db2953192303faaf709dc660b2f1c7203923483650bddd578d",
+    "a2a-protocol.md": "304c24ad5bee3d8619f34443ef753c4bf519b1e4aa10308b7b8960069c69f917",
+    "acceptance.md": "5414d2e1458e41370716c6c8664321941c24587c16a2d421e8bffff2b1d2adf8",
+    "agent-configuration.md": "961751aac36926b751880bf2a235aa3f1b9814b621b5c880ae87f28ee4040d02",
+    "architecture.md": "6d7df59a4e4a2e90f83885db74d83069f64dc357554f5177ed081276f814faec",
     "context.md": "c07d21e77d2fc719e4d1e22b4d9583055abbbef4d8ffbbd79f1d0d36d33cde21",
     "development-process.md": "3f0c3cd6881394705a921bbd767efddc56d5290c259b7ca9312eca13dc05a4c9",
     "execution-environment.md": "e9614ae9596c9e39a6b1a235e5ca50e17cbee10bb2855c71b0907e2016b4096e",
     "kernel-instructions.md": "37b2b9f0940c909c75d09d451737f511897cc2d2ed8e46675ea6bc95dc0112b7",
+    "local-operator-hitl.md": "c34bbce98d6756e58a2fb1b56f01013906ee755a83c9cb229010a453d4fc0543",
     "memory-service.md": "239b55fc8b03aed70b55dfd786ada85c6763ed5ddd9b8d999bfb0854a8bcb1b8",
     "observability.md": "21f498a5ea4652bd20ac9c2a3b7c9055cb24eed4eb25ee7f95d72eb64c59299f",
     "product.md": "4722378a59ab5fee77b38d2eba9a86efa7feb2d5b8721e1f499f1677790099c3",
-    "public-contract.md": "80b38aa18de0c4064773f7f7d3fdef5bb5b39bc1c792451952bdd505a4f93a3a",
-    "releases/v1.md": "6df535c551f7e44f16e160ace2e663f65ee62ee9fe81f1db85177d1ff7cbf33a",
-    "runtime.md": "b9581c4067be45e64c71023da57141bfd15f2008aeaa92fdb82c96f470bc94da",
+    "public-contract.md": "e8f464ff5183130f80ec18b0cc5a67b1112401ebdefdfa0644d566ed96ebff1f",
+    "releases/v1.md": "c945ce2cc5371c4358c4c0d06bf65f88c8cc57ea25aca5389d9e0853f3c66132",
+    "runtime.md": "af4e8cabd3ece77e47c92f2205d7166ac456889e86881429a3c28b6e7b011237",
     "security-and-reliability.md": "78438365e7f140c7372964f37070f37e7a75d8efb66a6251277740129c955df7",
     "skills.md": "7102b91a2f574ea5b75c02688a14ed5da7bbafc7d19b66b159330eae09600426",
     "tasks-and-delegation.md": "123b5f1b94c8e0ed5c3b92e3f0109b8c9a31a15ed9c258f8a26edb2568c0ce10",
-    "tools-and-approvals.md": "57ca2b9b4af2df493851c49e15433d71e214ecdb452e455ac7eef2883d184818",
+    "tools-and-approvals.md": "221ef341680f16d4ca7794311f92c51f0e91183abfadd8de9cc902b71cd1915c",
 }
 
 

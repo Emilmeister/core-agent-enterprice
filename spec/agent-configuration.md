@@ -51,6 +51,11 @@ context:
   compact_to_working_ratio: 0.15
 approval:
   mode: on_risk
+  local_operator:
+    enabled: true
+    extension_uri: urn:core-agent:local-operator-approval:v1
+    default_ttl_seconds: 7200
+    suggested_poll_seconds: 15
 execution:
   environment_profile: local-pty
 observability:
@@ -69,7 +74,9 @@ observability:
 - `mcp`: boolean;
 - `skills`: boolean;
 - `human_input`: boolean;
-- `reusable_approval_grants`: boolean.
+- `local_operator_approval`: boolean; отключение при protected action означает fail closed.
+
+Production config MUST задать owner-controlled HTTPS `extension_uri` и настоящий private operator control plane. `ApproveAllControlPlane` разрешён только development profile и не может включаться входным RunRequest.
 
 `disabled` memory означает:
 

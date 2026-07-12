@@ -29,20 +29,21 @@ Core Agent превращает три входа — `prompt`, `mcp` и `skills
 2. [Архитектура](architecture.md) — подсистемы, состояния, durability и расширяемость.
 3. [Конфигурация агента](agent-configuration.md) — feature switches, tools, MCP, memory mode и effective capabilities.
 4. [A2A protocol](a2a-protocol.md) — основной внешний transport, Task lifecycle и notifications.
-5. [Публичный контракт](public-contract.md) — отображение `prompt + MCP + skills` на A2A.
-6. [Kernel instructions](kernel-instructions.md) — защищённые правила ядра и порядок инструкций.
-7. [Runtime и reasoning](runtime.md) — agent loop, model routing и восстановление.
-8. [Фоновые задачи и делегирование](tasks-and-delegation.md) — async tasks, ожидание и сабагенты.
-9. [Memory MCP Service](memory-service.md) — Markdown, graph/NER, hybrid search и file lifecycle.
-10. [Контекст и суммаризация](context.md) — расчёт 90%, compaction до 10–15% и гарантии.
-11. [Skills](skills.md) — формат, registry, выбор и progressive disclosure.
-12. [Инструменты и approvals](tools-and-approvals.md) — built-ins, MCP и human-in-the-loop.
-13. [Local terminal sessions](execution-environment.md) — отдельные PTY/process groups/workspaces main и сабагентов в одном container.
-14. [Безопасность и надёжность](security-and-reliability.md) — trust boundaries и ошибки.
-15. [Наблюдаемость](observability.md) — OpenTelemetry, события, метрики, трассировка и evals.
-16. [Критерии готовности продукта](acceptance.md) — сквозные свойства целевого ядра.
-17. [Spec-driven процесс](development-process.md) — как менять спецификацию и связывать её с реализацией.
-18. [Профиль поставки v1](releases/v1.md) — первый вертикальный срез целевой спецификации.
+5. [Local operator HITL](local-operator-hitl.md) — authority boundary, frozen action, private approval и A2A wait projection.
+6. [Публичный контракт](public-contract.md) — отображение `prompt + MCP + skills` на A2A.
+7. [Kernel instructions](kernel-instructions.md) — защищённые правила ядра и порядок инструкций.
+8. [Runtime и reasoning](runtime.md) — agent loop, model routing и восстановление.
+9. [Фоновые задачи и делегирование](tasks-and-delegation.md) — async tasks, ожидание и сабагенты.
+10. [Memory MCP Service](memory-service.md) — Markdown, graph/NER, hybrid search и file lifecycle.
+11. [Контекст и суммаризация](context.md) — расчёт 90%, compaction до 10–15% и гарантии.
+12. [Skills](skills.md) — формат, registry, выбор и progressive disclosure.
+13. [Инструменты и approvals](tools-and-approvals.md) — built-ins, MCP и human-in-the-loop.
+14. [Local terminal sessions](execution-environment.md) — отдельные PTY/process groups/workspaces main и сабагентов в одном container.
+15. [Безопасность и надёжность](security-and-reliability.md) — trust boundaries и ошибки.
+16. [Наблюдаемость](observability.md) — OpenTelemetry, события, метрики, трассировка и evals.
+17. [Критерии готовности продукта](acceptance.md) — сквозные свойства целевого ядра.
+18. [Spec-driven процесс](development-process.md) — как менять спецификацию и связывать её с реализацией.
+19. [Профиль поставки v1](releases/v1.md) — первый вертикальный срез целевой спецификации.
 
 ## Нормативные слова
 

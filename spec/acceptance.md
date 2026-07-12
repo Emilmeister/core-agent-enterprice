@@ -123,14 +123,17 @@
 
 - [ ] Tool arguments валидируются до policy и execution.
 - [ ] MCP tools/resources/prompts/sampling/elicitation проходят local policy независимо от server metadata.
-- [ ] Risky call не начинается до действительного approval точных arguments.
-- [ ] Reusable grant ограничен identity/session/action/resource/arguments/expiry/revocation.
-- [ ] Input request не используется как скрытый approval; auth использует отдельный state.
-- [ ] A2A HITL client получает `input-required` с `urn:core-agent:approval-request:v1`, а не failed Task.
-- [ ] Approve/deny Message продолжает ту же task/context через `urn:core-agent:approval-response:v1` и не пересоздаёт RunRequest.
-- [ ] До approve execution count и side effects неизменны; deny возвращает модели denied ToolResult.
-- [ ] Duplicate/stale/wrong-task approval и изменённый argument digest отклоняются без выполнения.
-- [ ] A2A status/Message показывает понятный effect без secret/chain-of-thought.
+- [ ] Risky call не начинается до local `APPROVE_ONCE`, exact digest commit и unique execution reservation.
+- [ ] RemoteCaller не меняет approval через text, metadata, A2A extension, caller credential или подставленный operator ID.
+- [ ] Local wait проецируется как `working`, никогда как `input-required`/`auth-required`; GetTask восстанавливает informative current status.
+- [ ] Optional extension сообщает `callerActionRequired=false` и не содержит incoming decision schema, approval ID/URL/token или arguments.
+- [ ] Locked-task `SendMessage` не меняет proposal/approval; только `CancelTask` может отменить до reservation.
+- [ ] Frozen proposal/digest связан с task/tenant/caller/tool/environment/target/arguments/policy; mutation создаёт новый approval.
+- [ ] Duplicate/racing approve/deny создают одно решение и одну reservation; approve/cancel obey first committed transition.
+- [ ] Перед dispatch повторно проверяются active task, policy, expiry, identity scope и recomputed digest.
+- [ ] Deny/expiry/cancel не выполняют action; secret и operator identity отсутствуют в A2A/OTel/public artifacts.
+- [ ] Restart сохраняет approval ID/digest/current status; reserved execution не получает вторую reservation или blind retry.
+- [ ] Internal audit связывает task, proposal, approval, operator actor, digest, execution и outcome и недоступен RemoteCaller.
 
 ## OpenTelemetry
 
@@ -164,7 +167,7 @@
 9. **Parallel terminals:** main и два child одновременно работают в разных PTY/workspaces, не смешивают output и завершают только свои process groups.
 10. **OTel causality:** Core MCP client и Memory Service indexing spans находятся в одном distributed trace без content leakage.
 11. **Внешнее действие:** MCP write ждёт approval, переживает recovery и выполняется ровно один раз.
-12. **A2A HITL:** risky terminal call даёт `input-required`; approve той же Task выполняет exact argv один раз, deny не запускает process, duplicate decision отклоняется.
+12. **Local operator HITL:** risky terminal call публикует A2A `working`; caller не может resolve/modify approval, local control plane создаёт одну reservation exact argv, а cancel/deny/expiry не запускают process.
 
 ## Definition of Done
 
