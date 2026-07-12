@@ -1,9 +1,15 @@
+import json
+import os
 import re
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 from pathlib import Path
 
 from memory_service.errors import MemoryServiceError
+from memory_service.mcp_server import main as memory_main
+from memory_service.providers import HttpEmbeddingProvider, HttpEntityExtractor
 from memory_service.service import MemoryService
 
 
@@ -58,6 +64,76 @@ class ToggleExtractor:
                 }
             )
         return {"entities": entities, "relations": []}
+
+
+class ProviderResponse:
+    def __init__(self, value):
+        self.value = json.dumps(value).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self, limit):
+        return self.value[:limit]
+
+
+class ProductionProviderTests(unittest.TestCase):
+    def test_http_embedding_and_ner_validate_and_normalize_typed_responses(self):
+        embedding = HttpEmbeddingProvider(
+            "https://provider.example/embeddings", "embed-model", api_key="secret"
+        )
+        with patch(
+            "memory_service.providers.urlopen",
+            return_value=ProviderResponse({"data": [{"embedding": [3, 4]}]}),
+        ) as request:
+            self.assertEqual(embedding.embed("private text"), (0.6, 0.8))
+        sent = request.call_args.args[0]
+        self.assertEqual(sent.headers["Authorization"], "Bearer secret")
+
+        extractor = HttpEntityExtractor(
+            "https://provider.example/ner", "ner-model"
+        )
+        response = {
+            "entities": [
+                {
+                    "text": "Alice",
+                    "type": "person",
+                    "start": 0,
+                    "end": 5,
+                    "confidence": 0.99,
+                }
+            ],
+            "relations": [],
+        }
+        with patch(
+            "memory_service.providers.urlopen",
+            return_value=ProviderResponse(response),
+        ):
+            self.assertEqual(extractor.extract("Alice works"), response)
+
+    def test_invalid_provider_response_is_bounded_public_error(self):
+        provider = HttpEmbeddingProvider("https://provider.example", "model")
+        with patch(
+            "memory_service.providers.urlopen",
+            return_value=ProviderResponse({"data": [{"embedding": [float("inf")]}]}),
+        ):
+            with self.assertRaises(MemoryServiceError) as caught:
+                provider.embed("never expose this input")
+        self.assertEqual(caught.exception.code, "MEMORY_PROVIDER_INVALID_RESPONSE")
+        self.assertNotIn("never expose", str(caught.exception))
+
+    def test_production_entrypoint_rejects_development_adapters(self):
+        with patch.dict(
+            os.environ,
+            {"MEMORY_ENVIRONMENT": "production", "MEMORY_ROOT": "/memory"},
+            clear=True,
+        ):
+            with self.assertRaises(MemoryServiceError) as caught:
+                memory_main()
+        self.assertEqual(caught.exception.code, "MEMORY_CONFIG_INVALID")
 
 
 class MemoryLimitTests(unittest.TestCase):
@@ -286,6 +362,75 @@ class MemoryMutationTests(unittest.TestCase):
         self.assertEqual(self.service.graph_mentions("Alice"), ())
         self.assertEqual(
             self.service.search("Alice", namespace="session/context-1").results, ()
+        )
+
+    def test_committed_revision_history_and_resolution_survive_restart(self):
+        self._create()
+        first_revision = self.service.read("mem-1").revision
+        self.service.update(
+            "mem-1",
+            {"replace_content": markdown("Bob founded Beta.")},
+            expected_file_revision=first_revision,
+        )
+        self.service.entity_resolve(
+            "entity:Beta", "entity:Beta_Corp", evidence="operator-confirmed"
+        )
+        expected_repository_revision = self.service.repository_revision
+        self.service.close()
+
+        self.service = MemoryService(
+            Path(self.temp.name), entity_extractor=self.extractor
+        )
+        self.assertEqual(
+            self.service.repository_revision, expected_repository_revision
+        )
+        self.assertEqual(self.service.read("mem-1").revision, 2)
+        self.assertEqual(
+            [item.revision for item in self.service.history("mem-1")], [1, 2]
+        )
+        self.assertEqual(self.service.graph_mentions("Alice"), ())
+        self.assertEqual(self.service.graph_mentions("Beta"), ("mem-1",))
+        self.assertEqual(self.service.resolve_entity("Beta"), "entity:Beta_Corp")
+
+    def test_incomplete_staging_revision_is_never_visible_after_restart(self):
+        self._create()
+        staging = (
+            Path(self.temp.name)
+            / ".memory-service"
+            / "revisions"
+            / "999"
+            / "files"
+        )
+        staging.mkdir(parents=True)
+        (staging / "uncommitted.md").write_text(
+            markdown("Mallory", memory_id="mem-uncommitted"), encoding="utf-8"
+        )
+        self.service.close()
+        self.service = MemoryService(
+            Path(self.temp.name), entity_extractor=self.extractor
+        )
+        self.assertEqual(self.service.repository_revision, 1)
+        with self.assertRaises(MemoryServiceError) as caught:
+            self.service.read("mem-uncommitted")
+        self.assertEqual(caught.exception.code, "NOT_FOUND")
+
+    def test_concurrent_writers_have_one_revision_winner(self):
+        def create(index):
+            try:
+                return self.service.create(
+                    f"session/{index}.md",
+                    markdown(str(index), memory_id=f"mem-{index}"),
+                    expected_repository_revision=0,
+                )
+            except MemoryServiceError as error:
+                return error
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(create, range(2)))
+        self.assertEqual(sum(not isinstance(item, Exception) for item in results), 1)
+        self.assertEqual(
+            [item.code for item in results if isinstance(item, MemoryServiceError)],
+            ["MEMORY_CONFLICT"],
         )
 
 

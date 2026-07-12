@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from .errors import MemoryServiceError
+from .providers import HttpEmbeddingProvider, HttpEntityExtractor
 from .service import MemoryService
 
 
@@ -49,12 +50,14 @@ def _guard(function):
     return call
 
 
-def build_memory_mcp(service):
+def build_memory_mcp(service, *, host="127.0.0.1", port=8000):
     mcp = FastMCP(
         "core-agent-memory",
         instructions=INSTRUCTIONS,
         stateless_http=True,
         json_response=True,
+        host=host,
+        port=port,
     )
 
     @mcp.tool(name="memory.search")
@@ -144,8 +147,77 @@ def build_memory_mcp(service):
 
 
 def main():
-    service = MemoryService(Path(os.environ.get("MEMORY_ROOT", "./memory")))
-    build_memory_mcp(service).run(transport="streamable-http")
+    environment = os.getenv("MEMORY_ENVIRONMENT", "development")
+    root = os.getenv("MEMORY_ROOT", "")
+    prefixes = tuple(
+        value.strip()
+        for value in os.getenv("MEMORY_ALLOWED_NAMESPACE_PREFIXES", "").split(",")
+        if value.strip()
+    )
+    embedding_endpoint = os.getenv("MEMORY_EMBEDDING_ENDPOINT", "")
+    embedding_model = os.getenv("MEMORY_EMBEDDING_MODEL", "")
+    ner_endpoint = os.getenv("MEMORY_NER_ENDPOINT", "")
+    ner_model = os.getenv("MEMORY_NER_MODEL", "")
+    if environment == "production" and not all(
+        (root, prefixes, embedding_endpoint, embedding_model, ner_endpoint, ner_model)
+    ):
+        raise MemoryServiceError("MEMORY_CONFIG_INVALID")
+    try:
+        timeout = float(os.getenv("MEMORY_PROVIDER_TIMEOUT_SECONDS", "30"))
+        port = int(os.getenv("MEMORY_PORT", "8000"))
+    except ValueError:
+        raise MemoryServiceError("MEMORY_CONFIG_INVALID") from None
+    if timeout <= 0 or not 1 <= port <= 65_535:
+        raise MemoryServiceError("MEMORY_CONFIG_INVALID")
+    embedding = (
+        HttpEmbeddingProvider(
+            embedding_endpoint,
+            embedding_model,
+            api_key=os.getenv("MEMORY_EMBEDDING_API_KEY"),
+            timeout=timeout,
+        )
+        if embedding_endpoint or embedding_model
+        else None
+    )
+    extractor = (
+        HttpEntityExtractor(
+            ner_endpoint,
+            ner_model,
+            api_key=os.getenv("MEMORY_NER_API_KEY"),
+            timeout=timeout,
+        )
+        if ner_endpoint or ner_model
+        else None
+    )
+
+    def authorize(namespace, _action):
+        return not prefixes or any(namespace.startswith(prefix) for prefix in prefixes)
+
+    telemetry = None
+    if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        from core_agent.observability import Telemetry
+
+        telemetry = Telemetry.otlp(
+            endpoint=os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"],
+            service_name="core-agent-memory",
+        )
+    service = MemoryService(
+        Path(root or "./memory"),
+        entity_extractor=extractor,
+        embedding_provider=embedding,
+        telemetry=telemetry,
+        namespace_authorizer=authorize,
+    )
+    try:
+        build_memory_mcp(
+            service,
+            host=os.getenv("MEMORY_HOST", "127.0.0.1"),
+            port=port,
+        ).run(transport="streamable-http")
+    finally:
+        service.close()
+        if telemetry:
+            telemetry.shutdown()
 
 
 if __name__ == "__main__":

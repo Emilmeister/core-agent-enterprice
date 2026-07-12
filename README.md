@@ -79,6 +79,23 @@ MODEL_API_KEY=your-key \
 uv run core-agent
 ```
 
+Production Memory MCP uses its own process and storage mount; Core only receives its MCP
+descriptor. Development can use the deterministic local adapters with `uv run core-agent-memory`.
+Production requires real embedding and NER providers:
+
+```bash
+MEMORY_ENVIRONMENT=production \
+MEMORY_ROOT=/mounted-s3/memory \
+MEMORY_ALLOWED_NAMESPACE_PREFIXES=session/ \
+MEMORY_EMBEDDING_ENDPOINT=https://embedding.example/v1/embeddings \
+MEMORY_EMBEDDING_MODEL=your-embedding-model \
+MEMORY_EMBEDDING_API_KEY=your-embedding-key \
+MEMORY_NER_ENDPOINT=https://ner.example/v1/extract \
+MEMORY_NER_MODEL=your-ner-model \
+MEMORY_NER_API_KEY=your-ner-key \
+uv run core-agent-memory
+```
+
 `MODEL_ENDPOINT` overrides the complete request URL. Providers with custom authentication can use
 `MODEL_HEADERS_JSON`; optional provider parameters belong in `MODEL_EXTRA_BODY_JSON`. An API key is
 not required for a local OpenAI-compatible server:

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import re
 import hashlib
+import os
+import shutil
+import threading
 from dataclasses import dataclass, replace
+from functools import wraps
 from pathlib import Path
 
 from .errors import MemoryServiceError
@@ -106,6 +111,15 @@ def _tokens(text):
     return re.findall(r"[a-z0-9_]+", text.lower())
 
 
+def _serialized(function):
+    @wraps(function)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return function(self, *args, **kwargs)
+
+    return call
+
+
 class MemoryService:
     COMPONENTS = ("markdown", "chunks", "bm25", "vectors", "ner", "graph")
 
@@ -119,6 +133,10 @@ class MemoryService:
     ):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._state_root = self.root / ".memory-service"
+        self._revisions_root = self._state_root / "revisions"
+        self._revisions_root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self.extractor = entity_extractor or _DefaultExtractor()
         self.embedding_provider = embedding_provider or _HashEmbeddingProvider()
         self.telemetry = telemetry
@@ -145,9 +163,15 @@ class MemoryService:
             raise MemoryServiceError("NOT_FOUND")
 
     def _load_from_markdown(self):
+        committed = self._committed_revisions()
+        if committed:
+            self._load_committed(committed)
+            return
         documents = {}
         paths = {}
         for path in sorted(self.root.rglob("*.md")):
+            if path.relative_to(self.root).parts[0] == ".memory-service":
+                continue
             try:
                 relative = str(path.relative_to(self.root))
                 content = path.read_text(encoding="utf-8")
@@ -179,6 +203,97 @@ class MemoryService:
             versions = self._history.setdefault(document.id, [])
             if not versions or versions[-1] != document:
                 versions.append(document)
+
+    def _committed_revisions(self):
+        revisions = []
+        for path in self._revisions_root.iterdir():
+            if path.name.isdigit() and (path / "manifest.json").is_file():
+                revisions.append(int(path.name))
+        return tuple(sorted(revisions))
+
+    def _manifest(self, revision):
+        path = self._revisions_root / str(revision) / "manifest.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise MemoryServiceError("MEMORY_INDEX_FAILED", str(error)) from error
+        if value.get("repository_revision") != revision:
+            raise MemoryServiceError("MEMORY_INDEX_FAILED", "invalid revision manifest")
+        return value
+
+    def _load_committed(self, revisions):
+        history = {}
+        latest_documents = {}
+        latest_paths = {}
+        latest_manifest = None
+        for repository_revision in revisions:
+            manifest = self._manifest(repository_revision)
+            prefix = self._revisions_root / str(repository_revision) / "files"
+            documents = {}
+            paths = {}
+            for relative, metadata in sorted(manifest["files"].items()):
+                try:
+                    content = (prefix / relative).read_text(encoding="utf-8")
+                except OSError as error:
+                    raise MemoryServiceError("MEMORY_INDEX_FAILED", str(error)) from error
+                digest = hashlib.sha256(content.encode()).hexdigest()
+                if digest != metadata["sha256"]:
+                    raise MemoryServiceError("MEMORY_INDEX_FAILED", "content digest mismatch")
+                document = self._parse(relative, content, metadata["file_revision"])
+                if document.id != metadata["memory_id"]:
+                    raise MemoryServiceError("MEMORY_INDEX_FAILED", "memory id mismatch")
+                documents[document.id] = document
+                paths[relative] = document.id
+                versions = history.setdefault(document.id, [])
+                if not versions or versions[-1] != document:
+                    versions.append(document)
+            latest_documents, latest_paths = documents, paths
+            latest_manifest = manifest
+        entities, links = self._derive(latest_documents)
+        self._documents, self._paths = latest_documents, latest_paths
+        self._entities, self._links = entities, links
+        self.repository_revision = revisions[-1]
+        self._index_revision = self.repository_revision
+        self._history = history
+        self._resolutions = dict(latest_manifest.get("resolutions", {}))
+        for revision in revisions:
+            self._status[revision] = IndexStatus(
+                {name: "ready" for name in self.COMPONENTS}
+            )
+
+    def _publish_revision(self, documents, repository_revision):
+        prefix = self._revisions_root / str(repository_revision)
+        committed = prefix / "manifest.json"
+        if committed.exists():
+            raise MemoryServiceError("MEMORY_CONFLICT")
+        shutil.rmtree(prefix, ignore_errors=True)
+        files_root = prefix / "files"
+        files_root.mkdir(parents=True)
+        manifest_files = {}
+        for document in sorted(documents.values(), key=lambda item: item.path):
+            target = files_root / document.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            encoded = document.content.encode()
+            with target.open("xb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            manifest_files[document.path] = {
+                "memory_id": document.id,
+                "file_revision": document.revision,
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+            }
+        manifest = {
+            "schema_version": 1,
+            "repository_revision": repository_revision,
+            "files": manifest_files,
+            "resolutions": dict(sorted(self._resolutions.items())),
+        }
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        with committed.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def _parse(self, path, content, revision):
         lines = content.splitlines()
@@ -263,19 +378,13 @@ class MemoryService:
         return entities, links
 
     def _commit(self, documents, paths, entities, links, writes, deletes=()):
-        for relative, content in writes:
-            path = self._safe_path(relative)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
-        for relative in deletes:
-            path = self._safe_path(relative)
-            if path.exists():
-                path.unlink()
+        next_revision = self.repository_revision + 1
+        self._publish_revision(documents, next_revision)
         self._documents = documents
         self._paths = paths
         self._entities = entities
         self._links = links
-        self.repository_revision += 1
+        self.repository_revision = next_revision
         self._index_revision = self.repository_revision
         self._status[self.repository_revision] = IndexStatus(
             {name: "ready" for name in self.COMPONENTS}
@@ -284,8 +393,18 @@ class MemoryService:
             versions = self._history.setdefault(document.id, [])
             if not versions or versions[-1] != document:
                 versions.append(document)
+        # Canonical mirrors are operator-readable; committed revisions remain authoritative.
+        for relative, content in writes:
+            path = self._safe_path(relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        for relative in deletes:
+            path = self._safe_path(relative)
+            if path.exists():
+                path.unlink()
         return MutationResult(True, self.repository_revision, self._index_revision)
 
+    @_serialized
     def create(
         self, path, content, expected_repository_revision=None, *, trace_carrier=None
     ):
@@ -339,6 +458,7 @@ class MemoryService:
         with publish_span:
             return self._commit(documents, paths, entities, links, [(path, content)])
 
+    @_serialized
     def read(self, memory_id):
         try:
             document = self._documents[memory_id]
@@ -354,6 +474,7 @@ class MemoryService:
     def list_documents(self):
         return tuple(sorted(self._documents.values(), key=lambda item: item.path))
 
+    @_serialized
     def update(self, memory_id, patch, *, expected_file_revision):
         current = self.read(memory_id)
         if expected_file_revision != current.revision:
@@ -373,6 +494,7 @@ class MemoryService:
             documents, dict(self._paths), entities, links, [(current.path, content)]
         )
 
+    @_serialized
     def split(self, memory_id, plan, *, expected_file_revision):
         current = self.read(memory_id)
         if expected_file_revision != current.revision:
@@ -414,6 +536,7 @@ class MemoryService:
             deletes,
         )
 
+    @_serialized
     def delete(self, memory_id, reason, *, expected_file_revision):
         current = self.read(memory_id)
         if expected_file_revision != current.revision:
@@ -427,6 +550,7 @@ class MemoryService:
         entities, links = self._derive(documents)
         return self._commit(documents, paths, entities, links, [], (current.path,))
 
+    @_serialized
     def move(self, memory_id, new_path, *, expected_file_revision):
         current = self.read(memory_id)
         if expected_file_revision != current.revision:
@@ -498,6 +622,7 @@ class MemoryService:
         else:
             self._channel_failures[channel] = reason or "unavailable"
 
+    @_serialized
     def search(self, query, *, namespace, filters=None, limit=10, trace_carrier=None):
         if not self.telemetry:
             return self._search(
@@ -636,13 +761,32 @@ class MemoryService:
         self._links = {}
         self._index_revision = 0
 
+    @_serialized
     def rebuild(self):
         self._load_from_markdown()
         self._entities, self._links = self._derive(self._documents)
         self._index_revision = self.repository_revision
 
+    @_serialized
     def entity_resolve(self, source, target, *, evidence):
-        self._resolutions[source.removeprefix("entity:")] = target
+        name = source.removeprefix("entity:")
+        previous = self._resolutions.get(name)
+        self._resolutions[name] = target
+        try:
+            entities, links = self._derive(self._documents)
+            self._commit(
+                dict(self._documents),
+                dict(self._paths),
+                entities,
+                links,
+                [],
+            )
+        except Exception:
+            if previous is None:
+                self._resolutions.pop(name, None)
+            else:
+                self._resolutions[name] = previous
+            raise
 
     def resolve_entity(self, name):
         return self._resolutions.get(name, f"entity:{name}")
