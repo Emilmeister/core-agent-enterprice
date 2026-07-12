@@ -210,3 +210,9 @@ Missing channel явно помечает degraded search. Candidate set и mode
 Memory Service MUST экспортировать OTel traces, metrics и logs через OTLP. Core MCP client передаёт W3C Trace Context; service создаёт spans для search, BM25, vector, graph, rerank, write validation, chunking, embeddings, NER, entity resolution и atomic publication.
 
 Memory content, query text и entity names выключены в telemetry по умолчанию. Memory service outage/degradation наблюдаемы как MCP outcome и не заставляют Core Agent незаметно перейти на другую память.
+
+## Production provider configuration
+
+Production process (`MEMORY_ENVIRONMENT=production`) MUST получить `MEMORY_ROOT`, непустой allowlist `MEMORY_ALLOWED_NAMESPACE_PREFIXES`, `MEMORY_EMBEDDING_ENDPOINT`/`MEMORY_EMBEDDING_MODEL` и `MEMORY_NER_ENDPOINT`/`MEMORY_NER_MODEL` из deployment config. API credentials передаются отдельно через `MEMORY_EMBEDDING_API_KEY` и `MEMORY_NER_API_KEY`, если endpoint требует authentication. Built-in hash embeddings и regex proper-name extractor являются только development/test adapters; production startup с ними запрещён.
+
+Embedding endpoint использует OpenAI-compatible embeddings request/response. NER endpoint принимает typed JSON `{model, text}` и возвращает bounded `{entities, relations}` с offsets, types и confidence. Оба adapter имеют timeout и response-size limit, валидируют shape/numeric values и не включают input text или credentials в public error, audit или telemetry.

@@ -17,7 +17,7 @@ EXPECTED_SHA256 = {
     "implementation-status.md": "ee35caa87850c4bd85050d7273bc834b83cfa6d9074e0dad7ae462f21b9d4570",
     "kernel-instructions.md": "37b2b9f0940c909c75d09d451737f511897cc2d2ed8e46675ea6bc95dc0112b7",
     "local-operator-hitl.md": "0b6ae37fb7f062bd83b380e74e580700baee28c9a73118a57e536537ac091e4f",
-    "memory-service.md": "239b55fc8b03aed70b55dfd786ada85c6763ed5ddd9b8d999bfb0854a8bcb1b8",
+    "memory-service.md": "176f9de2353423d742f04d256affdcb919967274e3509ae32f1f1dd16cfb204d",
     "observability.md": "21f498a5ea4652bd20ac9c2a3b7c9055cb24eed4eb25ee7f95d72eb64c59299f",
     "product.md": "4722378a59ab5fee77b38d2eba9a86efa7feb2d5b8721e1f499f1677790099c3",
     "public-contract.md": "e8f464ff5183130f80ec18b0cc5a67b1112401ebdefdfa0644d566ed96ebff1f",
