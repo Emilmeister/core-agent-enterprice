@@ -27,3 +27,9 @@ package = true
 [tool.uv.build-backend]
 module-name = ["core_agent", "memory_service"]
 module-root = ""
+
+[dependency-groups]
+dev = [
+    "pyyaml>=6.0,<7",
+    "ruff==0.15.21",
+]
