@@ -13,6 +13,7 @@ from core_agent.durability import (
 )
 from core_agent.errors import CoreError
 from core_agent.mcp import InMemoryMcpConnector
+from core_agent.kernel import KernelCompiler
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.observability import FailingExporter, RecordingExporter, Telemetry
 from core_agent.runtime import CoreAgent
@@ -142,7 +143,13 @@ def run_request(memory=True):
 
 
 def make_agent(
-    model, *, memory="optional", connector=None, telemetry=None, max_turns=10
+    model,
+    *,
+    memory="optional",
+    connector=None,
+    telemetry=None,
+    max_turns=10,
+    **agent_options,
 ):
     registry = ToolRegistry()
     registry.register(
@@ -176,6 +183,7 @@ def make_agent(
         checkpoint_store=CheckpointStore(),
         audit_log=InMemoryAuditLog(),
         telemetry=telemetry or Telemetry(RecordingExporter()),
+        **agent_options,
     )
 
 
@@ -245,6 +253,63 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("memory.search", model.calls[0].tools)
         self.assertIn("memory.read", model.calls[0].tools)
         self.assertNotIn("memory.delete", model.calls[0].tools)
+        agent.close()
+
+    def test_protected_kernel_is_compiled_persisted_and_cannot_be_replaced_by_profile(self):
+        model = ScriptedModel([ModelResponse(message="done")])
+        compiler = KernelCompiler(
+            "SAFETY IMMUTABLE",
+            "HOST EFFECTIVE CONFIG ONLY",
+            "KERNEL DURABLE RULES",
+            {"memory": "MEMORY AUTHORING CONTRACT"},
+        )
+        agent = make_agent(model, kernel_compiler=compiler)
+        result = agent.run(run_request(memory=True), task_id="kernel-task")
+        instructions = model.calls[0].instructions
+        self.assertLess(
+            instructions.index("KERNEL DURABLE RULES"),
+            instructions.index("Act as a test agent."),
+        )
+        self.assertIn("MEMORY AUTHORING CONTRACT", instructions)
+        record = agent.workflow_store.lookup_task("kernel-task")
+        self.assertEqual(record.snapshot["compiled_instructions"], instructions)
+        self.assertTrue(record.snapshot["protected_kernel_digest"])
+        self.assertIn("Do it", model.calls[0].context)
+        self.assertNotIn("Do it", instructions)
+        self.assertEqual(result.message, "done")
+        agent.close()
+
+    def test_runtime_compacts_twice_and_keeps_prompt_and_full_transcript(self):
+        connector = InMemoryMcpConnector(
+            catalogs={"memory": {"search": {"type": "object"}}},
+            results={"memory.search": {"blob": "x" * 3_000}},
+        )
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest(f"call-{index}", "memory.search", {}),
+                    )
+                )
+                for index in range(2)
+            ]
+            + [ModelResponse(message="done")]
+        )
+        agent = make_agent(
+            model,
+            connector=connector,
+            context_window=1_000,
+            output_reserve=100,
+        )
+        result = agent.run(run_request(memory=True), task_id="compact-task")
+        record = agent.workflow_store.lookup_task("compact-task")
+        context = agent._context_from_dict(record.snapshot["context"])
+        self.assertEqual(context.active[0].content, "Do it")
+        self.assertEqual(context.transcript[0].content, "Do it")
+        self.assertGreater(len(context.transcript), len(context.active))
+        self.assertEqual(
+            agent.event_store.count(result.run_id, kind="context.compacted"), 2
+        )
         agent.close()
 
     def test_budget_stops_loop_without_automatic_growth(self):

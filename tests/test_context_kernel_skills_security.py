@@ -60,7 +60,12 @@ class CompactionTests(unittest.TestCase):
         def summarize(items, max_tokens):
             self.assertTrue(items)
             self.assertEqual(max_tokens, 100)
-            return ContextItem("summary", "structured summary", 100)
+            return ContextItem(
+                "summary",
+                "Goal: g\nConstraints: c\nDecisions: d\nCompleted: c\n"
+                "Artifacts: a\nPending: p\nFailures: f",
+                100,
+            )
 
         result = Compactor(self.budget, summarize).compact(state)
         self.assertGreaterEqual(result.working_tokens, 100)

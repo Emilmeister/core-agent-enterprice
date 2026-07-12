@@ -66,6 +66,8 @@ class CompatibleHttpModel:
         headers=None,
         extra_body=None,
         anthropic_version="2023-06-01",
+        context_window=128_000,
+        token_chars=3,
     ):
         if api_format not in {"openai", "anthropic"} or not model:
             raise CoreError("CONFIG_INVALID")
@@ -86,6 +88,14 @@ class CompatibleHttpModel:
         self.headers = dict(headers or {})
         self.extra_body = dict(extra_body or {})
         self.anthropic_version = anthropic_version
+        self.context_window = int(context_window)
+        self.token_chars = int(token_chars)
+        if self.context_window <= self.max_tokens or self.token_chars <= 0:
+            raise CoreError("CONFIG_INVALID")
+
+    def count_tokens(self, text):
+        """Conservative provider-neutral estimate when no tokenizer endpoint exists."""
+        return max(1, (len(text.encode("utf-8")) + self.token_chars - 1) // self.token_chars)
 
     @staticmethod
     def _endpoint(base_url, suffix):

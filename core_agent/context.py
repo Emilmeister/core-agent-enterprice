@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 from .errors import CoreError
 
@@ -91,11 +92,18 @@ class Compactor:
         if pinned_tokens > target:
             raise CoreError("CONTEXT_UNRECOVERABLE")
         summary = self.summarizer(candidates, target - pinned_tokens)
-        if (
-            not isinstance(summary, ContextItem)
-            or summary.kind != "summary"
-            or "structured" not in summary.content.lower()
-        ):
+        sections = (
+            "Goal:",
+            "Constraints:",
+            "Decisions:",
+            "Completed:",
+            "Artifacts:",
+            "Pending:",
+            "Failures:",
+        )
+        if not isinstance(summary, ContextItem) or summary.kind != "summary":
+            raise CoreError("CONTEXT_UNRECOVERABLE")
+        if not all(section in summary.content for section in sections):
             raise CoreError("CONTEXT_UNRECOVERABLE")
         active = pinned + (summary,)
         after = sum(item.tokens for item in active)
@@ -107,3 +115,39 @@ class Compactor:
             state.sequence_range,
             CompactionEvent(before, after, state.sequence_range),
         )
+
+
+class StructuredSummarizer:
+    """Conservative local summary: provenance is retained without another model call."""
+
+    def __init__(self, token_counter):
+        self.token_counter = token_counter
+
+    def __call__(self, items, max_tokens):
+        if max_tokens <= 0:
+            raise CoreError("CONTEXT_UNRECOVERABLE")
+        records = [
+            {"kind": item.kind, "content": item.content}
+            for item in items
+        ]
+        prefix = (
+            "STRUCTURED SUMMARY\n"
+            "Goal: preserved verbatim in pinned prompt\n"
+            "Constraints: preserved in pinned runtime contracts\n"
+            "Decisions: see provenance records below\n"
+            "Completed: "
+        )
+        suffix = (
+            "\nArtifacts: exact references remain in provenance records\n"
+            "Pending: unresolved pinned state remains outside this summary\n"
+            "Failures: see records with failure status"
+        )
+        encoded = json.dumps(records, ensure_ascii=False, separators=(",", ":"))
+        content = prefix + encoded + suffix
+        while self.token_counter(content) > max_tokens and encoded:
+            encoded = encoded[: max(0, int(len(encoded) * 0.9))]
+            content = prefix + encoded + suffix
+        tokens = self.token_counter(content)
+        if tokens > max_tokens:
+            raise CoreError("CONTEXT_UNRECOVERABLE")
+        return ContextItem("summary", content, tokens)
