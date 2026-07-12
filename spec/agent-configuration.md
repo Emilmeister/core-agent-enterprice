@@ -62,6 +62,12 @@ observability:
   otel_profile: production
 ```
 
+## Production persistence
+
+Database credentials являются Platform/deployment config и никогда не входят в RunRequest/AgentConfig. Production container требует `DATABASE_URL=postgresql://...` из secret injection, использует bounded connection pool и owner/tenant-scoped PostgreSQL rows. `DATABASE_POOL_MIN`, `DATABASE_POOL_MAX`, `DATABASE_CONNECT_TIMEOUT_SECONDS` и `DATABASE_AUTO_MIGRATE` управляются deployment-ом.
+
+`DATABASE_AUTO_MIGRATE=false` является production default: migration job с DDL role выполняется до app rollout, затем app role проверяет schema version и работает только с DML. Test profile MAY явно выбрать SQLite/in-memory adapter; implicit fallback при отсутствии PostgreSQL запрещён.
+
 ## Feature switches
 
 Минимальные optional features:

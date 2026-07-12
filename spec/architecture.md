@@ -57,6 +57,8 @@ Policy engine принимает нормализованный proposed action 
 
 Event log является источником истины для состояния A2A Task/run. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript и artifacts имеют независимые retention policies. Memory принадлежит отдельному MCP Service; Core сохраняет только использованные MCP results/provenance согласно Task retention.
 
+Production adapter хранит A2A Tasks, event log, checkpoints, approvals/reservations и append-only audit в PostgreSQL через один bounded pool. `DATABASE_URL` обязателен и берётся из deployment secret. Нет автоматического fallback на process memory/SQLite при database outage: startup/readiness fail closed, активные protected actions не исполняются. Test adapters не могут быть выбраны production configuration.
+
 ## Идентификаторы и иерархия
 
 ```text

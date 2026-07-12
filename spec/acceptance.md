@@ -134,6 +134,8 @@
 - [ ] Deny/expiry/cancel не выполняют action; secret и operator identity отсутствуют в A2A/OTel/public artifacts.
 - [ ] Restart сохраняет approval ID/digest/current status; reserved execution не получает вторую reservation или blind retry.
 - [ ] Internal audit связывает task, proposal, approval, operator actor, digest, execution и outcome и недоступен RemoteCaller.
+- [ ] Production без valid `DATABASE_URL`, ожидаемой PostgreSQL schema или database readiness не открывает A2A listener и не использует in-memory/SQLite fallback.
+- [ ] A2A Tasks, events, checkpoints, approval/reservation и audit переживают restart и остаются tenant/owner scoped в одной PostgreSQL transaction boundary.
 
 ## OpenTelemetry
 
