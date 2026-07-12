@@ -34,6 +34,7 @@ OPERATOR_JWT_HS256_SECRET='independent-32-byte-minimum-secret' \
 OPERATOR_JWT_ISSUER='https://operator.example' \
 OPERATOR_JWT_AUDIENCE='core-agent-operator' \
 LOCAL_APPROVAL_EXTENSION_URI='https://agent.example/a2a/extensions/local-operator-approval/v1' \
+PUSH_NOTIFICATION_ENCRYPTION_KEY='replace-with-generated-fernet-key' \
 uv run core-agent
 ```
 
@@ -50,6 +51,9 @@ auto-migration so the serving credential does not require DDL rights.
 The built-in private operator API verifies a separately-audienced HS256 JWT with `sub`, `jti`,
 `exp`, and the `agent_operator` role. Its approve/deny endpoints require `If-Match` and the exact
 action digest; A2A callers cannot use their credentials on this route.
+`PUSH_NOTIFICATION_ENCRYPTION_KEY` is a separate Fernet key used to encrypt durable A2A webhook
+configuration. Generate it with
+`uv run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`.
 
 OpenAI-compatible API (OpenAI, vLLM, Ollama, LM Studio, OpenRouter, or another compatible gateway):
 

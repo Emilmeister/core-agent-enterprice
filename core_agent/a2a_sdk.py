@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 
 from google.protobuf import json_format
 
@@ -288,13 +289,16 @@ class CoreRequestHandler(DefaultRequestHandler):
             call_context=call_context,
             create_task_if_missing=False,
         )
-        return await active_task.enqueue_request(
+        result = await active_task.enqueue_request(
             RequestContext(
                 call_context=call_context,
                 task_id=task_id,
                 context_id=context_id,
             )
         )
+        if self._push_sender and result is not None:
+            await self._push_sender.send_notification(task_id, result)
+        return result
 
 
 def build_starlette_app(
@@ -310,6 +314,8 @@ def build_starlette_app(
     resume_handler,
     context_builder=None,
     task_store=None,
+    push_config_store=None,
+    push_sender=None,
 ):
     """Build the official A2A 1.0 HTTP+JSON binding around the domain runtime."""
     sdk_card = to_sdk_agent_card(agent_card, base_url=base_url)
@@ -327,10 +333,28 @@ def build_starlette_app(
         ),
         task_store or InMemoryTaskStore(owner_resolver=resolve_owner_scope),
         sdk_card,
+        push_config_store=push_config_store,
+        push_sender=push_sender,
         can_cancel=can_cancel,
     )
     routes = create_agent_card_routes(sdk_card)
     routes.extend(create_rest_routes(request_handler, context_builder=context_builder))
-    app = Starlette(routes=routes)
+    lifespan = None
+    if push_sender:
+
+        @asynccontextmanager
+        async def lifespan(_app):
+            stop = asyncio.Event()
+            worker = asyncio.create_task(
+                push_sender.run(stop), name="push-notification-dispatcher"
+            )
+            try:
+                yield
+            finally:
+                stop.set()
+                await worker
+                await push_sender.close()
+
+    app = Starlette(routes=routes, lifespan=lifespan)
     app.state.a2a_request_handler = request_handler
     return app

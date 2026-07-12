@@ -7,7 +7,14 @@ from unittest.mock import patch
 import httpx
 from a2a.auth.user import User
 from a2a.server.context import ServerCallContext
-from a2a.types import Task, TaskState, TaskStatus
+from a2a.types import (
+    Task,
+    TaskPushNotificationConfig,
+    TaskState,
+    TaskStatus,
+    TaskStatusUpdateEvent,
+)
+from cryptography.fernet import Fernet
 
 from core_agent.app import _agent, create_app
 from core_agent.database import (
@@ -20,6 +27,10 @@ from core_agent.database import (
 from core_agent.errors import CoreError
 from core_agent.postgres_approvals import PostgresApprovalManager
 from core_agent.postgres_tasks import PostgresTaskScheduler
+from core_agent.push import (
+    DurablePushNotificationSender,
+    PostgresPushNotificationConfigStore,
+)
 from core_agent.tools import ToolCall
 from core_agent.approvals import ApproveAllControlPlane
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
@@ -124,7 +135,8 @@ class PostgresRestartTests(unittest.TestCase):
                 """TRUNCATE core_execution_records, core_approval_requests,
                    core_tool_proposals, core_events, core_checkpoints,
                    core_audit_records, core_a2a_tasks, core_runs,
-                   core_background_tasks, core_notifications, core_outbox CASCADE"""
+                   core_background_tasks, core_notifications, core_outbox,
+                   core_push_notification_configs, core_push_deliveries CASCADE"""
             )
 
     def _state(self, database):
@@ -197,6 +209,7 @@ class PostgresRestartTests(unittest.TestCase):
                 "OPERATOR_JWT_ISSUER": "operator-issuer",
                 "OPERATOR_JWT_AUDIENCE": "operator-api",
                 "LOCAL_APPROVAL_EXTENSION_URI": "https://agent.example/extensions/local-approval/v1",
+                "PUSH_NOTIFICATION_ENCRYPTION_KEY": Fernet.generate_key().decode(),
             },
             clear=True,
         ):
@@ -207,6 +220,72 @@ class PostgresRestartTests(unittest.TestCase):
             self.assertFalse(app.state.operator_control_plane.automatic)
         finally:
             app.state.close()
+
+    def test_push_delivery_is_encrypted_deduplicated_and_retried_after_restart(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        key = Fernet.generate_key()
+        store = PostgresPushNotificationConfigStore(database, key)
+        context = ServerCallContext(user=NamedUser(), tenant="tenant-1")
+        config = TaskPushNotificationConfig(
+            task_id="task-push",
+            url="https://push.example/hook",
+            token="push-secret",
+        )
+        public_dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with patch("core_agent.push.socket.getaddrinfo", return_value=public_dns):
+            asyncio.run(store.set_info("task-push", config, context))
+        self.assertTrue(config.id)
+        with database.pool.connection() as connection:
+            encrypted = bytes(
+                connection.execute(
+                    "SELECT encrypted_payload FROM core_push_notification_configs"
+                ).fetchone()["encrypted_payload"]
+            )
+        self.assertNotIn(b"push-secret", encrypted)
+        self.assertNotIn(b"push.example", encrypted)
+
+        responses = [503, 204]
+        deliveries = []
+
+        def webhook(request):
+            deliveries.append(request)
+            return httpx.Response(responses.pop(0), request=request)
+
+        event = TaskStatusUpdateEvent(
+            task_id="task-push",
+            context_id="context-push",
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        )
+        client = httpx.AsyncClient(transport=httpx.MockTransport(webhook))
+        first = DurablePushNotificationSender(
+            database, store, client=client, retry_seconds=0
+        )
+        with patch("core_agent.push.socket.getaddrinfo", return_value=public_dns):
+            asyncio.run(first.send_notification("task-push", event))
+            restarted = DurablePushNotificationSender(
+                database, store, client=client, retry_seconds=0
+            )
+            asyncio.run(restarted.dispatch_pending())
+            asyncio.run(restarted.send_notification("task-push", event))
+        asyncio.run(client.aclose())
+
+        with database.pool.connection() as connection:
+            row = connection.execute(
+                """SELECT count(*) AS count, min(state) AS state,
+                          min(attempts) AS attempts
+                   FROM core_push_deliveries"""
+            ).fetchone()
+        self.assertEqual(row, {"count": 1, "state": "delivered", "attempts": 2})
+        self.assertEqual(len(deliveries), 2)
+        self.assertEqual(
+            deliveries[0].headers["X-Core-Delivery-Id"],
+            deliveries[1].headers["X-Core-Delivery-Id"],
+        )
+        other = ServerCallContext(user=NamedUser(), tenant="tenant-2")
+        self.assertEqual(asyncio.run(store.get_info("task-push", other)), [])
+        database.close()
 
     def test_workflow_lease_outbox_and_background_recovery(self):
         database = self._database()

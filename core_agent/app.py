@@ -34,6 +34,7 @@ from .operator import (
 )
 from .postgres_approvals import PostgresApprovalManager
 from .postgres_tasks import PostgresTaskScheduler
+from .push import DurablePushNotificationSender, PostgresPushNotificationConfigStore
 from .runtime import ApprovalNeeded, CoreAgent
 from .tasks import TaskScheduler
 from .tools import (
@@ -366,7 +367,13 @@ def _agent(model, mcp_connector=None, *, state=None):
 
 
 def create_app(
-    *, model=None, mcp_connector=None, base_url=None, control_plane=None, database=None
+    *,
+    model=None,
+    mcp_connector=None,
+    base_url=None,
+    control_plane=None,
+    database=None,
+    push_client=None,
 ):
     environment = os.getenv("CORE_AGENT_ENVIRONMENT", "development")
     operator_authenticator = None
@@ -387,9 +394,23 @@ def create_app(
                     "CONFIG_INVALID", "production approval extension must use HTTPS"
                 )
     model = model or _model()
+    push_key = os.getenv("PUSH_NOTIFICATION_ENCRYPTION_KEY", "")
     state = _state(database)
+    if environment == "production" and not push_key:
+        if state["database"]:
+            state["database"].close()
+        raise CoreError("PUSH_ENCRYPTION_KEY_REQUIRED")
     agent, telemetry = _agent(model, mcp_connector, state=state)
     control_plane = control_plane or ApproveAllControlPlane()
+    push_config_store = None
+    push_sender = None
+    if state["database"] and push_key:
+        push_config_store = PostgresPushNotificationConfigStore(
+            state["database"], push_key
+        )
+        push_sender = DurablePushNotificationSender(
+            state["database"], push_config_store, client=push_client
+        )
 
     def handle(request, context):
         user = context.call_context.user
@@ -434,6 +455,10 @@ def create_app(
     base_url = base_url or os.getenv("CORE_AGENT_BASE_URL", f"http://localhost:{port}")
     card = AgentCard(
         os.getenv("CORE_AGENT_NAME", "core-agent"),
+        capabilities={
+            "streaming": True,
+            "pushNotifications": push_sender is not None,
+        },
         optional_extensions=(
             os.getenv("LOCAL_APPROVAL_EXTENSION_URI", LOCAL_APPROVAL_STATUS_URI),
         ),
@@ -449,6 +474,8 @@ def create_app(
         base_url=base_url,
         task_store=state["tasks"],
         resume_handler=resume,
+        push_config_store=push_config_store,
+        push_sender=push_sender,
     )
 
     async def live(_request):
@@ -471,6 +498,7 @@ def create_app(
     app.state.core_agent = agent
     app.state.operator_control_plane = control_plane
     app.state.database = state["database"]
+    app.state.push_sender = push_sender
 
     def close():
         agent.close()

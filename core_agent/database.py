@@ -22,7 +22,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -245,6 +245,41 @@ CREATE INDEX core_outbox_pending_idx
     ON core_outbox (available_at, created_at)
     WHERE published_at IS NULL;
 """,
+    3: """
+CREATE TABLE core_push_notification_configs (
+    task_id text NOT NULL,
+    config_id text NOT NULL,
+    owner text NOT NULL,
+    tenant_id text NOT NULL,
+    encrypted_payload bytea NOT NULL,
+    updated_at double precision NOT NULL,
+    PRIMARY KEY (task_id, config_id, owner, tenant_id)
+);
+
+CREATE INDEX core_push_configs_dispatch_idx
+    ON core_push_notification_configs (task_id, config_id);
+
+CREATE TABLE core_push_deliveries (
+    id text PRIMARY KEY,
+    task_id text NOT NULL,
+    config_id text NOT NULL,
+    event_key text NOT NULL,
+    payload jsonb NOT NULL,
+    state text NOT NULL,
+    attempts integer NOT NULL,
+    available_at double precision NOT NULL,
+    locked_until double precision,
+    last_error_code text,
+    delivered_at double precision,
+    created_at double precision NOT NULL,
+    updated_at double precision NOT NULL,
+    UNIQUE (task_id, config_id, event_key)
+);
+
+CREATE INDEX core_push_deliveries_pending_idx
+    ON core_push_deliveries (available_at, created_at)
+    WHERE state != 'delivered';
+""",
 }
 
 
@@ -375,6 +410,8 @@ class PostgresDatabase:
             "core_background_tasks": "SELECT, INSERT, UPDATE",
             "core_notifications": "SELECT, INSERT, UPDATE",
             "core_outbox": "SELECT, INSERT, UPDATE",
+            "core_push_notification_configs": "SELECT, INSERT, UPDATE, DELETE",
+            "core_push_deliveries": "SELECT, INSERT, UPDATE",
         }
         with self.transaction() as connection:
             connection.execute(
