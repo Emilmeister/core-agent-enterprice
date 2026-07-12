@@ -5,14 +5,26 @@ from pathlib import Path
 
 from core_agent.audit import InMemoryAuditLog
 from core_agent.config import AgentConfig, PlatformConfig, RunRequest
-from core_agent.durability import CheckpointStore, InMemoryEventStore, LeaseManager, RecoveryManager
+from core_agent.durability import (
+    CheckpointStore,
+    InMemoryEventStore,
+    LeaseManager,
+    RecoveryManager,
+)
 from core_agent.errors import CoreError
 from core_agent.mcp import InMemoryMcpConnector
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.observability import FailingExporter, RecordingExporter, Telemetry
 from core_agent.runtime import CoreAgent
 from core_agent.tasks import TaskScheduler
-from core_agent.tools import ApprovalManager, ApprovalMode, PolicyEngine, ToolDefinition, ToolRegistry, ToolRuntime
+from core_agent.tools import (
+    ApprovalManager,
+    ApprovalMode,
+    PolicyEngine,
+    ToolDefinition,
+    ToolRegistry,
+    ToolRuntime,
+)
 from core_agent.execution import ExecutionEnvironmentManager, ExecutionResult
 from memory_service.service import MemoryService
 
@@ -34,7 +46,9 @@ class IsolatedBackend:
             {
                 "id": f"env-{spec.run_id}",
                 "spec": spec,
-                "execute": lambda inner, request: ExecutionResult(0, "tool-ok", "", (), ()),
+                "execute": lambda inner, request: ExecutionResult(
+                    0, "tool-ok", "", (), ()
+                ),
                 "destroy": lambda inner: None,
             },
         )()
@@ -42,12 +56,24 @@ class IsolatedBackend:
 
 def platform():
     return PlatformConfig(
-        allowed_builtin_tools={"core.terminal.exec", "core.task.start", "core.task.wait", "core.delegate"},
+        allowed_builtin_tools={
+            "core.terminal.exec",
+            "core.task.start",
+            "core.task.wait",
+            "core.delegate",
+        },
         denied_builtin_tools=set(),
         allowed_mcp_servers={"memory"},
         denied_mcp_tools={},
         allowed_skills=set(),
-        supported_features={"memory", "background_tasks", "delegation", "terminal", "mcp", "human_input"},
+        supported_features={
+            "memory",
+            "background_tasks",
+            "delegation",
+            "terminal",
+            "mcp",
+            "human_input",
+        },
         a2a_protocol_versions=("1.0",),
         a2a_bindings=("HTTP+JSON",),
         max_model_turns=10,
@@ -80,11 +106,16 @@ def agent_config(memory="optional", *, max_turns=10):
                 "mcp": {
                     "default": "deny",
                     "allow_servers": ["memory"],
-                    "allow_tools": {"memory": ["search", "read", "create", "update", "split"]},
+                    "allow_tools": {
+                        "memory": ["search", "read", "create", "update", "split"]
+                    },
                 },
             },
             "skills": {"default": "deny", "allow": []},
-            "context": {"compact_at_working_ratio": 0.90, "compact_to_working_ratio": 0.15},
+            "context": {
+                "compact_at_working_ratio": 0.90,
+                "compact_to_working_ratio": 0.15,
+            },
             "approval": {"mode": "on_risk"},
             "execution": {"environment_profile": "local-pty-test"},
             "observability": {"otel_profile": "test"},
@@ -101,13 +132,18 @@ def run_request(memory=True):
                 "name": "memory",
                 "role": "memory",
                 "required": False,
-                "transport": {"type": "streamable_http", "url": "https://memory.test/mcp"},
+                "transport": {
+                    "type": "streamable_http",
+                    "url": "https://memory.test/mcp",
+                },
             }
         )
     return RunRequest.from_dict({"prompt": "Do it", "mcp": mcp, "skills": []})
 
 
-def make_agent(model, *, memory="optional", connector=None, telemetry=None, max_turns=10):
+def make_agent(
+    model, *, memory="optional", connector=None, telemetry=None, max_turns=10
+):
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
@@ -157,7 +193,13 @@ class RuntimeTests(unittest.TestCase):
     def test_agent_loop_executes_valid_tool_then_returns_final_message(self):
         model = ScriptedModel(
             [
-                ModelResponse(tool_requests=(ToolRequest("call-1", "core.terminal.exec", {"argv": ["check"]}),)),
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest(
+                            "call-1", "core.terminal.exec", {"argv": ["check"]}
+                        ),
+                    )
+                ),
                 ModelResponse(message="done"),
             ]
         )
@@ -220,7 +262,10 @@ class RuntimeTests(unittest.TestCase):
         result = agent.run(run_request(memory=False))
         audit = agent.audit_log.records(result.run_id)
         events = agent.event_store.events(result.run_id)
-        self.assertEqual([record.sequence for record in audit], sorted(record.sequence for record in audit))
+        self.assertEqual(
+            [record.sequence for record in audit],
+            sorted(record.sequence for record in audit),
+        )
         self.assertEqual(audit[-1].kind, "task.completed")
         self.assertLessEqual(audit[-1].written_at, events[-1].published_at)
         with self.assertRaises(CoreError):
@@ -258,7 +303,9 @@ class DurabilityTests(unittest.TestCase):
     def test_unknown_mutating_side_effect_is_not_replayed(self):
         events = InMemoryEventStore()
         checkpoints = CheckpointStore()
-        events.append("run-1", "tool.intent", {"tool_call_id": "call-1", "mutating": True})
+        events.append(
+            "run-1", "tool.intent", {"tool_call_id": "call-1", "mutating": True}
+        )
         checkpoints.save("run-1", 1, {"state": "tool_running"})
         with self.assertRaises(CoreError) as caught:
             RecoveryManager(events, checkpoints).recover("run-1")
@@ -270,7 +317,9 @@ class ObservabilityTests(unittest.TestCase):
     def test_w3c_context_propagates_without_becoming_authorization(self):
         exporter = RecordingExporter()
         telemetry = Telemetry(exporter)
-        incoming = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+        incoming = {
+            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        }
         context = telemetry.extract(incoming)
         outgoing = {}
         telemetry.inject(context, outgoing)
@@ -282,7 +331,9 @@ class ObservabilityTests(unittest.TestCase):
         exporter = RecordingExporter()
         telemetry = Telemetry(exporter)
         with telemetry.span("core_agent.task.submit") as submission:
-            linked = telemetry.start_background_span("core_agent.task.execute", submission.context)
+            linked = telemetry.start_background_span(
+                "core_agent.task.execute", submission.context
+            )
         self.assertTrue(submission.ended)
         self.assertNotEqual(linked.context.trace_id, submission.context.trace_id)
         self.assertEqual(linked.links[0].trace_id, submission.context.trace_id)
@@ -327,7 +378,9 @@ class ObservabilityTests(unittest.TestCase):
                 "---\nid: mem-1\ntitle: One\nnamespace: session/context-1\nkind: fact\n"
                 "status: active\ncreated_at: now\nupdated_at: now\nsources: []\n---\nAlice knows Bob.\n"
             )
-            with telemetry.span("mcp.client", attributes={"mcp.server": "memory"}) as client_span:
+            with telemetry.span(
+                "mcp.client", attributes={"mcp.server": "memory"}
+            ) as client_span:
                 carrier = {}
                 telemetry.inject(client_span.context, carrier)
                 service.create("session/one.md", content, 0, trace_carrier=carrier)
@@ -336,9 +389,15 @@ class ObservabilityTests(unittest.TestCase):
             self.assertIn("memory_service.mcp.request", names)
             self.assertIn("memory_service.ner", names)
             self.assertIn("memory_service.index_publish", names)
-            core_internal = [name for name in names if name.startswith("core_agent.memory.")]
+            core_internal = [
+                name for name in names if name.startswith("core_agent.memory.")
+            ]
             self.assertEqual(core_internal, [])
-            memory_span = next(span for span in exporter.spans if span.name == "memory_service.mcp.request")
+            memory_span = next(
+                span
+                for span in exporter.spans
+                if span.name == "memory_service.mcp.request"
+            )
             self.assertEqual(memory_span.context.trace_id, client_span.context.trace_id)
             service.close()
 

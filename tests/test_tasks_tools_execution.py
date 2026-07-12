@@ -1,9 +1,13 @@
 import threading
-import time
 import unittest
 
+from core_agent.approvals import ApproveAllControlPlane
 from core_agent.errors import CoreError
-from core_agent.execution import ExecutionEnvironmentManager, ExecutionResult, EnvironmentSpec
+from core_agent.execution import (
+    ExecutionEnvironmentManager,
+    ExecutionResult,
+    EnvironmentSpec,
+)
 from core_agent.tasks import (
     CapabilitySet,
     DelegationContract,
@@ -55,7 +59,9 @@ class RecordingBackend:
 
     def _execute(self, request):
         self.executed.append(request)
-        return ExecutionResult(exit_code=0, stdout="ok", stderr="", artifacts=(), side_effects=())
+        return ExecutionResult(
+            exit_code=0, stdout="ok", stderr="", artifacts=(), side_effects=()
+        )
 
 
 class MissingTerminalBackend:
@@ -148,7 +154,9 @@ class BackgroundTaskTests(unittest.TestCase):
 class DelegationTests(unittest.TestCase):
     def setUp(self):
         self.parent = CapabilitySet(
-            tools=frozenset({"core.terminal.exec", "core.fs.apply_patch", "core.task.wait"}),
+            tools=frozenset(
+                {"core.terminal.exec", "core.fs.apply_patch", "core.task.wait"}
+            ),
             mcp={
                 "repo": frozenset({"search", "read_file"}),
                 "memory": frozenset({"search", "read", "update"}),
@@ -173,10 +181,18 @@ class DelegationTests(unittest.TestCase):
         raw.update(changes)
         return DelegationContract.from_dict(raw)
 
-    def test_child_capabilities_are_exact_intersection_and_inherit_kernel_tenant_budget(self):
+    def test_child_capabilities_are_exact_intersection_and_inherit_kernel_tenant_budget(
+        self,
+    ):
         child = derive_child_capabilities(self.parent, self.contract(), current_depth=0)
         self.assertEqual(child.tools, frozenset({"core.terminal.exec"}))
-        self.assertEqual(child.mcp, {"repo": frozenset({"search"}), "memory": frozenset({"search", "read", "update"})})
+        self.assertEqual(
+            child.mcp,
+            {
+                "repo": frozenset({"search"}),
+                "memory": frozenset({"search", "read", "update"}),
+            },
+        )
         self.assertEqual(child.skills, frozenset({"database-review"}))
         self.assertEqual(child.budgets["turns"], 20)
         self.assertEqual(child.budgets["tool_calls"], 40)
@@ -197,7 +213,9 @@ class DelegationTests(unittest.TestCase):
                     derive_child_capabilities(self.parent, contract, current_depth=0)
                 self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
 
-    def test_memory_is_shared_only_when_same_server_tools_and_namespace_are_explicit(self):
+    def test_memory_is_shared_only_when_same_server_tools_and_namespace_are_explicit(
+        self,
+    ):
         no_memory = self.contract(mcp={"repo": ["search"]})
         child = derive_child_capabilities(self.parent, no_memory, current_depth=0)
         self.assertNotIn("memory", child.mcp)
@@ -226,7 +244,9 @@ class ToolRuntimeTests(unittest.TestCase):
                 description="execute",
                 input_schema={
                     "type": "object",
-                    "properties": {"argv": {"type": "array", "items": {"type": "string"}}},
+                    "properties": {
+                        "argv": {"type": "array", "items": {"type": "string"}}
+                    },
                     "required": ["argv"],
                     "additionalProperties": False,
                 },
@@ -240,7 +260,10 @@ class ToolRuntimeTests(unittest.TestCase):
                 description="publish",
                 input_schema={
                     "type": "object",
-                    "properties": {"target": {"type": "string"}, "body": {"type": "string"}},
+                    "properties": {
+                        "target": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
                     "required": ["target", "body"],
                     "additionalProperties": False,
                 },
@@ -265,7 +288,10 @@ class ToolRuntimeTests(unittest.TestCase):
             self.runtime.execute(ToolCall("call-0", "missing", {}), run_id="run-1")
         self.assertEqual(caught.exception.code, "TOOL_NOT_FOUND")
         with self.assertRaises(CoreError) as caught:
-            self.runtime.execute(ToolCall("call-1", "core.terminal.exec", {"argv": "not-array"}), run_id="run-1")
+            self.runtime.execute(
+                ToolCall("call-1", "core.terminal.exec", {"argv": "not-array"}),
+                run_id="run-1",
+            )
         self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
         self.assertEqual(self.backend.executed, [])
 
@@ -275,35 +301,53 @@ class ToolRuntimeTests(unittest.TestCase):
             run_id="run-1",
         )
         self.assertIsInstance(result, ToolResult)
-        self.assertEqual(self.events[:4], ["tool.requested", "tool.validated", "policy.allowed", "tool.started"])
+        self.assertEqual(
+            self.events[:4],
+            ["tool.requested", "tool.validated", "policy.allowed", "tool.started"],
+        )
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(len(self.backend.executed), 1)
 
     def test_risky_call_does_not_execute_until_exact_arguments_are_approved(self):
-        call = ToolCall("call-3", "external.publish", {"target": "org/repo", "body": "hello"})
+        call = ToolCall(
+            "call-3", "external.publish", {"target": "org/repo", "body": "hello"}
+        )
         approval = self.runtime.execute(call, run_id="run-1")
         self.assertEqual(approval.tool_call_id, "call-3")
         self.assertEqual(approval.risks, ("acts_as_user", "external_write"))
         self.assertEqual(self.backend.executed, [])
 
-        self.approvals.resolve(approval.id, "approve", scope="single_call")
+        ApproveAllControlPlane().approve(self.approvals, approval)
         result = self.runtime.resume_approved(call, approval.id, run_id="run-1")
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(len(self.backend.executed), 1)
 
-        changed = ToolCall("call-3", "external.publish", {"target": "other/repo", "body": "hello"})
+        changed = ToolCall(
+            "call-3", "external.publish", {"target": "other/repo", "body": "hello"}
+        )
         with self.assertRaises(CoreError) as caught:
             self.runtime.resume_approved(changed, approval.id, run_id="run-1")
         self.assertEqual(caught.exception.code, "APPROVAL_ARGUMENTS_CHANGED")
 
-    def test_approval_is_single_resolution_and_never_mode_denies_instead_of_allowing(self):
+    def test_approval_is_single_resolution_and_never_mode_denies_instead_of_allowing(
+        self,
+    ):
         approval = self.runtime.execute(
-            ToolCall("call-4", "external.publish", {"target": "org/repo", "body": "hello"}),
+            ToolCall(
+                "call-4", "external.publish", {"target": "org/repo", "body": "hello"}
+            ),
             run_id="run-1",
         )
-        self.approvals.resolve(approval.id, "deny")
+        denied_approval = self.approvals.deny(
+            approval.id,
+            action_digest=approval.action_digest,
+            expected_version=approval.version,
+            operator_principal_id="operator-1",
+            operator_session_id="session-1",
+        )
+        self.assertEqual(denied_approval.state, "DENIED")
         with self.assertRaises(CoreError) as caught:
-            self.approvals.resolve(approval.id, "approve")
+            ApproveAllControlPlane().approve(self.approvals, approval)
         self.assertEqual(caught.exception.code, "APPROVAL_ALREADY_RESOLVED")
 
         never_runtime = ToolRuntime(
@@ -313,14 +357,18 @@ class ToolRuntimeTests(unittest.TestCase):
             self.environment_manager,
         )
         denied = never_runtime.execute(
-            ToolCall("call-5", "external.publish", {"target": "org/repo", "body": "hello"}),
+            ToolCall(
+                "call-5", "external.publish", {"target": "org/repo", "body": "hello"}
+            ),
             run_id="run-1",
         )
         self.assertEqual(denied.status, "denied")
         self.assertEqual(self.backend.executed, [])
 
     def test_input_request_is_not_approval(self):
-        request = self.runtime.request_input("Choose branch", {"type": "string"}, run_id="run-1")
+        request = self.runtime.request_input(
+            "Choose branch", {"type": "string"}, run_id="run-1"
+        )
         self.assertEqual(request.kind, "information_required")
         self.assertFalse(hasattr(request, "argument_digest"))
 
@@ -360,7 +408,9 @@ class TerminalSessionContractTests(unittest.TestCase):
         self.assertNotEqual(parent.spec.workspace_id, child.spec.workspace_id)
         self.assertEqual(parent.spec.workspace_snapshot, child.spec.workspace_snapshot)
 
-    def test_environment_spec_declares_process_separation_without_os_sandbox_claim(self):
+    def test_environment_spec_declares_process_separation_without_os_sandbox_claim(
+        self,
+    ):
         spec = EnvironmentSpec(
             tenant_id="tenant-1",
             run_id="run-1",
@@ -387,7 +437,9 @@ class TerminalSessionContractTests(unittest.TestCase):
                 secrets={"TOKEN": "secret-value"},
             )
         )
-        result = manager.execute(environment.id, {"argv": ["tool"], "secret_refs": ["TOKEN"]})
+        result = manager.execute(
+            environment.id, {"argv": ["tool"], "secret_refs": ["TOKEN"]}
+        )
         self.assertNotIn("secret-value", repr(result))
         self.assertNotIn("secret-value", repr(manager.telemetry_records))
         self.assertNotIn("secret-value", repr(environment.spec.checkpoint_dict()))

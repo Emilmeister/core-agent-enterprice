@@ -53,8 +53,17 @@ uv run core-agent
 
 The A2A Agent Card is then available at `http://localhost:8000/.well-known/agent-card.json`.
 Terminal execution is trusted by default for the single-container deployment; set
-`CORE_AGENT_TRUST_TERMINAL=0` to require risk approval instead of automatic execution. Workspaces
-default to `/tmp/core-agent/runs` and can be moved with `LOCAL_WORKSPACE_ROOT`.
+`CORE_AGENT_TRUST_TERMINAL=0` to require local-operator approval instead of automatic execution.
+The development profile uses an in-process approve-all control-plane stub; the remote A2A caller
+cannot approve or deny. Local wait is exposed as A2A `WORKING`, while the private approval records
+and single-use execution reservations are stored in SQLite.
+
+`LOCAL_APPROVAL_DB_PATH` defaults to `/tmp/core-agent/state/approvals.sqlite3` and should point to
+durable mounted storage in deployment. `LOCAL_APPROVAL_EXTENSION_URI` configures the optional
+informational A2A extension. `LOCAL_APPROVAL_ENABLED=false` fails protected actions closed.
+`CORE_AGENT_ENVIRONMENT=production` refuses to start with the approve-all stub; inject a real
+operator control plane first. Workspaces default to `/tmp/core-agent/runs` and can be moved with
+`LOCAL_WORKSPACE_ROOT`.
 
 The specification and acceptance suite are frozen together before implementation changes.
 `tests/test_spec_lock.py` also protects every specification file byte-for-byte.

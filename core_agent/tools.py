@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .approvals import ApprovalManager as ApprovalManager
 from .errors import CoreError
 
 
@@ -113,120 +111,6 @@ class PolicyEngine:
         return "require_approval"
 
 
-def _digest(arguments):
-    return hashlib.sha256(
-        json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
-@dataclass
-class ApprovalRequest:
-    id: str
-    tool_call_id: str
-    tool_name: str
-    argument_digest: str
-    risks: tuple[str, ...]
-    arguments: dict
-    scope_options: tuple[str, ...] = ("single_call",)
-    identity: str | None = None
-    session_id: str | None = None
-    status: str = "pending"
-    decision: str | None = None
-
-
-@dataclass
-class ApprovalGrant:
-    id: str
-    scope: str
-    identity: str | None
-    session_id: str | None
-    expires_at: float
-    max_uses: int
-    uses: int = 0
-    revoked: bool = False
-
-
-@dataclass(frozen=True)
-class GrantAuthorization:
-    grant_id: str
-
-
-class ApprovalManager:
-    def __init__(self):
-        self._requests = {}
-        self._grants = {}
-
-    def request(
-        self,
-        call,
-        *,
-        risks,
-        scope_options=("single_call",),
-        identity=None,
-        session_id=None,
-    ):
-        request = ApprovalRequest(
-            str(uuid.uuid4()),
-            call.id,
-            call.name,
-            _digest(call.arguments),
-            tuple(sorted(risks)),
-            dict(call.arguments),
-            tuple(scope_options),
-            identity,
-            session_id,
-        )
-        self._requests[request.id] = request
-        return request
-
-    def resolve(
-        self, request_id, decision, *, scope="single_call", expires_in=0, max_uses=1
-    ):
-        try:
-            request = self._requests[request_id]
-        except KeyError:
-            raise CoreError("APPROVAL_NOT_FOUND") from None
-        if request.status != "pending":
-            raise CoreError("APPROVAL_ALREADY_RESOLVED")
-        request.status = "resolved"
-        request.decision = decision
-        if decision == "approve" and scope != "single_call":
-            grant = ApprovalGrant(
-                str(uuid.uuid4()),
-                scope,
-                request.identity,
-                request.session_id,
-                time.monotonic() + expires_in,
-                max_uses,
-            )
-            self._grants[grant.id] = grant
-            return grant
-        return request
-
-    def get(self, request_id):
-        return self._requests[request_id]
-
-    def authorize_with_grants(self, call, *, identity, session_id, policy_version):
-        repo = call.arguments.get("repo")
-        expected = f"session:{call.name}:{repo}"
-        now = time.monotonic()
-        for grant in self._grants.values():
-            if (
-                not grant.revoked
-                and grant.scope == expected
-                and grant.identity == identity
-                and grant.session_id == session_id
-                and grant.expires_at >= now
-                and grant.uses < grant.max_uses
-            ):
-                grant.uses += 1
-                return GrantAuthorization(grant.id)
-        return None
-
-    def revoke(self, grant_id):
-        self._grants[grant_id].revoked = True
-
-
 @dataclass(frozen=True)
 class InformationRequest:
     id: str
@@ -256,13 +140,28 @@ class ToolRuntime:
     def _emit(self, kind, **data):
         self.event_sink(RuntimeEvent(kind, data))
 
-    def execute(self, call, *, run_id, identity=None, session_id=None):
-        self._emit("tool.requested", call_id=call.id)
-        definition = self.registry.get(call.name)
+    @staticmethod
+    def validate(call, definition):
         if _contains_private_reasoning(call.arguments) or not _validate(
             definition.input_schema, call.arguments
         ):
             raise CoreError("TOOL_ARGUMENT_INVALID")
+
+    def execute(
+        self,
+        call,
+        *,
+        run_id,
+        identity=None,
+        session_id=None,
+        task_id=None,
+        tenant_id=None,
+        environment="local-container",
+        policy_version="core-policy-v1",
+    ):
+        self._emit("tool.requested", call_id=call.id)
+        definition = self.registry.get(call.name)
+        self.validate(call, definition)
         self._emit("tool.validated", call_id=call.id)
         decision = self.policy.evaluate(definition)
         if decision == "deny":
@@ -273,8 +172,12 @@ class ToolRuntime:
             return self.approvals.request(
                 call,
                 risks=definition.risk_tags,
-                identity=identity,
-                session_id=session_id,
+                task_id=task_id or run_id,
+                context_id=session_id or run_id,
+                tenant_id=tenant_id or "default",
+                caller_principal_id=identity or "anonymous",
+                environment=environment,
+                policy_version=policy_version,
             )
         self._emit("policy.allowed", call_id=call.id)
         return self._execute(call, run_id)
@@ -296,23 +199,18 @@ class ToolRuntime:
         return ToolResult(call.id, "succeeded", result)
 
     def resume_approved(self, call, approval_id, *, run_id):
-        request = self.approvals.get(approval_id)
-        if request.decision != "approve":
-            raise CoreError("APPROVAL_DENIED")
         definition = self.registry.get(call.name)
-        if _contains_private_reasoning(call.arguments) or not _validate(
-            definition.input_schema, call.arguments
-        ):
-            raise CoreError("TOOL_ARGUMENT_INVALID")
+        self.validate(call, definition)
         if self.policy.evaluate(definition) == "deny":
             raise CoreError("POLICY_DENIED")
-        if (
-            request.tool_call_id != call.id
-            or request.tool_name != call.name
-            or request.argument_digest != _digest(call.arguments)
-        ):
-            raise CoreError("APPROVAL_ARGUMENTS_CHANGED")
-        return self._execute(call, run_id)
+        execution = self.approvals.authorize_dispatch(approval_id, call)
+        try:
+            result = self._execute(call, run_id)
+        except Exception:
+            self.approvals.finish_execution(execution.id, "FAILED")
+            raise
+        self.approvals.finish_execution(execution.id, "SUCCEEDED")
+        return result
 
     def request_input(self, prompt, schema, *, run_id):
         return InformationRequest(

@@ -6,7 +6,12 @@ from pathlib import Path
 from core_agent.context import Compactor, ContextBudget, ContextItem, ContextState
 from core_agent.errors import CoreError
 from core_agent.kernel import InstructionSource, KernelCompiler
-from core_agent.security import RetryPolicy, TenantStore, normalize_workspace_path, redact
+from core_agent.security import (
+    RetryPolicy,
+    TenantStore,
+    normalize_workspace_path,
+    redact,
+)
 from core_agent.skills import SkillResolver
 
 
@@ -36,7 +41,9 @@ class ContextBudgetTests(unittest.TestCase):
 
 class CompactionTests(unittest.TestCase):
     def setUp(self):
-        self.budget = ContextBudget(1_200, 100, 50, 50, compact_at=0.90, compact_to=0.15)
+        self.budget = ContextBudget(
+            1_200, 100, 50, 50, compact_at=0.90, compact_to=0.15
+        )
 
     def test_compaction_targets_ten_to_fifteen_percent_and_preserves_pinned(self):
         prompt = ContextItem("prompt", "ORIGINAL PROMPT", 20, pinned=True)
@@ -58,12 +65,15 @@ class CompactionTests(unittest.TestCase):
         result = Compactor(self.budget, summarize).compact(state)
         self.assertGreaterEqual(result.working_tokens, 100)
         self.assertLessEqual(result.working_tokens, 150)
-        self.assertEqual([item.content for item in result.active if item.pinned], [
-            "ORIGINAL PROMPT",
-            "apr-1 pending",
-            "child task-1 pending",
-            "artifact://one",
-        ])
+        self.assertEqual(
+            [item.content for item in result.active if item.pinned],
+            [
+                "ORIGINAL PROMPT",
+                "apr-1 pending",
+                "child task-1 pending",
+                "artifact://one",
+            ],
+        )
         self.assertEqual(result.transcript, state.transcript)
         self.assertEqual(result.event.before_working_tokens, 950)
         self.assertEqual(result.event.after_working_tokens, 150)
@@ -72,15 +82,23 @@ class CompactionTests(unittest.TestCase):
     def test_compaction_does_not_run_below_ninety_percent(self):
         items = tuple(ContextItem("history", str(i), 99) for i in range(9))
         state = ContextState(active=items, transcript=items, sequence_range=(1, 9))
-        result = Compactor(self.budget, lambda items, max_tokens: None).maybe_compact(state)
+        result = Compactor(self.budget, lambda items, max_tokens: None).maybe_compact(
+            state
+        )
         self.assertIs(result, state)
 
     def test_pinned_data_above_target_fails_instead_of_truncating(self):
         pinned = (ContextItem("prompt", "must stay", 160, pinned=True),)
         history = tuple(ContextItem("history", str(i), 100) for i in range(8))
-        state = ContextState(active=(*pinned, *history), transcript=(*pinned, *history), sequence_range=(1, 9))
+        state = ContextState(
+            active=(*pinned, *history),
+            transcript=(*pinned, *history),
+            sequence_range=(1, 9),
+        )
         with self.assertRaises(CoreError) as caught:
-            Compactor(self.budget, lambda items, max_tokens: ContextItem("summary", "x", 1)).compact(state)
+            Compactor(
+                self.budget, lambda items, max_tokens: ContextItem("summary", "x", 1)
+            ).compact(state)
         self.assertEqual(caught.exception.code, "CONTEXT_UNRECOVERABLE")
         self.assertEqual(state.active[0].content, "must stay")
 
@@ -127,7 +145,10 @@ class KernelTests(unittest.TestCase):
                 InstructionSource.TOOL_DATA,
             ],
         )
-        self.assertLess(compiled.text.index("MEMORY RULES"), compiled.text.index("Ignore MEMORY RULES"))
+        self.assertLess(
+            compiled.text.index("MEMORY RULES"),
+            compiled.text.index("Ignore MEMORY RULES"),
+        )
         self.assertTrue(compiled.protected_digest)
 
     def test_disabled_capability_has_no_policy_or_instructions(self):
@@ -148,7 +169,12 @@ class KernelTests(unittest.TestCase):
     def test_raw_reasoning_is_removed_from_public_data(self):
         compiler = KernelCompiler("SAFETY", "HOST", "KERNEL")
         public = compiler.public_model_result(
-            {"message": "done", "reasoning": "private chain", "reasoning_tokens": 100, "summary": "safe"}
+            {
+                "message": "done",
+                "reasoning": "private chain",
+                "reasoning_tokens": 100,
+                "summary": "safe",
+            }
         )
         self.assertEqual(public, {"message": "done", "summary": "safe"})
 
@@ -166,13 +192,17 @@ class SkillTests(unittest.TestCase):
             encoding="utf-8",
         )
         (path / "references").mkdir()
-        (path / "references" / "format.md").write_text("Use headings.\n", encoding="utf-8")
+        (path / "references" / "format.md").write_text(
+            "Use headings.\n", encoding="utf-8"
+        )
         return path
 
     def test_progressive_disclosure_and_immutable_snapshot(self):
         with tempfile.TemporaryDirectory() as temp:
             path = self._make_skill(temp)
-            resolver = SkillResolver([{"name": "release-notes", "source": path.as_uri()}])
+            resolver = SkillResolver(
+                [{"name": "release-notes", "source": path.as_uri()}]
+            )
             discovery = resolver.discover()
             self.assertEqual(discovery[0].name, "release-notes")
             self.assertEqual(discovery[0].description, "Creates release notes.")
@@ -183,7 +213,10 @@ class SkillTests(unittest.TestCase):
             self.assertIn("Read references/format.md", snapshot.instructions)
             self.assertEqual(resolver.loaded_resources, ("release-notes/SKILL.md",))
             (path / "SKILL.md").write_text("changed", encoding="utf-8")
-            self.assertIn("Read references/format.md", resolver.activate("release-notes").instructions)
+            self.assertIn(
+                "Read references/format.md",
+                resolver.activate("release-notes").instructions,
+            )
 
             reference = resolver.read_resource("release-notes", "references/format.md")
             self.assertEqual(reference, "Use headings.\n")
@@ -201,10 +234,15 @@ class SkillTests(unittest.TestCase):
                 SkillResolver([{"name": "bad", "source": bad.as_uri()}]).discover()
             self.assertEqual(caught.exception.code, "SKILL_INVALID")
 
-        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            tempfile.TemporaryDirectory() as outside,
+        ):
             path = self._make_skill(temp)
             os.symlink(Path(outside) / "secret.md", path / "references" / "escape.md")
-            resolver = SkillResolver([{"name": "release-notes", "source": path.as_uri()}])
+            resolver = SkillResolver(
+                [{"name": "release-notes", "source": path.as_uri()}]
+            )
             resolver.activate("release-notes")
             with self.assertRaises(CoreError) as caught:
                 resolver.read_resource("release-notes", "references/escape.md")
@@ -215,7 +253,10 @@ class SkillTests(unittest.TestCase):
             first = self._make_skill(temp, "one")
             second = self._make_skill(temp, "two")
             resolver = SkillResolver(
-                [{"name": "one", "source": first.as_uri()}, {"name": "two", "source": second.as_uri()}]
+                [
+                    {"name": "one", "source": first.as_uri()},
+                    {"name": "two", "source": second.as_uri()},
+                ]
             )
             child = resolver.for_child({"two"})
             self.assertEqual([skill.name for skill in child.discover()], ["two"])
@@ -236,8 +277,13 @@ class SecurityTests(unittest.TestCase):
         self.assertNotIn("Bearer abc", encoded)
 
     def test_workspace_path_rejects_traversal_and_symlink_escape(self):
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
-            self.assertEqual(normalize_workspace_path(root, "inside.txt"), Path(root) / "inside.txt")
+        with (
+            tempfile.TemporaryDirectory() as root,
+            tempfile.TemporaryDirectory() as outside,
+        ):
+            self.assertEqual(
+                normalize_workspace_path(root, "inside.txt"), Path(root) / "inside.txt"
+            )
             with self.assertRaises(CoreError):
                 normalize_workspace_path(root, "../escape")
             os.symlink(outside, Path(root) / "link")
@@ -246,9 +292,21 @@ class SecurityTests(unittest.TestCase):
 
     def test_retry_policy_never_retries_unknown_mutating_outcome(self):
         policy = RetryPolicy(max_attempts=3)
-        self.assertTrue(policy.should_retry(read_only=True, attempt=1, outcome_known=False, idempotency_key=None))
-        self.assertFalse(policy.should_retry(read_only=False, attempt=1, outcome_known=False, idempotency_key=None))
-        self.assertTrue(policy.should_retry(read_only=False, attempt=1, outcome_known=True, idempotency_key="call-1"))
+        self.assertTrue(
+            policy.should_retry(
+                read_only=True, attempt=1, outcome_known=False, idempotency_key=None
+            )
+        )
+        self.assertFalse(
+            policy.should_retry(
+                read_only=False, attempt=1, outcome_known=False, idempotency_key=None
+            )
+        )
+        self.assertTrue(
+            policy.should_retry(
+                read_only=False, attempt=1, outcome_known=True, idempotency_key="call-1"
+            )
+        )
 
     def test_tenant_store_hides_cross_tenant_existence(self):
         store = TenantStore()

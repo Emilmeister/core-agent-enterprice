@@ -1,11 +1,12 @@
 import dataclasses
+import os
 import time
 import unittest
+from unittest.mock import patch
 
 from core_agent.a2a import (
-    APPROVAL_REQUEST_URI,
-    APPROVAL_RESPONSE_URI,
     CORE_EXTENSION_URI,
+    LOCAL_APPROVAL_STATUS_URI,
     A2AService,
     AgentCard,
     Artifact,
@@ -14,9 +15,10 @@ from core_agent.a2a import (
     Task,
     TaskState,
     map_core_state,
-    parse_approval_decision,
     parse_run_request,
 )
+from core_agent.approvals import ApprovalManager
+from core_agent.app import create_app
 from core_agent.config import (
     AgentConfig,
     PlatformConfig,
@@ -25,7 +27,7 @@ from core_agent.config import (
 )
 from core_agent.errors import CoreError
 from core_agent.runtime import ApprovalNeeded
-from core_agent.tools import ApprovalRequest
+from core_agent.tools import ApprovalMode, ToolCall
 
 
 def platform_config(**changes):
@@ -210,50 +212,73 @@ class RunRequestTests(unittest.TestCase):
             parse_run_request(unsupported, requested_extensions={CORE_EXTENSION_URI})
         self.assertEqual(caught.exception.code, "CONTENT_TYPE_NOT_SUPPORTED")
 
-    def test_approval_decision_is_a_separate_exact_a2a_extension(self):
+    def test_a2a_caller_has_no_approval_decision_schema(self):
         message = Message(
             role="user",
             parts=(Part("data", {"decision": "approve"}),),
-            extensions=(APPROVAL_RESPONSE_URI,),
-            metadata={
-                APPROVAL_RESPONSE_URI: {
-                    "approval_id": "approval-1",
-                    "decision": "approve",
-                    "scope": "single_call",
-                }
-            },
+            extensions=("urn:caller:approval-response",),
+            metadata={"urn:caller:approval-response": {"decision": "approve"}},
         )
-        decision = parse_approval_decision(
-            message, requested_extensions={APPROVAL_RESPONSE_URI}
-        )
-        self.assertEqual(decision.approval_id, "approval-1")
-        self.assertEqual(decision.decision, "approve")
-        self.assertNotIn(CORE_EXTENSION_URI, message.metadata)
-        message.metadata[APPROVAL_RESPONSE_URI]["arguments"] = {"changed": True}
         with self.assertRaises(CoreError) as caught:
-            parse_approval_decision(message, {APPROVAL_RESPONSE_URI})
-        self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+            parse_run_request(message, {"urn:caller:approval-response"})
+        self.assertEqual(caught.exception.code, "A2A_EXTENSION_REQUIRED")
 
-    def test_approval_request_redacts_sensitive_arguments(self):
-        request = ApprovalRequest(
-            "approval-1",
-            "call-1",
-            "external.publish",
-            "digest",
-            ("external_write",),
-            {
-                "target": "org/repo",
-                "access_token": "plain-secret",
-                "nested": {"password": "also-secret"},
-            },
+    def test_public_local_approval_status_contains_no_action_or_secret(self):
+        manager = ApprovalManager()
+        request = manager.request(
+            ToolCall(
+                "call-1",
+                "external.publish",
+                {
+                    "target": "org/repo",
+                    "access_token": {"secretRef": "secret://publisher/token"},
+                },
+            ),
+            risks={"external_write"},
+            task_id="task-1",
+            context_id="context-1",
+            tenant_id="tenant-1",
+            caller_principal_id="caller-1",
         )
-        payload = ApprovalNeeded("run-1", request).to_payload()
-        self.assertEqual(payload["arguments"]["target"], "org/repo")
-        self.assertEqual(payload["arguments"]["access_token"], "[REDACTED]")
-        self.assertEqual(payload["arguments"]["nested"]["password"], "[REDACTED]")
+        payload = ApprovalNeeded("run-1", request).to_public_payload()
+        self.assertFalse(payload["callerCanApprove"])
+        self.assertFalse(payload["callerActionRequired"])
+        encoded = repr(payload)
+        self.assertNotIn(request.id, encoded)
+        self.assertNotIn("secret://publisher/token", encoded)
+        self.assertNotIn("arguments", payload)
+        manager.close()
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_production_refuses_approve_all_stub_and_disabled_hitl_fails_closed(self):
+        model = type("Model", (), {"model": "test-model"})()
+        with patch.dict(os.environ, {"CORE_AGENT_ENVIRONMENT": "production"}):
+            with self.assertRaises(CoreError) as caught:
+                create_app(model=model)
+        self.assertEqual(caught.exception.code, "LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
+
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_ENVIRONMENT": "development",
+                "LOCAL_APPROVAL_ENABLED": "false",
+                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+            },
+        ):
+            app = create_app(model=model)
+        self.assertEqual(
+            app.state.core_agent.tool_runtime.policy.approval_mode,
+            ApprovalMode.NEVER,
+        )
+        self.assertFalse(
+            any(
+                "/internal/approvals" in getattr(route, "path", "")
+                for route in app.routes
+            )
+        )
+        app.state.close()
+
     def test_effective_config_is_intersection_with_deny_precedence(self):
         effective = compile_effective_config(
             platform_config(), agent_config(), request(), DISCOVERED
@@ -364,7 +389,8 @@ class A2ATests(unittest.TestCase):
             "WAITING_TASK": TaskState.WORKING,
             "PAUSED": TaskState.WORKING,
             "WAITING_INPUT": TaskState.INPUT_REQUIRED,
-            "WAITING_APPROVAL": TaskState.INPUT_REQUIRED,
+            "WAITING_LOCAL_APPROVAL": TaskState.WORKING,
+            "APPROVED_RESERVED": TaskState.WORKING,
             "WAITING_AUTH": TaskState.AUTH_REQUIRED,
             "COMPLETED": TaskState.COMPLETED,
             "FAILED": TaskState.FAILED,
@@ -388,8 +414,13 @@ class A2ATests(unittest.TestCase):
         self.assertNotIn("memory", str(encoded["capabilities"]).lower())
         extensions = {item["uri"]: item["required"] for item in encoded["extensions"]}
         self.assertTrue(extensions[CORE_EXTENSION_URI])
-        self.assertFalse(extensions[APPROVAL_REQUEST_URI])
-        self.assertFalse(extensions[APPROVAL_RESPONSE_URI])
+        self.assertFalse(extensions[LOCAL_APPROVAL_STATUS_URI])
+        local_extension = next(
+            item
+            for item in encoded["extensions"]
+            if item["uri"] == LOCAL_APPROVAL_STATUS_URI
+        )
+        self.assertFalse(local_extension["params"]["callerCanResolve"])
 
     def test_nonblocking_task_survives_stream_disconnect_and_is_queryable(self):
         def handler(run_request, task_context):

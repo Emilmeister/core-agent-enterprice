@@ -3,9 +3,11 @@ from __future__ import annotations
 import atexit
 import json
 import os
+from pathlib import Path
 
-from .a2a import APPROVAL_REQUEST_URI, AgentCard, ApprovalDecision, Artifact
+from .a2a import LOCAL_APPROVAL_STATUS_URI, AgentCard, Artifact
 from .a2a_sdk import build_starlette_app
+from .approvals import ApprovalManager, ApproveAllControlPlane
 from .audit import InMemoryAuditLog
 from .config import AgentConfig, PlatformConfig
 from .durability import CheckpointStore, InMemoryEventStore
@@ -17,7 +19,6 @@ from .observability import RecordingExporter, Telemetry
 from .runtime import ApprovalNeeded, CoreAgent
 from .tasks import TaskScheduler
 from .tools import (
-    ApprovalManager,
     ApprovalMode,
     PolicyEngine,
     ToolDefinition,
@@ -234,10 +235,27 @@ def _agent(model, mcp_connector=None):
     sessions = TerminalSessionManager(
         LocalTerminalBackend(os.getenv("LOCAL_WORKSPACE_ROOT", "/tmp/core-agent/runs"))
     )
+    local_approval_enabled = os.getenv("LOCAL_APPROVAL_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    approval_path = os.getenv(
+        "LOCAL_APPROVAL_DB_PATH", "/tmp/core-agent/state/approvals.sqlite3"
+    )
+    if approval_path != ":memory:":
+        Path(approval_path).parent.mkdir(parents=True, exist_ok=True)
     tools = ToolRuntime(
         registry,
-        PolicyEngine(ApprovalMode(config.approval["mode"])),
-        ApprovalManager(),
+        PolicyEngine(
+            ApprovalMode(config.approval["mode"])
+            if local_approval_enabled
+            else ApprovalMode.NEVER
+        ),
+        ApprovalManager(
+            approval_path,
+            ttl_seconds=int(os.getenv("LOCAL_APPROVAL_DEFAULT_TTL_SECONDS", "7200")),
+        ),
         sessions,
     )
     telemetry = (
@@ -261,54 +279,66 @@ def _agent(model, mcp_connector=None):
     return agent, telemetry
 
 
-def create_app(*, model=None, mcp_connector=None, base_url=None):
+def create_app(*, model=None, mcp_connector=None, base_url=None, control_plane=None):
+    if os.getenv("CORE_AGENT_ENVIRONMENT", "development") == "production" and (
+        control_plane is None or isinstance(control_plane, ApproveAllControlPlane)
+    ):
+        raise CoreError("LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
     model = model or _model()
     agent, telemetry = _agent(model, mcp_connector)
+    control_plane = control_plane or ApproveAllControlPlane()
 
     def handle(request, context):
         user = context.call_context.user
         identity = user.user_name if user.is_authenticated else "anonymous"
-        result = (
-            agent.resume_approval(
-                context.task_id,
-                request.approval_id,
-                request.decision,
-                scope=request.scope,
-                identity=identity,
-                session_id=context.context_id,
-            )
-            if isinstance(request, ApprovalDecision)
-            else agent.run(
-                request,
-                task_id=context.task_id,
-                identity=identity,
-                session_id=context.context_id,
-            )
+        result = agent.run(
+            request,
+            task_id=context.task_id,
+            identity=identity,
+            session_id=context.context_id,
+            tenant_id=context.tenant or "default",
         )
-        while (
-            isinstance(result, ApprovalNeeded)
-            and APPROVAL_REQUEST_URI not in context.requested_extensions
-        ):
-            result = agent.resume_approval(
-                context.task_id,
-                result.request.id,
-                "deny",
-                identity=identity,
-                session_id=context.context_id,
-            )
         if isinstance(result, ApprovalNeeded):
             return result
         return Artifact.text(result.message, {"run_id": result.run_id})
 
+    def reserve_local(pending, context):
+        return agent.reserve_local_approval(
+            context.task_id, pending.request.id, control_plane
+        )
+
+    def dispatch_local(reserved, context):
+        result = agent.dispatch_reserved_approval(
+            context.task_id, reserved.approval_id, reserved.execution_id
+        )
+        if isinstance(result, ApprovalNeeded):
+            return result
+        return Artifact.text(result.message, {"run_id": result.run_id})
+
+    def cancel(context):
+        agent.cancel_local_approval(context.task_id)
+
     host = os.getenv("CORE_AGENT_HOST", "0.0.0.0")
     port = int(os.getenv("CORE_AGENT_PORT", "8000"))
     base_url = base_url or os.getenv("CORE_AGENT_BASE_URL", f"http://localhost:{port}")
+    card = AgentCard(
+        os.getenv("CORE_AGENT_NAME", "core-agent"),
+        optional_extensions=(
+            os.getenv("LOCAL_APPROVAL_EXTENSION_URI", LOCAL_APPROVAL_STATUS_URI),
+        ),
+    )
     app = build_starlette_app(
-        agent_card=AgentCard.minimal(os.getenv("CORE_AGENT_NAME", "core-agent")),
+        agent_card=card,
         handler=handle,
+        local_approval_reserve_handler=reserve_local,
+        local_approval_dispatch_handler=dispatch_local,
+        cancel_handler=cancel,
+        is_waiting_local_approval=agent.is_waiting_local_approval,
+        can_cancel=agent.can_cancel_local_approval,
         base_url=base_url,
     )
     app.state.core_agent = agent
+    app.state.operator_control_plane = control_plane
 
     def close():
         agent.close()

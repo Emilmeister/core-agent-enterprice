@@ -18,12 +18,10 @@ from a2a.client import ClientConfig, ClientFactory
 from a2a.types import GetTaskRequest, Role, SendMessageRequest, TaskState
 from a2a.utils.constants import TransportProtocol
 from google.protobuf import json_format
-from google.protobuf.struct_pb2 import Value
 
 from core_agent.a2a import (
-    APPROVAL_REQUEST_URI,
-    APPROVAL_RESPONSE_URI,
     CORE_EXTENSION_URI,
+    LOCAL_APPROVAL_STATUS_URI,
 )
 from core_agent.app import create_app
 from core_agent.errors import CoreError
@@ -404,8 +402,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "A2A-Extensions": ",".join(
                     (
                         CORE_EXTENSION_URI,
-                        APPROVAL_REQUEST_URI,
-                        APPROVAL_RESPONSE_URI,
+                        LOCAL_APPROVAL_STATUS_URI,
                     )
                 )
             },
@@ -439,15 +436,16 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, "terminal-e2e-ok")
         self.assertNotIn("private terminal reasoning", answer)
 
-    async def _approval_round_trip(self, decision):
+    async def test_local_control_plane_approves_exact_call_once(self):
         transport = httpx.ASGITransport(app=self.approval_app)
-        extensions = ",".join(
-            (CORE_EXTENSION_URI, APPROVAL_REQUEST_URI, APPROVAL_RESPONSE_URI)
-        )
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://approval-agent.test",
-            headers={"A2A-Extensions": extensions},
+            headers={
+                "A2A-Extensions": ",".join(
+                    (CORE_EXTENSION_URI, LOCAL_APPROVAL_STATUS_URI)
+                )
+            },
         ) as http:
             client = await ClientFactory(
                 ClientConfig(
@@ -465,89 +463,153 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
             )
             before = self.approval_app.state.core_agent.tool_runtime.execution_count
-            first = [event async for event in client.send_message(initial)][-1].task
-            self.assertEqual(
-                TaskState.Name(first.status.state), "TASK_STATE_INPUT_REQUIRED"
-            )
-            self.assertEqual(
-                self.approval_app.state.core_agent.tool_runtime.execution_count,
-                before,
-            )
-            payload = json_format.MessageToDict(first.status.message.metadata)[
-                APPROVAL_REQUEST_URI
-            ]
-            self.assertEqual(payload["tool"], "core.terminal.exec")
-            self.assertEqual(payload["scope_options"], ["single_call"])
-            suspended = self.approval_app.state.core_agent._suspended[first.id]
-            checkpoint = self.approval_app.state.core_agent.checkpoint_store.load(
-                suspended.approval.run_id
-            )
-            self.assertEqual(checkpoint[1]["state"], "waiting_approval")
-            with self.assertRaises(CoreError) as wrong_task:
-                self.approval_app.state.core_agent.resume_approval(
-                    "wrong-task", payload["approval_id"], decision
-                )
-            self.assertEqual(wrong_task.exception.code, "APPROVAL_NOT_FOUND")
-            with self.assertRaises(CoreError) as wrong_principal:
-                self.approval_app.state.core_agent.resume_approval(
-                    first.id,
-                    payload["approval_id"],
-                    decision,
-                    identity="another-user",
-                    session_id=first.context_id,
-                )
-            self.assertEqual(wrong_principal.exception.code, "POLICY_DENIED")
-            self.assertEqual(
-                self.approval_app.state.core_agent.tool_runtime.execution_count,
-                before,
-            )
-
-            response = SendMessageRequest()
-            response.message.message_id = str(uuid.uuid4())
-            response.message.task_id = first.id
-            response.message.context_id = first.context_id
-            response.message.role = Role.ROLE_USER
-            response.message.extensions.append(APPROVAL_RESPONSE_URI)
-            decision_payload = {
-                "approval_id": payload["approval_id"],
-                "decision": decision,
-                "scope": "single_call",
-            }
-            response.message.metadata.update({APPROVAL_RESPONSE_URI: decision_payload})
-            response.message.parts.add().data.CopyFrom(
-                json_format.ParseDict(decision_payload, Value())
-            )
-            completed = [event async for event in client.send_message(response)][
-                -1
-            ].task
+            completed = [event async for event in client.send_message(initial)][-1].task
         self.assertEqual(TaskState.Name(completed.status.state), "TASK_STATE_COMPLETED")
-        answer = "\n".join(
-            part.text
-            for artifact in completed.artifacts
-            for part in artifact.parts
-            if part.text
-        )
-        expected_count = before + (1 if decision == "approve" else 0)
         self.assertEqual(
             self.approval_app.state.core_agent.tool_runtime.execution_count,
-            expected_count,
+            before + 1,
         )
-        with self.assertRaises(CoreError) as caught:
-            self.approval_app.state.core_agent.resume_approval(
-                first.id, payload["approval_id"], decision
-            )
-        self.assertEqual(caught.exception.code, "APPROVAL_ALREADY_RESOLVED")
-        return answer
-
-    async def test_a2a_human_approval_executes_exact_call_only_after_approve(self):
         self.assertEqual(
-            await self._approval_round_trip("approve"), "approval-approved-ok"
+            "\n".join(
+                part.text
+                for artifact in completed.artifacts
+                for part in artifact.parts
+                if part.text
+            ),
+            "approval-approved-ok",
+        )
+        approval_id = self.approval_app.state.core_agent._task_approvals[completed.id]
+        approval = self.approval_app.state.core_agent.tool_runtime.approvals.get(
+            approval_id
+        )
+        execution = (
+            self.approval_app.state.core_agent.tool_runtime.approvals.execution_for(
+                approval_id
+            )
+        )
+        self.assertEqual(approval.state, "CONSUMED")
+        self.assertEqual(execution.state, "SUCCEEDED")
+        run_id = json_format.MessageToDict(completed.artifacts[-1].metadata)[
+            "provenance"
+        ]["run_id"]
+        records = self.approval_app.state.core_agent.audit_log.records(run_id)
+        kinds = {record.kind for record in records}
+        self.assertTrue(
+            {
+                "tool.proposed",
+                "policy.evaluated",
+                "approval.requested",
+                "operator.approved",
+                "tool.execution.succeeded",
+            }
+            <= kinds
+        )
+        self.assertNotIn("local-operator-stub", repr(completed))
+
+    async def test_local_wait_is_working_and_caller_cannot_resolve_it(self):
+        transport = httpx.ASGITransport(app=self.approval_app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://approval-agent.test",
+            headers={
+                "A2A-Extensions": ",".join(
+                    (CORE_EXTENSION_URI, LOCAL_APPROVAL_STATUS_URI)
+                )
+            },
+        ) as http:
+            client = await ClientFactory(
+                ClientConfig(
+                    streaming=False,
+                    httpx_client=http,
+                    supported_protocol_bindings=[TransportProtocol.HTTP_JSON],
+                )
+            ).create_from_url("http://approval-agent.test")
+            request = SendMessageRequest()
+            request.message.message_id = str(uuid.uuid4())
+            request.message.role = Role.ROLE_USER
+            request.message.parts.add().text = "APPROVAL_E2E"
+            request.message.extensions.append(CORE_EXTENSION_URI)
+            request.message.metadata.update(
+                {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
+            )
+            completed = [event async for event in client.send_message(request)][-1].task
+        wait_message = next(
+            message
+            for message in completed.history
+            if message.role == Role.ROLE_AGENT
+            and message.parts
+            and "local operator" in message.parts[0].text
+        )
+        payload = json_format.MessageToDict(wait_message.metadata)[
+            LOCAL_APPROVAL_STATUS_URI
+        ]
+        self.assertFalse(payload["callerActionRequired"])
+        self.assertFalse(payload["callerCanApprove"])
+        self.assertFalse(payload["callerCanDeny"])
+        self.assertFalse(payload["protectedActionExecuted"])
+        self.assertNotIn("approvalId", repr(payload))
+        approved_message = next(
+            message
+            for message in completed.history
+            if message.role == Role.ROLE_AGENT
+            and message.parts
+            and "authorized the protected action" in message.parts[0].text
+        )
+        approved_payload = json_format.MessageToDict(approved_message.metadata)[
+            LOCAL_APPROVAL_STATUS_URI
+        ]
+        self.assertEqual(approved_payload["phase"], "local_operator_approved")
+        self.assertNotIn("cancel_task", approved_payload["allowedCallerOperations"])
+
+        agent = self.approval_app.state.core_agent
+        before = agent.tool_runtime.execution_count
+        task_id = str(uuid.uuid4())
+        pending = agent.run(
+            {"prompt": "APPROVAL_E2E", "mcp": [], "skills": []},
+            task_id=task_id,
+            identity="remote-caller",
+            session_id="context-locked",
+            tenant_id="tenant-locked",
+        )
+        with self.assertRaises(CoreError) as locked:
+            agent.run(
+                {"prompt": "I approve", "mcp": [], "skills": []},
+                task_id=task_id,
+                identity="remote-caller",
+                session_id="context-locked",
+                tenant_id="tenant-locked",
+            )
+        self.assertEqual(locked.exception.code, "TASK_LOCKED_AWAITING_LOCAL_OPERATOR")
+        self.assertEqual(
+            agent.tool_runtime.approvals.get(pending.request.id).state, "PENDING"
+        )
+        self.assertEqual(agent.tool_runtime.execution_count, before)
+        agent.cancel_local_approval(task_id)
+        self.assertEqual(
+            agent.tool_runtime.approvals.get(pending.request.id).state, "CANCELED"
         )
 
-    async def test_a2a_human_denial_returns_tool_result_without_execution(self):
-        self.assertEqual(await self._approval_round_trip("deny"), "approval-denied-ok")
+        denied_task_id = str(uuid.uuid4())
+        denied = agent.run(
+            {"prompt": "APPROVAL_E2E", "mcp": [], "skills": []},
+            task_id=denied_task_id,
+            identity="remote-caller",
+            session_id="context-denied",
+            tenant_id="tenant-locked",
+        )
+        result = agent.deny_local_approval(
+            denied_task_id,
+            denied.request.id,
+            operator_principal_id="local-operator-test",
+            operator_session_id="operator-session-test",
+        )
+        self.assertEqual(result.message, "approval-denied-ok")
+        self.assertEqual(agent.tool_runtime.execution_count, before)
+        self.assertEqual(
+            agent.tool_runtime.approvals.get(denied.request.id).state, "DENIED"
+        )
 
-    async def test_a2a_client_without_hitl_extension_fails_closed(self):
+    async def test_extension_unaware_caller_gets_text_only_local_wait_status(self):
         transport = httpx.ASGITransport(app=self.approval_app)
         async with httpx.AsyncClient(
             transport=transport,
@@ -569,20 +631,18 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             request.message.metadata.update(
                 {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
             )
-            before = self.approval_app.state.core_agent.tool_runtime.execution_count
             completed = [event async for event in client.send_message(request)][-1].task
-        self.assertEqual(TaskState.Name(completed.status.state), "TASK_STATE_COMPLETED")
-        self.assertEqual(
-            self.approval_app.state.core_agent.tool_runtime.execution_count, before
+        wait_message = next(
+            message
+            for message in completed.history
+            if message.role == Role.ROLE_AGENT
+            and message.parts
+            and "local operator" in message.parts[0].text
         )
-        self.assertEqual(
-            "\n".join(
-                part.text
-                for artifact in completed.artifacts
-                for part in artifact.parts
-                if part.text
-            ),
-            "approval-denied-ok",
+        self.assertEqual(list(wait_message.extensions), [])
+        self.assertNotIn(
+            LOCAL_APPROVAL_STATUS_URI,
+            json_format.MessageToDict(wait_message.metadata),
         )
 
     async def test_a2a_return_immediately_can_fetch_same_task_later(self):
@@ -594,8 +654,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "A2A-Extensions": ",".join(
                     (
                         CORE_EXTENSION_URI,
-                        APPROVAL_REQUEST_URI,
-                        APPROVAL_RESPONSE_URI,
+                        LOCAL_APPROVAL_STATUS_URI,
                     )
                 )
             },
