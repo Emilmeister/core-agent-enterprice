@@ -22,7 +22,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -133,6 +133,117 @@ FOR EACH ROW EXECUTE FUNCTION core_reject_mutation();
 CREATE TRIGGER core_audit_records_immutable
 BEFORE UPDATE OR DELETE ON core_audit_records
 FOR EACH ROW EXECUTE FUNCTION core_reject_mutation();
+""",
+    2: """
+ALTER TABLE core_events
+    ADD COLUMN tenant_id text NOT NULL DEFAULT 'default';
+ALTER TABLE core_checkpoints
+    ADD COLUMN tenant_id text NOT NULL DEFAULT 'default';
+ALTER TABLE core_audit_records
+    ADD COLUMN tenant_id text NOT NULL DEFAULT 'default';
+ALTER TABLE core_execution_records
+    ADD COLUMN started_at double precision,
+    ADD COLUMN finished_at double precision,
+    ADD COLUMN outcome jsonb,
+    ADD COLUMN error_code text;
+ALTER TABLE core_a2a_tasks
+    ADD COLUMN protocol_version text NOT NULL DEFAULT '1.0',
+    ADD COLUMN extension_version text NOT NULL DEFAULT 'v1';
+
+CREATE INDEX core_events_tenant_run_idx
+    ON core_events (tenant_id, run_id, revision);
+CREATE INDEX core_checkpoints_tenant_run_idx
+    ON core_checkpoints (tenant_id, run_id);
+CREATE INDEX core_audit_tenant_run_idx
+    ON core_audit_records (tenant_id, run_id, sequence);
+
+CREATE TABLE core_runs (
+    run_id text PRIMARY KEY,
+    task_id text NOT NULL,
+    context_id text NOT NULL,
+    tenant_id text NOT NULL,
+    owner_id text NOT NULL,
+    parent_run_id text,
+    state text NOT NULL,
+    version bigint NOT NULL DEFAULT 1,
+    request jsonb NOT NULL,
+    snapshot jsonb NOT NULL,
+    pending_approval_id text,
+    lease_owner text,
+    lease_token text,
+    lease_expires_at double precision,
+    result jsonb,
+    error_code text,
+    created_at double precision NOT NULL,
+    updated_at double precision NOT NULL,
+    UNIQUE (task_id, tenant_id, owner_id)
+);
+
+CREATE INDEX core_runs_recovery_idx
+    ON core_runs (state, updated_at)
+    WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'REJECTED', 'ABORTED');
+
+CREATE TABLE core_background_tasks (
+    id text PRIMARY KEY,
+    owner_run_id text NOT NULL,
+    tenant_id text NOT NULL,
+    kind text NOT NULL,
+    state text NOT NULL,
+    required boolean NOT NULL,
+    recoverable boolean NOT NULL,
+    revision bigint NOT NULL DEFAULT 0,
+    contract jsonb NOT NULL,
+    result jsonb,
+    error_code text,
+    cancel_requested boolean NOT NULL DEFAULT false,
+    created_at double precision NOT NULL,
+    updated_at double precision NOT NULL
+);
+
+CREATE INDEX core_background_owner_idx
+    ON core_background_tasks (tenant_id, owner_run_id, created_at);
+CREATE INDEX core_background_recovery_idx
+    ON core_background_tasks (state, updated_at)
+    WHERE state IN ('submitted', 'working');
+
+CREATE TABLE core_notifications (
+    id text PRIMARY KEY,
+    owner_run_id text NOT NULL,
+    tenant_id text NOT NULL,
+    task_id text NOT NULL,
+    kind text NOT NULL,
+    revision bigint NOT NULL,
+    payload jsonb NOT NULL,
+    acknowledged_at double precision,
+    created_at double precision NOT NULL,
+    UNIQUE (tenant_id, owner_run_id, task_id, kind, revision)
+);
+
+CREATE INDEX core_notifications_pending_idx
+    ON core_notifications (tenant_id, owner_run_id, created_at)
+    WHERE acknowledged_at IS NULL;
+
+CREATE TABLE core_outbox (
+    id text PRIMARY KEY,
+    tenant_id text NOT NULL,
+    aggregate_type text NOT NULL,
+    aggregate_id text NOT NULL,
+    event_type text NOT NULL,
+    sequence bigint NOT NULL,
+    payload jsonb NOT NULL,
+    attempts integer NOT NULL DEFAULT 0,
+    available_at double precision NOT NULL,
+    locked_by text,
+    locked_until double precision,
+    published_at double precision,
+    last_error_code text,
+    created_at double precision NOT NULL,
+    UNIQUE (tenant_id, aggregate_type, aggregate_id, event_type, sequence)
+);
+
+CREATE INDEX core_outbox_pending_idx
+    ON core_outbox (available_at, created_at)
+    WHERE published_at IS NULL;
 """,
 }
 
@@ -260,6 +371,10 @@ class PostgresDatabase:
             "core_checkpoints": "SELECT, INSERT, UPDATE",
             "core_audit_records": "SELECT, INSERT",
             "core_a2a_tasks": "SELECT, INSERT, UPDATE, DELETE",
+            "core_runs": "SELECT, INSERT, UPDATE",
+            "core_background_tasks": "SELECT, INSERT, UPDATE",
+            "core_notifications": "SELECT, INSERT, UPDATE",
+            "core_outbox": "SELECT, INSERT, UPDATE",
         }
         with self.transaction() as connection:
             connection.execute(
@@ -282,39 +397,45 @@ class PostgresEventStore:
     def __init__(self, database):
         self.database = database
 
-    def append(self, run_id, kind, data):
+    def append(self, run_id, kind, data, *, tenant_id="default"):
         published_at = time.time()
         with self.database.transaction() as connection:
             connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (run_id,))
             row = connection.execute(
-                "SELECT COALESCE(max(revision), 0) + 1 AS revision FROM core_events WHERE run_id = %s",
-                (run_id,),
+                """SELECT COALESCE(max(revision), 0) + 1 AS revision
+                   FROM core_events WHERE run_id = %s AND tenant_id = %s""",
+                (run_id, tenant_id),
             ).fetchone()
             revision = row["revision"]
             connection.execute(
-                "INSERT INTO core_events VALUES (%s, %s, %s, %s, %s)",
-                (run_id, revision, kind, Jsonb(dict(data)), published_at),
+                """INSERT INTO core_events
+                   (run_id, revision, kind, data, published_at, tenant_id)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (run_id, revision, kind, Jsonb(dict(data)), published_at, tenant_id),
             )
         return Event(run_id, revision, kind, dict(data), published_at)
 
-    def events(self, run_id):
+    def events(self, run_id, *, tenant_id="default"):
         with self.database.pool.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM core_events WHERE run_id = %s ORDER BY revision",
-                (run_id,),
+                """SELECT run_id, revision, kind, data, published_at
+                   FROM core_events WHERE run_id = %s AND tenant_id = %s
+                   ORDER BY revision""",
+                (run_id, tenant_id),
             ).fetchall()
         return tuple(Event(**row) for row in rows)
 
-    def revision(self, run_id):
+    def revision(self, run_id, *, tenant_id="default"):
         with self.database.pool.connection() as connection:
             return connection.execute(
-                "SELECT COALESCE(max(revision), 0) AS revision FROM core_events WHERE run_id = %s",
-                (run_id,),
+                """SELECT COALESCE(max(revision), 0) AS revision
+                   FROM core_events WHERE run_id = %s AND tenant_id = %s""",
+                (run_id, tenant_id),
             ).fetchone()["revision"]
 
-    def count(self, run_id, *, kind=None):
-        sql = "SELECT count(*) AS count FROM core_events WHERE run_id = %s"
-        values = [run_id]
+    def count(self, run_id, *, kind=None, tenant_id="default"):
+        sql = "SELECT count(*) AS count FROM core_events WHERE run_id = %s AND tenant_id = %s"
+        values = [run_id, tenant_id]
         if kind is not None:
             sql += " AND kind = %s"
             values.append(kind)
@@ -326,24 +447,27 @@ class PostgresCheckpointStore:
     def __init__(self, database):
         self.database = database
 
-    def save(self, run_id, revision, state):
+    def save(self, run_id, revision, state, *, tenant_id="default"):
         with self.database.transaction() as connection:
             connection.execute(
-                """INSERT INTO core_checkpoints (run_id, revision, state)
-                   VALUES (%s, %s, %s)
+                """INSERT INTO core_checkpoints (run_id, revision, state, tenant_id)
+                   VALUES (%s, %s, %s, %s)
                    ON CONFLICT (run_id) DO UPDATE SET
                      revision = EXCLUDED.revision,
                      state = EXCLUDED.state,
+                     tenant_id = EXCLUDED.tenant_id,
                      saved_at = now()
-                   WHERE core_checkpoints.revision <= EXCLUDED.revision""",
-                (run_id, revision, Jsonb(dict(state))),
+                   WHERE core_checkpoints.revision <= EXCLUDED.revision
+                     AND core_checkpoints.tenant_id = EXCLUDED.tenant_id""",
+                (run_id, revision, Jsonb(dict(state)), tenant_id),
             )
 
-    def load(self, run_id):
+    def load(self, run_id, *, tenant_id="default"):
         with self.database.pool.connection() as connection:
             row = connection.execute(
-                "SELECT revision, state FROM core_checkpoints WHERE run_id = %s",
-                (run_id,),
+                """SELECT revision, state FROM core_checkpoints
+                   WHERE run_id = %s AND tenant_id = %s""",
+                (run_id, tenant_id),
             ).fetchone()
         return (row["revision"], row["state"]) if row else None
 
@@ -352,25 +476,30 @@ class PostgresAuditLog:
     def __init__(self, database):
         self.database = database
 
-    def append(self, run_id, kind, data):
+    def append(self, run_id, kind, data, *, tenant_id="default"):
         written_at = time.time()
         with self.database.transaction() as connection:
             connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (run_id,))
             sequence = connection.execute(
-                "SELECT COALESCE(max(sequence), 0) + 1 AS sequence FROM core_audit_records WHERE run_id = %s",
-                (run_id,),
+                """SELECT COALESCE(max(sequence), 0) + 1 AS sequence
+                   FROM core_audit_records WHERE run_id = %s AND tenant_id = %s""",
+                (run_id, tenant_id),
             ).fetchone()["sequence"]
             connection.execute(
-                "INSERT INTO core_audit_records VALUES (%s, %s, %s, %s, %s)",
-                (run_id, sequence, kind, Jsonb(dict(data)), written_at),
+                """INSERT INTO core_audit_records
+                   (run_id, sequence, kind, data, written_at, tenant_id)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (run_id, sequence, kind, Jsonb(dict(data)), written_at, tenant_id),
             )
         return AuditRecord(run_id, sequence, kind, dict(data), written_at)
 
-    def records(self, run_id):
+    def records(self, run_id, *, tenant_id="default"):
         with self.database.pool.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM core_audit_records WHERE run_id = %s ORDER BY sequence",
-                (run_id,),
+                """SELECT run_id, sequence, kind, data, written_at
+                   FROM core_audit_records
+                   WHERE run_id = %s AND tenant_id = %s ORDER BY sequence""",
+                (run_id, tenant_id),
             ).fetchall()
         return tuple(AuditRecord(**row) for row in rows)
 

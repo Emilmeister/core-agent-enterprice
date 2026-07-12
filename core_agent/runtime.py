@@ -114,6 +114,7 @@ class CoreAgent:
         compactor=None,
         token_counter=None,
         depth=0,
+        workflow_store=None,
     ):
         self.platform_config = platform_config
         self.agent_config = agent_config
@@ -128,7 +129,9 @@ class CoreAgent:
         self.compactor = compactor
         self.token_counter = token_counter or (lambda text: max(1, len(text) // 4))
         self.depth = depth
+        self.workflow_store = workflow_store
         self._run_contexts = {}
+        self._run_scopes = {}
         self._suspended = {}
         self._task_approvals = {}
         self._suspended_lock = threading.Lock()
@@ -142,6 +145,10 @@ class CoreAgent:
                 "core.delegate": self._delegate,
             }
         )
+        if self.depth == 0 and hasattr(self.task_scheduler, "register"):
+            self.task_scheduler.register(
+                "background_tool", self._recover_background_tool
+            )
 
     def _enabled_builtins(self):
         raw = self.agent_config.to_dict()["tools"]["builtins"]
@@ -238,6 +245,8 @@ class CoreAgent:
         ):
             raise CoreError("CAPABILITY_DISABLED")
         task_run_id = f"{run_id}-background-{uuid.uuid4()}"
+        scope = self._run_scopes.get(run_id, {})
+        definition = self.tool_runtime.registry.get(target)
 
         def execute(cancel_event):
             if cancel_event.is_set():
@@ -245,6 +254,9 @@ class CoreAgent:
             outcome = self.tool_runtime.execute(
                 ToolCall(str(uuid.uuid4()), target, arguments.get("arguments", {})),
                 run_id=task_run_id,
+                identity=scope.get("identity"),
+                session_id=scope.get("session_id"),
+                tenant_id=scope.get("tenant_id"),
             )
             if isinstance(outcome, ApprovalRequest):
                 raise CoreError("APPROVAL_REQUIRED")
@@ -255,34 +267,74 @@ class CoreAgent:
             owner_id=run_id,
             required=bool(arguments.get("required")),
             accepts_cancel_event=True,
+            kind="background_tool",
+            contract={
+                "tool": target,
+                "arguments": arguments.get("arguments", {}),
+                "run_id": task_run_id,
+                "identity": scope.get("identity"),
+                "session_id": scope.get("session_id"),
+                "tenant_id": scope.get("tenant_id", "default"),
+            },
+            recoverable=not definition.mutating,
+            tenant_id=scope.get("tenant_id", "default"),
         )
         return self._task_snapshot(task)
 
+    def _recover_background_tool(self, contract, cancel_event):
+        if cancel_event.is_set():
+            return None
+        outcome = self.tool_runtime.execute(
+            ToolCall(
+                str(uuid.uuid4()), contract["tool"], dict(contract["arguments"])
+            ),
+            run_id=contract["run_id"],
+            identity=contract.get("identity"),
+            session_id=contract.get("session_id"),
+            tenant_id=contract.get("tenant_id", "default"),
+        )
+        if isinstance(outcome, ApprovalRequest):
+            raise CoreError("APPROVAL_REQUIRED")
+        return self._value(outcome.output)
+
     def _task_get(self, arguments, run_id):
+        tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
         return self._task_snapshot(
-            self.task_scheduler.get(arguments["task_id"], owner_id=run_id)
+            self.task_scheduler.get(
+                arguments["task_id"], owner_id=run_id, tenant_id=tenant_id
+            )
         )
 
     def _task_list(self, arguments, run_id):
+        tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
         return [
             self._task_snapshot(task)
-            for task in self.task_scheduler.list(owner_id=run_id)
+            for task in self.task_scheduler.list(
+                owner_id=run_id, tenant_id=tenant_id
+            )
         ]
 
     def _task_wait(self, arguments, run_id):
+        tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
         try:
             task = self.task_scheduler.wait(
                 arguments["task_id"],
                 arguments.get("timeout"),
                 owner_id=run_id,
+                tenant_id=tenant_id,
             )
         except TimeoutError:
-            task = self.task_scheduler.get(arguments["task_id"], owner_id=run_id)
+            task = self.task_scheduler.get(
+                arguments["task_id"], owner_id=run_id, tenant_id=tenant_id
+            )
         return self._task_snapshot(task)
 
     def _task_cancel(self, arguments, run_id):
+        tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
         return self._task_snapshot(
-            self.task_scheduler.cancel(arguments["task_id"], owner_id=run_id)
+            self.task_scheduler.cancel(
+                arguments["task_id"], owner_id=run_id, tenant_id=tenant_id
+            )
         )
 
     def _delegate(self, arguments, run_id):
@@ -370,6 +422,7 @@ class CoreAgent:
             compactor=self.compactor,
             token_counter=self.token_counter,
             depth=self.depth + 1,
+            workflow_store=self.workflow_store,
         )
         task = self.task_scheduler.start(
             lambda: child.run(
@@ -389,6 +442,25 @@ class CoreAgent:
             ),
             owner_id=run_id,
             required=True,
+            kind="subagent",
+            contract={
+                "request": {
+                    "prompt": contract.instruction,
+                    "mcp": [
+                        declaration
+                        for declaration in request.mcp
+                        if declaration["name"] in contract.mcp
+                    ],
+                    "skills": [
+                        declaration
+                        for declaration in request.skills
+                        if declaration["name"] in contract.skills
+                    ],
+                },
+                "agent_config": child_raw,
+            },
+            recoverable=False,
+            tenant_id=self._run_scopes.get(run_id, {}).get("tenant_id", "default"),
         )
         return self._task_snapshot(task)
 
@@ -425,6 +497,12 @@ class CoreAgent:
         ]
         run_id = str(uuid.uuid4())
         self._run_contexts[run_id] = (request, effective)
+        self._run_scopes[run_id] = {
+            "identity": identity or "anonymous",
+            "session_id": session_id or run_id,
+            "task_id": task_id or run_id,
+            "tenant_id": tenant_id or "default",
+        }
         self.audit_log.append(
             run_id,
             "config.snapshot",
@@ -627,7 +705,9 @@ class CoreAgent:
                     ),
                 )
             if response.message is not None:
-                self.task_scheduler.assert_can_complete_parent(run_id)
+                self.task_scheduler.assert_can_complete_parent(
+                    run_id, tenant_id=tenant_id or "default"
+                )
                 self.audit_log.append(
                     run_id, "task.completed", {"message": response.message}
                 )
@@ -650,6 +730,7 @@ class CoreAgent:
         except StopIteration as completed:
             if isinstance(completed.value, RunResult):
                 self._run_contexts.pop(completed.value.run_id, None)
+                self._run_scopes.pop(completed.value.run_id, None)
             if task_id is not None:
                 with self._suspended_lock:
                     self._suspended.pop(task_id, None)
@@ -806,6 +887,7 @@ class CoreAgent:
             suspended.generator.close()
         run_id = suspended.approval.run_id
         self._run_contexts.pop(run_id, None)
+        self._run_scopes.pop(run_id, None)
         self.audit_log.append(
             run_id,
             "approval.canceled",
@@ -825,5 +907,11 @@ class CoreAgent:
             self._suspended.clear()
             self._task_approvals.clear()
         self._run_contexts.clear()
+        self._run_scopes.clear()
         self.task_scheduler.close()
         self.tool_runtime.approvals.close()
+
+    def recover_durable_tasks(self):
+        if hasattr(self.task_scheduler, "recover"):
+            return self.task_scheduler.recover()
+        return 0

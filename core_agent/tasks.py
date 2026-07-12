@@ -66,7 +66,7 @@ class TaskScheduler:
         self.telemetry = telemetry
         self.active_compute_waiters = 0
 
-    def mailbox(self, owner_id):
+    def mailbox(self, owner_id, tenant_id="default"):
         return self._mailboxes.setdefault(owner_id, DurableMailbox(owner_id))
 
     def start(
@@ -77,6 +77,10 @@ class TaskScheduler:
         required=False,
         accepts_cancel_event=False,
         trace_context=None,
+        kind=None,
+        contract=None,
+        recoverable=False,
+        tenant_id="default",
     ):
         task = BackgroundTask(str(uuid.uuid4()), owner_id, required)
         self._tasks[task.id] = task
@@ -129,7 +133,7 @@ class TaskScheduler:
         threading.Thread(target=run, daemon=True).start()
         return task
 
-    def get(self, task_id, *, owner_id=None):
+    def get(self, task_id, *, owner_id=None, tenant_id="default"):
         try:
             task = self._tasks[task_id]
         except KeyError:
@@ -138,11 +142,11 @@ class TaskScheduler:
             raise CoreError("POLICY_DENIED")
         return task
 
-    def list(self, *, owner_id):
+    def list(self, *, owner_id, tenant_id="default"):
         return tuple(task for task in self._tasks.values() if task.owner_id == owner_id)
 
-    def wait(self, task_id, timeout=None, *, owner_id=None):
-        task = self.get(task_id, owner_id=owner_id)
+    def wait(self, task_id, timeout=None, *, owner_id=None, tenant_id="default"):
+        task = self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
         end = None if timeout is None else time.monotonic() + timeout
         with task.condition:
             while task.state not in {"completed", "failed", "canceled"}:
@@ -152,8 +156,8 @@ class TaskScheduler:
                 task.condition.wait(remaining)
         return task
 
-    def cancel(self, task_id, *, owner_id=None):
-        task = self.get(task_id, owner_id=owner_id)
+    def cancel(self, task_id, *, owner_id=None, tenant_id="default"):
+        task = self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
         if (
             task.state in {"completed", "failed", "canceled"}
             or task.cancel_event.is_set()
@@ -162,7 +166,7 @@ class TaskScheduler:
         task.cancel_event.set()
         return task
 
-    def assert_can_complete_parent(self, owner_id):
+    def assert_can_complete_parent(self, owner_id, tenant_id="default"):
         if any(
             task.owner_id == owner_id
             and task.required

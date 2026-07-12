@@ -27,6 +27,7 @@ from .mcp import StreamableHttpMcpConnector
 from .model import CompatibleHttpModel
 from .observability import RecordingExporter, Telemetry
 from .postgres_approvals import PostgresApprovalManager
+from .postgres_tasks import PostgresTaskScheduler
 from .runtime import ApprovalNeeded, CoreAgent
 from .tasks import TaskScheduler
 from .tools import (
@@ -36,6 +37,7 @@ from .tools import (
     ToolRegistry,
     ToolRuntime,
 )
+from .workflow import PostgresWorkflowStore
 
 
 def _csv(name, default=""):
@@ -111,6 +113,8 @@ def _state(database=None):
             "checkpoints": CheckpointStore(),
             "audit": InMemoryAuditLog(),
             "tasks": None,
+            "workflow": None,
+            "scheduler": None,
         }
     if backend != "postgres":
         raise CoreError("CONFIG_INVALID", "unknown CORE_AGENT_STATE_BACKEND")
@@ -135,6 +139,8 @@ def _state(database=None):
         "checkpoints": PostgresCheckpointStore(database),
         "audit": PostgresAuditLog(database),
         "tasks": PostgresTaskStore(database),
+        "workflow": PostgresWorkflowStore(database),
+        "scheduler": PostgresTaskScheduler,
     }
 
 
@@ -337,12 +343,18 @@ def _agent(model, mcp_connector=None, *, state=None):
         tool_runtime=tools,
         mcp_connector=mcp_connector
         or StreamableHttpMcpConnector(headers=_json("CORE_AGENT_MCP_HEADERS_JSON")),
-        task_scheduler=TaskScheduler(telemetry),
+        task_scheduler=(
+            state["scheduler"](state["database"], telemetry)
+            if state["scheduler"]
+            else TaskScheduler(telemetry)
+        ),
         event_store=state["events"],
         checkpoint_store=state["checkpoints"],
         audit_log=state["audit"],
         telemetry=telemetry,
+        workflow_store=state["workflow"],
     )
+    agent.recover_durable_tasks()
     return agent, telemetry
 
 

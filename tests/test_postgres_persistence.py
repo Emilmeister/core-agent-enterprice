@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import unittest
 from unittest.mock import patch
 
@@ -18,7 +19,10 @@ from core_agent.database import (
 )
 from core_agent.errors import CoreError
 from core_agent.postgres_approvals import PostgresApprovalManager
+from core_agent.postgres_tasks import PostgresTaskScheduler
 from core_agent.tools import ToolCall
+from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, WorkflowRecord
+from psycopg.types.json import Jsonb
 
 
 class ProductionConfigurationTests(unittest.TestCase):
@@ -112,15 +116,19 @@ class PostgresRestartTests(unittest.TestCase):
     def _database(self):
         return PostgresDatabase(os.environ["TEST_DATABASE_URL"], min_size=0, max_size=3)
 
-    def test_all_production_state_survives_pool_restart_and_is_scoped(self):
-        database = self._database()
-        database.migrate()
+    def _reset(self, database):
         with database.transaction() as connection:
             connection.execute(
                 """TRUNCATE core_execution_records, core_approval_requests,
                    core_tool_proposals, core_events, core_checkpoints,
-                   core_audit_records, core_a2a_tasks CASCADE"""
+                   core_audit_records, core_a2a_tasks, core_runs,
+                   core_background_tasks, core_notifications, core_outbox CASCADE"""
             )
+
+    def test_all_production_state_survives_pool_restart_and_is_scoped(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
         approvals = PostgresApprovalManager(database)
         approval = approvals.request(
             ToolCall("call-1", "core.terminal.exec", {"argv": ["true"]}),
@@ -157,5 +165,99 @@ class PostgresRestartTests(unittest.TestCase):
             self.assertEqual(asyncio.run(reopened_tasks.get("task-1", context)).id, "task-1")
             other_tenant = ServerCallContext(user=NamedUser(), tenant="tenant-2")
             self.assertIsNone(asyncio.run(reopened_tasks.get("task-1", other_tenant)))
+        finally:
+            reopened.close()
+
+    def test_workflow_lease_outbox_and_background_recovery(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        created = workflows.create(
+            WorkflowRecord(
+                "run-1",
+                "task-1",
+                "context-1",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "test", "mcp": [], "skills": []},
+                {"turns": 0},
+            ),
+            audit=(("task.started", {"safe": True}),),
+        )
+        self.assertEqual(created.version, 1)
+        token = workflows.acquire_lease(
+            "run-1",
+            tenant_id="tenant-1",
+            owner_id="owner-1",
+            worker_id="worker-1",
+            ttl=30,
+        )
+        with self.assertRaises(CoreError) as caught:
+            workflows.acquire_lease(
+                "run-1",
+                tenant_id="tenant-1",
+                owner_id="owner-1",
+                worker_id="worker-2",
+                ttl=30,
+            )
+        self.assertEqual(caught.exception.code, "LEASE_LOST")
+        transitioned = workflows.transition(
+            "run-1",
+            tenant_id="tenant-1",
+            owner_id="owner-1",
+            expected_version=1,
+            state="WAITING_TASK",
+            snapshot={"turns": 1, "waiting": "background-read"},
+            event_kind="task.waiting",
+            audit=(("task.waiting", {"kind": "background"}),),
+            lease_token=token,
+        )
+        self.assertEqual(transitioned.version, 2)
+        with self.assertRaises(CoreError) as caught:
+            workflows.get("run-1", tenant_id="tenant-2", owner_id="owner-1")
+        self.assertEqual(caught.exception.code, "TASK_NOT_FOUND")
+
+        now = time.time()
+        with database.transaction() as connection:
+            for task_id, recoverable in (("read-task", True), ("write-task", False)):
+                connection.execute(
+                    """INSERT INTO core_background_tasks
+                       (id, owner_run_id, tenant_id, kind, state, required,
+                        recoverable, contract, created_at, updated_at)
+                       VALUES (%s, 'run-1', 'tenant-1', 'test-read', 'working',
+                               true, %s, %s, %s, %s)""",
+                    (task_id, recoverable, Jsonb({"value": task_id}), now, now),
+                )
+        database.close()
+
+        reopened = self._database()
+        try:
+            scheduler = PostgresTaskScheduler(reopened)
+            scheduler.register(
+                "test-read", lambda contract, cancel: {"value": contract["value"]}
+            )
+            self.assertEqual(scheduler.recover(), 1)
+            read = scheduler.wait(
+                "read-task", owner_id="run-1", tenant_id="tenant-1", timeout=2
+            )
+            self.assertEqual(read.state, "completed")
+            self.assertEqual(read.result, {"value": "read-task"})
+            write = scheduler.get(
+                "write-task", owner_id="run-1", tenant_id="tenant-1"
+            )
+            self.assertEqual(write.state, "failed")
+            self.assertEqual(write.error.code, "RECOVERY_REQUIRES_RECONCILIATION")
+            notifications = scheduler.mailbox("run-1", "tenant-1").poll()
+            self.assertEqual({item.task_id for item in notifications}, {"read-task", "write-task"})
+
+            published = []
+            dispatcher = OutboxDispatcher(reopened, lambda event: published.append(event["id"]))
+            self.assertGreaterEqual(dispatcher.drain_once(), 3)
+            self.assertEqual(len(published), len(set(published)))
+            scheduler.close()
         finally:
             reopened.close()
