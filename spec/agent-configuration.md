@@ -82,7 +82,7 @@ Database credentials являются Platform/deployment config и никогд
 - `human_input`: boolean;
 - `local_operator_approval`: boolean; отключение при protected action означает fail closed.
 
-Production config MUST задать owner-controlled HTTPS `extension_uri` и настоящий private operator control plane. `ApproveAllControlPlane` разрешён только development profile и не может включаться входным RunRequest.
+Production config MUST задать owner-controlled HTTPS `extension_uri` и настоящий private operator control plane. Встроенный private HTTP adapter требует `OPERATOR_JWT_HS256_SECRET` минимум 32 bytes, отдельные `OPERATOR_JWT_ISSUER`/`OPERATOR_JWT_AUDIENCE` и bounded role `OPERATOR_JWT_ROLE=agent_operator`; token обязан содержать `sub`, `jti`, `exp`, matching issuer/audience и role. Эти credentials не принимаются A2A plane и не попадают в модель, audit или telemetry. Внешний adapter MAY быть внедрён host-ом с эквивалентными guarantees. `ApproveAllControlPlane` разрешён только development profile и не может включаться входным RunRequest.
 
 `disabled` memory означает:
 

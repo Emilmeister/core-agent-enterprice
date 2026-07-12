@@ -145,6 +145,8 @@ POST /internal/approvals/{approvalId}:deny
 
 Он проверяет отдельную audience/role, authenticated operator identity, CSRF для browser session, TLS, rate/session limits, `If-Match` version, digest, expiry, active Task, tenant/environment и proposal immutability. Operator identity берётся только из auth context. Audit append-only связывает task, proposal, approval, digest, operator actor, execution и outcome; RemoteCaller не читает internal audit.
 
+Встроенный bearer adapter принимает только JWT `HS256` с отдельными operator issuer/audience, обязательными `sub`, `jti`, `exp` и role `agent_operator`; ключ имеет минимум 256 bits. Неверный algorithm/signature/time/audience/role возвращает одинаковую безопасную unauthorized error. Host MAY заменить adapter на mTLS/OIDC gateway, сохранив отдельную audience и тот же decision contract.
+
 Development profile MAY заменить UI/API in-process заглушкой `ApproveAllControlPlane`. Она MUST проходить тот же local-only decision, CAS, digest и reservation path, иметь явную internal actor identity, не принимать caller payload и не объявляться в Agent Card. Заглушка MUST быть запрещена production policy.
 
 ## Failure, expiry и denial
