@@ -6,7 +6,7 @@ from pathlib import Path
 SPEC_ROOT = Path(__file__).resolve().parents[1] / "spec"
 
 EXPECTED_SHA256 = {
-    "README.md": "e478bcddb3da73db2953192303faaf709dc660b2f1c7203923483650bddd578d",
+    "README.md": "79192f747cd838d45b0b363e7560a63554d06d6fccd9a8c06ef6cef3dc51ffb2",
     "a2a-protocol.md": "304c24ad5bee3d8619f34443ef753c4bf519b1e4aa10308b7b8960069c69f917",
     "acceptance.md": "2883640dd7d1d039b55f6f396b8fb550498aa5d7b6002406a2166fa86e482190",
     "agent-configuration.md": "86500184291176e382e3417d10ca57b19875aebcb4c5a2b3ccb92e945ef2140c",
@@ -14,6 +14,7 @@ EXPECTED_SHA256 = {
     "context.md": "c07d21e77d2fc719e4d1e22b4d9583055abbbef4d8ffbbd79f1d0d36d33cde21",
     "development-process.md": "3f0c3cd6881394705a921bbd767efddc56d5290c259b7ca9312eca13dc05a4c9",
     "execution-environment.md": "e9614ae9596c9e39a6b1a235e5ca50e17cbee10bb2855c71b0907e2016b4096e",
+    "implementation-status.md": "ee35caa87850c4bd85050d7273bc834b83cfa6d9074e0dad7ae462f21b9d4570",
     "kernel-instructions.md": "37b2b9f0940c909c75d09d451737f511897cc2d2ed8e46675ea6bc95dc0112b7",
     "local-operator-hitl.md": "acce4ac07390bb7de4dfa8d7b1935c6a538fe18b3247988ab9ebfd57cbc00fe4",
     "memory-service.md": "239b55fc8b03aed70b55dfd786ada85c6763ed5ddd9b8d999bfb0854a8bcb1b8",
