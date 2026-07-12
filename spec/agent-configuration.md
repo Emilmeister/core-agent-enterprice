@@ -68,6 +68,8 @@ Database credentials являются Platform/deployment config и никогд
 
 `DATABASE_AUTO_MIGRATE=false` обязателен production: migration job с DDL role выполняется до app rollout, выдаёт app role только необходимые DML grants, затем app role проверяет schema version. Production startup MUST reject `DATABASE_AUTO_MIGRATE=true`. Test profile MAY явно выбрать SQLite/in-memory adapter; implicit fallback при отсутствии PostgreSQL запрещён.
 
+Production deployment MUST задавать `DURABLE_STORAGE_ROOT` как путь к отдельному S3-backed mount для immutable blobs, snapshots, manifests и artifacts. `LOCAL_WORKSPACE_ROOT` MUST указывать на локальную ephemeral filesystem container-а и не может находиться внутри durable mount. Optional `LOCAL_BASE_SNAPSHOT` содержит content-addressed snapshot ID; если он задан, startup проверяет commit manifest и все blobs до первого terminal call. Active workspace никогда не размещается под `DURABLE_STORAGE_ROOT`.
+
 ## Feature switches
 
 Минимальные optional features:

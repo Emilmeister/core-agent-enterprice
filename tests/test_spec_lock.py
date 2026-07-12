@@ -9,7 +9,7 @@ EXPECTED_SHA256 = {
     "README.md": "79192f747cd838d45b0b363e7560a63554d06d6fccd9a8c06ef6cef3dc51ffb2",
     "a2a-protocol.md": "66f18d60f946b0c98cb4968228c9d18e44aaec5ab18ac0627f7ac2b60b4869d9",
     "acceptance.md": "2883640dd7d1d039b55f6f396b8fb550498aa5d7b6002406a2166fa86e482190",
-    "agent-configuration.md": "c3cc5055bbbe68775b811508bfa43f3b387b2c99706d1c4da0ce848a523e38f7",
+    "agent-configuration.md": "51edf1f76b411bf37fd21601bcb1092bb1a0ad8dfa1e1565d7018b2b52873cb5",
     "architecture.md": "9dacc30f3d3a7ec8f228dec240829c05684cafb3742aa07720e107a14669816e",
     "context.md": "c07d21e77d2fc719e4d1e22b4d9583055abbbef4d8ffbbd79f1d0d36d33cde21",
     "development-process.md": "3f0c3cd6881394705a921bbd767efddc56d5290c259b7ca9312eca13dc05a4c9",
