@@ -106,6 +106,10 @@ A2A streaming, polling и push notifications являются тремя пре�
 
 Webhook implementation MUST проверять HTTPS/authentication, защищаться от SSRF и не разрешать private/loopback target без явной host policy.
 
+Production deployment MUST задать `PUSH_NOTIFICATION_ENCRYPTION_KEY` как URL-safe base64 Fernet key из secret injection. Push configurations и authentication tokens хранятся в PostgreSQL только в зашифрованном виде. Каждая доставка сначала фиксируется в durable delivery ledger с уникальностью `(task_id, config_id, event_key)`, затем отправляется с stable delivery ID. Успешный HTTP response фиксируется после отправки; crash между send и commit приводит к допустимой повторной доставке. Pending delivery восстанавливается после restart, использует bounded exponential backoff и не теряется после исчерпания фиксированного числа попыток.
+
+Target URL проверяется и при регистрации, и непосредственно перед каждой доставкой: только HTTPS port 443, без userinfo и redirect following; все DNS addresses должны быть public/global. Unresolved, loopback, link-local, private, reserved и mixed public/private answers отклоняются. Явное разрешение private targets требует отдельной host policy, отсутствующей в v1.
+
 ## Trace context
 
 A2A binding MUST принимать и передавать W3C Trace Context через разрешённые transport headers. Trace context не используется для authorization. Baggage по умолчанию не пересылается внешнему агенту; allowlist запрещает secrets, prompt и user content.
