@@ -113,7 +113,7 @@ Operator v1 не редактирует proposal: только `APPROVE_ONCE` и
 
 Production profile использует PostgreSQL как единый durable store для ToolProposal/ApprovalRequest/ExecutionRecord, A2A Tasks, workflow events, checkpoints и audit. Connection credentials приходят только из deployment secret `DATABASE_URL`; URI MUST NOT попадать в model context, A2A, audit или OTel. Production startup MUST fail до открытия A2A listener, если URL отсутствует, TLS/pool/permissions invalid или schema migration не применена. SQLite и in-memory stores разрешены только явному test profile.
 
-Schema изменяется versioned migrations под PostgreSQL advisory lock. App role получает DML-права без DDL; migration role применяется отдельной командой/инициализацией deployment. Readiness проверяет pool и ожидаемую schema version. Несовместимая или более новая schema завершает startup fail-closed.
+Schema изменяется versioned migrations под PostgreSQL advisory lock. Serving process читает только runtime `DATABASE_URL`. Отдельная migration command MAY читать `DATABASE_MIGRATION_URL` и `DATABASE_APP_ROLE`, после чего выдаёт app role exact table-level DML-права без DDL. Production запрещает in-process auto-migration. Readiness проверяет pool и ожидаемую schema version. Несовместимая или более новая schema завершает startup fail-closed.
 
 `ApprovalRequest` хранит `approvalId`, `taskId`, `proposalId`, `actionDigest`, state, version, created/expiry timestamps, required role и policy version. States: `PENDING`, `APPROVED`, `DENIED`, `EXPIRED`, `CANCELED`, `SUPERSEDED`, `CONSUMED`.
 

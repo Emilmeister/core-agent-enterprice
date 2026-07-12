@@ -135,6 +135,7 @@
 - [ ] Restart сохраняет approval ID/digest/current status; reserved execution не получает вторую reservation или blind retry.
 - [ ] Internal audit связывает task, proposal, approval, operator actor, digest, execution и outcome и недоступен RemoteCaller.
 - [ ] Production без valid `DATABASE_URL`, ожидаемой PostgreSQL schema или database readiness не открывает A2A listener и не использует in-memory/SQLite fallback.
+- [ ] Production serving credential не имеет DDL path: `DATABASE_AUTO_MIGRATE=true` отклоняется, а separate migration credential/app role дают только exact DML grants.
 - [ ] A2A Tasks, events, checkpoints, approval/reservation и audit переживают restart и остаются tenant/owner scoped в одной PostgreSQL transaction boundary.
 
 ## OpenTelemetry

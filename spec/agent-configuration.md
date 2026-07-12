@@ -64,9 +64,9 @@ observability:
 
 ## Production persistence
 
-Database credentials являются Platform/deployment config и никогда не входят в RunRequest/AgentConfig. Production container требует `DATABASE_URL=postgresql://...` из secret injection, использует bounded connection pool и owner/tenant-scoped PostgreSQL rows. `DATABASE_POOL_MIN`, `DATABASE_POOL_MAX`, `DATABASE_CONNECT_TIMEOUT_SECONDS` и `DATABASE_AUTO_MIGRATE` управляются deployment-ом.
+Database credentials являются Platform/deployment config и никогда не входят в RunRequest/AgentConfig. Production container требует runtime credential `DATABASE_URL=postgresql://...` из secret injection, использует bounded connection pool и owner/tenant-scoped PostgreSQL rows. Отдельный migration job MAY получать DDL credential через `DATABASE_MIGRATION_URL` и exact runtime role через `DATABASE_APP_ROLE`; serving process не читает migration credential. `DATABASE_POOL_MIN`, `DATABASE_POOL_MAX`, `DATABASE_CONNECT_TIMEOUT_SECONDS` и `DATABASE_AUTO_MIGRATE` управляются deployment-ом.
 
-`DATABASE_AUTO_MIGRATE=false` является production default: migration job с DDL role выполняется до app rollout, затем app role проверяет schema version и работает только с DML. Test profile MAY явно выбрать SQLite/in-memory adapter; implicit fallback при отсутствии PostgreSQL запрещён.
+`DATABASE_AUTO_MIGRATE=false` обязателен production: migration job с DDL role выполняется до app rollout, выдаёт app role только необходимые DML grants, затем app role проверяет schema version. Production startup MUST reject `DATABASE_AUTO_MIGRATE=true`. Test profile MAY явно выбрать SQLite/in-memory adapter; implicit fallback при отсутствии PostgreSQL запрещён.
 
 ## Feature switches
 
