@@ -9,10 +9,12 @@ dependencies = [
     "mcp==1.28.1",
     "opentelemetry-exporter-otlp-proto-http==1.43.0",
     "opentelemetry-sdk==1.43.0",
+    "psycopg[binary,pool]>=3.2,<4",
 ]
 
 [project.scripts]
 core-agent = "core_agent.app:main"
+core-agent-db = "core_agent.database:main"
 core-agent-memory = "memory_service.mcp_server:main"
 
 [build-system]

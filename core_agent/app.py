@@ -5,17 +5,28 @@ import json
 import os
 from pathlib import Path
 
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
 from .a2a import LOCAL_APPROVAL_STATUS_URI, AgentCard, Artifact
 from .a2a_sdk import build_starlette_app
 from .approvals import ApprovalManager, ApproveAllControlPlane
 from .audit import InMemoryAuditLog
 from .config import AgentConfig, PlatformConfig
 from .durability import CheckpointStore, InMemoryEventStore
+from .database import (
+    PostgresAuditLog,
+    PostgresCheckpointStore,
+    PostgresDatabase,
+    PostgresEventStore,
+    PostgresTaskStore,
+)
 from .errors import CoreError
 from .execution import LocalTerminalBackend, TerminalSessionManager
 from .mcp import StreamableHttpMcpConnector
 from .model import CompatibleHttpModel
 from .observability import RecordingExporter, Telemetry
+from .postgres_approvals import PostgresApprovalManager
 from .runtime import ApprovalNeeded, CoreAgent
 from .tasks import TaskScheduler
 from .tools import (
@@ -75,7 +86,59 @@ def _model():
     )
 
 
-def _agent(model, mcp_connector=None):
+def _boolean(name, default):
+    value = os.getenv(name, default).lower()
+    if value in {"1", "true", "yes"}:
+        return True
+    if value in {"0", "false", "no"}:
+        return False
+    raise CoreError("CONFIG_INVALID", f"{name} must be boolean")
+
+
+def _state(database=None):
+    environment = os.getenv("CORE_AGENT_ENVIRONMENT", "development")
+    backend = os.getenv(
+        "CORE_AGENT_STATE_BACKEND",
+        "postgres" if environment == "production" or database else "test",
+    )
+    if environment == "production" and backend != "postgres":
+        raise CoreError("PRODUCTION_DATABASE_REQUIRED")
+    if backend == "test":
+        return {
+            "database": None,
+            "approvals": None,
+            "events": InMemoryEventStore(),
+            "checkpoints": CheckpointStore(),
+            "audit": InMemoryAuditLog(),
+            "tasks": None,
+        }
+    if backend != "postgres":
+        raise CoreError("CONFIG_INVALID", "unknown CORE_AGENT_STATE_BACKEND")
+    database = database or PostgresDatabase.from_environment()
+    try:
+        auto_migrate = _boolean(
+            "DATABASE_AUTO_MIGRATE", "false" if environment == "production" else "true"
+        )
+        if environment == "production" and auto_migrate:
+            raise CoreError("PRODUCTION_AUTO_MIGRATE_FORBIDDEN")
+        database.migrate() if auto_migrate else database.verify_schema()
+    except Exception:
+        database.close()
+        raise
+    return {
+        "database": database,
+        "approvals": PostgresApprovalManager(
+            database,
+            ttl_seconds=int(os.getenv("LOCAL_APPROVAL_DEFAULT_TTL_SECONDS", "7200")),
+        ),
+        "events": PostgresEventStore(database),
+        "checkpoints": PostgresCheckpointStore(database),
+        "audit": PostgresAuditLog(database),
+        "tasks": PostgresTaskStore(database),
+    }
+
+
+def _agent(model, mcp_connector=None, *, state=None):
     servers = set(_csv("CORE_AGENT_ALLOWED_MCP_SERVERS", "memory"))
     allowed_skills = set(_csv("CORE_AGENT_ALLOWED_SKILLS"))
     mcp_tools = _allowed_mcp_tools(servers)
@@ -240,11 +303,18 @@ def _agent(model, mcp_connector=None):
         "true",
         "yes",
     }
-    approval_path = os.getenv(
-        "LOCAL_APPROVAL_DB_PATH", "/tmp/core-agent/state/approvals.sqlite3"
-    )
-    if approval_path != ":memory:":
-        Path(approval_path).parent.mkdir(parents=True, exist_ok=True)
+    state = state or _state()
+    approvals = state["approvals"]
+    if approvals is None:
+        approval_path = os.getenv(
+            "LOCAL_APPROVAL_DB_PATH", "/tmp/core-agent/state/approvals.sqlite3"
+        )
+        if approval_path != ":memory:":
+            Path(approval_path).parent.mkdir(parents=True, exist_ok=True)
+        approvals = ApprovalManager(
+            approval_path,
+            ttl_seconds=int(os.getenv("LOCAL_APPROVAL_DEFAULT_TTL_SECONDS", "7200")),
+        )
     tools = ToolRuntime(
         registry,
         PolicyEngine(
@@ -252,10 +322,7 @@ def _agent(model, mcp_connector=None):
             if local_approval_enabled
             else ApprovalMode.NEVER
         ),
-        ApprovalManager(
-            approval_path,
-            ttl_seconds=int(os.getenv("LOCAL_APPROVAL_DEFAULT_TTL_SECONDS", "7200")),
-        ),
+        approvals,
         sessions,
     )
     telemetry = (
@@ -271,21 +338,24 @@ def _agent(model, mcp_connector=None):
         mcp_connector=mcp_connector
         or StreamableHttpMcpConnector(headers=_json("CORE_AGENT_MCP_HEADERS_JSON")),
         task_scheduler=TaskScheduler(telemetry),
-        event_store=InMemoryEventStore(),
-        checkpoint_store=CheckpointStore(),
-        audit_log=InMemoryAuditLog(),
+        event_store=state["events"],
+        checkpoint_store=state["checkpoints"],
+        audit_log=state["audit"],
         telemetry=telemetry,
     )
     return agent, telemetry
 
 
-def create_app(*, model=None, mcp_connector=None, base_url=None, control_plane=None):
+def create_app(
+    *, model=None, mcp_connector=None, base_url=None, control_plane=None, database=None
+):
     if os.getenv("CORE_AGENT_ENVIRONMENT", "development") == "production" and (
         control_plane is None or isinstance(control_plane, ApproveAllControlPlane)
     ):
         raise CoreError("LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
     model = model or _model()
-    agent, telemetry = _agent(model, mcp_connector)
+    state = _state(database)
+    agent, telemetry = _agent(model, mcp_connector, state=state)
     control_plane = control_plane or ApproveAllControlPlane()
 
     def handle(request, context):
@@ -336,13 +406,31 @@ def create_app(*, model=None, mcp_connector=None, base_url=None, control_plane=N
         is_waiting_local_approval=agent.is_waiting_local_approval,
         can_cancel=agent.can_cancel_local_approval,
         base_url=base_url,
+        task_store=state["tasks"],
     )
+
+    async def live(_request):
+        return JSONResponse({"status": "ok"})
+
+    async def ready(_request):
+        try:
+            if state["database"]:
+                state["database"].check()
+                state["database"].verify_schema()
+        except Exception:
+            return JSONResponse({"status": "unavailable"}, status_code=503)
+        return JSONResponse({"status": "ready"})
+
+    app.routes[0:0] = (Route("/health/live", live), Route("/health/ready", ready))
     app.state.core_agent = agent
     app.state.operator_control_plane = control_plane
+    app.state.database = state["database"]
 
     def close():
         agent.close()
         telemetry.shutdown()
+        if state["database"]:
+            state["database"].close()
 
     atexit.register(close)
     app.state.close = close

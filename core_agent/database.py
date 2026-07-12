@@ -1,0 +1,504 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import time
+from contextlib import contextmanager
+
+from a2a.server.owner_resolver import resolve_user_scope
+from a2a.server.tasks import TaskStore
+from a2a.types import a2a_pb2
+from a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
+from a2a.utils.errors import InvalidParamsError
+from a2a.utils.task import decode_page_token, encode_page_token
+from psycopg.rows import dict_row
+from psycopg.sql import SQL, Identifier
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
+
+from .audit import AuditRecord
+from .durability import Event
+from .errors import CoreError
+
+
+SCHEMA_VERSION = 1
+MIGRATIONS = {
+    1: """
+CREATE TABLE IF NOT EXISTS core_schema_migrations (
+    version integer PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE core_tool_proposals (
+    id text PRIMARY KEY,
+    task_id text NOT NULL,
+    context_id text NOT NULL,
+    tenant_id text NOT NULL,
+    caller_principal_id text NOT NULL,
+    tool_call_id text NOT NULL,
+    tool_name text NOT NULL,
+    tool_version text NOT NULL,
+    environment text NOT NULL,
+    target_json text NOT NULL,
+    arguments_json text NOT NULL,
+    side_effect_class text NOT NULL,
+    risk_level text NOT NULL,
+    policy_version text NOT NULL,
+    created_at double precision NOT NULL,
+    action_digest text NOT NULL
+);
+
+CREATE TABLE core_approval_requests (
+    id text PRIMARY KEY,
+    task_id text NOT NULL,
+    proposal_id text NOT NULL UNIQUE REFERENCES core_tool_proposals(id),
+    action_digest text NOT NULL,
+    state text NOT NULL,
+    version integer NOT NULL,
+    created_at double precision NOT NULL,
+    expires_at double precision,
+    required_operator_role text NOT NULL,
+    policy_version text NOT NULL,
+    decision text,
+    operator_principal_id text,
+    operator_session_id text
+);
+
+CREATE INDEX core_approval_pending_idx
+    ON core_approval_requests (created_at) WHERE state = 'PENDING';
+
+CREATE TABLE core_execution_records (
+    id text PRIMARY KEY,
+    task_id text NOT NULL,
+    approval_id text NOT NULL UNIQUE REFERENCES core_approval_requests(id),
+    proposal_id text NOT NULL REFERENCES core_tool_proposals(id),
+    action_digest text NOT NULL,
+    idempotency_key text NOT NULL UNIQUE,
+    state text NOT NULL,
+    attempt integer NOT NULL,
+    reserved_at double precision NOT NULL
+);
+
+CREATE TABLE core_events (
+    run_id text NOT NULL,
+    revision bigint NOT NULL,
+    kind text NOT NULL,
+    data jsonb NOT NULL,
+    published_at double precision NOT NULL,
+    PRIMARY KEY (run_id, revision)
+);
+
+CREATE TABLE core_checkpoints (
+    run_id text PRIMARY KEY,
+    revision bigint NOT NULL,
+    state jsonb NOT NULL,
+    saved_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE core_audit_records (
+    run_id text NOT NULL,
+    sequence bigint NOT NULL,
+    kind text NOT NULL,
+    data jsonb NOT NULL,
+    written_at double precision NOT NULL,
+    PRIMARY KEY (run_id, sequence)
+);
+
+CREATE TABLE core_a2a_tasks (
+    task_id text NOT NULL,
+    owner text NOT NULL,
+    tenant text NOT NULL,
+    context_id text NOT NULL,
+    state integer NOT NULL,
+    status_timestamp double precision,
+    payload bytea NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, owner, tenant)
+);
+
+CREATE INDEX core_a2a_tasks_list_idx
+    ON core_a2a_tasks (owner, tenant, status_timestamp DESC, task_id DESC);
+
+CREATE OR REPLACE FUNCTION core_reject_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'row is immutable';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER core_tool_proposals_immutable
+BEFORE UPDATE OR DELETE ON core_tool_proposals
+FOR EACH ROW EXECUTE FUNCTION core_reject_mutation();
+
+CREATE TRIGGER core_audit_records_immutable
+BEFORE UPDATE OR DELETE ON core_audit_records
+FOR EACH ROW EXECUTE FUNCTION core_reject_mutation();
+""",
+}
+
+
+class PostgresDatabase:
+    """One bounded PostgreSQL pool shared by all production state adapters."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        min_size: int = 1,
+        max_size: int = 10,
+        timeout: float = 10,
+    ):
+        if not url:
+            raise CoreError("DATABASE_URL_REQUIRED")
+        if min_size < 0 or max_size < 1 or min_size > max_size or timeout <= 0:
+            raise CoreError("CONFIG_INVALID", "invalid database pool configuration")
+        self._closed = False
+        self.pool = ConnectionPool(
+            conninfo=url,
+            min_size=min_size,
+            max_size=max_size,
+            timeout=timeout,
+            open=False,
+            name="core-agent",
+            kwargs={"autocommit": True, "row_factory": dict_row},
+        )
+        try:
+            self.pool.open(wait=True, timeout=timeout)
+            self.check()
+        except Exception:
+            self.pool.close()
+            raise CoreError("DATABASE_UNAVAILABLE") from None
+
+    @classmethod
+    def from_environment(cls, url=None):
+        def integer(name, default):
+            try:
+                return int(os.getenv(name, default))
+            except ValueError:
+                raise CoreError("CONFIG_INVALID", f"{name} must be an integer") from None
+
+        try:
+            timeout = float(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "10"))
+        except ValueError:
+            raise CoreError(
+                "CONFIG_INVALID", "DATABASE_CONNECT_TIMEOUT_SECONDS must be numeric"
+            ) from None
+        return cls(
+            os.getenv("DATABASE_URL", "") if url is None else url,
+            min_size=integer("DATABASE_POOL_MIN", "1"),
+            max_size=integer("DATABASE_POOL_MAX", "10"),
+            timeout=timeout,
+        )
+
+    @contextmanager
+    def transaction(self):
+        with self.pool.connection() as connection:
+            with connection.transaction():
+                yield connection
+
+    def check(self):
+        with self.pool.connection() as connection:
+            connection.execute("SELECT 1").fetchone()
+
+    def schema_version(self):
+        with self.pool.connection() as connection:
+            row = connection.execute("SELECT to_regclass('core_schema_migrations') AS name").fetchone()
+            if not row["name"]:
+                return 0
+            row = connection.execute(
+                "SELECT COALESCE(max(version), 0) AS version FROM core_schema_migrations"
+            ).fetchone()
+            return row["version"]
+
+    def migrate(self):
+        with self.transaction() as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(913728451)")
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS core_schema_migrations (
+                    version integer PRIMARY KEY,
+                    applied_at timestamptz NOT NULL DEFAULT now()
+                )"""
+            )
+            applied = {
+                row["version"]
+                for row in connection.execute(
+                    "SELECT version FROM core_schema_migrations"
+                ).fetchall()
+            }
+            unknown = applied - MIGRATIONS.keys()
+            if unknown:
+                raise CoreError("DATABASE_SCHEMA_UNSUPPORTED")
+            for version, sql in MIGRATIONS.items():
+                if version not in applied:
+                    connection.execute(sql)
+                    connection.execute(
+                        "INSERT INTO core_schema_migrations (version) VALUES (%s)",
+                        (version,),
+                    )
+        self.verify_schema()
+
+    def verify_schema(self):
+        try:
+            version = self.schema_version()
+        except Exception:
+            raise CoreError("DATABASE_SCHEMA_UNAVAILABLE") from None
+        if version != SCHEMA_VERSION:
+            raise CoreError(
+                "DATABASE_SCHEMA_MISMATCH",
+                f"expected schema {SCHEMA_VERSION}, got {version}",
+            )
+
+    def grant_application_role(self, role):
+        if not role:
+            raise CoreError("CONFIG_INVALID", "DATABASE_APP_ROLE is required")
+        grants = {
+            "core_schema_migrations": "SELECT",
+            "core_tool_proposals": "SELECT, INSERT",
+            "core_approval_requests": "SELECT, INSERT, UPDATE",
+            "core_execution_records": "SELECT, INSERT, UPDATE",
+            "core_events": "SELECT, INSERT",
+            "core_checkpoints": "SELECT, INSERT, UPDATE",
+            "core_audit_records": "SELECT, INSERT",
+            "core_a2a_tasks": "SELECT, INSERT, UPDATE, DELETE",
+        }
+        with self.transaction() as connection:
+            connection.execute(
+                SQL("GRANT USAGE ON SCHEMA public TO {}").format(Identifier(role))
+            )
+            for table, privileges in grants.items():
+                connection.execute(
+                    SQL("GRANT {} ON {} TO {}").format(
+                        SQL(privileges), Identifier(table), Identifier(role)
+                    )
+                )
+
+    def close(self):
+        if not self._closed:
+            self.pool.close()
+            self._closed = True
+
+
+class PostgresEventStore:
+    def __init__(self, database):
+        self.database = database
+
+    def append(self, run_id, kind, data):
+        published_at = time.time()
+        with self.database.transaction() as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (run_id,))
+            row = connection.execute(
+                "SELECT COALESCE(max(revision), 0) + 1 AS revision FROM core_events WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+            revision = row["revision"]
+            connection.execute(
+                "INSERT INTO core_events VALUES (%s, %s, %s, %s, %s)",
+                (run_id, revision, kind, Jsonb(dict(data)), published_at),
+            )
+        return Event(run_id, revision, kind, dict(data), published_at)
+
+    def events(self, run_id):
+        with self.database.pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM core_events WHERE run_id = %s ORDER BY revision",
+                (run_id,),
+            ).fetchall()
+        return tuple(Event(**row) for row in rows)
+
+    def revision(self, run_id):
+        with self.database.pool.connection() as connection:
+            return connection.execute(
+                "SELECT COALESCE(max(revision), 0) AS revision FROM core_events WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()["revision"]
+
+    def count(self, run_id, *, kind=None):
+        sql = "SELECT count(*) AS count FROM core_events WHERE run_id = %s"
+        values = [run_id]
+        if kind is not None:
+            sql += " AND kind = %s"
+            values.append(kind)
+        with self.database.pool.connection() as connection:
+            return connection.execute(sql, values).fetchone()["count"]
+
+
+class PostgresCheckpointStore:
+    def __init__(self, database):
+        self.database = database
+
+    def save(self, run_id, revision, state):
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO core_checkpoints (run_id, revision, state)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (run_id) DO UPDATE SET
+                     revision = EXCLUDED.revision,
+                     state = EXCLUDED.state,
+                     saved_at = now()
+                   WHERE core_checkpoints.revision <= EXCLUDED.revision""",
+                (run_id, revision, Jsonb(dict(state))),
+            )
+
+    def load(self, run_id):
+        with self.database.pool.connection() as connection:
+            row = connection.execute(
+                "SELECT revision, state FROM core_checkpoints WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+        return (row["revision"], row["state"]) if row else None
+
+
+class PostgresAuditLog:
+    def __init__(self, database):
+        self.database = database
+
+    def append(self, run_id, kind, data):
+        written_at = time.time()
+        with self.database.transaction() as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (run_id,))
+            sequence = connection.execute(
+                "SELECT COALESCE(max(sequence), 0) + 1 AS sequence FROM core_audit_records WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()["sequence"]
+            connection.execute(
+                "INSERT INTO core_audit_records VALUES (%s, %s, %s, %s, %s)",
+                (run_id, sequence, kind, Jsonb(dict(data)), written_at),
+            )
+        return AuditRecord(run_id, sequence, kind, dict(data), written_at)
+
+    def records(self, run_id):
+        with self.database.pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM core_audit_records WHERE run_id = %s ORDER BY sequence",
+                (run_id,),
+            ).fetchall()
+        return tuple(AuditRecord(**row) for row in rows)
+
+    def replace(self, run_id, sequence, data):
+        raise CoreError("AUDIT_IMMUTABLE")
+
+
+class PostgresTaskStore(TaskStore):
+    """Durable A2A task store scoped by authenticated owner and tenant."""
+
+    def __init__(self, database, owner_resolver=resolve_user_scope):
+        self.database = database
+        self.owner_resolver = owner_resolver
+
+    def _scope(self, context):
+        return self.owner_resolver(context), context.tenant or ""
+
+    def _save(self, task, context):
+        owner, tenant = self._scope(context)
+        timestamp = None
+        if task.HasField("status") and task.status.HasField("timestamp"):
+            timestamp = task.status.timestamp.ToMilliseconds() / 1000
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO core_a2a_tasks
+                   (task_id, owner, tenant, context_id, state, status_timestamp, payload)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (task_id, owner, tenant) DO UPDATE SET
+                     context_id = EXCLUDED.context_id,
+                     state = EXCLUDED.state,
+                     status_timestamp = EXCLUDED.status_timestamp,
+                     payload = EXCLUDED.payload,
+                     updated_at = now()""",
+                (
+                    task.id,
+                    owner,
+                    tenant,
+                    task.context_id,
+                    int(task.status.state),
+                    timestamp,
+                    task.SerializeToString(),
+                ),
+            )
+
+    def _get(self, task_id, context):
+        owner, tenant = self._scope(context)
+        with self.database.pool.connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM core_a2a_tasks WHERE task_id = %s AND owner = %s AND tenant = %s",
+                (task_id, owner, tenant),
+            ).fetchone()
+        return a2a_pb2.Task.FromString(bytes(row["payload"])) if row else None
+
+    def _list(self, params, context):
+        owner, tenant = self._scope(context)
+        sql = "SELECT payload FROM core_a2a_tasks WHERE owner = %s AND tenant = %s"
+        values = [owner, tenant]
+        if params.context_id:
+            sql += " AND context_id = %s"
+            values.append(params.context_id)
+        if params.status:
+            sql += " AND state = %s"
+            values.append(int(params.status))
+        if params.HasField("status_timestamp_after"):
+            sql += " AND status_timestamp >= %s"
+            values.append(params.status_timestamp_after.ToMilliseconds() / 1000)
+        sql += " ORDER BY status_timestamp DESC NULLS LAST, task_id DESC"
+        with self.database.pool.connection() as connection:
+            rows = connection.execute(sql, values).fetchall()
+        tasks = [a2a_pb2.Task.FromString(bytes(row["payload"])) for row in rows]
+        total_size = len(tasks)
+        start_idx = 0
+        if params.page_token:
+            task_id = decode_page_token(params.page_token)
+            for index, task in enumerate(tasks):
+                if task.id == task_id:
+                    start_idx = index
+                    break
+            else:
+                raise InvalidParamsError(f"Invalid page token: {params.page_token}")
+        page_size = params.page_size or DEFAULT_LIST_TASKS_PAGE_SIZE
+        end_idx = start_idx + page_size
+        next_token = encode_page_token(tasks[end_idx].id) if end_idx < total_size else None
+        return a2a_pb2.ListTasksResponse(
+            next_page_token=next_token,
+            tasks=tasks[start_idx:end_idx],
+            total_size=total_size,
+            page_size=page_size,
+        )
+
+    def _delete(self, task_id, context):
+        owner, tenant = self._scope(context)
+        with self.database.transaction() as connection:
+            connection.execute(
+                "DELETE FROM core_a2a_tasks WHERE task_id = %s AND owner = %s AND tenant = %s",
+                (task_id, owner, tenant),
+            )
+
+    async def save(self, task, context):
+        await asyncio.to_thread(self._save, task, context)
+
+    async def get(self, task_id, context):
+        return await asyncio.to_thread(self._get, task_id, context)
+
+    async def list(self, params, context):
+        return await asyncio.to_thread(self._list, params, context)
+
+    async def delete(self, task_id, context):
+        await asyncio.to_thread(self._delete, task_id, context)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Manage core-agent PostgreSQL schema")
+    parser.add_argument("command", nargs="?", default="migrate", choices=("migrate", "check"))
+    args = parser.parse_args(argv)
+    database = PostgresDatabase.from_environment(
+        os.getenv("DATABASE_MIGRATION_URL") or os.getenv("DATABASE_URL", "")
+    )
+    try:
+        if args.command == "migrate":
+            database.migrate()
+            if os.getenv("DATABASE_APP_ROLE"):
+                database.grant_application_role(os.environ["DATABASE_APP_ROLE"])
+        else:
+            database.verify_schema()
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    main()

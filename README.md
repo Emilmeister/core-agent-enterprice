@@ -20,6 +20,30 @@ Streamable HTTP Memory MCP, Markdown indexing/NER/graph search, and explicit ski
 
 ## Run the agent
 
+Production state requires PostgreSQL. Apply the versioned schema before starting the app:
+
+```bash
+export DATABASE_URL='postgresql://core_agent:password@database:5432/core_agent'
+DATABASE_MIGRATION_URL='postgresql://migrator:password@database:5432/core_agent' \
+DATABASE_APP_ROLE=core_agent \
+uv run core-agent-db migrate
+CORE_AGENT_ENVIRONMENT=production \
+CORE_AGENT_STATE_BACKEND=postgres \
+DATABASE_AUTO_MIGRATE=false \
+uv run core-agent
+```
+
+`DATABASE_URL` must come from the deployment secret store. Production startup fails closed when
+the credential is missing, PostgreSQL is unavailable, or the schema version differs. A bounded
+pool is configured with `DATABASE_POOL_MIN`, `DATABASE_POOL_MAX`, and
+`DATABASE_CONNECT_TIMEOUT_SECONDS`; there is no production fallback to process memory or SQLite.
+A2A tasks, workflow events, checkpoints, approval reservations, and append-only audit records all
+use that pool. `/health/live` checks the process and `/health/ready` checks PostgreSQL and schema
+readiness.
+The migration job may use the separate `DATABASE_MIGRATION_URL`; with `DATABASE_APP_ROLE` it grants
+that runtime role only the table-specific DML privileges it needs. Production rejects in-process
+auto-migration so the serving credential does not require DDL rights.
+
 OpenAI-compatible API (OpenAI, vLLM, Ollama, LM Studio, OpenRouter, or another compatible gateway):
 
 ```bash
@@ -54,16 +78,28 @@ uv run core-agent
 The A2A Agent Card is then available at `http://localhost:8000/.well-known/agent-card.json`.
 Terminal execution is trusted by default for the single-container deployment; set
 `CORE_AGENT_TRUST_TERMINAL=0` to require local-operator approval instead of automatic execution.
-The development profile uses an in-process approve-all control-plane stub; the remote A2A caller
+The explicit test/development state profile may use SQLite/in-memory, and the development operator
+profile uses an in-process approve-all control-plane stub; the remote A2A caller
 cannot approve or deny. Local wait is exposed as A2A `WORKING`, while the private approval records
-and single-use execution reservations are stored in SQLite.
+and single-use execution reservations use the selected state backend.
 
-`LOCAL_APPROVAL_DB_PATH` defaults to `/tmp/core-agent/state/approvals.sqlite3` and should point to
-durable mounted storage in deployment. `LOCAL_APPROVAL_EXTENSION_URI` configures the optional
-informational A2A extension. `LOCAL_APPROVAL_ENABLED=false` fails protected actions closed.
+`LOCAL_APPROVAL_DB_PATH` only configures the non-production SQLite test adapter.
+`LOCAL_APPROVAL_EXTENSION_URI` configures the optional informational A2A extension.
+`LOCAL_APPROVAL_ENABLED=false` fails protected actions closed.
 `CORE_AGENT_ENVIRONMENT=production` refuses to start with the approve-all stub; inject a real
 operator control plane first. Workspaces default to `/tmp/core-agent/runs` and can be moved with
 `LOCAL_WORKSPACE_ROOT`.
+
+For a local Docker smoke run, copy `.env.example` to `.env`, set the database and model credentials,
+then run:
+
+```bash
+docker compose up --build
+```
+
+Compose waits for PostgreSQL, runs `core-agent-db migrate` as a one-shot job, then starts the agent
+with PostgreSQL persistence. It deliberately uses the development approve-all operator stub; a
+production deployment must replace that control plane and set `CORE_AGENT_ENVIRONMENT=production`.
 
 The specification and acceptance suite are frozen together before implementation changes.
 `tests/test_spec_lock.py` also protects every specification file byte-for-byte.
