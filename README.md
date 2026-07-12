@@ -30,6 +30,10 @@ uv run core-agent-db migrate
 CORE_AGENT_ENVIRONMENT=production \
 CORE_AGENT_STATE_BACKEND=postgres \
 DATABASE_AUTO_MIGRATE=false \
+OPERATOR_JWT_HS256_SECRET='independent-32-byte-minimum-secret' \
+OPERATOR_JWT_ISSUER='https://operator.example' \
+OPERATOR_JWT_AUDIENCE='core-agent-operator' \
+LOCAL_APPROVAL_EXTENSION_URI='https://agent.example/a2a/extensions/local-operator-approval/v1' \
 uv run core-agent
 ```
 
@@ -43,6 +47,9 @@ readiness.
 The migration job may use the separate `DATABASE_MIGRATION_URL`; with `DATABASE_APP_ROLE` it grants
 that runtime role only the table-specific DML privileges it needs. Production rejects in-process
 auto-migration so the serving credential does not require DDL rights.
+The built-in private operator API verifies a separately-audienced HS256 JWT with `sub`, `jti`,
+`exp`, and the `agent_operator` role. Its approve/deny endpoints require `If-Match` and the exact
+action digest; A2A callers cannot use their credentials on this route.
 
 OpenAI-compatible API (OpenAI, vLLM, Ollama, LM Studio, OpenRouter, or another compatible gateway):
 

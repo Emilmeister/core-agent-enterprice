@@ -515,7 +515,8 @@ class PostgresTaskStore(TaskStore):
         self.owner_resolver = owner_resolver
 
     def _scope(self, context):
-        return self.owner_resolver(context), context.tenant or ""
+        owner = self.owner_resolver(context)
+        return (owner if context.user.is_authenticated and owner else "anonymous"), context.tenant or ""
 
     def _save(self, task, context):
         owner, tenant = self._scope(context)

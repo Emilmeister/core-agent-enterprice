@@ -9,7 +9,7 @@ from a2a.auth.user import User
 from a2a.server.context import ServerCallContext
 from a2a.types import Task, TaskState, TaskStatus
 
-from core_agent.app import create_app
+from core_agent.app import _agent, create_app
 from core_agent.database import (
     PostgresAuditLog,
     PostgresCheckpointStore,
@@ -21,6 +21,8 @@ from core_agent.errors import CoreError
 from core_agent.postgres_approvals import PostgresApprovalManager
 from core_agent.postgres_tasks import PostgresTaskScheduler
 from core_agent.tools import ToolCall
+from core_agent.approvals import ApproveAllControlPlane
+from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, WorkflowRecord
 from psycopg.types.json import Jsonb
 
@@ -125,6 +127,18 @@ class PostgresRestartTests(unittest.TestCase):
                    core_background_tasks, core_notifications, core_outbox CASCADE"""
             )
 
+    def _state(self, database):
+        return {
+            "database": database,
+            "approvals": PostgresApprovalManager(database),
+            "events": PostgresEventStore(database),
+            "checkpoints": PostgresCheckpointStore(database),
+            "audit": PostgresAuditLog(database),
+            "tasks": PostgresTaskStore(database),
+            "workflow": PostgresWorkflowStore(database),
+            "scheduler": PostgresTaskScheduler,
+        }
+
     def test_all_production_state_survives_pool_restart_and_is_scoped(self):
         database = self._database()
         database.migrate()
@@ -167,6 +181,32 @@ class PostgresRestartTests(unittest.TestCase):
             self.assertIsNone(asyncio.run(reopened_tasks.get("task-1", other_tenant)))
         finally:
             reopened.close()
+
+    def test_stock_production_entrypoint_builds_private_operator_plane(self):
+        database = self._database()
+        database.migrate()
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "production-model"
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_ENVIRONMENT": "production",
+                "CORE_AGENT_STATE_BACKEND": "postgres",
+                "DATABASE_AUTO_MIGRATE": "false",
+                "OPERATOR_JWT_HS256_SECRET": "x" * 32,
+                "OPERATOR_JWT_ISSUER": "operator-issuer",
+                "OPERATOR_JWT_AUDIENCE": "operator-api",
+                "LOCAL_APPROVAL_EXTENSION_URI": "https://agent.example/extensions/local-approval/v1",
+            },
+            clear=True,
+        ):
+            app = create_app(model=model, database=database)
+        try:
+            paths = {getattr(route, "path", "") for route in app.routes}
+            self.assertIn("/internal/approvals", paths)
+            self.assertFalse(app.state.operator_control_plane.automatic)
+        finally:
+            app.state.close()
 
     def test_workflow_lease_outbox_and_background_recovery(self):
         database = self._database()
@@ -260,4 +300,145 @@ class PostgresRestartTests(unittest.TestCase):
             self.assertEqual(len(published), len(set(published)))
             scheduler.close()
         finally:
+            reopened.close()
+
+    def test_agent_approval_continues_after_complete_process_state_loss(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        first_model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest(
+                            "call-restart",
+                            "core.terminal.exec",
+                            {"argv": ["python", "-c", "print('once')"]},
+                        ),
+                    )
+                )
+            ]
+        )
+        first_model.model = "restart-model"
+        environment = {
+            "CORE_AGENT_TRUST_TERMINAL": "0",
+            "CORE_AGENT_APPROVAL_MODE": "on_risk",
+            "LOCAL_WORKSPACE_ROOT": "/tmp/core-agent-restart-test",
+        }
+        with patch.dict(os.environ, environment):
+            first, first_telemetry = _agent(first_model, state=self._state(database))
+            pending = first.run(
+                {"prompt": "run once", "mcp": [], "skills": []},
+                task_id="restart-task",
+                identity="owner-1",
+                session_id="context-1",
+                tenant_id="tenant-1",
+            )
+        approval_id = pending.request.id
+        run_id = pending.run_id
+        first.close()
+        first_telemetry.shutdown()
+        database.close()
+
+        reopened = self._database()
+        second_model = ScriptedModel([ModelResponse(message="continued")])
+        second_model.model = "restart-model"
+        with patch.dict(os.environ, environment):
+            second, second_telemetry = _agent(
+                second_model, state=self._state(reopened)
+            )
+            reserved = second.reserve_local_approval(
+                "restart-task", approval_id, ApproveAllControlPlane()
+            )
+            result = second.dispatch_reserved_approval(
+                "restart-task", approval_id, reserved.execution_id
+            )
+        try:
+            self.assertEqual(result.message, "continued")
+            self.assertEqual(len(second_model.calls), 1)
+            self.assertEqual(
+                PostgresApprovalManager(reopened).execution_for(approval_id).state,
+                "SUCCEEDED",
+            )
+            record = PostgresWorkflowStore(reopened).get(
+                run_id, tenant_id="tenant-1", owner_id="owner-1"
+            )
+            self.assertEqual(record.state, "COMPLETED")
+        finally:
+            second.close()
+            second_telemetry.shutdown()
+            reopened.close()
+
+    def test_dispatched_side_effect_is_aborted_not_retried_after_restart(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest(
+                            "unknown-call",
+                            "core.terminal.exec",
+                            {"argv": ["python", "-c", "print('must-not-repeat')"]},
+                        ),
+                    )
+                )
+            ]
+        )
+        model.model = "restart-model"
+        environment = {
+            "CORE_AGENT_TRUST_TERMINAL": "0",
+            "CORE_AGENT_APPROVAL_MODE": "on_risk",
+            "LOCAL_WORKSPACE_ROOT": "/tmp/core-agent-unknown-test",
+        }
+        with patch.dict(os.environ, environment):
+            agent, telemetry = _agent(model, state=self._state(database))
+            pending = agent.run(
+                {"prompt": "unknown outcome", "mcp": [], "skills": []},
+                task_id="unknown-task",
+                identity="owner-1",
+                session_id="context-1",
+                tenant_id="tenant-1",
+            )
+            reserved = agent.reserve_local_approval(
+                "unknown-task", pending.request.id, ApproveAllControlPlane()
+            )
+        call = ToolCall(
+            "unknown-call",
+            "core.terminal.exec",
+            {"argv": ["python", "-c", "print('must-not-repeat')"]},
+        )
+        PostgresApprovalManager(database).authorize_dispatch(pending.request.id, call)
+        workflows = PostgresWorkflowStore(database)
+        current = workflows.lookup_task("unknown-task")
+        workflows.transition(
+            current.run_id,
+            tenant_id=current.tenant_id,
+            owner_id=current.owner_id,
+            expected_version=current.version,
+            state="EXECUTING",
+            snapshot={**current.snapshot, "execution_id": reserved.execution_id},
+            event_kind="tool.intent",
+            pending_approval_id=pending.request.id,
+        )
+        agent.close()
+        telemetry.shutdown()
+        database.close()
+
+        reopened = self._database()
+        empty_model = ScriptedModel([])
+        empty_model.model = "restart-model"
+        with patch.dict(os.environ, environment):
+            recovered, recovered_telemetry = _agent(
+                empty_model, state=self._state(reopened)
+            )
+        try:
+            record = PostgresWorkflowStore(reopened).lookup_task("unknown-task")
+            self.assertEqual(record.state, "ABORTED")
+            self.assertEqual(record.error_code, "SIDE_EFFECT_UNKNOWN")
+            self.assertEqual(empty_model.calls, ())
+        finally:
+            recovered.close()
+            recovered_telemetry.shutdown()
             reopened.close()

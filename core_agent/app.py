@@ -4,6 +4,7 @@ import atexit
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -26,6 +27,11 @@ from .execution import LocalTerminalBackend, TerminalSessionManager
 from .mcp import StreamableHttpMcpConnector
 from .model import CompatibleHttpModel
 from .observability import RecordingExporter, Telemetry
+from .operator import (
+    OperatorAuthenticator,
+    PrivateOperatorControlPlane,
+    operator_routes,
+)
 from .postgres_approvals import PostgresApprovalManager
 from .postgres_tasks import PostgresTaskScheduler
 from .runtime import ApprovalNeeded, CoreAgent
@@ -37,7 +43,7 @@ from .tools import (
     ToolRegistry,
     ToolRuntime,
 )
-from .workflow import PostgresWorkflowStore
+from .workflow import InMemoryWorkflowStore, PostgresWorkflowStore
 
 
 def _csv(name, default=""):
@@ -113,7 +119,7 @@ def _state(database=None):
             "checkpoints": CheckpointStore(),
             "audit": InMemoryAuditLog(),
             "tasks": None,
-            "workflow": None,
+            "workflow": InMemoryWorkflowStore(),
             "scheduler": None,
         }
     if backend != "postgres":
@@ -355,16 +361,31 @@ def _agent(model, mcp_connector=None, *, state=None):
         workflow_store=state["workflow"],
     )
     agent.recover_durable_tasks()
+    agent.recover_workflows()
     return agent, telemetry
 
 
 def create_app(
     *, model=None, mcp_connector=None, base_url=None, control_plane=None, database=None
 ):
-    if os.getenv("CORE_AGENT_ENVIRONMENT", "development") == "production" and (
-        control_plane is None or isinstance(control_plane, ApproveAllControlPlane)
-    ):
-        raise CoreError("LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
+    environment = os.getenv("CORE_AGENT_ENVIRONMENT", "development")
+    operator_authenticator = None
+    if environment == "production":
+        if isinstance(control_plane, ApproveAllControlPlane):
+            raise CoreError("LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
+        control_plane = control_plane or PrivateOperatorControlPlane()
+        if isinstance(control_plane, PrivateOperatorControlPlane):
+            operator_authenticator = OperatorAuthenticator(
+                os.getenv("OPERATOR_JWT_HS256_SECRET", ""),
+                issuer=os.getenv("OPERATOR_JWT_ISSUER", ""),
+                audience=os.getenv("OPERATOR_JWT_AUDIENCE", ""),
+                role=os.getenv("OPERATOR_JWT_ROLE", "agent_operator"),
+            )
+            extension_uri = os.getenv("LOCAL_APPROVAL_EXTENSION_URI", "")
+            if urlparse(extension_uri).scheme != "https":
+                raise CoreError(
+                    "CONFIG_INVALID", "production approval extension must use HTTPS"
+                )
     model = model or _model()
     state = _state(database)
     agent, telemetry = _agent(model, mcp_connector, state=state)
@@ -385,9 +406,17 @@ def create_app(
         return Artifact.text(result.message, {"run_id": result.run_id})
 
     def reserve_local(pending, context):
+        if not getattr(control_plane, "automatic", True):
+            return None
         return agent.reserve_local_approval(
             context.task_id, pending.request.id, control_plane
         )
+
+    def resume(context):
+        result = agent.resume_task(context.task_id)
+        if isinstance(result, ApprovalNeeded):
+            return result
+        return Artifact.text(result.message, {"run_id": result.run_id})
 
     def dispatch_local(reserved, context):
         result = agent.dispatch_reserved_approval(
@@ -419,6 +448,7 @@ def create_app(
         can_cancel=agent.can_cancel_local_approval,
         base_url=base_url,
         task_store=state["tasks"],
+        resume_handler=resume,
     )
 
     async def live(_request):
@@ -434,6 +464,10 @@ def create_app(
         return JSONResponse({"status": "ready"})
 
     app.routes[0:0] = (Route("/health/live", live), Route("/health/ready", ready))
+    if operator_authenticator:
+        app.routes[0:0] = operator_routes(
+            agent, app.state.a2a_request_handler, operator_authenticator
+        )
     app.state.core_agent = agent
     app.state.operator_control_plane = control_plane
     app.state.database = state["database"]

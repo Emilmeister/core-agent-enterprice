@@ -5,7 +5,7 @@ import uuid
 
 from google.protobuf import json_format
 
-from a2a.server.agent_execution import AgentExecutor
+from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_rest_routes
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
@@ -52,6 +52,11 @@ LOCAL_APPROVAL_LOCKED_TEXT = (
     "use GetTask, SubscribeToTask, push "
     "notifications, or CancelTask."
 )
+
+
+def resolve_owner_scope(context):
+    name = context.user.user_name
+    return name if context.user.is_authenticated and name else "anonymous"
 
 
 def to_sdk_agent_card(card, *, base_url):
@@ -113,6 +118,7 @@ class CoreAgentExecutor(AgentExecutor):
         cancel_handler,
         is_waiting_local_approval,
         local_approval_extension_uri,
+        resume_handler,
     ):
         self.handler = handler
         self.local_approval_reserve_handler = local_approval_reserve_handler
@@ -120,6 +126,7 @@ class CoreAgentExecutor(AgentExecutor):
         self.cancel_handler = cancel_handler
         self.is_waiting_local_approval = is_waiting_local_approval
         self.local_approval_extension_uri = local_approval_extension_uri
+        self.resume_handler = resume_handler
 
     @staticmethod
     def _message(context):
@@ -209,9 +216,12 @@ class CoreAgentExecutor(AgentExecutor):
             )
         await updater.start_work()
         try:
-            message = self._message(context)
-            command = parse_run_request(message, context.requested_extensions)
-            artifact = await asyncio.to_thread(self.handler, command, context)
+            if context.message is None and context.current_task is not None:
+                artifact = await asyncio.to_thread(self.resume_handler, context)
+            else:
+                message = self._message(context)
+                command = parse_run_request(message, context.requested_extensions)
+                artifact = await asyncio.to_thread(self.handler, command, context)
             while isinstance(artifact, ApprovalNeeded):
                 await updater.update_status(
                     SdkTaskState.TASK_STATE_WORKING,
@@ -222,6 +232,8 @@ class CoreAgentExecutor(AgentExecutor):
                 reserved = await asyncio.to_thread(
                     self.local_approval_reserve_handler, pending, context
                 )
+                if reserved is None:
+                    return
                 await updater.update_status(
                     SdkTaskState.TASK_STATE_WORKING,
                     message=self._local_approval_message(
@@ -269,6 +281,21 @@ class CoreRequestHandler(DefaultRequestHandler):
             )
         return await super().on_cancel_task(params, context)
 
+    async def resume_task(self, task_id, context_id, call_context):
+        active_task = await self._active_task_registry.get_or_create(
+            task_id,
+            context_id=context_id,
+            call_context=call_context,
+            create_task_if_missing=False,
+        )
+        return await active_task.enqueue_request(
+            RequestContext(
+                call_context=call_context,
+                task_id=task_id,
+                context_id=context_id,
+            )
+        )
+
 
 def build_starlette_app(
     *,
@@ -280,6 +307,7 @@ def build_starlette_app(
     is_waiting_local_approval,
     can_cancel,
     base_url,
+    resume_handler,
     context_builder=None,
     task_store=None,
 ):
@@ -295,11 +323,14 @@ def build_starlette_app(
             agent_card.optional_extensions[0]
             if agent_card.optional_extensions
             else LOCAL_APPROVAL_STATUS_URI,
+            resume_handler,
         ),
-        task_store or InMemoryTaskStore(),
+        task_store or InMemoryTaskStore(owner_resolver=resolve_owner_scope),
         sdk_card,
         can_cancel=can_cancel,
     )
     routes = create_agent_card_routes(sdk_card)
     routes.extend(create_rest_routes(request_handler, context_builder=context_builder))
-    return Starlette(routes=routes)
+    app = Starlette(routes=routes)
+    app.state.a2a_request_handler = request_handler
+    return app

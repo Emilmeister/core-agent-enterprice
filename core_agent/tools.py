@@ -206,10 +206,14 @@ class ToolRuntime:
         execution = self.approvals.authorize_dispatch(approval_id, call)
         try:
             result = self._execute(call, run_id)
-        except Exception:
-            self.approvals.finish_execution(execution.id, "FAILED")
+        except Exception as error:
+            self.approvals.finish_execution(
+                execution.id,
+                "FAILED",
+                error_code=getattr(error, "code", type(error).__name__),
+            )
             raise
-        self.approvals.finish_execution(execution.id, "SUCCEEDED")
+        self.approvals.finish_execution(execution.id, "SUCCEEDED", outcome=result)
         return result
 
     def request_input(self, prompt, schema, *, run_id):

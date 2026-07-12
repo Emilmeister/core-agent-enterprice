@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import fnmatch
+import copy
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 import json
-import threading
 
 from .config import AgentConfig, RunRequest, compile_effective_config
 from .context import ContextItem, ContextState
@@ -14,6 +14,7 @@ from .approvals import ApprovalRequest
 from .skills import SkillResolver
 from .tasks import DelegationContract
 from .tools import ToolCall, ToolDefinition, ToolResult
+from .workflow import InMemoryWorkflowStore, WorkflowRecord
 
 
 def _mcp_read_only(tool_name):
@@ -83,13 +84,6 @@ class ApprovalNeeded:
         }
 
 
-@dataclass
-class _SuspendedRun:
-    generator: object
-    approval: ApprovalNeeded
-    execution_id: str | None = None
-
-
 @dataclass(frozen=True)
 class ApprovalReserved:
     run_id: str
@@ -129,12 +123,12 @@ class CoreAgent:
         self.compactor = compactor
         self.token_counter = token_counter or (lambda text: max(1, len(text) // 4))
         self.depth = depth
-        self.workflow_store = workflow_store
+        self._worker_id = str(uuid.uuid4())
+        self.workflow_store = workflow_store or InMemoryWorkflowStore()
         self._run_contexts = {}
         self._run_scopes = {}
-        self._suspended = {}
+        self._runtime_cache = {}
         self._task_approvals = {}
-        self._suspended_lock = threading.Lock()
         self.tool_runtime.handlers.update(
             {
                 "core.task.start": self._task_start,
@@ -149,6 +143,598 @@ class CoreAgent:
             self.task_scheduler.register(
                 "background_tool", self._recover_background_tool
             )
+
+    @staticmethod
+    def _context_to_dict(state):
+        return {
+            "active": [asdict(item) for item in state.active],
+            "transcript": [asdict(item) for item in state.transcript],
+            "sequence_range": list(state.sequence_range),
+        }
+
+    @staticmethod
+    def _context_from_dict(value):
+        return ContextState(
+            tuple(ContextItem(**item) for item in value["active"]),
+            tuple(ContextItem(**item) for item in value["transcript"]),
+            tuple(value["sequence_range"]),
+        )
+
+    def _resolve_capabilities(self, request):
+        raw = self.agent_config.to_dict()
+        memory_mode = raw["features"].get("memory", "disabled")
+        discovered = {}
+        if raw["features"].get("mcp"):
+            for declaration in request.mcp:
+                if declaration.get("role") == "memory" and memory_mode == "disabled":
+                    continue
+                if declaration["name"] in self.platform_config.allowed_mcp_servers:
+                    try:
+                        discovered[declaration["name"]] = self.mcp_connector.connect(
+                            declaration
+                        )
+                    except CoreError:
+                        if declaration.get("required"):
+                            raise
+        effective = compile_effective_config(
+            self.platform_config, self.agent_config, request, discovered
+        )
+        return raw, discovered, effective
+
+    def _activate_skills(self, request, effective):
+        resolver = SkillResolver(
+            [item for item in request.skills if item.get("name") in effective.skills]
+        )
+        return tuple(
+            resolver.activate(skill.name)
+            for skill in resolver.discover()
+            if skill.name.lower() in request.prompt.lower()
+        )
+
+    def _tool_catalog(self, effective, discovered):
+        catalog = {}
+        for name in effective.model_tool_catalog:
+            server, separator, remote_tool = name.partition(".")
+            if separator and server in effective.mcp_tools:
+                catalog[name] = {
+                    "description": name,
+                    "input_schema": discovered.get(server, {}).get(remote_tool, {}),
+                }
+            else:
+                try:
+                    definition = self.tool_runtime.registry.get(name)
+                except CoreError as error:
+                    if error.code != "TOOL_NOT_FOUND":
+                        raise
+                    catalog[name] = {}
+                else:
+                    catalog[name] = {
+                        "description": definition.description,
+                        "input_schema": definition.input_schema,
+                    }
+        return catalog
+
+    @staticmethod
+    def _response_dict(response):
+        return {
+            "message": response.message,
+            "tool_requests": [
+                {"id": item.id, "name": item.name, "arguments": item.arguments}
+                for item in response.tool_requests
+            ],
+            "continue_reasoning": response.continue_reasoning,
+        }
+
+    def _record_transition(
+        self,
+        record,
+        *,
+        state,
+        snapshot,
+        event_kind,
+        event_data=None,
+        audit=(),
+        pending_approval_id=None,
+        result=None,
+        error_code=None,
+        lease_token=None,
+    ):
+        updated = self.workflow_store.transition(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            expected_version=record.version,
+            state=state,
+            snapshot=snapshot,
+            event_kind=event_kind,
+            event_data=event_data,
+            audit=audit,
+            pending_approval_id=pending_approval_id,
+            result=result,
+            error_code=error_code,
+            lease_token=lease_token,
+        )
+        if not self.workflow_store.atomic:
+            for kind, data in audit:
+                self.audit_log.append(record.run_id, kind, data)
+            self.event_store.append(record.run_id, event_kind, event_data or {"state": state})
+            self.checkpoint_store.save(
+                record.run_id,
+                self.event_store.revision(record.run_id),
+                {**snapshot, "state": state},
+            )
+        return updated
+
+    def _new_workflow(
+        self, request, *, task_id, identity, session_id, tenant_id, parent_run_id=None
+    ):
+        if isinstance(request, dict):
+            request = RunRequest.from_dict(request)
+        if not isinstance(request, RunRequest):
+            raise CoreError("INVALID_REQUEST")
+        raw, discovered, effective = self._resolve_capabilities(request)
+        skills = self._activate_skills(request, effective)
+        run_id = str(uuid.uuid4())
+        owner_id = identity or "anonymous"
+        tenant_id = tenant_id or "default"
+        task_id = task_id or run_id
+        context_id = session_id or run_id
+        prompt = ContextItem(
+            "prompt", request.prompt, self.token_counter(request.prompt), pinned=True
+        )
+        snapshot = {
+            "effective_config_digest": effective.digest,
+            "turns": 0,
+            "tool_calls": 0,
+            "context": self._context_to_dict(
+                ContextState((prompt,), (prompt,), (1, 1))
+            ),
+            "skills": [
+                {"name": skill.name, "instructions": skill.instructions}
+                for skill in skills
+            ],
+            "pending_response": None,
+            "tool_queue": [],
+            "pending_call": None,
+            "execution_id": None,
+        }
+        record = WorkflowRecord(
+            run_id,
+            task_id,
+            context_id,
+            tenant_id,
+            owner_id,
+            parent_run_id,
+            "RUNNING",
+            1,
+            request.to_dict(),
+            snapshot,
+        )
+        audit = (
+            (
+                "config.snapshot",
+                {"digest": effective.digest, "snapshot": effective.audit_snapshot},
+            ),
+            ("kernel.snapshot", {"version": effective.kernel_version}),
+            ("task.started", {}),
+        )
+        record = self.workflow_store.create(record, audit=audit)
+        if not self.workflow_store.atomic:
+            for kind, data in audit:
+                self.audit_log.append(run_id, kind, data)
+            self.event_store.append(run_id, "task.started", {})
+            self.checkpoint_store.save(
+                run_id,
+                self.event_store.revision(run_id),
+                {**snapshot, "state": "RUNNING"},
+            )
+        self._run_contexts[run_id] = (request, effective)
+        self._runtime_cache[run_id] = (raw, discovered, effective)
+        self._run_scopes[run_id] = {
+            "identity": owner_id,
+            "session_id": context_id,
+            "task_id": task_id,
+            "tenant_id": tenant_id,
+        }
+        return record, raw, discovered, effective
+
+    def _load_workflow_runtime(self, record):
+        request = RunRequest.from_dict(record.request)
+        cached = self._runtime_cache.get(record.run_id)
+        raw, discovered, effective = (
+            cached if cached is not None else self._resolve_capabilities(request)
+        )
+        if effective.digest != record.snapshot["effective_config_digest"]:
+            raise CoreError("CHECKPOINT_INVALID")
+        self._run_contexts[record.run_id] = (request, effective)
+        self._run_scopes[record.run_id] = {
+            "identity": record.owner_id,
+            "session_id": record.context_id,
+            "task_id": record.task_id,
+            "tenant_id": record.tenant_id,
+        }
+        return request, raw, discovered, effective
+
+    def _instructions(self, raw, effective, snapshot):
+        value = "CORE KERNEL\n" + raw["agent"].get("profile_prompt", "")
+        if "memory" in effective.enabled_capability_policies:
+            value += "\nMEMORY POLICY"
+        for skill in snapshot["skills"]:
+            value += f"\nSKILL {skill['name']}\n{skill['instructions']}"
+        return value
+
+    def _definition(self, call, effective, discovered):
+        server, separator, remote_tool = call.name.partition(".")
+        if separator and server in effective.mcp_tools:
+            read_only = _mcp_read_only(call.name)
+            return (
+                ToolDefinition(
+                    call.name,
+                    call.name,
+                    discovered.get(server, {}).get(remote_tool, {}),
+                    mutating=not read_only,
+                    risk_tags=(
+                        frozenset()
+                        if read_only
+                        else frozenset({"external_write"})
+                    ),
+                ),
+                True,
+            )
+        return self.tool_runtime.registry.get(call.name), False
+
+    def _result_text(self, call_id, outcome):
+        if isinstance(outcome, ToolResult):
+            value = {
+                "tool_call_id": outcome.tool_call_id,
+                "status": outcome.status,
+                "output": self._value(outcome.output),
+            }
+        else:
+            value = {"tool_call_id": call_id, "status": "succeeded", "output": outcome}
+        return json.dumps(value, sort_keys=True, default=str)
+
+    def _append_result(self, snapshot, text):
+        context = self._context_from_dict(snapshot["context"])
+        item = ContextItem("tool_result", text, self.token_counter(text))
+        context = ContextState(
+            context.active + (item,),
+            context.transcript + (item,),
+            (context.sequence_range[0], context.sequence_range[1] + 1),
+        )
+        snapshot["context"] = self._context_to_dict(context)
+        snapshot["pending_call"] = None
+        snapshot["execution_id"] = None
+        if snapshot["tool_queue"]:
+            snapshot["tool_queue"].pop(0)
+
+    def _execute_pending(
+        self,
+        record,
+        snapshot,
+        raw,
+        discovered,
+        effective,
+        *,
+        approved=False,
+        lease_token,
+    ):
+        pending = snapshot["pending_call"]
+        call = ToolCall(pending["id"], pending["name"], dict(pending["arguments"]))
+        definition, is_mcp = self._definition(call, effective, discovered)
+        self.tool_runtime.validate(call, definition)
+        if self.tool_runtime.policy.evaluate(definition) == "deny":
+            self._append_result(snapshot, self._result_text(call.id, ToolResult(call.id, "denied")))
+            return self._record_transition(
+                record,
+                state="RUNNING",
+                snapshot=snapshot,
+                event_kind="tool.denied",
+                event_data={"tool_call_id": call.id},
+                audit=(("tool.denied", {"tool_call_id": call.id}),),
+                lease_token=lease_token,
+            )
+        record = self._record_transition(
+            record,
+            state="EXECUTING",
+            snapshot=snapshot,
+            event_kind="tool.intent",
+            event_data={"tool_call_id": call.id, "mutating": definition.mutating},
+            audit=(
+                (
+                    "tool.execution.started",
+                    {
+                        "tool_call_id": call.id,
+                        "approval_id": record.pending_approval_id,
+                    },
+                ),
+            ),
+            pending_approval_id=record.pending_approval_id,
+            lease_token=lease_token,
+        )
+        try:
+            if is_mcp:
+                execution = None
+                if approved:
+                    execution = self.tool_runtime.approvals.authorize_dispatch(
+                        record.pending_approval_id, call
+                    )
+                try:
+                    outcome = self.mcp_connector.call(call.name, call.arguments)
+                except Exception:
+                    if execution:
+                        self.tool_runtime.approvals.finish_execution(
+                            execution.id,
+                            "FAILED",
+                            error_code="MCP_EXECUTION_FAILED",
+                        )
+                    raise
+                if execution:
+                    self.tool_runtime.approvals.finish_execution(
+                        execution.id, "SUCCEEDED", outcome=outcome
+                    )
+            elif approved:
+                outcome = self.tool_runtime.resume_approved(
+                    call, record.pending_approval_id, run_id=record.run_id
+                )
+            else:
+                outcome = self.tool_runtime.execute(
+                    call,
+                    run_id=record.run_id,
+                    identity=record.owner_id,
+                    session_id=record.context_id,
+                    task_id=record.task_id,
+                    tenant_id=record.tenant_id,
+                    environment=raw["execution"]["environment_profile"],
+                    policy_version=effective.digest,
+                )
+                if isinstance(outcome, ApprovalRequest):
+                    raise CoreError("INVALID_TASK_STATE")
+        except Exception as error:
+            self._record_transition(
+                record,
+                state="FAILED",
+                snapshot=snapshot,
+                event_kind="tool.failed",
+                event_data={"tool_call_id": call.id},
+                audit=(
+                    (
+                        "tool.execution.failed",
+                        {
+                            "tool_call_id": call.id,
+                            "error_code": getattr(error, "code", type(error).__name__),
+                        },
+                    ),
+                ),
+                error_code=getattr(error, "code", "TOOL_EXECUTION_FAILED"),
+                lease_token=lease_token,
+            )
+            raise
+        self._append_result(snapshot, self._result_text(call.id, outcome))
+        return self._record_transition(
+            record,
+            state="RUNNING",
+            snapshot=snapshot,
+            event_kind="tool.completed",
+            event_data={"tool_call_id": call.id},
+            audit=(("tool.execution.succeeded", {"tool_call_id": call.id}),),
+            lease_token=lease_token,
+        )
+
+    def _continue_workflow(self, record, *, decision=None):
+        if record.state == "WAITING_LOCAL_APPROVAL" and decision is None:
+            return ApprovalNeeded(
+                record.run_id,
+                self.tool_runtime.approvals.get(record.pending_approval_id),
+            )
+        lease_token = self.workflow_store.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id=self._worker_id,
+            ttl=600,
+        )
+        try:
+            request, raw, discovered, effective = self._load_workflow_runtime(record)
+            snapshot = copy.deepcopy(record.snapshot)
+            if record.state == "APPROVED_RESERVED":
+                record = self._execute_pending(
+                    record,
+                    snapshot,
+                    raw,
+                    discovered,
+                    effective,
+                    approved=True,
+                    lease_token=lease_token,
+                )
+            budgets = raw.get("budgets", {})
+            max_turns = min(
+                budgets.get("model_turns", self.platform_config.max_model_turns),
+                self.platform_config.max_model_turns,
+            )
+            max_tools = min(
+                budgets.get("tool_calls", self.platform_config.max_tool_calls),
+                self.platform_config.max_tool_calls,
+            )
+            while snapshot["turns"] < max_turns:
+                context = self._context_from_dict(snapshot["context"])
+                if self.compactor:
+                    compacted = self.compactor.maybe_compact(context)
+                    if compacted is not context:
+                        snapshot["context"] = self._context_to_dict(compacted)
+                        record = self._record_transition(
+                            record,
+                            state="RUNNING",
+                            snapshot=snapshot,
+                            event_kind="context.compacted",
+                            event_data={
+                                "before": compacted.event.before_working_tokens,
+                                "after": compacted.event.after_working_tokens,
+                            },
+                            audit=(("context.compacted", {"content": False}),),
+                            lease_token=lease_token,
+                        )
+                        context = compacted
+                if snapshot["pending_response"] is None:
+                    response = self.model.generate(
+                        context="\n".join(item.content for item in context.active),
+                        tools=self._tool_catalog(effective, discovered),
+                        instructions=self._instructions(raw, effective, snapshot),
+                    )
+                    snapshot["turns"] += 1
+                    snapshot["pending_response"] = self._response_dict(response)
+                    snapshot["tool_queue"] = copy.deepcopy(
+                        snapshot["pending_response"]["tool_requests"]
+                    )
+                    record = self._record_transition(
+                        record,
+                        state="MODEL_RESPONDED",
+                        snapshot=snapshot,
+                        event_kind="model.completed",
+                        event_data={"turn": snapshot["turns"]},
+                        audit=(("model.completed", {"turn": snapshot["turns"]}),),
+                        lease_token=lease_token,
+                    )
+                if snapshot["tool_queue"]:
+                    if snapshot["tool_calls"] >= max_tools:
+                        raise CoreError("BUDGET_EXCEEDED")
+                    pending = snapshot["tool_queue"][0]
+                    effective.require_tool(pending["name"])
+                    call = ToolCall(
+                        pending["id"], pending["name"], dict(pending["arguments"])
+                    )
+                    definition, _is_mcp = self._definition(
+                        call, effective, discovered
+                    )
+                    self.tool_runtime.validate(call, definition)
+                    snapshot["tool_calls"] += 1
+                    decision_value = self.tool_runtime.policy.evaluate(definition)
+                    if decision_value == "require_approval":
+                        snapshot["pending_call"] = copy.deepcopy(pending)
+                        record, approval = self.workflow_store.enter_approval(
+                            record,
+                            self.tool_runtime.approvals,
+                            call,
+                            risks=definition.risk_tags,
+                            snapshot=snapshot,
+                            environment=raw["execution"]["environment_profile"],
+                            policy_version=effective.digest,
+                            lease_token=lease_token,
+                        )
+                        if not self.workflow_store.atomic:
+                            for kind, data in (
+                                (
+                                    "tool.proposed",
+                                    {
+                                        "task_id": approval.task_id,
+                                        "proposal_id": approval.proposal_id,
+                                        "approval_id": approval.id,
+                                        "tool_call_id": approval.tool_call_id,
+                                        "action_digest": approval.action_digest,
+                                    },
+                                ),
+                                (
+                                    "policy.evaluated",
+                                    {
+                                        "proposal_id": approval.proposal_id,
+                                        "decision": "REQUIRE_LOCAL_APPROVAL",
+                                        "policy_version": approval.policy_version,
+                                    },
+                                ),
+                                (
+                                    "approval.requested",
+                                    {
+                                        "approval_id": approval.id,
+                                        "proposal_id": approval.proposal_id,
+                                        "action_digest": approval.action_digest,
+                                    },
+                                ),
+                            ):
+                                self.audit_log.append(record.run_id, kind, data)
+                            self.event_store.append(
+                                record.run_id,
+                                "approval.required",
+                                {"approval_id": approval.id},
+                            )
+                            self.checkpoint_store.save(
+                                record.run_id,
+                                self.event_store.revision(record.run_id),
+                                {**snapshot, "state": "WAITING_LOCAL_APPROVAL"},
+                            )
+                        self._task_approvals[record.task_id] = approval.id
+                        return ApprovalNeeded(record.run_id, approval)
+                    snapshot["pending_call"] = copy.deepcopy(pending)
+                    record = self._execute_pending(
+                        record,
+                        snapshot,
+                        raw,
+                        discovered,
+                        effective,
+                        lease_token=lease_token,
+                    )
+                    continue
+                response = snapshot["pending_response"]
+                if response["message"] is not None:
+                    self.task_scheduler.assert_can_complete_parent(
+                        record.run_id, tenant_id=record.tenant_id
+                    )
+                    result = {
+                        "message": response["message"],
+                        "usage": {
+                            "model_turns": snapshot["turns"],
+                            "tool_calls": snapshot["tool_calls"],
+                        },
+                    }
+                    record = self._record_transition(
+                        record,
+                        state="COMPLETED",
+                        snapshot=snapshot,
+                        event_kind="task.completed",
+                        event_data={"message": response["message"]},
+                        audit=(("task.completed", {"message": response["message"]}),),
+                        result=result,
+                        lease_token=lease_token,
+                    )
+                    self._run_contexts.pop(record.run_id, None)
+                    self._run_scopes.pop(record.run_id, None)
+                    self._runtime_cache.pop(record.run_id, None)
+                    return RunResult(
+                        record.run_id,
+                        result["message"],
+                        "completed",
+                        Usage(**result["usage"]),
+                    )
+                snapshot["pending_response"] = None
+                record = self._record_transition(
+                    record,
+                    state="RUNNING",
+                    snapshot=snapshot,
+                    event_kind="model.continued",
+                    event_data={"turn": snapshot["turns"]},
+                    lease_token=lease_token,
+                )
+            error = CoreError("BUDGET_EXCEEDED")
+            self._record_transition(
+                record,
+                state="FAILED",
+                snapshot=snapshot,
+                event_kind="task.failed",
+                event_data={"error_code": error.code},
+                audit=(("task.failed", {"error_code": error.code}),),
+                error_code=error.code,
+                lease_token=lease_token,
+            )
+            raise error
+        finally:
+            try:
+                self.workflow_store.release_lease(
+                    record.run_id,
+                    tenant_id=record.tenant_id,
+                    worker_id=self._worker_id,
+                    token=lease_token,
+                )
+            except CoreError:
+                pass
 
     def _enabled_builtins(self):
         raw = self.agent_config.to_dict()["tools"]["builtins"]
@@ -188,53 +774,6 @@ class CoreAgent:
             "error": str(task.error) if task.error else None,
             "revision": task.revision,
         }
-
-    def _record_pending_approval(self, run_id, approval, effective, context_state):
-        self.audit_log.append(
-            run_id,
-            "tool.proposed",
-            {
-                "task_id": approval.task_id,
-                "proposal_id": approval.proposal_id,
-                "approval_id": approval.id,
-                "tool_call_id": approval.tool_call_id,
-                "action_digest": approval.action_digest,
-            },
-        )
-        self.audit_log.append(
-            run_id,
-            "policy.evaluated",
-            {
-                "proposal_id": approval.proposal_id,
-                "decision": "REQUIRE_LOCAL_APPROVAL",
-                "policy_version": approval.policy_version,
-            },
-        )
-        self.audit_log.append(
-            run_id,
-            "approval.requested",
-            {
-                "approval_id": approval.id,
-                "proposal_id": approval.proposal_id,
-                "action_digest": approval.action_digest,
-            },
-        )
-        self.event_store.append(
-            run_id, "approval.required", {"approval_id": approval.id}
-        )
-        self.checkpoint_store.save(
-            run_id,
-            self.event_store.revision(run_id),
-            {
-                "state": "waiting_local_approval",
-                "approval_id": approval.id,
-                "proposal_id": approval.proposal_id,
-                "tool_call_id": approval.tool_call_id,
-                "action_digest": approval.action_digest,
-                "effective_config_digest": effective.digest,
-                "context_sequence_range": context_state.sequence_range,
-            },
-        )
 
     def _task_start(self, arguments, run_id):
         target = arguments["tool"]
@@ -464,290 +1003,6 @@ class CoreAgent:
         )
         return self._task_snapshot(task)
 
-    def _run_loop(self, request, identity, session_id, task_id, tenant_id):
-        if isinstance(request, dict):
-            request = RunRequest.from_dict(request)
-        if not isinstance(request, RunRequest):
-            raise CoreError("INVALID_REQUEST")
-        raw = self.agent_config.to_dict()
-        memory_mode = raw["features"].get("memory", "disabled")
-        discovered = {}
-        if raw["features"].get("mcp"):
-            for declaration in request.mcp:
-                if declaration.get("role") == "memory" and memory_mode == "disabled":
-                    continue
-                if declaration["name"] in self.platform_config.allowed_mcp_servers:
-                    try:
-                        discovered[declaration["name"]] = self.mcp_connector.connect(
-                            declaration
-                        )
-                    except CoreError:
-                        if declaration.get("required"):
-                            raise
-        effective = compile_effective_config(
-            self.platform_config, self.agent_config, request, discovered
-        )
-        skill_resolver = SkillResolver(
-            [item for item in request.skills if item.get("name") in effective.skills]
-        )
-        active_skills = [
-            skill_resolver.activate(skill.name)
-            for skill in skill_resolver.discover()
-            if skill.name.lower() in request.prompt.lower()
-        ]
-        run_id = str(uuid.uuid4())
-        self._run_contexts[run_id] = (request, effective)
-        self._run_scopes[run_id] = {
-            "identity": identity or "anonymous",
-            "session_id": session_id or run_id,
-            "task_id": task_id or run_id,
-            "tenant_id": tenant_id or "default",
-        }
-        self.audit_log.append(
-            run_id,
-            "config.snapshot",
-            {"digest": effective.digest, "snapshot": effective.audit_snapshot},
-        )
-        self.audit_log.append(run_id, "task.started", {})
-        self.event_store.append(run_id, "task.started", {})
-        self.checkpoint_store.save(
-            run_id,
-            self.event_store.revision(run_id),
-            {"state": "working", "effective_config_digest": effective.digest},
-        )
-        prompt_item = ContextItem(
-            "prompt", request.prompt, self.token_counter(request.prompt), pinned=True
-        )
-        context_state = ContextState((prompt_item,), (prompt_item,), (1, 1))
-        instructions = "CORE KERNEL\n" + raw["agent"].get("profile_prompt", "")
-        if "memory" in effective.enabled_capability_policies:
-            instructions += "\nMEMORY POLICY"
-        for skill in active_skills:
-            instructions += f"\nSKILL {skill.name}\n{skill.instructions}"
-        budgets = raw.get("budgets", {})
-        max_turns = min(
-            budgets.get("model_turns", self.platform_config.max_model_turns),
-            self.platform_config.max_model_turns,
-        )
-        max_tools = min(
-            budgets.get("tool_calls", self.platform_config.max_tool_calls),
-            self.platform_config.max_tool_calls,
-        )
-        turns = 0
-        tool_calls = 0
-        while turns < max_turns:
-            if self.compactor:
-                context_state = self.compactor.maybe_compact(context_state)
-            context = "\n".join(item.content for item in context_state.active)
-            turns += 1
-            tool_catalog = {}
-            for name in effective.model_tool_catalog:
-                server, separator, remote_tool = name.partition(".")
-                if separator and server in effective.mcp_tools:
-                    tool_catalog[name] = {
-                        "description": name,
-                        "input_schema": discovered.get(server, {}).get(remote_tool, {}),
-                    }
-                else:
-                    try:
-                        definition = self.tool_runtime.registry.get(name)
-                    except CoreError as error:
-                        if error.code != "TOOL_NOT_FOUND":
-                            raise
-                        tool_catalog[name] = {}
-                    else:
-                        tool_catalog[name] = {
-                            "description": definition.description,
-                            "input_schema": definition.input_schema,
-                        }
-            response = self.model.generate(
-                context=context,
-                tools=tool_catalog,
-                instructions=instructions,
-            )
-            for tool_request in response.tool_requests:
-                if tool_calls >= max_tools:
-                    raise CoreError("BUDGET_EXCEEDED")
-                tool_calls += 1
-                effective.require_tool(tool_request.name)
-                server, separator, remote_tool = tool_request.name.partition(".")
-                call = ToolCall(
-                    tool_request.id, tool_request.name, tool_request.arguments
-                )
-                if separator and server in effective.mcp_tools:
-                    read_only = _mcp_read_only(tool_request.name)
-                    definition = ToolDefinition(
-                        tool_request.name,
-                        tool_request.name,
-                        discovered.get(server, {}).get(remote_tool, {}),
-                        mutating=not read_only,
-                        risk_tags=(
-                            frozenset() if read_only else frozenset({"external_write"})
-                        ),
-                    )
-                    self.tool_runtime.validate(call, definition)
-                    policy_decision = self.tool_runtime.policy.evaluate(definition)
-                    if policy_decision == "deny":
-                        outcome = ToolResult(call.id, "denied")
-                    elif policy_decision == "require_approval":
-                        approval = self.tool_runtime.approvals.request(
-                            call,
-                            risks=definition.risk_tags,
-                            task_id=task_id or run_id,
-                            context_id=session_id or run_id,
-                            tenant_id=tenant_id or "default",
-                            caller_principal_id=identity or "anonymous",
-                            environment=raw["execution"]["environment_profile"],
-                            policy_version=effective.digest,
-                        )
-                        self._record_pending_approval(
-                            run_id, approval, effective, context_state
-                        )
-                        decision = yield ApprovalNeeded(run_id, approval)
-                        if decision == "approve":
-                            execution = self.tool_runtime.approvals.authorize_dispatch(
-                                approval.id, call
-                            )
-                            try:
-                                outcome = self.mcp_connector.call(
-                                    tool_request.name, tool_request.arguments
-                                )
-                            except Exception:
-                                self.tool_runtime.approvals.finish_execution(
-                                    execution.id, "FAILED"
-                                )
-                                raise
-                            self.tool_runtime.approvals.finish_execution(
-                                execution.id, "SUCCEEDED"
-                            )
-                        else:
-                            outcome = ToolResult(call.id, "denied")
-                    else:
-                        outcome = self.mcp_connector.call(
-                            tool_request.name, tool_request.arguments
-                        )
-                    if isinstance(outcome, ToolResult):
-                        result_text = json.dumps(
-                            {
-                                "tool_call_id": outcome.tool_call_id,
-                                "status": outcome.status,
-                                "output": self._value(outcome.output),
-                            },
-                            sort_keys=True,
-                            default=str,
-                        )
-                    else:
-                        result_text = json.dumps(outcome, sort_keys=True, default=str)
-                else:
-                    outcome = self.tool_runtime.execute(
-                        call,
-                        run_id=run_id,
-                        identity=identity,
-                        session_id=session_id,
-                        task_id=task_id,
-                        tenant_id=tenant_id,
-                        environment=raw["execution"]["environment_profile"],
-                        policy_version=effective.digest,
-                    )
-                    if isinstance(outcome, ApprovalRequest):
-                        self._record_pending_approval(
-                            run_id, outcome, effective, context_state
-                        )
-                        approval = outcome
-                        decision = yield ApprovalNeeded(run_id, approval)
-                        if decision == "approve":
-                            try:
-                                outcome = self.tool_runtime.resume_approved(
-                                    call, approval.id, run_id=run_id
-                                )
-                            except Exception:
-                                self.audit_log.append(
-                                    run_id,
-                                    "tool.execution.failed",
-                                    {
-                                        "approval_id": approval.id,
-                                        "proposal_id": approval.proposal_id,
-                                        "action_digest": approval.action_digest,
-                                    },
-                                )
-                                raise
-                            self.audit_log.append(
-                                run_id,
-                                "tool.execution.succeeded",
-                                {
-                                    "approval_id": approval.id,
-                                    "proposal_id": approval.proposal_id,
-                                    "action_digest": approval.action_digest,
-                                    "tool_call_id": outcome.tool_call_id,
-                                },
-                            )
-                        else:
-                            outcome = ToolResult(call.id, "denied")
-                    if isinstance(outcome, ToolResult):
-                        result_text = json.dumps(
-                            {
-                                "tool_call_id": outcome.tool_call_id,
-                                "status": outcome.status,
-                                "output": self._value(outcome.output),
-                            },
-                            sort_keys=True,
-                            default=str,
-                        )
-                result_item = ContextItem(
-                    "tool_result", result_text, self.token_counter(result_text)
-                )
-                context_state = ContextState(
-                    context_state.active + (result_item,),
-                    context_state.transcript + (result_item,),
-                    (
-                        context_state.sequence_range[0],
-                        context_state.sequence_range[1] + 1,
-                    ),
-                )
-            if response.message is not None:
-                self.task_scheduler.assert_can_complete_parent(
-                    run_id, tenant_id=tenant_id or "default"
-                )
-                self.audit_log.append(
-                    run_id, "task.completed", {"message": response.message}
-                )
-                self.event_store.append(
-                    run_id, "task.completed", {"message": response.message}
-                )
-                self.checkpoint_store.save(
-                    run_id,
-                    self.event_store.revision(run_id),
-                    {"state": "completed", "tool_calls": tool_calls},
-                )
-                return RunResult(
-                    run_id, response.message, "completed", Usage(turns, tool_calls)
-                )
-        raise CoreError("BUDGET_EXCEEDED")
-
-    def _advance(self, generator, *, task_id=None, decision=None):
-        try:
-            outcome = next(generator) if decision is None else generator.send(decision)
-        except StopIteration as completed:
-            if isinstance(completed.value, RunResult):
-                self._run_contexts.pop(completed.value.run_id, None)
-                self._run_scopes.pop(completed.value.run_id, None)
-            if task_id is not None:
-                with self._suspended_lock:
-                    self._suspended.pop(task_id, None)
-            return completed.value
-        if not isinstance(outcome, ApprovalNeeded):
-            generator.close()
-            raise CoreError("INVALID_TASK_STATE")
-        if task_id is None:
-            generator.close()
-            raise CoreError(
-                "APPROVAL_REQUIRED", data={"approval_id": outcome.request.id}
-            )
-        with self._suspended_lock:
-            self._suspended[task_id] = _SuspendedRun(generator, outcome)
-            self._task_approvals[task_id] = outcome.request.id
-        return outcome
-
     def run(
         self,
         request,
@@ -758,79 +1013,112 @@ class CoreAgent:
         tenant_id=None,
     ):
         if task_id is not None:
-            with self._suspended_lock:
-                if task_id in self._suspended:
+            try:
+                existing = self.workflow_store.by_task(
+                    task_id,
+                    tenant_id=tenant_id or "default",
+                    owner_id=identity or "anonymous",
+                )
+            except CoreError as error:
+                if error.code != "TASK_NOT_FOUND":
+                    raise
+            else:
+                if existing.state == "WAITING_LOCAL_APPROVAL":
                     raise CoreError("TASK_LOCKED_AWAITING_LOCAL_OPERATOR")
-        return self._advance(
-            self._run_loop(request, identity, session_id, task_id, tenant_id),
+                if existing.state in {
+                    "COMPLETED",
+                    "FAILED",
+                    "CANCELLED",
+                    "REJECTED",
+                    "ABORTED",
+                }:
+                    raise CoreError("INVALID_TASK_STATE")
+                return self._continue_workflow(existing)
+        record, _raw, _discovered, _effective = self._new_workflow(
+            request,
             task_id=task_id,
+            identity=identity,
+            session_id=session_id,
+            tenant_id=tenant_id,
         )
+        return self._continue_workflow(record)
 
     def is_waiting_local_approval(self, task_id):
-        with self._suspended_lock:
-            return task_id in self._suspended
+        try:
+            return self.workflow_store.lookup_task(task_id).state == "WAITING_LOCAL_APPROVAL"
+        except CoreError:
+            return False
 
     def can_cancel_local_approval(self, task_id):
-        with self._suspended_lock:
-            suspended = self._suspended.get(task_id)
-            return suspended is None or suspended.execution_id is None
+        try:
+            record = self.workflow_store.lookup_task(task_id)
+        except CoreError:
+            return True
+        return record.state != "APPROVED_RESERVED"
 
     def reserve_local_approval(self, task_id, approval_id, control_plane):
-        with self._suspended_lock:
-            suspended = self._suspended.get(task_id)
-            if not suspended:
-                if self._task_approvals.get(task_id) == approval_id:
-                    raise CoreError("APPROVAL_ALREADY_RESOLVED")
-                raise CoreError("APPROVAL_NOT_FOUND")
-            if suspended.approval.request.id != approval_id:
-                raise CoreError("APPROVAL_NOT_FOUND")
-            execution = control_plane.approve(
-                self.tool_runtime.approvals, suspended.approval.request
-            )
-            suspended.execution_id = execution.id
-        run_id = suspended.approval.run_id
-        self.audit_log.append(
-            run_id,
-            "operator.approved",
-            {
+        record = self.workflow_store.lookup_task(task_id)
+        if record.state != "WAITING_LOCAL_APPROVAL" or record.pending_approval_id != approval_id:
+            raise CoreError("APPROVAL_NOT_FOUND")
+        approval = self.tool_runtime.approvals.get(approval_id)
+        operator_principal_id = getattr(
+            control_plane, "operator_principal_id", "local-operator"
+        )
+        operator_session_id = getattr(
+            control_plane, "operator_session_id", "operator-session"
+        )
+        record, execution = self.workflow_store.reserve_approval(
+            record,
+            self.tool_runtime.approvals,
+            approval,
+            operator_principal_id=operator_principal_id,
+            operator_session_id=operator_session_id,
+            snapshot=copy.deepcopy(record.snapshot),
+        )
+        if not self.workflow_store.atomic:
+            data = {
                 "approval_id": approval_id,
-                "proposal_id": suspended.approval.request.proposal_id,
+                "proposal_id": approval.proposal_id,
                 "execution_id": execution.id,
                 "action_digest": execution.action_digest,
                 "actor_type": "local_operator",
-                "actor_principal_id": getattr(
-                    control_plane, "operator_principal_id", "local-operator"
-                ),
-            },
-        )
-        self.event_store.append(
-            run_id,
-            "execution.reserved",
-            {"approval_id": approval_id, "execution_id": execution.id},
-        )
-        self.checkpoint_store.save(
-            run_id,
-            self.event_store.revision(run_id),
-            {
-                "state": "approved_reserved",
-                "approval_id": approval_id,
-                "execution_id": execution.id,
-                "action_digest": execution.action_digest,
-            },
-        )
-        return ApprovalReserved(run_id, approval_id, execution.id)
+                "actor_principal_id": operator_principal_id,
+            }
+            self.audit_log.append(record.run_id, "operator.approved", data)
+            self.event_store.append(
+                record.run_id,
+                "execution.reserved",
+                {"approval_id": approval_id, "execution_id": execution.id},
+            )
+            self.checkpoint_store.save(
+                record.run_id,
+                self.event_store.revision(record.run_id),
+                {**record.snapshot, "state": "APPROVED_RESERVED"},
+            )
+        return ApprovalReserved(record.run_id, approval_id, execution.id)
 
     def dispatch_reserved_approval(self, task_id, approval_id, execution_id):
-        with self._suspended_lock:
-            suspended = self._suspended.get(task_id)
-            if (
-                suspended is None
-                or suspended.approval.request.id != approval_id
-                or suspended.execution_id != execution_id
-            ):
-                raise CoreError("APPROVAL_NOT_FOUND")
-            self._suspended.pop(task_id)
-        return self._advance(suspended.generator, task_id=task_id, decision="approve")
+        record = self.workflow_store.lookup_task(task_id)
+        if (
+            record.state != "APPROVED_RESERVED"
+            or record.pending_approval_id != approval_id
+            or record.snapshot.get("execution_id") != execution_id
+        ):
+            raise CoreError("APPROVAL_NOT_FOUND")
+        return self._continue_workflow(record)
+
+    def resume_task(self, task_id):
+        record = self.workflow_store.lookup_task(task_id)
+        if record.state == "COMPLETED":
+            return RunResult(
+                record.run_id,
+                record.result["message"],
+                "completed",
+                Usage(**record.result["usage"]),
+            )
+        if record.state in {"FAILED", "ABORTED", "CANCELLED", "REJECTED"}:
+            raise CoreError(record.error_code or "INVALID_TASK_STATE")
+        return self._continue_workflow(record)
 
     def resume_local_approval(self, task_id, approval_id, control_plane):
         reserved = self.reserve_local_approval(task_id, approval_id, control_plane)
@@ -845,69 +1133,79 @@ class CoreAgent:
         *,
         operator_principal_id,
         operator_session_id,
+        continue_run=True,
     ):
-        with self._suspended_lock:
-            suspended = self._suspended.get(task_id)
-            if suspended is None or suspended.approval.request.id != approval_id:
-                raise CoreError("APPROVAL_NOT_FOUND")
-            request = suspended.approval.request
-            self.tool_runtime.approvals.deny(
-                approval_id,
-                action_digest=request.action_digest,
-                expected_version=request.version,
-                operator_principal_id=operator_principal_id,
-                operator_session_id=operator_session_id,
-            )
-            self._suspended.pop(task_id)
-        run_id = suspended.approval.run_id
-        self.audit_log.append(
-            run_id,
-            "operator.denied",
-            {
-                "approval_id": approval_id,
-                "proposal_id": request.proposal_id,
-                "actor_type": "local_operator",
-            },
+        record = self.workflow_store.lookup_task(task_id)
+        if record.state != "WAITING_LOCAL_APPROVAL" or record.pending_approval_id != approval_id:
+            raise CoreError("APPROVAL_NOT_FOUND")
+        approval = self.tool_runtime.approvals.get(approval_id)
+        self.tool_runtime.approvals.deny(
+            approval_id,
+            action_digest=approval.action_digest,
+            expected_version=approval.version,
+            operator_principal_id=operator_principal_id,
+            operator_session_id=operator_session_id,
         )
-        self.event_store.append(run_id, "approval.denied", {"approval_id": approval_id})
-        return self._advance(suspended.generator, task_id=task_id, decision="deny")
+        snapshot = copy.deepcopy(record.snapshot)
+        self._append_result(
+            snapshot,
+            self._result_text(
+                snapshot["pending_call"]["id"],
+                ToolResult(snapshot["pending_call"]["id"], "denied"),
+            ),
+        )
+        record = self._record_transition(
+            record,
+            state="RUNNING",
+            snapshot=snapshot,
+            event_kind="approval.denied",
+            event_data={"approval_id": approval_id},
+            audit=(
+                (
+                    "operator.denied",
+                    {
+                        "approval_id": approval_id,
+                        "proposal_id": approval.proposal_id,
+                        "actor_type": "local_operator",
+                    },
+                ),
+            ),
+        )
+        return self._continue_workflow(record) if continue_run else record
 
     def cancel_local_approval(self, task_id):
-        with self._suspended_lock:
-            suspended = self._suspended.get(task_id)
-            if suspended is None:
-                approval_id = self._task_approvals.get(task_id)
-                if approval_id and self.tool_runtime.approvals.execution_for(
-                    approval_id
-                ):
-                    raise CoreError("TASK_NOT_CANCELABLE")
-                return
-            self.tool_runtime.approvals.cancel(suspended.approval.request.id)
-            self._suspended.pop(task_id)
-            suspended.generator.close()
-        run_id = suspended.approval.run_id
-        self._run_contexts.pop(run_id, None)
-        self._run_scopes.pop(run_id, None)
-        self.audit_log.append(
-            run_id,
-            "approval.canceled",
-            {"approval_id": suspended.approval.request.id},
+        try:
+            record = self.workflow_store.lookup_task(task_id)
+        except CoreError:
+            return
+        if record.state == "APPROVED_RESERVED":
+            raise CoreError("TASK_NOT_CANCELABLE")
+        if record.state != "WAITING_LOCAL_APPROVAL":
+            return
+        self.tool_runtime.approvals.cancel(record.pending_approval_id)
+        snapshot = copy.deepcopy(record.snapshot)
+        self._record_transition(
+            record,
+            state="CANCELLED",
+            snapshot=snapshot,
+            event_kind="task.canceled",
+            event_data={"approval_id": record.pending_approval_id},
+            audit=(
+                (
+                    "approval.canceled",
+                    {"approval_id": record.pending_approval_id},
+                ),
+            ),
         )
-        self.event_store.append(run_id, "task.canceled", {})
-        self.checkpoint_store.save(
-            run_id,
-            self.event_store.revision(run_id),
-            {"state": "canceled", "approval_id": suspended.approval.request.id},
-        )
+        self._run_contexts.pop(record.run_id, None)
+        self._run_scopes.pop(record.run_id, None)
+        self._runtime_cache.pop(record.run_id, None)
 
     def close(self):
-        with self._suspended_lock:
-            for suspended in self._suspended.values():
-                suspended.generator.close()
-            self._suspended.clear()
-            self._task_approvals.clear()
+        self._task_approvals.clear()
         self._run_contexts.clear()
         self._run_scopes.clear()
+        self._runtime_cache.clear()
         self.task_scheduler.close()
         self.tool_runtime.approvals.close()
 
@@ -915,3 +1213,87 @@ class CoreAgent:
         if hasattr(self.task_scheduler, "recover"):
             return self.task_scheduler.recover()
         return 0
+
+    def recover_workflows(self):
+        recovered = []
+        for record in self.workflow_store.recoverable():
+            if record.state == "WAITING_LOCAL_APPROVAL" and record.pending_approval_id:
+                execution = self.tool_runtime.approvals.execution_for(
+                    record.pending_approval_id
+                )
+                if execution and execution.state == "RESERVED":
+                    snapshot = copy.deepcopy(record.snapshot)
+                    snapshot["execution_id"] = execution.id
+                    record = self._record_transition(
+                        record,
+                        state="APPROVED_RESERVED",
+                        snapshot=snapshot,
+                        event_kind="execution.recovered_reserved",
+                        event_data={"execution_id": execution.id},
+                        audit=(("execution.recovered", {"safe": True}),),
+                        pending_approval_id=record.pending_approval_id,
+                    )
+            if record.state != "EXECUTING":
+                recovered.append(record)
+                continue
+            execution = (
+                self.tool_runtime.approvals.execution_for(
+                    record.pending_approval_id
+                )
+                if record.pending_approval_id
+                else None
+            )
+            if execution and execution.state == "RESERVED":
+                snapshot = copy.deepcopy(record.snapshot)
+                snapshot["execution_id"] = execution.id
+                recovered.append(
+                    self._record_transition(
+                        record,
+                        state="APPROVED_RESERVED",
+                        snapshot=snapshot,
+                        event_kind="execution.recovered_reserved",
+                        event_data={"execution_id": execution.id},
+                        audit=(("execution.recovered", {"safe": True}),),
+                        pending_approval_id=record.pending_approval_id,
+                    )
+                )
+                continue
+            details = (
+                self.tool_runtime.approvals.execution_outcome(
+                    record.pending_approval_id
+                )
+                if record.pending_approval_id
+                and hasattr(self.tool_runtime.approvals, "execution_outcome")
+                else None
+            )
+            if details and details["state"] == "SUCCEEDED" and details["outcome"] is not None:
+                snapshot = copy.deepcopy(record.snapshot)
+                outcome = details["outcome"]
+                text = (
+                    json.dumps(outcome, sort_keys=True, default=str)
+                    if isinstance(outcome, dict)
+                    and {"tool_call_id", "status"} <= set(outcome)
+                    else self._result_text(snapshot["pending_call"]["id"], outcome)
+                )
+                self._append_result(snapshot, text)
+                recovered.append(
+                    self._record_transition(
+                        record,
+                        state="RUNNING",
+                        snapshot=snapshot,
+                        event_kind="execution.recovered_succeeded",
+                        event_data={"execution_id": execution.id},
+                        audit=(("execution.recovered", {"safe": True}),),
+                    )
+                )
+                continue
+            self._record_transition(
+                record,
+                state="ABORTED",
+                snapshot=record.snapshot,
+                event_kind="execution.side_effect_unknown",
+                event_data={"tool_call_id": record.snapshot["pending_call"]["id"]},
+                audit=(("execution.reconciliation_required", {}),),
+                error_code="SIDE_EFFECT_UNKNOWN",
+            )
+        return tuple(recovered)

@@ -503,7 +503,7 @@ class ApprovalManager:
                 **{**execution.__dict__, "state": "DISPATCHED", "attempt": 1}
             )
 
-    def finish_execution(self, execution_id, state):
+    def finish_execution(self, execution_id, state, outcome=None, error_code=None):
         with self._transaction() as db:
             updated = db.execute(
                 "UPDATE execution_records SET state = ? WHERE id = ? AND state = 'DISPATCHED'",
@@ -531,6 +531,7 @@ class ApprovalManager:
 class ApproveAllControlPlane:
     operator_principal_id: str = "local-operator-stub"
     operator_session_id: str = "approve-all-development-stub"
+    automatic: bool = True
 
     def approve(self, manager, approval):
         return manager.approve_once(

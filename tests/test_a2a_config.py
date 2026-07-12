@@ -17,7 +17,7 @@ from core_agent.a2a import (
     map_core_state,
     parse_run_request,
 )
-from core_agent.approvals import ApprovalManager
+from core_agent.approvals import ApprovalManager, ApproveAllControlPlane
 from core_agent.app import create_app
 from core_agent.config import (
     AgentConfig,
@@ -255,7 +255,7 @@ class ConfigurationTests(unittest.TestCase):
         model = type("Model", (), {"model": "test-model"})()
         with patch.dict(os.environ, {"CORE_AGENT_ENVIRONMENT": "production"}):
             with self.assertRaises(CoreError) as caught:
-                create_app(model=model)
+                create_app(model=model, control_plane=ApproveAllControlPlane())
         self.assertEqual(caught.exception.code, "LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
 
         with patch.dict(

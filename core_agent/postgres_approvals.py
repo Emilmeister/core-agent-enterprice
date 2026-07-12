@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import time
 import uuid
+import dataclasses
+
+from psycopg.types.json import Jsonb
 
 from .approvals import (
     ApprovalRequest,
@@ -12,6 +15,20 @@ from .approvals import (
     _target,
 )
 from .errors import CoreError
+
+
+def _value(value):
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    if isinstance(value, dict):
+        return {str(key): _value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 class PostgresApprovalManager:
@@ -28,7 +45,12 @@ class PostgresApprovalManager:
 
     @staticmethod
     def _execution(row):
-        return ExecutionRecord(**dict(row))
+        return ExecutionRecord(
+            **{
+                key: row[key]
+                for key in ExecutionRecord.__dataclass_fields__
+            }
+        )
 
     def _get(self, connection, approval_id, *, lock=False):
         suffix = " FOR UPDATE" if lock else ""
@@ -58,6 +80,7 @@ class PostgresApprovalManager:
         environment="local-container",
         policy_version="core-policy-v1",
         ttl_seconds=None,
+        connection=None,
     ):
         created_at = self.clock()
         proposal = ToolProposal(
@@ -84,12 +107,12 @@ class PostgresApprovalManager:
         approval_id = str(uuid.uuid4())
         ttl = self.ttl_seconds if ttl_seconds is None else ttl_seconds
         expires_at = created_at + ttl if ttl is not None else None
-        with self.database.transaction() as connection:
-            connection.execute(
+        def insert(db):
+            db.execute(
                 "INSERT INTO core_tool_proposals VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 tuple(proposal.__dict__.values()),
             )
-            connection.execute(
+            db.execute(
                 "INSERT INTO core_approval_requests VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     approval_id,
@@ -107,7 +130,12 @@ class PostgresApprovalManager:
                     None,
                 ),
             )
-        return self.get(approval_id)
+            return self._get(db, approval_id)
+
+        if connection is not None:
+            return insert(connection)
+        with self.database.transaction() as db:
+            return insert(db)
 
     def get(self, approval_id):
         with self.database.pool.connection() as connection:
@@ -187,6 +215,70 @@ class PostgresApprovalManager:
             raise CoreError("APPROVAL_EXPIRED")
         return execution
 
+    def approve_once_in_transaction(
+        self,
+        connection,
+        approval_id,
+        *,
+        action_digest,
+        expected_version,
+        operator_principal_id,
+        operator_session_id,
+        idempotency_key,
+    ):
+        approval = self._get(connection, approval_id, lock=True)
+        row = connection.execute(
+            "SELECT * FROM core_execution_records WHERE approval_id = %s",
+            (approval_id,),
+        ).fetchone()
+        if row:
+            execution = self._execution(row)
+            if execution.idempotency_key == idempotency_key:
+                return execution
+            raise CoreError("APPROVAL_ALREADY_RESOLVED")
+        if approval.state != "PENDING":
+            raise CoreError("APPROVAL_ALREADY_RESOLVED")
+        if approval.expires_at is not None and approval.expires_at <= self.clock():
+            connection.execute(
+                """UPDATE core_approval_requests SET state = 'EXPIRED',
+                   version = version + 1 WHERE id = %s""",
+                (approval_id,),
+            )
+            raise CoreError("APPROVAL_EXPIRED")
+        if (
+            approval.version != expected_version
+            or approval.action_digest != action_digest
+            or approval.proposal.recompute_digest() != approval.action_digest
+        ):
+            raise CoreError("APPROVAL_ARGUMENTS_CHANGED")
+        execution = ExecutionRecord(
+            str(uuid.uuid4()),
+            approval.task_id,
+            approval.id,
+            approval.proposal_id,
+            approval.action_digest,
+            idempotency_key,
+            "RESERVED",
+            0,
+            self.clock(),
+        )
+        connection.execute(
+            """INSERT INTO core_execution_records
+               (id, task_id, approval_id, proposal_id, action_digest,
+                idempotency_key, state, attempt, reserved_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            tuple(execution.__dict__.values()),
+        )
+        connection.execute(
+            """UPDATE core_approval_requests
+               SET state = 'CONSUMED', version = version + 1,
+                   decision = 'APPROVE_ONCE', operator_principal_id = %s,
+                   operator_session_id = %s
+               WHERE id = %s AND state = 'PENDING'""",
+            (operator_principal_id, operator_session_id, approval_id),
+        )
+        return execution
+
     def deny(
         self,
         approval_id,
@@ -246,9 +338,9 @@ class PostgresApprovalManager:
                 raise CoreError("APPROVAL_ARGUMENTS_CHANGED")
             updated = connection.execute(
                 """UPDATE core_execution_records
-                   SET state = 'DISPATCHED', attempt = attempt + 1
+                   SET state = 'DISPATCHED', attempt = attempt + 1, started_at = %s
                    WHERE id = %s AND state = 'RESERVED'""",
-                (execution.id,),
+                (self.clock(), execution.id),
             )
             if updated.rowcount != 1:
                 raise CoreError("EXECUTION_ALREADY_DISPATCHED")
@@ -256,11 +348,19 @@ class PostgresApprovalManager:
             **{**execution.__dict__, "state": "DISPATCHED", "attempt": execution.attempt + 1}
         )
 
-    def finish_execution(self, execution_id, state):
+    def finish_execution(self, execution_id, state, outcome=None, error_code=None):
         with self.database.transaction() as connection:
             updated = connection.execute(
-                "UPDATE core_execution_records SET state = %s WHERE id = %s AND state = 'DISPATCHED'",
-                (state, execution_id),
+                """UPDATE core_execution_records SET state = %s,
+                       finished_at = %s, outcome = %s, error_code = %s
+                   WHERE id = %s AND state = 'DISPATCHED'""",
+                (
+                    state,
+                    self.clock(),
+                    Jsonb(_value(outcome)) if outcome is not None else None,
+                    error_code,
+                    execution_id,
+                ),
             )
             if updated.rowcount != 1:
                 raise CoreError("INVALID_TASK_STATE")
@@ -272,6 +372,15 @@ class PostgresApprovalManager:
                 (approval_id,),
             ).fetchone()
         return self._execution(row) if row else None
+
+    def execution_outcome(self, approval_id):
+        with self.database.pool.connection() as connection:
+            row = connection.execute(
+                """SELECT state, outcome, error_code FROM core_execution_records
+                   WHERE approval_id = %s""",
+                (approval_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def close(self):
         # The application owns and closes the shared pool after CoreAgent.close().
