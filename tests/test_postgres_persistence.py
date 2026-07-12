@@ -1,5 +1,6 @@
 import asyncio
 import os
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -199,7 +200,7 @@ class PostgresRestartTests(unittest.TestCase):
         database.migrate()
         model = ScriptedModel([ModelResponse(message="ok")])
         model.model = "production-model"
-        with patch.dict(
+        with tempfile.TemporaryDirectory() as durable, patch.dict(
             os.environ,
             {
                 "CORE_AGENT_ENVIRONMENT": "production",
@@ -210,6 +211,7 @@ class PostgresRestartTests(unittest.TestCase):
                 "OPERATOR_JWT_AUDIENCE": "operator-api",
                 "LOCAL_APPROVAL_EXTENSION_URI": "https://agent.example/extensions/local-approval/v1",
                 "PUSH_NOTIFICATION_ENCRYPTION_KEY": Fernet.generate_key().decode(),
+                "DURABLE_STORAGE_ROOT": durable,
             },
             clear=True,
         ):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import ipaddress
+import json
 import os
 import pty
 import shutil
@@ -101,6 +103,166 @@ class ProcessHandle:
     _result: ExecutionResult | None = field(repr=False, default=None)
 
 
+@dataclass(frozen=True)
+class WorkspaceSnapshot:
+    id: str
+    parent_id: str | None
+    files: dict
+
+
+class WorkspaceSnapshotStore:
+    """Immutable content-addressed snapshots for an S3-backed mounted path."""
+
+    def __init__(self, root):
+        self.root = Path(root).absolute()
+        self.blobs = self.root / "blobs" / "sha256"
+        self.snapshots = self.root / "snapshots"
+        self.blobs.mkdir(parents=True, exist_ok=True)
+        self.snapshots.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _digest(content):
+        return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def _relative(path):
+        value = path.as_posix()
+        if value.startswith("/") or ".." in path.parts or value in {"", "."}:
+            raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+        return value
+
+    def _put_blob(self, content):
+        digest = self._digest(content)
+        target = self.blobs / digest
+        try:
+            with target.open("xb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except FileExistsError:
+            if self._digest(target.read_bytes()) != digest:
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
+        return digest
+
+    def publish(self, workspace, *, parent_id=None):
+        workspace = Path(workspace).resolve()
+        files = {}
+        for path in sorted(workspace.rglob("*")):
+            relative = path.relative_to(workspace)
+            if relative.parts and relative.parts[0] == ".tmp":
+                continue
+            if path.is_symlink():
+                raise CoreError("WORKSPACE_SNAPSHOT_INVALID", "symlinks are forbidden")
+            if not path.is_file():
+                continue
+            content = path.read_bytes()
+            files[self._relative(relative)] = {
+                "sha256": self._put_blob(content),
+                "size": len(content),
+                "mode": path.stat().st_mode & 0o777,
+            }
+        manifest = {"schema_version": 1, "parent_id": parent_id, "files": files}
+        encoded = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ).encode()
+        snapshot_id = self._digest(encoded)
+        prefix = self.snapshots / snapshot_id
+        prefix.mkdir(exist_ok=True)
+        committed = prefix / "manifest.json"
+        try:
+            with committed.open("xb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except FileExistsError:
+            if committed.read_bytes() != encoded:
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
+        return WorkspaceSnapshot(snapshot_id, parent_id, files)
+
+    def get(self, snapshot_id):
+        if not isinstance(snapshot_id, str) or len(snapshot_id) != 64:
+            raise CoreError("WORKSPACE_SNAPSHOT_NOT_FOUND")
+        manifest_path = self.snapshots / snapshot_id / "manifest.json"
+        try:
+            encoded = manifest_path.read_bytes()
+            manifest = json.loads(encoded)
+        except (OSError, json.JSONDecodeError):
+            raise CoreError("WORKSPACE_SNAPSHOT_NOT_FOUND") from None
+        if self._digest(encoded) != snapshot_id or manifest.get("schema_version") != 1:
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        files = manifest.get("files")
+        if not isinstance(files, dict):
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        return WorkspaceSnapshot(snapshot_id, manifest.get("parent_id"), files)
+
+    def materialize(self, snapshot_id, destination):
+        snapshot = self.get(snapshot_id)
+        destination = Path(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        for relative, metadata in snapshot.files.items():
+            path = Path(relative)
+            self._relative(path)
+            blob = self.blobs / metadata["sha256"]
+            try:
+                content = blob.read_bytes()
+            except OSError:
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
+            if (
+                self._digest(content) != metadata["sha256"]
+                or len(content) != metadata["size"]
+            ):
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+            target = destination / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            target.chmod(metadata["mode"])
+        return snapshot
+
+    @staticmethod
+    def _workspace_files(workspace):
+        result = {}
+        workspace = Path(workspace)
+        for path in sorted(workspace.rglob("*")):
+            if path.is_file() and not path.is_symlink() and ".tmp" not in path.parts:
+                result[path.relative_to(workspace).as_posix()] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+        return result
+
+    def merge(self, *, base_snapshot_id, child_snapshot_id, target_workspace):
+        base = self.get(base_snapshot_id)
+        child = self.get(child_snapshot_id)
+        if child.parent_id != base.id:
+            raise CoreError("WORKSPACE_BASE_MISMATCH")
+        target_workspace = Path(target_workspace)
+        current = self._workspace_files(target_workspace)
+        base_hashes = {path: value["sha256"] for path, value in base.files.items()}
+        child_hashes = {path: value["sha256"] for path, value in child.files.items()}
+        changed = {
+            path
+            for path in set(base_hashes) | set(child_hashes)
+            if base_hashes.get(path) != child_hashes.get(path)
+        }
+        conflicts = sorted(
+            path for path in changed if current.get(path) != base_hashes.get(path)
+        )
+        if conflicts:
+            raise CoreError("WORKSPACE_CONFLICT", data={"paths": conflicts})
+        for relative in changed:
+            target = target_workspace / relative
+            metadata = child.files.get(relative)
+            if metadata is None:
+                target.unlink(missing_ok=True)
+                continue
+            content = (self.blobs / metadata["sha256"]).read_bytes()
+            if self._digest(content) != metadata["sha256"]:
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            target.chmod(metadata["mode"])
+        return self.publish(target_workspace, parent_id=base.id)
+
+
 class LocalTerminalBackend:
     local = True
     capabilities = {
@@ -111,10 +273,12 @@ class LocalTerminalBackend:
         "process_tree_teardown",
     }
 
-    def __init__(self, root):
+    def __init__(self, root, *, snapshot_store=None, base_snapshot=None):
         # Keep the caller-visible path spelling (notably /var vs /private/var on macOS).
         self.root = Path(root).absolute()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.snapshot_store = snapshot_store
+        self.base_snapshot = base_snapshot
 
     @staticmethod
     def _path_component(value):
@@ -136,20 +300,25 @@ class LocalTerminalBackend:
             / "workspace"
         )
         workspace.mkdir(parents=True, exist_ok=False)
-        snapshot = Path(spec.workspace_snapshot)
-        if snapshot.is_dir():
+        snapshot_id = spec.workspace_snapshot or self.base_snapshot
+        snapshot = Path(snapshot_id) if snapshot_id else None
+        if snapshot and snapshot.is_dir():
             shutil.copytree(snapshot, workspace, dirs_exist_ok=True, symlinks=True)
-        return _LocalTerminalSession(spec, workspace)
+        elif snapshot_id and self.snapshot_store:
+            self.snapshot_store.materialize(snapshot_id, workspace)
+        return _LocalTerminalSession(spec, workspace, self.snapshot_store)
 
 
 class _LocalTerminalSession:
-    def __init__(self, spec, workspace):
+    def __init__(self, spec, workspace, snapshot_store=None):
         self.id = spec.session_id
         self.spec = spec
         self.workspace = workspace
         self._processes = {}
         self._lock = threading.Lock()
         self._closed = False
+        self.snapshot_store = snapshot_store
+        self.final_snapshot = None
 
     def _cwd(self, requested):
         candidate = Path(requested or ".")
@@ -348,7 +517,13 @@ class _LocalTerminalSession:
                 os.close(handle._master_fd)
             except OSError:
                 pass
+        if self.snapshot_store:
+            parent_id = self.spec.workspace_snapshot or None
+            self.final_snapshot = self.snapshot_store.publish(
+                self.workspace, parent_id=parent_id
+            )
         shutil.rmtree(self.workspace.parent, ignore_errors=True)
+        return self.final_snapshot
 
 
 class TerminalSessionManager:
@@ -368,6 +543,8 @@ class TerminalSessionManager:
         self.backend = backend
         self._environments = {}
         self.telemetry_records = []
+        self._run_environments = {}
+        self._lock = threading.Lock()
 
     def create(self, spec):
         prepared = replace(
@@ -448,20 +625,32 @@ class TerminalSessionManager:
         self._owned(environment_id, owner_id).cancel(process_id)
 
     def execute_transient(self, request, run_id):
-        environment = self.create(
-            EnvironmentSpec(
-                "default", run_id, "runtime", (".",), (), {}, owner_id=run_id
-            )
-        )
-        try:
-            return self.execute(environment.id, request, owner_id=run_id)
-        finally:
-            self.destroy(environment.id, owner_id=run_id)
+        with self._lock:
+            environment_id = self._run_environments.get(run_id)
+            if environment_id is None:
+                environment = self.create(
+                    EnvironmentSpec(
+                        "default",
+                        run_id,
+                        getattr(self.backend, "base_snapshot", None) or "",
+                        (".",),
+                        (),
+                        {},
+                        owner_id=run_id,
+                    )
+                )
+                environment_id = environment.id
+                self._run_environments[run_id] = environment_id
+        return self.execute(environment_id, request, owner_id=run_id)
 
     def destroy(self, environment_id, *, owner_id=None):
         environment = self._owned(environment_id, owner_id)
-        environment.destroy()
+        snapshot = environment.destroy()
         self._environments.pop(environment_id, None)
+        for run_id, owned_id in tuple(self._run_environments.items()):
+            if owned_id == environment_id:
+                self._run_environments.pop(run_id, None)
+        return snapshot
 
     def close(self):
         for environment_id in tuple(self._environments):

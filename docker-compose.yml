@@ -42,7 +42,8 @@ services:
       MODEL_NAME: ${MODEL_NAME}
       MODEL_API_KEY: ${MODEL_API_KEY}
       CORE_AGENT_PORT: 8000
-      LOCAL_WORKSPACE_ROOT: /data/runs
+      LOCAL_WORKSPACE_ROOT: /tmp/core-agent/runs
+      DURABLE_STORAGE_ROOT: /data/durable
     ports:
       - "${CORE_AGENT_PORT:-8000}:8000"
     volumes:

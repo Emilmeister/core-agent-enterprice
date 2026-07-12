@@ -35,6 +35,8 @@ OPERATOR_JWT_ISSUER='https://operator.example' \
 OPERATOR_JWT_AUDIENCE='core-agent-operator' \
 LOCAL_APPROVAL_EXTENSION_URI='https://agent.example/a2a/extensions/local-operator-approval/v1' \
 PUSH_NOTIFICATION_ENCRYPTION_KEY='replace-with-generated-fernet-key' \
+DURABLE_STORAGE_ROOT='/mounted-s3/core-agent' \
+LOCAL_WORKSPACE_ROOT='/tmp/core-agent/runs' \
 uv run core-agent
 ```
 
@@ -54,6 +56,8 @@ action digest; A2A callers cannot use their credentials on this route.
 `PUSH_NOTIFICATION_ENCRYPTION_KEY` is a separate Fernet key used to encrypt durable A2A webhook
 configuration. Generate it with
 `uv run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`.
+`DURABLE_STORAGE_ROOT` must be the S3-backed mount used only for immutable snapshots and artifacts;
+`LOCAL_WORKSPACE_ROOT` must be a separate local ephemeral path used by active processes.
 
 OpenAI-compatible API (OpenAI, vLLM, Ollama, LM Studio, OpenRouter, or another compatible gateway):
 

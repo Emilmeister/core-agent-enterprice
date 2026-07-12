@@ -10,6 +10,7 @@ from core_agent.execution import (
     EnvironmentSpec,
     LocalTerminalBackend,
     TerminalSessionManager,
+    WorkspaceSnapshotStore,
 )
 
 
@@ -197,6 +198,92 @@ class LocalTerminalTests(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertEqual(result.status, "timed_out")
         self.assertEqual(result.cleanup, "process_group_terminated")
+
+    def test_transient_exec_reuses_one_owned_workspace_per_run(self):
+        first = self.manager.execute_transient(
+            {
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('state.txt').write_text('kept')",
+                ]
+            },
+            "persistent-run",
+        )
+        second = self.manager.execute_transient(
+            {
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; print(Path('state.txt').read_text())",
+                ]
+            },
+            "persistent-run",
+        )
+        self.assertEqual(first.exit_code, 0)
+        self.assertEqual(second.stdout.strip(), "kept")
+        self.assertEqual(first.terminal_session_id, second.terminal_session_id)
+
+
+class WorkspaceSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.store = WorkspaceSnapshotStore(root / "durable")
+        self.source = root / "source"
+        self.source.mkdir()
+        (self.source / "shared.txt").write_text("base\n", encoding="utf-8")
+        (self.source / "unchanged.txt").write_text("same\n", encoding="utf-8")
+        self.base = self.store.publish(self.source)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_snapshot_is_content_addressed_verified_and_materialized(self):
+        target = Path(self.temp.name) / "target"
+        restored = self.store.materialize(self.base.id, target)
+        self.assertEqual(restored.id, self.base.id)
+        self.assertEqual((target / "shared.txt").read_text(), "base\n")
+        again = self.store.publish(self.source)
+        self.assertEqual(again.id, self.base.id)
+
+        digest = self.base.files["shared.txt"]["sha256"]
+        (self.store.blobs / digest).write_text("tampered", encoding="utf-8")
+        with self.assertRaises(CoreError) as caught:
+            self.store.materialize(self.base.id, Path(self.temp.name) / "broken")
+        self.assertEqual(caught.exception.code, "ARTIFACT_INTEGRITY_FAILED")
+
+    def test_child_patch_merges_unrelated_change_and_rejects_conflict(self):
+        root = Path(self.temp.name)
+        child = root / "child"
+        main = root / "main"
+        self.store.materialize(self.base.id, child)
+        self.store.materialize(self.base.id, main)
+        (child / "shared.txt").write_text("child\n", encoding="utf-8")
+        (child / "new.txt").write_text("new\n", encoding="utf-8")
+        child_snapshot = self.store.publish(child, parent_id=self.base.id)
+        (main / "unchanged.txt").write_text("main-only\n", encoding="utf-8")
+        merged = self.store.merge(
+            base_snapshot_id=self.base.id,
+            child_snapshot_id=child_snapshot.id,
+            target_workspace=main,
+        )
+        self.assertEqual((main / "shared.txt").read_text(), "child\n")
+        self.assertEqual((main / "new.txt").read_text(), "new\n")
+        self.assertEqual((main / "unchanged.txt").read_text(), "main-only\n")
+        self.assertEqual(merged.parent_id, self.base.id)
+
+        conflicting = root / "conflicting"
+        self.store.materialize(self.base.id, conflicting)
+        (conflicting / "shared.txt").write_text("main-conflict\n", encoding="utf-8")
+        with self.assertRaises(CoreError) as caught:
+            self.store.merge(
+                base_snapshot_id=self.base.id,
+                child_snapshot_id=child_snapshot.id,
+                target_workspace=conflicting,
+            )
+        self.assertEqual(caught.exception.code, "WORKSPACE_CONFLICT")
+        self.assertEqual(caught.exception.data["paths"], ["shared.txt"])
 
 
 if __name__ == "__main__":

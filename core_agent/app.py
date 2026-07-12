@@ -23,7 +23,11 @@ from .database import (
     PostgresTaskStore,
 )
 from .errors import CoreError
-from .execution import LocalTerminalBackend, TerminalSessionManager
+from .execution import (
+    LocalTerminalBackend,
+    TerminalSessionManager,
+    WorkspaceSnapshotStore,
+)
 from .kernel import KernelCompiler
 from .mcp import StreamableHttpMcpConnector
 from .model import CompatibleHttpModel
@@ -311,8 +315,26 @@ def _agent(model, mcp_connector=None, *, state=None):
                 risk_tags=frozenset(),
             )
         )
+    local_root = Path(os.getenv("LOCAL_WORKSPACE_ROOT", "/tmp/core-agent/runs")).resolve()
+    durable_value = os.getenv("DURABLE_STORAGE_ROOT", "")
+    if os.getenv("CORE_AGENT_ENVIRONMENT", "development") == "production" and not durable_value:
+        raise CoreError("DURABLE_STORAGE_REQUIRED")
+    snapshot_store = WorkspaceSnapshotStore(durable_value) if durable_value else None
+    if snapshot_store:
+        durable_root = snapshot_store.root.resolve()
+        if local_root == durable_root or durable_root in local_root.parents:
+            raise CoreError("CONFIG_INVALID", "active workspace cannot use durable mount")
+    base_snapshot = os.getenv("LOCAL_BASE_SNAPSHOT") or None
+    if base_snapshot and not snapshot_store:
+        raise CoreError("CONFIG_INVALID", "base snapshot requires durable storage")
+    if base_snapshot:
+        snapshot_store.get(base_snapshot)
     sessions = TerminalSessionManager(
-        LocalTerminalBackend(os.getenv("LOCAL_WORKSPACE_ROOT", "/tmp/core-agent/runs"))
+        LocalTerminalBackend(
+            local_root,
+            snapshot_store=snapshot_store,
+            base_snapshot=base_snapshot,
+        )
     )
     local_approval_enabled = os.getenv("LOCAL_APPROVAL_ENABLED", "true").lower() in {
         "1",
@@ -448,7 +470,12 @@ def create_app(
         if state["database"]:
             state["database"].close()
         raise CoreError("PUSH_ENCRYPTION_KEY_REQUIRED")
-    agent, telemetry = _agent(model, mcp_connector, state=state)
+    try:
+        agent, telemetry = _agent(model, mcp_connector, state=state)
+    except Exception:
+        if state["database"]:
+            state["database"].close()
+        raise
     control_plane = control_plane or ApproveAllControlPlane()
     push_config_store = None
     push_sender = None
