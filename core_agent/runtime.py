@@ -1690,6 +1690,7 @@ class CoreAgent:
             },
             recoverable=True,
             tenant_id=scope.get("tenant_id", "default"),
+            continue_trace=True,
         )
         if not contract.background:
             task = self.task_scheduler.wait(

@@ -8,6 +8,7 @@ import uuid
 from psycopg.types.json import Jsonb
 
 from .errors import CoreError
+from .observability import TraceContext
 from .tasks import BackgroundTask, Notification
 
 
@@ -114,6 +115,7 @@ class PostgresTaskScheduler:
         contract,
         recoverable=False,
         tenant_id="default",
+        continue_trace=False,
     ):
         if self._closed:
             raise CoreError("INVALID_TASK_STATE")
@@ -125,6 +127,13 @@ class PostgresTaskScheduler:
                 linked_context = submission.context
         now = self.clock()
         task = BackgroundTask(str(uuid.uuid4()), owner_id, required)
+        stored_contract = dict(contract)
+        if continue_trace and linked_context is not None:
+            stored_contract["_trace_parent"] = {
+                "trace_id": linked_context.trace_id,
+                "span_id": linked_context.span_id,
+                "trace_flags": linked_context.trace_flags,
+            }
         with self.database.transaction() as connection:
             connection.execute(
                 """INSERT INTO core_background_tasks
@@ -138,7 +147,7 @@ class PostgresTaskScheduler:
                     kind,
                     required,
                     recoverable,
-                    Jsonb(_value(contract)),
+                    Jsonb(_value(stored_contract)),
                     now,
                     now,
                 ),
@@ -149,6 +158,7 @@ class PostgresTaskScheduler:
             function,
             accepts_cancel_event=accepts_cancel_event,
             trace_context=linked_context,
+            continue_trace=continue_trace,
         )
         return task
 
@@ -160,6 +170,7 @@ class PostgresTaskScheduler:
         *,
         accepts_cancel_event,
         trace_context=None,
+        continue_trace=False,
     ):
         cancel_event = self._cancel_event(task_id)
         with self.database.transaction() as connection:
@@ -176,13 +187,17 @@ class PostgresTaskScheduler:
             owner_id = row["owner_run_id"]
 
         def run():
-            span = (
-                self.telemetry.start_background_span(
-                    "core_agent.task.execute", trace_context
+            span = None
+            if self.telemetry:
+                span = (
+                    self.telemetry.span(
+                        "core_agent.task.execute", parent=trace_context
+                    )
+                    if continue_trace
+                    else self.telemetry.start_background_span(
+                        "core_agent.task.execute", trace_context
+                    )
                 )
-                if self.telemetry
-                else None
-            )
             context = span if span else _NullContext()
             try:
                 with context:
@@ -379,11 +394,18 @@ class PostgresTaskScheduler:
             def execute(cancel_event, current=row, callback=handler):
                 return callback(current["contract"], cancel_event)
 
+            trace_parent = row["contract"].get("_trace_parent")
+            trace_context = (
+                TraceContext(**trace_parent) if trace_parent is not None else None
+            )
+
             self._launch(
                 row["id"],
                 row["tenant_id"],
                 execute,
                 accepts_cancel_event=True,
+                trace_context=trace_context,
+                continue_trace=trace_context is not None,
             )
             recovered += 1
         return recovered

@@ -83,6 +83,7 @@ class TaskScheduler:
         contract=None,
         recoverable=False,
         tenant_id="default",
+        continue_trace=False,
     ):
         task = BackgroundTask(str(uuid.uuid4()), owner_id, required)
         self._tasks[task.id] = task
@@ -93,13 +94,17 @@ class TaskScheduler:
                 linked_context = submission.context
 
         def run():
-            span = (
-                self.telemetry.start_background_span(
-                    "core_agent.task.execute", linked_context
+            span = None
+            if self.telemetry:
+                span = (
+                    self.telemetry.span(
+                        "core_agent.task.execute", parent=linked_context
+                    )
+                    if continue_trace
+                    else self.telemetry.start_background_span(
+                        "core_agent.task.execute", linked_context
+                    )
                 )
-                if self.telemetry
-                else None
-            )
             context = span if span else _NullContext()
             with context:
                 task.state = "working"

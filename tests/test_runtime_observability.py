@@ -790,6 +790,27 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(linked.links[0].trace_id, submission.context.trace_id)
         linked.end()
 
+    def test_subagent_task_continues_parent_trace(self):
+        exporter = RecordingExporter()
+        telemetry = Telemetry(exporter)
+        scheduler = TaskScheduler(telemetry=telemetry)
+        with telemetry.span("core_agent.parent") as parent:
+            task = scheduler.start(
+                lambda: "child-ok",
+                owner_id="parent-run",
+                kind="subagent",
+                continue_trace=True,
+            )
+        scheduler.wait(task.id, timeout=1, owner_id="parent-run")
+        child = next(
+            span
+            for span in exporter.spans
+            if span.name == "core_agent.task.execute"
+        )
+        self.assertEqual(child.context.trace_id, parent.context.trace_id)
+        self.assertEqual(child.links, ())
+        scheduler.close()
+
     def test_background_span_without_submission_context_is_valid(self):
         exporter = RecordingExporter()
         telemetry = Telemetry(exporter)

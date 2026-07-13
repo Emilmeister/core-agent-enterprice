@@ -48,9 +48,11 @@ Core Agent MUST использовать W3C Trace Context через OTel propa
 
 Incoming A2A request span завершается после ответа transport-а и не остаётся открытым на часы. Background Task создаёт новый execution trace со `Span Link` на submission span и attributes A2A task/context IDs.
 
-Сабагент, indexing job и notification delivery используют тот же принцип:
+Сабагент сохраняет trace parent-а, чтобы Phoenix и другой trace UI показывали child `core_agent.task.execute` внутри дерева main agent. Submission/tool span является его прямым parent даже при asynchronous execution; durable recovery сохраняет только W3C trace/span IDs и продолжает тот же trace без authorization/baggage.
 
-- synchronous child operation MAY быть child span;
+Остальные independently scheduled indexing jobs и notification deliveries используют trace links:
+
+- child-agent Task MUST быть child span в trace parent-а;
 - independently scheduled/durable operation получает новый trace + link;
 - retry создаёт новый attempt span, связанный с logical task/tool call;
 - polling/subscription span не становится parent всей Task;
