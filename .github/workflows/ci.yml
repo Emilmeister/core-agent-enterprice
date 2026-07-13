@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_DB: core_agent
           POSTGRES_USER: postgres
@@ -42,6 +42,10 @@ jobs:
       - run: uv run python -m unittest discover -s tests -v
       - run: uv build --no-sources
       - run: docker build -t core-agent:ci .
+      - run: test "$(docker image inspect core-agent:ci --format '{{.Config.User}}')" = agent
+      - run: >-
+          docker run --rm --entrypoint python core-agent:ci
+          -c "import core_agent, memory_service; print('image-smoke-ok')"
       - run: >-
           POSTGRES_DB=core_agent POSTGRES_USER=core_agent POSTGRES_PASSWORD=test
           MODEL_API_FORMAT=openai MODEL_BASE_URL=http://model.invalid/v1
