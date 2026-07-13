@@ -71,6 +71,12 @@ Primary agent при создании сабагента MUST передать �
 
 Если parent не перечислил необходимую capability, child возвращает `blocked`/`input-required`; он не расширяет allowlist самостоятельно.
 
+## Глубина делегирования
+
+Main agent имеет depth `0`, созданный им child — depth `1`, а child этого агента — depth `2`. V1 разрешает оба уровня сабагентов, но depth `2` является hard platform maximum: агент этого уровня не может создать ещё одного child, даже если `core.delegate` присутствует в его allowlist. Такая попытка завершается `BUDGET_EXCEEDED` до создания Task.
+
+AgentConfig MAY понизить maximum depth до `0` или `1`, но не может повысить его выше `2`. Этот предел применяется ко всей цепочке и сохраняется в child EffectiveConfig; delegation contract не может его расширить.
+
 ## Общая память
 
 Core Agent не имеет собственной общей memory. Main и child разделяют память, только если parent явно перечислил в delegation contract тот же Memory MCP server и namespace:

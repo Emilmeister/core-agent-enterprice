@@ -94,6 +94,62 @@ class ModelHandler(BaseHTTPRequestHandler):
             message = _text(
                 "skill-e2e-ok" if self.skill_instructions_seen else "missing-skill"
             )
+        elif "DEPTH_TWO_CHILD_E2E" in context:
+            message = _tool(
+                body,
+                "core.delegate",
+                {
+                    "instruction": "DEPTH_THREE_MUST_NOT_START",
+                    "tools": [],
+                    "mcp": {},
+                    "skills": [],
+                    "budget": {"turns": 1, "tool_calls": 1},
+                },
+            )
+        elif "DEPTH_ONE_CHILD_E2E" in context:
+            task_ids = re.findall(r'"task_id": "([^"]+)"', context)
+            if not task_ids:
+                message = _tool(
+                    body,
+                    "core.delegate",
+                    {
+                        "instruction": "DEPTH_TWO_CHILD_E2E",
+                        "tools": ["core.delegate"],
+                        "mcp": {},
+                        "skills": [],
+                        "budget": {"turns": 2, "tool_calls": 1},
+                    },
+                )
+            elif "BUDGET_EXCEEDED" not in context:
+                message = _tool(
+                    body,
+                    "core.task.wait",
+                    {"task_id": task_ids[-1], "timeout": 2},
+                )
+            else:
+                message = _text("depth-two-ok")
+        elif "DEPTH_TWO_E2E" in context:
+            task_ids = re.findall(r'"task_id": "([^"]+)"', context)
+            if not task_ids:
+                message = _tool(
+                    body,
+                    "core.delegate",
+                    {
+                        "instruction": "DEPTH_ONE_CHILD_E2E",
+                        "tools": ["core.delegate", "core.task.wait"],
+                        "mcp": {},
+                        "skills": [],
+                        "budget": {"turns": 4, "tool_calls": 3},
+                    },
+                )
+            elif "depth-two-ok" not in context:
+                message = _tool(
+                    body,
+                    "core.task.wait",
+                    {"task_id": task_ids[-1], "timeout": 2},
+                )
+            else:
+                message = _text("depth-two-e2e-ok")
         elif "CHILD_MEMORY_E2E" in context:
             self.child_memory_catalogs.append(wire_names)
             message = (
@@ -711,6 +767,9 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             all(catalog == {terminal_name} for catalog in ModelHandler.child_catalogs)
         )
         self.assertGreaterEqual(len(set(ModelHandler.workspaces)), 2)
+
+    async def test_child_can_delegate_one_more_level_but_grandchild_cannot(self):
+        self.assertEqual(await self._send("DEPTH_TWO_E2E"), "depth-two-e2e-ok")
 
     async def test_child_receives_only_explicit_shared_memory_tool(self):
         ModelHandler.child_memory_catalogs.clear()

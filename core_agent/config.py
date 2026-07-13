@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from .errors import CoreError
 
 
+MAX_SUBAGENT_DEPTH = 2
+
+
 @dataclass(frozen=True)
 class RunRequest:
     prompt: str
@@ -84,6 +87,16 @@ class AgentConfig:
         features = raw.get("features", {})
         if features.get("delegation") and not features.get("background_tasks"):
             raise CoreError("CONFIG_CONFLICT")
+        budgets = raw.get("budgets", {})
+        if not isinstance(budgets, dict):
+            raise CoreError("CONFIG_INVALID")
+        depth = budgets.get("depth", MAX_SUBAGENT_DEPTH)
+        if (
+            not isinstance(depth, int)
+            or isinstance(depth, bool)
+            or not 0 <= depth <= MAX_SUBAGENT_DEPTH
+        ):
+            raise CoreError("CONFIG_INVALID")
         return cls(raw)
 
     def to_dict(self):

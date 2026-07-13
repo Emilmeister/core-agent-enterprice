@@ -357,6 +357,19 @@ class ConfigurationTests(unittest.TestCase):
             AgentConfig.from_dict(raw)
         self.assertEqual(caught.exception.code, "CONFIG_CONFLICT")
 
+    def test_subagent_depth_can_be_lowered_but_never_exceeds_two(self):
+        for depth in (0, 1, 2):
+            raw = agent_config().to_dict()
+            raw["budgets"] = {"depth": depth}
+            self.assertEqual(AgentConfig.from_dict(raw).budgets["depth"], depth)
+
+        for depth in (-1, 3, True, "2"):
+            raw = agent_config().to_dict()
+            raw["budgets"] = {"depth": depth}
+            with self.subTest(depth=depth), self.assertRaises(CoreError) as caught:
+                AgentConfig.from_dict(raw)
+            self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+
     def test_disabled_tool_is_not_discoverable_and_stale_call_is_denied(self):
         raw = agent_config().to_dict()
         raw["tools"]["builtins"]["deny"] = ["core.terminal.exec"]

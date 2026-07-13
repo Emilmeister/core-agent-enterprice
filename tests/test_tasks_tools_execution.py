@@ -1,5 +1,6 @@
 import threading
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 from core_agent.approvals import ApproveAllControlPlane
@@ -251,8 +252,20 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(child.memory_namespace, "session/context-1")
 
     def test_depth_and_fanout_are_enforced(self):
+        child = derive_child_capabilities(
+            self.parent, self.contract(), current_depth=1
+        )
+        self.assertEqual(child.budgets["depth"], 2)
+
         with self.assertRaises(CoreError) as caught:
             derive_child_capabilities(self.parent, self.contract(), current_depth=2)
+        self.assertEqual(caught.exception.code, "BUDGET_EXCEEDED")
+
+        uncapped = replace(
+            self.parent, budgets={**self.parent.budgets, "depth": 99}
+        )
+        with self.assertRaises(CoreError) as caught:
+            derive_child_capabilities(uncapped, self.contract(), current_depth=2)
         self.assertEqual(caught.exception.code, "BUDGET_EXCEEDED")
 
     def test_child_result_must_match_declared_schema(self):

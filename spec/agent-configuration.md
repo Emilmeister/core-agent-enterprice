@@ -60,6 +60,8 @@ execution:
   environment_profile: local-pty
 observability:
   otel_profile: production
+budgets:
+  depth: 2
 ```
 
 ## Production persistence
@@ -123,6 +125,8 @@ Config validation MUST обнаруживать как минимум:
 - advertised A2A capability без runtime/transport implementation;
 - tool allow pattern, полностью перекрытый deny policy;
 - skill/MCP requirement, несовместимый с execution/network profile.
+
+`budgets.depth` задаёт максимальную глубину сабагентов относительно main agent с depth `0`. Допустимы только целые значения `0`, `1` и `2`; hard platform maximum `2` не может быть увеличен через deployment environment, AgentConfig или delegation contract.
 
 ## MCP policy и roles
 

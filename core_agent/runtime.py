@@ -7,7 +7,12 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 import json
 
-from .config import AgentConfig, RunRequest, compile_effective_config
+from .config import (
+    MAX_SUBAGENT_DEPTH,
+    AgentConfig,
+    RunRequest,
+    compile_effective_config,
+)
 from .context import (
     Compactor,
     ContextBudget,
@@ -1025,13 +1030,17 @@ class CoreAgent:
         parent_budget = {
             "turns": raw.get("budgets", {}).get("model_turns", 100),
             "tool_calls": raw.get("budgets", {}).get("tool_calls", 200),
-            "depth": raw.get("budgets", {}).get("depth", 3),
+            "depth": min(
+                raw.get("budgets", {}).get("depth", MAX_SUBAGENT_DEPTH),
+                MAX_SUBAGENT_DEPTH,
+            ),
             "fan_out": raw.get("budgets", {}).get("fan_out", 4),
         }
         scope = self._run_scopes.get(run_id, {})
+        if self.depth >= parent_budget["depth"]:
+            raise CoreError("BUDGET_EXCEEDED")
         if (
-            self.depth >= parent_budget["depth"]
-            or self.task_scheduler.count(
+            self.task_scheduler.count(
                 owner_id=run_id,
                 kind="subagent",
                 active_only=True,

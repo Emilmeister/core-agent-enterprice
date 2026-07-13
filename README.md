@@ -60,6 +60,8 @@ configuration. Generate it with
 `LOCAL_WORKSPACE_ROOT` must be a separate local ephemeral path used by active processes.
 `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` can remove individual terminal, task, delegation, or artifact
 tools; the resulting allowlist is reflected in both the Agent Card and every model tool catalog.
+`CORE_AGENT_MAX_DEPTH` may lower delegation depth to `0` or `1`; `2` is the hard maximum, allowing
+main → child → grandchild while rejecting any further delegation.
 Final A2A results and `core.artifact.put` content are stored as tenant-scoped, digest-verified blobs
 with PostgreSQL metadata. `ARTIFACT_MAX_BYTES` bounds each stored artifact.
 

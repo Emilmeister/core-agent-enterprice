@@ -14,7 +14,7 @@ from .a2a_sdk import build_starlette_app
 from .approvals import ApprovalManager, ApproveAllControlPlane
 from .artifacts import InMemoryArtifactStore, PostgresArtifactStore
 from .audit import InMemoryAuditLog
-from .config import AgentConfig, PlatformConfig
+from .config import MAX_SUBAGENT_DEPTH, AgentConfig, PlatformConfig
 from .durability import CheckpointStore, InMemoryEventStore
 from .database import (
     PostgresAuditLog,
@@ -246,7 +246,9 @@ def _agent(model, mcp_connector=None, *, state=None):
             "budgets": {
                 "model_turns": platform.max_model_turns,
                 "tool_calls": platform.max_tool_calls,
-                "depth": int(os.getenv("CORE_AGENT_MAX_DEPTH", "3")),
+                "depth": int(
+                    os.getenv("CORE_AGENT_MAX_DEPTH", str(MAX_SUBAGENT_DEPTH))
+                ),
                 "fan_out": int(os.getenv("CORE_AGENT_MAX_FAN_OUT", "4")),
             },
         }

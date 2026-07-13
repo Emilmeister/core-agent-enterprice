@@ -5,6 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from .config import MAX_SUBAGENT_DEPTH
 from .errors import CoreError
 
 
@@ -247,7 +248,8 @@ class DelegationContract:
 
 
 def derive_child_capabilities(parent, contract, *, current_depth):
-    if current_depth >= parent.budgets.get("depth", 0):
+    depth_limit = min(parent.budgets.get("depth", 0), MAX_SUBAGENT_DEPTH)
+    if current_depth >= depth_limit:
         raise CoreError("BUDGET_EXCEEDED")
     if not set(contract.tools) <= set(parent.tools) or not set(contract.skills) <= set(
         parent.skills
