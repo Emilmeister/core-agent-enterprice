@@ -180,7 +180,12 @@ class DelegationTests(unittest.TestCase):
     def setUp(self):
         self.parent = CapabilitySet(
             tools=frozenset(
-                {"core.terminal.exec", "core.fs.apply_patch", "core.task.wait"}
+                {
+                    "core.terminal.exec",
+                    "core.fs.apply_patch",
+                    "core.task.wait",
+                    "core.delegate",
+                }
             ),
             mcp={
                 "repo": frozenset({"search", "read_file"}),
@@ -256,6 +261,18 @@ class DelegationTests(unittest.TestCase):
             self.parent, self.contract(), current_depth=1
         )
         self.assertEqual(child.budgets["depth"], 2)
+        first_level = derive_child_capabilities(
+            self.parent,
+            self.contract(tools=["core.delegate"]),
+            current_depth=0,
+        )
+        second_level = derive_child_capabilities(
+            self.parent,
+            self.contract(tools=["core.delegate"]),
+            current_depth=1,
+        )
+        self.assertIn("core.delegate", first_level.tools)
+        self.assertNotIn("core.delegate", second_level.tools)
 
         with self.assertRaises(CoreError) as caught:
             derive_child_capabilities(self.parent, self.contract(), current_depth=2)

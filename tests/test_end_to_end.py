@@ -58,6 +58,8 @@ def _text(value):
 class ModelHandler(BaseHTTPRequestHandler):
     child_catalogs = []
     child_memory_catalogs = []
+    depth_two_catalogs = []
+    depth_two_instructions = []
     workspaces = []
     skill_instructions_seen = False
 
@@ -95,17 +97,9 @@ class ModelHandler(BaseHTTPRequestHandler):
                 "skill-e2e-ok" if self.skill_instructions_seen else "missing-skill"
             )
         elif "DEPTH_TWO_CHILD_E2E" in context:
-            message = _tool(
-                body,
-                "core.delegate",
-                {
-                    "instruction": "DEPTH_THREE_MUST_NOT_START",
-                    "tools": [],
-                    "mcp": {},
-                    "skills": [],
-                    "budget": {"turns": 1, "tool_calls": 1},
-                },
-            )
+            self.depth_two_catalogs.append(wire_names)
+            self.depth_two_instructions.append(body["messages"][0]["content"])
+            message = _text("depth-two-no-delegation-ok")
         elif "DEPTH_ONE_CHILD_E2E" in context:
             task_ids = re.findall(r'"task_id": "([^"]+)"', context)
             if not task_ids:
@@ -120,7 +114,7 @@ class ModelHandler(BaseHTTPRequestHandler):
                         "budget": {"turns": 2, "tool_calls": 1},
                     },
                 )
-            elif "BUDGET_EXCEEDED" not in context:
+            elif "depth-two-no-delegation-ok" not in context:
                 message = _tool(
                     body,
                     "core.task.wait",
@@ -769,7 +763,21 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(set(ModelHandler.workspaces)), 2)
 
     async def test_child_can_delegate_one_more_level_but_grandchild_cannot(self):
+        ModelHandler.depth_two_catalogs.clear()
+        ModelHandler.depth_two_instructions.clear()
         self.assertEqual(await self._send("DEPTH_TWO_E2E"), "depth-two-e2e-ok")
+        delegate = CompatibleHttpModel._wire_name("core.delegate")
+        self.assertTrue(ModelHandler.depth_two_catalogs)
+        self.assertTrue(
+            all(delegate not in catalog for catalog in ModelHandler.depth_two_catalogs)
+        )
+        self.assertTrue(
+            all(
+                "complete the task directly and do not try to create another agent"
+                in instructions
+                for instructions in ModelHandler.depth_two_instructions
+            )
+        )
 
     async def test_child_receives_only_explicit_shared_memory_tool(self):
         ModelHandler.child_memory_catalogs.clear()

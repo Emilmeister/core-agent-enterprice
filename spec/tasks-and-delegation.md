@@ -73,7 +73,9 @@ Primary agent при создании сабагента MUST передать �
 
 ## Глубина делегирования
 
-Main agent имеет depth `0`, созданный им child — depth `1`, а child этого агента — depth `2`. V1 разрешает оба уровня сабагентов, но depth `2` является hard platform maximum: агент этого уровня не может создать ещё одного child, даже если `core.delegate` присутствует в его allowlist. Такая попытка завершается `BUDGET_EXCEEDED` до создания Task.
+Main agent имеет depth `0`, созданный им child — depth `1`, а child этого агента — depth `2`. V1 разрешает оба уровня сабагентов, но depth `2` является hard platform maximum. При создании агента depth `2` runtime MUST удалить `core.delegate` из его effective tool allowlist и model catalog, отключить delegation feature и добавить protected KernelInstructions о необходимости выполнить задачу без дальнейшего делегирования. Persisted child contract отражает уже суженный effective набор tools.
+
+Модель depth `2` не должна тратить turn на заведомо запрещённый вызов. Runtime guard всё равно MUST отклонять stale/replayed `core.delegate` с `BUDGET_EXCEEDED` до создания Task.
 
 AgentConfig MAY понизить maximum depth до `0` или `1`, но не может повысить его выше `2`. Этот предел применяется ко всей цепочке и сохраняется в child EffectiveConfig; delegation contract не может его расширить.
 

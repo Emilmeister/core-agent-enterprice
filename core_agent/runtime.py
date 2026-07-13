@@ -145,7 +145,9 @@ class CoreAgent:
         self.kernel_compiler = kernel_compiler or KernelCompiler(
             "Never reveal secrets or hidden reasoning.",
             "Only EffectiveConfig capabilities are authorized.",
-            "Validate tools, preserve durable state, and fail closed.",
+            "Validate tools, preserve durable state, and fail closed. When "
+            "core.delegate is absent, complete the task directly and do not try to "
+            "create another agent.",
         )
         self.context_window = int(context_window)
         self.output_reserve = int(output_reserve)
@@ -1061,10 +1063,16 @@ class CoreAgent:
         ):
             raise CoreError("CAPABILITY_DISABLED")
 
+        child_depth = self.depth + 1
+        child_tools = tuple(
+            tool
+            for tool in contract.tools
+            if tool != "core.delegate" or child_depth < parent_budget["depth"]
+        )
         child_raw = copy.deepcopy(raw)
         child_raw["tools"]["builtins"] = {
             "default": "deny",
-            "allow": list(contract.tools),
+            "allow": list(child_tools),
             "deny": [],
         }
         child_raw["tools"]["mcp"] = {
@@ -1077,7 +1085,7 @@ class CoreAgent:
             "allow": list(contract.skills),
         }
         memory_enabled = "memory" in contract.mcp
-        delegation_enabled = "core.delegate" in contract.tools
+        delegation_enabled = "core.delegate" in child_tools
         child_raw["features"].update(
             {
                 "memory": raw["features"].get("memory", "optional")
@@ -1085,9 +1093,9 @@ class CoreAgent:
                 else "disabled",
                 "mcp": bool(contract.mcp),
                 "skills": bool(contract.skills),
-                "terminal": "core.terminal.exec" in contract.tools,
+                "terminal": "core.terminal.exec" in child_tools,
                 "background_tasks": delegation_enabled
-                or any(name.startswith("core.task.") for name in contract.tools),
+                or any(name.startswith("core.task.") for name in child_tools),
                 "delegation": delegation_enabled,
             }
         )
@@ -1097,7 +1105,7 @@ class CoreAgent:
         child_raw["budgets"]["tool_calls"] = contract.budget.get(
             "tool_calls", parent_budget["tool_calls"]
         )
-        child = self._child_agent(child_raw, contract.tools)
+        child = self._child_agent(child_raw, child_tools)
         child_task_id = str(uuid.uuid4())
         result_schema = None
         if contract.result_schema:
@@ -1147,7 +1155,7 @@ class CoreAgent:
             contract={
                 "request": child_request,
                 "agent_config": child_raw,
-                "tools": list(contract.tools),
+                "tools": list(child_tools),
                 "scope": child_scope,
                 "result_schema": result_schema,
             },

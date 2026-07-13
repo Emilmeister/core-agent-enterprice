@@ -30,7 +30,7 @@
 | BGT-01 | background Tasks и mailbox durable, versioned, at-least-once | PostgreSQL recovery/mailbox test | implemented |
 | BGT-02 | passive wait освобождает worker и cancel handles process tree | scheduler and PTY process-group cancel tests | implemented |
 | SUB-01 | child является durable Task с exact capabilities/shared memory policy | delegation and child-memory E2E | implemented |
-| SUB-02 | общий parent budget, hard depth `2`/fan-out и schema-valid result | two-level delegation E2E, atomic budget ledger/fan-out/result-schema tests | implemented |
+| SUB-02 | общий parent budget, hard depth `2`/fan-out и schema-valid result | depth-2 catalog/kernel E2E, stale-call guard, atomic budget/fan-out/schema tests | implemented |
 | TER-01 | owned PTY/process groups/workspaces и bounded output | local terminal integration suite | implemented |
 | TER-02 | immutable base snapshot, conflict-aware merge и S3 manifest | content-addressed snapshot/merge tests | implemented |
 | HITL-01 | private authority, frozen digest и single reservation | approval digest/race suite | implemented |

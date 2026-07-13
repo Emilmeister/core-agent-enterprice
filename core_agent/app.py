@@ -445,7 +445,9 @@ def _agent(model, mcp_connector=None, *, state=None):
             "KERNEL v1: Keep workflow, task, approval, checkpoint, notification, audit, "
             "and artifact identifiers durable. Never retry an ambiguous mutating side "
             "effect. Delegate only exact tools, MCP tools, skills, memory policy, budget, "
-            "and result schema. Background work must be cancelable and observable."
+            "and result schema. When core.delegate is absent, complete the task directly "
+            "and do not try to create another agent. Background work must be cancelable "
+            "and observable."
         ),
         capability_policies={
             "memory": (

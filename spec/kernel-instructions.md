@@ -19,6 +19,7 @@ Prompt-only enforcement недостаточен: даже ошибочная м
 - compaction threshold и pinned context;
 - tool schema validation и risk assessment;
 - delegation contract, tool/skill allowlists и child budgets;
+- если следующий delegation level запрещён, явное указание работать без новых сабагентов при отсутствии `core.delegate` в model catalog;
 - background task lifecycle, cancellation, notifications и passive wait;
 - durable checkpoints и защита от duplicate side effects;
 - audit, redaction и OpenTelemetry instrumentation;

@@ -224,6 +224,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("reasoning", result.to_dict())
         agent.close()
 
+    def test_stale_delegate_call_at_maximum_depth_creates_no_task(self):
+        model = ScriptedModel([ModelResponse(message="must not run")])
+        agent = make_agent(model, memory="disabled", depth=2)
+        request = run_request(memory=False)
+        _raw, _discovered, effective = agent._resolve_capabilities(request)
+        run_id = "stale-depth-two"
+        agent._run_contexts[run_id] = (request, effective)
+        with self.assertRaises(CoreError) as caught:
+            agent._delegate(
+                {
+                    "instruction": "must not start",
+                    "tools": [],
+                    "mcp": {},
+                    "skills": [],
+                    "budget": {"turns": 1, "tool_calls": 1},
+                },
+                run_id,
+            )
+        self.assertEqual(caught.exception.code, "BUDGET_EXCEEDED")
+        self.assertEqual(agent.task_scheduler.list(owner_id=run_id), ())
+        self.assertEqual(model.calls, ())
+        agent.close()
+
     def test_memory_disabled_never_connects_or_discovers_memory(self):
         connector = InMemoryMcpConnector(
             catalogs={"memory": {"search": {"type": "object"}}},

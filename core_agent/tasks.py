@@ -265,8 +265,13 @@ def derive_child_capabilities(parent, contract, *, current_depth):
         if value > parent.budgets.get(key, value):
             raise CoreError("CAPABILITY_DISABLED")
         budgets[key] = value
+    tools = frozenset(
+        tool
+        for tool in contract.tools
+        if tool != "core.delegate" or current_depth + 1 < depth_limit
+    )
     return CapabilitySet(
-        frozenset(contract.tools),
+        tools,
         mcp,
         frozenset(contract.skills),
         parent.features,
