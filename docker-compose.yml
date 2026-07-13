@@ -58,7 +58,7 @@ services:
     environment:
       CORE_AGENT_ENVIRONMENT: development
       CORE_AGENT_NAME: ${CORE_AGENT_NAME:-core-agent}
-      CORE_AGENT_PROFILE: ${CORE_AGENT_PROFILE:-Complete the user's task using available tools.}
+      CORE_AGENT_PROFILE: ${CORE_AGENT_PROFILE:-}
       CORE_AGENT_STATE_BACKEND: postgres
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
       DATABASE_AUTO_MIGRATE: "false"

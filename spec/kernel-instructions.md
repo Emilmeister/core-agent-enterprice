@@ -18,7 +18,7 @@ Prompt-only enforcement недостаточен: даже ошибочная м
 - правила включённых trusted capability profiles, включая Memory MCP authoring contract;
 - compaction threshold и pinned context;
 - tool schema validation и risk assessment;
-- delegation contract, tool/skill allowlists и child budgets;
+- delegation contract, minimum sufficient tool/skill allowlists, child budgets и bounded autonomy: точный outcome/scope при свободном выборе child-ом метода внутри выданных границ;
 - если следующий delegation level запрещён, явное указание работать без новых сабагентов при отсутствии `core.delegate` в model catalog;
 - background task lifecycle, cancellation, notifications и passive wait;
 - durable checkpoints и защита от duplicate side effects;
@@ -44,6 +44,14 @@ Agent profile, user prompt, skill, MCP response, memory file или tool output 
 
 Нижний уровень не отменяет верхний. Явный user prompt имеет приоритет над skill только внутри разрешённой kernel/host policy.
 
+User Message передаётся модели отдельной user-role записью и MUST NOT копироваться в system instructions. AgentProfilePrompt является optional: при отсутствии явной роли его default пуст и segment не добавляется.
+
+## Выбор инструментов
+
+Пользователь не обязан называть tool явно. Agent выбирает capability по смыслу задачи, но не вызывает tool, который не улучшает корректность результата. Stable knowledge и pure language work выполняются напрямую; runtime-dependent, accuracy-sensitive, durable или stateful result проверяется через самый узкий доступный authoritative tool. Если подходящей capability нет, agent сообщает, что значение не удалось проверить, а не выдумывает его.
+
+Tool-specific lifecycle не дублируется целиком в base kernel: он находится в conditional capability policy и model-facing description зарегистрированного tool. Отключённая capability не добавляет свой policy text.
+
 ## AgentProfilePrompt
 
 AgentProfilePrompt MAY задавать:
@@ -53,6 +61,8 @@ AgentProfilePrompt MAY задавать:
 - guidance по выбору переданных MCP/skills;
 - предпочтительную стратегию исследования или коммуникации;
 - дополнительные консервативные ограничения.
+
+Платформа MAY оставить AgentProfilePrompt пустым. Generic instruction вроде `Complete the user's task using available tools.` не является обязательным default: цель уже приходит отдельным user Message.
 
 Он MUST NOT:
 

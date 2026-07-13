@@ -171,6 +171,21 @@ class KernelTests(unittest.TestCase):
         self.assertNotIn("MEMORY RULES", compiled.text)
         self.assertIn("TASK RULES", compiled.text)
 
+    def test_empty_optional_instruction_layers_are_omitted(self):
+        compiler = KernelCompiler("SAFETY", "HOST", "KERNEL")
+        compiled = compiler.compile(
+            enabled_capabilities=set(), agent_profile="", user_prompt=""
+        )
+        self.assertEqual(
+            [segment.source for segment in compiled.segments],
+            [
+                InstructionSource.SAFETY,
+                InstructionSource.HOST_POLICY,
+                InstructionSource.BASE_KERNEL,
+            ],
+        )
+        self.assertEqual(compiled.text, "SAFETY\n\nHOST\n\nKERNEL")
+
     def test_raw_reasoning_is_removed_from_public_data(self):
         compiler = KernelCompiler("SAFETY", "HOST", "KERNEL")
         public = compiler.public_model_result(

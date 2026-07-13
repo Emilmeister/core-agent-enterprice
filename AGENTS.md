@@ -202,6 +202,8 @@ Target spec может описывать больше текущего runtime.
   отклоняется при dispatch. Prompt или stale tool call не расширяет policy.
 - Safety/host/kernel/capability instructions нельзя заменить через
   `CORE_AGENT_PROFILE`, prompt, skill, MCP, memory или tool output.
+- `CORE_AGENT_PROFILE` optional и по умолчанию пуст; user request передаётся
+  отдельным user Message/context item, а не generic system instruction.
 - Prompt, profile, skill, MCP, memory, peer-agent, file, terminal и network
   content всегда считаются недоверенными данными.
 - Tenant устанавливается только authenticated transport context. Stores,
@@ -289,6 +291,12 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
 - Depth `2` не получает `core.delegate` ни в instructions, ни в catalog/runtime.
 - Delegation передаёт одну узкую instruction, exact tools/MCP/skills allowlists,
   положительный budget и optional `artifact://` result schema.
+- Parent делегирует coherent outcome, scope, deliverable и acceptance criteria,
+  а не mechanical microsteps. Он выбирает minimum sufficient capability set;
+  runtime предоставляет exactly этот set.
+- Внутри objective/scope child самостоятельно выбирает strategy, sequencing и
+  delegated tools. Procedure задаётся только для safety, correctness,
+  reproducibility или policy; assumptions не подменяют tenant/approval/scope.
 - Child не расширяет capabilities, tenant или parent budget.
 - Joined `core.delegate` по умолчанию требует использовать child result и не
   повторять ту же работу. `background: true` разрешает main продолжать только

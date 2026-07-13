@@ -60,8 +60,12 @@ class KernelCompiler:
             if name in self.capability_policies
         ]
         segments += [
-            InstructionSegment(InstructionSource.AGENT_PROFILE, agent_profile),
-            InstructionSegment(InstructionSource.USER, user_prompt),
+            InstructionSegment(source, text)
+            for source, text in (
+                (InstructionSource.AGENT_PROFILE, agent_profile),
+                (InstructionSource.USER, user_prompt),
+            )
+            if text
         ]
         segments += [
             InstructionSegment(InstructionSource.SKILL, value)

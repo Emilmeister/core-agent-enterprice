@@ -23,10 +23,10 @@ Streamable HTTP Memory MCP, Markdown indexing/NER/graph search, and explicit ski
 ### Runtime prompt
 
 The replaceable role/profile prompt is `CORE_AGENT_PROFILE`; local Compose reads it from `.env`.
-If it is absent, the exact default is `Complete the user's task using available tools.`. This is
-only the `AgentProfilePrompt`: the effective model instructions are compiled for every run from
-the protected safety, host-policy, kernel and enabled-capability layers, followed by this profile
-and selected skills. The default and protected layers are assembled in
+It is optional and empty by default. The actual request is sent separately as a user Message and
+is never copied into system instructions. Effective model instructions are compiled for every run
+from the protected safety, host-policy, kernel and enabled-capability layers, followed by a
+non-empty profile and selected skills. The protected layers are assembled in
 [`core_agent/app.py`](core_agent/app.py), compiled in [`core_agent/runtime.py`](core_agent/runtime.py),
 and specified in [`spec/kernel-instructions.md`](spec/kernel-instructions.md). The protected layers
 cannot be replaced through `.env`, A2A input, MCP, memory, skills, or tool output.

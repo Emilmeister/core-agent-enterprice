@@ -19,6 +19,7 @@
 | CFG-02 | disabled capability отсутствует в card/catalog и stale call denied | built-in allowlist/runtime-mode card and model tests | implemented |
 | KRN-01 | versioned kernel отдельно от profile, runtime enforcement | protected kernel persistence test | implemented |
 | KRN-02 | child наследует kernel и не расширяет policy | delegation E2E and exact catalog tests | implemented |
+| KRN-03 | пустой profile не дублирует user prompt; conditional prompt/tool guidance не обещает отсутствующие capabilities | kernel and built-in description contract tests | implemented |
 | RUN-01 | сериализуемая state machine и irreversible terminal states | workflow transition suite | implemented |
 | RUN-02 | lease, checkpoint replay и recovery безопасной границы | PostgreSQL process-state-loss tests | implemented |
 | RUN-03 | ambiguous side effect переходит в reconciliation без retry | dispatched-side-effect restart chaos test | implemented |
@@ -31,6 +32,7 @@
 | BGT-02 | passive wait освобождает worker и cancel handles process tree | scheduler and PTY process-group cancel tests | implemented |
 | SUB-01 | child является durable Task с exact capabilities/shared memory policy | delegation and child-memory E2E | implemented |
 | SUB-02 | общий parent budget, hard depth `2`/fan-out и schema-valid result | depth-2 catalog/kernel E2E, stale-call guard, atomic budget/fan-out/schema tests | implemented |
+| SUB-03 | outcome contract сохраняет bounded method autonomy при minimum sufficient/exact capabilities | delegation kernel/description contract tests | implemented |
 | TER-01 | owned PTY/process groups/workspaces и bounded output | local terminal integration suite | implemented |
 | TER-02 | immutable base snapshot, conflict-aware merge и S3 manifest | content-addressed snapshot/merge tests | implemented |
 | PY-01 | bounded Python process вызывает exact built-in/MCP tools через policy/budget/audit/OTel broker только без HITL | Python broker E2E, mode gate and process failure tests | implemented |

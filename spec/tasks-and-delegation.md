@@ -61,9 +61,15 @@ Primary agent при создании сабагента MUST передать �
 }
 ```
 
+Parent делегирует coherent outcome, а не заранее придуманный список механических шагов. Instruction задаёт objective, только необходимый context, scope boundaries, deliverable, acceptance criteria и важные constraints/reserved actions. Конкретную процедуру следует предписывать только там, где она обязательна для safety, correctness, reproducibility или policy compliance.
+
+Parent выбирает minimum sufficient tools/MCP/skills и budget для результата; runtime предоставляет child ровно этот набор и не больше. Внутри objective, scope и выданных capabilities child самостоятельно выбирает strategy, sequencing, intermediate analysis и используемые delegated tools. Exactness относится к permissions, side effects, boundaries, budget и result requirements, но не к micromanagement внутреннего плана.
+
+Child MAY разрешить небольшую безопасную неоднозначность разумным assumption и обязан перечислить его в результате. Child MUST остановиться с blocker, если продолжение расширит scope, потребует невыданную capability, авторизует новый side effect или создаст существенный риск неверного результата. Assumption никогда не подменяет tenant, authorization, approval или product decision.
+
 Требования:
 
-- `instruction` содержит одну узкую цель, ограничения и success criteria;
+- `instruction` содержит один coherent outcome, scope, deliverable, constraints и success criteria без необязательного пошагового плана;
 - `tools`, `skills` и server-scoped `mcp` являются allowlists, а не рекомендациями;
 - `budget` содержит только положительные integer-поля `turns` и/или `tool_calls`; aliases вроде `max_steps` запрещены schema;
 - `result_schema`, если задана, является `artifact://...` ссылкой на заранее сохранённую JSON Schema, а не inline JSON string;

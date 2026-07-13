@@ -139,6 +139,57 @@ class ProductionConfigurationTests(unittest.TestCase):
         finally:
             app.state.close()
 
+    def test_default_prompt_and_builtin_descriptions_match_runtime_contract(self):
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "prompt-contract-model"
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_STATE_BACKEND": "test",
+                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+            },
+            clear=True,
+        ):
+            app = create_app(model=model)
+        try:
+            prompt = "Actual request stays in the user context."
+            app.state.core_agent.run(
+                {"prompt": prompt, "mcp": [], "skills": []}
+            )
+            call = model.calls[0]
+            self.assertIn(prompt, call.context)
+            self.assertNotIn(prompt, call.instructions)
+            self.assertNotIn(
+                "Complete the user's task using available tools.", call.instructions
+            )
+            self.assertIn("Delegate a coherent outcome", call.instructions)
+            self.assertNotIn("PYTHON:", call.instructions)
+
+            registry = app.state.core_agent.tool_runtime.registry
+            delegate = registry.get("core.delegate").description
+            self.assertIn("coherent outcome", delegate)
+            self.assertIn("minimum sufficient capabilities", delegate)
+            self.assertIn("child receives exactly that set", delegate)
+            self.assertIn("independently chooses its method", delegate)
+            self.assertNotIn("exactly once", delegate)
+            self.assertIn(
+                "non-task, non-delegation, non-Python",
+                registry.get("core.task.start").description,
+            )
+            self.assertIn(
+                "timeout returns the current snapshot",
+                registry.get("core.task.wait").description,
+            )
+            self.assertIn(
+                "tenant and effective scope",
+                registry.get("core.artifact.get").description,
+            )
+            python = registry.get("core.python.exec").description
+            self.assertIn("datetime.now().astimezone()", python)
+            self.assertIn("not an OS sandbox", python)
+        finally:
+            app.state.close()
+
     def test_without_terminal_mode_is_a_capability_ceiling(self):
         model = ScriptedModel([ModelResponse(message="ok")])
         model.model = "without-terminal-model"

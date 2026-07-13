@@ -8,14 +8,14 @@ SPEC_ROOT = Path(__file__).resolve().parents[1] / "spec"
 EXPECTED_SHA256 = {
     "README.md": "79192f747cd838d45b0b363e7560a63554d06d6fccd9a8c06ef6cef3dc51ffb2",
     "a2a-protocol.md": "66f18d60f946b0c98cb4968228c9d18e44aaec5ab18ac0627f7ac2b60b4869d9",
-    "acceptance.md": "6aeb288ec0180da20c1f7ee8a86e964211f9c773f08af73925ec19c6a8e6e9eb",
-    "agent-configuration.md": "793e91a4eb64a476f005d39f46cbeddb75c2eff313df0cc2d618b84888f8e1ba",
+    "acceptance.md": "71c847d8b61353a5ae35f65864f7975a6048f249a60371ab104aad1d5aa75d54",
+    "agent-configuration.md": "8d0cc995abe753c21bdc73c2883b8d4dc2108ee6788b9d6149b219ae655013eb",
     "architecture.md": "9dacc30f3d3a7ec8f228dec240829c05684cafb3742aa07720e107a14669816e",
     "context.md": "c07d21e77d2fc719e4d1e22b4d9583055abbbef4d8ffbbd79f1d0d36d33cde21",
     "development-process.md": "3f0c3cd6881394705a921bbd767efddc56d5290c259b7ca9312eca13dc05a4c9",
     "execution-environment.md": "41d1480f00311afb6a31dc14cd1496a78f8b4eab0bcac019c6452e2ab0efbd28",
-    "implementation-status.md": "aa1e2589860be84a704d3f7b1fe5e60d333c46a4819d6553767ca6ce2759475b",
-    "kernel-instructions.md": "c6521b51a7d10bce4e6697c82736bb09d6b75b7ce7ad48fafd0ce18889530454",
+    "implementation-status.md": "fedbf6ca644d1b7ad1ee7cc83f65bb1efd970d33324557839ab9d6cdf33c18e2",
+    "kernel-instructions.md": "8470ab3d96ca5a88ad12ea10b3b5c3cbf6451c72f6f4bcc2611556359687ca9f",
     "local-operator-hitl.md": "0b6ae37fb7f062bd83b380e74e580700baee28c9a73118a57e536537ac091e4f",
     "memory-service.md": "f27d9ec86866bf88de1a04924307c175f362983f39674e1c09aead057afb90d4",
     "observability.md": "a373baa6899d21b3b7a1d9a148e285b3921b4ce1ff658b15927decaf98ed479b",
@@ -25,8 +25,8 @@ EXPECTED_SHA256 = {
     "runtime.md": "c35bf56032682ad2b533af632f3243410f3128d3c26178f134d872fdbf5dc5ec",
     "security-and-reliability.md": "78438365e7f140c7372964f37070f37e7a75d8efb66a6251277740129c955df7",
     "skills.md": "7102b91a2f574ea5b75c02688a14ed5da7bbafc7d19b66b159330eae09600426",
-    "tasks-and-delegation.md": "54f97d24c0ef16807b96d4e0bef6e1b3d55b0e3bbbbf395f3f3c5331afc60d25",
-    "tools-and-approvals.md": "35883d35962ded2a0b380e8167821464802f7c504e17c6e6579084664deef405",
+    "tasks-and-delegation.md": "17557cb26dbd9cecfe03b0b65a275ecae5f146719dd89ff347d586abde2ca308",
+    "tools-and-approvals.md": "2cc1869e93d553781ef2c8f974a38bfd95c7da3e25bb6f89029dbf81e0c004e6",
 }
 
 

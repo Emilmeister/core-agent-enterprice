@@ -14,6 +14,8 @@ AgentConfig создаёт конкретный экземпляр Core Agent и
 
 Нижний уровень MAY дополнительно сузить capabilities, но не расширяет верхний.
 
+`agent.profile_prompt` optional и по умолчанию пуст. Он задаёт роль/стиль, но не повторяет Task prompt: фактический запрос передаётся отдельным user Message.
+
 ## Пример
 
 ```yaml

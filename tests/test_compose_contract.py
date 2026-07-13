@@ -49,7 +49,7 @@ class ComposeContractTests(unittest.TestCase):
     def test_agent_profile_is_explicitly_configurable(self):
         environment = self.services["agent"]["environment"]
         self.assertIn("CORE_AGENT_NAME", environment)
-        self.assertIn("CORE_AGENT_PROFILE", environment)
+        self.assertEqual(environment["CORE_AGENT_PROFILE"], "${CORE_AGENT_PROFILE:-}")
         self.assertEqual(
             environment["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"],
             "${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-true}",

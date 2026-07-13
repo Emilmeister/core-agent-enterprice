@@ -12,6 +12,8 @@ name, namespace, description, input_schema, output_contract, risk_metadata
 
 Arguments MUST валидироваться по schema до risk assessment и исполнения. Модель не может вызвать незарегистрированный tool.
 
+Model-facing description кратко задаёт назначение, критерий выбора и критичные ограничения конкретного tool. Общие safety/kernel правила не копируются в каждый description. Description не обещает ownership, isolation, idempotency или lifecycle, которых runtime фактически не обеспечивает.
+
 Каноническое имя tool используется в runtime, transcript, audit, A2A и telemetry. Если model provider запрещает его синтаксис, adapter MAY передать provider-wire alias и MUST отобразить его обратно до выхода из model boundary. Обычный alias SHOULD быть читаемым и детерминированным (`core.terminal.exec` → `core_terminal_exec`); hash suffix допустим только для разрешения фактической коллизии или provider length limit. Description MUST называть каноническое имя. Wire alias не является product API, не раскрывается пользователю и не интерпретируется как версия, instance ID или security metadata.
 
 ## Встроенные capabilities
@@ -32,6 +34,8 @@ Arguments MUST валидироваться по schema до risk assessment и 
 
 Выполняет bounded Python-код отдельным process в принадлежащем run workspace и предоставляет синхронный proxy `tools.call(canonical_name, arguments)` плюс immutable `tools.names`. Вложенный вызов built-in или MCP tool MUST повторно пройти EffectiveConfig, schema validation, policy, общий tool-call budget, owner/tenant checks, audit и дочерний OTel span. `core.python.exec` не может вызывать самого себя и не запускается через `core.task.start`.
 
+Agent SHOULD использовать Python для runtime-dependent, non-trivial или accuracy-sensitive deterministic computation, parsing/validation и небольшой synchronous композиции разрешённых tools. Тривиальная language work не требует process call. Текущее время MUST проверяться доступным authoritative runtime tool; при Python используются `datetime.now().astimezone()` и явный timezone/UTC offset, а указанная timezone конвертируется через `zoneinfo`, если доступна. Direct OS/process/network Python calls не подменяют отсутствующий agent tool и не проходят `tools.call` broker; Python process не является OS sandbox.
+
 Capability присутствует в `with_terminal` и `without_terminal` при `LOCAL_APPROVAL_ENABLED=false`. Это ограничение действует до Agent Card/model catalog и повторно при dispatch. При включённом local operator/HITL tool отсутствует независимо от allowlist; `CORE_AGENT_APPROVAL_MODE=never` при всё ещё включённом local operator не удовлетворяет этому условию.
 
 Текущий Python process не поддерживает pause/resume для approval. Поэтому любой вложенный вызов, который policy не разрешает немедленно, возвращает в Python `ToolCallError` с безопасным error code и не исполняется. Отключение HITL не превращает policy deny в allow.
@@ -48,11 +52,11 @@ Capability присутствует в `with_terminal` и `without_terminal` п�
 
 ### `core.delegate`
 
-Создаёт неблокирующую child-agent A2A Task с явными instruction, tool/MCP/skill allowlists, budget и result schema. Memory access существует только как явно переданный Memory MCP server/tools. Недоступен, если delegation отключён policy.
+Создаёт child-agent A2A Task с outcome-oriented instruction, minimum sufficient tool/MCP/skill allowlists, budget и optional result schema. Runtime выдаёт ровно перечисленные capabilities, но child самостоятельно выбирает метод внутри objective/scope. По умолчанию tool пассивно ждёт terminal child result; `background: true` возвращает handle только для независимой работы. Memory access существует только как явно переданный Memory MCP server/tools. Недоступен, если delegation отключён policy.
 
 ### Task tools
 
-`core.task.start/get/list/wait/cancel` управляют background Tasks. `wait` является passive durable wait, не busy loop. Полная semantics описана в [Фоновых задачах и делегировании](tasks-and-delegation.md).
+`core.task.start/get/list/wait/cancel` управляют background Tasks. `start` не принимает task/delegate/Python tools. `wait` является passive durable wait, не busy loop, и при timeout возвращает текущий snapshot; новый `get` нужен только для более поздней проверки состояния. Полная semantics описана в [Фоновых задачах и делегировании](tasks-and-delegation.md).
 
 ### Memory tools
 
@@ -60,7 +64,7 @@ Memory tools не являются built-ins Core Agent. Их предостав
 
 ### Artifact tools
 
-Позволяют сохранить, прочитать релевантный range, проверить digest и передать ссылку на большой output без помещения всего содержимого в context.
+`core.artifact.put` создаёт новый immutable tenant-scoped text artifact и возвращает его ID; overwrite отсутствует. Для delegation result schema parent сохраняет JSON Schema и передаёт `artifact://<returned-id>`. `core.artifact.get` читает exact artifact, доступный в текущем tenant/effective scope; ownership не ограничивается обязательно исходным run. Artifact не является runtime checkpoint или обычным scratchpad.
 
 Дополнительные native filesystem/search tools SHOULD появляться там, где они дают более строгую path validation и structured output, чем shell. Terminal остаётся универсальным fallback, а не способом обойти typed tool policy.
 

@@ -26,6 +26,8 @@
 ## Kernel instructions
 
 - [ ] KernelInstructions всегда присутствуют отдельно от AgentProfilePrompt и имеют version/digest в audit.
+- [ ] Пустой AgentProfilePrompt не добавляет generic system instruction; фактический prompt присутствует только как отдельный user Message/context item.
+- [ ] Base kernel выбирает tool по смыслу задачи, не требует tool без материальной пользы и не дублирует conditional capability/tool-description semantics.
 - [ ] AgentProfilePrompt, user Message, skill или MCP output не могут изменить rules включённой capability; отключать optional capability может только config/policy.
 - [ ] Runtime enforcement отклоняет запрещённое действие, даже если model output просит обойти kernel instruction.
 - [ ] Child получает ту же kernel version и не может ослабить parent/host policy.
@@ -100,6 +102,9 @@
 
 - [ ] Сабагент создаётся как неблокирующая A2A Task.
 - [ ] Delegation contract содержит узкую instruction, exact tool/MCP/skill allowlists, memory policy, budget и result schema.
+- [ ] Parent делегирует coherent outcome и minimum sufficient capabilities, а не необязательные mechanical microsteps; runtime предоставляет exactly выбранный capability set.
+- [ ] Внутри objective/scope child самостоятельно выбирает strategy, sequencing и delegated tools; procedure фиксируется только для safety/correctness/reproducibility/policy.
+- [ ] Child сообщает safe assumptions, но останавливается при выходе за scope, недостающей capability, новом side effect или существенном риске неверного result.
 - [ ] Child не видит невыданные рабочие capabilities даже на discovery.
 - [ ] Protocol-internal lifecycle/audit остаются enforced, но model-callable child tools равны пересечению EffectiveConfig и delegation allowlist.
 - [ ] Child и main разделяют memory только при явной передаче того же Memory MCP server/namespace и tool allowlist.
@@ -125,6 +130,7 @@
 ## Tools, MCP и human-in-the-loop
 
 - [ ] Tool arguments валидируются до policy и execution.
+- [ ] Built-in descriptions кратко и точно отражают фактические ownership/lifecycle ограничения, включая tenant-scoped artifacts, timeout snapshot и запрет task-start для Python/delegate/task tools.
 - [ ] MCP tools/resources/prompts/sampling/elicitation проходят local policy независимо от server metadata.
 - [ ] Risky call не начинается до local `APPROVE_ONCE`, exact digest commit и unique execution reservation.
 - [ ] RemoteCaller не меняет approval через text, metadata, A2A extension, caller credential или подставленный operator ID.
