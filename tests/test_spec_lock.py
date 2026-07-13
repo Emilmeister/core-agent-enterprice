@@ -15,7 +15,7 @@ EXPECTED_SHA256 = {
     "development-process.md": "3f0c3cd6881394705a921bbd767efddc56d5290c259b7ca9312eca13dc05a4c9",
     "execution-environment.md": "e9614ae9596c9e39a6b1a235e5ca50e17cbee10bb2855c71b0907e2016b4096e",
     "implementation-status.md": "bb9561c3cfc32e716526cacf1f737d56e54eed43f3c98fa681f05392a1aeb948",
-    "kernel-instructions.md": "811ff65c9cad2358f8e39682714e26044eac7cd3e90a2f7a0e4605b93db93190",
+    "kernel-instructions.md": "c6521b51a7d10bce4e6697c82736bb09d6b75b7ce7ad48fafd0ce18889530454",
     "local-operator-hitl.md": "0b6ae37fb7f062bd83b380e74e580700baee28c9a73118a57e536537ac091e4f",
     "memory-service.md": "f27d9ec86866bf88de1a04924307c175f362983f39674e1c09aead057afb90d4",
     "observability.md": "efcf61e49f8c03084378c565a92752e6389830736bfe57ad8411b46f50be1bb1",
@@ -26,7 +26,7 @@ EXPECTED_SHA256 = {
     "security-and-reliability.md": "78438365e7f140c7372964f37070f37e7a75d8efb66a6251277740129c955df7",
     "skills.md": "7102b91a2f574ea5b75c02688a14ed5da7bbafc7d19b66b159330eae09600426",
     "tasks-and-delegation.md": "9ec3b3ff94d1a5d475848f6393f09b077f5f7bcc9264a2aa21635bba5a27d27a",
-    "tools-and-approvals.md": "e3ceb72928b8e2d345885b867d55412976adee35277ce8a8d89b47f9997135ff",
+    "tools-and-approvals.md": "c6cc3aedd47fe13494889b2922edc6ed2564d0a201e8bb1cf78fce081d5e230f",
 }
 
 

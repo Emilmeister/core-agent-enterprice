@@ -148,7 +148,9 @@ class CoreAgent:
             "Only EffectiveConfig capabilities are authorized.",
             "Validate tools, preserve durable state, and fail closed. When "
             "core.delegate is absent, complete the task directly and do not try to "
-            "create another agent.",
+            "create another agent. Provider tool aliases are transport-only; never "
+            "mention them in user-facing text, use canonical names from tool "
+            "descriptions, and never infer meaning from alias spelling.",
         )
         self.context_window = int(context_window)
         self.output_reserve = int(output_reserve)

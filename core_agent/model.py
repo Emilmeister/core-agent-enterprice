@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 import json
 import re
@@ -123,17 +124,30 @@ class CompatibleHttpModel:
         return base if base.endswith(suffix) else base + suffix
 
     @staticmethod
-    def _wire_name(name):
+    def _wire_name(name, *, disambiguate=False):
         if len(name) <= 64 and re.fullmatch(r"[a-zA-Z0-9_-]+", name):
             return name
-        stem = re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:54]
+        stem = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+        if len(stem) <= 64 and not disambiguate:
+            return stem
+        stem = stem[:55]
         return f"{stem}_{hashlib.sha256(name.encode()).hexdigest()[:8]}"
 
     def _tools(self, catalog):
         definitions = (
             catalog if isinstance(catalog, dict) else {name: {} for name in catalog}
         )
-        reverse = {self._wire_name(name): name for name in sorted(definitions)}
+        candidates = {name: self._wire_name(name) for name in sorted(definitions)}
+        counts = Counter(candidates.values())
+        collisions = {
+            wire_name
+            for wire_name in candidates.values()
+            if counts[wire_name] > 1
+        }
+        reverse = {
+            self._wire_name(name, disambiguate=wire_name in collisions): name
+            for name, wire_name in candidates.items()
+        }
         if len(reverse) != len(definitions):
             raise CoreError("TOOL_NAME_COLLISION")
         schemas = []
@@ -144,6 +158,10 @@ class CompatibleHttpModel:
                 "additionalProperties": True,
             }
             description = definition.get("description") or reverse[wire_name]
+            if wire_name != reverse[wire_name]:
+                description = (
+                    f"Canonical tool name: {reverse[wire_name]}. {description}"
+                )
             if self.api_format == "openai":
                 schemas.append(
                     {
@@ -312,9 +330,14 @@ class CompatibleHttpModel:
         return value
 
     @staticmethod
-    def _public_text(value):
+    def _public_text(value, reverse=None):
         value = re.sub(r"(?is)<think>.*?</think>\s*", "", value)
         value = re.sub(r"(?is)<think>.*$", "", value).strip()
+        for wire_name, canonical_name in sorted(
+            (reverse or {}).items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if wire_name != canonical_name:
+                value = value.replace(wire_name, canonical_name)
         if not value:
             raise CoreError("MODEL_UNAVAILABLE", "model returned no public text")
         return value
@@ -356,7 +379,7 @@ class CompatibleHttpModel:
             return ModelResponse(tool_requests=tuple(calls), **usage_fields)
         if not isinstance(content, str):
             raise CoreError("MODEL_UNAVAILABLE", "model returned no text")
-        return ModelResponse(message=self._public_text(content), **usage_fields)
+        return ModelResponse(message=self._public_text(content, reverse), **usage_fields)
 
     def _parse_anthropic(self, response, reverse):
         content = response.get("content")
@@ -399,7 +422,9 @@ class CompatibleHttpModel:
         }
         if calls:
             return ModelResponse(tool_requests=tuple(calls), **usage_fields)
-        return ModelResponse(message=self._public_text("".join(text)), **usage_fields)
+        return ModelResponse(
+            message=self._public_text("".join(text), reverse), **usage_fields
+        )
 
     def generate(self, *, context, tools, instructions, messages=None):
         body, headers, reverse = self._request(

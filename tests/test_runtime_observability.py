@@ -315,8 +315,13 @@ class RuntimeTests(unittest.TestCase):
             },
         ]
         openai = CompatibleHttpModel(api_format="openai", model="test")
-        body, _headers, _reverse = openai._request(
+        body, _headers, reverse = openai._request(
             "unused", "system", tools, messages=messages
+        )
+        self.assertEqual(set(reverse), {"core_terminal_exec"})
+        self.assertIn(
+            "Canonical tool name: core.terminal.exec",
+            body["tools"][0]["function"]["description"],
         )
         self.assertEqual(
             [message["role"] for message in body["messages"]],
@@ -324,6 +329,18 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertEqual(body["messages"][2]["tool_calls"][0]["id"], "call-1")
         self.assertEqual(body["messages"][3]["tool_call_id"], "call-1")
+        parsed = openai._parse_openai(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "Use core_terminal_exec."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            reverse,
+        )
+        self.assertEqual(parsed.message, "Use core.terminal.exec.")
 
         anthropic = CompatibleHttpModel(api_format="anthropic", model="test")
         body, _headers, _reverse = anthropic._request(
@@ -335,6 +352,17 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertEqual(body["messages"][1]["content"][0]["type"], "tool_use")
         self.assertEqual(body["messages"][2]["content"][0]["type"], "tool_result")
+
+    def test_provider_wire_alias_adds_hash_only_for_a_real_collision(self):
+        model = CompatibleHttpModel(api_format="openai", model="test")
+        schemas, reverse = model._tools({"example.tool": {}, "example_tool": {}})
+        aliases = {item["function"]["name"] for item in schemas}
+        self.assertEqual(set(reverse.values()), {"example.tool", "example_tool"})
+        self.assertEqual(len(aliases), 2)
+        self.assertIn("example_tool", aliases)
+        self.assertTrue(
+            any(name.startswith("example_tool_") for name in aliases - {"example_tool"})
+        )
 
     def test_stale_delegate_call_at_maximum_depth_creates_no_task(self):
         model = ScriptedModel([ModelResponse(message="must not run")])

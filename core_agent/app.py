@@ -456,7 +456,9 @@ def _agent(model, mcp_connector=None, *, state=None):
             "effect. Delegate only exact tools, MCP tools, skills, memory policy, budget, "
             "and result schema. When core.delegate is absent, complete the task directly "
             "and do not try to create another agent. Background work must be cancelable "
-            "and observable."
+            "and observable. Provider tool aliases are transport-only; never mention "
+            "them in user-facing text, use canonical names from tool descriptions, "
+            "and never infer meaning from alias spelling."
         ),
         capability_policies={
             "memory": (

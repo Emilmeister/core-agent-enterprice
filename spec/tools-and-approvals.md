@@ -12,6 +12,8 @@ name, namespace, description, input_schema, output_contract, risk_metadata
 
 Arguments MUST валидироваться по schema до risk assessment и исполнения. Модель не может вызвать незарегистрированный tool.
 
+Каноническое имя tool используется в runtime, transcript, audit, A2A и telemetry. Если model provider запрещает его синтаксис, adapter MAY передать provider-wire alias и MUST отобразить его обратно до выхода из model boundary. Обычный alias SHOULD быть читаемым и детерминированным (`core.terminal.exec` → `core_terminal_exec`); hash suffix допустим только для разрешения фактической коллизии или provider length limit. Description MUST называть каноническое имя. Wire alias не является product API, не раскрывается пользователю и не интерпретируется как версия, instance ID или security metadata.
+
 ## Встроенные capabilities
 
 Ядро предоставляет базовый набор, но AgentConfig MAY отключить любой model-callable built-in или целую optional feature. Модель видит только EffectiveConfig catalog:

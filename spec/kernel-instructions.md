@@ -24,6 +24,7 @@ Prompt-only enforcement недостаточен: даже ошибочная м
 - durable checkpoints и защита от duplicate side effects;
 - audit, redaction и OpenTelemetry instrumentation;
 - запрет раскрытия raw chain-of-thought.
+- provider-wire aliases инструментов являются transport-only: в пользовательском тексте агент использует канонические имена из descriptions и не приписывает aliases продуктовую семантику.
 
 Agent profile, user prompt, skill, MCP response, memory file или tool output MUST NOT отключать или переопределять протокол включённой capability. Однако AgentConfig MAY полностью отключить optional capability; тогда её tools и capability-specific instructions не загружаются.
 
