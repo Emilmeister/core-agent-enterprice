@@ -20,6 +20,17 @@ Streamable HTTP Memory MCP, Markdown indexing/NER/graph search, and explicit ski
 
 ## Run the agent
 
+### Runtime prompt
+
+The replaceable role/profile prompt is `CORE_AGENT_PROFILE`; local Compose reads it from `.env`.
+If it is absent, the exact default is `Complete the user's task using available tools.`. This is
+only the `AgentProfilePrompt`: the effective model instructions are compiled for every run from
+the protected safety, host-policy, kernel and enabled-capability layers, followed by this profile
+and selected skills. The default and protected layers are assembled in
+[`core_agent/app.py`](core_agent/app.py), compiled in [`core_agent/runtime.py`](core_agent/runtime.py),
+and specified in [`spec/kernel-instructions.md`](spec/kernel-instructions.md). The protected layers
+cannot be replaced through `.env`, A2A input, MCP, memory, skills, or tool output.
+
 Production state requires PostgreSQL. Apply the versioned schema before starting the app:
 
 ```bash
@@ -128,16 +139,23 @@ and single-use execution reservations use the selected state backend.
 operator control plane first. Workspaces default to `/tmp/core-agent/runs` and can be moved with
 `LOCAL_WORKSPACE_ROOT`.
 
-For a local Docker smoke run, copy `.env.example` to `.env`, set the database and model credentials,
-then run:
+For a local Docker smoke run, copy `.env.example` to `.env`, set the database, model credentials,
+and optional `CORE_AGENT_PROFILE`, then run:
 
 ```bash
 docker compose up --build
 ```
 
 Compose waits for PostgreSQL, runs `core-agent-db migrate` as a one-shot job, then starts the agent
-with PostgreSQL persistence. It deliberately uses the development approve-all operator stub; a
-production deployment must replace that control plane and set `CORE_AGENT_ENVIRONMENT=production`.
+with PostgreSQL persistence. It also starts the pinned Arize Phoenix UI at
+`http://localhost:6006`, stores Phoenix data in the `phoenix` PostgreSQL schema, and sends Core Agent
+and Memory Service traces to its OTLP/HTTP collector. `PHOENIX_PORT` changes the host UI port and
+`PHOENIX_DEFAULT_RETENTION_POLICY_DAYS` controls trace retention. The applications use the standard
+per-signal `OTEL_EXPORTER_OTLP_*_ENDPOINT` variables, so a production deployment can route traces,
+metrics, and logs to separate backends without sending unsupported signals to Phoenix.
+
+Compose deliberately uses the development approve-all operator stub; a production deployment must
+replace that control plane and set `CORE_AGENT_ENVIRONMENT=production`.
 
 The specification and acceptance suite are frozen together before implementation changes.
 `tests/test_spec_lock.py` also protects every specification file byte-for-byte.

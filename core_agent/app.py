@@ -424,11 +424,7 @@ def _agent(model, mcp_connector=None, *, state=None):
         approvals,
         sessions,
     )
-    telemetry = (
-        Telemetry.otlp(endpoint=os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"])
-        if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-        else Telemetry(RecordingExporter())
-    )
+    telemetry = Telemetry.otlp_from_env() or Telemetry(RecordingExporter())
     kernel = KernelCompiler(
         safety=(
             "SAFETY: Never disclose secrets, credentials, raw chain-of-thought, or "

@@ -51,8 +51,7 @@ def _guard(function):
 
 
 def _trace_carrier(context):
-    request = context.request_context.request
-    meta = request.params.meta if request and request.params else None
+    meta = context.request_context.meta
     value = (meta.model_extra or {}).get("traceparent") if meta else None
     return {"traceparent": value} if isinstance(value, str) else None
 
@@ -218,14 +217,9 @@ def main():
     def authorize(namespace, _action):
         return not prefixes or any(namespace.startswith(prefix) for prefix in prefixes)
 
-    telemetry = None
-    if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
-        from core_agent.observability import Telemetry
+    from core_agent.observability import Telemetry
 
-        telemetry = Telemetry.otlp(
-            endpoint=os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"],
-            service_name="core-agent-memory",
-        )
+    telemetry = Telemetry.otlp_from_env(service_name="core-agent-memory")
     service = MemoryService(
         Path(root or "./memory"),
         entity_extractor=extractor,

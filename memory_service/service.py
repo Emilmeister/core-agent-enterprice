@@ -636,8 +636,10 @@ class MemoryService:
         )
         with self.telemetry.span(request_span, parent=parent):
             with contextlib.ExitStack() as stack:
-                for name in ("bm25", "vector", "query_ner", "graph", "rerank"):
-                    stack.enter_context(self.telemetry.span(f"memory_service.{name}"))
+                for name in ("bm25", "vector", "ner", "graph", "rerank"):
+                    stack.enter_context(
+                        self.telemetry.span(f"memory_service.search.{name}")
+                    )
                 return self._search(
                     query, namespace=namespace, filters=filters, limit=limit
                 )

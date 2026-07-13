@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 import contextvars
+import os
 import re
 from dataclasses import dataclass
 
@@ -55,7 +56,15 @@ class FailingExporter:
 class OtlpExporter:
     """Bridge the small runtime interface to the official OTel SDK/OTLP HTTP exporters."""
 
-    def __init__(self, *, endpoint=None, service_name="core-agent"):
+    def __init__(
+        self,
+        *,
+        endpoint=None,
+        trace_endpoint=None,
+        metric_endpoint=None,
+        log_endpoint=None,
+        service_name="core-agent",
+    ):
         from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
         from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
             OTLPMetricExporter,
@@ -75,23 +84,30 @@ class OtlpExporter:
             {"service.name": service_name, "telemetry.semconv.version": "1.43.0"}
         )
         base = endpoint.rstrip("/") if endpoint else None
-        trace_exporter = OTLPSpanExporter(
-            endpoint=f"{base}/v1/traces" if base else None
-        )
-        metric_exporter = OTLPMetricExporter(
-            endpoint=f"{base}/v1/metrics" if base else None
-        )
-        log_exporter = OTLPLogExporter(endpoint=f"{base}/v1/logs" if base else None)
+        trace_endpoint = trace_endpoint or (f"{base}/v1/traces" if base else None)
+        metric_endpoint = metric_endpoint or (f"{base}/v1/metrics" if base else None)
+        log_endpoint = log_endpoint or (f"{base}/v1/logs" if base else None)
         self.trace_provider = TracerProvider(resource=resource)
-        self.trace_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
+        if trace_endpoint:
+            self.trace_provider.add_span_processor(
+                BatchSpanProcessor(OTLPSpanExporter(endpoint=trace_endpoint))
+            )
+        metric_readers = []
+        if metric_endpoint:
+            metric_readers.append(
+                PeriodicExportingMetricReader(
+                    OTLPMetricExporter(endpoint=metric_endpoint)
+                )
+            )
         self.meter_provider = MeterProvider(
             resource=resource,
-            metric_readers=[PeriodicExportingMetricReader(metric_exporter)],
+            metric_readers=metric_readers,
         )
         self.logger_provider = LoggerProvider(resource=resource)
-        self.logger_provider.add_log_record_processor(
-            BatchLogRecordProcessor(log_exporter)
-        )
+        if log_endpoint:
+            self.logger_provider.add_log_record_processor(
+                BatchLogRecordProcessor(OTLPLogExporter(endpoint=log_endpoint))
+            )
         self.tracer = self.trace_provider.get_tracer("core_agent", "1.0")
         self.meter = self.meter_provider.get_meter("core_agent", "1.0")
         self.logger = self.logger_provider.get_logger("core_agent", "1.0")
@@ -222,9 +238,40 @@ class Telemetry:
         )
 
     @classmethod
-    def otlp(cls, *, endpoint=None, service_name="core-agent", content_enabled=False):
+    def otlp(
+        cls,
+        *,
+        endpoint=None,
+        trace_endpoint=None,
+        metric_endpoint=None,
+        log_endpoint=None,
+        service_name="core-agent",
+        content_enabled=False,
+    ):
         return cls(
-            OtlpExporter(endpoint=endpoint, service_name=service_name),
+            OtlpExporter(
+                endpoint=endpoint,
+                trace_endpoint=trace_endpoint,
+                metric_endpoint=metric_endpoint,
+                log_endpoint=log_endpoint,
+                service_name=service_name,
+            ),
+            content_enabled=content_enabled,
+        )
+
+    @classmethod
+    def otlp_from_env(cls, *, service_name="core-agent", content_enabled=False):
+        endpoints = {
+            "endpoint": os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+            "trace_endpoint": os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
+            "metric_endpoint": os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"),
+            "log_endpoint": os.getenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"),
+        }
+        if not any(endpoints.values()):
+            return None
+        return cls.otlp(
+            **endpoints,
+            service_name=service_name,
             content_enabled=content_enabled,
         )
 

@@ -1,7 +1,9 @@
+import os
 import tempfile
 import time
 import unittest
 import threading
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -505,6 +507,49 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn(b"secret prompt", payload)
         self.assertNotIn(b"secret response", payload)
 
+    def test_otlp_env_can_export_only_traces_to_a_trace_backend(self):
+        received = []
+
+        class TraceBackend(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                received.append((self.path, body))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-protobuf")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TraceBackend)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        endpoint = f"http://127.0.0.1:{server.server_port}/v1/traces"
+        with patch.dict(
+            os.environ,
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": endpoint,
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "",
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "",
+            },
+        ):
+            telemetry = Telemetry.otlp_from_env(service_name="trace-only-test")
+        try:
+            with telemetry.span("core_agent.trace_only"):
+                pass
+            telemetry.metric("core_agent.trace_only.count", 1)
+            telemetry.log("trace-only-safe-log")
+            telemetry.shutdown()
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual([path for path, _body in received], ["/v1/traces"])
+
+    def test_otlp_env_is_optional(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(Telemetry.otlp_from_env())
+
     def test_memory_service_continues_core_mcp_trace_and_owns_internal_spans(self):
         exporter = RecordingExporter()
         telemetry = Telemetry(exporter)
@@ -526,6 +571,10 @@ class ObservabilityTests(unittest.TestCase):
             self.assertIn("memory_service.mcp.request", names)
             self.assertIn("memory_service.ner", names)
             self.assertIn("memory_service.index_publish", names)
+            self.assertIn("memory_service.search.bm25", names)
+            self.assertIn("memory_service.search.vector", names)
+            self.assertIn("memory_service.search.graph", names)
+            self.assertIn("memory_service.search.rerank", names)
             core_internal = [
                 name for name in names if name.startswith("core_agent.memory.")
             ]

@@ -14,6 +14,32 @@ services:
       retries: 30
     restart: unless-stopped
 
+  phoenix:
+    image: arizephoenix/phoenix:version-17.5.0@sha256:936d39fc27ea5b7807d39bdc184b1033222a413dc185858817cbf51d2bbf96e4
+    environment:
+      PHOENIX_SQL_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
+      PHOENIX_SQL_DATABASE_SCHEMA: phoenix
+      PHOENIX_DEFAULT_RETENTION_POLICY_DAYS: ${PHOENIX_DEFAULT_RETENTION_POLICY_DAYS:-30}
+      PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
+      PHOENIX_TELEMETRY_ENABLED: "false"
+    ports:
+      - "${PHOENIX_PORT:-6006}:6006"
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:6006/', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   migrate:
     build: .
     command: ["core-agent-db", "migrate"]
@@ -31,6 +57,8 @@ services:
     build: .
     environment:
       CORE_AGENT_ENVIRONMENT: development
+      CORE_AGENT_NAME: ${CORE_AGENT_NAME:-core-agent}
+      CORE_AGENT_PROFILE: ${CORE_AGENT_PROFILE:-Complete the user's task using available tools.}
       CORE_AGENT_STATE_BACKEND: postgres
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
       DATABASE_AUTO_MIGRATE: "false"
@@ -45,6 +73,7 @@ services:
       CORE_AGENT_MAX_DEPTH: ${CORE_AGENT_MAX_DEPTH:-2}
       LOCAL_WORKSPACE_ROOT: /tmp/core-agent/runs
       DURABLE_STORAGE_ROOT: /data/durable
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://phoenix:6006/v1/traces}
     ports:
       - "${CORE_AGENT_PORT:-8000}:8000"
     volumes:
@@ -54,6 +83,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      phoenix:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -85,11 +116,14 @@ services:
       MEMORY_ALLOWED_NAMESPACE_PREFIXES: session/
       MEMORY_HOST: 0.0.0.0
       MEMORY_PORT: 8000
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://phoenix:6006/v1/traces}
     volumes:
       - memory-data:/memory
     depends_on:
       memory-volume-init:
         condition: service_completed_successfully
+      phoenix:
+        condition: service_healthy
     healthcheck:
       test:
         [

@@ -22,6 +22,14 @@ Telemetry не заменяет durable audit: sampling или недоступ�
 
 Structured logs описывают operator diagnostics и correlation с trace/span. Prompt, memory content, tool arguments/output и secrets не логируются по умолчанию.
 
+## OTLP deployment configuration
+
+Runtime MUST поддерживать стандартные OTLP/HTTP environment variables: общий base endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` и точные per-signal endpoints `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. Per-signal value имеет приоритет над общим endpoint. Если задан общий endpoint, runtime добавляет стандартные paths `/v1/traces`, `/v1/metrics`, `/v1/logs`; per-signal value уже является полным URL и не изменяется.
+
+Production profile MUST предоставить destination для всех трёх signals, напрямую или через OTel Collector. Deployment с backend-ом, принимающим только часть signals, MUST задавать только поддерживаемые per-signal endpoints и не отправлять ему неподдерживаемые requests. Отсутствующий endpoint не отключает instrumentation и не влияет на durable audit.
+
+Local Docker Compose profile MUST запускать version-pinned Arize Phoenix с PostgreSQL persistence в отдельной schema, bounded retention и выключенной Phoenix product telemetry. Core Agent и Memory Service отправляют туда только OTLP traces через `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; Phoenix UI и HTTP collector доступны на configurable host port, по умолчанию `6006`. Metrics/logs этого development profile могут быть направлены в отдельный collector через соответствующие per-signal variables.
+
 ## Context propagation
 
 Core Agent MUST использовать W3C Trace Context через OTel propagators для A2A bindings, MCP HTTP и task queue. Локальные background/subagent процессы получают trace context только через runtime, но trace context не становится authorization.

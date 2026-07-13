@@ -4,11 +4,12 @@ import re
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from memory_service.errors import MemoryServiceError
-from memory_service.mcp_server import main as memory_main
+from memory_service.mcp_server import _trace_carrier, main as memory_main
 from memory_service.providers import HttpEmbeddingProvider, HttpEntityExtractor
 from memory_service.service import MemoryService
 
@@ -41,6 +42,27 @@ def markdown(
         "---\n"
         f"{body}\n"
     )
+
+
+class McpTraceCarrierTests(unittest.TestCase):
+    def test_reads_traceparent_from_current_sdk_request_context_meta(self):
+        traceparent = (
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        )
+        context = SimpleNamespace(
+            request_context=SimpleNamespace(
+                meta=SimpleNamespace(model_extra={"traceparent": traceparent})
+            )
+        )
+        self.assertEqual(_trace_carrier(context), {"traceparent": traceparent})
+
+    def test_missing_traceparent_returns_no_carrier(self):
+        context = SimpleNamespace(
+            request_context=SimpleNamespace(
+                meta=SimpleNamespace(model_extra={})
+            )
+        )
+        self.assertIsNone(_trace_carrier(context))
 
 
 class ToggleExtractor:
