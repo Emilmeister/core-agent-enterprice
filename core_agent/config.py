@@ -10,6 +10,8 @@ from .errors import CoreError
 
 
 MAX_SUBAGENT_DEPTH = 2
+RUNTIME_MODES = frozenset({"with_terminal", "without_terminal"})
+LOCAL_EXECUTION_TOOLS = frozenset({"core.terminal.exec", "core.task.start"})
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,11 @@ class AgentConfig:
         features = raw.get("features", {})
         if features.get("delegation") and not features.get("background_tasks"):
             raise CoreError("CONFIG_CONFLICT")
+        runtime_mode = raw.get("execution", {}).get(
+            "runtime_mode", "with_terminal"
+        )
+        if runtime_mode not in RUNTIME_MODES:
+            raise CoreError("CONFIG_INVALID")
         budgets = raw.get("budgets", {})
         if not isinstance(budgets, dict):
             raise CoreError("CONFIG_INVALID")
@@ -195,6 +202,9 @@ def compile_effective_config(platform, agent, request, discovered):
         platform.denied_builtin_tools
     )
     allowed -= denied
+    runtime_mode = raw["execution"].get("runtime_mode", "with_terminal")
+    if runtime_mode == "without_terminal":
+        allowed -= LOCAL_EXECUTION_TOOLS
 
     capability_for_prefix = {
         "core.terminal.": "terminal",
@@ -268,6 +278,7 @@ def compile_effective_config(platform, agent, request, discovered):
         "context": raw["context"],
         "approval_mode": raw["approval"].get("mode"),
         "execution_profile": raw["execution"].get("environment_profile"),
+        "runtime_mode": runtime_mode,
         "otel_profile": raw["observability"].get("otel_profile"),
         "kernel_version": "kernel-v1",
     }

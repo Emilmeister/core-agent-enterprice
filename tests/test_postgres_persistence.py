@@ -139,6 +139,58 @@ class ProductionConfigurationTests(unittest.TestCase):
         finally:
             app.state.close()
 
+    def test_without_terminal_mode_is_a_capability_ceiling(self):
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "without-terminal-model"
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_STATE_BACKEND": "test",
+                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "CORE_AGENT_RUNTIME_MODE": "without_terminal",
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
+                    "core.terminal.exec,core.task.start,core.task.get,"
+                    "core.task.list,core.task.wait,core.task.cancel,"
+                    "core.delegate,core.artifact.put,core.artifact.get"
+                ),
+            },
+            clear=True,
+        ):
+            app = create_app(model=model)
+        try:
+            result = app.state.core_agent.run(
+                {"prompt": "answer", "mcp": [], "skills": []}
+            )
+            self.assertEqual(result.message, "ok")
+            self.assertNotIn("core.terminal.exec", model.calls[0].tools)
+            self.assertNotIn("core.task.start", model.calls[0].tools)
+            self.assertIn("core.delegate", model.calls[0].tools)
+            self.assertIn("core.task.wait", model.calls[0].tools)
+            advertised = {
+                skill.id for skill in app.state.a2a_request_handler._agent_card.skills
+            }
+            self.assertEqual(advertised, set(model.calls[0].tools))
+            execution = app.state.core_agent.agent_config.to_dict()["execution"]
+            self.assertEqual(execution["runtime_mode"], "without_terminal")
+            self.assertEqual(execution["environment_profile"], "no-local-execution")
+        finally:
+            app.state.close()
+
+    def test_unknown_runtime_mode_is_rejected(self):
+        model = ScriptedModel([ModelResponse(message="ok")])
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_STATE_BACKEND": "test",
+                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "CORE_AGENT_RUNTIME_MODE": "maybe",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(CoreError) as caught:
+                create_app(model=model)
+        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+
 
 class NamedUser(User):
     @property

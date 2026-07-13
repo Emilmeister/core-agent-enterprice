@@ -65,6 +65,11 @@ class ComposeContractTests(unittest.TestCase):
             environment["CORE_AGENT_LOG_MAX_CHARS"],
             "${CORE_AGENT_LOG_MAX_CHARS:-12000}",
         )
+        self.assertEqual(
+            environment["CORE_AGENT_RUNTIME_MODE"],
+            "${CORE_AGENT_RUNTIME_MODE:-with_terminal}",
+        )
+        self.assertIn("CORE_AGENT_ALLOWED_BUILTIN_TOOLS", environment)
 
 
 if __name__ == "__main__":

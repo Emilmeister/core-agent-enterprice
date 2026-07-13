@@ -69,8 +69,11 @@ configuration. Generate it with
 `uv run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`.
 `DURABLE_STORAGE_ROOT` must be the S3-backed mount used only for immutable snapshots and artifacts;
 `LOCAL_WORKSPACE_ROOT` must be a separate local ephemeral path used by active processes.
-`CORE_AGENT_ALLOWED_BUILTIN_TOOLS` can remove individual terminal, task, delegation, or artifact
-tools; the resulting allowlist is reflected in both the Agent Card and every model tool catalog.
+`CORE_AGENT_RUNTIME_MODE=with_terminal` enables the full local execution profile.
+`CORE_AGENT_RUNTIME_MODE=without_terminal` removes `core.terminal.exec` and `core.task.start` from
+both the Agent Card and model catalog while retaining task lifecycle, delegation, artifact, MCP,
+and memory tools. `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` can further remove individual tools but cannot
+widen the selected runtime mode.
 `CORE_AGENT_MAX_DEPTH` may lower delegation depth to `0` or `1`; `2` is the hard maximum, allowing
 main → child → grandchild while rejecting any further delegation.
 Final A2A results and `core.artifact.put` content are stored as tenant-scoped, digest-verified blobs

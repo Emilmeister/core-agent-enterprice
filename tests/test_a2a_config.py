@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import os
 import time
 import unittest
@@ -380,6 +381,25 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(CoreError) as caught:
             effective.require_tool("core.terminal.exec")
         self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
+
+    def test_without_terminal_mode_is_enforced_by_effective_config(self):
+        raw = agent_config().to_dict()
+        raw["execution"]["runtime_mode"] = "without_terminal"
+        effective = compile_effective_config(
+            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
+        )
+        self.assertNotIn("core.terminal.exec", effective.model_tool_catalog)
+        self.assertNotIn("core.task.start", effective.model_tool_catalog)
+        self.assertIn("core.task.wait", effective.model_tool_catalog)
+        self.assertEqual(
+            json.loads(effective.audit_snapshot)["runtime_mode"],
+            "without_terminal",
+        )
+
+        raw["execution"]["runtime_mode"] = "unknown"
+        with self.assertRaises(CoreError) as caught:
+            AgentConfig.from_dict(raw)
+        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
     def test_effective_digest_is_stable_and_contains_no_secrets(self):
         effective_a = compile_effective_config(

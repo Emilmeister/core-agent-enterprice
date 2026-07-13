@@ -168,9 +168,7 @@ def _agent(model, mcp_connector=None, *, state=None):
     servers = set(_csv("CORE_AGENT_ALLOWED_MCP_SERVERS", "memory"))
     allowed_skills = set(_csv("CORE_AGENT_ALLOWED_SKILLS"))
     mcp_tools = _allowed_mcp_tools(servers)
-    available_builtin_tools = {
-        "core.terminal.exec",
-        "core.task.start",
+    builtin_tools_without_terminal = {
         "core.task.get",
         "core.task.list",
         "core.task.wait",
@@ -179,14 +177,24 @@ def _agent(model, mcp_connector=None, *, state=None):
         "core.artifact.put",
         "core.artifact.get",
     }
-    builtin_tools = set(
+    builtin_tools_by_mode = {
+        "with_terminal": builtin_tools_without_terminal
+        | {"core.terminal.exec", "core.task.start"},
+        "without_terminal": builtin_tools_without_terminal,
+    }
+    runtime_mode = os.getenv("CORE_AGENT_RUNTIME_MODE", "with_terminal")
+    if runtime_mode not in builtin_tools_by_mode:
+        raise CoreError("CONFIG_INVALID", "unknown CORE_AGENT_RUNTIME_MODE")
+    available_builtin_tools = set().union(*builtin_tools_by_mode.values())
+    requested_builtin_tools = set(
         _csv(
             "CORE_AGENT_ALLOWED_BUILTIN_TOOLS",
-            ",".join(sorted(available_builtin_tools)),
+            ",".join(sorted(builtin_tools_by_mode[runtime_mode])),
         )
     )
-    if builtin_tools - available_builtin_tools:
+    if requested_builtin_tools - available_builtin_tools:
         raise CoreError("CONFIG_INVALID", "unknown built-in tool configured")
+    builtin_tools = requested_builtin_tools & builtin_tools_by_mode[runtime_mode]
     platform = PlatformConfig(
         allowed_builtin_tools=builtin_tools,
         denied_builtin_tools=set(),
@@ -245,7 +253,14 @@ def _agent(model, mcp_connector=None, *, state=None):
                 "compact_to_working_ratio": 0.15,
             },
             "approval": {"mode": os.getenv("CORE_AGENT_APPROVAL_MODE", "on_risk")},
-            "execution": {"environment_profile": "local-pty"},
+            "execution": {
+                "environment_profile": (
+                    "local-pty"
+                    if runtime_mode == "with_terminal"
+                    else "no-local-execution"
+                ),
+                "runtime_mode": runtime_mode,
+            },
             "observability": {"otel_profile": "otlp"},
             "budgets": {
                 "model_turns": platform.max_model_turns,

@@ -57,6 +57,7 @@ approval:
     default_ttl_seconds: 7200
     suggested_poll_seconds: 15
 execution:
+  runtime_mode: with_terminal
   environment_profile: local-pty
 observability:
   otel_profile: production
@@ -96,6 +97,17 @@ Production config MUST задать owner-controlled HTTPS `extension_uri` и н
 - Core Agent не выполняет implicit memory retrieval/write.
 
 `optional` разрешает Task передать Memory MCP. `required` требует подходящий descriptor до первого model turn.
+
+## Runtime modes
+
+Deployment MUST выбрать один из двух capability-профилей через `CORE_AGENT_RUNTIME_MODE`:
+
+- `with_terminal` — разрешает `core.terminal.exec` и `core.task.start` в пределах последующих tool filters;
+- `without_terminal` — удаляет `core.terminal.exec` и `core.task.start`, но сохраняет task lifecycle (`get`, `list`, `wait`, `cancel`), delegation, artifacts, MCP и memory.
+
+Значение по умолчанию — `with_terminal`. Неизвестное значение завершает startup с `CONFIG_INVALID`. Runtime mode является верхней границей capabilities: `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, AgentConfig, Task и delegation contract могут только сузить выбранный профиль. В частности, старый allowlist с terminal tools не может снова включить их в `without_terminal`.
+
+`without_terminal` означает отсутствие произвольного локального исполнения. Python/CodeAct, shell, stdio MCP и skill scripts, требующие локального process, в этом режиме MUST отсутствовать из model context и отклоняться при stale call.
 
 ## Tool filters
 
