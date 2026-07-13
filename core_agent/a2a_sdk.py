@@ -316,6 +316,7 @@ def build_starlette_app(
     task_store=None,
     push_config_store=None,
     push_sender=None,
+    shutdown_handler=None,
 ):
     """Build the official A2A 1.0 HTTP+JSON binding around the domain runtime."""
     sdk_card = to_sdk_agent_card(agent_card, base_url=base_url)
@@ -340,20 +341,27 @@ def build_starlette_app(
     routes = create_agent_card_routes(sdk_card)
     routes.extend(create_rest_routes(request_handler, context_builder=context_builder))
     lifespan = None
-    if push_sender:
+    if push_sender or shutdown_handler:
 
         @asynccontextmanager
         async def lifespan(_app):
             stop = asyncio.Event()
-            worker = asyncio.create_task(
-                push_sender.run(stop), name="push-notification-dispatcher"
+            worker = (
+                asyncio.create_task(
+                    push_sender.run(stop), name="push-notification-dispatcher"
+                )
+                if push_sender
+                else None
             )
             try:
                 yield
             finally:
-                stop.set()
-                await worker
-                await push_sender.close()
+                if push_sender:
+                    stop.set()
+                    await worker
+                    await push_sender.close()
+                if shutdown_handler:
+                    await asyncio.to_thread(shutdown_handler)
 
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.a2a_request_handler = request_handler

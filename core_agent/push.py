@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import socket
@@ -142,7 +143,15 @@ class PostgresPushNotificationConfigStore(PushNotificationConfigStore):
 
 
 class DurablePushNotificationSender(PushNotificationSender):
-    def __init__(self, database, config_store, *, client=None, retry_seconds=1.0):
+    def __init__(
+        self,
+        database,
+        config_store,
+        *,
+        client=None,
+        retry_seconds=1.0,
+        telemetry=None,
+    ):
         self.database = database
         self.config_store = config_store
         self.client = client or httpx.AsyncClient(
@@ -151,6 +160,7 @@ class DurablePushNotificationSender(PushNotificationSender):
         )
         self._owns_client = client is None
         self.retry_seconds = retry_seconds
+        self.telemetry = telemetry
 
     @staticmethod
     def _event(event):
@@ -245,50 +255,59 @@ class DurablePushNotificationSender(PushNotificationSender):
         rows = await asyncio.to_thread(self._claim, limit)
         for row in rows:
             attempts = row["attempts"] + 1
-            config = await self._config(row["task_id"], row["config_id"])
-            if config is None:
-                await asyncio.to_thread(
-                    self._finish,
-                    row["id"],
-                    delivered=False,
-                    attempts=attempts,
-                    error_code="PUSH_CONFIG_NOT_FOUND",
+            span = (
+                self.telemetry.span(
+                    "core_agent.notification.deliver",
+                    attributes={"core_agent.notification.attempt": attempts},
                 )
-                continue
-            try:
-                await asyncio.to_thread(validate_push_url, config.url)
-                headers = {
-                    "X-Core-Delivery-Id": row["id"],
-                    **(
-                        {"X-A2A-Notification-Token": config.token}
-                        if config.token
-                        else {}
-                    ),
-                }
-                response = await self.client.post(
-                    config.url, json=row["payload"], headers=headers
-                )
-                response.raise_for_status()
-            except Exception as error:
-                code = (
-                    error.code
-                    if isinstance(error, CoreError)
-                    else "PUSH_DELIVERY_FAILED"
-                )
-                await asyncio.to_thread(
-                    self._finish,
-                    row["id"],
-                    delivered=False,
-                    attempts=attempts,
-                    error_code=code,
-                )
-            else:
-                await asyncio.to_thread(
-                    self._finish,
-                    row["id"],
-                    delivered=True,
-                    attempts=attempts,
-                )
+                if self.telemetry
+                else contextlib.nullcontext()
+            )
+            with span:
+                config = await self._config(row["task_id"], row["config_id"])
+                if config is None:
+                    await asyncio.to_thread(
+                        self._finish,
+                        row["id"],
+                        delivered=False,
+                        attempts=attempts,
+                        error_code="PUSH_CONFIG_NOT_FOUND",
+                    )
+                    continue
+                try:
+                    await asyncio.to_thread(validate_push_url, config.url)
+                    headers = {
+                        "X-Core-Delivery-Id": row["id"],
+                        **(
+                            {"X-A2A-Notification-Token": config.token}
+                            if config.token
+                            else {}
+                        ),
+                    }
+                    response = await self.client.post(
+                        config.url, json=row["payload"], headers=headers
+                    )
+                    response.raise_for_status()
+                except Exception as error:
+                    code = (
+                        error.code
+                        if isinstance(error, CoreError)
+                        else "PUSH_DELIVERY_FAILED"
+                    )
+                    await asyncio.to_thread(
+                        self._finish,
+                        row["id"],
+                        delivered=False,
+                        attempts=attempts,
+                        error_code=code,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self._finish,
+                        row["id"],
+                        delivered=True,
+                        attempts=attempts,
+                    )
         return len(rows)
 
     async def run(self, stop_event, *, interval=1.0):

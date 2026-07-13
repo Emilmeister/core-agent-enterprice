@@ -231,9 +231,17 @@ class ModelHandler(BaseHTTPRequestHandler):
 
 class MemoryMcpHandler(BaseHTTPRequestHandler):
     service = None
+    trace_carriers = []
 
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.trace_carriers.append(
+            {
+                "header": self.headers.get("traceparent"),
+                "meta": request.get("params", {}).get("_meta", {}).get("traceparent"),
+                "method": request["method"],
+            }
+        )
         method = request["method"]
         if method == "notifications/initialized":
             self.send_response(202)
@@ -404,7 +412,8 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                         CORE_EXTENSION_URI,
                         LOCAL_APPROVAL_STATUS_URI,
                     )
-                )
+                ),
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
             },
         ) as http:
             config = ClientConfig(
@@ -728,6 +737,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_memory_mcp_search_reaches_markdown_indexes_and_graph(self):
+        MemoryMcpHandler.trace_carriers.clear()
         declaration = {
             "name": "memory",
             "role": "memory",
@@ -743,6 +753,35 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.memory.graph_mentions("Bob"), ("mem-created",))
         status = self.memory.index_status(self.memory.repository_revision)
         self.assertTrue(all(value == "ready" for value in status.components.values()))
+        tool_calls = [
+            item
+            for item in MemoryMcpHandler.trace_carriers
+            if item["method"] == "tools/call"
+        ]
+        self.assertTrue(tool_calls)
+        self.assertTrue(all(item["header"] == item["meta"] for item in tool_calls))
+        self.assertTrue(all(item["header"].startswith("00-") for item in tool_calls))
+        spans = self.app.state.telemetry.exporter.spans
+        a2a_span = next(
+            span for span in reversed(spans) if span.name == "core_agent.a2a.message.send"
+        )
+        self.assertEqual(
+            a2a_span.context.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736"
+        )
+        names = {span.name for span in spans}
+        self.assertTrue(
+            {
+                "core_agent.task.submit",
+                "core_agent.task.execute",
+                "core_agent.context.assemble",
+                "gen_ai.chat",
+                "core_agent.policy.evaluate",
+                "core_agent.tool.execute",
+                "core_agent.task.checkpoint",
+                "mcp.client",
+            }
+            <= names
+        )
 
     async def test_explicit_skill_is_validated_and_activated_before_model_call(self):
         ModelHandler.skill_instructions_seen = False

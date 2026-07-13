@@ -6,7 +6,7 @@ import os
 from functools import wraps
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from .errors import MemoryServiceError
@@ -50,6 +50,13 @@ def _guard(function):
     return call
 
 
+def _trace_carrier(context):
+    request = context.request_context.request
+    meta = request.params.meta if request and request.params else None
+    value = (meta.model_extra or {}).get("traceparent") if meta else None
+    return {"traceparent": value} if isinstance(value, str) else None
+
+
 def build_memory_mcp(service, *, host="127.0.0.1", port=8000):
     mcp = FastMCP(
         "core-agent-memory",
@@ -63,10 +70,20 @@ def build_memory_mcp(service, *, host="127.0.0.1", port=8000):
     @mcp.tool(name="memory.search")
     @_guard
     def memory_search(
-        query: str, namespace: str, filters: dict | None = None, limit: int = 10
+        context: Context,
+        query: str,
+        namespace: str,
+        filters: dict | None = None,
+        limit: int = 10,
     ) -> dict:
         """Hybrid BM25, embedding and entity-graph retrieval."""
-        return service.search(query, namespace=namespace, filters=filters, limit=limit)
+        return service.search(
+            query,
+            namespace=namespace,
+            filters=filters,
+            limit=limit,
+            trace_carrier=_trace_carrier(context),
+        )
 
     @mcp.tool(name="memory.read")
     @_guard
@@ -84,10 +101,18 @@ def build_memory_mcp(service, *, host="127.0.0.1", port=8000):
     @mcp.tool(name="memory.create")
     @_guard
     def memory_create(
-        path: str, content: str, expected_repository_revision: int
+        context: Context,
+        path: str,
+        content: str,
+        expected_repository_revision: int,
     ) -> dict:
         """Atomically create and index a new Markdown memory."""
-        return service.create(path, content, expected_repository_revision)
+        return service.create(
+            path,
+            content,
+            expected_repository_revision,
+            trace_carrier=_trace_carrier(context),
+        )
 
     @mcp.tool(name="memory.update")
     @_guard

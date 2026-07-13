@@ -256,21 +256,25 @@ class CoreAgent:
         error_code=None,
         lease_token=None,
     ):
-        updated = self.workflow_store.transition(
-            record.run_id,
-            tenant_id=record.tenant_id,
-            owner_id=record.owner_id,
-            expected_version=record.version,
-            state=state,
-            snapshot=snapshot,
-            event_kind=event_kind,
-            event_data=event_data,
-            audit=audit,
-            pending_approval_id=pending_approval_id,
-            result=result,
-            error_code=error_code,
-            lease_token=lease_token,
-        )
+        with self.telemetry.span(
+            "core_agent.task.checkpoint",
+            attributes={"core_agent.task.state": state},
+        ):
+            updated = self.workflow_store.transition(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+                expected_version=record.version,
+                state=state,
+                snapshot=snapshot,
+                event_kind=event_kind,
+                event_data=event_data,
+                audit=audit,
+                pending_approval_id=pending_approval_id,
+                result=result,
+                error_code=error_code,
+                lease_token=lease_token,
+            )
         if not self.workflow_store.atomic:
             for kind, data in audit:
                 self.audit_log.append(record.run_id, kind, data)
@@ -595,15 +599,19 @@ class CoreAgent:
             request, raw, discovered, effective = self._load_workflow_runtime(record)
             snapshot = copy.deepcopy(record.snapshot)
             if record.state == "APPROVED_RESERVED":
-                record = self._execute_pending(
-                    record,
-                    snapshot,
-                    raw,
-                    discovered,
-                    effective,
-                    approved=True,
-                    lease_token=lease_token,
-                )
+                with self.telemetry.span(
+                    "core_agent.tool.execute",
+                    attributes={"core_agent.tool.approved": True},
+                ):
+                    record = self._execute_pending(
+                        record,
+                        snapshot,
+                        raw,
+                        discovered,
+                        effective,
+                        approved=True,
+                        lease_token=lease_token,
+                    )
             budgets = raw.get("budgets", {})
             max_turns = min(
                 budgets.get("model_turns", self.platform_config.max_model_turns),
@@ -637,11 +645,24 @@ class CoreAgent:
                     )
                     context = compacted
                 if snapshot["pending_response"] is None:
-                    response = self.model.generate(
-                        context="\n".join(item.content for item in context.active),
-                        tools=self._tool_catalog(effective, discovered),
-                        instructions=self._instructions(snapshot),
-                    )
+                    with self.telemetry.span("core_agent.context.assemble"):
+                        model_context = "\n".join(
+                            item.content for item in context.active
+                        )
+                        model_tools = self._tool_catalog(effective, discovered)
+                        model_instructions = self._instructions(snapshot)
+                    with self.telemetry.span(
+                        "gen_ai.chat",
+                        attributes={
+                            "gen_ai.operation.name": "chat",
+                            "gen_ai.request.model": raw["model"].get("route", "unknown"),
+                        },
+                    ):
+                        response = self.model.generate(
+                            context=model_context,
+                            tools=model_tools,
+                            instructions=model_instructions,
+                        )
                     snapshot["turns"] += 1
                     snapshot["pending_response"] = self._response_dict(response)
                     snapshot["tool_queue"] = copy.deepcopy(
@@ -669,7 +690,13 @@ class CoreAgent:
                     )
                     self.tool_runtime.validate(call, definition)
                     snapshot["tool_calls"] += 1
-                    decision_value = self.tool_runtime.policy.evaluate(definition)
+                    with self.telemetry.span(
+                        "core_agent.policy.evaluate",
+                        attributes={
+                            "core_agent.tool.namespace": pending["name"].split(".", 1)[0]
+                        },
+                    ):
+                        decision_value = self.tool_runtime.policy.evaluate(definition)
                     if decision_value == "require_approval":
                         snapshot["pending_call"] = copy.deepcopy(pending)
                         record, approval = self.workflow_store.enter_approval(
@@ -725,14 +752,20 @@ class CoreAgent:
                         self._task_approvals[record.task_id] = approval.id
                         return ApprovalNeeded(record.run_id, approval)
                     snapshot["pending_call"] = copy.deepcopy(pending)
-                    record = self._execute_pending(
-                        record,
-                        snapshot,
-                        raw,
-                        discovered,
-                        effective,
-                        lease_token=lease_token,
-                    )
+                    with self.telemetry.span(
+                        "core_agent.tool.execute",
+                        attributes={
+                            "core_agent.tool.namespace": pending["name"].split(".", 1)[0]
+                        },
+                    ):
+                        record = self._execute_pending(
+                            record,
+                            snapshot,
+                            raw,
+                            discovered,
+                            effective,
+                            lease_token=lease_token,
+                        )
                     continue
                 response = snapshot["pending_response"]
                 if response["message"] is not None:

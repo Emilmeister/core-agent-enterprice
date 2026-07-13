@@ -413,7 +413,9 @@ def _agent(model, mcp_connector=None, *, state=None):
         model=model,
         tool_runtime=tools,
         mcp_connector=mcp_connector
-        or StreamableHttpMcpConnector(headers=_json("CORE_AGENT_MCP_HEADERS_JSON")),
+        or StreamableHttpMcpConnector(
+            headers=_json("CORE_AGENT_MCP_HEADERS_JSON"), telemetry=telemetry
+        ),
         task_scheduler=(
             state["scheduler"](state["database"], telemetry)
             if state["scheduler"]
@@ -484,18 +486,38 @@ def create_app(
             state["database"], push_key
         )
         push_sender = DurablePushNotificationSender(
-            state["database"], push_config_store, client=push_client
+            state["database"],
+            push_config_store,
+            client=push_client,
+            telemetry=telemetry,
         )
+
+    def traced_execution(context, operation, function):
+        headers = context.call_context.state.get("headers", {})
+        parent = telemetry.extract(headers)
+        with telemetry.span(
+            f"core_agent.a2a.{operation}",
+            parent=parent,
+            attributes={"rpc.system": "a2a", "rpc.method": operation},
+        ):
+            with telemetry.span("core_agent.task.submit") as submission:
+                linked = submission.context
+        with telemetry.start_background_span("core_agent.task.execute", linked):
+            return function()
 
     def handle(request, context):
         user = context.call_context.user
         identity = user.user_name if user.is_authenticated else "anonymous"
-        result = agent.run(
-            request,
-            task_id=context.task_id,
-            identity=identity,
-            session_id=context.context_id,
-            tenant_id=context.tenant or "default",
+        result = traced_execution(
+            context,
+            "message.send",
+            lambda: agent.run(
+                request,
+                task_id=context.task_id,
+                identity=identity,
+                session_id=context.context_id,
+                tenant_id=context.tenant or "default",
+            ),
         )
         if isinstance(result, ApprovalNeeded):
             return result
@@ -509,14 +531,20 @@ def create_app(
         )
 
     def resume(context):
-        result = agent.resume_task(context.task_id)
+        result = traced_execution(
+            context, "task.resume", lambda: agent.resume_task(context.task_id)
+        )
         if isinstance(result, ApprovalNeeded):
             return result
         return Artifact.text(result.message, {"run_id": result.run_id})
 
     def dispatch_local(reserved, context):
-        result = agent.dispatch_reserved_approval(
-            context.task_id, reserved.approval_id, reserved.execution_id
+        result = traced_execution(
+            context,
+            "approval.dispatch",
+            lambda: agent.dispatch_reserved_approval(
+                context.task_id, reserved.approval_id, reserved.execution_id
+            ),
         )
         if isinstance(result, ApprovalNeeded):
             return result
@@ -538,6 +566,18 @@ def create_app(
             os.getenv("LOCAL_APPROVAL_EXTENSION_URI", LOCAL_APPROVAL_STATUS_URI),
         ),
     )
+    closed = False
+
+    def close():
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        agent.close()
+        telemetry.shutdown()
+        if state["database"]:
+            state["database"].close()
+
     app = build_starlette_app(
         agent_card=card,
         handler=handle,
@@ -551,6 +591,7 @@ def create_app(
         resume_handler=resume,
         push_config_store=push_config_store,
         push_sender=push_sender,
+        shutdown_handler=close,
     )
 
     async def live(_request):
@@ -574,12 +615,7 @@ def create_app(
     app.state.operator_control_plane = control_plane
     app.state.database = state["database"]
     app.state.push_sender = push_sender
-
-    def close():
-        agent.close()
-        telemetry.shutdown()
-        if state["database"]:
-            state["database"].close()
+    app.state.telemetry = telemetry
 
     atexit.register(close)
     app.state.close = close

@@ -391,6 +391,11 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(outgoing["traceparent"], incoming["traceparent"])
         self.assertIsNone(context.tenant_id)
         self.assertIsNone(context.authorization)
+        invalid = telemetry.extract(
+            {"traceparent": "00-not-a-trace-id-not-a-span-id-01"}
+        )
+        self.assertNotEqual(invalid.trace_id, "not-a-trace-id")
+        self.assertEqual(telemetry.dropped_records, 1)
 
     def test_background_task_uses_new_trace_with_link_not_long_request_span(self):
         exporter = RecordingExporter()

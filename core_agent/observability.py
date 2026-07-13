@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 import contextvars
+import re
 from dataclasses import dataclass
 
 from .errors import CoreError
@@ -232,7 +233,16 @@ class Telemetry:
         if not value:
             return TraceContext(_hex(16), _hex(8))
         parts = value.split("-")
-        if len(parts) != 4:
+        if (
+            len(parts) != 4
+            or parts[0] != "00"
+            or not re.fullmatch(r"[0-9a-f]{32}", parts[1])
+            or not re.fullmatch(r"[0-9a-f]{16}", parts[2])
+            or not re.fullmatch(r"[0-9a-f]{2}", parts[3])
+            or int(parts[1], 16) == 0
+            or int(parts[2], 16) == 0
+        ):
+            self.dropped_records += 1
             return TraceContext(_hex(16), _hex(8))
         return TraceContext(parts[1], parts[2], parts[3])
 

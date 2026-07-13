@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import ipaddress
 import json
@@ -152,13 +153,21 @@ class McpManager:
 class StreamableHttpMcpConnector:
     """Minimal MCP Streamable HTTP client with initialize/discovery and JSON-RPC calls."""
 
-    def __init__(self, *, timeout=30, headers=None, protocol_versions=("2025-11-25",)):
+    def __init__(
+        self,
+        *,
+        timeout=30,
+        headers=None,
+        protocol_versions=("2025-11-25",),
+        telemetry=None,
+    ):
         self.timeout = timeout
         self.headers = dict(headers or {})
         self._servers = {}
         self._connections = []
         self.protocol_versions = tuple(protocol_versions)
         self._negotiated_versions = {}
+        self.telemetry = telemetry
 
     @property
     def connections(self):
@@ -177,34 +186,54 @@ class StreamableHttpMcpConnector:
             pass
         if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
             raise CoreError("MCP_CONNECTION_FAILED")
-        payload = {"jsonrpc": "2.0", "method": method}
-        if not notification:
-            payload["id"] = str(uuid.uuid4())
-        if params is not None:
-            payload["params"] = params
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "Mcp-Method": method,
-            **self.headers,
-        }
-        target_name = (params or {}).get("name") or (params or {}).get("uri")
-        if target_name:
-            headers["Mcp-Name"] = target_name
-        if server in self._negotiated_versions:
-            headers["MCP-Protocol-Version"] = self._negotiated_versions[server]
-        request = Request(
-            endpoint, data=json.dumps(payload).encode(), headers=headers, method="POST"
+        span = (
+            self.telemetry.span(
+                "mcp.client",
+                attributes={
+                    "rpc.system": "jsonrpc",
+                    "rpc.method": method,
+                    "server.address": parsed.hostname or "unknown",
+                },
+            )
+            if self.telemetry
+            else contextlib.nullcontext()
         )
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                if notification:
-                    return None
-                value = json.load(response)
-        except Exception as error:
-            raise CoreError(
-                "MCP_CONNECTION_FAILED", str(error), retryable=True
-            ) from error
+        with span as active_span:
+            call_params = dict(params or {})
+            payload = {"jsonrpc": "2.0", "method": method}
+            if not notification:
+                payload["id"] = str(uuid.uuid4())
+            if params is not None:
+                payload["params"] = call_params
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Mcp-Method": method,
+                **self.headers,
+            }
+            if self.telemetry:
+                carrier = {}
+                self.telemetry.inject(active_span.context, carrier)
+                headers.update(carrier)
+                call_params["_meta"] = carrier
+            target_name = call_params.get("name") or call_params.get("uri")
+            if target_name:
+                headers["Mcp-Name"] = target_name
+            if server in self._negotiated_versions:
+                headers["MCP-Protocol-Version"] = self._negotiated_versions[server]
+            request = Request(
+                endpoint,
+                data=json.dumps(payload).encode(),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    if notification:
+                        return None
+                    value = json.load(response)
+            except Exception as error:
+                raise CoreError("MCP_CONNECTION_FAILED", retryable=True) from error
         if "error" in value:
             raise CoreError("MCP_PROTOCOL_ERROR", data=value["error"])
         return value.get("result", {})
