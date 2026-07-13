@@ -247,6 +247,7 @@ def _agent(model, mcp_connector=None, *, state=None):
                 "model_turns": platform.max_model_turns,
                 "tool_calls": platform.max_tool_calls,
                 "depth": int(os.getenv("CORE_AGENT_MAX_DEPTH", "3")),
+                "fan_out": int(os.getenv("CORE_AGENT_MAX_FAN_OUT", "4")),
             },
         }
     )

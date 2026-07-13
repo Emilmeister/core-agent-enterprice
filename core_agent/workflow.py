@@ -40,13 +40,37 @@ class InMemoryWorkflowStore:
         self._records = {}
         self._leases = {}
         self._lock = threading.RLock()
+        self._budgets = {}
 
-    def create(self, record, **_metadata):
+    def create(self, record, *, budget_limits=(100, 200), **_metadata):
         with self._lock:
             if record.run_id in self._records:
                 raise CoreError("SESSION_CONFLICT")
+            if record.parent_run_id:
+                parent = self._records.get(record.parent_run_id)
+                if parent is None:
+                    raise CoreError("TASK_NOT_FOUND")
+                root_run_id = parent.snapshot.get("budget_root_id", parent.run_id)
+            else:
+                root_run_id = record.run_id
+                self._budgets[root_run_id] = [*budget_limits, 0, 0]
+            record = WorkflowRecord(
+                **{
+                    **record.__dict__,
+                    "snapshot": {**record.snapshot, "budget_root_id": root_run_id},
+                }
+            )
             self._records[record.run_id] = record
             return record
+
+    def consume_budget(self, record, *, model_turns=0, tool_calls=0):
+        with self._lock:
+            root = record.snapshot["budget_root_id"]
+            budget = self._budgets[root]
+            if budget[2] + model_turns > budget[0] or budget[3] + tool_calls > budget[1]:
+                raise CoreError("BUDGET_EXCEEDED")
+            budget[2] += model_turns
+            budget[3] += tool_calls
 
     def get(self, run_id, *, tenant_id, owner_id=None, **_options):
         with self._lock:
@@ -310,11 +334,49 @@ class PostgresWorkflowStore:
             ),
         )
 
-    def create(self, record, *, audit=(), outbox_payload=None):
+    def create(
+        self,
+        record,
+        *,
+        audit=(),
+        outbox_payload=None,
+        budget_limits=(100, 200),
+    ):
         now = self.clock()
         if record.version != 1:
             raise CoreError("INVALID_TASK_STATE")
         with self.database.transaction() as connection:
+            if record.parent_run_id:
+                parent = connection.execute(
+                    """SELECT snapshot FROM core_runs
+                       WHERE run_id = %s AND tenant_id = %s FOR SHARE""",
+                    (record.parent_run_id, record.tenant_id),
+                ).fetchone()
+                if parent is None:
+                    raise CoreError("TASK_NOT_FOUND")
+                root_run_id = parent["snapshot"].get(
+                    "budget_root_id", record.parent_run_id
+                )
+            else:
+                root_run_id = record.run_id
+                connection.execute(
+                    """INSERT INTO core_budget_ledgers
+                       (root_run_id, tenant_id, max_model_turns, max_tool_calls,
+                        updated_at) VALUES (%s, %s, %s, %s, %s)""",
+                    (
+                        root_run_id,
+                        record.tenant_id,
+                        budget_limits[0],
+                        budget_limits[1],
+                        now,
+                    ),
+                )
+            record = WorkflowRecord(
+                **{
+                    **record.__dict__,
+                    "snapshot": {**record.snapshot, "budget_root_id": root_run_id},
+                }
+            )
             connection.execute(
                 """INSERT INTO core_runs
                    (run_id, task_id, context_id, tenant_id, owner_id,
@@ -363,6 +425,31 @@ class PostgresWorkflowStore:
                 now,
             )
         return self.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+
+    def consume_budget(self, record, *, model_turns=0, tool_calls=0):
+        now = self.clock()
+        root_run_id = record.snapshot["budget_root_id"]
+        with self.database.transaction() as connection:
+            updated = connection.execute(
+                """UPDATE core_budget_ledgers SET
+                     used_model_turns = used_model_turns + %s,
+                     used_tool_calls = used_tool_calls + %s,
+                     updated_at = %s
+                   WHERE root_run_id = %s AND tenant_id = %s
+                     AND used_model_turns + %s <= max_model_turns
+                     AND used_tool_calls + %s <= max_tool_calls""",
+                (
+                    model_turns,
+                    tool_calls,
+                    now,
+                    root_run_id,
+                    record.tenant_id,
+                    model_turns,
+                    tool_calls,
+                ),
+            )
+        if updated.rowcount != 1:
+            raise CoreError("BUDGET_EXCEEDED")
 
     def get(self, run_id, *, tenant_id, owner_id=None, connection=None, lock=False):
         def query(db):

@@ -23,7 +23,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -304,6 +304,17 @@ CREATE INDEX core_artifacts_run_idx
     5: """
 UPDATE core_a2a_tasks SET tenant = 'default' WHERE tenant = '';
 """,
+    6: """
+CREATE TABLE core_budget_ledgers (
+    root_run_id text PRIMARY KEY,
+    tenant_id text NOT NULL,
+    max_model_turns integer NOT NULL,
+    max_tool_calls integer NOT NULL,
+    used_model_turns integer NOT NULL DEFAULT 0,
+    used_tool_calls integer NOT NULL DEFAULT 0,
+    updated_at double precision NOT NULL
+);
+""",
 }
 
 
@@ -437,6 +448,7 @@ class PostgresDatabase:
             "core_push_notification_configs": "SELECT, INSERT, UPDATE, DELETE",
             "core_push_deliveries": "SELECT, INSERT, UPDATE",
             "core_artifacts": "SELECT, INSERT, UPDATE, DELETE",
+            "core_budget_ledgers": "SELECT, INSERT, UPDATE, DELETE",
         }
         with self.transaction() as connection:
             connection.execute(

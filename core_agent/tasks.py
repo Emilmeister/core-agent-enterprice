@@ -63,6 +63,7 @@ class TaskScheduler:
         self._tasks = {}
         self._mailboxes = {}
         self._closed = False
+        self._kinds = {}
         self.telemetry = telemetry
         self.active_compute_waiters = 0
 
@@ -84,6 +85,7 @@ class TaskScheduler:
     ):
         task = BackgroundTask(str(uuid.uuid4()), owner_id, required)
         self._tasks[task.id] = task
+        self._kinds[task.id] = kind
         linked_context = trace_context
         if self.telemetry and linked_context is None:
             with self.telemetry.span("core_agent.task.submit") as submission:
@@ -132,6 +134,15 @@ class TaskScheduler:
 
         threading.Thread(target=run, daemon=True).start()
         return task
+
+    def count(self, *, owner_id, kind=None, active_only=False, tenant_id="default"):
+        terminal = {"completed", "failed", "canceled"}
+        return sum(
+            task.owner_id == owner_id
+            and (kind is None or self._kinds.get(task.id) == kind)
+            and (not active_only or task.state not in terminal)
+            for task in self._tasks.values()
+        )
 
     def get(self, task_id, *, owner_id=None, tenant_id="default"):
         try:
@@ -215,6 +226,14 @@ class DelegationContract:
             not isinstance(raw, dict)
             or not required <= set(raw)
             or not raw["instruction"].strip()
+            or (
+                raw.get("result_schema") is not None
+                and (
+                    not isinstance(raw["result_schema"], str)
+                    or not raw["result_schema"].startswith("artifact://")
+                    or not raw["result_schema"].removeprefix("artifact://")
+                )
+            )
         ):
             raise CoreError("INVALID_REQUEST")
         return cls(

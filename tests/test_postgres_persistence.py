@@ -166,7 +166,7 @@ class PostgresRestartTests(unittest.TestCase):
                    core_audit_records, core_a2a_tasks, core_runs,
                    core_background_tasks, core_notifications, core_outbox,
                    core_push_notification_configs, core_push_deliveries,
-                   core_artifacts CASCADE"""
+                   core_artifacts, core_budget_ledgers CASCADE"""
             )
 
     def _state(self, database):
@@ -500,8 +500,32 @@ class PostgresRestartTests(unittest.TestCase):
                 {"turns": 0},
             ),
             audit=(("task.started", {"safe": True}),),
+            budget_limits=(2, 2),
         )
         self.assertEqual(created.version, 1)
+        child = workflows.create(
+            WorkflowRecord(
+                "run-child",
+                "task-child",
+                "context-1",
+                "tenant-1",
+                "owner-1",
+                created.run_id,
+                "RUNNING",
+                1,
+                {"prompt": "child", "mcp": [], "skills": []},
+                {"turns": 0},
+            ),
+            budget_limits=(100, 100),
+        )
+        self.assertEqual(
+            child.snapshot["budget_root_id"], created.snapshot["budget_root_id"]
+        )
+        workflows.consume_budget(created, model_turns=1, tool_calls=1)
+        workflows.consume_budget(child, model_turns=1, tool_calls=1)
+        with self.assertRaises(CoreError) as caught:
+            workflows.consume_budget(child, model_turns=1)
+        self.assertEqual(caught.exception.code, "BUDGET_EXCEEDED")
         token = workflows.acquire_lease(
             "run-1",
             tenant_id="tenant-1",

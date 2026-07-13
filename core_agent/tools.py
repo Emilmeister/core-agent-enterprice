@@ -86,6 +86,10 @@ def _validate(schema, value):
     return True
 
 
+def validate_json_schema(schema, value):
+    return isinstance(schema, dict) and _validate(schema, value)
+
+
 def _contains_private_reasoning(value):
     if isinstance(value, dict):
         return any(

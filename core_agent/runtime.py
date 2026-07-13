@@ -20,7 +20,7 @@ from .approvals import ApprovalRequest
 from .skills import SkillResolver
 from .kernel import KernelCompiler
 from .tasks import DelegationContract
-from .tools import ToolCall, ToolDefinition, ToolResult
+from .tools import ToolCall, ToolDefinition, ToolResult, validate_json_schema
 from .workflow import InMemoryWorkflowStore, WorkflowRecord
 
 
@@ -355,7 +355,21 @@ class CoreAgent:
             ),
             ("task.started", {}),
         )
-        record = self.workflow_store.create(record, audit=audit)
+        budgets = raw.get("budgets", {})
+        record = self.workflow_store.create(
+            record,
+            audit=audit,
+            budget_limits=(
+                min(
+                    budgets.get("model_turns", self.platform_config.max_model_turns),
+                    self.platform_config.max_model_turns,
+                ),
+                min(
+                    budgets.get("tool_calls", self.platform_config.max_tool_calls),
+                    self.platform_config.max_tool_calls,
+                ),
+            ),
+        )
         if not self.workflow_store.atomic:
             for kind, data in audit:
                 self.audit_log.append(run_id, kind, data)
@@ -652,6 +666,7 @@ class CoreAgent:
                     )
                     context = compacted
                 if snapshot["pending_response"] is None:
+                    self.workflow_store.consume_budget(record, model_turns=1)
                     with self.telemetry.span("core_agent.context.assemble"):
                         model_context = "\n".join(
                             item.content for item in context.active
@@ -687,6 +702,7 @@ class CoreAgent:
                 if snapshot["tool_queue"]:
                     if snapshot["tool_calls"] >= max_tools:
                         raise CoreError("BUDGET_EXCEEDED")
+                    self.workflow_store.consume_budget(record, tool_calls=1)
                     pending = snapshot["tool_queue"][0]
                     effective.require_tool(pending["name"])
                     call = ToolCall(
@@ -1010,9 +1026,18 @@ class CoreAgent:
             "turns": raw.get("budgets", {}).get("model_turns", 100),
             "tool_calls": raw.get("budgets", {}).get("tool_calls", 200),
             "depth": raw.get("budgets", {}).get("depth", 3),
+            "fan_out": raw.get("budgets", {}).get("fan_out", 4),
         }
+        scope = self._run_scopes.get(run_id, {})
         if (
             self.depth >= parent_budget["depth"]
+            or self.task_scheduler.count(
+                owner_id=run_id,
+                kind="subagent",
+                active_only=True,
+                tenant_id=scope.get("tenant_id", "default"),
+            )
+            >= parent_budget["fan_out"]
             or not set(contract.tools) <= self._enabled_builtins()
             or not set(contract.skills) <= set(effective.skills)
             or any(
@@ -1064,10 +1089,27 @@ class CoreAgent:
             "tool_calls", parent_budget["tool_calls"]
         )
         child = self._child_agent(child_raw, contract.tools)
-        scope = self._run_scopes.get(run_id, {})
         child_task_id = str(uuid.uuid4())
+        result_schema = None
+        if contract.result_schema:
+            if self.artifact_store is None:
+                raise CoreError("CAPABILITY_DISABLED")
+            schema_id = contract.result_schema.removeprefix("artifact://")
+            _metadata, schema_content = self.artifact_store.get(
+                scope.get("tenant_id", "default"), schema_id
+            )
+            try:
+                result_schema = json.loads(schema_content)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise CoreError("INVALID_REQUEST") from None
         child_request = {
-            "prompt": contract.instruction,
+            "prompt": contract.instruction
+            + (
+                "\nReturn only JSON conforming to this result schema:\n"
+                + json.dumps(result_schema, sort_keys=True)
+                if result_schema
+                else ""
+            ),
             "mcp": [
                 declaration
                 for declaration in request.mcp
@@ -1087,7 +1129,9 @@ class CoreAgent:
             "parent_run_id": run_id,
         }
         task = self.task_scheduler.start(
-            lambda: child.run(child_request, **child_scope),
+            lambda: self._run_child(
+                child, child_request, child_scope, result_schema
+            ),
             owner_id=run_id,
             required=True,
             kind="subagent",
@@ -1096,6 +1140,7 @@ class CoreAgent:
                 "agent_config": child_raw,
                 "tools": list(contract.tools),
                 "scope": child_scope,
+                "result_schema": result_schema,
             },
             recoverable=True,
             tenant_id=scope.get("tenant_id", "default"),
@@ -1136,13 +1181,30 @@ class CoreAgent:
         )
         return child
 
+    @staticmethod
+    def _run_child(child, request, scope, result_schema):
+        result = child.run(request, **scope)
+        if result_schema:
+            try:
+                value = json.loads(result.message)
+            except json.JSONDecodeError:
+                raise CoreError("CHILD_RESULT_INVALID") from None
+            if not validate_json_schema(result_schema, value):
+                raise CoreError("CHILD_RESULT_INVALID")
+        return result
+
     def _recover_subagent(self, contract, cancel_event):
         if cancel_event.is_set():
             return None
         child = self._child_agent(
             copy.deepcopy(contract["agent_config"]), tuple(contract["tools"])
         )
-        return child.run(dict(contract["request"]), **dict(contract["scope"]))
+        return self._run_child(
+            child,
+            dict(contract["request"]),
+            dict(contract["scope"]),
+            contract.get("result_schema"),
+        )
 
     def run(
         self,

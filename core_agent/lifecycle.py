@@ -99,5 +99,9 @@ class PostgresRetentionManager:
                 "DELETE FROM core_runs WHERE tenant_id = %s AND run_id = ANY(%s)",
                 (tenant_id, run_ids),
             )
+            connection.execute(
+                "DELETE FROM core_budget_ledgers WHERE tenant_id = %s AND root_run_id = %s",
+                (tenant_id, run_id),
+            )
         self.artifact_store.purge_unreferenced(digests)
         return {"deleted": True, "runs": len(run_ids), "artifacts": len(digests)}

@@ -298,6 +298,18 @@ class PostgresTaskScheduler:
             ).fetchall()
         return tuple(self._task(row) for row in rows)
 
+    def count(self, *, owner_id, kind=None, active_only=False, tenant_id="default"):
+        sql = """SELECT count(*) AS count FROM core_background_tasks
+                 WHERE tenant_id = %s AND owner_run_id = %s"""
+        values = [tenant_id, owner_id]
+        if kind is not None:
+            sql += " AND kind = %s"
+            values.append(kind)
+        if active_only:
+            sql += " AND state NOT IN ('completed','failed','canceled')"
+        with self.database.pool.connection() as connection:
+            return connection.execute(sql, values).fetchone()["count"]
+
     def wait(self, task_id, timeout=None, *, owner_id=None, tenant_id="default"):
         end = None if timeout is None else time.monotonic() + timeout
         condition = self._condition(task_id)
