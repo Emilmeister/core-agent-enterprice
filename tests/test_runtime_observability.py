@@ -1,6 +1,8 @@
 import tempfile
 import time
 import unittest
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from core_agent.audit import InMemoryAuditLog
@@ -437,6 +439,48 @@ class ObservabilityTests(unittest.TestCase):
             pass
         self.assertEqual(audit.records("run-1")[0].kind, "task.completed")
         self.assertEqual(telemetry.dropped_records, 1)
+
+    def test_otlp_http_exports_traces_metrics_and_logs_without_content(self):
+        received = []
+
+        class Collector(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                received.append((self.path, body))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-protobuf")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        telemetry = Telemetry.otlp(
+            endpoint=f"http://127.0.0.1:{server.server_port}",
+            service_name="collector-integration-test",
+        )
+        try:
+            with telemetry.span(
+                "core_agent.test",
+                attributes={"gen_ai.input.messages": "secret prompt"},
+            ):
+                pass
+            telemetry.metric("core_agent.test.count", 1, labels={"outcome": "ok"})
+            telemetry.log(
+                "safe-event",
+                attributes={"gen_ai.output.messages": "secret response"},
+            )
+            telemetry.shutdown()
+        finally:
+            server.shutdown()
+            server.server_close()
+        paths = {path for path, _body in received}
+        self.assertEqual(paths, {"/v1/traces", "/v1/metrics", "/v1/logs"})
+        payload = b"".join(body for _path, body in received)
+        self.assertNotIn(b"secret prompt", payload)
+        self.assertNotIn(b"secret response", payload)
 
     def test_memory_service_continues_core_mcp_trace_and_owns_internal_spans(self):
         exporter = RecordingExporter()
