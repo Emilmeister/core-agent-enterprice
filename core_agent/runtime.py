@@ -152,7 +152,10 @@ class CoreAgent:
             "Only EffectiveConfig capabilities are authorized.",
             "Validate tools, preserve durable state, and fail closed. When "
             "core.delegate is absent, complete the task directly and do not try to "
-            "create another agent. Provider tool aliases are transport-only; never "
+            "create another agent. core.delegate joins by default; consume its child "
+            "result and never repeat or perform the delegated work yourself. Use "
+            "background=true only for independent work and wait when its result is "
+            "needed. Provider tool aliases are transport-only; never "
             "mention them in user-facing text, use canonical names from tool "
             "descriptions, and never infer meaning from alias spelling.",
         )
@@ -745,19 +748,84 @@ class CoreAgent:
         )
         snapshot["context"] = self._context_to_dict(context)
 
-    def _append_result(self, snapshot, text):
+    def _append_context_item(self, snapshot, kind, text):
         context = self._context_from_dict(snapshot["context"])
-        item = ContextItem("tool_result", text, self.token_counter(text))
+        item = ContextItem(kind, text, self.token_counter(text))
         context = ContextState(
             context.active + (item,),
             context.transcript + (item,),
             (context.sequence_range[0], context.sequence_range[1] + 1),
         )
         snapshot["context"] = self._context_to_dict(context)
+
+    def _append_result(self, snapshot, text):
+        self._append_context_item(snapshot, "tool_result", text)
         snapshot["pending_call"] = None
         snapshot["execution_id"] = None
         if snapshot["tool_queue"]:
             snapshot["tool_queue"].pop(0)
+
+    def _ack_task_notifications(self, run_id, tenant_id, task_id):
+        mailbox = self.task_scheduler.mailbox(run_id, tenant_id)
+        for notification in mailbox.poll():
+            if notification.task_id == task_id:
+                try:
+                    mailbox.ack(notification.id)
+                except CoreError as error:
+                    if error.code != "TASK_NOT_FOUND":
+                        raise
+
+    def _consume_task_notifications(
+        self, record, snapshot, *, lease_token
+    ):
+        mailbox = self.task_scheduler.mailbox(record.run_id, record.tenant_id)
+        notifications = mailbox.poll()
+        if not notifications:
+            return record, snapshot
+        seen = {
+            tuple(item) for item in snapshot.get("task_notification_revisions", ())
+        }
+        consumed = []
+        for notification in notifications:
+            key = (notification.task_id, notification.kind, notification.revision)
+            if key not in seen:
+                content = json.dumps(
+                    {
+                        "task_notification": {
+                            "task_id": notification.task_id,
+                            "kind": notification.kind,
+                            "revision": notification.revision,
+                            "payload": self._value(notification.payload),
+                        }
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+                self._append_context_item(snapshot, "task_notification", content)
+                seen.add(key)
+                consumed.append(notification)
+        snapshot["task_notification_revisions"] = [
+            list(item) for item in sorted(seen)
+        ]
+        if consumed:
+            record = self._record_transition(
+                record,
+                state="RUNNING",
+                snapshot=snapshot,
+                event_kind="task.notifications.consumed",
+                event_data={
+                    "count": len(consumed),
+                    "task_ids": sorted({item.task_id for item in consumed}),
+                },
+                lease_token=lease_token,
+            )
+        for notification in notifications:
+            try:
+                mailbox.ack(notification.id)
+            except CoreError as error:
+                if error.code != "TASK_NOT_FOUND":
+                    raise
+        return record, snapshot
 
     @staticmethod
     def _recoverable_tool_error(call, error):
@@ -818,7 +886,7 @@ class CoreAgent:
             **({"error_code": error_code} if error_code else {}),
             **({"output": self._value(outcome.output)} if self.log_content else {}),
         )
-        return self._record_transition(
+        updated = self._record_transition(
             record,
             state="RUNNING",
             snapshot=snapshot,
@@ -835,6 +903,17 @@ class CoreAgent:
             ),
             lease_token=lease_token,
         )
+        output = outcome.output if isinstance(outcome, ToolResult) else outcome
+        if (
+            call.name in {"core.delegate", "core.task.get", "core.task.wait"}
+            and isinstance(output, dict)
+            and output.get("state") in {"completed", "failed", "canceled"}
+            and isinstance(output.get("task_id"), str)
+        ):
+            self._ack_task_notifications(
+                record.run_id, record.tenant_id, output["task_id"]
+            )
+        return updated
 
     def _execute_pending(
         self,
@@ -1005,6 +1084,9 @@ class CoreAgent:
             )
             compactor = self._context_compactor(raw, effective, discovered, snapshot)
             while snapshot["turns"] < max_turns:
+                record, snapshot = self._consume_task_notifications(
+                    record, snapshot, lease_token=lease_token
+                )
                 context = self._context_from_dict(snapshot["context"])
                 compacted = compactor.maybe_compact(context)
                 if compacted is not context:
@@ -1609,7 +1691,27 @@ class CoreAgent:
             recoverable=True,
             tenant_id=scope.get("tenant_id", "default"),
         )
-        return self._task_snapshot(task)
+        if not contract.background:
+            task = self.task_scheduler.wait(
+                task.id,
+                owner_id=run_id,
+                tenant_id=scope.get("tenant_id", "default"),
+            )
+            return {**self._task_snapshot(task), "mode": "joined"}
+        return {
+            **self._task_snapshot(task),
+            "mode": "background",
+            "notification_channel": "durable_mailbox",
+            "next_action": {
+                "tool": "core.task.wait",
+                "arguments": {"task_id": task.id},
+            },
+            "instruction": (
+                "Continue only independent work. Before using this result or answering "
+                "the delegated objective, call core.task.wait with this task_id. Do not "
+                "repeat or perform the delegated work yourself."
+            ),
+        }
 
     def _child_agent(self, child_raw, tools):
         child_registry = type(self.tool_runtime.registry)()

@@ -247,6 +247,7 @@ class DelegationTests(unittest.TestCase):
         for changes in (
             {"budget": {"max_steps": 3}},
             {"result_schema": '{"type":"object"}'},
+            {"background": "yes"},
         ):
             raw = {
                 "instruction": "Review",
@@ -260,6 +261,28 @@ class DelegationTests(unittest.TestCase):
                 with self.assertRaises(CoreError) as caught:
                     DelegationContract.from_dict(raw)
                 self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
+
+        joined = DelegationContract.from_dict(
+            {
+                "instruction": "Review",
+                "tools": [],
+                "mcp": {},
+                "skills": [],
+                "budget": {"turns": 2, "tool_calls": 1},
+            }
+        )
+        background = DelegationContract.from_dict(
+            {
+                "instruction": "Review",
+                "tools": [],
+                "mcp": {},
+                "skills": [],
+                "budget": {"turns": 2, "tool_calls": 1},
+                "background": True,
+            }
+        )
+        self.assertFalse(joined.background)
+        self.assertTrue(background.background)
 
     def test_memory_is_shared_only_when_same_server_tools_and_namespace_are_explicit(
         self,

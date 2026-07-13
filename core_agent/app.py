@@ -315,6 +315,10 @@ def _agent(model, mcp_connector=None, *, state=None):
         "core.delegate": (
             (
                 "Start a focused child Core Agent with an exact capability contract. "
+                "By default wait passively and return the completed child result. Set "
+                "background=true only for genuinely independent work, then consume its "
+                "notification or call core.task.wait exactly once; never repeat or perform "
+                "the delegated work yourself. "
                 "Budget accepts only turns/tool_calls. result_schema is an optional "
                 "artifact:// reference created before delegation, never inline JSON."
             ),
@@ -342,6 +346,7 @@ def _agent(model, mcp_connector=None, *, state=None):
                     "type": "string",
                     "pattern": "^artifact://.+",
                 },
+                "background": {"type": "boolean"},
             },
             ["instruction", "tools", "mcp", "skills", "budget"],
         ),
@@ -499,7 +504,11 @@ def _agent(model, mcp_connector=None, *, state=None):
             ),
             "delegation": (
                 "DELEGATION: A child receives no capability unless explicitly listed; "
-                "shared memory requires the same explicitly delegated Memory MCP namespace."
+                "shared memory requires the same explicitly delegated Memory MCP namespace. "
+                "core.delegate joins by default: consume its child result, never repeat the "
+                "same delegation, and never perform delegated work yourself. Use "
+                "background=true only for independent foreground work; wait on the returned "
+                "task ID when its result becomes necessary."
             ),
         },
     )

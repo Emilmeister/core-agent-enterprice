@@ -219,11 +219,12 @@ class DelegationContract:
     skills: tuple[str, ...]
     budget: dict[str, int]
     result_schema: str | None = None
+    background: bool = False
 
     @classmethod
     def from_dict(cls, raw):
         required = {"instruction", "tools", "mcp", "skills", "budget"}
-        allowed = required | {"result_schema"}
+        allowed = required | {"result_schema", "background"}
         if (
             not isinstance(raw, dict)
             or not required <= set(raw)
@@ -250,6 +251,7 @@ class DelegationContract:
                 and value > 0
                 for value in raw["budget"].values()
             )
+            or not isinstance(raw.get("background", False), bool)
             or (
                 raw.get("result_schema") is not None
                 and (
@@ -267,6 +269,7 @@ class DelegationContract:
             tuple(raw["skills"]),
             dict(raw["budget"]),
             raw.get("result_schema"),
+            raw.get("background", False),
         )
 
 

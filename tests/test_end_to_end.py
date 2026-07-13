@@ -62,6 +62,7 @@ class ModelHandler(BaseHTTPRequestHandler):
     depth_two_instructions = []
     workspaces = []
     skill_instructions_seen = False
+    joined_parent_artifact_calls = 0
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -117,6 +118,38 @@ class ModelHandler(BaseHTTPRequestHandler):
                     },
                 )
             )
+        elif "JOIN_CHILD_E2E" in context:
+            message = (
+                _tool(
+                    body,
+                    "core.artifact.put",
+                    {"content": "child-created", "media_type": "text/plain"},
+                )
+                if '"media_type": "text/plain"' not in context
+                else _text("joined-child-result")
+            )
+        elif "DELEGATE_JOIN_E2E" in context:
+            if '"mode": "joined"' in context and "joined-child-result" in context:
+                message = _text("delegate-join-ok")
+            elif '"tool_name": "core.delegate"' not in context:
+                message = _tool(
+                    body,
+                    "core.delegate",
+                    {
+                        "instruction": "JOIN_CHILD_E2E: create the artifact",
+                        "tools": ["core.artifact.put"],
+                        "mcp": {},
+                        "skills": [],
+                        "budget": {"turns": 3, "tool_calls": 2},
+                    },
+                )
+            else:
+                type(self).joined_parent_artifact_calls += 1
+                message = _tool(
+                    body,
+                    "core.artifact.put",
+                    {"content": "parent-duplicate", "media_type": "text/plain"},
+                )
         elif "SLOW_A2A_E2E" in context:
             time.sleep(0.1)
             message = _text("slow-a2a-ok")
@@ -800,6 +833,11 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             all(catalog == {terminal_name} for catalog in ModelHandler.child_catalogs)
         )
         self.assertGreaterEqual(len(set(ModelHandler.workspaces)), 2)
+
+    async def test_delegate_joins_and_parent_does_not_duplicate_child_work(self):
+        ModelHandler.joined_parent_artifact_calls = 0
+        self.assertEqual(await self._send("DELEGATE_JOIN_E2E"), "delegate-join-ok")
+        self.assertEqual(ModelHandler.joined_parent_artifact_calls, 0)
 
     async def test_child_can_delegate_one_more_level_but_grandchild_cannot(self):
         ModelHandler.depth_two_catalogs.clear()

@@ -13,7 +13,7 @@
 - `core.task.list` — перечислить дочерние tasks текущего run/session;
 - `core.task.cancel` — запросить отмену;
 - `core.task.wait` — passive wait до notification, timeout или cancellation;
-- `core.delegate` — создать child-agent Task по строгому delegation contract.
+- `core.delegate` — создать child-agent Task по строгому delegation contract; по умолчанию passive join возвращает terminal child result, а `background: true` явно запрашивает неблокирующий task handle.
 
 `core.task.wait` MUST освобождать model worker и compute lease. Busy polling через terminal или повторные model turns запрещён, если scheduler способен прислать notification.
 
@@ -29,6 +29,8 @@
 - завершить parent только после явного решения, что pending result не нужен.
 
 Вызов start не добавляет весь будущий output в контекст. Возвращаются task ID, accepted contract, initial state и ожидаемый notification channel.
+
+После joined `core.delegate` parent MUST использовать возвращённый child result и MUST NOT повторять ту же делегацию или выполнять делегированную работу самостоятельно. После `background: true` parent MAY продолжить только независимую работу; если result нужен для ответа, parent вызывает `core.task.wait` с возвращённым task ID либо получает terminal notification на следующей safe boundary.
 
 ## Durable mailbox и notifications
 
@@ -65,6 +67,7 @@ Primary agent при создании сабагента MUST передать �
 - `tools`, `skills` и server-scoped `mcp` являются allowlists, а не рекомендациями;
 - `budget` содержит только положительные integer-поля `turns` и/или `tool_calls`; aliases вроде `max_steps` запрещены schema;
 - `result_schema`, если задана, является `artifact://...` ссылкой на заранее сохранённую JSON Schema, а не inline JSON string;
+- optional `background` является boolean и по умолчанию равен `false`;
 - каждый элемент MUST входить в capability set parent-а;
 - child не видит остальные рабочие tools/skills даже на discovery;
 - protocol-internal lifecycle, audit и safe completion сохраняются runtime-ом, но model-callable tools определяются EffectiveConfig и delegation allowlist; parent не может передать отключённую capability;

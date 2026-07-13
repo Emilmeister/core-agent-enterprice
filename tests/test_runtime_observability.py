@@ -1,5 +1,6 @@
 import json
 import os
+import copy
 import tempfile
 import time
 import unittest
@@ -452,6 +453,82 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(agent.task_scheduler.list(owner_id=run_id), ())
         self.assertEqual(model.calls, ())
         agent.close()
+
+    def test_delegate_joins_by_default_and_returns_child_result(self):
+        model = ScriptedModel([ModelResponse(message="child-result")])
+        agent = make_agent(model, memory="disabled")
+        request = run_request(memory=False)
+        record, _raw, _discovered, _effective = agent._new_workflow(
+            request,
+            task_id="joined-parent-task",
+            identity="owner",
+            session_id="session",
+            tenant_id="default",
+        )
+        try:
+            result = agent._delegate(
+                {
+                    "instruction": "Return child result",
+                    "tools": [],
+                    "mcp": {},
+                    "skills": [],
+                    "budget": {"turns": 2, "tool_calls": 1},
+                },
+                record.run_id,
+            )
+        finally:
+            agent.close()
+        self.assertEqual(result["mode"], "joined")
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["result"]["message"], "child-result")
+
+    def test_completed_background_notification_enters_parent_context_once(self):
+        model = ScriptedModel([ModelResponse(message="unused")])
+        agent = make_agent(model, memory="disabled")
+        record, _raw, _discovered, _effective = agent._new_workflow(
+            run_request(memory=False),
+            task_id="notification-parent",
+            identity="owner",
+            session_id="session",
+            tenant_id="default",
+        )
+        task = agent.task_scheduler.start(
+            lambda: {"message": "child-notification"},
+            owner_id=record.run_id,
+            required=True,
+            kind="test",
+            contract={},
+        )
+        agent.task_scheduler.wait(task.id, owner_id=record.run_id)
+        lease = agent.workflow_store.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id=agent._worker_id,
+            ttl=600,
+        )
+        try:
+            record, snapshot = agent._consume_task_notifications(
+                record, copy.deepcopy(record.snapshot), lease_token=lease
+            )
+            _record, second = agent._consume_task_notifications(
+                record, copy.deepcopy(snapshot), lease_token=lease
+            )
+        finally:
+            agent.workflow_store.release_lease(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                worker_id=agent._worker_id,
+                token=lease,
+            )
+            agent.close()
+        notification_items = [
+            item
+            for item in agent._context_from_dict(second["context"]).active
+            if item.kind == "task_notification"
+        ]
+        self.assertEqual(len(notification_items), 1)
+        self.assertIn("child-notification", notification_items[0].content)
 
     def test_memory_disabled_never_connects_or_discovers_memory(self):
         connector = InMemoryMcpConnector(
