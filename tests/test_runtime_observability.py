@@ -18,7 +18,12 @@ from core_agent.durability import (
 from core_agent.errors import CoreError
 from core_agent.mcp import InMemoryMcpConnector
 from core_agent.kernel import KernelCompiler
-from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
+from core_agent.model import (
+    CompatibleHttpModel,
+    ModelResponse,
+    ScriptedModel,
+    ToolRequest,
+)
 from core_agent.observability import FailingExporter, RecordingExporter, Telemetry
 from core_agent.runtime import CoreAgent
 from core_agent.tasks import TaskScheduler
@@ -223,8 +228,65 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(model.calls), 2)
         second_context = model.calls[1].context
         self.assertIn("tool-ok", second_context)
+        self.assertEqual(
+            [message["role"] for message in model.calls[1].messages],
+            ["user", "assistant", "tool"],
+        )
+        self.assertEqual(
+            model.calls[1].messages[-1]["tool_call_id"], "call-1"
+        )
         self.assertNotIn("reasoning", result.to_dict())
         agent.close()
+
+    def test_provider_adapters_preserve_native_tool_call_and_result_messages(self):
+        tools = {
+            "core.terminal.exec": {
+                "description": "execute",
+                "input_schema": {"type": "object"},
+            }
+        }
+        messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "core.terminal.exec",
+                            "arguments": {"argv": ["check"]},
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "core.terminal.exec",
+                "content": '{"status":"succeeded"}',
+            },
+        ]
+        openai = CompatibleHttpModel(api_format="openai", model="test")
+        body, _headers, _reverse = openai._request(
+            "unused", "system", tools, messages=messages
+        )
+        self.assertEqual(
+            [message["role"] for message in body["messages"]],
+            ["system", "user", "assistant", "tool"],
+        )
+        self.assertEqual(body["messages"][2]["tool_calls"][0]["id"], "call-1")
+        self.assertEqual(body["messages"][3]["tool_call_id"], "call-1")
+
+        anthropic = CompatibleHttpModel(api_format="anthropic", model="test")
+        body, _headers, _reverse = anthropic._request(
+            "unused", "system", tools, messages=messages
+        )
+        self.assertEqual(
+            [message["role"] for message in body["messages"]],
+            ["user", "assistant", "user"],
+        )
+        self.assertEqual(body["messages"][1]["content"][0]["type"], "tool_use")
+        self.assertEqual(body["messages"][2]["content"][0]["type"], "tool_result")
 
     def test_stale_delegate_call_at_maximum_depth_creates_no_task(self):
         model = ScriptedModel([ModelResponse(message="must not run")])
@@ -282,7 +344,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("memory.delete", model.calls[0].tools)
         agent.close()
 
-    def test_protected_kernel_is_compiled_persisted_and_cannot_be_replaced_by_profile(self):
+    def test_protected_kernel_is_compiled_persisted_and_cannot_be_replaced_by_profile(
+        self,
+    ):
         model = ScriptedModel([ModelResponse(message="done")])
         compiler = KernelCompiler(
             "SAFETY IMMUTABLE",
@@ -314,9 +378,7 @@ class RuntimeTests(unittest.TestCase):
         model = ScriptedModel(
             [
                 ModelResponse(
-                    tool_requests=(
-                        ToolRequest(f"call-{index}", "memory.search", {}),
-                    )
+                    tool_requests=(ToolRequest(f"call-{index}", "memory.search", {}),)
                 )
                 for index in range(2)
             ]
@@ -406,6 +468,79 @@ class DurabilityTests(unittest.TestCase):
 
 
 class ObservabilityTests(unittest.TestCase):
+    def test_openinference_llm_and_tool_spans_show_agent_inputs_and_outputs(self):
+        exporter = RecordingExporter()
+        telemetry = Telemetry(exporter, content_enabled=True)
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest(
+                            "call-1", "core.terminal.exec", {"argv": ["check"]}
+                        ),
+                    ),
+                    prompt_tokens=40,
+                    completion_tokens=6,
+                    total_tokens=46,
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(message="done", finish_reason="stop"),
+            ]
+        )
+        model.api_key = "provider-secret"
+        agent = make_agent(model, memory="disabled", telemetry=telemetry)
+        try:
+            request = RunRequest.from_dict(
+                {"prompt": "Do it with provider-secret", "mcp": [], "skills": []}
+            )
+            agent.run(request, session_id="context-1")
+        finally:
+            agent.close()
+
+        llm_spans = [span for span in exporter.spans if span.name == "gen_ai.chat"]
+        self.assertEqual(len(llm_spans), 2)
+        first = llm_spans[0]
+        self.assertEqual(first.attributes["openinference.span.kind"], "LLM")
+        self.assertEqual(first.attributes["session.id"], "context-1")
+        self.assertEqual(
+            first.attributes["llm.input_messages.0.message.content"],
+            model.calls[0].instructions,
+        )
+        self.assertEqual(
+            first.attributes["llm.input_messages.1.message.content"],
+            model.calls[0].context.replace("provider-secret", "[REDACTED]"),
+        )
+        self.assertNotIn("provider-secret", str(first.attributes))
+        tool_schemas = [
+            value
+            for key, value in first.attributes.items()
+            if key.startswith("llm.tools.")
+        ]
+        self.assertTrue(any("core.terminal.exec" in schema for schema in tool_schemas))
+        self.assertEqual(
+            first.attributes[
+                "llm.output_messages.0.message.tool_calls.0.tool_call.function.name"
+            ],
+            "core.terminal.exec",
+        )
+        self.assertEqual(first.attributes["llm.token_count.total"], 46)
+        self.assertEqual(first.status_code, "OK")
+        second = llm_spans[1].attributes
+        self.assertEqual(second["llm.input_messages.2.message.role"], "assistant")
+        self.assertEqual(second["llm.input_messages.3.message.role"], "tool")
+        self.assertEqual(
+            second["llm.input_messages.3.message.tool_call_id"], "call-1"
+        )
+
+        tool_span = next(
+            span for span in exporter.spans if span.name == "core_agent.tool.execute"
+        )
+        self.assertEqual(tool_span.attributes["openinference.span.kind"], "TOOL")
+        self.assertEqual(tool_span.attributes["tool.name"], "core.terminal.exec")
+        self.assertIn('"check"', tool_span.attributes["input.value"])
+        self.assertIn("tool-ok", tool_span.attributes["output.value"])
+        self.assertEqual(tool_span.status_code, "OK")
+
     def test_w3c_context_propagates_without_becoming_authorization(self):
         exporter = RecordingExporter()
         telemetry = Telemetry(exporter)
@@ -444,13 +579,19 @@ class ObservabilityTests(unittest.TestCase):
             attributes={
                 "gen_ai.input.messages": "secret prompt",
                 "gen_ai.tool.call.arguments": {"token": "secret"},
+                "llm.input_messages.0.message.content": "secret system prompt",
+                "llm.tools.0.tool.json_schema": "secret schema",
                 "core_agent.task.state": "working",
             },
-        ):
-            pass
+        ) as span:
+            span.set_attribute("output.value", "secret response")
         attrs = exporter.spans[-1].attributes
         self.assertNotIn("gen_ai.input.messages", attrs)
         self.assertNotIn("gen_ai.tool.call.arguments", attrs)
+        self.assertNotIn("llm.input_messages.0.message.content", attrs)
+        self.assertNotIn("llm.tools.0.tool.json_schema", attrs)
+        self.assertNotIn("output.value", attrs)
+        self.assertEqual(attrs["openinference.span.kind"], "LLM")
         self.assertEqual(attrs["core_agent.task.state"], "working")
         with self.assertRaises(CoreError) as caught:
             telemetry.metric("core_agent.tasks", 1, labels={"task_id": "task-1"})
@@ -464,6 +605,18 @@ class ObservabilityTests(unittest.TestCase):
             pass
         self.assertEqual(audit.records("run-1")[0].kind, "task.completed")
         self.assertEqual(telemetry.dropped_records, 1)
+
+    def test_span_records_error_status_without_error_message_content(self):
+        exporter = RecordingExporter()
+        telemetry = Telemetry(exporter)
+        with self.assertRaisesRegex(ValueError, "secret detail"):
+            with telemetry.span("core_agent.test"):
+                raise ValueError("secret detail")
+        span = exporter.spans[-1]
+        self.assertEqual(span.status_code, "ERROR")
+        self.assertEqual(span.status_message, "ValueError")
+        self.assertEqual(span.attributes["error.type"], "ValueError")
+        self.assertNotIn("secret detail", str(span.attributes))
 
     def test_otlp_http_exports_traces_metrics_and_logs_without_content(self):
         received = []
@@ -532,9 +685,11 @@ class ObservabilityTests(unittest.TestCase):
                 "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": endpoint,
                 "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "",
                 "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "",
+                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
             },
         ):
             telemetry = Telemetry.otlp_from_env(service_name="trace-only-test")
+        self.assertTrue(telemetry.content_enabled)
         try:
             with telemetry.span("core_agent.trace_only"):
                 pass

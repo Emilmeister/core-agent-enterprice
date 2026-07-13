@@ -25,6 +25,10 @@ class ModelResponse:
     tool_requests: tuple[ToolRequest, ...] = ()
     continue_reasoning: bool = False
     reasoning: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    finish_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,7 @@ class ModelCall:
     context: str
     tools: frozenset[str]
     instructions: str
+    messages: tuple[dict, ...] = ()
 
 
 class ScriptedModel:
@@ -43,8 +48,10 @@ class ScriptedModel:
     def calls(self):
         return tuple(self._calls)
 
-    def generate(self, *, context, tools, instructions):
-        self._calls.append(ModelCall(context, frozenset(tools), instructions))
+    def generate(self, *, context, tools, instructions, messages=None):
+        self._calls.append(
+            ModelCall(context, frozenset(tools), instructions, tuple(messages or ()))
+        )
         if not self._responses:
             raise CoreError("MODEL_UNAVAILABLE")
         return self._responses.pop(0)
@@ -58,6 +65,7 @@ class CompatibleHttpModel:
         *,
         api_format,
         model,
+        provider=None,
         base_url=None,
         endpoint=None,
         api_key=None,
@@ -82,6 +90,16 @@ class CompatibleHttpModel:
             raise CoreError("CONFIG_INVALID")
         self.api_format = api_format
         self.model = model
+        hostname = urlparse(self.endpoint).hostname or ""
+        inferred_provider = next(
+            (
+                candidate
+                for candidate in ("openai", "anthropic", "minimax")
+                if candidate in hostname.lower()
+            ),
+            api_format,
+        )
+        self.provider = provider or inferred_provider
         self.api_key = api_key
         self.timeout = float(timeout)
         self.max_tokens = int(max_tokens)
@@ -95,7 +113,9 @@ class CompatibleHttpModel:
 
     def count_tokens(self, text):
         """Conservative provider-neutral estimate when no tokenizer endpoint exists."""
-        return max(1, (len(text.encode("utf-8")) + self.token_chars - 1) // self.token_chars)
+        return max(
+            1, (len(text.encode("utf-8")) + self.token_chars - 1) // self.token_chars
+        )
 
     @staticmethod
     def _endpoint(base_url, suffix):
@@ -145,17 +165,88 @@ class CompatibleHttpModel:
                 )
         return schemas, reverse
 
-    def _request(self, context, instructions, tools):
+    @staticmethod
+    def _openai_messages(messages, reverse):
+        logical_to_wire = {logical: wire for wire, logical in reverse.items()}
+        result = []
+        for message in messages:
+            if message["role"] == "assistant" and message.get("tool_calls"):
+                result.append(
+                    {
+                        "role": "assistant",
+                        "content": message.get("content"),
+                        "tool_calls": [
+                            {
+                                "id": call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": logical_to_wire[call["function"]["name"]],
+                                    "arguments": json.dumps(
+                                        call["function"]["arguments"],
+                                        sort_keys=True,
+                                        separators=(",", ":"),
+                                    ),
+                                },
+                            }
+                            for call in message["tool_calls"]
+                        ],
+                    }
+                )
+                continue
+            current = dict(message)
+            if current["role"] == "tool" and current.get("name"):
+                current["name"] = logical_to_wire[current["name"]]
+            result.append(current)
+        return result
+
+    @staticmethod
+    def _anthropic_messages(messages, reverse):
+        logical_to_wire = {logical: wire for wire, logical in reverse.items()}
+        result = []
+        for message in messages:
+            if message["role"] == "assistant" and message.get("tool_calls"):
+                result.append(
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": call["id"],
+                                "name": logical_to_wire[call["function"]["name"]],
+                                "input": call["function"]["arguments"],
+                            }
+                            for call in message["tool_calls"]
+                        ],
+                    }
+                )
+                continue
+            if message["role"] == "tool":
+                result.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": message["tool_call_id"],
+                                "content": message["content"],
+                            }
+                        ],
+                    }
+                )
+                continue
+            result.append({"role": message["role"], "content": message["content"]})
+        return result
+
+    def _request(self, context, instructions, tools, messages=None):
         schemas, reverse = self._tools(tools)
+        messages = list(messages or ({"role": "user", "content": context},))
         body = dict(self.extra_body)
         if self.api_format == "openai":
             body.update(
                 {
                     "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": instructions},
-                        {"role": "user", "content": context},
-                    ],
+                    "messages": [{"role": "system", "content": instructions}]
+                    + self._openai_messages(messages, reverse),
                 }
             )
         else:
@@ -164,7 +255,7 @@ class CompatibleHttpModel:
                     "model": self.model,
                     "max_tokens": self.max_tokens,
                     "system": instructions,
-                    "messages": [{"role": "user", "content": context}],
+                    "messages": self._anthropic_messages(messages, reverse),
                 }
             )
         if schemas:
@@ -254,11 +345,18 @@ class CompatibleHttpModel:
                 for part in content
                 if isinstance(part, dict) and part.get("type") == "text"
             )
+        usage = response.get("usage") or {}
+        usage_fields = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "finish_reason": response["choices"][0].get("finish_reason"),
+        }
         if calls:
-            return ModelResponse(tool_requests=tuple(calls))
+            return ModelResponse(tool_requests=tuple(calls), **usage_fields)
         if not isinstance(content, str):
             raise CoreError("MODEL_UNAVAILABLE", "model returned no text")
-        return ModelResponse(message=self._public_text(content))
+        return ModelResponse(message=self._public_text(content), **usage_fields)
 
     def _parse_anthropic(self, response, reverse):
         content = response.get("content")
@@ -285,12 +383,28 @@ class CompatibleHttpModel:
                         self._arguments(block.get("input", {})),
                     )
                 )
+        usage = response.get("usage") or {}
+        prompt_tokens = usage.get("input_tokens")
+        completion_tokens = usage.get("output_tokens")
+        total_tokens = (
+            prompt_tokens + completion_tokens
+            if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int)
+            else None
+        )
+        usage_fields = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "finish_reason": response.get("stop_reason"),
+        }
         if calls:
-            return ModelResponse(tool_requests=tuple(calls))
-        return ModelResponse(message=self._public_text("".join(text)))
+            return ModelResponse(tool_requests=tuple(calls), **usage_fields)
+        return ModelResponse(message=self._public_text("".join(text)), **usage_fields)
 
-    def generate(self, *, context, tools, instructions):
-        body, headers, reverse = self._request(context, instructions, tools)
+    def generate(self, *, context, tools, instructions, messages=None):
+        body, headers, reverse = self._request(
+            context, instructions, tools, messages=messages
+        )
         response = self._post(body, headers)
         if self.api_format == "openai":
             return self._parse_openai(response, reverse)

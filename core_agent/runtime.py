@@ -24,6 +24,7 @@ from .errors import CoreError
 from .approvals import ApprovalRequest
 from .skills import SkillResolver
 from .kernel import KernelCompiler
+from .security import redact
 from .tasks import DelegationContract
 from .tools import ToolCall, ToolDefinition, ToolResult, validate_json_schema
 from .workflow import InMemoryWorkflowStore, WorkflowRecord
@@ -245,6 +246,125 @@ class CoreAgent:
                     }
         return catalog
 
+    def _safe_telemetry(self, value):
+        return redact(value, (getattr(self.model, "api_key", None),))
+
+    def _json(self, value):
+        return json.dumps(
+            self._safe_telemetry(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _llm_input_attributes(self, *, model, messages, instructions, tools, session_id):
+        messages = self._safe_telemetry(
+            [{"role": "system", "content": instructions}, *messages]
+        )
+        invocation_parameters = {"model": model}
+        invocation_parameters.update(getattr(self.model, "extra_body", {}))
+        if getattr(self.model, "api_format", None) == "anthropic":
+            invocation_parameters["max_tokens"] = getattr(
+                self.model, "max_tokens", None
+            )
+        attributes = {
+            "openinference.span.kind": "LLM",
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": model,
+            "llm.model_name": model,
+            "llm.system": getattr(self.model, "provider", "unknown"),
+            "llm.provider": getattr(self.model, "provider", "unknown"),
+            "gen_ai.provider.name": getattr(self.model, "provider", "unknown"),
+            "llm.invocation_parameters": self._json(invocation_parameters),
+            "session.id": session_id,
+            "input.value": self._json(messages),
+            "input.mime_type": "application/json",
+        }
+        for index, message in enumerate(messages):
+            prefix = f"llm.input_messages.{index}.message"
+            attributes[f"{prefix}.role"] = message["role"]
+            if message.get("content") is not None:
+                attributes[f"{prefix}.content"] = message["content"]
+            if message.get("tool_call_id"):
+                attributes[f"{prefix}.tool_call_id"] = message["tool_call_id"]
+            if message.get("name"):
+                attributes[f"{prefix}.name"] = message["name"]
+            for tool_index, call in enumerate(message.get("tool_calls", ())):
+                call_prefix = f"{prefix}.tool_calls.{tool_index}.tool_call"
+                attributes[f"{call_prefix}.id"] = call["id"]
+                attributes[f"{call_prefix}.function.name"] = call["function"]["name"]
+                attributes[f"{call_prefix}.function.arguments"] = self._json(
+                    call["function"]["arguments"]
+                )
+        for index, (name, definition) in enumerate(sorted(tools.items())):
+            schema = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": definition.get("description") or name,
+                    "parameters": definition.get("input_schema")
+                    or {"type": "object", "additionalProperties": True},
+                },
+            }
+            attributes[f"llm.tools.{index}.tool.json_schema"] = self._json(schema)
+        return attributes
+
+    def _llm_output_attributes(self, response):
+        message = {"role": "assistant"}
+        attributes = {"llm.output_messages.0.message.role": "assistant"}
+        if response.message is not None:
+            public_message = self._safe_telemetry(response.message)
+            message["content"] = public_message
+            attributes["llm.output_messages.0.message.content"] = public_message
+        if response.tool_requests:
+            message["tool_calls"] = []
+            for index, call in enumerate(response.tool_requests):
+                arguments = self._json(call.arguments)
+                message["tool_calls"].append(
+                    {
+                        "id": call.id,
+                        "function": {"name": call.name, "arguments": arguments},
+                    }
+                )
+                prefix = f"llm.output_messages.0.message.tool_calls.{index}.tool_call"
+                attributes[f"{prefix}.id"] = call.id
+                attributes[f"{prefix}.function.name"] = call.name
+                attributes[f"{prefix}.function.arguments"] = arguments
+        attributes["output.value"] = self._json(message)
+        attributes["output.mime_type"] = "application/json"
+        token_attributes = {
+            "llm.token_count.prompt": response.prompt_tokens,
+            "llm.token_count.completion": response.completion_tokens,
+            "llm.token_count.total": response.total_tokens,
+            "gen_ai.usage.input_tokens": response.prompt_tokens,
+            "gen_ai.usage.output_tokens": response.completion_tokens,
+        }
+        attributes.update(
+            {key: value for key, value in token_attributes.items() if value is not None}
+        )
+        if response.finish_reason:
+            attributes["llm.finish_reason"] = response.finish_reason
+            attributes["gen_ai.response.finish_reasons"] = [response.finish_reason]
+        return attributes
+
+    def _instrument_tool(self, span, call, definition):
+        arguments = self._json(call.arguments)
+        schema = self._json(definition.input_schema)
+        span.set_attributes(
+            {
+                "openinference.span.kind": "TOOL",
+                "tool.name": call.name,
+                "tool.description": self._safe_telemetry(definition.description),
+                "tool.id": call.id,
+                "tool.parameters": schema,
+                "tool.json_schema": schema,
+                "input.value": arguments,
+                "input.mime_type": "application/json",
+                "core_agent.tool.call.id": call.id,
+                "core_agent.tool.mutating": definition.mutating,
+            }
+        )
+
     @staticmethod
     def _response_dict(response):
         return {
@@ -255,6 +375,33 @@ class CoreAgent:
             ],
             "continue_reasoning": response.continue_reasoning,
         }
+
+    @staticmethod
+    def _model_messages(context):
+        messages = []
+        known_tool_calls = set()
+        for item in context.active:
+            if item.kind == "assistant_tool_calls":
+                calls = json.loads(item.content)
+                known_tool_calls.update(call["id"] for call in calls)
+                messages.append({"role": "assistant", "tool_calls": calls})
+                continue
+            if item.kind == "tool_result":
+                result = json.loads(item.content)
+                if result["tool_call_id"] not in known_tool_calls:
+                    messages.append({"role": "user", "content": item.content})
+                    continue
+                message = {
+                    "role": "tool",
+                    "tool_call_id": result["tool_call_id"],
+                    "content": item.content,
+                }
+                if result.get("tool_name"):
+                    message["name"] = result["tool_name"]
+                messages.append(message)
+                continue
+            messages.append({"role": "user", "content": item.content})
+        return messages
 
     def _record_transition(
         self,
@@ -292,7 +439,9 @@ class CoreAgent:
         if not self.workflow_store.atomic:
             for kind, data in audit:
                 self.audit_log.append(record.run_id, kind, data)
-            self.event_store.append(record.run_id, event_kind, event_data or {"state": state})
+            self.event_store.append(
+                record.run_id, event_kind, event_data or {"state": state}
+            )
             self.checkpoint_store.save(
                 record.run_id,
                 self.event_store.revision(record.run_id),
@@ -463,16 +612,14 @@ class CoreAgent:
                     discovered.get(server, {}).get(remote_tool, {}),
                     mutating=not read_only,
                     risk_tags=(
-                        frozenset()
-                        if read_only
-                        else frozenset({"external_write"})
+                        frozenset() if read_only else frozenset({"external_write"})
                     ),
                 ),
                 True,
             )
         return self.tool_runtime.registry.get(call.name), False
 
-    def _result_text(self, call_id, outcome):
+    def _result_text(self, call_id, outcome, tool_name=None):
         if isinstance(outcome, ToolResult):
             value = {
                 "tool_call_id": outcome.tool_call_id,
@@ -481,7 +628,34 @@ class CoreAgent:
             }
         else:
             value = {"tool_call_id": call_id, "status": "succeeded", "output": outcome}
+        if tool_name:
+            value["tool_name"] = tool_name
         return json.dumps(value, sort_keys=True, default=str)
+
+    def _append_assistant_tool_calls(self, snapshot, response):
+        calls = [
+            {
+                "id": item["id"],
+                "function": {
+                    "name": item["name"],
+                    "arguments": item["arguments"],
+                },
+            }
+            for item in response["tool_requests"]
+        ]
+        content = json.dumps(
+            calls, sort_keys=True, separators=(",", ":"), default=str
+        )
+        context = self._context_from_dict(snapshot["context"])
+        item = ContextItem(
+            "assistant_tool_calls", content, self.token_counter(content)
+        )
+        context = ContextState(
+            context.active + (item,),
+            context.transcript + (item,),
+            (context.sequence_range[0], context.sequence_range[1] + 1),
+        )
+        snapshot["context"] = self._context_to_dict(context)
 
     def _append_result(self, snapshot, text):
         context = self._context_from_dict(snapshot["context"])
@@ -507,13 +681,27 @@ class CoreAgent:
         *,
         approved=False,
         lease_token,
+        span=None,
     ):
         pending = snapshot["pending_call"]
         call = ToolCall(pending["id"], pending["name"], dict(pending["arguments"]))
         definition, is_mcp = self._definition(call, effective, discovered)
+        if span:
+            self._instrument_tool(span, call, definition)
         self.tool_runtime.validate(call, definition)
         if self.tool_runtime.policy.evaluate(definition) == "deny":
-            self._append_result(snapshot, self._result_text(call.id, ToolResult(call.id, "denied")))
+            result_text = self._result_text(
+                call.id, ToolResult(call.id, "denied"), call.name
+            )
+            if span:
+                span.set_attributes(
+                    {
+                        "core_agent.tool.outcome": "denied",
+                        "output.value": result_text,
+                        "output.mime_type": "application/json",
+                    }
+                )
+            self._append_result(snapshot, result_text)
             return self._record_transition(
                 record,
                 state="RUNNING",
@@ -599,7 +787,16 @@ class CoreAgent:
                 lease_token=lease_token,
             )
             raise
-        self._append_result(snapshot, self._result_text(call.id, outcome))
+        result_text = self._result_text(call.id, outcome, call.name)
+        if span:
+            span.set_attributes(
+                {
+                    "core_agent.tool.outcome": "succeeded",
+                    "output.value": self._safe_telemetry(result_text),
+                    "output.mime_type": "application/json",
+                }
+            )
+        self._append_result(snapshot, result_text)
         return self._record_transition(
             record,
             state="RUNNING",
@@ -630,7 +827,7 @@ class CoreAgent:
                 with self.telemetry.span(
                     "core_agent.tool.execute",
                     attributes={"core_agent.tool.approved": True},
-                ):
+                ) as tool_span:
                     record = self._execute_pending(
                         record,
                         snapshot,
@@ -639,6 +836,7 @@ class CoreAgent:
                         effective,
                         approved=True,
                         lease_token=lease_token,
+                        span=tool_span,
                     )
             budgets = raw.get("budgets", {})
             max_turns = min(
@@ -678,22 +876,32 @@ class CoreAgent:
                         model_context = "\n".join(
                             item.content for item in context.active
                         )
+                        model_messages = self._model_messages(context)
                         model_tools = self._tool_catalog(effective, discovered)
                         model_instructions = self._instructions(snapshot)
                     with self.telemetry.span(
                         "gen_ai.chat",
-                        attributes={
-                            "gen_ai.operation.name": "chat",
-                            "gen_ai.request.model": raw["model"].get("route", "unknown"),
-                        },
-                    ):
+                        attributes=self._llm_input_attributes(
+                            model=raw["model"].get("route", "unknown"),
+                            messages=model_messages,
+                            instructions=model_instructions,
+                            tools=model_tools,
+                            session_id=record.context_id,
+                        ),
+                    ) as model_span:
                         response = self.model.generate(
                             context=model_context,
                             tools=model_tools,
                             instructions=model_instructions,
+                            messages=model_messages,
                         )
+                        model_span.set_attributes(self._llm_output_attributes(response))
                     snapshot["turns"] += 1
                     snapshot["pending_response"] = self._response_dict(response)
+                    if snapshot["pending_response"]["tool_requests"]:
+                        self._append_assistant_tool_calls(
+                            snapshot, snapshot["pending_response"]
+                        )
                     snapshot["tool_queue"] = copy.deepcopy(
                         snapshot["pending_response"]["tool_requests"]
                     )
@@ -715,15 +923,15 @@ class CoreAgent:
                     call = ToolCall(
                         pending["id"], pending["name"], dict(pending["arguments"])
                     )
-                    definition, _is_mcp = self._definition(
-                        call, effective, discovered
-                    )
+                    definition, _is_mcp = self._definition(call, effective, discovered)
                     self.tool_runtime.validate(call, definition)
                     snapshot["tool_calls"] += 1
                     with self.telemetry.span(
                         "core_agent.policy.evaluate",
                         attributes={
-                            "core_agent.tool.namespace": pending["name"].split(".", 1)[0]
+                            "core_agent.tool.namespace": pending["name"].split(".", 1)[
+                                0
+                            ]
                         },
                     ):
                         decision_value = self.tool_runtime.policy.evaluate(definition)
@@ -785,9 +993,11 @@ class CoreAgent:
                     with self.telemetry.span(
                         "core_agent.tool.execute",
                         attributes={
-                            "core_agent.tool.namespace": pending["name"].split(".", 1)[0]
+                            "core_agent.tool.namespace": pending["name"].split(".", 1)[
+                                0
+                            ]
                         },
-                    ):
+                    ) as tool_span:
                         record = self._execute_pending(
                             record,
                             snapshot,
@@ -795,6 +1005,7 @@ class CoreAgent:
                             discovered,
                             effective,
                             lease_token=lease_token,
+                            span=tool_span,
                         )
                     continue
                 response = snapshot["pending_response"]
@@ -960,9 +1171,7 @@ class CoreAgent:
         if self.artifact_store is None:
             raise CoreError("CAPABILITY_DISABLED")
         tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
-        artifact, content = self.artifact_store.get(
-            tenant_id, arguments["artifact_id"]
-        )
+        artifact, content = self.artifact_store.get(tenant_id, arguments["artifact_id"])
         try:
             text = content.decode()
         except UnicodeDecodeError:
@@ -973,9 +1182,7 @@ class CoreAgent:
         if cancel_event.is_set():
             return None
         outcome = self.tool_runtime.execute(
-            ToolCall(
-                str(uuid.uuid4()), contract["tool"], dict(contract["arguments"])
-            ),
+            ToolCall(str(uuid.uuid4()), contract["tool"], dict(contract["arguments"])),
             run_id=contract["run_id"],
             identity=contract.get("identity"),
             session_id=contract.get("session_id"),
@@ -997,9 +1204,7 @@ class CoreAgent:
         tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
         return [
             self._task_snapshot(task)
-            for task in self.task_scheduler.list(
-                owner_id=run_id, tenant_id=tenant_id
-            )
+            for task in self.task_scheduler.list(owner_id=run_id, tenant_id=tenant_id)
         ]
 
     def _task_wait(self, arguments, run_id):
@@ -1146,9 +1351,7 @@ class CoreAgent:
             "parent_run_id": run_id,
         }
         task = self.task_scheduler.start(
-            lambda: self._run_child(
-                child, child_request, child_scope, result_schema
-            ),
+            lambda: self._run_child(child, child_request, child_scope, result_schema),
             owner_id=run_id,
             required=True,
             kind="subagent",
@@ -1274,7 +1477,10 @@ class CoreAgent:
 
     def is_waiting_local_approval(self, task_id):
         try:
-            return self.workflow_store.lookup_task(task_id).state == "WAITING_LOCAL_APPROVAL"
+            return (
+                self.workflow_store.lookup_task(task_id).state
+                == "WAITING_LOCAL_APPROVAL"
+            )
         except CoreError:
             return False
 
@@ -1287,7 +1493,10 @@ class CoreAgent:
 
     def reserve_local_approval(self, task_id, approval_id, control_plane):
         record = self.workflow_store.lookup_task(task_id)
-        if record.state != "WAITING_LOCAL_APPROVAL" or record.pending_approval_id != approval_id:
+        if (
+            record.state != "WAITING_LOCAL_APPROVAL"
+            or record.pending_approval_id != approval_id
+        ):
             raise CoreError("APPROVAL_NOT_FOUND")
         approval = self.tool_runtime.approvals.get(approval_id)
         operator_principal_id = getattr(
@@ -1365,7 +1574,10 @@ class CoreAgent:
         continue_run=True,
     ):
         record = self.workflow_store.lookup_task(task_id)
-        if record.state != "WAITING_LOCAL_APPROVAL" or record.pending_approval_id != approval_id:
+        if (
+            record.state != "WAITING_LOCAL_APPROVAL"
+            or record.pending_approval_id != approval_id
+        ):
             raise CoreError("APPROVAL_NOT_FOUND")
         approval = self.tool_runtime.approvals.get(approval_id)
         self.tool_runtime.approvals.deny(
@@ -1381,6 +1593,7 @@ class CoreAgent:
             self._result_text(
                 snapshot["pending_call"]["id"],
                 ToolResult(snapshot["pending_call"]["id"], "denied"),
+                snapshot["pending_call"]["name"],
             ),
         )
         record = self._record_transition(
@@ -1454,7 +1667,9 @@ class CoreAgent:
                     )
                 except CoreError:
                     pass
-        destroy_run = getattr(self.tool_runtime.environment_manager, "destroy_run", None)
+        destroy_run = getattr(
+            self.tool_runtime.environment_manager, "destroy_run", None
+        )
         if destroy_run:
             destroy_run(record.run_id)
         self._record_transition(
@@ -1505,9 +1720,7 @@ class CoreAgent:
                 recovered.append(record)
                 continue
             execution = (
-                self.tool_runtime.approvals.execution_for(
-                    record.pending_approval_id
-                )
+                self.tool_runtime.approvals.execution_for(record.pending_approval_id)
                 if record.pending_approval_id
                 else None
             )
@@ -1534,14 +1747,22 @@ class CoreAgent:
                 and hasattr(self.tool_runtime.approvals, "execution_outcome")
                 else None
             )
-            if details and details["state"] == "SUCCEEDED" and details["outcome"] is not None:
+            if (
+                details
+                and details["state"] == "SUCCEEDED"
+                and details["outcome"] is not None
+            ):
                 snapshot = copy.deepcopy(record.snapshot)
                 outcome = details["outcome"]
                 text = (
                     json.dumps(outcome, sort_keys=True, default=str)
                     if isinstance(outcome, dict)
                     and {"tool_call_id", "status"} <= set(outcome)
-                    else self._result_text(snapshot["pending_call"]["id"], outcome)
+                    else self._result_text(
+                        snapshot["pending_call"]["id"],
+                        outcome,
+                        snapshot["pending_call"]["name"],
+                    )
                 )
                 self._append_result(snapshot, text)
                 recovered.append(

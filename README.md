@@ -153,6 +153,11 @@ and Memory Service traces to its OTLP/HTTP collector. `PHOENIX_PORT` changes the
 `PHOENIX_DEFAULT_RETENTION_POLICY_DAYS` controls trace retention. The applications use the standard
 per-signal `OTEL_EXPORTER_OTLP_*_ENDPOINT` variables, so a production deployment can route traces,
 metrics, and logs to separate backends without sending unsupported signals to Phoenix.
+The local profile sets `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`, so Phoenix renders
+the agent system prompt, available tool schemas, model input/output, tool calls/results, and token
+usage as OpenInference AGENT/LLM/TOOL spans. Set it to `false` to verify the production-safe view;
+production must opt in only with explicit access, redaction, sampling, and retention policy. Raw
+chain-of-thought and credentials are never captured.
 
 Compose deliberately uses the development approve-all operator stub; a production deployment must
 replace that control plane and set `CORE_AGENT_ENVIRONMENT=production`.

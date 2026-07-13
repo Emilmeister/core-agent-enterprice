@@ -109,6 +109,24 @@ Core Agent MUST NOT создавать fake internal memory spans: он созд
 
 Content attributes из GenAI conventions, tool definitions/arguments/results, system instructions, retrieved documents и memory text MUST быть выключены по умолчанию. Их opt-in требует explicit data policy, redaction, sampling и retention limits.
 
+## Phoenix/OpenInference presentation contract
+
+Phoenix является operator UI, а не только хранилищем произвольных OTel spans. Для предсказуемого отображения runtime MUST экспортировать совместимые с [OpenInference semantic conventions](https://github.com/Arize-ai/openinference/blob/main/spec/semantic_conventions.md) attributes; Phoenix translation других conventions не считается заменой явному контракту.
+
+Каждый AI-related span MUST иметь `openinference.span.kind`. Минимальное отображение:
+
+- `core_agent.task.execute` имеет kind `AGENT`, `agent.name`, `session.id`, A2A task/context IDs, пользовательский input и публичный final output;
+- `gen_ai.chat` имеет kind `LLM`, `llm.system`, `llm.model_name`, JSON `llm.invocation_parameters`, `input.value`/`output.value` с MIME type, flattened `llm.input_messages.<n>.message.*` и `llm.output_messages.<n>.message.*`;
+- весь фактически доступный модели catalog публикуется как JSON schemas в `llm.tools.<n>.tool.json_schema`; assistant tool calls публикуются в `llm.output_messages.<n>.message.tool_calls.<n>.tool_call.*` с ID, function name и JSON arguments;
+- известный model usage публикуется одновременно в OpenInference `llm.token_count.*` и совместимых `gen_ai.usage.*` attributes;
+- `core_agent.tool.execute` имеет kind `TOOL`, `tool.name`, description, JSON input/parameters, JSON/text output, outcome и tool-call ID;
+- orchestration, policy, checkpoint и protocol spans имеют осмысленный `CHAIN`, а memory retrieval/rerank/embed spans — `RETRIEVER`, `RERANKER` или `EMBEDDING` соответственно;
+- успешный span завершается OTel status `OK`, exception — `ERROR` с безопасным exception type без raw error message.
+
+Поля `input.value`, `output.value`, message content, tool schemas/descriptions/arguments/results являются content. Runtime MUST фильтровать их как при создании span, так и при последующем добавлении attributes. Deployment включает их только через `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. Отсутствующая переменная эквивалентна `false`; local Compose profile явно включает её для ограниченного operator-only Phoenix и документирует retention. Production MUST оставить её выключенной, пока отдельная policy не определит access control, redaction, sampling и retention.
+
+Даже при content capture запрещено экспортировать provider credentials, secret values, raw chain-of-thought/private reasoning, MCP authorization headers и полный RunRequest с transport credentials. System/kernel/profile instructions разрешены только в этом привилегированном operator channel и не становятся A2A output, log или audit content.
+
 ## Metrics
 
 Core Agent MUST публиковать минимум:

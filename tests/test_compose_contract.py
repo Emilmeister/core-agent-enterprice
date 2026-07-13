@@ -33,8 +33,7 @@ class ComposeContractTests(unittest.TestCase):
 
     def test_core_services_send_only_traces_to_phoenix(self):
         expected = (
-            "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-"
-            "http://phoenix:6006/v1/traces}"
+            "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://phoenix:6006/v1/traces}"
         )
         for service_name in ("agent", "memory"):
             environment = self.services[service_name]["environment"]
@@ -51,6 +50,10 @@ class ComposeContractTests(unittest.TestCase):
         environment = self.services["agent"]["environment"]
         self.assertIn("CORE_AGENT_NAME", environment)
         self.assertIn("CORE_AGENT_PROFILE", environment)
+        self.assertEqual(
+            environment["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"],
+            "${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-true}",
+        )
 
 
 if __name__ == "__main__":

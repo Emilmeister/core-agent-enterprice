@@ -69,6 +69,7 @@
 Route описывается требованиями, а не именем модели: context window, modalities, tool calling, reasoning, structured output, region, data policy, latency и price ceiling.
 
 - Provider adapter MUST объявлять capabilities и effective limits.
+- Provider adapter MUST сохранять нативную последовательность user message → assistant tool call → tool result с исходным `tool_call_id`; склейка tool result обратно в новый user prompt запрещена, потому что ломает provider tool protocol и провоцирует повторный вызов.
 - Fallback MUST сохранять system/user semantics и tool call state.
 - Переход на модель с меньшим окном требует compaction до вызова.
 - Provider не может получить данные, запрещённые tenant routing policy.

@@ -169,15 +169,30 @@ class OtlpExporter:
     def export_span(self, span):
         sdk_span = self._active_spans.pop(span.context.span_id, None)
         if sdk_span:
-            sdk_span.end()
+            try:
+                self._set_status(sdk_span, span.status_code, span.status_message)
+            finally:
+                sdk_span.end()
             return
         with self.tracer.start_as_current_span(
             span.name,
             context=self._otel_context(span.context),
             attributes=span.attributes,
             links=self._links(span.links),
-        ):
-            pass
+        ) as sdk_span:
+            self._set_status(sdk_span, span.status_code, span.status_message)
+
+    @staticmethod
+    def _set_status(sdk_span, code, message=""):
+        from opentelemetry.trace import Status, StatusCode
+
+        status_code = StatusCode.ERROR if code == "ERROR" else StatusCode.OK
+        sdk_span.set_status(Status(status_code, message if code == "ERROR" else None))
+
+    def set_span_attribute(self, context, key, value):
+        sdk_span = self._active_spans.get(context.span_id)
+        if sdk_span:
+            sdk_span.set_attribute(key, value)
 
     def export_metric(self, metric):
         name, value, labels = metric
@@ -202,6 +217,8 @@ class Span:
     attributes: dict
     links: tuple[TraceContext, ...] = ()
     ended: bool = False
+    status_code: str = "UNSET"
+    status_message: str = ""
     _token: object = None
 
     def __enter__(self):
@@ -211,11 +228,27 @@ class Span:
     def __exit__(self, exc_type, exc, tb):
         if self._token is not None:
             self.telemetry._current.reset(self._token)
-        self.end()
+        self.end(exc)
 
-    def end(self):
+    def set_attribute(self, key, value):
+        if self.ended or not self.telemetry._content_allowed(key):
+            return
+        self.attributes[key] = value
+        self.telemetry._set_span_attribute(self.context, key, value)
+
+    def set_attributes(self, attributes):
+        for key, value in attributes.items():
+            self.set_attribute(key, value)
+
+    def end(self, error=None):
         if self.ended:
             return
+        if error is None:
+            self.status_code = "OK"
+        else:
+            self.status_code = "ERROR"
+            self.status_message = type(error).__name__
+            self.set_attribute("error.type", type(error).__name__)
         self.ended = True
         self.telemetry._export_span(self)
 
@@ -227,7 +260,17 @@ class Telemetry:
         "gen_ai.output.messages",
         "gen_ai.tool.call.arguments",
         "gen_ai.tool.call.result",
+        "input.value",
+        "output.value",
+        "tool.description",
+        "tool.json_schema",
+        "tool.parameters",
     }
+    CONTENT_PREFIXES = (
+        "llm.input_messages.",
+        "llm.output_messages.",
+        "llm.tools.",
+    )
 
     def __init__(self, exporter, content_enabled=False):
         self.exporter = exporter
@@ -260,7 +303,7 @@ class Telemetry:
         )
 
     @classmethod
-    def otlp_from_env(cls, *, service_name="core-agent", content_enabled=False):
+    def otlp_from_env(cls, *, service_name="core-agent", content_enabled=None):
         endpoints = {
             "endpoint": os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
             "trace_endpoint": os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
@@ -269,6 +312,10 @@ class Telemetry:
         }
         if not any(endpoints.values()):
             return None
+        if content_enabled is None:
+            content_enabled = os.getenv(
+                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "false"
+            ).lower() in {"1", "true", "yes"}
         return cls.otlp(
             **endpoints,
             service_name=service_name,
@@ -296,13 +343,36 @@ class Telemetry:
     def inject(self, context, carrier):
         carrier["traceparent"] = context.traceparent
 
+    @staticmethod
+    def _span_kind(name):
+        if name.startswith("gen_ai."):
+            return "LLM"
+        if name in {"core_agent.task.execute", "core_agent.subagent.execute"}:
+            return "AGENT"
+        if name in {"core_agent.tool.execute", "mcp.client"} or name.startswith(
+            "core_agent.terminal."
+        ):
+            return "TOOL"
+        if name.endswith(".rerank"):
+            return "RERANKER"
+        if name.endswith(".embed"):
+            return "EMBEDDING"
+        if name.startswith("memory_service.search."):
+            return "RETRIEVER"
+        return "CHAIN"
+
+    def _content_allowed(self, key):
+        return self.content_enabled or (
+            key not in self.CONTENT_KEYS
+            and not any(key.startswith(prefix) for prefix in self.CONTENT_PREFIXES)
+        )
+
     def span(self, name, *, attributes=None, parent=None, links=(), _new_trace=False):
         attrs = dict(attributes or {})
+        attrs.setdefault("openinference.span.kind", self._span_kind(name))
         if not self.content_enabled:
             attrs = {
-                key: value
-                for key, value in attrs.items()
-                if key not in self.CONTENT_KEYS
+                key: value for key, value in attrs.items() if self._content_allowed(key)
             }
         if parent is None and not _new_trace:
             parent = self._current.get()
@@ -318,12 +388,26 @@ class Telemetry:
         )
         return Span(self, name, context, attrs, tuple(links))
 
-    def start_background_span(self, name, linked_context):
-        return self.span(name, links=(linked_context,), _new_trace=True)
+    def start_background_span(self, name, linked_context, *, attributes=None):
+        return self.span(
+            name,
+            attributes=attributes,
+            links=(linked_context,),
+            _new_trace=True,
+        )
 
     def _export_span(self, span):
         try:
             self.exporter.export_span(span)
+        except Exception:
+            self.dropped_records += 1
+
+    def _set_span_attribute(self, context, key, value):
+        setter = getattr(self.exporter, "set_span_attribute", None)
+        if not setter:
+            return
+        try:
+            setter(context, key, value)
         except Exception:
             self.dropped_records += 1
 
@@ -342,7 +426,7 @@ class Telemetry:
             attributes = {
                 key: value
                 for key, value in attributes.items()
-                if key not in self.CONTENT_KEYS
+                if self._content_allowed(key)
             }
         try:
             self.exporter.export_log((body, attributes))

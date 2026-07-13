@@ -65,7 +65,11 @@ class ModelHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        context = body["messages"][-1]["content"]
+        context = "\n".join(
+            message["content"]
+            for message in body["messages"]
+            if isinstance(message.get("content"), str)
+        )
         wire_names = {item["function"]["name"] for item in body.get("tools", [])}
         self.workspaces.extend(re.findall(r'/[^" ]+?/workspace', context))
 

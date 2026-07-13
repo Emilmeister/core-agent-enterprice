@@ -43,6 +43,7 @@ from .postgres_approvals import PostgresApprovalManager
 from .postgres_tasks import PostgresTaskScheduler
 from .push import DurablePushNotificationSender, PostgresPushNotificationConfigStore
 from .runtime import ApprovalNeeded, CoreAgent
+from .security import redact
 from .tasks import TaskScheduler
 from .tools import (
     ApprovalMode,
@@ -91,6 +92,7 @@ def _model():
     return CompatibleHttpModel(
         api_format=os.getenv("MODEL_API_FORMAT", "openai").lower(),
         model=model_name,
+        provider=os.getenv("MODEL_PROVIDER"),
         base_url=os.getenv("MODEL_BASE_URL"),
         endpoint=os.getenv("MODEL_ENDPOINT"),
         api_key=os.getenv("MODEL_API_KEY"),
@@ -362,15 +364,22 @@ def _agent(model, mcp_connector=None, *, state=None):
                 risk_tags=frozenset(),
             )
         )
-    local_root = Path(os.getenv("LOCAL_WORKSPACE_ROOT", "/tmp/core-agent/runs")).resolve()
+    local_root = Path(
+        os.getenv("LOCAL_WORKSPACE_ROOT", "/tmp/core-agent/runs")
+    ).resolve()
     durable_value = os.getenv("DURABLE_STORAGE_ROOT", "")
-    if os.getenv("CORE_AGENT_ENVIRONMENT", "development") == "production" and not durable_value:
+    if (
+        os.getenv("CORE_AGENT_ENVIRONMENT", "development") == "production"
+        and not durable_value
+    ):
         raise CoreError("DURABLE_STORAGE_REQUIRED")
     snapshot_store = WorkspaceSnapshotStore(durable_value) if durable_value else None
     if snapshot_store:
         durable_root = snapshot_store.root.resolve()
         if local_root == durable_root or durable_root in local_root.parents:
-            raise CoreError("CONFIG_INVALID", "active workspace cannot use durable mount")
+            raise CoreError(
+                "CONFIG_INVALID", "active workspace cannot use durable mount"
+            )
     base_snapshot = os.getenv("LOCAL_BASE_SNAPSHOT") or None
     if base_snapshot and not snapshot_store:
         raise CoreError("CONFIG_INVALID", "base snapshot requires durable storage")
@@ -489,7 +498,9 @@ def _agent(model, mcp_connector=None, *, state=None):
         context_window=int(
             os.getenv("MODEL_CONTEXT_WINDOW", getattr(model, "context_window", 128_000))
         ),
-        output_reserve=int(os.getenv("MODEL_MAX_TOKENS", getattr(model, "max_tokens", 4_096))),
+        output_reserve=int(
+            os.getenv("MODEL_MAX_TOKENS", getattr(model, "max_tokens", 4_096))
+        ),
         token_counter=token_counter,
         artifact_store=artifact_store,
         retention_manager=retention_manager,
@@ -561,18 +572,58 @@ def create_app(
             telemetry=telemetry,
         )
 
-    def traced_execution(context, operation, function):
+    def traced_execution(context, operation, function, request=None):
         headers = context.call_context.state.get("headers", {})
         parent = telemetry.extract(headers)
+        task_attributes = {
+            "openinference.span.kind": "AGENT",
+            "agent.name": agent.agent_config.agent["name"],
+            "a2a.task.id": context.task_id,
+            "a2a.context.id": context.context_id,
+            "session.id": context.context_id,
+        }
+        if request is not None:
+            prompt = request.prompt if hasattr(request, "prompt") else request["prompt"]
+            prompt = redact(prompt, (getattr(model, "api_key", None),))
+            task_attributes.update(
+                {
+                    "input.value": json.dumps(
+                        {"prompt": prompt}, sort_keys=True, separators=(",", ":")
+                    ),
+                    "input.mime_type": "application/json",
+                }
+            )
         with telemetry.span(
             f"core_agent.a2a.{operation}",
             parent=parent,
-            attributes={"rpc.system": "a2a", "rpc.method": operation},
+            attributes={
+                "rpc.system": "a2a",
+                "rpc.method": operation,
+                "a2a.task.id": context.task_id,
+                "a2a.context.id": context.context_id,
+            },
         ):
             with telemetry.span("core_agent.task.submit") as submission:
                 linked = submission.context
-        with telemetry.start_background_span("core_agent.task.execute", linked):
-            return function()
+        with telemetry.start_background_span(
+            "core_agent.task.execute", linked, attributes=task_attributes
+        ) as execution_span:
+            result = function()
+            if hasattr(result, "run_id"):
+                execution_span.set_attribute("core_agent.run.id", result.run_id)
+            if hasattr(result, "message"):
+                execution_span.set_attributes(
+                    {
+                        "output.value": redact(
+                            result.message, (getattr(model, "api_key", None),)
+                        ),
+                        "output.mime_type": "text/plain",
+                        "core_agent.task.state": getattr(
+                            result, "terminal_state", "waiting_local_approval"
+                        ),
+                    }
+                )
+            return result
 
     def result_artifact(result, context):
         provenance = {"run_id": result.run_id, "task_id": context.task_id}
@@ -603,6 +654,7 @@ def create_app(
                 session_id=context.context_id,
                 tenant_id=context.tenant or "default",
             ),
+            request=request,
         )
         if isinstance(result, ApprovalNeeded):
             return result

@@ -272,14 +272,22 @@ class SkillTests(unittest.TestCase):
 class SecurityTests(unittest.TestCase):
     def test_redaction_covers_nested_values_and_common_credentials(self):
         value = {
-            "text": "token=secret-value and ghp_abcdefghijklmnopqrstuvwxyz1234567890",
-            "nested": ["secret-value", {"Authorization": "Bearer abc"}],
+            "text": (
+                "token=secret-value and ghp_abcdefghijklmnopqrstuvwxyz1234567890 "
+                "and sk-abcdefghijklmnop123456"
+            ),
+            "nested": [
+                "secret-value",
+                {"Authorization": "Bearer abc", "api_key": "plain-value"},
+            ],
         }
         cleaned = redact(value, known_secrets={"secret-value", "abc"})
         encoded = repr(cleaned)
         self.assertNotIn("secret-value", encoded)
         self.assertNotIn("ghp_", encoded)
+        self.assertNotIn("sk-", encoded)
         self.assertNotIn("Bearer abc", encoded)
+        self.assertNotIn("plain-value", encoded)
 
     def test_workspace_path_rejects_traversal_and_symlink_escape(self):
         with (

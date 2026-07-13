@@ -11,7 +11,24 @@ def redact(value, known_secrets=()):
 
     def clean(item):
         if isinstance(item, dict):
-            return {key: clean(val) for key, val in item.items()}
+            return {
+                key: (
+                    "[REDACTED]"
+                    if isinstance(key, str)
+                    and any(
+                        marker in key.lower()
+                        for marker in (
+                            "authorization",
+                            "api_key",
+                            "password",
+                            "secret",
+                            "token",
+                        )
+                    )
+                    else clean(val)
+                )
+                for key, val in item.items()
+            }
         if isinstance(item, list):
             return [clean(val) for val in item]
         if isinstance(item, tuple):
@@ -20,6 +37,7 @@ def redact(value, known_secrets=()):
             return item
         result = item
         result = re.sub(r"gh[pousr]_[A-Za-z0-9_]{20,}", "[REDACTED]", result)
+        result = re.sub(r"\bsk-[A-Za-z0-9_-]{16,}\b", "[REDACTED]", result)
         for secret in secrets:
             result = result.replace(secret, "[REDACTED]")
         result = re.sub(
