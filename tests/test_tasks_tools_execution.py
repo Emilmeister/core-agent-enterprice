@@ -243,6 +243,24 @@ class DelegationTests(unittest.TestCase):
                     derive_child_capabilities(self.parent, contract, current_depth=0)
                 self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
 
+    def test_delegate_contract_rejects_ambiguous_budget_and_inline_schema(self):
+        for changes in (
+            {"budget": {"max_steps": 3}},
+            {"result_schema": '{"type":"object"}'},
+        ):
+            raw = {
+                "instruction": "Review",
+                "tools": [],
+                "mcp": {},
+                "skills": [],
+                "budget": {"turns": 2, "tool_calls": 1},
+                **changes,
+            }
+            with self.subTest(changes=changes):
+                with self.assertRaises(CoreError) as caught:
+                    DelegationContract.from_dict(raw)
+                self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
+
     def test_memory_is_shared_only_when_same_server_tools_and_namespace_are_explicit(
         self,
     ):

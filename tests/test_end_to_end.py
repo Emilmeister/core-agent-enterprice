@@ -100,6 +100,23 @@ class ModelHandler(BaseHTTPRequestHandler):
                     {"argv": ["echo && hello-tool-check && pwd"]},
                 )
             )
+        elif "DELEGATE_INVALID_E2E" in context:
+            message = (
+                _text("delegate-validation-recovered")
+                if "TOOL_ARGUMENT_INVALID" in context
+                else _tool(
+                    body,
+                    "core.delegate",
+                    {
+                        "instruction": "invalid contract must return to parent",
+                        "tools": ["core.terminal.exec"],
+                        "mcp": {},
+                        "skills": [],
+                        "budget": {"max_steps": 3},
+                        "result_schema": '{"type":"object"}',
+                    },
+                )
+            )
         elif "SLOW_A2A_E2E" in context:
             time.sleep(0.1)
             message = _text("slow-a2a-ok")
@@ -512,6 +529,10 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_a2a_tool_start_failure_returns_to_model_and_task_completes(self):
         answer = await self._send("TOOL_FAILURE_E2E")
         self.assertEqual(answer, "tool-failure-e2e-ok")
+
+    async def test_a2a_invalid_delegate_contract_returns_to_model(self):
+        answer = await self._send("DELEGATE_INVALID_E2E")
+        self.assertEqual(answer, "delegate-validation-recovered")
 
     async def test_local_control_plane_approves_exact_call_once(self):
         transport = httpx.ASGITransport(app=self.approval_app)

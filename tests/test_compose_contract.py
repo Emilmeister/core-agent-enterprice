@@ -54,6 +54,17 @@ class ComposeContractTests(unittest.TestCase):
             environment["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"],
             "${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-true}",
         )
+        self.assertEqual(
+            environment["CORE_AGENT_LOG_LEVEL"], "${CORE_AGENT_LOG_LEVEL:-INFO}"
+        )
+        self.assertEqual(
+            environment["CORE_AGENT_LOG_CONTENT"],
+            "${CORE_AGENT_LOG_CONTENT:-true}",
+        )
+        self.assertEqual(
+            environment["CORE_AGENT_LOG_MAX_CHARS"],
+            "${CORE_AGENT_LOG_MAX_CHARS:-12000}",
+        )
 
 
 if __name__ == "__main__":

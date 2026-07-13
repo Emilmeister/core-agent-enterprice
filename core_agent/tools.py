@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -64,26 +65,54 @@ class ToolRegistry:
 
 
 def _validate(schema, value):
+    if "enum" in schema and value not in schema["enum"]:
+        return False
     if schema.get("type") == "object":
         if not isinstance(value, dict):
             return False
         if any(key not in value for key in schema.get("required", [])):
             return False
+        if len(value) < schema.get("minProperties", 0):
+            return False
         if schema.get("additionalProperties") is False and set(value) - set(
             schema.get("properties", {})
         ):
             return False
+        properties = schema.get("properties", {})
+        additional = schema.get("additionalProperties", {})
         return all(
-            _validate(schema["properties"][key], item)
+            _validate(properties[key], item)
+            if key in properties
+            else not isinstance(additional, dict) or _validate(additional, item)
             for key, item in value.items()
-            if key in schema.get("properties", {})
         )
     if schema.get("type") == "array":
         return isinstance(value, list) and all(
             _validate(schema.get("items", {}), item) for item in value
         )
     if schema.get("type") == "string":
-        return isinstance(value, str)
+        return (
+            isinstance(value, str)
+            and len(value) >= schema.get("minLength", 0)
+            and (
+                "pattern" not in schema
+                or re.search(schema["pattern"], value) is not None
+            )
+        )
+    if schema.get("type") == "integer":
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= schema.get("minimum", value)
+        )
+    if schema.get("type") == "number":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value >= schema.get("minimum", value)
+        )
+    if schema.get("type") == "boolean":
+        return isinstance(value, bool)
     return True
 
 

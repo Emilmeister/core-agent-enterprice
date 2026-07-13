@@ -18,15 +18,15 @@ EXPECTED_SHA256 = {
     "kernel-instructions.md": "c6521b51a7d10bce4e6697c82736bb09d6b75b7ce7ad48fafd0ce18889530454",
     "local-operator-hitl.md": "0b6ae37fb7f062bd83b380e74e580700baee28c9a73118a57e536537ac091e4f",
     "memory-service.md": "f27d9ec86866bf88de1a04924307c175f362983f39674e1c09aead057afb90d4",
-    "observability.md": "efcf61e49f8c03084378c565a92752e6389830736bfe57ad8411b46f50be1bb1",
+    "observability.md": "c7708c967e817c3d21c988e7d90e0b3bf1ee183d9035466a20e9b1f104927220",
     "product.md": "4722378a59ab5fee77b38d2eba9a86efa7feb2d5b8721e1f499f1677790099c3",
     "public-contract.md": "e8f464ff5183130f80ec18b0cc5a67b1112401ebdefdfa0644d566ed96ebff1f",
     "releases/v1.md": "c6d0e16314e141022ecee3dae27b0bd9dd06dbb1f183a8e5cf9e6a9024fc5e9b",
-    "runtime.md": "ebba00d9ff7d752a8aea5bf431cd9c25c00fa6a545c5cbb72b1c02dcc93b07d3",
+    "runtime.md": "c35bf56032682ad2b533af632f3243410f3128d3c26178f134d872fdbf5dc5ec",
     "security-and-reliability.md": "78438365e7f140c7372964f37070f37e7a75d8efb66a6251277740129c955df7",
     "skills.md": "7102b91a2f574ea5b75c02688a14ed5da7bbafc7d19b66b159330eae09600426",
-    "tasks-and-delegation.md": "9ec3b3ff94d1a5d475848f6393f09b077f5f7bcc9264a2aa21635bba5a27d27a",
-    "tools-and-approvals.md": "c6cc3aedd47fe13494889b2922edc6ed2564d0a201e8bb1cf78fce081d5e230f",
+    "tasks-and-delegation.md": "db57d66344c684d39538eb8f8c913a5592ae4d26b6db9d310b881f4d2db51e5f",
+    "tools-and-approvals.md": "0c0658d92613800ad6a8704081c73d3fcb016dda05fa6dd63028415d48b2e58f",
 }
 
 

@@ -119,6 +119,10 @@ class PostgresTaskScheduler:
             raise CoreError("INVALID_TASK_STATE")
         if not kind or not isinstance(contract, dict):
             raise CoreError("CONFIG_INVALID", "durable task contract is required")
+        linked_context = trace_context
+        if self.telemetry and linked_context is None:
+            with self.telemetry.span("core_agent.task.submit") as submission:
+                linked_context = submission.context
         now = self.clock()
         task = BackgroundTask(str(uuid.uuid4()), owner_id, required)
         with self.database.transaction() as connection:
@@ -144,7 +148,7 @@ class PostgresTaskScheduler:
             tenant_id,
             function,
             accepts_cancel_event=accepts_cancel_event,
-            trace_context=trace_context,
+            trace_context=linked_context,
         )
         return task
 

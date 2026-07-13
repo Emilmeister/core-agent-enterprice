@@ -148,6 +148,7 @@ class OtlpExporter:
                 )
             )
             for link in links
+            if link is not None
         ]
 
     def start_span(self, name, *, parent, attributes, links):
@@ -400,9 +401,12 @@ class Telemetry:
         return self.span(
             name,
             attributes=attributes,
-            links=(linked_context,),
+            links=(linked_context,) if linked_context is not None else (),
             _new_trace=True,
         )
+
+    def current_context(self):
+        return self._current.get()
 
     def _export_span(self, span):
         try:

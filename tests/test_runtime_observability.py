@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import time
@@ -237,6 +238,71 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("reasoning", result.to_dict())
         agent.close()
+
+    def test_structured_logs_show_flow_without_private_reasoning_or_secrets(self):
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest(
+                            "call-log", "core.terminal.exec", {"argv": ["check"]}
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(
+                    message="finished",
+                    reasoning="private chain must not be logged",
+                    prompt_tokens=20,
+                    completion_tokens=5,
+                    total_tokens=25,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+        agent = make_agent(model, memory="disabled", log_content=True)
+        request = RunRequest.from_dict(
+            {
+                "prompt": "run with sk-12345678901234567890",
+                "mcp": [],
+                "skills": [],
+            }
+        )
+        try:
+            with self.assertLogs("core_agent.runtime", level="INFO") as captured:
+                result = agent.run(request)
+        finally:
+            agent.close()
+
+        records = [json.loads(record.getMessage()) for record in captured.records]
+        events = {record["event"] for record in records}
+        self.assertEqual(result.message, "finished")
+        self.assertTrue(
+            {
+                "task.started",
+                "model.requested",
+                "model.response",
+                "tool.requested",
+                "tool.completed",
+                "workflow.transition",
+            }
+            <= events
+        )
+        encoded = json.dumps(records)
+        self.assertIn('"argv": ["check"]', encoded)
+        self.assertIn("finished", encoded)
+        self.assertIn("[REDACTED]", encoded)
+        self.assertNotIn("private chain must not be logged", encoded)
+        final_model_record = next(
+            record
+            for record in records
+            if record["event"] == "model.response"
+            and record["action"] == "final_answer"
+        )
+        self.assertTrue(final_model_record["reasoning_private"])
+        self.assertEqual(final_model_record["prompt_tokens"], 20)
+        self.assertEqual(final_model_record["completion_tokens"], 5)
+        self.assertEqual(final_model_record["total_tokens"], 25)
 
     def test_terminal_start_failure_returns_to_model_and_task_completes(self):
         exporter = RecordingExporter()
@@ -646,6 +712,13 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotEqual(linked.context.trace_id, submission.context.trace_id)
         self.assertEqual(linked.links[0].trace_id, submission.context.trace_id)
         linked.end()
+
+    def test_background_span_without_submission_context_is_valid(self):
+        exporter = RecordingExporter()
+        telemetry = Telemetry(exporter)
+        with telemetry.start_background_span("core_agent.task.execute", None) as span:
+            self.assertEqual(span.links, ())
+        self.assertTrue(span.ended)
 
     def test_content_is_off_and_metric_labels_are_bounded(self):
         exporter = RecordingExporter()

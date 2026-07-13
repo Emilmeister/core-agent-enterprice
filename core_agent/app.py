@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -311,14 +313,35 @@ def _agent(model, mcp_connector=None, *, state=None):
             ["task_id"],
         ),
         "core.delegate": (
-            "Start a focused child Core Agent with an exact capability contract.",
+            (
+                "Start a focused child Core Agent with an exact capability contract. "
+                "Budget accepts only turns/tool_calls. result_schema is an optional "
+                "artifact:// reference created before delegation, never inline JSON."
+            ),
             {
-                "instruction": {"type": "string"},
+                "instruction": {"type": "string", "minLength": 1},
                 "tools": {"type": "array", "items": {"type": "string"}},
-                "mcp": {"type": "object"},
+                "mcp": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
                 "skills": {"type": "array", "items": {"type": "string"}},
-                "budget": {"type": "object"},
-                "result_schema": {"type": "string"},
+                "budget": {
+                    "type": "object",
+                    "properties": {
+                        "turns": {"type": "integer", "minimum": 1},
+                        "tool_calls": {"type": "integer", "minimum": 1},
+                    },
+                    "minProperties": 1,
+                    "additionalProperties": False,
+                },
+                "result_schema": {
+                    "type": "string",
+                    "pattern": "^artifact://.+",
+                },
             },
             ["instruction", "tools", "mcp", "skills", "budget"],
         ),
@@ -510,6 +533,8 @@ def _agent(model, mcp_connector=None, *, state=None):
         token_counter=token_counter,
         artifact_store=artifact_store,
         retention_manager=retention_manager,
+        log_content=_boolean("CORE_AGENT_LOG_CONTENT", "false"),
+        log_max_chars=int(os.getenv("CORE_AGENT_LOG_MAX_CHARS", "12000")),
     )
     agent.recover_durable_tasks()
     agent.recover_workflows()
@@ -614,7 +639,18 @@ def create_app(
         with telemetry.start_background_span(
             "core_agent.task.execute", linked, attributes=task_attributes
         ) as execution_span:
-            result = function()
+            try:
+                result = function()
+            except Exception as error:
+                agent._log(
+                    "task.exception",
+                    level=logging.ERROR,
+                    task_id=context.task_id,
+                    context_id=context.context_id,
+                    error_code=getattr(error, "code", type(error).__name__),
+                    error_type=type(error).__name__,
+                )
+                raise
             if hasattr(result, "run_id"):
                 execution_span.set_attribute("core_agent.run.id", result.run_id)
             if hasattr(result, "message"):
@@ -770,6 +806,13 @@ def create_app(
 def main():
     import uvicorn
 
+    logger = logging.getLogger("core_agent.runtime")
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+    logger.setLevel(os.getenv("CORE_AGENT_LOG_LEVEL", "INFO").upper())
+    logger.propagate = False
     app = create_app()
     host, port = app.state.bind
     uvicorn.run(app, host=host, port=port)

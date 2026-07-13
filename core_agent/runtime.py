@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import copy
+import logging
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
@@ -127,6 +128,9 @@ class CoreAgent:
         output_reserve=4_096,
         artifact_store=None,
         retention_manager=None,
+        logger=None,
+        log_content=False,
+        log_max_chars=12_000,
     ):
         self.platform_config = platform_config
         self.agent_config = agent_config
@@ -156,6 +160,9 @@ class CoreAgent:
         self.output_reserve = int(output_reserve)
         self.artifact_store = artifact_store
         self.retention_manager = retention_manager
+        self.logger = logger or logging.getLogger("core_agent.runtime")
+        self.log_content = bool(log_content)
+        self.log_max_chars = max(512, int(log_max_chars))
         self._run_contexts = {}
         self._run_scopes = {}
         self._runtime_cache = {}
@@ -177,6 +184,62 @@ class CoreAgent:
                 "background_tool", self._recover_background_tool
             )
             self.task_scheduler.register("subagent", self._recover_subagent)
+
+    def _bounded_log_value(self, value):
+        if isinstance(value, str):
+            if len(value) <= self.log_max_chars:
+                return value
+            return value[: self.log_max_chars] + "...[TRUNCATED]"
+        if isinstance(value, dict):
+            return {
+                str(key): self._bounded_log_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._bounded_log_value(item) for item in value[:100]]
+        if is_dataclass(value):
+            return self._bounded_log_value(asdict(value))
+        return value
+
+    def _log(self, event, *, level=logging.INFO, **fields):
+        try:
+            context = self.telemetry.current_context()
+            payload = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "severity": logging.getLevelName(level),
+                "service": "core-agent",
+                "component": "runtime",
+                "event": event,
+                "agent_depth": self.depth,
+                **fields,
+            }
+            if context:
+                payload.update(
+                    {"trace_id": context.trace_id, "span_id": context.span_id}
+                )
+            payload = self._bounded_log_value(payload)
+            cleaned = redact(payload, (getattr(self.model, "api_key", None),))
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                if isinstance(payload.get(key), int) and not isinstance(
+                    payload[key], bool
+                ):
+                    cleaned[key] = payload[key]
+            payload = cleaned
+            self.logger.log(
+                level,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+            )
+            self.telemetry.log(
+                event,
+                attributes={
+                    key: value
+                    for key, value in payload.items()
+                    if isinstance(value, (str, int, float, bool))
+                    and key not in {"prompt", "arguments", "output", "response"}
+                },
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _context_to_dict(state):
@@ -449,6 +512,19 @@ class CoreAgent:
                 self.event_store.revision(record.run_id),
                 {**snapshot, "state": state},
             )
+        transition_data = dict(event_data or {})
+        if not self.log_content:
+            for key in ("message", "prompt", "arguments", "output", "content"):
+                transition_data.pop(key, None)
+        self._log(
+            "workflow.transition",
+            run_id=record.run_id,
+            task_id=record.task_id,
+            context_id=record.context_id,
+            state=state,
+            transition_event=event_kind,
+            **transition_data,
+        )
         return updated
 
     def _new_workflow(
@@ -545,6 +621,14 @@ class CoreAgent:
             "task_id": task_id,
             "tenant_id": tenant_id,
         }
+        self._log(
+            "task.started",
+            run_id=run_id,
+            task_id=task_id,
+            context_id=context_id,
+            parent_run_id=parent_run_id,
+            **({"prompt": request.prompt} if self.log_content else {}),
+        )
         return record, raw, discovered, effective
 
     def _load_workflow_runtime(self, record):
@@ -675,6 +759,83 @@ class CoreAgent:
         if snapshot["tool_queue"]:
             snapshot["tool_queue"].pop(0)
 
+    @staticmethod
+    def _recoverable_tool_error(call, error):
+        return isinstance(error, CoreError) and (
+            error.code in {"TOOL_ARGUMENT_INVALID", "TOOL_START_FAILED"}
+            or (call.name == "core.delegate" and error.code == "CAPABILITY_DISABLED")
+        )
+
+    @staticmethod
+    def _failed_tool_outcome(call, error):
+        return ToolResult(
+            call.id,
+            "failed",
+            {"error": {"code": error.code, "message": str(error)[:1000]}},
+            error.code,
+        )
+
+    def _record_tool_outcome(
+        self, record, snapshot, call, outcome, *, lease_token, span=None
+    ):
+        result_text = self._result_text(call.id, outcome, call.name)
+        status = outcome.status if isinstance(outcome, ToolResult) else "succeeded"
+        succeeded = status == "succeeded"
+        denied = status == "denied"
+        error_code = None
+        if not succeeded and not denied:
+            error_code = outcome.error_code or (
+                "TOOL_TIMED_OUT" if status == "timed_out" else "TOOL_RETURNED_FAILED"
+            )
+            if span and span.status_code != "ERROR":
+                span.record_error(CoreError(error_code))
+        if span:
+            span.set_attributes(
+                {
+                    "core_agent.tool.outcome": status,
+                    "output.value": self._safe_telemetry(result_text),
+                    "output.mime_type": "application/json",
+                }
+            )
+        self._append_result(snapshot, result_text)
+        event_kind = (
+            "tool.completed"
+            if succeeded
+            else ("tool.denied" if denied else "tool.failed")
+        )
+        audit_kind = (
+            "tool.execution.succeeded"
+            if succeeded
+            else ("tool.denied" if denied else "tool.execution.failed")
+        )
+        self._log(
+            event_kind,
+            run_id=record.run_id,
+            task_id=record.task_id,
+            tool_call_id=call.id,
+            tool_name=call.name,
+            status=status,
+            **({"error_code": error_code} if error_code else {}),
+            **({"output": self._value(outcome.output)} if self.log_content else {}),
+        )
+        return self._record_transition(
+            record,
+            state="RUNNING",
+            snapshot=snapshot,
+            event_kind=event_kind,
+            event_data={"tool_call_id": call.id, "status": status},
+            audit=(
+                (
+                    audit_kind,
+                    {
+                        "tool_call_id": call.id,
+                        **({"error_code": error_code} if error_code else {}),
+                    },
+                ),
+            ),
+            lease_token=lease_token,
+        )
+
     def _execute_pending(
         self,
         record,
@@ -692,28 +853,23 @@ class CoreAgent:
         definition, is_mcp = self._definition(call, effective, discovered)
         if span:
             self._instrument_tool(span, call, definition)
+        self._log(
+            "tool.requested",
+            run_id=record.run_id,
+            task_id=record.task_id,
+            tool_call_id=call.id,
+            tool_name=call.name,
+            **({"arguments": call.arguments} if self.log_content else {}),
+        )
         self.tool_runtime.validate(call, definition)
         if self.tool_runtime.policy.evaluate(definition) == "deny":
-            result_text = self._result_text(
-                call.id, ToolResult(call.id, "denied"), call.name
-            )
-            if span:
-                span.set_attributes(
-                    {
-                        "core_agent.tool.outcome": "denied",
-                        "output.value": result_text,
-                        "output.mime_type": "application/json",
-                    }
-                )
-            self._append_result(snapshot, result_text)
-            return self._record_transition(
+            return self._record_tool_outcome(
                 record,
-                state="RUNNING",
-                snapshot=snapshot,
-                event_kind="tool.denied",
-                event_data={"tool_call_id": call.id},
-                audit=(("tool.denied", {"tool_call_id": call.id}),),
+                snapshot,
+                call,
+                ToolResult(call.id, "denied"),
                 lease_token=lease_token,
+                span=span,
             )
         record = self._record_transition(
             record,
@@ -772,13 +928,8 @@ class CoreAgent:
                 if isinstance(outcome, ApprovalRequest):
                     raise CoreError("INVALID_TASK_STATE")
         except Exception as error:
-            if isinstance(error, CoreError) and error.code == "TOOL_START_FAILED":
-                outcome = ToolResult(
-                    call.id,
-                    "failed",
-                    {"error": {"code": error.code, "message": str(error)[:1000]}},
-                    error.code,
-                )
+            if self._recoverable_tool_error(call, error):
+                outcome = self._failed_tool_outcome(call, error)
                 if span:
                     span.record_error(error)
             else:
@@ -803,43 +954,13 @@ class CoreAgent:
                     lease_token=lease_token,
                 )
                 raise
-        result_text = self._result_text(call.id, outcome, call.name)
-        status = outcome.status if isinstance(outcome, ToolResult) else "succeeded"
-        succeeded = status == "succeeded"
-        error_code = None
-        if not succeeded:
-            error_code = outcome.error_code or (
-                "TOOL_TIMED_OUT" if status == "timed_out" else "TOOL_RETURNED_FAILED"
-            )
-            if span and span.status_code != "ERROR":
-                span.record_error(CoreError(error_code))
-        if span:
-            span.set_attributes(
-                {
-                    "core_agent.tool.outcome": status,
-                    "output.value": self._safe_telemetry(result_text),
-                    "output.mime_type": "application/json",
-                }
-            )
-        self._append_result(snapshot, result_text)
-        return self._record_transition(
+        return self._record_tool_outcome(
             record,
-            state="RUNNING",
-            snapshot=snapshot,
-            event_kind="tool.completed" if succeeded else "tool.failed",
-            event_data={"tool_call_id": call.id, "status": status},
-            audit=(
-                (
-                    "tool.execution.succeeded"
-                    if succeeded
-                    else "tool.execution.failed",
-                    {
-                        "tool_call_id": call.id,
-                        **({"error_code": error_code} if error_code else {}),
-                    },
-                ),
-            ),
+            snapshot,
+            call,
+            outcome,
             lease_token=lease_token,
+            span=span,
         )
 
     def _continue_workflow(self, record, *, decision=None):
@@ -914,6 +1035,15 @@ class CoreAgent:
                         model_messages = self._model_messages(context)
                         model_tools = self._tool_catalog(effective, discovered)
                         model_instructions = self._instructions(snapshot)
+                    self._log(
+                        "model.requested",
+                        run_id=record.run_id,
+                        task_id=record.task_id,
+                        turn=snapshot["turns"] + 1,
+                        model=raw["model"].get("route", "unknown"),
+                        available_tools=sorted(model_tools),
+                        context_items=len(context.active),
+                    )
                     with self.telemetry.span(
                         "gen_ai.chat",
                         attributes=self._llm_input_attributes(
@@ -931,6 +1061,41 @@ class CoreAgent:
                             messages=model_messages,
                         )
                         model_span.set_attributes(self._llm_output_attributes(response))
+                    action = (
+                        "request_tools"
+                        if response.tool_requests
+                        else (
+                            "final_answer"
+                            if response.message is not None
+                            else "continue_reasoning"
+                        )
+                    )
+                    tool_calls = [
+                        {
+                            "tool_call_id": item.id,
+                            "tool_name": item.name,
+                            **({"arguments": item.arguments} if self.log_content else {}),
+                        }
+                        for item in response.tool_requests
+                    ]
+                    self._log(
+                        "model.response",
+                        run_id=record.run_id,
+                        task_id=record.task_id,
+                        turn=snapshot["turns"] + 1,
+                        action=action,
+                        finish_reason=response.finish_reason,
+                        prompt_tokens=response.prompt_tokens,
+                        completion_tokens=response.completion_tokens,
+                        total_tokens=response.total_tokens,
+                        reasoning_private=bool(response.reasoning),
+                        tool_calls=tool_calls,
+                        **(
+                            {"response": response.message}
+                            if self.log_content and response.message is not None
+                            else {}
+                        ),
+                    )
                     snapshot["turns"] += 1
                     snapshot["pending_response"] = self._response_dict(response)
                     if snapshot["pending_response"]["tool_requests"]:
@@ -959,8 +1124,43 @@ class CoreAgent:
                         pending["id"], pending["name"], dict(pending["arguments"])
                     )
                     definition, _is_mcp = self._definition(call, effective, discovered)
-                    self.tool_runtime.validate(call, definition)
                     snapshot["tool_calls"] += 1
+                    try:
+                        self.tool_runtime.validate(call, definition)
+                    except CoreError as error:
+                        if error.code != "TOOL_ARGUMENT_INVALID":
+                            raise
+                        self._log(
+                            "tool.requested",
+                            run_id=record.run_id,
+                            task_id=record.task_id,
+                            tool_call_id=call.id,
+                            tool_name=call.name,
+                            **(
+                                {"arguments": call.arguments}
+                                if self.log_content
+                                else {}
+                            ),
+                        )
+                        with self.telemetry.span(
+                            "core_agent.tool.execute",
+                            attributes={
+                                "core_agent.tool.namespace": pending["name"].split(
+                                    ".", 1
+                                )[0]
+                            },
+                        ) as tool_span:
+                            self._instrument_tool(tool_span, call, definition)
+                            tool_span.record_error(error)
+                            record = self._record_tool_outcome(
+                                record,
+                                snapshot,
+                                call,
+                                self._failed_tool_outcome(call, error),
+                                lease_token=lease_token,
+                                span=tool_span,
+                            )
+                        continue
                     with self.telemetry.span(
                         "core_agent.policy.evaluate",
                         attributes={
@@ -1023,6 +1223,15 @@ class CoreAgent:
                                 {**snapshot, "state": "WAITING_LOCAL_APPROVAL"},
                             )
                         self._task_approvals[record.task_id] = approval.id
+                        self._log(
+                            "approval.requested",
+                            run_id=record.run_id,
+                            task_id=record.task_id,
+                            approval_id=approval.id,
+                            tool_call_id=approval.tool_call_id,
+                            tool_name=call.name,
+                            risk_tags=sorted(definition.risk_tags),
+                        )
                         return ApprovalNeeded(record.run_id, approval)
                     snapshot["pending_call"] = copy.deepcopy(pending)
                     with self.telemetry.span(
@@ -1433,6 +1642,9 @@ class CoreAgent:
             output_reserve=self.output_reserve,
             artifact_store=self.artifact_store,
             retention_manager=self.retention_manager,
+            logger=self.logger,
+            log_content=self.log_content,
+            log_max_chars=self.log_max_chars,
         )
         return child
 
@@ -1568,6 +1780,13 @@ class CoreAgent:
                 self.event_store.revision(record.run_id),
                 {**record.snapshot, "state": "APPROVED_RESERVED"},
             )
+        self._log(
+            "approval.approved",
+            run_id=record.run_id,
+            task_id=record.task_id,
+            approval_id=approval_id,
+            execution_id=execution.id,
+        )
         return ApprovalReserved(record.run_id, approval_id, execution.id)
 
     def dispatch_reserved_approval(self, task_id, approval_id, execution_id):

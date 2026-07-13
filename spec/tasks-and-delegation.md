@@ -63,6 +63,8 @@ Primary agent при создании сабагента MUST передать �
 
 - `instruction` содержит одну узкую цель, ограничения и success criteria;
 - `tools`, `skills` и server-scoped `mcp` являются allowlists, а не рекомендациями;
+- `budget` содержит только положительные integer-поля `turns` и/или `tool_calls`; aliases вроде `max_steps` запрещены schema;
+- `result_schema`, если задана, является `artifact://...` ссылкой на заранее сохранённую JSON Schema, а не inline JSON string;
 - каждый элемент MUST входить в capability set parent-а;
 - child не видит остальные рабочие tools/skills даже на discovery;
 - protocol-internal lifecycle, audit и safe completion сохраняются runtime-ом, но model-callable tools определяются EffectiveConfig и delegation allowlist; parent не может передать отключённую capability;

@@ -22,6 +22,10 @@ Telemetry не заменяет durable audit: sampling или недоступ�
 
 Structured logs описывают operator diagnostics и correlation с trace/span. Prompt, memory content, tool arguments/output и secrets не логируются по умолчанию.
 
+Runtime MUST писать в stdout контейнера однострочные JSON records минимум для Task lifecycle, model turn/action, tool call/outcome, approval, background/subagent lifecycle, compaction и terminal errors. Record содержит canonical tool name, run/task/context IDs и trace/span IDs при наличии. `CORE_AGENT_LOG_CONTENT=false` является безопасным default; explicit local operator profile MAY включить bounded prompt, public model response, tool arguments и normalized output через `CORE_AGENT_LOG_CONTENT=true`. Перед записью content проходит redaction и truncation.
+
+Raw chain-of-thought/private reasoning не логируется даже в content mode. Вместо него model record показывает только безопасное состояние решения (`continue_reasoning`, `request_tools`, `final_answer`), finish reason и token usage. Public reasoning summary MAY логироваться только если provider явно вернул её как пользовательский контент, а не hidden scratchpad.
+
 ## OTLP deployment configuration
 
 Runtime MUST поддерживать стандартные OTLP/HTTP environment variables: общий base endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` и точные per-signal endpoints `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. Per-signal value имеет приоритет над общим endpoint. Если задан общий endpoint, runtime добавляет стандартные paths `/v1/traces`, `/v1/metrics`, `/v1/logs`; per-signal value уже является полным URL и не изменяется.
@@ -152,7 +156,7 @@ Metric labels MUST иметь bounded cardinality. Task/run/user/tenant IDs, pro
 - LogRecord содержит timestamp, severity, service/resource, trace ID, span ID, component, safe event name и error code.
 - Structured error сохраняет exception type/stack только в защищённом operator channel.
 - Debug mode не отключает redaction.
-- Notification/message payload, raw stdout/stderr и Markdown content не логируются автоматически.
+- Notification/message payload, raw stdout/stderr и Markdown content не логируются автоматически; explicit operator content mode MAY писать их bounded/redacted представление в stdout, но не raw chain-of-thought или credentials.
 - Tenant data classification определяет exporter, region, retention и access.
 
 ## A2A updates и audit

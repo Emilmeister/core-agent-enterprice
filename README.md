@@ -146,6 +146,19 @@ and optional `CORE_AGENT_PROFILE`, then run:
 docker compose up --build
 ```
 
+Follow the agent's structured runtime log with:
+
+```bash
+docker compose logs -f agent
+```
+
+The local Compose profile enables bounded, redacted content logging with
+`CORE_AGENT_LOG_CONTENT=true`, so each JSON line shows task transitions, model action states, tool
+names and arguments/results, approvals, subagent/background-task activity, and the public final
+answer. Set it to `false` for the production-safe metadata-only profile. `CORE_AGENT_LOG_LEVEL`
+controls verbosity and `CORE_AGENT_LOG_MAX_CHARS` bounds each content field. Raw chain-of-thought
+and credentials are never logged.
+
 Compose waits for PostgreSQL, runs `core-agent-db migrate` as a one-shot job, then starts the agent
 with PostgreSQL persistence. It also starts the pinned Arize Phoenix UI at
 `http://localhost:6006`, stores Phoenix data in the `phoenix` PostgreSQL schema, and sends Core Agent

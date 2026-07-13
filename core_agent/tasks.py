@@ -223,10 +223,33 @@ class DelegationContract:
     @classmethod
     def from_dict(cls, raw):
         required = {"instruction", "tools", "mcp", "skills", "budget"}
+        allowed = required | {"result_schema"}
         if (
             not isinstance(raw, dict)
             or not required <= set(raw)
+            or set(raw) - allowed
+            or not isinstance(raw["instruction"], str)
             or not raw["instruction"].strip()
+            or not isinstance(raw["tools"], list)
+            or not all(isinstance(value, str) for value in raw["tools"])
+            or not isinstance(raw["skills"], list)
+            or not all(isinstance(value, str) for value in raw["skills"])
+            or not isinstance(raw["mcp"], dict)
+            or not all(
+                isinstance(server, str)
+                and isinstance(tools, list)
+                and all(isinstance(tool, str) for tool in tools)
+                for server, tools in raw["mcp"].items()
+            )
+            or not isinstance(raw["budget"], dict)
+            or not raw["budget"]
+            or set(raw["budget"]) - {"turns", "tool_calls"}
+            or not all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in raw["budget"].values()
+            )
             or (
                 raw.get("result_schema") is not None
                 and (
@@ -236,7 +259,7 @@ class DelegationContract:
                 )
             )
         ):
-            raise CoreError("INVALID_REQUEST")
+            raise CoreError("TOOL_ARGUMENT_INVALID")
         return cls(
             raw["instruction"],
             tuple(raw["tools"]),
