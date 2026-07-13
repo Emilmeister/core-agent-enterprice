@@ -70,12 +70,14 @@ configuration. Generate it with
 `DURABLE_STORAGE_ROOT` must be the S3-backed mount used only for immutable snapshots and artifacts;
 `LOCAL_WORKSPACE_ROOT` must be a separate local ephemeral path used by active processes.
 `CORE_AGENT_RUNTIME_MODE=with_terminal` enables the full local execution profile.
-`CORE_AGENT_RUNTIME_MODE=without_terminal` removes `core.terminal.exec`, `core.python.exec`, and `core.task.start` from
+`CORE_AGENT_RUNTIME_MODE=without_terminal` removes `core.terminal.exec` and `core.task.start` from
 both the Agent Card and model catalog while retaining task lifecycle, delegation, artifact, MCP,
-and memory tools. `core.python.exec` is available only in `with_terminal` when
+memory, and Python tools. `core.python.exec` is available in either mode when
 `LOCAL_APPROVAL_ENABLED=false`; Python code receives bounded `tools.call(...)` access to the same
-effective built-in/MCP catalog. `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` can further remove individual
-tools but cannot widen the selected runtime mode or bypass the HITL gate.
+effective built-in/MCP catalog. Python may still use standard-library OS/process APIs, so
+`without_terminal` means that the terminal capability is absent, not that local code is sandboxed.
+`CORE_AGENT_ALLOWED_BUILTIN_TOOLS` can further remove individual tools but cannot widen the
+selected runtime mode or bypass the HITL gate.
 `CORE_AGENT_MAX_DEPTH` may lower delegation depth to `0` or `1`; `2` is the hard maximum, allowing
 main → child → grandchild while rejecting any further delegation.
 Final A2A results and `core.artifact.put` content are stored as tenant-scoped, digest-verified blobs

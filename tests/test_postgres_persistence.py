@@ -193,39 +193,43 @@ class ProductionConfigurationTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
     def test_python_exec_requires_local_operator_to_be_fully_disabled(self):
-        for local_approval, expected in (("true", False), ("false", True)):
-            with self.subTest(local_approval=local_approval):
-                model = ScriptedModel([ModelResponse(message="ok")])
-                model.model = "python-gate-model"
-                with patch.dict(
-                    os.environ,
-                    {
-                        "CORE_AGENT_STATE_BACKEND": "test",
-                        "LOCAL_APPROVAL_DB_PATH": ":memory:",
-                        "LOCAL_APPROVAL_ENABLED": local_approval,
-                        "CORE_AGENT_APPROVAL_MODE": "never",
-                        "CORE_AGENT_RUNTIME_MODE": "with_terminal",
-                        "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.python.exec",
-                    },
-                    clear=True,
+        for runtime_mode in ("with_terminal", "without_terminal"):
+            for local_approval, expected in (("true", False), ("false", True)):
+                with self.subTest(
+                    runtime_mode=runtime_mode, local_approval=local_approval
                 ):
-                    app = create_app(model=model)
-                try:
-                    app.state.core_agent.run(
-                        {"prompt": "answer", "mcp": [], "skills": []}
-                    )
-                    self.assertEqual(
-                        "core.python.exec" in model.calls[0].tools, expected
-                    )
-                    advertised = {
-                        skill.id
-                        for skill in app.state.a2a_request_handler._agent_card.skills
-                    }
-                    self.assertEqual(
-                        "core.python.exec" in advertised, expected
-                    )
-                finally:
-                    app.state.close()
+                    self._assert_python_gate(runtime_mode, local_approval, expected)
+
+    def _assert_python_gate(self, runtime_mode, local_approval, expected):
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "python-gate-model"
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_STATE_BACKEND": "test",
+                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "LOCAL_APPROVAL_ENABLED": local_approval,
+                "CORE_AGENT_APPROVAL_MODE": "never",
+                "CORE_AGENT_RUNTIME_MODE": runtime_mode,
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.python.exec",
+            },
+            clear=True,
+        ):
+            app = create_app(model=model)
+        try:
+            app.state.core_agent.run(
+                {"prompt": "answer", "mcp": [], "skills": []}
+            )
+            self.assertEqual("core.python.exec" in model.calls[0].tools, expected)
+            advertised = {
+                skill.id for skill in app.state.a2a_request_handler._agent_card.skills
+            }
+            self.assertEqual("core.python.exec" in advertised, expected)
+            if runtime_mode == "without_terminal" and expected:
+                execution = app.state.core_agent.agent_config.to_dict()["execution"]
+                self.assertEqual(execution["environment_profile"], "local-python")
+        finally:
+            app.state.close()
 
 
 class NamedUser(User):

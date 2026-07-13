@@ -1491,7 +1491,6 @@ class CoreAgent:
         raw = self.agent_config.to_dict()
         if (
             cached is None
-            or raw["execution"].get("runtime_mode") != "with_terminal"
             or raw["approval"].get("local_operator", {}).get("enabled", True)
             or self.tool_runtime.policy.approval_mode.value != "never"
         ):

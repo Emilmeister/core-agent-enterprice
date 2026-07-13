@@ -397,11 +397,14 @@ class ConfigurationTests(unittest.TestCase):
     def test_without_terminal_mode_is_enforced_by_effective_config(self):
         raw = agent_config().to_dict()
         raw["execution"]["runtime_mode"] = "without_terminal"
+        raw["approval"]["local_operator"] = {"enabled": False}
+        raw["approval"]["mode"] = "never"
         effective = compile_effective_config(
             platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
         )
         self.assertNotIn("core.terminal.exec", effective.model_tool_catalog)
         self.assertNotIn("core.task.start", effective.model_tool_catalog)
+        self.assertIn("core.python.exec", effective.model_tool_catalog)
         self.assertIn("core.task.wait", effective.model_tool_catalog)
         self.assertEqual(
             json.loads(effective.audit_snapshot)["runtime_mode"],

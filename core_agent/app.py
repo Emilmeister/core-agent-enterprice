@@ -193,10 +193,11 @@ def _agent(model, mcp_connector=None, *, state=None):
     builtin_tools_by_mode = {
         "with_terminal": builtin_tools_without_terminal
         | {"core.terminal.exec", "core.python.exec", "core.task.start"},
-        "without_terminal": builtin_tools_without_terminal,
+        "without_terminal": builtin_tools_without_terminal | {"core.python.exec"},
     }
     if local_approval_enabled:
-        builtin_tools_by_mode["with_terminal"].discard("core.python.exec")
+        for tools in builtin_tools_by_mode.values():
+            tools.discard("core.python.exec")
     runtime_mode = os.getenv("CORE_AGENT_RUNTIME_MODE", "with_terminal")
     if runtime_mode not in builtin_tools_by_mode:
         raise CoreError("CONFIG_INVALID", "unknown CORE_AGENT_RUNTIME_MODE")
@@ -280,7 +281,11 @@ def _agent(model, mcp_connector=None, *, state=None):
                 "environment_profile": (
                     "local-pty"
                     if runtime_mode == "with_terminal"
-                    else "no-local-execution"
+                    else (
+                        "local-python"
+                        if "core.python.exec" in builtin_tools
+                        else "no-local-execution"
+                    )
                 ),
                 "runtime_mode": runtime_mode,
             },

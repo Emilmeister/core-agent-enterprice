@@ -97,6 +97,8 @@ Parent и child не должны одновременно изменять од
 
 `core.python.exec` переиспользует owned local workspace и process-group lifecycle TerminalSession, но запускает interpreter с очищенным environment и отдельным локальным IPC channel к parent runtime. IPC выдаёт только список разрешённых имён и `tools.call`; MCP credentials, database handles, ToolRuntime objects и operator authority в child process не materialize-ятся.
 
+Этот внутренний process backend работает и в `without_terminal`: model-visible `core.terminal.exec` и `core.task.start` при этом отсутствуют. Python остаётся доверенным локальным кодом и может использовать стандартные OS/process APIs; разделение runtime modes не добавляет OS security boundary.
+
 Parent является единственным tool broker: проверяет каждый canonical name/arguments по неизменному EffectiveConfig run-а, списывает общий budget и исполняет вызов через существующий built-in/MCP dispatch. IPC имеет single-run capability token, owner-only local endpoint, bounded JSON frames и закрывается вместе с Python process. Эта схема остаётся process separation, а не OS security boundary.
 
 Пока Python continuation нельзя надёжно checkpoint/resume, capability разрешена только при полностью отключённом local operator/HITL и не поддерживает background start. Timeout или cancel завершают Python process group; уже начатый вложенный side effect следует обычным downstream idempotency/reconciliation guarantees и не повторяется автоматически.

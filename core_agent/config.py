@@ -11,9 +11,7 @@ from .errors import CoreError
 
 MAX_SUBAGENT_DEPTH = 2
 RUNTIME_MODES = frozenset({"with_terminal", "without_terminal"})
-LOCAL_EXECUTION_TOOLS = frozenset(
-    {"core.terminal.exec", "core.python.exec", "core.task.start"}
-)
+TERMINAL_MODE_TOOLS = frozenset({"core.terminal.exec", "core.task.start"})
 
 
 @dataclass(frozen=True)
@@ -211,7 +209,7 @@ def compile_effective_config(platform, agent, request, discovered):
     allowed -= denied
     runtime_mode = raw["execution"].get("runtime_mode", "with_terminal")
     if runtime_mode == "without_terminal":
-        allowed -= LOCAL_EXECUTION_TOOLS
+        allowed -= TERMINAL_MODE_TOOLS
     if raw["approval"].get("local_operator", {}).get("enabled", True):
         allowed.discard("core.python.exec")
 

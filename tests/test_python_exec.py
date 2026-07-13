@@ -14,7 +14,7 @@ class PythonExecTests(unittest.TestCase):
             "CORE_AGENT_STATE_BACKEND": "test",
             "LOCAL_APPROVAL_DB_PATH": ":memory:",
             "LOCAL_APPROVAL_ENABLED": "false",
-            "CORE_AGENT_RUNTIME_MODE": "with_terminal",
+            "CORE_AGENT_RUNTIME_MODE": "without_terminal",
             "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
                 "core.python.exec,core.artifact.put"
             ),
@@ -77,6 +77,9 @@ print(memory["answer"], artifact["id"], sorted(tools.names))
         try:
             result = app.state.core_agent.run(request)
             self.assertEqual(result.message, "python-broker-ok")
+            self.assertIn("core.python.exec", model.calls[0].tools)
+            self.assertNotIn("core.terminal.exec", model.calls[0].tools)
+            self.assertNotIn("core.task.start", model.calls[0].tools)
             self.assertIn("Alice sha256:", model.calls[1].context)
             self.assertIn("core.artifact.put", model.calls[1].context)
             audit = app.state.core_agent.audit_log.records(result.run_id)
@@ -234,6 +237,7 @@ except ToolCallError as error:
             os.environ,
             self._environment(
                 workspace,
+                CORE_AGENT_RUNTIME_MODE="with_terminal",
                 CORE_AGENT_ALLOWED_BUILTIN_TOOLS=(
                     "core.python.exec,core.task.start,core.task.wait"
                 ),

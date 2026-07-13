@@ -103,12 +103,14 @@ Production deployment MUST задавать `DURABLE_STORAGE_ROOT` как пут
 
 Deployment MUST выбрать один из двух capability-профилей через `CORE_AGENT_RUNTIME_MODE`:
 
-- `with_terminal` — разрешает `core.terminal.exec` и `core.task.start`; `core.python.exec` дополнительно разрешён только при `approval.local_operator.enabled: false`;
-- `without_terminal` — удаляет `core.terminal.exec`, `core.python.exec` и `core.task.start`, но сохраняет task lifecycle (`get`, `list`, `wait`, `cancel`), delegation, artifacts, MCP и memory.
+- `with_terminal` — разрешает `core.terminal.exec` и `core.task.start`;
+- `without_terminal` — удаляет `core.terminal.exec` и `core.task.start`, но сохраняет task lifecycle (`get`, `list`, `wait`, `cancel`), delegation, artifacts, MCP, memory и Python.
+
+В обоих профилях `core.python.exec` дополнительно разрешён только при `approval.local_operator.enabled: false`.
 
 Значение по умолчанию — `with_terminal`. Неизвестное значение завершает startup с `CONFIG_INVALID`. Runtime mode является верхней границей capabilities: `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, AgentConfig, Task и delegation contract могут только сузить выбранный профиль. В частности, старый allowlist с terminal tools не может снова включить их в `without_terminal`.
 
-`without_terminal` означает отсутствие произвольного локального исполнения. `core.python.exec`, shell, stdio MCP и skill scripts, требующие локального process, в этом режиме MUST отсутствовать из model context и отклоняться при stale call. `core.python.exec` также MUST быть отфильтрован в `with_terminal`, пока `LOCAL_APPROVAL_ENABLED` не равен `false`; allowlist не может обойти это ограничение.
+`without_terminal` означает отсутствие model-visible terminal capability, а не OS security sandbox: Python-код всё ещё может использовать стандартные `os`, `subprocess` и filesystem APIs внутри доверенной single-container среды. Shell, stdio MCP и skill scripts не предоставляются как самостоятельные tools в этом профиле. `core.python.exec` MUST быть отфильтрован в обоих профилях, пока `LOCAL_APPROVAL_ENABLED` не равен `false`; allowlist не может обойти это ограничение.
 
 ## Tool filters
 
