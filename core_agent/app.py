@@ -9,9 +9,10 @@ from urllib.parse import urlparse
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .a2a import LOCAL_APPROVAL_STATUS_URI, AgentCard, Artifact
+from .a2a import LOCAL_APPROVAL_STATUS_URI, AgentCard, Artifact, Part
 from .a2a_sdk import build_starlette_app
 from .approvals import ApprovalManager, ApproveAllControlPlane
+from .artifacts import InMemoryArtifactStore, PostgresArtifactStore
 from .audit import InMemoryAuditLog
 from .config import AgentConfig, PlatformConfig
 from .durability import CheckpointStore, InMemoryEventStore
@@ -162,7 +163,7 @@ def _agent(model, mcp_connector=None, *, state=None):
     servers = set(_csv("CORE_AGENT_ALLOWED_MCP_SERVERS", "memory"))
     allowed_skills = set(_csv("CORE_AGENT_ALLOWED_SKILLS"))
     mcp_tools = _allowed_mcp_tools(servers)
-    builtin_tools = {
+    available_builtin_tools = {
         "core.terminal.exec",
         "core.task.start",
         "core.task.get",
@@ -170,7 +171,17 @@ def _agent(model, mcp_connector=None, *, state=None):
         "core.task.wait",
         "core.task.cancel",
         "core.delegate",
+        "core.artifact.put",
+        "core.artifact.get",
     }
+    builtin_tools = set(
+        _csv(
+            "CORE_AGENT_ALLOWED_BUILTIN_TOOLS",
+            ",".join(sorted(available_builtin_tools)),
+        )
+    )
+    if builtin_tools - available_builtin_tools:
+        raise CoreError("CONFIG_INVALID", "unknown built-in tool configured")
     platform = PlatformConfig(
         allowed_builtin_tools=builtin_tools,
         denied_builtin_tools=set(),
@@ -201,10 +212,12 @@ def _agent(model, mcp_connector=None, *, state=None):
             "model": {"route": model.model},
             "features": {
                 "memory": os.getenv("CORE_AGENT_MEMORY", "optional"),
-                "background_tasks": True,
-                "delegation": True,
-                "terminal": True,
-                "filesystem_mutation": True,
+                "background_tasks": any(
+                    name.startswith("core.task.") for name in builtin_tools
+                ),
+                "delegation": "core.delegate" in builtin_tools,
+                "terminal": "core.terminal.exec" in builtin_tools,
+                "filesystem_mutation": "core.terminal.exec" in builtin_tools,
                 "mcp": True,
                 "skills": bool(allowed_skills),
                 "human_input": False,
@@ -315,6 +328,36 @@ def _agent(model, mcp_connector=None, *, state=None):
                 risk_tags=frozenset(),
             )
         )
+    artifact_definitions = {
+        "core.artifact.put": (
+            "Store a bounded immutable text artifact and return its durable reference.",
+            {
+                "content": {"type": "string"},
+                "media_type": {"type": "string"},
+            },
+            ["content", "media_type"],
+        ),
+        "core.artifact.get": (
+            "Read an owned durable text artifact by reference.",
+            {"artifact_id": {"type": "string"}},
+            ["artifact_id"],
+        ),
+    }
+    for name, (description, properties, required) in artifact_definitions.items():
+        registry.register(
+            ToolDefinition(
+                name,
+                description,
+                {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+                mutating=False,
+                risk_tags=frozenset(),
+            )
+        )
     local_root = Path(os.getenv("LOCAL_WORKSPACE_ROOT", "/tmp/core-agent/runs")).resolve()
     durable_value = os.getenv("DURABLE_STORAGE_ROOT", "")
     if os.getenv("CORE_AGENT_ENVIRONMENT", "development") == "production" and not durable_value:
@@ -329,6 +372,15 @@ def _agent(model, mcp_connector=None, *, state=None):
         raise CoreError("CONFIG_INVALID", "base snapshot requires durable storage")
     if base_snapshot:
         snapshot_store.get(base_snapshot)
+    artifact_store = (
+        PostgresArtifactStore(
+            state["database"],
+            durable_value,
+            max_bytes=int(os.getenv("ARTIFACT_MAX_BYTES", "50000000")),
+        )
+        if state["database"] and durable_value
+        else InMemoryArtifactStore()
+    )
     sessions = TerminalSessionManager(
         LocalTerminalBackend(
             local_root,
@@ -432,6 +484,7 @@ def _agent(model, mcp_connector=None, *, state=None):
         ),
         output_reserve=int(os.getenv("MODEL_MAX_TOKENS", getattr(model, "max_tokens", 4_096))),
         token_counter=token_counter,
+        artifact_store=artifact_store,
     )
     agent.recover_durable_tasks()
     agent.recover_workflows()
@@ -505,6 +558,22 @@ def create_app(
         with telemetry.start_background_span("core_agent.task.execute", linked):
             return function()
 
+    def result_artifact(result, context):
+        provenance = {"run_id": result.run_id, "task_id": context.task_id}
+        stored = agent.artifact_store.put(
+            context.tenant or "default",
+            result.message.encode(),
+            media_type="text/plain",
+            provenance=provenance,
+        )
+        return Artifact(
+            stored.id,
+            (Part.text(result.message),),
+            1,
+            provenance,
+            stored.media_type,
+        )
+
     def handle(request, context):
         user = context.call_context.user
         identity = user.user_name if user.is_authenticated else "anonymous"
@@ -521,7 +590,7 @@ def create_app(
         )
         if isinstance(result, ApprovalNeeded):
             return result
-        return Artifact.text(result.message, {"run_id": result.run_id})
+        return result_artifact(result, context)
 
     def reserve_local(pending, context):
         if not getattr(control_plane, "automatic", True):
@@ -536,7 +605,7 @@ def create_app(
         )
         if isinstance(result, ApprovalNeeded):
             return result
-        return Artifact.text(result.message, {"run_id": result.run_id})
+        return result_artifact(result, context)
 
     def dispatch_local(reserved, context):
         result = traced_execution(
@@ -548,7 +617,7 @@ def create_app(
         )
         if isinstance(result, ApprovalNeeded):
             return result
-        return Artifact.text(result.message, {"run_id": result.run_id})
+        return result_artifact(result, context)
 
     def cancel(context):
         agent.cancel_local_approval(context.task_id)
@@ -562,6 +631,7 @@ def create_app(
             "streaming": True,
             "pushNotifications": push_sender is not None,
         },
+        skills=tuple(sorted(agent.platform_config.allowed_builtin_tools)),
         optional_extensions=(
             os.getenv("LOCAL_APPROVAL_EXTENSION_URI", LOCAL_APPROVAL_STATUS_URI),
         ),

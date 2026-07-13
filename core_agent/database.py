@@ -22,7 +22,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -280,6 +280,26 @@ CREATE INDEX core_push_deliveries_pending_idx
     ON core_push_deliveries (available_at, created_at)
     WHERE state != 'delivered';
 """,
+    4: """
+CREATE TABLE core_artifacts (
+    id text NOT NULL,
+    tenant_id text NOT NULL,
+    media_type text NOT NULL,
+    digest text NOT NULL,
+    size bigint NOT NULL,
+    provenance jsonb NOT NULL,
+    state text NOT NULL,
+    created_at double precision NOT NULL,
+    deleted_at double precision,
+    PRIMARY KEY (id, tenant_id)
+);
+
+CREATE INDEX core_artifacts_digest_idx
+    ON core_artifacts (digest) WHERE state = 'active';
+CREATE INDEX core_artifacts_run_idx
+    ON core_artifacts (tenant_id, ((provenance->>'run_id')))
+    WHERE state = 'active';
+""",
 }
 
 
@@ -412,6 +432,7 @@ class PostgresDatabase:
             "core_outbox": "SELECT, INSERT, UPDATE",
             "core_push_notification_configs": "SELECT, INSERT, UPDATE, DELETE",
             "core_push_deliveries": "SELECT, INSERT, UPDATE",
+            "core_artifacts": "SELECT, INSERT, UPDATE",
         }
         with self.transaction() as connection:
             connection.execute(

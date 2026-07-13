@@ -58,6 +58,10 @@ configuration. Generate it with
 `uv run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`.
 `DURABLE_STORAGE_ROOT` must be the S3-backed mount used only for immutable snapshots and artifacts;
 `LOCAL_WORKSPACE_ROOT` must be a separate local ephemeral path used by active processes.
+`CORE_AGENT_ALLOWED_BUILTIN_TOOLS` can remove individual terminal, task, delegation, or artifact
+tools; the resulting allowlist is reflected in both the Agent Card and every model tool catalog.
+Final A2A results and `core.artifact.put` content are stored as tenant-scoped, digest-verified blobs
+with PostgreSQL metadata. `ARTIFACT_MAX_BYTES` bounds each stored artifact.
 
 OpenAI-compatible API (OpenAI, vLLM, Ollama, LM Studio, OpenRouter, or another compatible gateway):
 

@@ -119,6 +119,7 @@ class CoreAgent:
         kernel_compiler=None,
         context_window=128_000,
         output_reserve=4_096,
+        artifact_store=None,
     ):
         self.platform_config = platform_config
         self.agent_config = agent_config
@@ -142,6 +143,7 @@ class CoreAgent:
         )
         self.context_window = int(context_window)
         self.output_reserve = int(output_reserve)
+        self.artifact_store = artifact_store
         self._run_contexts = {}
         self._run_scopes = {}
         self._runtime_cache = {}
@@ -154,6 +156,8 @@ class CoreAgent:
                 "core.task.wait": self._task_wait,
                 "core.task.cancel": self._task_cancel,
                 "core.delegate": self._delegate,
+                "core.artifact.put": self._artifact_put,
+                "core.artifact.get": self._artifact_get,
             }
         )
         if self.depth == 0 and hasattr(self.task_scheduler, "register"):
@@ -914,6 +918,31 @@ class CoreAgent:
         )
         return self._task_snapshot(task)
 
+    def _artifact_put(self, arguments, run_id):
+        if self.artifact_store is None:
+            raise CoreError("CAPABILITY_DISABLED")
+        scope = self._run_scopes.get(run_id, {})
+        artifact = self.artifact_store.put(
+            scope.get("tenant_id", "default"),
+            arguments["content"].encode(),
+            media_type=arguments["media_type"],
+            provenance={"run_id": run_id, "task_id": scope.get("task_id")},
+        )
+        return asdict(artifact)
+
+    def _artifact_get(self, arguments, run_id):
+        if self.artifact_store is None:
+            raise CoreError("CAPABILITY_DISABLED")
+        tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
+        artifact, content = self.artifact_store.get(
+            tenant_id, arguments["artifact_id"]
+        )
+        try:
+            text = content.decode()
+        except UnicodeDecodeError:
+            raise CoreError("CONTENT_TYPE_NOT_SUPPORTED") from None
+        return {**asdict(artifact), "content": text}
+
     def _recover_background_tool(self, contract, cancel_event):
         if cancel_event.is_set():
             return None
@@ -1059,6 +1088,7 @@ class CoreAgent:
             kernel_compiler=self.kernel_compiler,
             context_window=self.context_window,
             output_reserve=self.output_reserve,
+            artifact_store=self.artifact_store,
         )
         task = self.task_scheduler.start(
             lambda: child.run(

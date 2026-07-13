@@ -18,6 +18,7 @@ from a2a.types import (
 from cryptography.fernet import Fernet
 
 from core_agent.app import _agent, create_app
+from core_agent.artifacts import PostgresArtifactStore
 from core_agent.database import (
     PostgresAuditLog,
     PostgresCheckpointStore,
@@ -111,6 +112,32 @@ class ProductionConfigurationTests(unittest.TestCase):
                 create_app(model=model, control_plane=object(), database=Database())
         self.assertEqual(caught.exception.code, "PRODUCTION_AUTO_MIGRATE_FORBIDDEN")
 
+    def test_builtin_allowlist_removes_disabled_tools_from_card_and_model(self):
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "allowlist-model"
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_STATE_BACKEND": "test",
+                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.artifact.get",
+            },
+            clear=True,
+        ):
+            app = create_app(model=model)
+        try:
+            result = app.state.core_agent.run(
+                {"prompt": "answer", "mcp": [], "skills": []}
+            )
+            self.assertEqual(result.message, "ok")
+            self.assertEqual(model.calls[0].tools, frozenset({"core.artifact.get"}))
+            advertised = {
+                skill.id for skill in app.state.a2a_request_handler._agent_card.skills
+            }
+            self.assertEqual(advertised, {"core.artifact.get"})
+        finally:
+            app.state.close()
+
 
 class NamedUser(User):
     @property
@@ -137,7 +164,8 @@ class PostgresRestartTests(unittest.TestCase):
                    core_tool_proposals, core_events, core_checkpoints,
                    core_audit_records, core_a2a_tasks, core_runs,
                    core_background_tasks, core_notifications, core_outbox,
-                   core_push_notification_configs, core_push_deliveries CASCADE"""
+                   core_push_notification_configs, core_push_deliveries,
+                   core_artifacts CASCADE"""
             )
 
     def _state(self, database):
@@ -288,6 +316,41 @@ class PostgresRestartTests(unittest.TestCase):
         other = ServerCallContext(user=NamedUser(), tenant="tenant-2")
         self.assertEqual(asyncio.run(store.get_info("task-push", other)), [])
         database.close()
+
+    def test_artifacts_are_durable_verified_and_tenant_scoped(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        with tempfile.TemporaryDirectory() as root:
+            store = PostgresArtifactStore(database, root, max_bytes=1024)
+            first = store.put(
+                "tenant-1",
+                b"durable result",
+                media_type="text/plain",
+                provenance={"run_id": "run-1"},
+            )
+            second = store.put(
+                "tenant-2",
+                b"durable result",
+                media_type="text/plain",
+                provenance={"run_id": "run-2"},
+            )
+            database.close()
+
+            reopened = self._database()
+            store = PostgresArtifactStore(reopened, root, max_bytes=1024)
+            metadata, content = store.get("tenant-1", first.id)
+            self.assertEqual(metadata.digest, first.digest)
+            self.assertEqual(content, b"durable result")
+            with self.assertRaises(CoreError) as caught:
+                store.get("tenant-1", second.id)
+            self.assertEqual(caught.exception.code, "NOT_FOUND")
+            blob = store._blob(first.digest)
+            store.delete("tenant-1", first.id)
+            self.assertTrue(blob.exists())
+            store.delete("tenant-2", second.id)
+            self.assertFalse(blob.exists())
+            reopened.close()
 
     def test_workflow_lease_outbox_and_background_recovery(self):
         database = self._database()
