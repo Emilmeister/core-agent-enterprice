@@ -67,6 +67,15 @@ services:
       retries: 6
     restart: unless-stopped
 
+  memory-volume-init:
+    build: .
+    user: "0:0"
+    command: ["chown", "-R", "agent:agent", "/memory"]
+    network_mode: none
+    volumes:
+      - memory-data:/memory
+    restart: "no"
+
   memory:
     build: .
     command: ["core-agent-memory"]
@@ -75,8 +84,23 @@ services:
       MEMORY_ROOT: /memory
       MEMORY_ALLOWED_NAMESPACE_PREFIXES: session/
       MEMORY_HOST: 0.0.0.0
+      MEMORY_PORT: 8000
     volumes:
       - memory-data:/memory
+    depends_on:
+      memory-volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; socket.create_connection(('127.0.0.1', 8000), 2).close()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
     restart: unless-stopped
 
 volumes:

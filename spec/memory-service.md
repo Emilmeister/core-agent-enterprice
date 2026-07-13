@@ -20,6 +20,8 @@ Markdown files являются единственным канонически�
 
 Agent не имеет прямого filesystem access к memory corpus. Любая mutation проходит MCP tool и enforcement самого Memory Service.
 
+Memory Service MUST работать от non-root runtime user, а `MEMORY_ROOT` MUST быть writable этим user до startup. Container image заранее создаёт стандартный mount point с правильным owner. Deployment с уже существующим volume MAY выполнить bounded init-job для исправления ownership; init-job завершается до запуска сервиса, а основной process не повышает privileges и не удаляет существующие данные. Container healthcheck подтверждает, что MCP listener принимает соединения после инициализации storage.
+
 ## MCP capability profile
 
 Memory Service объявляет stable server identity, protocol/profile version и tools:

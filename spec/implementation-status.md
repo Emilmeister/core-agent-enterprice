@@ -43,7 +43,7 @@
 | OTL-02 | bounded labels/content-off и exporter failure isolation | telemetry privacy/failure suite | implemented |
 | SEC-01 | stable public errors, secret redaction и trust boundaries | adversarial/security suite and secret scan gate | implemented |
 | SEC-02 | retention/coordinated deletion очищает cached derived data | run-family lifecycle and Memory delete E2E | implemented |
-| OPS-01 | non-root image, graceful shutdown, probes и separate migration | pinned image smoke/user/health/migration gates | implemented |
+| OPS-01 | non-root image, writable durable mounts, graceful shutdown, probes и separate migration | pinned image/mount smoke, Compose init, health/migration gates | implemented |
 | CI-01 | spec, unit, PostgreSQL, E2E, crash/race и image gates обязательны | `.github/workflows/ci.yml` | implemented |
 
 ## Release rule

@@ -43,6 +43,7 @@ jobs:
       - run: uv build --no-sources
       - run: docker build -t core-agent:ci .
       - run: test "$(docker image inspect core-agent:ci --format '{{.Config.User}}')" = agent
+      - run: docker run --rm --entrypoint sh core-agent:ci -c "test -w /memory"
       - run: >-
           docker run --rm --entrypoint python core-agent:ci
           -c "import core_agent, memory_service; print('image-smoke-ok')"
@@ -50,3 +51,21 @@ jobs:
           POSTGRES_DB=core_agent POSTGRES_USER=core_agent POSTGRES_PASSWORD=test
           MODEL_API_FORMAT=openai MODEL_BASE_URL=http://model.invalid/v1
           MODEL_NAME=test MODEL_API_KEY=test docker compose config --quiet
+      - name: Smoke existing Memory volume
+        env:
+          COMPOSE_PROJECT_NAME: core-agent-ci
+          POSTGRES_DB: core_agent
+          POSTGRES_USER: core_agent
+          POSTGRES_PASSWORD: test
+          MODEL_API_FORMAT: openai
+          MODEL_BASE_URL: http://model.invalid/v1
+          MODEL_NAME: test
+          MODEL_API_KEY: test
+        run: |
+          trap 'docker compose down -v' EXIT
+          docker volume create core-agent-ci_memory-data
+          docker run --rm --user 0:0 -v core-agent-ci_memory-data:/memory \
+            --entrypoint sh core-agent:ci -c 'touch /memory/existing-data'
+          docker compose up --build -d --wait --wait-timeout 60 memory
+          docker compose exec -T memory sh -c \
+            'test -w /memory && test -f /memory/existing-data'
