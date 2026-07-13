@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import time
 from contextlib import contextmanager
@@ -22,7 +23,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -300,6 +301,9 @@ CREATE INDEX core_artifacts_run_idx
     ON core_artifacts (tenant_id, ((provenance->>'run_id')))
     WHERE state = 'active';
 """,
+    5: """
+UPDATE core_a2a_tasks SET tenant = 'default' WHERE tenant = '';
+""",
 }
 
 
@@ -574,7 +578,67 @@ class PostgresTaskStore(TaskStore):
 
     def _scope(self, context):
         owner = self.owner_resolver(context)
-        return (owner if context.user.is_authenticated and owner else "anonymous"), context.tenant or ""
+        return (
+            owner if context.user.is_authenticated and owner else "anonymous"
+        ), context.tenant or "default"
+
+    def reconcile_from_workflows(self):
+        terminal = {
+            "COMPLETED": a2a_pb2.TASK_STATE_COMPLETED,
+            "FAILED": a2a_pb2.TASK_STATE_FAILED,
+            "ABORTED": a2a_pb2.TASK_STATE_FAILED,
+            "CANCELLED": a2a_pb2.TASK_STATE_CANCELED,
+            "REJECTED": a2a_pb2.TASK_STATE_REJECTED,
+        }
+        reconciled = 0
+        with self.database.transaction() as connection:
+            rows = connection.execute(
+                """SELECT task.payload, task.owner, task.tenant,
+                          run.state AS run_state, run.result, run.error_code
+                   FROM core_a2a_tasks task
+                   JOIN core_runs run ON run.task_id = task.task_id
+                   WHERE task.state NOT IN (%s, %s, %s, %s)
+                     AND run.state IN ('COMPLETED','FAILED','ABORTED','CANCELLED','REJECTED')
+                   FOR UPDATE OF task""",
+                (
+                    int(a2a_pb2.TASK_STATE_COMPLETED),
+                    int(a2a_pb2.TASK_STATE_FAILED),
+                    int(a2a_pb2.TASK_STATE_CANCELED),
+                    int(a2a_pb2.TASK_STATE_REJECTED),
+                ),
+            ).fetchall()
+            for row in rows:
+                task = a2a_pb2.Task.FromString(bytes(row["payload"]))
+                task.status.state = terminal[row["run_state"]]
+                task.status.timestamp.GetCurrentTime()
+                result = row["result"] or {}
+                message = result.get("message")
+                if row["run_state"] == "COMPLETED" and message and not task.artifacts:
+                    encoded = message.encode()
+                    digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+                    artifact = task.artifacts.add()
+                    artifact.artifact_id = digest
+                    part = artifact.parts.add()
+                    part.text = message
+                    part.media_type = "text/plain"
+                    artifact.metadata.update(
+                        {"digest": digest, "size": len(encoded), "recovered": True}
+                    )
+                connection.execute(
+                    """UPDATE core_a2a_tasks SET state = %s,
+                           status_timestamp = %s, payload = %s, updated_at = now()
+                       WHERE task_id = %s AND owner = %s AND tenant = %s""",
+                    (
+                        int(task.status.state),
+                        task.status.timestamp.ToMilliseconds() / 1000,
+                        task.SerializeToString(),
+                        task.id,
+                        row["owner"],
+                        row["tenant"],
+                    ),
+                )
+                reconciled += 1
+        return reconciled
 
     def _save(self, task, context):
         owner, tenant = self._scope(context)

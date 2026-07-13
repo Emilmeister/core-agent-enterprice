@@ -224,6 +224,51 @@ class PostgresRestartTests(unittest.TestCase):
         finally:
             reopened.close()
 
+    def test_terminal_workflow_reconciles_same_a2a_task_and_artifact_after_crash(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        workflows.create(
+            WorkflowRecord(
+                "reconcile-run",
+                "reconcile-task",
+                "reconcile-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "work", "mcp": [], "skills": []},
+                {"turns": 1},
+            )
+        )
+        context = ServerCallContext(user=NamedUser(), tenant="tenant-1")
+        store = PostgresTaskStore(database)
+        asyncio.run(
+            store.save(
+                Task(
+                    id="reconcile-task",
+                    context_id="reconcile-context",
+                    status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                ),
+                context,
+            )
+        )
+        with database.transaction() as connection:
+            connection.execute(
+                """UPDATE core_runs SET state = 'COMPLETED',
+                       result = %s, version = version + 1
+                   WHERE run_id = 'reconcile-run'""",
+                (Jsonb({"message": "recovered result", "usage": {"model_turns": 1, "tool_calls": 0}}),),
+            )
+        self.assertEqual(store.reconcile_from_workflows(), 1)
+        task = asyncio.run(store.get("reconcile-task", context))
+        self.assertEqual(task.status.state, TaskState.TASK_STATE_COMPLETED)
+        self.assertEqual(task.artifacts[0].parts[0].text, "recovered result")
+        self.assertEqual(store.reconcile_from_workflows(), 0)
+        database.close()
+
     def test_stock_production_entrypoint_builds_private_operator_plane(self):
         database = self._database()
         database.migrate()

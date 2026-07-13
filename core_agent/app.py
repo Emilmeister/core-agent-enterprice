@@ -540,6 +540,8 @@ def create_app(
         raise CoreError("PUSH_ENCRYPTION_KEY_REQUIRED")
     try:
         agent, telemetry = _agent(model, mcp_connector, state=state)
+        if state["tasks"]:
+            state["tasks"].reconcile_from_workflows()
     except Exception:
         if state["database"]:
             state["database"].close()
