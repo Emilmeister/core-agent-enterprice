@@ -120,6 +120,7 @@ class CoreAgent:
         context_window=128_000,
         output_reserve=4_096,
         artifact_store=None,
+        retention_manager=None,
     ):
         self.platform_config = platform_config
         self.agent_config = agent_config
@@ -144,6 +145,7 @@ class CoreAgent:
         self.context_window = int(context_window)
         self.output_reserve = int(output_reserve)
         self.artifact_store = artifact_store
+        self.retention_manager = retention_manager
         self._run_contexts = {}
         self._run_scopes = {}
         self._runtime_cache = {}
@@ -790,7 +792,7 @@ class CoreAgent:
                         snapshot=snapshot,
                         event_kind="task.completed",
                         event_data={"message": response["message"]},
-                        audit=(("task.completed", {"message": response["message"]}),),
+                        audit=(("task.completed", {"content_persisted": False}),),
                         result=result,
                         lease_token=lease_token,
                     )
@@ -1130,6 +1132,7 @@ class CoreAgent:
             context_window=self.context_window,
             output_reserve=self.output_reserve,
             artifact_store=self.artifact_store,
+            retention_manager=self.retention_manager,
         )
         return child
 
@@ -1182,6 +1185,13 @@ class CoreAgent:
             parent_run_id=parent_run_id,
         )
         return self._continue_workflow(record)
+
+    def delete_run_data(self, tenant_id, run_id, *, operator_principal_id):
+        if self.retention_manager is None:
+            raise CoreError("CAPABILITY_DISABLED")
+        return self.retention_manager.delete_run(
+            tenant_id, run_id, operator_principal_id=operator_principal_id
+        )
 
     def is_waiting_local_approval(self, task_id):
         try:

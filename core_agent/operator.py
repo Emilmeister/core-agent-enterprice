@@ -38,6 +38,7 @@ class AuthenticatedControlPlane:
 @dataclass(frozen=True)
 class PrivateOperatorControlPlane:
     automatic: bool = False
+    trusted_operator_control_plane: bool = True
 
 
 class OperatorAuthenticator:
@@ -203,6 +204,20 @@ def operator_routes(agent, request_handler, authenticator):
             request, lambda req, identity: decision(req, identity, approve=False)
         )
 
+    async def delete_run(request, identity):
+        tenant_id = request.query_params.get("tenant_id")
+        if not tenant_id:
+            raise CoreError("INVALID_REQUEST")
+        result = agent.delete_run_data(
+            tenant_id,
+            request.path_params["run_id"],
+            operator_principal_id=identity.principal_id,
+        )
+        return JSONResponse(result)
+
+    async def delete_run_endpoint(request):
+        return await guarded(request, delete_run)
+
     return [
         Route(
             "/internal/approvals",
@@ -223,5 +238,10 @@ def operator_routes(agent, request_handler, authenticator):
             "/internal/approvals/{approval_id}:deny",
             deny_endpoint,
             methods=["POST"],
+        ),
+        Route(
+            "/internal/runs/{run_id}",
+            delete_run_endpoint,
+            methods=["DELETE"],
         ),
     ]

@@ -30,6 +30,7 @@ from .execution import (
     WorkspaceSnapshotStore,
 )
 from .kernel import KernelCompiler
+from .lifecycle import PostgresRetentionManager
 from .mcp import StreamableHttpMcpConnector
 from .model import CompatibleHttpModel
 from .observability import RecordingExporter, Telemetry
@@ -381,6 +382,11 @@ def _agent(model, mcp_connector=None, *, state=None):
         if state["database"] and durable_value
         else InMemoryArtifactStore()
     )
+    retention_manager = (
+        PostgresRetentionManager(state["database"], artifact_store)
+        if state["database"]
+        else None
+    )
     sessions = TerminalSessionManager(
         LocalTerminalBackend(
             local_root,
@@ -485,6 +491,7 @@ def _agent(model, mcp_connector=None, *, state=None):
         output_reserve=int(os.getenv("MODEL_MAX_TOKENS", getattr(model, "max_tokens", 4_096))),
         token_counter=token_counter,
         artifact_store=artifact_store,
+        retention_manager=retention_manager,
     )
     agent.recover_durable_tasks()
     agent.recover_workflows()
@@ -521,6 +528,12 @@ def create_app(
     model = model or _model()
     push_key = os.getenv("PUSH_NOTIFICATION_ENCRYPTION_KEY", "")
     state = _state(database)
+    if environment == "production" and not getattr(
+        control_plane, "trusted_operator_control_plane", False
+    ):
+        if state["database"]:
+            state["database"].close()
+        raise CoreError("LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
     if environment == "production" and not push_key:
         if state["database"]:
             state["database"].close()

@@ -163,3 +163,14 @@ class PostgresArtifactStore:
             ).fetchone()
         if not remaining:
             self._blob(row["digest"]).unlink(missing_ok=True)
+
+    def purge_unreferenced(self, digests):
+        for digest in set(digests):
+            with self.database.pool.connection() as connection:
+                active = connection.execute(
+                    """SELECT 1 FROM core_artifacts
+                       WHERE digest = %s AND state = 'active' LIMIT 1""",
+                    (digest,),
+                ).fetchone()
+            if not active:
+                self._blob(digest).unlink(missing_ok=True)

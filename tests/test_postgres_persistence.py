@@ -36,6 +36,7 @@ from core_agent.push import (
 from core_agent.tools import ToolCall
 from core_agent.approvals import ApproveAllControlPlane
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
+from core_agent.lifecycle import PostgresRetentionManager
 from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, WorkflowRecord
 from psycopg.types.json import Jsonb
 
@@ -351,6 +352,89 @@ class PostgresRestartTests(unittest.TestCase):
             store.delete("tenant-2", second.id)
             self.assertFalse(blob.exists())
             reopened.close()
+
+    def test_coordinated_retention_deletes_run_family_content_and_keeps_tombstone(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        root = workflows.create(
+            WorkflowRecord(
+                "retain-root",
+                "retain-task",
+                "retain-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "private", "mcp": [], "skills": []},
+                {"context": "private transcript"},
+            ),
+            audit=(("task.started", {"content": False}),),
+        )
+        workflows.create(
+            WorkflowRecord(
+                "retain-child",
+                "retain-child-task",
+                "retain-context",
+                "tenant-1",
+                "owner-1",
+                root.run_id,
+                "RUNNING",
+                1,
+                {"prompt": "child private", "mcp": [], "skills": []},
+                {"context": "child transcript"},
+            )
+        )
+        context = ServerCallContext(user=NamedUser(), tenant="tenant-1")
+        asyncio.run(
+            PostgresTaskStore(database).save(
+                Task(
+                    id="retain-task",
+                    context_id="retain-context",
+                    status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                ),
+                context,
+            )
+        )
+        with tempfile.TemporaryDirectory() as durable:
+            artifacts = PostgresArtifactStore(database, durable)
+            artifact = artifacts.put(
+                "tenant-1",
+                b"private artifact",
+                media_type="text/plain",
+                provenance={"run_id": "retain-child"},
+            )
+            result = PostgresRetentionManager(database, artifacts).delete_run(
+                "tenant-1",
+                "retain-root",
+                operator_principal_id="operator-1",
+            )
+            self.assertEqual(result, {"deleted": True, "runs": 2, "artifacts": 1})
+            self.assertFalse(artifacts._blob(artifact.digest).exists())
+            with self.assertRaises(CoreError):
+                artifacts.get("tenant-1", artifact.id)
+        with database.pool.connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) AS count FROM core_runs WHERE tenant_id = 'tenant-1'"
+                ).fetchone()["count"],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) AS count FROM core_checkpoints WHERE tenant_id = 'tenant-1'"
+                ).fetchone()["count"],
+                0,
+            )
+            tombstones = connection.execute(
+                """SELECT data FROM core_audit_records
+                   WHERE tenant_id = 'tenant-1' AND kind = 'retention.deleted'"""
+            ).fetchall()
+        self.assertEqual(len(tombstones), 2)
+        self.assertNotIn("private", repr(tombstones))
+        database.close()
 
     def test_workflow_lease_outbox_and_background_recovery(self):
         database = self._database()
