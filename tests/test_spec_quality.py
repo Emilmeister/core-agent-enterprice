@@ -11,6 +11,21 @@ SPEC = ROOT / "spec"
 
 
 class SpecificationQualityTests(unittest.TestCase):
+    def test_repository_contains_no_committed_private_key_or_api_token(self):
+        patterns = (
+            re.compile(r"sk-[A-Za-z0-9_-]{32,}"),
+            re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+        )
+        roots = (ROOT / "core_agent", ROOT / "memory_service", ROOT / "tests")
+        files = [ROOT / ".env.example", ROOT / "README.md"]
+        for root in roots:
+            files.extend(root.rglob("*.py"))
+        for document in files:
+            content = document.read_text(encoding="utf-8")
+            for pattern in patterns:
+                with self.subTest(document=document, pattern=pattern.pattern):
+                    self.assertIsNone(pattern.search(content))
+
     def test_relative_markdown_links_exist(self):
         pattern = re.compile(r"\[[^]]+\]\(([^)]+)\)")
         for document in SPEC.rglob("*.md"):
