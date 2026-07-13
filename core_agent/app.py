@@ -636,7 +636,7 @@ def create_app(
         return result_artifact(result, context)
 
     def cancel(context):
-        agent.cancel_local_approval(context.task_id)
+        agent.cancel_task(context.task_id)
 
     host = os.getenv("CORE_AGENT_HOST", "0.0.0.0")
     port = int(os.getenv("CORE_AGENT_PORT", "8000"))

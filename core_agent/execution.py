@@ -652,6 +652,13 @@ class TerminalSessionManager:
                 self._run_environments.pop(run_id, None)
         return snapshot
 
+    def destroy_run(self, run_id):
+        with self._lock:
+            environment_id = self._run_environments.get(run_id)
+        if environment_id is None:
+            return None
+        return self.destroy(environment_id, owner_id=run_id)
+
     def close(self):
         for environment_id in tuple(self._environments):
             self.destroy(environment_id)

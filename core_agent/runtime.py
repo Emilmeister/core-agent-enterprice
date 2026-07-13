@@ -1413,6 +1413,45 @@ class CoreAgent:
         self._run_scopes.pop(record.run_id, None)
         self._runtime_cache.pop(record.run_id, None)
 
+    def cancel_task(self, task_id):
+        record = self.workflow_store.lookup_task(task_id)
+        if record.state == "APPROVED_RESERVED" or record.state in {
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "REJECTED",
+            "ABORTED",
+        }:
+            raise CoreError("TASK_NOT_CANCELABLE")
+        if record.state == "WAITING_LOCAL_APPROVAL":
+            self.tool_runtime.approvals.cancel(record.pending_approval_id)
+        for task in self.task_scheduler.list(
+            owner_id=record.run_id, tenant_id=record.tenant_id
+        ):
+            if task.state not in {"completed", "failed", "canceled"}:
+                try:
+                    self.task_scheduler.cancel(
+                        task.id,
+                        owner_id=record.run_id,
+                        tenant_id=record.tenant_id,
+                    )
+                except CoreError:
+                    pass
+        destroy_run = getattr(self.tool_runtime.environment_manager, "destroy_run", None)
+        if destroy_run:
+            destroy_run(record.run_id)
+        self._record_transition(
+            record,
+            state="CANCELLED",
+            snapshot=copy.deepcopy(record.snapshot),
+            event_kind="task.canceled",
+            event_data={"task_id": task_id},
+            audit=(("task.canceled", {"content": False}),),
+        )
+        self._run_contexts.pop(record.run_id, None)
+        self._run_scopes.pop(record.run_id, None)
+        self._runtime_cache.pop(record.run_id, None)
+
     def close(self):
         self._task_approvals.clear()
         self._run_contexts.clear()
