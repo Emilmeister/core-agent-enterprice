@@ -22,11 +22,11 @@ EXPECTED_SHA256 = {
     "product.md": "4722378a59ab5fee77b38d2eba9a86efa7feb2d5b8721e1f499f1677790099c3",
     "public-contract.md": "e8f464ff5183130f80ec18b0cc5a67b1112401ebdefdfa0644d566ed96ebff1f",
     "releases/v1.md": "c6d0e16314e141022ecee3dae27b0bd9dd06dbb1f183a8e5cf9e6a9024fc5e9b",
-    "runtime.md": "7a31f9603c4a9af45d5a4b785192e85f40375b2b7c6a897adba1435034411214",
+    "runtime.md": "ebba00d9ff7d752a8aea5bf431cd9c25c00fa6a545c5cbb72b1c02dcc93b07d3",
     "security-and-reliability.md": "78438365e7f140c7372964f37070f37e7a75d8efb66a6251277740129c955df7",
     "skills.md": "7102b91a2f574ea5b75c02688a14ed5da7bbafc7d19b66b159330eae09600426",
     "tasks-and-delegation.md": "9ec3b3ff94d1a5d475848f6393f09b077f5f7bcc9264a2aa21635bba5a27d27a",
-    "tools-and-approvals.md": "221ef341680f16d4ca7794311f92c51f0e91183abfadd8de9cc902b71cd1915c",
+    "tools-and-approvals.md": "e3ceb72928b8e2d345885b867d55412976adee35277ce8a8d89b47f9997135ff",
 }
 
 

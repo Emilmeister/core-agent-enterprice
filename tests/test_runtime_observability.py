@@ -238,6 +238,54 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("reasoning", result.to_dict())
         agent.close()
 
+    def test_terminal_start_failure_returns_to_model_and_task_completes(self):
+        exporter = RecordingExporter()
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest(
+                            "call-1",
+                            "core.terminal.exec",
+                            {"argv": ["echo && hello-tool-check && pwd"]},
+                        ),
+                    )
+                ),
+                ModelResponse(message="The command was malformed."),
+            ]
+        )
+        agent = make_agent(
+            model,
+            memory="disabled",
+            telemetry=Telemetry(exporter, content_enabled=True),
+        )
+
+        def fail_before_start(_request, _run_id):
+            raise CoreError(
+                "TOOL_START_FAILED",
+                "No such file or directory: 'echo && hello-tool-check && pwd'",
+            )
+
+        agent.tool_runtime.environment_manager.execute_transient = fail_before_start
+        try:
+            result = agent.run(run_request(memory=False))
+        finally:
+            agent.close()
+
+        self.assertEqual(result.terminal_state, "completed")
+        self.assertEqual(result.message, "The command was malformed.")
+        self.assertEqual(len(model.calls), 2)
+        self.assertIn('"status": "failed"', model.calls[1].context)
+        self.assertIn('"error_code": "TOOL_START_FAILED"', model.calls[1].context)
+        tool_span = next(
+            span for span in exporter.spans if span.name == "core_agent.tool.execute"
+        )
+        self.assertEqual(tool_span.status_code, "ERROR")
+        self.assertEqual(tool_span.attributes["core_agent.tool.outcome"], "failed")
+        self.assertEqual(
+            tool_span.attributes["core_agent.error.code"], "TOOL_START_FAILED"
+        )
+
     def test_provider_adapters_preserve_native_tool_call_and_result_messages(self):
         tools = {
             "core.terminal.exec": {

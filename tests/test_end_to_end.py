@@ -90,6 +90,16 @@ class ModelHandler(BaseHTTPRequestHandler):
                         ]
                     },
                 )
+        elif "TOOL_FAILURE_E2E" in context:
+            message = (
+                _text("tool-failure-e2e-ok")
+                if '"status": "failed"' in context
+                else _tool(
+                    body,
+                    "core.terminal.exec",
+                    {"argv": ["echo && hello-tool-check && pwd"]},
+                )
+            )
         elif "SLOW_A2A_E2E" in context:
             time.sleep(0.1)
             message = _text("slow-a2a-ok")
@@ -498,6 +508,10 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         answer = await self._send("TERMINAL_E2E")
         self.assertEqual(answer, "terminal-e2e-ok")
         self.assertNotIn("private terminal reasoning", answer)
+
+    async def test_a2a_tool_start_failure_returns_to_model_and_task_completes(self):
+        answer = await self._send("TOOL_FAILURE_E2E")
+        self.assertEqual(answer, "tool-failure-e2e-ok")
 
     async def test_local_control_plane_approves_exact_call_once(self):
         transport = httpx.ASGITransport(app=self.approval_app)

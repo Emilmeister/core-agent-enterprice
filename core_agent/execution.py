@@ -390,7 +390,7 @@ class _LocalTerminalSession:
             )
         except (OSError, ValueError) as error:
             os.close(master_fd)
-            raise CoreError("TOOL_EXECUTION_FAILED", str(error)) from error
+            raise CoreError("TOOL_START_FAILED", str(error)) from error
         finally:
             os.close(slave_fd)
 

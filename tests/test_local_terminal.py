@@ -187,6 +187,14 @@ class LocalTerminalTests(unittest.TestCase):
                     self.manager.execute(session.id, request, owner_id="main")
                 self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
 
+        with self.assertRaises(CoreError) as caught:
+            self.manager.execute(
+                session.id,
+                {"argv": ["echo && hello-tool-check && pwd"]},
+                owner_id="main",
+            )
+        self.assertEqual(caught.exception.code, "TOOL_START_FAILED")
+
         result = self.manager.execute(
             session.id,
             {

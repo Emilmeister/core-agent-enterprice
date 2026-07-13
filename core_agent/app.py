@@ -264,7 +264,11 @@ def _agent(model, mcp_connector=None, *, state=None):
     registry.register(
         ToolDefinition(
             "core.terminal.exec",
-            "Execute argv in the agent's local terminal workspace.",
+            (
+                "Execute argv directly in the agent's local terminal workspace; "
+                "there is no implicit shell, so use ['sh', '-lc', '...'] when "
+                "shell syntax such as && is required."
+            ),
             {
                 "type": "object",
                 "properties": {

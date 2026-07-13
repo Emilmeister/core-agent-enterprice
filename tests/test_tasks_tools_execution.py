@@ -382,6 +382,18 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(len(self.backend.executed), 1)
 
+    def test_completed_terminal_failure_is_a_failed_tool_result(self):
+        self.environment_manager.execute_transient = lambda _request, _run_id: (
+            ExecutionResult(7, "", "bad command", (), (), status="failed")
+        )
+        result = self.runtime.execute(
+            ToolCall("call-failed", "core.terminal.exec", {"argv": ["false"]}),
+            run_id="run-1",
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error_code, "TOOL_RETURNED_FAILED")
+        self.assertEqual(self.events[-1], "tool.failed")
+
     def test_risky_call_does_not_execute_until_exact_arguments_are_approved(self):
         call = ToolCall(
             "call-3", "external.publish", {"target": "org/repo", "body": "hello"}
@@ -402,6 +414,24 @@ class ToolRuntimeTests(unittest.TestCase):
         with self.assertRaises(CoreError) as caught:
             self.runtime.resume_approved(changed, approval.id, run_id="run-1")
         self.assertEqual(caught.exception.code, "APPROVAL_ARGUMENTS_CHANGED")
+
+    def test_approved_failed_outcome_is_recorded_and_returned_to_model(self):
+        call = ToolCall(
+            "call-failed", "external.publish", {"target": "org/repo", "body": "x"}
+        )
+        approval = self.runtime.execute(call, run_id="run-1")
+        ApproveAllControlPlane().approve(self.approvals, approval)
+        self.environment_manager.execute_transient = lambda _request, _run_id: (
+            ExecutionResult(1, "", "failed", (), (), status="failed")
+        )
+
+        result = self.runtime.resume_approved(call, approval.id, run_id="run-1")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            self.approvals.execution_for(approval.id).state,
+            "FAILED",
+        )
 
     def test_approval_is_single_resolution_and_never_mode_denies_instead_of_allowing(
         self,

@@ -626,6 +626,8 @@ class CoreAgent:
                 "status": outcome.status,
                 "output": self._value(outcome.output),
             }
+            if outcome.error_code:
+                value["error_code"] = outcome.error_code
         else:
             value = {"tool_call_id": call_id, "status": "succeeded", "output": outcome}
         if tool_name:
@@ -768,30 +770,51 @@ class CoreAgent:
                 if isinstance(outcome, ApprovalRequest):
                     raise CoreError("INVALID_TASK_STATE")
         except Exception as error:
-            self._record_transition(
-                record,
-                state="FAILED",
-                snapshot=snapshot,
-                event_kind="tool.failed",
-                event_data={"tool_call_id": call.id},
-                audit=(
-                    (
-                        "tool.execution.failed",
-                        {
-                            "tool_call_id": call.id,
-                            "error_code": getattr(error, "code", type(error).__name__),
-                        },
+            if isinstance(error, CoreError) and error.code == "TOOL_START_FAILED":
+                outcome = ToolResult(
+                    call.id,
+                    "failed",
+                    {"error": {"code": error.code, "message": str(error)[:1000]}},
+                    error.code,
+                )
+                if span:
+                    span.record_error(error)
+            else:
+                self._record_transition(
+                    record,
+                    state="FAILED",
+                    snapshot=snapshot,
+                    event_kind="tool.failed",
+                    event_data={"tool_call_id": call.id},
+                    audit=(
+                        (
+                            "tool.execution.failed",
+                            {
+                                "tool_call_id": call.id,
+                                "error_code": getattr(
+                                    error, "code", type(error).__name__
+                                ),
+                            },
+                        ),
                     ),
-                ),
-                error_code=getattr(error, "code", "TOOL_EXECUTION_FAILED"),
-                lease_token=lease_token,
-            )
-            raise
+                    error_code=getattr(error, "code", "TOOL_EXECUTION_FAILED"),
+                    lease_token=lease_token,
+                )
+                raise
         result_text = self._result_text(call.id, outcome, call.name)
+        status = outcome.status if isinstance(outcome, ToolResult) else "succeeded"
+        succeeded = status == "succeeded"
+        error_code = None
+        if not succeeded:
+            error_code = outcome.error_code or (
+                "TOOL_TIMED_OUT" if status == "timed_out" else "TOOL_RETURNED_FAILED"
+            )
+            if span and span.status_code != "ERROR":
+                span.record_error(CoreError(error_code))
         if span:
             span.set_attributes(
                 {
-                    "core_agent.tool.outcome": "succeeded",
+                    "core_agent.tool.outcome": status,
                     "output.value": self._safe_telemetry(result_text),
                     "output.mime_type": "application/json",
                 }
@@ -801,9 +824,19 @@ class CoreAgent:
             record,
             state="RUNNING",
             snapshot=snapshot,
-            event_kind="tool.completed",
-            event_data={"tool_call_id": call.id},
-            audit=(("tool.execution.succeeded", {"tool_call_id": call.id}),),
+            event_kind="tool.completed" if succeeded else "tool.failed",
+            event_data={"tool_call_id": call.id, "status": status},
+            audit=(
+                (
+                    "tool.execution.succeeded"
+                    if succeeded
+                    else "tool.execution.failed",
+                    {
+                        "tool_call_id": call.id,
+                        **({"error_code": error_code} if error_code else {}),
+                    },
+                ),
+            ),
             lease_token=lease_token,
         )
 

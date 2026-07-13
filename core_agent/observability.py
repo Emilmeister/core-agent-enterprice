@@ -240,15 +240,23 @@ class Span:
         for key, value in attributes.items():
             self.set_attribute(key, value)
 
+    def record_error(self, error):
+        if self.ended:
+            return
+        self.status_code = "ERROR"
+        self.status_message = type(error).__name__
+        self.set_attribute("error.type", type(error).__name__)
+        code = getattr(error, "code", None)
+        if code:
+            self.set_attribute("core_agent.error.code", code)
+
     def end(self, error=None):
         if self.ended:
             return
-        if error is None:
+        if error is None and self.status_code == "UNSET":
             self.status_code = "OK"
-        else:
-            self.status_code = "ERROR"
-            self.status_message = type(error).__name__
-            self.set_attribute("error.type", type(error).__name__)
+        elif error is not None:
+            self.record_error(error)
         self.ended = True
         self.telemetry._export_span(self)
 

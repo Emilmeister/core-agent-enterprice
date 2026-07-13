@@ -35,6 +35,7 @@ class ToolResult:
     tool_call_id: str
     status: str
     output: object = None
+    error_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -199,8 +200,20 @@ class ToolRuntime:
             else {"tool": call.name, "arguments": call.arguments}
         )
         result = self.environment_manager.execute_transient(request, run_id)
-        self._emit("tool.completed", call_id=call.id)
-        return ToolResult(call.id, "succeeded", result)
+        status = getattr(result, "status", "succeeded")
+        if status not in {"failed", "timed_out"}:
+            status = "succeeded"
+        error_code = (
+            "TOOL_TIMED_OUT"
+            if status == "timed_out"
+            else ("TOOL_RETURNED_FAILED" if status == "failed" else None)
+        )
+        self._emit(
+            "tool.completed" if status == "succeeded" else "tool.failed",
+            call_id=call.id,
+            status=status,
+        )
+        return ToolResult(call.id, status, result, error_code)
 
     def resume_approved(self, call, approval_id, *, run_id):
         definition = self.registry.get(call.name)
@@ -217,7 +230,13 @@ class ToolRuntime:
                 error_code=getattr(error, "code", type(error).__name__),
             )
             raise
-        self.approvals.finish_execution(execution.id, "SUCCEEDED", outcome=result)
+        state = "SUCCEEDED" if result.status == "succeeded" else "FAILED"
+        self.approvals.finish_execution(
+            execution.id,
+            state,
+            outcome=result,
+            error_code=result.error_code,
+        )
         return result
 
     def request_input(self, prompt, schema, *, run_id):
