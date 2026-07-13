@@ -35,6 +35,7 @@ def platform_config(**changes):
     values = {
         "allowed_builtin_tools": {
             "core.terminal.exec",
+            "core.python.exec",
             "core.terminal.write",
             "core.fs.apply_patch",
             "core.task.start",
@@ -53,6 +54,7 @@ def platform_config(**changes):
             "background_tasks",
             "delegation",
             "terminal",
+            "python",
             "filesystem_mutation",
             "mcp",
             "skills",
@@ -75,6 +77,7 @@ def agent_config(**changes):
             "background_tasks": True,
             "delegation": True,
             "terminal": True,
+            "python": True,
             "filesystem_mutation": True,
             "mcp": True,
             "skills": True,
@@ -85,6 +88,7 @@ def agent_config(**changes):
                 "default": "deny",
                 "allow": [
                     "core.terminal.exec",
+                    "core.python.exec",
                     "core.fs.apply_patch",
                     "core.task.*",
                     "core.delegate",
@@ -254,7 +258,13 @@ class RunRequestTests(unittest.TestCase):
 class ConfigurationTests(unittest.TestCase):
     def test_production_refuses_approve_all_stub_and_disabled_hitl_fails_closed(self):
         model = type("Model", (), {"model": "test-model"})()
-        with patch.dict(os.environ, {"CORE_AGENT_ENVIRONMENT": "production"}):
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_ENVIRONMENT": "production",
+                "LOCAL_APPROVAL_ENABLED": "true",
+            },
+        ):
             with self.assertRaises(CoreError) as caught:
                 create_app(model=model, control_plane=ApproveAllControlPlane())
         self.assertEqual(caught.exception.code, "LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
@@ -278,6 +288,8 @@ class ConfigurationTests(unittest.TestCase):
                 for route in app.routes
             )
         )
+        extensions = app.state.a2a_request_handler._agent_card.capabilities.extensions
+        self.assertNotIn(LOCAL_APPROVAL_STATUS_URI, {item.uri for item in extensions})
         app.state.close()
 
     def test_effective_config_is_intersection_with_deny_precedence(self):
@@ -400,6 +412,22 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(CoreError) as caught:
             AgentConfig.from_dict(raw)
         self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+
+    def test_python_exec_requires_disabled_local_operator_in_effective_config(self):
+        raw = agent_config().to_dict()
+        effective = compile_effective_config(
+            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
+        )
+        self.assertNotIn("core.python.exec", effective.model_tool_catalog)
+        self.assertNotIn("python", effective.enabled_capability_policies)
+
+        raw["approval"]["local_operator"] = {"enabled": False}
+        raw["approval"]["mode"] = "never"
+        effective = compile_effective_config(
+            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
+        )
+        self.assertIn("core.python.exec", effective.model_tool_catalog)
+        self.assertIn("python", effective.enabled_capability_policies)
 
     def test_effective_digest_is_stable_and_contains_no_secrets(self):
         effective_a = compile_effective_config(

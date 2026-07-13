@@ -19,7 +19,7 @@ class InMemoryAuditLog:
     def __init__(self):
         self._records = {}
 
-    def append(self, run_id, kind, data):
+    def append(self, run_id, kind, data, *, tenant_id="default"):
         records = self._records.setdefault(run_id, [])
         record = AuditRecord(run_id, len(records) + 1, kind, dict(data), time.time())
         records.append(record)

@@ -28,6 +28,16 @@ Arguments MUST валидироваться по schema до risk assessment и 
 
 Передаёт input существующему PTY/process или запрашивает его текущее состояние. Не может адресовать session другого agent/run.
 
+### `core.python.exec`
+
+Выполняет bounded Python-код отдельным process в принадлежащем run workspace и предоставляет синхронный proxy `tools.call(canonical_name, arguments)` плюс immutable `tools.names`. Вложенный вызов built-in или MCP tool MUST повторно пройти EffectiveConfig, schema validation, policy, общий tool-call budget, owner/tenant checks, audit и дочерний OTel span. `core.python.exec` не может вызывать самого себя и не запускается через `core.task.start`.
+
+Capability присутствует только в `with_terminal` при `LOCAL_APPROVAL_ENABLED=false`. Это ограничение действует до Agent Card/model catalog и повторно при dispatch. При включённом local operator/HITL tool отсутствует независимо от allowlist; `CORE_AGENT_APPROVAL_MODE=never` при всё ещё включённом local operator не удовлетворяет этому условию.
+
+Текущий Python process не поддерживает pause/resume для approval. Поэтому любой вложенный вызов, который policy не разрешает немедленно, возвращает в Python `ToolCallError` с безопасным error code и не исполняется. Отключение HITL не превращает policy deny в allow.
+
+Код, timeout, cwd и output limit валидируются до запуска. Process использует очищенный environment, тот же owned workspace/process-group lifecycle и те же ограничения single-container trust model, что terminal. Ненулевой exit, exception, timeout и truncation нормализуются как обычный model-facing tool result; raw credentials в Python process не передаются.
+
 ### `core.fs.apply_patch`
 
 Атомарно применяет текстовый patch внутри разрешённых workspace roots и возвращает список изменённых файлов. Patch, выходящий за root, отклоняется до изменения файлов.

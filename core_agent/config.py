@@ -11,7 +11,9 @@ from .errors import CoreError
 
 MAX_SUBAGENT_DEPTH = 2
 RUNTIME_MODES = frozenset({"with_terminal", "without_terminal"})
-LOCAL_EXECUTION_TOOLS = frozenset({"core.terminal.exec", "core.task.start"})
+LOCAL_EXECUTION_TOOLS = frozenset(
+    {"core.terminal.exec", "core.python.exec", "core.task.start"}
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,11 @@ class AgentConfig:
             "runtime_mode", "with_terminal"
         )
         if runtime_mode not in RUNTIME_MODES:
+            raise CoreError("CONFIG_INVALID")
+        local_operator = raw.get("approval", {}).get("local_operator", {})
+        if not isinstance(local_operator, dict) or not isinstance(
+            local_operator.get("enabled", True), bool
+        ):
             raise CoreError("CONFIG_INVALID")
         budgets = raw.get("budgets", {})
         if not isinstance(budgets, dict):
@@ -205,9 +212,12 @@ def compile_effective_config(platform, agent, request, discovered):
     runtime_mode = raw["execution"].get("runtime_mode", "with_terminal")
     if runtime_mode == "without_terminal":
         allowed -= LOCAL_EXECUTION_TOOLS
+    if raw["approval"].get("local_operator", {}).get("enabled", True):
+        allowed.discard("core.python.exec")
 
     capability_for_prefix = {
         "core.terminal.": "terminal",
+        "core.python.": "python",
         "core.fs.": "filesystem_mutation",
         "core.task.": "background_tasks",
         "core.delegate": "delegation",
@@ -261,6 +271,8 @@ def compile_effective_config(platform, agent, request, discovered):
     }
     if memory_mode == "disabled" or not (memory_servers & set(mcp_tools)):
         policies.discard("memory")
+    if "core.python.exec" not in allowed:
+        policies.discard("python")
 
     model_catalog = set(allowed)
     for server, tools in mcp_tools.items():
@@ -277,6 +289,9 @@ def compile_effective_config(platform, agent, request, discovered):
         "budgets": raw.get("budgets", {}),
         "context": raw["context"],
         "approval_mode": raw["approval"].get("mode"),
+        "local_operator_enabled": raw["approval"]
+        .get("local_operator", {})
+        .get("enabled", True),
         "execution_profile": raw["execution"].get("environment_profile"),
         "runtime_mode": runtime_mode,
         "otel_profile": raw["observability"].get("otel_profile"),

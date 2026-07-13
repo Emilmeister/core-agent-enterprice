@@ -149,7 +149,7 @@ class ProductionConfigurationTests(unittest.TestCase):
                 "LOCAL_APPROVAL_DB_PATH": ":memory:",
                 "CORE_AGENT_RUNTIME_MODE": "without_terminal",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
-                    "core.terminal.exec,core.task.start,core.task.get,"
+                    "core.terminal.exec,core.python.exec,core.task.start,core.task.get,"
                     "core.task.list,core.task.wait,core.task.cancel,"
                     "core.delegate,core.artifact.put,core.artifact.get"
                 ),
@@ -163,6 +163,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             )
             self.assertEqual(result.message, "ok")
             self.assertNotIn("core.terminal.exec", model.calls[0].tools)
+            self.assertNotIn("core.python.exec", model.calls[0].tools)
             self.assertNotIn("core.task.start", model.calls[0].tools)
             self.assertIn("core.delegate", model.calls[0].tools)
             self.assertIn("core.task.wait", model.calls[0].tools)
@@ -190,6 +191,41 @@ class ProductionConfigurationTests(unittest.TestCase):
             with self.assertRaises(CoreError) as caught:
                 create_app(model=model)
         self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+
+    def test_python_exec_requires_local_operator_to_be_fully_disabled(self):
+        for local_approval, expected in (("true", False), ("false", True)):
+            with self.subTest(local_approval=local_approval):
+                model = ScriptedModel([ModelResponse(message="ok")])
+                model.model = "python-gate-model"
+                with patch.dict(
+                    os.environ,
+                    {
+                        "CORE_AGENT_STATE_BACKEND": "test",
+                        "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                        "LOCAL_APPROVAL_ENABLED": local_approval,
+                        "CORE_AGENT_APPROVAL_MODE": "never",
+                        "CORE_AGENT_RUNTIME_MODE": "with_terminal",
+                        "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.python.exec",
+                    },
+                    clear=True,
+                ):
+                    app = create_app(model=model)
+                try:
+                    app.state.core_agent.run(
+                        {"prompt": "answer", "mcp": [], "skills": []}
+                    )
+                    self.assertEqual(
+                        "core.python.exec" in model.calls[0].tools, expected
+                    )
+                    advertised = {
+                        skill.id
+                        for skill in app.state.a2a_request_handler._agent_card.skills
+                    }
+                    self.assertEqual(
+                        "core.python.exec" in advertised, expected
+                    )
+                finally:
+                    app.state.close()
 
 
 class NamedUser(User):

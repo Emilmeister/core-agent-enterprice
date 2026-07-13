@@ -70,6 +70,11 @@ class ComposeContractTests(unittest.TestCase):
             "${CORE_AGENT_RUNTIME_MODE:-with_terminal}",
         )
         self.assertIn("CORE_AGENT_ALLOWED_BUILTIN_TOOLS", environment)
+        self.assertEqual(
+            environment["LOCAL_APPROVAL_ENABLED"],
+            "${LOCAL_APPROVAL_ENABLED:-true}",
+        )
+        self.assertIn("core.python.exec", environment["CORE_AGENT_ALLOWED_BUILTIN_TOOLS"])
 
 
 if __name__ == "__main__":

@@ -118,6 +118,9 @@
 - [ ] Cancel/timeout завершает owned process group, закрывает PTY и фиксирует cleanup outcome.
 - [ ] Secret инжектируется только в environment разрешённого process и не попадает в checkpoint/telemetry/artifact.
 - [ ] Runtime явно сообщает logical/process separation и не рекламирует отдельные OS security namespaces.
+- [ ] `core.python.exec` доступен только в `with_terminal` при полностью отключённом local operator/HITL и исчезает из Agent Card/model catalog при любом более строгом профиле.
+- [ ] Python process получает только bounded `tools.call`; каждый вложенный built-in/MCP вызов повторно проходит EffectiveConfig, schema, policy, общий budget, owner/tenant, audit и OTel.
+- [ ] Python exception/nonzero exit/timeout возвращается модели как failed tool result, не завершает родительскую Task и не повторяет неоднозначный side effect.
 
 ## Tools, MCP и human-in-the-loop
 

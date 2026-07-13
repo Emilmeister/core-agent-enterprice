@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import socket
+import sys
+import tempfile
+import threading
+
+from .errors import CoreError
+
+
+MAX_RPC_BYTES = 2_000_000
+
+RUNNER = r'''
+import json
+import socket
+import sys
+import uuid
+
+MAX_RPC_BYTES = 2_000_000
+
+
+def receive(stream):
+    line = stream.readline(MAX_RPC_BYTES + 1)
+    if not line or len(line) > MAX_RPC_BYTES or not line.endswith(b"\n"):
+        raise RuntimeError("python tool broker disconnected")
+    return json.loads(line)
+
+
+def send(stream, value):
+    encoded = json.dumps(value, separators=(",", ":")).encode() + b"\n"
+    if len(encoded) > MAX_RPC_BYTES:
+        raise RuntimeError("python tool request is too large")
+    stream.write(encoded)
+    stream.flush()
+
+
+class ToolCallError(RuntimeError):
+    def __init__(self, tool_name, code, message):
+        self.tool_name = tool_name
+        self.code = code
+        super().__init__(f"{tool_name}: {code}: {message}")
+
+
+class Tools:
+    def __init__(self, stream, names):
+        self._stream = stream
+        self.names = tuple(names)
+
+    def call(self, name, arguments=None, **kwargs):
+        if arguments is not None and kwargs:
+            raise TypeError("pass arguments or keyword arguments, not both")
+        arguments = kwargs if arguments is None else arguments
+        if name not in self.names or not isinstance(arguments, dict):
+            raise ToolCallError(str(name), "CAPABILITY_DISABLED", "tool is unavailable")
+        request_id = str(uuid.uuid4())
+        send(
+            self._stream,
+            {"id": request_id, "name": name, "arguments": arguments},
+        )
+        response = receive(self._stream)
+        if response.get("id") != request_id:
+            raise RuntimeError("python tool broker response mismatch")
+        if not response.get("ok"):
+            error = response.get("error", {})
+            raise ToolCallError(
+                name,
+                error.get("code", "TOOL_EXECUTION_FAILED"),
+                error.get("message", "tool call failed"),
+            )
+        return response.get("output")
+
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    connection.connect(sys.argv[1])
+    with connection.makefile("rwb") as stream:
+        send(stream, {"token": sys.argv[2]})
+        initial = receive(stream)
+        namespace = {
+            "__name__": "__main__",
+            "ToolCallError": ToolCallError,
+            "tools": Tools(stream, initial["tools"]),
+        }
+        exec(compile(initial["code"], "<core.python.exec>", "exec"), namespace, namespace)
+'''
+
+
+class PythonToolBroker:
+    def __init__(self, code, tool_names, dispatch):
+        self.code = code
+        self.tool_names = tuple(sorted(tool_names))
+        self.dispatch = dispatch
+        self.token = secrets.token_hex(32)
+        self.directory = Path(tempfile.mkdtemp(prefix="core-python-", dir="/tmp"))
+        self.path = self.directory / "broker.sock"
+        self._stop = threading.Event()
+        self._connection = None
+        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self._listener.bind(str(self.path))
+        except Exception:
+            self._listener.close()
+            shutil.rmtree(self.directory, ignore_errors=True)
+            raise
+        os.chmod(self.path, 0o600)
+        self._listener.listen(1)
+        self._listener.settimeout(0.1)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    @staticmethod
+    def _receive(stream):
+        line = stream.readline(MAX_RPC_BYTES + 1)
+        if not line:
+            return None
+        if len(line) > MAX_RPC_BYTES or not line.endswith(b"\n"):
+            raise CoreError("TOOL_ARGUMENT_INVALID", "python RPC frame is too large")
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise CoreError("TOOL_ARGUMENT_INVALID", "invalid python RPC frame") from error
+        if not isinstance(value, dict):
+            raise CoreError("TOOL_ARGUMENT_INVALID", "invalid python RPC frame")
+        return value
+
+    @staticmethod
+    def _send(stream, value):
+        encoded = (
+            json.dumps(value, separators=(",", ":"), default=str).encode() + b"\n"
+        )
+        if len(encoded) > MAX_RPC_BYTES:
+            raise CoreError("TOOL_OUTPUT_TOO_LARGE")
+        stream.write(encoded)
+        stream.flush()
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            self._connection = connection
+            try:
+                self._handle(connection)
+            except Exception:
+                pass
+            finally:
+                connection.close()
+                self._connection = None
+            return
+
+    def _handle(self, connection):
+        with connection.makefile("rwb") as stream:
+            hello = self._receive(stream)
+            if hello is None or not secrets.compare_digest(
+                str(hello.get("token", "")), self.token
+            ):
+                raise CoreError("POLICY_DENIED")
+            self._send(
+                stream,
+                {"code": self.code, "tools": self.tool_names},
+            )
+            while not self._stop.is_set():
+                request = self._receive(stream)
+                if request is None:
+                    return
+                request_id = request.get("id")
+                try:
+                    name = request.get("name")
+                    arguments = request.get("arguments")
+                    if (
+                        not isinstance(request_id, str)
+                        or name not in self.tool_names
+                        or not isinstance(arguments, dict)
+                    ):
+                        raise CoreError("CAPABILITY_DISABLED")
+                    output = self.dispatch(name, arguments)
+                    response = {"id": request_id, "ok": True, "output": output}
+                    try:
+                        self._send(stream, response)
+                    except CoreError as error:
+                        if error.code != "TOOL_OUTPUT_TOO_LARGE":
+                            raise
+                        self._send(
+                            stream,
+                            {
+                                "id": request_id,
+                                "ok": False,
+                                "error": {"code": error.code, "message": str(error)},
+                            },
+                        )
+                except CoreError as error:
+                    self._send(
+                        stream,
+                        {
+                            "id": request_id,
+                            "ok": False,
+                            "error": {"code": error.code, "message": str(error)[:1000]},
+                        },
+                    )
+                except Exception as error:
+                    self._send(
+                        stream,
+                        {
+                            "id": request_id,
+                            "ok": False,
+                            "error": {
+                                "code": "TOOL_EXECUTION_FAILED",
+                                "message": type(error).__name__,
+                            },
+                        },
+                    )
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_error):
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        if self._connection is not None:
+            try:
+                self._connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self._thread.join(timeout=1)
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
+def execute_python(
+    environment_manager,
+    *,
+    run_id,
+    code,
+    tool_names,
+    dispatch,
+    cwd=None,
+    timeout=30,
+    max_output_bytes=100_000,
+):
+    with PythonToolBroker(code, tool_names, dispatch) as broker:
+        request = {
+            "argv": [
+                sys.executable,
+                "-I",
+                "-u",
+                "-c",
+                RUNNER,
+                str(broker.path),
+                broker.token,
+            ],
+            "timeout": timeout,
+            "max_output_bytes": max_output_bytes,
+        }
+        if cwd is not None:
+            request["cwd"] = cwd
+        return environment_manager.execute_transient(request, run_id)

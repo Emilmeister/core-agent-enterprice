@@ -33,6 +33,7 @@
 | SUB-02 | общий parent budget, hard depth `2`/fan-out и schema-valid result | depth-2 catalog/kernel E2E, stale-call guard, atomic budget/fan-out/schema tests | implemented |
 | TER-01 | owned PTY/process groups/workspaces и bounded output | local terminal integration suite | implemented |
 | TER-02 | immutable base snapshot, conflict-aware merge и S3 manifest | content-addressed snapshot/merge tests | implemented |
+| PY-01 | bounded Python process вызывает exact built-in/MCP tools через policy/budget/audit/OTel broker только без HITL | Python broker E2E, mode gate and process failure tests | implemented |
 | HITL-01 | private authority, frozen digest и single reservation | approval digest/race suite | implemented |
 | HITL-02 | wait transition, A2A status, checkpoint, audit и outbox atomic | PostgreSQL HITL continuation/reconciliation tests | implemented |
 | HITL-03 | approval/rejection/cancel/recovery сохраняют IDs и at-most-once | operator A2A and crash-at-dispatch tests | implemented |

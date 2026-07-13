@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -168,6 +169,13 @@ def _agent(model, mcp_connector=None, *, state=None):
     servers = set(_csv("CORE_AGENT_ALLOWED_MCP_SERVERS", "memory"))
     allowed_skills = set(_csv("CORE_AGENT_ALLOWED_SKILLS"))
     mcp_tools = _allowed_mcp_tools(servers)
+    local_approval_enabled = _boolean("LOCAL_APPROVAL_ENABLED", "true")
+    try:
+        configured_approval_mode = ApprovalMode(
+            os.getenv("CORE_AGENT_APPROVAL_MODE", "on_risk")
+        )
+    except ValueError as error:
+        raise CoreError("CONFIG_INVALID", "unknown CORE_AGENT_APPROVAL_MODE") from error
     builtin_tools_without_terminal = {
         "core.task.get",
         "core.task.list",
@@ -177,22 +185,28 @@ def _agent(model, mcp_connector=None, *, state=None):
         "core.artifact.put",
         "core.artifact.get",
     }
+    all_builtin_tools = builtin_tools_without_terminal | {
+        "core.terminal.exec",
+        "core.python.exec",
+        "core.task.start",
+    }
     builtin_tools_by_mode = {
         "with_terminal": builtin_tools_without_terminal
-        | {"core.terminal.exec", "core.task.start"},
+        | {"core.terminal.exec", "core.python.exec", "core.task.start"},
         "without_terminal": builtin_tools_without_terminal,
     }
+    if local_approval_enabled:
+        builtin_tools_by_mode["with_terminal"].discard("core.python.exec")
     runtime_mode = os.getenv("CORE_AGENT_RUNTIME_MODE", "with_terminal")
     if runtime_mode not in builtin_tools_by_mode:
         raise CoreError("CONFIG_INVALID", "unknown CORE_AGENT_RUNTIME_MODE")
-    available_builtin_tools = set().union(*builtin_tools_by_mode.values())
     requested_builtin_tools = set(
         _csv(
             "CORE_AGENT_ALLOWED_BUILTIN_TOOLS",
             ",".join(sorted(builtin_tools_by_mode[runtime_mode])),
         )
     )
-    if requested_builtin_tools - available_builtin_tools:
+    if requested_builtin_tools - all_builtin_tools:
         raise CoreError("CONFIG_INVALID", "unknown built-in tool configured")
     builtin_tools = requested_builtin_tools & builtin_tools_by_mode[runtime_mode]
     platform = PlatformConfig(
@@ -208,6 +222,7 @@ def _agent(model, mcp_connector=None, *, state=None):
             "filesystem_mutation",
             "background_tasks",
             "delegation",
+            "python",
         },
         max_model_turns=int(os.getenv("CORE_AGENT_MAX_MODEL_TURNS", "100")),
         max_tool_calls=int(os.getenv("CORE_AGENT_MAX_TOOL_CALLS", "200")),
@@ -230,6 +245,7 @@ def _agent(model, mcp_connector=None, *, state=None):
                 ),
                 "delegation": "core.delegate" in builtin_tools,
                 "terminal": "core.terminal.exec" in builtin_tools,
+                "python": "core.python.exec" in builtin_tools,
                 "filesystem_mutation": "core.terminal.exec" in builtin_tools,
                 "mcp": True,
                 "skills": bool(allowed_skills),
@@ -252,7 +268,14 @@ def _agent(model, mcp_connector=None, *, state=None):
                 "compact_at_working_ratio": 0.90,
                 "compact_to_working_ratio": 0.15,
             },
-            "approval": {"mode": os.getenv("CORE_AGENT_APPROVAL_MODE", "on_risk")},
+            "approval": {
+                "mode": (
+                    configured_approval_mode.value
+                    if local_approval_enabled
+                    else ApprovalMode.NEVER.value
+                ),
+                "local_operator": {"enabled": local_approval_enabled},
+            },
             "execution": {
                 "environment_profile": (
                     "local-pty"
@@ -278,6 +301,23 @@ def _agent(model, mcp_connector=None, *, state=None):
         "true",
         "yes",
     }
+    try:
+        python_max_code_chars = int(
+            os.getenv("CORE_AGENT_PYTHON_MAX_CODE_CHARS", "100000")
+        )
+        python_max_seconds = float(
+            os.getenv("CORE_AGENT_PYTHON_MAX_SECONDS", "120")
+        )
+        python_max_output_bytes = int(
+            os.getenv("CORE_AGENT_PYTHON_MAX_OUTPUT_BYTES", "1000000")
+        )
+    except ValueError as error:
+        raise CoreError("CONFIG_INVALID", "invalid Python execution limits") from error
+    if (
+        min(python_max_code_chars, python_max_seconds, python_max_output_bytes) <= 0
+        or not math.isfinite(python_max_seconds)
+    ):
+        raise CoreError("CONFIG_INVALID", "Python execution limits must be positive")
     registry.register(
         ToolDefinition(
             "core.terminal.exec",
@@ -299,6 +339,42 @@ def _agent(model, mcp_connector=None, *, state=None):
             },
             mutating=not trusted,
             risk_tags=frozenset() if trusted else frozenset({"local_execution"}),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            "core.python.exec",
+            (
+                "Execute bounded Python in the owned workspace. The code receives "
+                "tools.names and synchronous tools.call(canonical_name, arguments); "
+                "print the final value needed by the model. Available only when local "
+                "operator/HITL is fully disabled."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": python_max_code_chars,
+                    },
+                    "cwd": {"type": "string"},
+                    "timeout": {
+                        "type": "number",
+                        "minimum": 0.001,
+                        "maximum": python_max_seconds,
+                    },
+                    "max_output_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": python_max_output_bytes,
+                    },
+                },
+                "required": ["code"],
+                "additionalProperties": False,
+            },
+            mutating=False,
+            risk_tags=frozenset(),
         )
     )
     task_definitions = {
@@ -453,11 +529,6 @@ def _agent(model, mcp_connector=None, *, state=None):
             base_snapshot=base_snapshot,
         )
     )
-    local_approval_enabled = os.getenv("LOCAL_APPROVAL_ENABLED", "true").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
     state = state or _state()
     approvals = state["approvals"]
     if approvals is None:
@@ -472,11 +543,7 @@ def _agent(model, mcp_connector=None, *, state=None):
         )
     tools = ToolRuntime(
         registry,
-        PolicyEngine(
-            ApprovalMode(config.approval["mode"])
-            if local_approval_enabled
-            else ApprovalMode.NEVER
-        ),
+        PolicyEngine(ApprovalMode(config.approval["mode"])),
         approvals,
         sessions,
     )
@@ -512,6 +579,11 @@ def _agent(model, mcp_connector=None, *, state=None):
             "terminal": (
                 "TERMINAL: Use only the owned workspace/session and bounded output. "
                 "Do not address another agent's process group or workspace."
+            ),
+            "python": (
+                "PYTHON: core.python.exec runs bounded code in the owned workspace. "
+                "Use only tools.names and tools.call for agent tools; never call "
+                "core.python.exec recursively. Print the result needed by the model."
             ),
             "background_tasks": (
                 "BACKGROUND TASKS: Start durable work, continue useful foreground work, "
@@ -575,8 +647,9 @@ def create_app(
     push_client=None,
 ):
     environment = os.getenv("CORE_AGENT_ENVIRONMENT", "development")
+    local_approval_enabled = _boolean("LOCAL_APPROVAL_ENABLED", "true")
     operator_authenticator = None
-    if environment == "production":
+    if environment == "production" and local_approval_enabled:
         if isinstance(control_plane, ApproveAllControlPlane):
             raise CoreError("LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
         control_plane = control_plane or PrivateOperatorControlPlane()
@@ -595,7 +668,7 @@ def create_app(
     model = model or _model()
     push_key = os.getenv("PUSH_NOTIFICATION_ENCRYPTION_KEY", "")
     state = _state(database)
-    if environment == "production" and not getattr(
+    if environment == "production" and local_approval_enabled and not getattr(
         control_plane, "trusted_operator_control_plane", False
     ):
         if state["database"]:
@@ -613,7 +686,9 @@ def create_app(
         if state["database"]:
             state["database"].close()
         raise
-    control_plane = control_plane or ApproveAllControlPlane()
+    control_plane = control_plane or (
+        ApproveAllControlPlane() if local_approval_enabled else None
+    )
     push_config_store = None
     push_sender = None
     if state["database"] and push_key:
@@ -727,7 +802,7 @@ def create_app(
         return result_artifact(result, context)
 
     def reserve_local(pending, context):
-        if not getattr(control_plane, "automatic", True):
+        if control_plane is None or not getattr(control_plane, "automatic", True):
             return None
         return agent.reserve_local_approval(
             context.task_id, pending.request.id, control_plane
@@ -767,7 +842,9 @@ def create_app(
         },
         skills=tuple(sorted(agent.platform_config.allowed_builtin_tools)),
         optional_extensions=(
-            os.getenv("LOCAL_APPROVAL_EXTENSION_URI", LOCAL_APPROVAL_STATUS_URI),
+            (os.getenv("LOCAL_APPROVAL_EXTENSION_URI", LOCAL_APPROVAL_STATUS_URI),)
+            if local_approval_enabled
+            else ()
         ),
     )
     closed = False

@@ -94,6 +94,7 @@ def _validate(schema, value):
         return (
             isinstance(value, str)
             and len(value) >= schema.get("minLength", 0)
+            and len(value) <= schema.get("maxLength", len(value))
             and (
                 "pattern" not in schema
                 or re.search(schema["pattern"], value) is not None
@@ -104,12 +105,14 @@ def _validate(schema, value):
             isinstance(value, int)
             and not isinstance(value, bool)
             and value >= schema.get("minimum", value)
+            and value <= schema.get("maximum", value)
         )
     if schema.get("type") == "number":
         return (
             isinstance(value, (int, float))
             and not isinstance(value, bool)
             and value >= schema.get("minimum", value)
+            and value <= schema.get("maximum", value)
         )
     if schema.get("type") == "boolean":
         return isinstance(value, bool)
@@ -221,14 +224,13 @@ class ToolRuntime:
         self.execution_count += 1
         if call.name in self.handlers:
             result = self.handlers[call.name](call.arguments, run_id)
-            self._emit("tool.completed", call_id=call.id)
-            return ToolResult(call.id, "succeeded", result)
-        request = (
-            call.arguments
-            if call.name == "core.terminal.exec"
-            else {"tool": call.name, "arguments": call.arguments}
-        )
-        result = self.environment_manager.execute_transient(request, run_id)
+        else:
+            request = (
+                call.arguments
+                if call.name == "core.terminal.exec"
+                else {"tool": call.name, "arguments": call.arguments}
+            )
+            result = self.environment_manager.execute_transient(request, run_id)
         status = getattr(result, "status", "succeeded")
         if status not in {"failed", "timed_out"}:
             status = "succeeded"

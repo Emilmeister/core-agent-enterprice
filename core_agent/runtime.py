@@ -25,6 +25,7 @@ from .errors import CoreError
 from .approvals import ApprovalRequest
 from .skills import SkillResolver
 from .kernel import KernelCompiler
+from .python_exec import execute_python
 from .security import redact
 from .tasks import DelegationContract
 from .tools import ToolCall, ToolDefinition, ToolResult, validate_json_schema
@@ -177,6 +178,7 @@ class CoreAgent:
                 "core.task.list": self._task_list,
                 "core.task.wait": self._task_wait,
                 "core.task.cancel": self._task_cancel,
+                "core.python.exec": self._python_exec,
                 "core.delegate": self._delegate,
                 "core.artifact.put": self._artifact_put,
                 "core.artifact.get": self._artifact_get,
@@ -831,7 +833,10 @@ class CoreAgent:
     def _recoverable_tool_error(call, error):
         return isinstance(error, CoreError) and (
             error.code in {"TOOL_ARGUMENT_INVALID", "TOOL_START_FAILED"}
-            or (call.name == "core.delegate" and error.code == "CAPABILITY_DISABLED")
+            or (
+                call.name in {"core.delegate", "core.task.start"}
+                and error.code == "CAPABILITY_DISABLED"
+            )
         )
 
     @staticmethod
@@ -1441,7 +1446,7 @@ class CoreAgent:
         if (
             target not in self._enabled_builtins()
             or target.startswith("core.task.")
-            or target == "core.delegate"
+            or target in {"core.delegate", "core.python.exec"}
         ):
             raise CoreError("CAPABILITY_DISABLED")
         task_run_id = f"{run_id}-background-{uuid.uuid4()}"
@@ -1480,6 +1485,201 @@ class CoreAgent:
             tenant_id=scope.get("tenant_id", "default"),
         )
         return self._task_snapshot(task)
+
+    def _python_exec(self, arguments, run_id):
+        cached = self._runtime_cache.get(run_id)
+        raw = self.agent_config.to_dict()
+        if (
+            cached is None
+            or raw["execution"].get("runtime_mode") != "with_terminal"
+            or raw["approval"].get("local_operator", {}).get("enabled", True)
+            or self.tool_runtime.policy.approval_mode.value != "never"
+        ):
+            raise CoreError("CAPABILITY_DISABLED")
+        _raw, discovered, effective = cached
+        effective.require_tool("core.python.exec")
+        schema = self.tool_runtime.registry.get("core.python.exec").input_schema[
+            "properties"
+        ]
+        parent_context = self.telemetry.current_context()
+        tool_names = set(effective.model_tool_catalog) - {"core.python.exec"}
+        return execute_python(
+            self.tool_runtime.environment_manager,
+            run_id=run_id,
+            code=arguments["code"],
+            tool_names=tool_names,
+            dispatch=lambda name, values: self._python_tool_call(
+                name,
+                values,
+                run_id=run_id,
+                discovered=discovered,
+                effective=effective,
+                parent_context=parent_context,
+            ),
+            cwd=arguments.get("cwd"),
+            timeout=arguments.get(
+                "timeout", min(30, schema["timeout"].get("maximum", 30))
+            ),
+            max_output_bytes=arguments.get(
+                "max_output_bytes",
+                min(100_000, schema["max_output_bytes"].get("maximum", 100_000)),
+            ),
+        )
+
+    def _python_tool_call(
+        self,
+        name,
+        arguments,
+        *,
+        run_id,
+        discovered,
+        effective,
+        parent_context,
+    ):
+        if name == "core.python.exec":
+            raise CoreError("CAPABILITY_DISABLED")
+        effective.require_tool(name)
+        call = ToolCall(str(uuid.uuid4()), name, arguments)
+        definition, is_mcp = self._definition(call, effective, discovered)
+        scope = self._run_scopes.get(run_id, {})
+        tenant_id = scope.get("tenant_id", "default")
+        record = self.workflow_store.get(
+            run_id,
+            tenant_id=tenant_id,
+            owner_id=scope.get("identity"),
+        )
+        self.workflow_store.consume_budget(record, tool_calls=1)
+        audit_data = {
+            "tool_call_id": call.id,
+            "tool_name": name,
+            "source": "core.python.exec",
+        }
+        self._log(
+            "tool.requested",
+            run_id=run_id,
+            task_id=scope.get("task_id"),
+            tool_call_id=call.id,
+            tool_name=name,
+            source="core.python.exec",
+            **({"arguments": arguments} if self.log_content else {}),
+        )
+        try:
+            self.tool_runtime.validate(call, definition)
+        except CoreError as error:
+            with self.telemetry.span(
+                "core_agent.tool.execute", parent=parent_context
+            ) as span:
+                self._instrument_tool(span, call, definition)
+                span.record_error(error)
+            self.audit_log.append(
+                run_id,
+                "tool.execution.failed",
+                {**audit_data, "error_code": error.code},
+                tenant_id=tenant_id,
+            )
+            self._log(
+                "tool.failed",
+                run_id=run_id,
+                task_id=scope.get("task_id"),
+                tool_call_id=call.id,
+                tool_name=name,
+                source="core.python.exec",
+                error_code=error.code,
+            )
+            raise
+        if self.tool_runtime.policy.evaluate(definition) != "allow":
+            error = CoreError("POLICY_DENIED")
+            with self.telemetry.span(
+                "core_agent.tool.execute", parent=parent_context
+            ) as span:
+                self._instrument_tool(span, call, definition)
+                span.record_error(error)
+            self.audit_log.append(
+                run_id, "tool.denied", audit_data, tenant_id=tenant_id
+            )
+            self._log(
+                "tool.denied",
+                run_id=run_id,
+                task_id=scope.get("task_id"),
+                tool_call_id=call.id,
+                tool_name=name,
+                source="core.python.exec",
+            )
+            raise error
+        self.audit_log.append(
+            run_id, "tool.execution.started", audit_data, tenant_id=tenant_id
+        )
+        try:
+            with self.telemetry.span(
+                "core_agent.tool.execute", parent=parent_context
+            ) as span:
+                self._instrument_tool(span, call, definition)
+                if is_mcp:
+                    output = self.mcp_connector.call(name, arguments)
+                else:
+                    outcome = self.tool_runtime.execute(
+                        call,
+                        run_id=run_id,
+                        identity=scope.get("identity"),
+                        session_id=scope.get("session_id"),
+                        task_id=scope.get("task_id"),
+                        tenant_id=tenant_id,
+                        environment="local-pty",
+                        policy_version=effective.digest,
+                    )
+                    if isinstance(outcome, ApprovalRequest):
+                        raise CoreError("POLICY_DENIED")
+                    if outcome.status != "succeeded":
+                        raise CoreError(
+                            outcome.error_code
+                            or (
+                                "POLICY_DENIED"
+                                if outcome.status == "denied"
+                                else "TOOL_RETURNED_FAILED"
+                            )
+                        )
+                    output = outcome.output
+                value = self._value(output)
+                span.set_attributes(
+                    {
+                        "core_agent.tool.outcome": "succeeded",
+                        "output.value": self._json(value),
+                        "output.mime_type": "application/json",
+                    }
+                )
+        except Exception as error:
+            self.audit_log.append(
+                run_id,
+                "tool.execution.failed",
+                {
+                    **audit_data,
+                    "error_code": getattr(error, "code", type(error).__name__),
+                },
+                tenant_id=tenant_id,
+            )
+            self._log(
+                "tool.failed",
+                run_id=run_id,
+                task_id=scope.get("task_id"),
+                tool_call_id=call.id,
+                tool_name=name,
+                source="core.python.exec",
+                error_code=getattr(error, "code", type(error).__name__),
+            )
+            raise
+        self.audit_log.append(
+            run_id, "tool.execution.succeeded", audit_data, tenant_id=tenant_id
+        )
+        self._log(
+            "tool.completed",
+            run_id=run_id,
+            task_id=scope.get("task_id"),
+            tool_call_id=call.id,
+            tool_name=name,
+            source="core.python.exec",
+            **({"output": value} if self.log_content else {}),
+        )
+        return value
 
     def _artifact_put(self, arguments, run_id):
         if self.artifact_store is None:

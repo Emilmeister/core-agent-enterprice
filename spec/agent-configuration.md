@@ -81,13 +81,14 @@ Production deployment MUST задавать `DURABLE_STORAGE_ROOT` как пут
 - `background_tasks`: boolean;
 - `delegation`: boolean;
 - `terminal`: boolean или результат tool filters;
+- `python`: boolean или результат runtime mode/HITL/tool filters;
 - `filesystem_mutation`: boolean или результат tool filters;
 - `mcp`: boolean;
 - `skills`: boolean;
 - `human_input`: boolean;
 - `local_operator_approval`: boolean; отключение при protected action означает fail closed.
 
-Production config MUST задать owner-controlled HTTPS `extension_uri` и настоящий private operator control plane. Встроенный private HTTP adapter требует `OPERATOR_JWT_HS256_SECRET` минимум 32 bytes, отдельные `OPERATOR_JWT_ISSUER`/`OPERATOR_JWT_AUDIENCE` и bounded role `OPERATOR_JWT_ROLE=agent_operator`; token обязан содержать `sub`, `jti`, `exp`, matching issuer/audience и role. Эти credentials не принимаются A2A plane и не попадают в модель, audit или telemetry. Внешний adapter MAY быть внедрён host-ом с эквивалентными guarantees. `ApproveAllControlPlane` разрешён только development profile и не может включаться входным RunRequest.
+При `approval.local_operator.enabled: true` production config MUST задать owner-controlled HTTPS `extension_uri` и настоящий private operator control plane. Встроенный private HTTP adapter требует `OPERATOR_JWT_HS256_SECRET` минимум 32 bytes, отдельные `OPERATOR_JWT_ISSUER`/`OPERATOR_JWT_AUDIENCE` и bounded role `OPERATOR_JWT_ROLE=agent_operator`; token обязан содержать `sub`, `jti`, `exp`, matching issuer/audience и role. Эти credentials не принимаются A2A plane и не попадают в модель, audit или telemetry. Внешний adapter MAY быть внедрён host-ом с эквивалентными guarantees. `ApproveAllControlPlane` разрешён только development profile и не может включаться входным RunRequest. При `enabled: false` private operator routes и optional A2A approval extension отсутствуют, effective approval mode становится `never`, а protected actions fail closed.
 
 `disabled` memory означает:
 
@@ -102,12 +103,12 @@ Production config MUST задать owner-controlled HTTPS `extension_uri` и н
 
 Deployment MUST выбрать один из двух capability-профилей через `CORE_AGENT_RUNTIME_MODE`:
 
-- `with_terminal` — разрешает `core.terminal.exec` и `core.task.start` в пределах последующих tool filters;
-- `without_terminal` — удаляет `core.terminal.exec` и `core.task.start`, но сохраняет task lifecycle (`get`, `list`, `wait`, `cancel`), delegation, artifacts, MCP и memory.
+- `with_terminal` — разрешает `core.terminal.exec` и `core.task.start`; `core.python.exec` дополнительно разрешён только при `approval.local_operator.enabled: false`;
+- `without_terminal` — удаляет `core.terminal.exec`, `core.python.exec` и `core.task.start`, но сохраняет task lifecycle (`get`, `list`, `wait`, `cancel`), delegation, artifacts, MCP и memory.
 
 Значение по умолчанию — `with_terminal`. Неизвестное значение завершает startup с `CONFIG_INVALID`. Runtime mode является верхней границей capabilities: `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, AgentConfig, Task и delegation contract могут только сузить выбранный профиль. В частности, старый allowlist с terminal tools не может снова включить их в `without_terminal`.
 
-`without_terminal` означает отсутствие произвольного локального исполнения. Python/CodeAct, shell, stdio MCP и skill scripts, требующие локального process, в этом режиме MUST отсутствовать из model context и отклоняться при stale call.
+`without_terminal` означает отсутствие произвольного локального исполнения. `core.python.exec`, shell, stdio MCP и skill scripts, требующие локального process, в этом режиме MUST отсутствовать из model context и отклоняться при stale call. `core.python.exec` также MUST быть отфильтрован в `with_terminal`, пока `LOCAL_APPROVAL_ENABLED` не равен `false`; allowlist не может обойти это ограничение.
 
 ## Tool filters
 

@@ -93,6 +93,14 @@ Parent и child не должны одновременно изменять од
 7. Собрать patch/artifacts и опубликовать durable manifest в S3.
 8. Закрыть PTY, удалить local workspace по policy и записать cleanup outcome.
 
+## Python CodeAct process
+
+`core.python.exec` переиспользует owned local workspace и process-group lifecycle TerminalSession, но запускает interpreter с очищенным environment и отдельным локальным IPC channel к parent runtime. IPC выдаёт только список разрешённых имён и `tools.call`; MCP credentials, database handles, ToolRuntime objects и operator authority в child process не materialize-ятся.
+
+Parent является единственным tool broker: проверяет каждый canonical name/arguments по неизменному EffectiveConfig run-а, списывает общий budget и исполняет вызов через существующий built-in/MCP dispatch. IPC имеет single-run capability token, owner-only local endpoint, bounded JSON frames и закрывается вместе с Python process. Эта схема остаётся process separation, а не OS security boundary.
+
+Пока Python continuation нельзя надёжно checkpoint/resume, capability разрешена только при полностью отключённом local operator/HITL и не поддерживает background start. Timeout или cancel завершают Python process group; уже начатый вложенный side effect следует обычным downstream idempotency/reconciliation guarantees и не повторяется автоматически.
+
 ## Параллельность и reuse
 
 TerminalSession принадлежит ровно одному main/child agent, но несколько sessions MAY работать параллельно в одном container в пределах общего semaphore и aggregate resource budget.
