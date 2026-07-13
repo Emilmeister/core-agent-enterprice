@@ -164,6 +164,7 @@ class CoreAgent:
             self.task_scheduler.register(
                 "background_tool", self._recover_background_tool
             )
+            self.task_scheduler.register("subagent", self._recover_subagent)
 
     @staticmethod
     def _context_to_dict(state):
@@ -1024,7 +1025,7 @@ class CoreAgent:
         ):
             raise CoreError("CAPABILITY_DISABLED")
 
-        child_raw = raw
+        child_raw = copy.deepcopy(raw)
         child_raw["tools"]["builtins"] = {
             "default": "deny",
             "allow": list(contract.tools),
@@ -1060,8 +1061,48 @@ class CoreAgent:
         child_raw["budgets"]["tool_calls"] = contract.budget.get(
             "tool_calls", parent_budget["tool_calls"]
         )
+        child = self._child_agent(child_raw, contract.tools)
+        scope = self._run_scopes.get(run_id, {})
+        child_task_id = str(uuid.uuid4())
+        child_request = {
+            "prompt": contract.instruction,
+            "mcp": [
+                declaration
+                for declaration in request.mcp
+                if declaration["name"] in contract.mcp
+            ],
+            "skills": [
+                declaration
+                for declaration in request.skills
+                if declaration["name"] in contract.skills
+            ],
+        }
+        child_scope = {
+            "task_id": child_task_id,
+            "identity": scope.get("identity", "anonymous"),
+            "session_id": scope.get("session_id"),
+            "tenant_id": scope.get("tenant_id", "default"),
+            "parent_run_id": run_id,
+        }
+        task = self.task_scheduler.start(
+            lambda: child.run(child_request, **child_scope),
+            owner_id=run_id,
+            required=True,
+            kind="subagent",
+            contract={
+                "request": child_request,
+                "agent_config": child_raw,
+                "tools": list(contract.tools),
+                "scope": child_scope,
+            },
+            recoverable=True,
+            tenant_id=scope.get("tenant_id", "default"),
+        )
+        return self._task_snapshot(task)
+
+    def _child_agent(self, child_raw, tools):
         child_registry = type(self.tool_runtime.registry)()
-        for name in contract.tools:
+        for name in tools:
             child_registry.register(self.tool_runtime.registry.get(name))
         child_runtime = type(self.tool_runtime)(
             child_registry,
@@ -1090,45 +1131,15 @@ class CoreAgent:
             output_reserve=self.output_reserve,
             artifact_store=self.artifact_store,
         )
-        task = self.task_scheduler.start(
-            lambda: child.run(
-                {
-                    "prompt": contract.instruction,
-                    "mcp": [
-                        declaration
-                        for declaration in request.mcp
-                        if declaration["name"] in contract.mcp
-                    ],
-                    "skills": [
-                        declaration
-                        for declaration in request.skills
-                        if declaration["name"] in contract.skills
-                    ],
-                }
-            ),
-            owner_id=run_id,
-            required=True,
-            kind="subagent",
-            contract={
-                "request": {
-                    "prompt": contract.instruction,
-                    "mcp": [
-                        declaration
-                        for declaration in request.mcp
-                        if declaration["name"] in contract.mcp
-                    ],
-                    "skills": [
-                        declaration
-                        for declaration in request.skills
-                        if declaration["name"] in contract.skills
-                    ],
-                },
-                "agent_config": child_raw,
-            },
-            recoverable=False,
-            tenant_id=self._run_scopes.get(run_id, {}).get("tenant_id", "default"),
+        return child
+
+    def _recover_subagent(self, contract, cancel_event):
+        if cancel_event.is_set():
+            return None
+        child = self._child_agent(
+            copy.deepcopy(contract["agent_config"]), tuple(contract["tools"])
         )
-        return self._task_snapshot(task)
+        return child.run(dict(contract["request"]), **dict(contract["scope"]))
 
     def run(
         self,
@@ -1138,6 +1149,7 @@ class CoreAgent:
         identity=None,
         session_id=None,
         tenant_id=None,
+        parent_run_id=None,
     ):
         if task_id is not None:
             try:
@@ -1167,6 +1179,7 @@ class CoreAgent:
             identity=identity,
             session_id=session_id,
             tenant_id=tenant_id,
+            parent_run_id=parent_run_id,
         )
         return self._continue_workflow(record)
 
