@@ -32,6 +32,8 @@
 
 После joined `core.delegate` parent MUST использовать возвращённый child result и MUST NOT повторять ту же делегацию или выполнять делегированную работу самостоятельно. После `background: true` parent MAY продолжить только независимую работу; если result нужен для ответа, parent вызывает `core.task.wait` с возвращённым task ID либо получает terminal notification на следующей safe boundary.
 
+Пока child Task non-terminal, parent MAY отправить ей дополнительный A2A Message по тому же `taskId`: child получает его как следующий user turn на safe boundary. Это уточняет текущую делегацию, но не расширяет capability contract или budget и не прерывает выполняющийся tool/model call. После terminal child Task новое уточнение создаёт новую Task.
+
 ## Durable mailbox и notifications
 
 Каждый run имеет mailbox. Scheduler пишет туда versioned notifications `task.updated`, `task.completed`, `task.failed`, `task.input-required` и `task.artifact-updated`.

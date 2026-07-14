@@ -82,6 +82,7 @@ class ApprovalNeeded:
         ]
         if phase == "awaiting_local_operator":
             allowed_operations.append("cancel_task")
+        allowed_operations.append("send_message_queued")
         return {
             "schemaVersion": "1.0",
             "phase": phase,
@@ -827,6 +828,70 @@ class CoreAgent:
                     raise
         return record, snapshot
 
+    def _consume_inbound_messages(
+        self,
+        record,
+        snapshot,
+        *,
+        lease_token,
+        discard_pending_response=False,
+    ):
+        messages = self.workflow_store.pending_inbound(record)
+        if not messages:
+            return record, snapshot, 0
+        snapshot = copy.deepcopy(snapshot)
+        if discard_pending_response:
+            snapshot["pending_response"] = None
+            snapshot["tool_queue"] = []
+        context = self._context_from_dict(snapshot["context"])
+        active = list(context.active)
+        transcript = list(context.transcript)
+        sequence_end = context.sequence_range[1]
+        for message in messages:
+            item = ContextItem(
+                "user_message",
+                message["content"],
+                self.token_counter(message["content"]),
+            )
+            active.append(item)
+            transcript.append(item)
+            sequence_end += 1
+        snapshot["context"] = self._context_to_dict(
+            ContextState(
+                tuple(active),
+                tuple(transcript),
+                (context.sequence_range[0], sequence_end),
+            )
+        )
+        sequences = tuple(message["sequence"] for message in messages)
+        record = self.workflow_store.consume_inbound(
+            record,
+            expected_version=record.version,
+            snapshot=snapshot,
+            sequences=sequences,
+            lease_token=lease_token,
+        )
+        if not self.workflow_store.atomic:
+            self.audit_log.append(
+                record.run_id, "input.delivered", {"sequences": list(sequences)}
+            )
+            self.event_store.append(
+                record.run_id, "input.delivered", {"sequences": list(sequences)}
+            )
+            self.checkpoint_store.save(
+                record.run_id,
+                self.event_store.revision(record.run_id),
+                {**snapshot, "state": "RUNNING"},
+            )
+        self._log(
+            "input.delivered",
+            run_id=record.run_id,
+            task_id=record.task_id,
+            sequences=list(sequences),
+            message_ids=[message["message_id"] for message in messages],
+        )
+        return record, snapshot, len(messages)
+
     @staticmethod
     def _recoverable_tool_error(call, error):
         return isinstance(error, CoreError) and (
@@ -1090,6 +1155,9 @@ class CoreAgent:
                 record, snapshot = self._consume_task_notifications(
                     record, snapshot, lease_token=lease_token
                 )
+                record, snapshot, _ = self._consume_inbound_messages(
+                    record, snapshot, lease_token=lease_token
+                )
                 context = self._context_from_dict(snapshot["context"])
                 compacted = compactor.maybe_compact(context)
                 if compacted is not context:
@@ -1339,6 +1407,14 @@ class CoreAgent:
                     continue
                 response = snapshot["pending_response"]
                 if response["message"] is not None:
+                    record, snapshot, delivered = self._consume_inbound_messages(
+                        record,
+                        snapshot,
+                        lease_token=lease_token,
+                        discard_pending_response=True,
+                    )
+                    if delivered:
+                        continue
                     self.task_scheduler.assert_can_complete_parent(
                         record.run_id, tenant_id=record.tenant_id
                     )
@@ -1349,16 +1425,23 @@ class CoreAgent:
                             "tool_calls": snapshot["tool_calls"],
                         },
                     }
-                    record = self._record_transition(
-                        record,
-                        state="COMPLETED",
-                        snapshot=snapshot,
-                        event_kind="task.completed",
-                        event_data={"message": response["message"]},
-                        audit=(("task.completed", {"content_persisted": False}),),
-                        result=result,
-                        lease_token=lease_token,
-                    )
+                    try:
+                        record = self._record_transition(
+                            record,
+                            state="COMPLETED",
+                            snapshot=snapshot,
+                            event_kind="task.completed",
+                            event_data={"message": response["message"]},
+                            audit=(("task.completed", {"content_persisted": False}),),
+                            result=result,
+                            lease_token=lease_token,
+                        )
+                    except CoreError as error:
+                        if error.code != "INBOUND_MESSAGE_PENDING":
+                            raise
+                        snapshot["pending_response"] = None
+                        snapshot["tool_queue"] = []
+                        continue
                     self._run_contexts.pop(record.run_id, None)
                     self._run_scopes.pop(record.run_id, None)
                     self._runtime_cache.pop(record.run_id, None)
@@ -1955,6 +2038,53 @@ class CoreAgent:
             parent_run_id=parent_run_id,
         )
         return self._continue_workflow(record)
+
+    def enqueue_message(
+        self,
+        request,
+        *,
+        task_id,
+        message_id,
+        identity=None,
+        session_id=None,
+        tenant_id=None,
+    ):
+        if isinstance(request, dict):
+            request = RunRequest.from_dict(request)
+        if not isinstance(request, RunRequest) or not task_id or not message_id:
+            raise CoreError("INVALID_REQUEST")
+        owner_id = identity or "anonymous"
+        tenant_id = tenant_id or "default"
+        record = self.workflow_store.by_task(
+            task_id, tenant_id=tenant_id, owner_id=owner_id
+        )
+        context_id = session_id or record.context_id
+        if (
+            request.mcp != tuple(record.request.get("mcp", ()))
+            or request.skills != tuple(record.request.get("skills", ()))
+        ):
+            raise CoreError(
+                "INVALID_REQUEST",
+                "follow-up cannot change the active capability snapshot",
+            )
+        message, accepted = self.workflow_store.append_inbound(
+            task_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            message_id=message_id,
+            context_id=context_id,
+            content=request.prompt,
+            provenance={"owner_id": owner_id, "tenant_id": tenant_id},
+        )
+        self._log(
+            "input.accepted" if accepted else "input.duplicate",
+            run_id=record.run_id,
+            task_id=task_id,
+            message_id=message_id,
+            sequence=message["sequence"],
+            **({"content": request.prompt} if self.log_content else {}),
+        )
+        return message
 
     def delete_run_data(self, tenant_id, run_id, *, operator_principal_id):
         if self.retention_manager is None:

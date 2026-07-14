@@ -23,7 +23,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -315,6 +315,25 @@ CREATE TABLE core_budget_ledgers (
     updated_at double precision NOT NULL
 );
 """,
+    7: """
+CREATE TABLE core_inbound_messages (
+    run_id text NOT NULL REFERENCES core_runs(run_id) ON DELETE CASCADE,
+    sequence bigint NOT NULL,
+    message_id text NOT NULL,
+    context_id text NOT NULL,
+    role text NOT NULL,
+    content text NOT NULL,
+    provenance jsonb NOT NULL,
+    received_at double precision NOT NULL,
+    consumed_at double precision,
+    PRIMARY KEY (run_id, sequence),
+    UNIQUE (run_id, message_id)
+);
+
+CREATE INDEX core_inbound_pending_idx
+    ON core_inbound_messages (run_id, sequence)
+    WHERE consumed_at IS NULL;
+""",
 }
 
 
@@ -449,6 +468,7 @@ class PostgresDatabase:
             "core_push_deliveries": "SELECT, INSERT, UPDATE",
             "core_artifacts": "SELECT, INSERT, UPDATE, DELETE",
             "core_budget_ledgers": "SELECT, INSERT, UPDATE, DELETE",
+            "core_inbound_messages": "SELECT, INSERT, UPDATE, DELETE",
         }
         with self.transaction() as connection:
             connection.execute(

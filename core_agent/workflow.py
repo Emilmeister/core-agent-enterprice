@@ -41,6 +41,7 @@ class InMemoryWorkflowStore:
         self._leases = {}
         self._lock = threading.RLock()
         self._budgets = {}
+        self._inbound = {}
 
     def create(self, record, *, budget_limits=(100, 200), **_metadata):
         with self._lock:
@@ -61,7 +62,96 @@ class InMemoryWorkflowStore:
                 }
             )
             self._records[record.run_id] = record
+            self._inbound[record.run_id] = []
             return record
+
+    def append_inbound(
+        self,
+        task_id,
+        *,
+        tenant_id,
+        owner_id,
+        message_id,
+        context_id,
+        content,
+        provenance,
+    ):
+        with self._lock:
+            record = self.by_task(
+                task_id, tenant_id=tenant_id, owner_id=owner_id
+            )
+            messages = self._inbound[record.run_id]
+            duplicate = next(
+                (item for item in messages if item["message_id"] == message_id),
+                None,
+            )
+            if duplicate is not None:
+                return dict(duplicate), False
+            if record.context_id != context_id:
+                raise CoreError("INVALID_REQUEST", "context_id does not match task")
+            if record.state in TERMINAL_STATES:
+                raise CoreError("TASK_TERMINAL")
+            message = {
+                "sequence": len(messages) + 1,
+                "message_id": message_id,
+                "context_id": context_id,
+                "role": "user",
+                "content": content,
+                "provenance": dict(provenance),
+                "consumed": False,
+            }
+            messages.append(message)
+            return dict(message), True
+
+    def pending_inbound(self, record):
+        with self._lock:
+            current = self.get(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+            )
+            return tuple(
+                dict(item)
+                for item in self._inbound[current.run_id]
+                if not item["consumed"]
+            )
+
+    def consume_inbound(
+        self,
+        record,
+        *,
+        expected_version,
+        snapshot,
+        sequences,
+        lease_token,
+    ):
+        with self._lock:
+            current = self.get(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+            )
+            selected = {
+                item["sequence"]: item
+                for item in self._inbound[current.run_id]
+                if not item["consumed"] and item["sequence"] in sequences
+            }
+            if set(selected) != set(sequences):
+                raise CoreError("SESSION_CONFLICT")
+            updated = self.transition(
+                current.run_id,
+                tenant_id=current.tenant_id,
+                owner_id=current.owner_id,
+                expected_version=expected_version,
+                state="RUNNING",
+                snapshot=snapshot,
+                event_kind="input.delivered",
+                event_data={"sequences": list(sequences)},
+                lease_token=lease_token,
+            )
+            for sequence in sequences:
+                selected[sequence]["consumed"] = True
+            return updated
 
     def consume_budget(self, record, *, model_turns=0, tool_calls=0):
         with self._lock:
@@ -124,6 +214,10 @@ class InMemoryWorkflowStore:
                 raise CoreError("SESSION_CONFLICT")
             if current.state in TERMINAL_STATES and state != current.state:
                 raise CoreError("INVALID_TASK_STATE")
+            if state == "COMPLETED" and any(
+                not item["consumed"] for item in self._inbound.get(run_id, ())
+            ):
+                raise CoreError("INBOUND_MESSAGE_PENDING")
             if lease_token is not None:
                 lease = self._leases.get(run_id)
                 if not lease or lease[1] != lease_token or lease[2] <= self.clock():
@@ -481,6 +575,149 @@ class PostgresWorkflowStore:
             raise CoreError("TASK_NOT_FOUND")
         return self._record(row)
 
+    def append_inbound(
+        self,
+        task_id,
+        *,
+        tenant_id,
+        owner_id,
+        message_id,
+        context_id,
+        content,
+        provenance,
+    ):
+        now = self.clock()
+        with self.database.transaction() as connection:
+            record = connection.execute(
+                """SELECT * FROM core_runs
+                   WHERE task_id = %s AND tenant_id = %s AND owner_id = %s
+                   FOR UPDATE""",
+                (task_id, tenant_id, owner_id),
+            ).fetchone()
+            if record is None:
+                raise CoreError("TASK_NOT_FOUND")
+            record = self._record(record)
+            duplicate = connection.execute(
+                """SELECT sequence, message_id, context_id, role, content,
+                          provenance, consumed_at
+                   FROM core_inbound_messages
+                   WHERE run_id = %s AND message_id = %s""",
+                (record.run_id, message_id),
+            ).fetchone()
+            if duplicate is not None:
+                return {
+                    **dict(duplicate),
+                    "consumed": duplicate["consumed_at"] is not None,
+                }, False
+            if record.context_id != context_id:
+                raise CoreError("INVALID_REQUEST", "context_id does not match task")
+            if record.state in TERMINAL_STATES:
+                raise CoreError("TASK_TERMINAL")
+            sequence = connection.execute(
+                """SELECT COALESCE(max(sequence), 0) + 1 AS sequence
+                   FROM core_inbound_messages WHERE run_id = %s""",
+                (record.run_id,),
+            ).fetchone()["sequence"]
+            connection.execute(
+                """INSERT INTO core_inbound_messages
+                   (run_id, sequence, message_id, context_id, role, content,
+                    provenance, received_at)
+                   VALUES (%s, %s, %s, %s, 'user', %s, %s, %s)""",
+                (
+                    record.run_id,
+                    sequence,
+                    message_id,
+                    context_id,
+                    content,
+                    Jsonb(dict(provenance)),
+                    now,
+                ),
+            )
+            self._event(
+                connection,
+                record,
+                "input.accepted",
+                {"message_id": message_id, "sequence": sequence},
+                now,
+            )
+            self._audit(
+                connection,
+                record,
+                (
+                    (
+                        "input.accepted",
+                        {"message_id": message_id, "sequence": sequence},
+                    ),
+                ),
+                now,
+            )
+        return {
+            "sequence": sequence,
+            "message_id": message_id,
+            "context_id": context_id,
+            "role": "user",
+            "content": content,
+            "provenance": dict(provenance),
+            "consumed": False,
+        }, True
+
+    def pending_inbound(self, record):
+        with self.database.pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT sequence, message_id, context_id, role, content,
+                          provenance
+                   FROM core_inbound_messages
+                   WHERE run_id = %s AND consumed_at IS NULL
+                   ORDER BY sequence""",
+                (record.run_id,),
+            ).fetchall()
+        return tuple({**dict(row), "consumed": False} for row in rows)
+
+    def consume_inbound(
+        self,
+        record,
+        *,
+        expected_version,
+        snapshot,
+        sequences,
+        lease_token,
+    ):
+        now = self.clock()
+        with self.database.transaction() as connection:
+            current = self.get(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+                connection=connection,
+                lock=True,
+            )
+            rows = connection.execute(
+                """SELECT sequence FROM core_inbound_messages
+                   WHERE run_id = %s AND consumed_at IS NULL
+                     AND sequence = ANY(%s)
+                   FOR UPDATE""",
+                (record.run_id, list(sequences)),
+            ).fetchall()
+            if {row["sequence"] for row in rows} != set(sequences):
+                raise CoreError("SESSION_CONFLICT")
+            updated = self._transition_locked(
+                connection,
+                current,
+                expected_version=expected_version,
+                state="RUNNING",
+                snapshot=snapshot,
+                event_kind="input.delivered",
+                event_data={"sequences": list(sequences)},
+                lease_token=lease_token,
+            )
+            connection.execute(
+                """UPDATE core_inbound_messages SET consumed_at = %s
+                   WHERE run_id = %s AND sequence = ANY(%s)
+                     AND consumed_at IS NULL""",
+                (now, record.run_id, list(sequences)),
+            )
+        return updated
+
     def lookup_task(self, task_id):
         with self.database.pool.connection() as connection:
             rows = connection.execute(
@@ -512,6 +749,14 @@ class PostgresWorkflowStore:
             raise CoreError("SESSION_CONFLICT")
         if current.state in TERMINAL_STATES and state != current.state:
             raise CoreError("INVALID_TASK_STATE")
+        if state == "COMPLETED":
+            pending = connection.execute(
+                """SELECT 1 FROM core_inbound_messages
+                   WHERE run_id = %s AND consumed_at IS NULL LIMIT 1""",
+                (current.run_id,),
+            ).fetchone()
+            if pending is not None:
+                raise CoreError("INBOUND_MESSAGE_PENDING")
         if lease_token is not None:
             lease = connection.execute(
                 """SELECT lease_token, lease_expires_at FROM core_runs

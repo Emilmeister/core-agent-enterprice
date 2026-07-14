@@ -27,7 +27,7 @@ A2A является основным внешним контрактом: Agent
 
 ### Run orchestrator
 
-Владеет task state machine, turn loop, budgets, checkpoints, cancellation, background work, durable mailbox, delegation и terminal outcome. Только orchestrator может переводить task/run между состояниями.
+Владеет task state machine, turn loop, budgets, checkpoints, cancellation, background work, durable mailbox/inbound inbox, delegation и terminal outcome. Только orchestrator может переводить task/run между состояниями.
 
 ### Config compiler
 
@@ -55,7 +55,7 @@ Policy engine принимает нормализованный proposed action 
 
 ### Durable state
 
-Event log является источником истины для состояния A2A Task/run. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript и artifacts имеют независимые retention policies. Memory принадлежит отдельному MCP Service; Core сохраняет только использованные MCP results/provenance согласно Task retention.
+Event log является источником истины для состояния A2A Task/run. Inbound Messages durable сохраняются до model delivery и дедуплицируются по `(task_id, message_id)`; inbox append и terminal transition сериализуются без потери подтверждённого input. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript и artifacts имеют независимые retention policies. Memory принадлежит отдельному MCP Service; Core сохраняет только использованные MCP results/provenance согласно Task retention.
 
 Production adapter хранит A2A Tasks, event log, checkpoints, approvals/reservations и append-only audit в PostgreSQL через один bounded pool. `DATABASE_URL` обязателен и берётся из deployment secret. Нет автоматического fallback на process memory/SQLite при database outage: startup/readiness fail closed, активные protected actions не исполняются. Test adapters не могут быть выбраны production configuration.
 

@@ -63,7 +63,8 @@ Compaction MUST запускаться до model call, если прогноз�
 - точные пути изменённых файлов и ссылки на созданные artifacts;
 - последние сообщения, без которых следующий шаг теряет непосредственный смысл;
 - provenance и revision извлечённых memory records, влияющих на текущее решение;
-- parent/child Task contracts и ещё не проверенные child results.
+- parent/child Task contracts и ещё не проверенные child results;
+- принятые, но ещё не доставленные model loop inbound Messages с их sequence/provenance.
 
 Если pinned data вместе с `output_reserve` не помещается в окно, запуск MUST завершиться с `CONTEXT_UNRECOVERABLE`. Ядро MUST NOT молча обрезать pinned data.
 

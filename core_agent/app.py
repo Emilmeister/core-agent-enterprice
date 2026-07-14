@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import time
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -12,7 +13,13 @@ from urllib.parse import urlparse
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .a2a import LOCAL_APPROVAL_STATUS_URI, AgentCard, Artifact, Part
+from .a2a import (
+    LOCAL_APPROVAL_STATUS_URI,
+    AgentCard,
+    Artifact,
+    Part,
+    parse_run_request,
+)
 from .a2a_sdk import build_starlette_app
 from .approvals import ApprovalManager, ApproveAllControlPlane
 from .artifacts import InMemoryArtifactStore, PostgresArtifactStore
@@ -825,6 +832,26 @@ def create_app(
             return result
         return result_artifact(result, context)
 
+    def followup(message, task, call_context):
+        request = parse_run_request(message, call_context.requested_extensions)
+        user = call_context.user
+        identity = user.user_name if user.is_authenticated else "anonymous"
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                return agent.enqueue_message(
+                    request,
+                    task_id=task.id,
+                    message_id=message.message_id,
+                    identity=identity,
+                    session_id=task.context_id,
+                    tenant_id=call_context.tenant or "default",
+                )
+            except CoreError as error:
+                if error.code != "TASK_NOT_FOUND" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+
     def reserve_local(pending, context):
         if control_plane is None or not getattr(control_plane, "automatic", True):
             return None
@@ -894,6 +921,7 @@ def create_app(
         base_url=base_url,
         task_store=state["tasks"],
         resume_handler=resume,
+        followup_handler=followup,
         push_config_store=push_config_store,
         push_sender=push_sender,
         shutdown_handler=close,

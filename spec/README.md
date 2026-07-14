@@ -66,6 +66,7 @@ Core Agent превращает три входа — `prompt`, `mcp` и `skills
 - Инструменты исполняются последовательно, пока runtime не доказал независимость; разрешённый параллелизм остаётся внутренней оптимизацией.
 - Делегирование дочерним агентам является внутренней возможностью и не добавляет полей клиенту.
 - Основной внешний протокол — A2A; внутренний run и фоновая работа отображаются на A2A Task.
+- Non-terminal A2A Task принимает follow-up Messages по своему `taskId`; runtime durable доставляет их model loop на safe boundaries без interrupt текущей операции или изменения EffectiveConfig.
 - Memory является отдельным MCP service, а не подсистемой Core Agent.
 - AgentConfig может отключить memory, built-in tools, отдельные MCP tools, skills, delegation и другие optional capabilities.
 - Main agent и сабагенты используют общую память только когда parent явно передал им один Memory MCP namespace.

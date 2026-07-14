@@ -70,6 +70,8 @@ class Message:
     extensions: tuple[str, ...] = ()
     metadata: dict = field(default_factory=dict)
     context_id: str | None = None
+    message_id: str | None = None
+    task_id: str | None = None
 
     @classmethod
     def user(cls, text):

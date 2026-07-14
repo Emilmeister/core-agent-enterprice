@@ -8,6 +8,10 @@ from google.protobuf import json_format
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.request_handlers.request_handler import (
+    validate,
+    validate_request_params,
+)
 from a2a.server.routes import create_agent_card_routes, create_rest_routes
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
 from a2a.types import (
@@ -24,7 +28,13 @@ from a2a.types import (
     TaskStatus as SdkTaskStatus,
 )
 from starlette.applications import Starlette
-from a2a.utils.errors import TaskNotCancelableError
+from a2a.utils.errors import (
+    InvalidParamsError,
+    TaskNotCancelableError,
+    TaskNotFoundError,
+    UnsupportedOperationError,
+)
+from a2a.utils.task import apply_history_length, validate_history_length
 
 from .a2a import (
     Artifact,
@@ -49,10 +59,17 @@ LOCAL_APPROVAL_GRANTED_TEXT = (
 LOCAL_APPROVAL_LOCKED_TEXT = (
     "The task is locked while awaiting authorization from the serving agent's "
     "local operator. The caller cannot resolve or modify this authorization. "
-    "No protected side effect has been executed. The message was not applied; "
-    "use GetTask, SubscribeToTask, push "
-    "notifications, or CancelTask."
+    "No protected side effect has been executed. Follow-up messages are queued "
+    "for the next permitted model turn; use GetTask, SubscribeToTask, push "
+    "notifications, or CancelTask to track or stop the task."
 )
+
+A2A_TERMINAL_STATES = {
+    SdkTaskState.TASK_STATE_COMPLETED,
+    SdkTaskState.TASK_STATE_FAILED,
+    SdkTaskState.TASK_STATE_CANCELED,
+    SdkTaskState.TASK_STATE_REJECTED,
+}
 
 
 def resolve_owner_scope(context):
@@ -130,8 +147,7 @@ class CoreAgentExecutor(AgentExecutor):
         self.resume_handler = resume_handler
 
     @staticmethod
-    def _message(context):
-        message = context.message
+    def _from_sdk_message(message, *, context_id=None):
         metadata = json_format.MessageToDict(message.metadata) if message else {}
         parts = []
         for part in message.parts if message else ():
@@ -144,8 +160,16 @@ class CoreAgentExecutor(AgentExecutor):
             parts=tuple(parts),
             extensions=tuple(message.extensions if message else ()),
             metadata=metadata,
-            context_id=context.context_id,
+            context_id=(
+                message.context_id if message and message.context_id else context_id
+            ),
+            message_id=message.message_id if message else None,
+            task_id=message.task_id if message and message.task_id else None,
         )
+
+    @classmethod
+    def _message(cls, context):
+        return cls._from_sdk_message(context.message, context_id=context.context_id)
 
     def _local_approval_message(
         self, context, approval, *, phase="awaiting_local_operator"
@@ -271,9 +295,60 @@ class CoreAgentExecutor(AgentExecutor):
 
 
 class CoreRequestHandler(DefaultRequestHandler):
-    def __init__(self, *args, can_cancel, **kwargs):
+    def __init__(self, *args, can_cancel, followup_handler, **kwargs):
         super().__init__(*args, **kwargs)
         self.can_cancel = can_cancel
+        self.followup_handler = followup_handler
+
+    async def _accept_followup(self, params, context):
+        validate_history_length(params.configuration)
+        task_id = params.message.task_id
+        task = await self.task_store.get(task_id, context)
+        if task is None:
+            raise TaskNotFoundError(message=f"Task {task_id} not found")
+        if task.status.state in A2A_TERMINAL_STATES:
+            raise UnsupportedOperationError(
+                message=f"Task {task_id} is already terminal"
+            )
+        if params.message.role != SdkRole.ROLE_USER:
+            raise InvalidParamsError(message="Follow-up role must be ROLE_USER")
+        if params.message.context_id and params.message.context_id != task.context_id:
+            raise InvalidParamsError(message="context_id does not match task")
+        message = CoreAgentExecutor._from_sdk_message(
+            params.message, context_id=task.context_id
+        )
+        try:
+            await asyncio.to_thread(self.followup_handler, message, task, context)
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if code == "TASK_NOT_FOUND":
+                raise TaskNotFoundError(message=f"Task {task_id} not found") from None
+            if code in {"TASK_TERMINAL", "INVALID_TASK_STATE"}:
+                raise UnsupportedOperationError(
+                    message=f"Task {task_id} is already terminal"
+                ) from None
+            if code in {"INVALID_REQUEST", "A2A_EXTENSION_REQUIRED"}:
+                raise InvalidParamsError(message=str(error)) from None
+            raise
+        return apply_history_length(task, params.configuration)
+
+    @validate_request_params
+    async def on_message_send(self, params, context):
+        if params.message.task_id:
+            return await self._accept_followup(params, context)
+        return await super().on_message_send(params, context)
+
+    @validate_request_params
+    @validate(
+        lambda self: self._agent_card.capabilities.streaming,
+        "Streaming is not supported by the agent",
+    )
+    async def on_message_send_stream(self, params, context):
+        if params.message.task_id:
+            yield await self._accept_followup(params, context)
+            return
+        async for event in super().on_message_send_stream(params, context):
+            yield event
 
     async def on_cancel_task(self, params, context):
         if not self.can_cancel(params.id):
@@ -312,6 +387,7 @@ def build_starlette_app(
     can_cancel,
     base_url,
     resume_handler,
+    followup_handler,
     context_builder=None,
     task_store=None,
     push_config_store=None,
@@ -337,6 +413,7 @@ def build_starlette_app(
         push_config_store=push_config_store,
         push_sender=push_sender,
         can_cancel=can_cancel,
+        followup_handler=followup_handler,
     )
     routes = create_agent_card_routes(sdk_card)
     routes.extend(create_rest_routes(request_handler, context_builder=context_builder))

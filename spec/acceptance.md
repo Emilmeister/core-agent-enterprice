@@ -11,6 +11,10 @@
 - [ ] A2A `contextId` сохраняет session, но MCP/skills не наследуются в новую Task неявно.
 - [ ] Blocking, `return_immediately`, polling, subscription/streaming и push видят одну durable Task history.
 - [ ] Disconnect stream не отменяет Task; at-least-once push update дедуплицируется.
+- [ ] Follow-up Message с существующим non-terminal `taskId` возвращает ту же Task, durable переживает restart и попадает отдельным user turn перед следующим model call.
+- [ ] Duplicate `messageId` не доставляется дважды; concurrent Messages получают стабильный committed order; context/task mismatch и cross-tenant ID отклоняются.
+- [ ] Уже начатый model/tool/side-effect call не прерывается; completion atomically проигрывает более раннему accepted Message, поэтому подтверждённый input не теряется.
+- [ ] Follow-up не изменяет EffectiveConfig/MCP/skills/budgets. В `WAITING_LOCAL_APPROVAL` он остаётся queued и не действует как approve/deny/cancel.
 - [ ] Internal states корректно отображаются только на стандартные A2A Task states.
 
 ## Конфигурация агента
@@ -180,6 +184,7 @@
 10. **OTel causality:** Core MCP client и Memory Service indexing spans находятся в одном distributed trace без content leakage.
 11. **Внешнее действие:** MCP write ждёт approval, переживает recovery и выполняется ровно один раз.
 12. **Local operator HITL:** risky terminal call публикует A2A `working`; caller не может resolve/modify approval, local control plane создаёт одну reservation exact argv, а cancel/deny/expiry не запускают process.
+13. **Live steering:** пока Task выполняет model/tool loop, два follow-up Messages приходят с тем же `taskId`, сохраняют committed order и учитываются агентом до terminal result без дублирования уже выполненного side effect.
 
 ## Definition of Done
 

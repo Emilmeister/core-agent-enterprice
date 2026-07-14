@@ -756,6 +756,110 @@ class PostgresRestartTests(unittest.TestCase):
         finally:
             reopened.close()
 
+    def test_inbound_inbox_is_durable_idempotent_and_gates_completion(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.create(
+            WorkflowRecord(
+                "inbound-run",
+                "inbound-task",
+                "inbound-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "initial", "mcp": [], "skills": []},
+                {"turns": 1},
+            )
+        )
+        first, accepted = workflows.append_inbound(
+            record.task_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            message_id="message-1",
+            context_id=record.context_id,
+            content="correction",
+            provenance={"source": "a2a"},
+        )
+        duplicate, accepted_again = workflows.append_inbound(
+            record.task_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            message_id="message-1",
+            context_id=record.context_id,
+            content="correction",
+            provenance={"source": "a2a"},
+        )
+        self.assertTrue(accepted)
+        self.assertFalse(accepted_again)
+        self.assertEqual(first["sequence"], duplicate["sequence"])
+        database.close()
+
+        database = self._database()
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.lookup_task("inbound-task")
+        self.assertEqual(
+            [item["content"] for item in workflows.pending_inbound(record)],
+            ["correction"],
+        )
+        token = workflows.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id="worker-1",
+            ttl=30,
+        )
+        with self.assertRaises(CoreError) as pending:
+            workflows.transition(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+                expected_version=record.version,
+                state="COMPLETED",
+                snapshot=record.snapshot,
+                event_kind="task.completed",
+                lease_token=token,
+            )
+        self.assertEqual(pending.exception.code, "INBOUND_MESSAGE_PENDING")
+        delivered = workflows.consume_inbound(
+            record,
+            expected_version=record.version,
+            snapshot={**record.snapshot, "delivered": True},
+            sequences=(first["sequence"],),
+            lease_token=token,
+        )
+        self.assertEqual(workflows.pending_inbound(delivered), ())
+        completed = workflows.transition(
+            delivered.run_id,
+            tenant_id=delivered.tenant_id,
+            owner_id=delivered.owner_id,
+            expected_version=delivered.version,
+            state="COMPLETED",
+            snapshot=delivered.snapshot,
+            event_kind="task.completed",
+            lease_token=token,
+        )
+        self.assertEqual(completed.state, "COMPLETED")
+        database.close()
+
+        reopened = self._database()
+        try:
+            persisted = PostgresWorkflowStore(reopened).lookup_task("inbound-task")
+            self.assertEqual(persisted.state, "COMPLETED")
+            with reopened.pool.connection() as connection:
+                rows = connection.execute(
+                    """SELECT message_id, sequence, consumed_at
+                       FROM core_inbound_messages WHERE run_id = 'inbound-run'"""
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["message_id"], "message-1")
+            self.assertIsNotNone(rows[0]["consumed_at"])
+        finally:
+            reopened.close()
+
     def test_agent_approval_continues_after_complete_process_state_loss(self):
         database = self._database()
         database.migrate()

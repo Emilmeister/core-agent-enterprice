@@ -49,11 +49,11 @@ Extension payload содержит ровно:
 
 Protected action разрешает только local operator ServingAgent через private control plane. Remote A2A caller никогда не получает approval request/response capability и не может изменить pending decision сообщением, metadata, extension или credential.
 
-`WAITING_LOCAL_APPROVAL` проецируется как `working`, а не `input-required`/`auth-required`. Current Task status сохраняет понятный text Message: решение принимает local operator; caller не может approve/deny; side effect ещё не выполнен; caller может GetTask/subscribe/push/cancel.
+`WAITING_LOCAL_APPROVAL` проецируется как `working`, а не `input-required`/`auth-required`. Current Task status сохраняет понятный text Message: решение принимает local operator; caller не может approve/deny; side effect ещё не выполнен; caller может GetTask/subscribe/push/cancel или отправить follow-up, который останется queued до снятия lock.
 
-Agent Card объявляет одну optional informational extension с configurable owner URI `LOCAL_APPROVAL_EXTENSION_URI`. Она сообщает `authorizationOwner=serving_agent_local_operator`, `callerActionRequired=false`, `callerCanApprove=false`, `callerCanDeny=false`, `protectedActionExecuted=false`, allowed tracking/cancel operations, wait timestamp и status version. В extension нет incoming decision schema, approval ID, URL или token. Extension-unaware caller получает тот же core A2A lifecycle и достаточный text status.
+Agent Card объявляет одну optional informational extension с configurable owner URI `LOCAL_APPROVAL_EXTENSION_URI`. Она сообщает `authorizationOwner=serving_agent_local_operator`, `callerActionRequired=false`, `callerCanApprove=false`, `callerCanDeny=false`, `protectedActionExecuted=false`, allowed tracking/queued-message/cancel operations, wait timestamp и status version. В extension нет incoming decision schema, approval ID, URL или token. Extension-unaware caller получает тот же core A2A lifecycle и достаточный text status.
 
-Message, адресованный locked Task, отклоняется с `TASK_LOCKED_AWAITING_LOCAL_OPERATOR` без изменения frozen proposal. Только A2A `CancelTask` может выиграть race до execution reservation. Полный authority, digest, transaction, recovery и audit contract определён в [Local operator HITL](local-operator-hitl.md).
+Message, адресованный Task в `WAITING_LOCAL_APPROVAL`, принимается в durable inbox, но не изменяет frozen proposal, approval или reservation и не интерпретируется как approve/deny/cancel. Runtime передаёт его модели только после разрешения approval lock. Только A2A `CancelTask` может выиграть race до execution reservation. Полный authority, digest, transaction, recovery и audit contract определён в [Local operator HITL](local-operator-hitl.md).
 
 ## Task mapping
 
@@ -83,6 +83,24 @@ Core Agent MUST поддерживать A2A operations, необходимые 
 - получить extended Agent Card, если capability объявлена.
 
 Конкретный binding MAY временно поддерживать подмножество optional operations только если Agent Card честно отражает capability.
+
+## Сообщения активной Task
+
+Caller MAY отправлять дополнительные A2A Messages в уже существующую non-terminal Task, указывая её server-generated `taskId`. Если передан `contextId`, он MUST совпадать с context Task; `contextId` без `taskId` создаёт новую Task и не steer-ит существующую. После terminal state Message отклоняется стандартной A2A terminal-task ошибкой.
+
+Сервер MUST:
+
+- проверить authenticated caller, tenant и доступ к Task с not-found semantics для чужого ID;
+- принимать от caller только `ROLE_USER` и нормализовать его в новый user turn с provenance исходного `messageId`;
+- сохранить Message в durable inbox до acknowledgement, назначить monotonic task-local sequence и дедуплицировать повторный `messageId`;
+- вернуть ту же Task, а не создать параллельный run;
+- доставить принятые Messages в commit order на ближайшей safe boundary перед следующим model turn;
+- не прерывать уже начатый model call, tool call или side effect;
+- перед terminal commit атомарно проверить inbox: Message, committed раньше terminal transition, MUST быть обработан; Message, проигравший race terminal transition, MUST быть отклонён.
+
+Follow-up не пересобирает EffectiveConfig и не пополняет budgets. Core extension использует ту же version и тот же canonical `mcp`/`skills` snapshot, что исходный Message; попытка добавить, удалить или изменить capability отклоняется с `CONFIG_CONFLICT`. Новейший turn MAY уточнить или изменить желаемый будущий результат, но не отменяет уже committed side effect; для отмены Task используется `CancelTask`.
+
+`WAITING_INPUT` и `WAITING_TASK` Task возобновляются notification-ом о новом inbox Message. В `RUNNING` Message ждёт следующую safe boundary. В `PAUSED`, `WAITING_AUTH` и `WAITING_LOCAL_APPROVAL` Message сохраняется, но не снимает lock/паузу и не передаётся модели до разрешённого resume.
 
 ## Blocking, background и ожидание
 

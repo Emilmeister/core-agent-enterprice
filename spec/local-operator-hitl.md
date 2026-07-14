@@ -54,7 +54,7 @@ RECEIVED -> PLANNING -> POLICY_EVALUATION
 
 Local approval MUST NOT использовать `input-required` или `auth-required`: caller не должен и не может разрешить ожидание. `input-required` остаётся только для новых бизнес-данных от caller, `auth-required` — только для authorization flow, который должен разрешить сам caller.
 
-При входе в wait Task сохраняет current status Message, сообщающий четыре факта: решение принадлежит local operator; caller не может approve/deny; side effect ещё не выполнен; caller может ждать через GetTask/subscribe/push либо вызвать CancelTask. `GetTask` MUST возвращать это сообщение после reconnect.
+При входе в wait Task сохраняет current status Message, сообщающий пять фактов: решение принадлежит local operator; caller не может approve/deny; side effect ещё не выполнен; caller может ждать через GetTask/subscribe/push либо вызвать CancelTask; новый follow-up будет сохранён, но модель увидит его только после снятия lock. `GetTask` MUST возвращать это сообщение после reconnect.
 
 ## Informational A2A extension
 
@@ -82,7 +82,7 @@ Extension-aware caller получает metadata:
   "callerCanApprove": false,
   "callerCanDeny": false,
   "protectedActionExecuted": false,
-  "allowedCallerOperations": ["get_task", "subscribe_to_task", "create_push_notification_config", "cancel_task"],
+  "allowedCallerOperations": ["get_task", "subscribe_to_task", "send_message_queued", "create_push_notification_config", "cancel_task"],
   "waitStartedAt": "RFC3339 timestamp",
   "suggestedPollIntervalSeconds": 15,
   "statusVersion": 1
@@ -91,7 +91,7 @@ Extension-aware caller получает metadata:
 
 Extension `required` всегда `false`. В ней нет incoming decision schema, approval URL/token/ID или approve/deny operation. Extension-unaware caller получает достаточный text status.
 
-Task, locked в `WAITING_LOCAL_APPROVAL`, отклоняет адресованный ей `SendMessage` с `TASK_LOCKED_AWAITING_LOCAL_OPERATOR`/failed precondition без изменения proposal или approval. Natural-language cancel не отменяет Task; только A2A `CancelTask` участвует в cancel race. Новая независимая Task MAY использовать тот же context ID без locked task ID.
+Task, locked в `WAITING_LOCAL_APPROVAL`, принимает адресованный ей `SendMessage` в durable inbox, но не меняет proposal/approval, не возобновляет model loop и не доставляет Message модели до разрешения lock. Natural-language approve/deny/cancel не влияет на решение; только A2A `CancelTask` участвует в cancel race. Новая независимая Task MAY использовать тот же context ID без locked task ID.
 
 ## Frozen proposal и action digest
 

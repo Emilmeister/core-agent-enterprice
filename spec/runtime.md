@@ -44,17 +44,26 @@
 
 В состоянии `RUNNING` ядро повторяет:
 
-1. оценивает заполнение контекста и при необходимости выполняет compaction;
-2. вызывает модель с активным контекстом и доступными tool schemas;
-3. стримит пользовательский текст без скрытого reasoning;
-4. если модель завершила ответ — завершает запуск;
-5. если модель запросила tool — валидирует имя и arguments;
-6. оценивает риск, замораживает exact action и при необходимости durable-переходит в `WAITING_LOCAL_APPROVAL`;
-7. исполняет разрешённый tool, нормализует result и добавляет его в контекст;
-8. принимает durable task notifications на safe boundary;
-9. продолжает цикл, другую независимую работу или passive wait.
+1. принимает durable task notifications и новые inbound Messages на safe boundary;
+2. добавляет каждый принятый Message отдельным user turn с provenance и committed sequence;
+3. оценивает заполнение контекста и при необходимости выполняет compaction;
+4. вызывает модель с активным контекстом и доступными tool schemas;
+5. стримит пользовательский текст без скрытого reasoning;
+6. если модель завершила ответ — атомарно проверяет inbound inbox и завершает запуск только при отсутствии более раннего unread Message;
+7. если модель запросила tool — валидирует имя и arguments;
+8. оценивает риск, замораживает exact action и при необходимости durable-переходит в `WAITING_LOCAL_APPROVAL`;
+9. исполняет разрешённый tool, нормализует result и добавляет его в контекст;
+10. продолжает цикл, другую независимую работу или passive wait.
 
 Последовательность является базовой семантикой. Runtime MAY построить dependency graph и параллельно исполнить доказуемо независимые read-only calls или изолированные child Tasks. Каждый call всё равно получает отдельные policy decision, lifecycle и audit. Порядок слияния результатов должен быть стабильным.
+
+## Live steering
+
+Новый A2A Message не является interrupt текущей операции. Adapter durable-фиксирует его в inbox существующего non-terminal run; orchestrator забирает committed Messages перед следующим model turn. Если Message приходит между последним model response и terminal commit, completion gate обязан либо включить его в следующий turn, либо проиграть race уже committed terminal state и отклонить SendMessage.
+
+Каждый accepted Message сохраняет исходные `messageId`, task/context IDs, authenticated caller provenance и monotonic inbox sequence, но поступает модели как недоверенный user-role input. Несколько Messages не склеиваются в один prompt и не подменяют system/kernel instructions. Unconsumed Messages pinned при compaction и recovery. Follow-up не сбрасывает и не увеличивает hard budgets.
+
+Message возобновляет `WAITING_INPUT` или `WAITING_TASK` run. В `PAUSED`, `WAITING_AUTH` и `WAITING_LOCAL_APPROVAL` он остаётся queued до разрешённого resume, потому что remote text не может снять host pause, заменить auth flow или изменить frozen action/authority boundary.
 
 ## Reasoning
 

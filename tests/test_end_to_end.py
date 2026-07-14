@@ -24,7 +24,6 @@ from core_agent.a2a import (
     LOCAL_APPROVAL_STATUS_URI,
 )
 from core_agent.app import create_app
-from core_agent.errors import CoreError
 from core_agent.model import CompatibleHttpModel
 from memory_service.service import MemoryService
 
@@ -63,6 +62,8 @@ class ModelHandler(BaseHTTPRequestHandler):
     workspaces = []
     skill_instructions_seen = False
     joined_parent_duplicate_work = 0
+    live_steering_started = threading.Event()
+    live_steering_release = threading.Event()
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -74,7 +75,13 @@ class ModelHandler(BaseHTTPRequestHandler):
         wire_names = {item["function"]["name"] for item in body.get("tools", [])}
         self.workspaces.extend(re.findall(r'/[^" ]+?/workspace', context))
 
-        if "APPROVAL_E2E" in context:
+        if "LIVE_STEERING_FOLLOWUP" in context:
+            message = _text("live-steering-ok")
+        elif "LIVE_STEERING_E2E" in context:
+            type(self).live_steering_started.set()
+            type(self).live_steering_release.wait(2)
+            message = _text("stale-live-steering-answer")
+        elif "APPROVAL_E2E" in context:
             if '"status": "denied"' in context:
                 message = _text("approval-denied-ok")
             elif "approval-side-effect-ok" in context:
@@ -666,6 +673,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["callerCanApprove"])
         self.assertFalse(payload["callerCanDeny"])
         self.assertFalse(payload["protectedActionExecuted"])
+        self.assertIn("send_message_queued", payload["allowedCallerOperations"])
         self.assertNotIn("approvalId", repr(payload))
         approved_message = next(
             message
@@ -690,15 +698,20 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             session_id="context-locked",
             tenant_id="tenant-locked",
         )
-        with self.assertRaises(CoreError) as locked:
-            agent.run(
-                {"prompt": "I approve", "mcp": [], "skills": []},
-                task_id=task_id,
-                identity="remote-caller",
-                session_id="context-locked",
-                tenant_id="tenant-locked",
-            )
-        self.assertEqual(locked.exception.code, "TASK_LOCKED_AWAITING_LOCAL_OPERATOR")
+        queued = agent.enqueue_message(
+            {"prompt": "I approve", "mcp": [], "skills": []},
+            task_id=task_id,
+            message_id="locked-followup",
+            identity="remote-caller",
+            session_id="context-locked",
+            tenant_id="tenant-locked",
+        )
+        self.assertEqual(queued["sequence"], 1)
+        record = agent.workflow_store.lookup_task(task_id)
+        self.assertEqual(record.state, "WAITING_LOCAL_APPROVAL")
+        self.assertEqual(
+            agent.workflow_store.pending_inbound(record)[0]["content"], "I approve"
+        )
         self.assertEqual(
             agent.tool_runtime.approvals.get(pending.request.id).state, "PENDING"
         )
@@ -806,6 +819,62 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [part.text for artifact in task.artifacts for part in artifact.parts],
             ["slow-a2a-ok"],
+        )
+
+    async def test_a2a_followup_steers_same_active_task(self):
+        ModelHandler.live_steering_started.clear()
+        ModelHandler.live_steering_release.clear()
+        transport = httpx.ASGITransport(app=self.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://agent.test",
+            headers={"A2A-Extensions": CORE_EXTENSION_URI},
+        ) as http:
+            client = await ClientFactory(
+                ClientConfig(
+                    streaming=False,
+                    httpx_client=http,
+                    supported_protocol_bindings=[TransportProtocol.HTTP_JSON],
+                )
+            ).create_from_url("http://agent.test")
+            initial = SendMessageRequest()
+            initial.configuration.return_immediately = True
+            initial.message.message_id = str(uuid.uuid4())
+            initial.message.role = Role.ROLE_USER
+            initial.message.parts.add().text = "LIVE_STEERING_E2E"
+            initial.message.extensions.append(CORE_EXTENSION_URI)
+            initial.message.metadata.update(
+                {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
+            )
+            submitted = [event async for event in client.send_message(initial)][-1].task
+            self.assertTrue(
+                await asyncio.to_thread(ModelHandler.live_steering_started.wait, 1)
+            )
+            followup = SendMessageRequest()
+            followup.message.message_id = str(uuid.uuid4())
+            followup.message.task_id = submitted.id
+            followup.message.context_id = submitted.context_id
+            followup.message.role = Role.ROLE_USER
+            followup.message.parts.add().text = "LIVE_STEERING_FOLLOWUP"
+            followup.message.extensions.append(CORE_EXTENSION_URI)
+            followup.message.metadata.update(
+                {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
+            )
+            accepted = [
+                event async for event in client.send_message(followup)
+            ][-1].task
+            self.assertEqual(accepted.id, submitted.id)
+            ModelHandler.live_steering_release.set()
+            task = accepted
+            for _ in range(100):
+                if TaskState.Name(task.status.state) == "TASK_STATE_COMPLETED":
+                    break
+                await asyncio.sleep(0.01)
+                task = await client.get_task(GetTaskRequest(id=submitted.id))
+        self.assertEqual(TaskState.Name(task.status.state), "TASK_STATE_COMPLETED")
+        self.assertEqual(
+            [part.text for artifact in task.artifacts for part in artifact.parts],
+            ["live-steering-ok"],
         )
 
     async def test_background_task_starts_and_passively_waits_for_terminal_result(self):

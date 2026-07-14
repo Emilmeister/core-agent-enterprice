@@ -138,6 +138,14 @@ Extension value содержит ровно `mcp` и `skills`. Prompt наход
 - Закрытие stream не отменяет Task.
 - Main agent также использует этот lifecycle для внутренних background/subagent tasks.
 
+## Follow-up в активную Task
+
+Клиент не обязан ждать завершения Task, чтобы написать снова. Follow-up Message указывает существующий `taskId` и тот же `contextId`; A2A adapter сохраняет его в durable inbox текущего run и возвращает ту же Task. `contextId` без `taskId` начинает отдельную Task в той же conversation context.
+
+Follow-up содержит новый text turn и тот же canonical Core extension snapshot. Он не может изменить `mcp`, `skills`, EffectiveConfig, tenant, model route, policy или budgets активной Task. Повторный `messageId` идемпотентен; concurrent Messages упорядочиваются server-side sequence.
+
+Runtime добавляет принятый input в model transcript как user-role Message на ближайшей safe boundary. Уже выполняющийся model/tool call не прерывается. Перед завершением Task runtime обязан атомарно проверить, что нет более раннего непрочитанного input. После terminal state продолжение диалога создаёт новую Task в том же `contextId`.
+
 ## Результаты
 
 Основной результат Task — A2A Artifact:
@@ -160,7 +168,7 @@ Remote input и local approval имеют разные contracts:
 
 RemoteCaller не получает approval ID, exact arguments, decision schema, operator URL/token или право продолжить Task approval-сообщением. Optional owner-controlled extension сообщает только `callerActionRequired=false`, `callerCanApprove=false`, `callerCanDeny=false`, отсутствие выполненного side effect и разрешённые tracking/cancel operations.
 
-Protected action frozen и hashed внутри ServingAgent. Только private operator control plane может создать single-use reservation; execution gate повторно проверяет digest. `SendMessage` locked Task отклоняется без изменения proposal, а `CancelTask` участвует в атомарной race до reservation. Полный contract: [Local operator HITL](local-operator-hitl.md).
+Protected action frozen и hashed внутри ServingAgent. Только private operator control plane может создать single-use reservation; execution gate повторно проверяет digest. `SendMessage` locked Task сохраняется для более позднего model turn, не изменяет proposal и не является approval/cancel; `CancelTask` участвует в атомарной race до reservation. Полный contract: [Local operator HITL](local-operator-hitl.md).
 
 ## Cancellation и passive wait
 
@@ -178,6 +186,8 @@ Internal event log имеет monotonic revision/sequence. A2A status/artifact u
 - не применить stale approval/input;
 - не перепутать artifact chunks;
 - связать внешний Task с внутренним audit.
+
+Inbound Messages используют тот же принцип: `(task_id, message_id)` уникален, а committed inbox sequence задаёт порядок model delivery. Inbox append и terminal transition сериализуются так, чтобы сервер не подтвердил Message, которое Task затем потеряет.
 
 ## Terminal semantics
 
@@ -200,3 +210,4 @@ Embedded/local SDK MAY предоставить convenience `run(prompt, mcp, sk
 - Добавление optional A2A status metadata обратно совместимо.
 - Изменение смысла `mcp`/`skills`, обязательного поля или approval payload требует новой major extension version.
 - Persisted Task хранит обе versions для replay/migration.
+- Live steering использует стандартные `Message.taskId/contextId/messageId` и не меняет shape Core extension, поэтому остаётся совместимым с `v1alpha1`.

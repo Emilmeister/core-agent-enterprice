@@ -193,6 +193,12 @@ Target spec может описывать больше текущего runtime.
   через authenticated transport/platform config, а не добавляются в RunRequest.
 - A2A является внешним lifecycle. Не создавать параллельную несовместимую task
   state machine в transport или adapter.
+- Non-terminal A2A Task принимает follow-up по тому же `taskId`. Adapter durable
+  пишет его в workflow inbox; runtime доставляет отдельным user turn только на
+  safe boundary и атомарно не завершает Task, пока есть принятый unread input.
+- Follow-up не прерывает текущий model/tool call, не меняет EffectiveConfig или
+  budgets и дедуплицируется по `(task_id, message_id)`. После terminal state
+  продолжение создаёт новую Task в том же context.
 - Любая tool/side-effect/background/subagent работа принадлежит A2A Task.
   Закрытие stream не отменяет Task; critical wait/status сохраняется durable и
   восстанавливается через GetTask.
@@ -277,8 +283,10 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
   проверкой task, proposal, tenant, caller principal, tool/version, environment,
   target, semantic arguments, side-effect class, policy version и expiry.
 - Approval не заменяет повторную schema, tenant и tool-policy validation.
-- `WAITING_LOCAL_APPROVAL` проецируется в A2A как `working`; caller может только
-  наблюдать или вызвать настоящий A2A `CancelTask`.
+- `WAITING_LOCAL_APPROVAL` проецируется в A2A как `working`; caller может
+  наблюдать, поставить follow-up в durable очередь или вызвать настоящий A2A
+  `CancelTask`. Queued text не является approve/deny/cancel и не доставляется
+  модели до снятия approval lock.
 - Первый committed approve/deny/cancel transition побеждает. Cancel, committed
   до reservation, отменяет approval; после reservation Task не отменяется.
 - Expiry, deny или outage operator service оставляют side effect неисполненным;
@@ -318,8 +326,8 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
 
 - Production использует PostgreSQL и fail closed без `DATABASE_URL`, доступной
   DB и совпадающей schema version. Нет SQLite/in-memory fallback.
-- Tasks, workflow events/checkpoints, approvals/reservations, outbox и audit
-  tenant/owner-scoped и сохраняются в PostgreSQL согласованно.
+- Tasks, workflow events/checkpoints, inbound inbox, approvals/reservations,
+  outbox и audit tenant/owner-scoped и сохраняются в PostgreSQL согласованно.
 - После restart ambiguous dispatched side effect переходит в reconciliation, а
   не replay. Shared storage lock не заменяет lease: у stateful run один active
   owner.

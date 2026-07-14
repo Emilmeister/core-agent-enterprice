@@ -199,6 +199,144 @@ def make_agent(
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_live_steering_delivers_ordered_idempotent_messages_before_completion(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class SteeringModel:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, *, context, tools, instructions, messages=None):
+                self.calls.append(tuple(messages or ()))
+                if len(self.calls) == 1:
+                    started.set()
+                    self.assert_released = release.wait(2)
+                    return ModelResponse(message="stale answer")
+                return ModelResponse(message="steered answer")
+
+        model = SteeringModel()
+        agent = make_agent(model, memory="disabled")
+        result = []
+        failure = []
+
+        def run():
+            try:
+                result.append(
+                    agent.run(
+                        run_request(memory=False),
+                        task_id="steering-task",
+                        identity="owner-1",
+                        session_id="context-1",
+                        tenant_id="tenant-1",
+                    )
+                )
+            except Exception as error:
+                failure.append(error)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(started.wait(1))
+        first = agent.enqueue_message(
+            RunRequest.from_dict(
+                {"prompt": "first correction", "mcp": [], "skills": []}
+            ),
+            task_id="steering-task",
+            message_id="message-1",
+            identity="owner-1",
+            session_id="context-1",
+            tenant_id="tenant-1",
+        )
+        duplicate = agent.enqueue_message(
+            RunRequest.from_dict(
+                {"prompt": "first correction", "mcp": [], "skills": []}
+            ),
+            task_id="steering-task",
+            message_id="message-1",
+            identity="owner-1",
+            session_id="context-1",
+            tenant_id="tenant-1",
+        )
+        second = agent.enqueue_message(
+            RunRequest.from_dict(
+                {"prompt": "second correction", "mcp": [], "skills": []}
+            ),
+            task_id="steering-task",
+            message_id="message-2",
+            identity="owner-1",
+            session_id="context-1",
+            tenant_id="tenant-1",
+        )
+        self.assertEqual(first["sequence"], duplicate["sequence"])
+        self.assertEqual((first["sequence"], second["sequence"]), (1, 2))
+        with self.assertRaises(CoreError) as wrong_context:
+            agent.enqueue_message(
+                RunRequest.from_dict(
+                    {"prompt": "wrong context", "mcp": [], "skills": []}
+                ),
+                task_id="steering-task",
+                message_id="message-wrong-context",
+                identity="owner-1",
+                session_id="context-2",
+                tenant_id="tenant-1",
+            )
+        self.assertEqual(wrong_context.exception.code, "INVALID_REQUEST")
+        with self.assertRaises(CoreError) as wrong_owner:
+            agent.enqueue_message(
+                RunRequest.from_dict(
+                    {"prompt": "wrong owner", "mcp": [], "skills": []}
+                ),
+                task_id="steering-task",
+                message_id="message-wrong-owner",
+                identity="owner-2",
+                session_id="context-1",
+                tenant_id="tenant-1",
+            )
+        self.assertEqual(wrong_owner.exception.code, "TASK_NOT_FOUND")
+        with self.assertRaises(CoreError) as changed_capabilities:
+            agent.enqueue_message(
+                RunRequest.from_dict(
+                    {
+                        "prompt": "change capabilities",
+                        "mcp": [],
+                        "skills": [{"name": "new-skill"}],
+                    }
+                ),
+                task_id="steering-task",
+                message_id="message-new-capability",
+                identity="owner-1",
+                session_id="context-1",
+                tenant_id="tenant-1",
+            )
+        self.assertEqual(changed_capabilities.exception.code, "INVALID_REQUEST")
+        release.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failure, [])
+        self.assertEqual(result[0].message, "steered answer")
+        self.assertTrue(model.assert_released)
+        self.assertEqual(
+            [
+                message["content"]
+                for message in model.calls[1]
+                if message.get("role") == "user"
+            ],
+            ["Do it", "first correction", "second correction"],
+        )
+        with self.assertRaises(CoreError) as terminal:
+            agent.enqueue_message(
+                RunRequest.from_dict(
+                    {"prompt": "too late", "mcp": [], "skills": []}
+                ),
+                task_id="steering-task",
+                message_id="message-3",
+                identity="owner-1",
+                session_id="context-1",
+                tenant_id="tenant-1",
+            )
+        self.assertEqual(terminal.exception.code, "TASK_TERMINAL")
+        agent.close()
+
     def test_invalid_request_fails_before_model_or_tools(self):
         model = ScriptedModel([ModelResponse(message="should not run")])
         agent = make_agent(model)

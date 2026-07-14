@@ -15,6 +15,7 @@
 | A2A-01 | Agent Card, Core extension и version negotiation | `test_a2a_config`, `test_advanced_protocols` | implemented |
 | A2A-02 | send/stream/get/list/subscribe/cancel используют одну durable Task | `test_end_to_end`, PostgreSQL A2A reconciliation | implemented |
 | A2A-03 | push notification at-least-once и deduplication | encrypted push retry/restart integration | implemented |
+| A2A-04 | active Task принимает durable/idempotent follow-up Messages и доставляет их model loop на safe boundary без completion race | runtime concurrency, A2A HTTP E2E и PostgreSQL inbox/completion-gate tests | implemented |
 | CFG-01 | Platform/Agent/Run разделены, capability intersection fail closed | effective-config contract suite | implemented |
 | CFG-02 | disabled capability отсутствует в card/catalog и stale call denied | built-in allowlist/runtime-mode card and model tests | implemented |
 | KRN-01 | versioned kernel отдельно от profile, runtime enforcement | protected kernel persistence test | implemented |
