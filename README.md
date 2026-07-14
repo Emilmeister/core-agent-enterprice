@@ -71,7 +71,7 @@ configuration. Generate it with
 `LOCAL_WORKSPACE_ROOT` must be a separate local ephemeral path used by active processes.
 `CORE_AGENT_RUNTIME_MODE=with_terminal` enables the full local execution profile.
 `CORE_AGENT_RUNTIME_MODE=without_terminal` removes `core.terminal.exec` and `core.task.start` from
-both the Agent Card and model catalog while retaining task lifecycle, delegation, artifact, MCP,
+both the Agent Card and model catalog while retaining task lifecycle, delegation, MCP,
 memory, and Python tools. `core.python.exec` is available in either mode when
 `LOCAL_APPROVAL_ENABLED=false`; Python code receives bounded `tools.call(...)` access to the same
 effective built-in/MCP catalog. Python may still use standard-library OS/process APIs, so
@@ -80,8 +80,10 @@ effective built-in/MCP catalog. Python may still use standard-library OS/process
 selected runtime mode or bypass the HITL gate.
 `CORE_AGENT_MAX_DEPTH` may lower delegation depth to `0` or `1`; `2` is the hard maximum, allowing
 main → child → grandchild while rejecting any further delegation.
-Final A2A results and `core.artifact.put` content are stored as tenant-scoped, digest-verified blobs
-with PostgreSQL metadata. `ARTIFACT_MAX_BYTES` bounds each stored artifact.
+The model has no artifact storage tools: child agents return ordinary text results. The A2A adapter
+stores each final result as a tenant-scoped, digest-verified Task Artifact with PostgreSQL metadata;
+`ARTIFACT_MAX_BYTES` bounds that transport-level result. Remove retired `core.artifact.put` and
+`core.artifact.get` names from an existing `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` value before startup.
 
 OpenAI-compatible API (OpenAI, vLLM, Ollama, LM Studio, OpenRouter, or another compatible gateway):
 

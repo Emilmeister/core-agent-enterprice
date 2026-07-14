@@ -28,7 +28,7 @@ from .kernel import KernelCompiler
 from .python_exec import execute_python
 from .security import redact
 from .tasks import DelegationContract
-from .tools import ToolCall, ToolDefinition, ToolResult, validate_json_schema
+from .tools import ToolCall, ToolDefinition, ToolResult
 from .workflow import InMemoryWorkflowStore, WorkflowRecord
 
 
@@ -180,8 +180,6 @@ class CoreAgent:
                 "core.task.cancel": self._task_cancel,
                 "core.python.exec": self._python_exec,
                 "core.delegate": self._delegate,
-                "core.artifact.put": self._artifact_put,
-                "core.artifact.get": self._artifact_get,
             }
         )
         if self.depth == 0 and hasattr(self.task_scheduler, "register"):
@@ -1680,29 +1678,6 @@ class CoreAgent:
         )
         return value
 
-    def _artifact_put(self, arguments, run_id):
-        if self.artifact_store is None:
-            raise CoreError("CAPABILITY_DISABLED")
-        scope = self._run_scopes.get(run_id, {})
-        artifact = self.artifact_store.put(
-            scope.get("tenant_id", "default"),
-            arguments["content"].encode(),
-            media_type=arguments["media_type"],
-            provenance={"run_id": run_id, "task_id": scope.get("task_id")},
-        )
-        return asdict(artifact)
-
-    def _artifact_get(self, arguments, run_id):
-        if self.artifact_store is None:
-            raise CoreError("CAPABILITY_DISABLED")
-        tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
-        artifact, content = self.artifact_store.get(tenant_id, arguments["artifact_id"])
-        try:
-            text = content.decode()
-        except UnicodeDecodeError:
-            raise CoreError("CONTENT_TYPE_NOT_SUPPORTED") from None
-        return {**asdict(artifact), "content": text}
-
     def _recover_background_tool(self, contract, cancel_event):
         if cancel_event.is_set():
             return None
@@ -1837,26 +1812,8 @@ class CoreAgent:
         )
         child = self._child_agent(child_raw, child_tools)
         child_task_id = str(uuid.uuid4())
-        result_schema = None
-        if contract.result_schema:
-            if self.artifact_store is None:
-                raise CoreError("CAPABILITY_DISABLED")
-            schema_id = contract.result_schema.removeprefix("artifact://")
-            _metadata, schema_content = self.artifact_store.get(
-                scope.get("tenant_id", "default"), schema_id
-            )
-            try:
-                result_schema = json.loads(schema_content)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise CoreError("INVALID_REQUEST") from None
         child_request = {
-            "prompt": contract.instruction
-            + (
-                "\nReturn only JSON conforming to this result schema:\n"
-                + json.dumps(result_schema, sort_keys=True)
-                if result_schema
-                else ""
-            ),
+            "prompt": contract.instruction,
             "mcp": [
                 declaration
                 for declaration in request.mcp
@@ -1876,7 +1833,7 @@ class CoreAgent:
             "parent_run_id": run_id,
         }
         task = self.task_scheduler.start(
-            lambda: self._run_child(child, child_request, child_scope, result_schema),
+            lambda: child.run(child_request, **child_scope),
             owner_id=run_id,
             required=True,
             kind="subagent",
@@ -1885,7 +1842,6 @@ class CoreAgent:
                 "agent_config": child_raw,
                 "tools": list(child_tools),
                 "scope": child_scope,
-                "result_schema": result_schema,
             },
             recoverable=True,
             tenant_id=scope.get("tenant_id", "default"),
@@ -1950,30 +1906,13 @@ class CoreAgent:
         )
         return child
 
-    @staticmethod
-    def _run_child(child, request, scope, result_schema):
-        result = child.run(request, **scope)
-        if result_schema:
-            try:
-                value = json.loads(result.message)
-            except json.JSONDecodeError:
-                raise CoreError("CHILD_RESULT_INVALID") from None
-            if not validate_json_schema(result_schema, value):
-                raise CoreError("CHILD_RESULT_INVALID")
-        return result
-
     def _recover_subagent(self, contract, cancel_event):
         if cancel_event.is_set():
             return None
         child = self._child_agent(
             copy.deepcopy(contract["agent_config"]), tuple(contract["tools"])
         )
-        return self._run_child(
-            child,
-            dict(contract["request"]),
-            dict(contract["scope"]),
-            contract.get("result_schema"),
-        )
+        return child.run(dict(contract["request"]), **dict(contract["scope"]))
 
     def run(
         self,

@@ -106,7 +106,7 @@ Production deployment MUST задавать `DURABLE_STORAGE_ROOT` как пут
 Deployment MUST выбрать один из двух capability-профилей через `CORE_AGENT_RUNTIME_MODE`:
 
 - `with_terminal` — разрешает `core.terminal.exec` и `core.task.start`;
-- `without_terminal` — удаляет `core.terminal.exec` и `core.task.start`, но сохраняет task lifecycle (`get`, `list`, `wait`, `cancel`), delegation, artifacts, MCP, memory и Python.
+- `without_terminal` — удаляет `core.terminal.exec` и `core.task.start`, но сохраняет task lifecycle (`get`, `list`, `wait`, `cancel`), delegation, MCP, memory и Python.
 
 В обоих профилях `core.python.exec` дополнительно разрешён только при `approval.local_operator.enabled: false`.
 

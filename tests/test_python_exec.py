@@ -16,7 +16,7 @@ class PythonExecTests(unittest.TestCase):
             "LOCAL_APPROVAL_ENABLED": "false",
             "CORE_AGENT_RUNTIME_MODE": "without_terminal",
             "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
-                "core.python.exec,core.artifact.put"
+                "core.python.exec,core.task.list"
             ),
             "CORE_AGENT_ALLOWED_MCP_SERVERS": "memory",
             "CORE_AGENT_ALLOWED_MCP_TOOLS": "memory.search",
@@ -27,11 +27,8 @@ class PythonExecTests(unittest.TestCase):
     def test_python_calls_builtin_and_mcp_through_the_parent_broker(self):
         code = """
 memory = tools.call("memory.search", {"query": "Alice"})
-artifact = tools.call(
-    "core.artifact.put",
-    {"content": memory["answer"], "media_type": "text/plain"},
-)
-print(memory["answer"], artifact["id"], sorted(tools.names))
+tasks = tools.call("core.task.list", {})
+print(memory["answer"], len(tasks), sorted(tools.names))
 """
         model = ScriptedModel(
             [
@@ -82,8 +79,8 @@ print(memory["answer"], artifact["id"], sorted(tools.names))
             self.assertIn("datetime.now().astimezone()", model.calls[0].instructions)
             self.assertNotIn("core.terminal.exec", model.calls[0].tools)
             self.assertNotIn("core.task.start", model.calls[0].tools)
-            self.assertIn("Alice sha256:", model.calls[1].context)
-            self.assertIn("core.artifact.put", model.calls[1].context)
+            self.assertIn("Alice 0", model.calls[1].context)
+            self.assertIn("core.task.list", model.calls[1].context)
             audit = app.state.core_agent.audit_log.records(result.run_id)
             nested = [
                 item
@@ -95,15 +92,15 @@ print(memory["answer"], artifact["id"], sorted(tools.names))
                 [
                     ("tool.execution.started", "memory.search"),
                     ("tool.execution.succeeded", "memory.search"),
-                    ("tool.execution.started", "core.artifact.put"),
-                    ("tool.execution.succeeded", "core.artifact.put"),
+                    ("tool.execution.started", "core.task.list"),
+                    ("tool.execution.succeeded", "core.task.list"),
                 ],
             )
             spans = app.state.core_agent.telemetry.exporter.spans
             tool_spans = [span for span in spans if span.name == "core_agent.tool.execute"]
             names = {span.attributes.get("tool.name") for span in tool_spans}
             self.assertTrue(
-                {"core.python.exec", "memory.search", "core.artifact.put"} <= names
+                {"core.python.exec", "memory.search", "core.task.list"} <= names
             )
             traces = {
                 span.context.trace_id

@@ -1,7 +1,6 @@
 import threading
 import unittest
 from dataclasses import replace
-from types import SimpleNamespace
 
 from core_agent.approvals import ApproveAllControlPlane
 from core_agent.errors import CoreError
@@ -28,7 +27,6 @@ from core_agent.tools import (
     ToolResult,
     ToolRuntime,
 )
-from core_agent.runtime import CoreAgent
 
 
 class RecordingBackend:
@@ -206,7 +204,6 @@ class DelegationTests(unittest.TestCase):
             "mcp": {"repo": ["search"], "memory": ["search", "read", "update"]},
             "skills": ["database-review"],
             "budget": {"turns": 20, "tool_calls": 40},
-            "result_schema": "artifact://schemas/review.json",
         }
         raw.update(changes)
         return DelegationContract.from_dict(raw)
@@ -243,7 +240,7 @@ class DelegationTests(unittest.TestCase):
                     derive_child_capabilities(self.parent, contract, current_depth=0)
                 self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
 
-    def test_delegate_contract_rejects_ambiguous_budget_and_inline_schema(self):
+    def test_delegate_contract_rejects_ambiguous_budget_and_unknown_fields(self):
         for changes in (
             {"budget": {"max_steps": 3}},
             {"result_schema": '{"type":"object"}'},
@@ -325,27 +322,6 @@ class DelegationTests(unittest.TestCase):
         with self.assertRaises(CoreError) as caught:
             derive_child_capabilities(uncapped, self.contract(), current_depth=2)
         self.assertEqual(caught.exception.code, "BUDGET_EXCEEDED")
-
-    def test_child_result_must_match_declared_schema(self):
-        class Child:
-            def __init__(self, message):
-                self.message = message
-
-            def run(self, _request, **_scope):
-                return SimpleNamespace(message=self.message)
-
-        schema = {
-            "type": "object",
-            "properties": {"ok": {"type": "string"}},
-            "required": ["ok"],
-            "additionalProperties": False,
-        }
-        result = CoreAgent._run_child(Child('{"ok":"yes"}'), {}, {}, schema)
-        self.assertEqual(result.message, '{"ok":"yes"}')
-        with self.assertRaises(CoreError) as caught:
-            CoreAgent._run_child(Child('{"wrong":true}'), {}, {}, schema)
-        self.assertEqual(caught.exception.code, "CHILD_RESULT_INVALID")
-
 
 class ToolRuntimeTests(unittest.TestCase):
     def setUp(self):

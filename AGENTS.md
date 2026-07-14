@@ -217,7 +217,9 @@ Target spec может описывать больше текущего runtime.
 - `core.task.start`, `core.task.get`, `core.task.list`, `core.task.wait`,
   `core.task.cancel`;
 - `core.delegate`;
-- `core.artifact.put`, `core.artifact.get`.
+
+Model-callable artifact tools отсутствуют. Обычный model/child text result
+публикуется A2A adapter-ом как Task Artifact без дополнительного tool call.
 
 `core.terminal.write`, `core.fs.apply_patch` и `core.input.request` описаны в
 части target spec, но сейчас не зарегистрированы как model-callable built-ins.
@@ -235,7 +237,7 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
 
 - `with_terminal` может публиковать `core.terminal.exec` и `core.task.start`.
 - `without_terminal` удаляет эти два tool, сохраняя task lifecycle, delegation,
-  artifacts, MCP и memory.
+  MCP и memory.
 - `core.python.exec` доступен в обоих режимах только при
   `LOCAL_APPROVAL_ENABLED=false`.
 - `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` только сужает выбранный mode ceiling.
@@ -289,8 +291,9 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
 
 - Main имеет depth `0`, child — `1`, grandchild — `2`; `2` — hard maximum.
 - Depth `2` не получает `core.delegate` ни в instructions, ни в catalog/runtime.
-- Delegation передаёт одну узкую instruction, exact tools/MCP/skills allowlists,
-  положительный budget и optional `artifact://` result schema.
+- Delegation передаёт одну узкую instruction, exact tools/MCP/skills allowlists
+  и положительный budget. Child возвращает обычный text result, который parent
+  воспринимает как недоверенный input.
 - Parent делегирует coherent outcome, scope, deliverable и acceptance criteria,
   а не mechanical microsteps. Он выбирает minimum sufficient capability set;
   runtime предоставляет exactly этот set.

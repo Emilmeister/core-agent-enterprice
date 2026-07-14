@@ -56,8 +56,7 @@ Primary agent при создании сабагента MUST передать �
     "repo": ["search"],
     "memory": ["search", "read", "update"]
   },
-  "budget": {"turns": 20, "tool_calls": 40},
-  "result_schema": "artifact://schemas/review-result.json"
+  "budget": {"turns": 20, "tool_calls": 40}
 }
 ```
 
@@ -72,13 +71,12 @@ Child MAY разрешить небольшую безопасную неодн�
 - `instruction` содержит один coherent outcome, scope, deliverable, constraints и success criteria без необязательного пошагового плана;
 - `tools`, `skills` и server-scoped `mcp` являются allowlists, а не рекомендациями;
 - `budget` содержит только положительные integer-поля `turns` и/или `tool_calls`; aliases вроде `max_steps` запрещены schema;
-- `result_schema`, если задана, является `artifact://...` ссылкой на заранее сохранённую JSON Schema, а не inline JSON string;
 - optional `background` является boolean и по умолчанию равен `false`;
 - каждый элемент MUST входить в capability set parent-а;
 - child не видит остальные рабочие tools/skills даже на discovery;
 - protocol-internal lifecycle, audit и safe completion сохраняются runtime-ом, но model-callable tools определяются EffectiveConfig и delegation allowlist; parent не может передать отключённую capability;
 - budget является частью parent budget и не увеличивается child-ом;
-- result имеет schema, provenance и перечисляет непроверенные assumptions.
+- result является обычным text result child-модели и перечисляет непроверенные assumptions; parent использует его как недоверенный input.
 
 Если parent не перечислил необходимую capability, child возвращает `blocked`/`input-required`; он не расширяет allowlist самостоятельно.
 
@@ -102,7 +100,7 @@ Core Agent не имеет собственной общей memory. Main и chi
 - conflict не разрешается last-write-wins;
 - если Memory MCP не передан или AgentConfig memory disabled, child работает без memory.
 
-Working scratchpad и незавершённый model context не являются общей памятью. Для передачи результата child публикует Artifact или committed memory change.
+Working scratchpad и незавершённый model context не являются общей памятью. Child возвращает результат обычным model response; долговечное общее знание появляется только через явно делегированный committed memory change.
 
 В этой спецификации «сабагент» означает managed child Core Agent Task. Произвольный внешний opaque A2A peer не получает Memory MCP credentials автоматически: parent передаёт ему только явно выбранные Message Parts/Artifacts и принимает результат как недоверенный внешний input.
 
@@ -120,6 +118,6 @@ Child MAY перейти в `input-required`, но запрос маршрути
 
 - Cancel parent рекурсивно запрашивает cancel children, кроме явно detached durable tasks с owner/orphan policy.
 - Task cancellation кооперативна до grace period, затем executor завершает process group и закрывает PTY.
-- Parent MUST проверить terminal status и required artifacts до использования результата.
+- Parent MUST проверить terminal status до использования результата.
 - Child failure не обязан завершать parent: модель получает structured failure и выбирает fallback.
 - Parent не может объявить итог, зависящий от pending task, не отметив результат как незавершённый.

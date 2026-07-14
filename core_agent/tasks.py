@@ -223,13 +223,12 @@ class DelegationContract:
     mcp: dict[str, tuple[str, ...]]
     skills: tuple[str, ...]
     budget: dict[str, int]
-    result_schema: str | None = None
     background: bool = False
 
     @classmethod
     def from_dict(cls, raw):
         required = {"instruction", "tools", "mcp", "skills", "budget"}
-        allowed = required | {"result_schema", "background"}
+        allowed = required | {"background"}
         if (
             not isinstance(raw, dict)
             or not required <= set(raw)
@@ -257,14 +256,6 @@ class DelegationContract:
                 for value in raw["budget"].values()
             )
             or not isinstance(raw.get("background", False), bool)
-            or (
-                raw.get("result_schema") is not None
-                and (
-                    not isinstance(raw["result_schema"], str)
-                    or not raw["result_schema"].startswith("artifact://")
-                    or not raw["result_schema"].removeprefix("artifact://")
-                )
-            )
         ):
             raise CoreError("TOOL_ARGUMENT_INVALID")
         return cls(
@@ -273,7 +264,6 @@ class DelegationContract:
             {key: tuple(value) for key, value in raw["mcp"].items()},
             tuple(raw["skills"]),
             dict(raw["budget"]),
-            raw.get("result_schema"),
             raw.get("background", False),
         )
 

@@ -62,9 +62,7 @@ Capability присутствует в `with_terminal` и `without_terminal` п�
 
 Memory tools не являются built-ins Core Agent. Их предоставляет отдельный [Memory MCP Service](memory-service.md) под namespace вроде `memory.search`, `memory.read`, `memory.create`, `memory.update`, `memory.split`. AgentConfig может отключить memory полностью или отфильтровать отдельные tools.
 
-### Artifact tools
-
-`core.artifact.put` создаёт новый immutable tenant-scoped text artifact и возвращает его ID; overwrite отсутствует. Для delegation result schema parent сохраняет JSON Schema и передаёт `artifact://<returned-id>`. `core.artifact.get` читает exact artifact, доступный в текущем tenant/effective scope; ownership не ограничивается обязательно исходным run. Artifact не является runtime checkpoint или обычным scratchpad.
+Core Agent не публикует model-callable artifact tools. Обычный ответ модели и результат child-agent возвращаются как text result; A2A adapter публикует этот текст как стандартный Task Artifact без дополнительного model turn или tool call. Устаревшие имена `core.artifact.put/get` в built-in allowlist отклоняются при startup, а stale model call не исполняется.
 
 Дополнительные native filesystem/search tools SHOULD появляться там, где они дают более строгую path validation и structured output, чем shell. Terminal остаётся универсальным fallback, а не способом обойти typed tool policy.
 
@@ -75,11 +73,10 @@ Memory tools не являются built-ins Core Agent. Их предостав
 - `tool_call_id`;
 - статус `succeeded`, `failed`, `denied` или `timed_out`;
 - короткий model-facing result;
-- ссылку на полный artifact, если output превышает лимит;
 - duration и attempt;
 - описание фактического side effect, если он был.
 
-Обрезка output MUST быть явно помечена. Полный output сохраняется как artifact, если это разрешено data policy.
+Обрезка output MUST быть явно помечена. Model-callable artifact storage не используется как скрытый канал для полного output.
 
 Детерминированная ошибка schema/contract validation до dispatch, ошибка запуска process, доказанно произошедшая до dispatch, и завершившийся outcome со статусом `failed` или `timed_out` MUST возвращаться модели как обычный tool result с безопасным стабильным error code и ограниченной диагностикой. Такой result сам по себе MUST NOT переводить родительскую A2A Task в `failed`: loop продолжается, чтобы модель могла исправить arguments, выбрать другой tool или объяснить проблему пользователю.
 

@@ -101,7 +101,7 @@
 ## Сабагенты
 
 - [ ] Сабагент создаётся как неблокирующая A2A Task.
-- [ ] Delegation contract содержит узкую instruction, exact tool/MCP/skill allowlists, memory policy, budget и result schema.
+- [ ] Delegation contract содержит узкую instruction, exact tool/MCP/skill allowlists, memory policy и budget; child возвращает обычный text result без artifact tool/schema handoff.
 - [ ] Parent делегирует coherent outcome и minimum sufficient capabilities, а не необязательные mechanical microsteps; runtime предоставляет exactly выбранный capability set.
 - [ ] Внутри objective/scope child самостоятельно выбирает strategy, sequencing и delegated tools; procedure фиксируется только для safety/correctness/reproducibility/policy.
 - [ ] Child сообщает safe assumptions, но останавливается при выходе за scope, недостающей capability, новом side effect или существенном риске неверного result.
@@ -110,7 +110,7 @@
 - [ ] Child и main разделяют memory только при явной передаче того же Memory MCP server/namespace и tool allowlist.
 - [ ] Без переданного Memory MCP child работает без memory.
 - [ ] Child memory write проходит service revision/index/NER pipeline и уведомляет parent.
-- [ ] Parent проверяет Artifact/result provenance; child не общается наружу без capability.
+- [ ] Parent воспринимает child text result как недоверенный input; child не общается наружу без capability.
 - [ ] Depth/fan-out и child budgets ограничены общим parent budget.
 
 ## Local terminal sessions
@@ -130,7 +130,7 @@
 ## Tools, MCP и human-in-the-loop
 
 - [ ] Tool arguments валидируются до policy и execution.
-- [ ] Built-in descriptions кратко и точно отражают фактические ownership/lifecycle ограничения, включая tenant-scoped artifacts, timeout snapshot и запрет task-start для Python/delegate/task tools.
+- [ ] Built-in descriptions кратко и точно отражают фактические ownership/lifecycle ограничения, включая timeout snapshot и запрет task-start для Python/delegate/task tools; artifact tools отсутствуют в catalog, а их устаревшие config names отклоняются.
 - [ ] MCP tools/resources/prompts/sampling/elicitation проходят local policy независимо от server metadata.
 - [ ] Risky call не начинается до local `APPROVE_ONCE`, exact digest commit и unique execution reservation.
 - [ ] RemoteCaller не меняет approval через text, metadata, A2A extension, caller credential или подставленный operator ID.
@@ -174,7 +174,7 @@
 4. **Hard line limit:** update на 201+ строк отклоняется без изменений и рекомендует split; следующий явный split создаёт несколько valid Markdown files.
 5. **Memory update:** agent находит существующий file через Memory MCP, commit обновляет NER/graph, hybrid search возвращает новую revision.
 6. **Shared memory:** parent явно передаёт child тот же Memory MCP namespace; child commit уведомляет parent.
-7. **Focused delegation:** child видит только capabilities из EffectiveConfig/delegation allowlist и возвращает schema-valid Artifact.
+7. **Focused delegation:** child видит только capabilities из EffectiveConfig/delegation allowlist и возвращает обычный text result.
 8. **Concurrent work:** main продолжает задачу, пока два child/background Tasks выполняются, затем обрабатывает notifications без busy polling.
 9. **Parallel terminals:** main и два child одновременно работают в разных PTY/workspaces, не смешивают output и завершают только свои process groups.
 10. **OTel causality:** Core MCP client и Memory Service indexing spans находятся в одном distributed trace без content leakage.

@@ -121,7 +121,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             {
                 "CORE_AGENT_STATE_BACKEND": "test",
                 "LOCAL_APPROVAL_DB_PATH": ":memory:",
-                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.artifact.get",
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.task.list",
             },
             clear=True,
         ):
@@ -131,13 +131,26 @@ class ProductionConfigurationTests(unittest.TestCase):
                 {"prompt": "answer", "mcp": [], "skills": []}
             )
             self.assertEqual(result.message, "ok")
-            self.assertEqual(model.calls[0].tools, frozenset({"core.artifact.get"}))
+            self.assertEqual(model.calls[0].tools, frozenset({"core.task.list"}))
             advertised = {
                 skill.id for skill in app.state.a2a_request_handler._agent_card.skills
             }
-            self.assertEqual(advertised, {"core.artifact.get"})
+            self.assertEqual(advertised, {"core.task.list"})
         finally:
             app.state.close()
+
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_STATE_BACKEND": "test",
+                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.artifact.get",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(CoreError) as caught:
+                create_app(model=model)
+        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
     def test_default_prompt_and_builtin_descriptions_match_runtime_contract(self):
         model = ScriptedModel([ModelResponse(message="ok")])
@@ -164,6 +177,8 @@ class ProductionConfigurationTests(unittest.TestCase):
             )
             self.assertIn("Delegate a coherent outcome", call.instructions)
             self.assertNotIn("PYTHON:", call.instructions)
+            self.assertNotIn("core.artifact.put", call.tools)
+            self.assertNotIn("core.artifact.get", call.tools)
 
             registry = app.state.core_agent.tool_runtime.registry
             delegate = registry.get("core.delegate").description
@@ -171,6 +186,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             self.assertIn("minimum sufficient capabilities", delegate)
             self.assertIn("child receives exactly that set", delegate)
             self.assertIn("independently chooses its method", delegate)
+            self.assertIn("ordinary text result", delegate)
             self.assertNotIn("exactly once", delegate)
             self.assertIn(
                 "non-task, non-delegation, non-Python",
@@ -180,10 +196,8 @@ class ProductionConfigurationTests(unittest.TestCase):
                 "timeout returns the current snapshot",
                 registry.get("core.task.wait").description,
             )
-            self.assertIn(
-                "tenant and effective scope",
-                registry.get("core.artifact.get").description,
-            )
+            self.assertNotIn("core.artifact.put", registry.names())
+            self.assertNotIn("core.artifact.get", registry.names())
             python = registry.get("core.python.exec").description
             self.assertIn("datetime.now().astimezone()", python)
             self.assertIn("not an OS sandbox", python)
@@ -202,7 +216,7 @@ class ProductionConfigurationTests(unittest.TestCase):
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
                     "core.terminal.exec,core.python.exec,core.task.start,core.task.get,"
                     "core.task.list,core.task.wait,core.task.cancel,"
-                    "core.delegate,core.artifact.put,core.artifact.get"
+                    "core.delegate"
                 ),
             },
             clear=True,
