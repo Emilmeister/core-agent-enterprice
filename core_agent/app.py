@@ -113,6 +113,7 @@ def _model():
         anthropic_version=os.getenv("ANTHROPIC_VERSION", "2023-06-01"),
         context_window=int(os.getenv("MODEL_CONTEXT_WINDOW", "128000")),
         token_chars=int(os.getenv("MODEL_TOKEN_CHARS", "3")),
+        reasoning_effort=os.getenv("MODEL_REASONING_EFFORT") or None,
     )
 
 

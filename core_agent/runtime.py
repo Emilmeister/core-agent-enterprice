@@ -223,7 +223,12 @@ class CoreAgent:
                 )
             payload = self._bounded_log_value(payload)
             cleaned = redact(payload, (getattr(self.model, "api_key", None),))
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "reasoning_tokens",
+                "total_tokens",
+            ):
                 if isinstance(payload.get(key), int) and not isinstance(
                     payload[key], bool
                 ):
@@ -327,11 +332,21 @@ class CoreAgent:
         )
 
     def _llm_input_attributes(self, *, model, messages, instructions, tools, session_id):
+        messages = [
+            {key: value for key, value in message.items() if key != "reasoning_replay"}
+            for message in messages
+        ]
         messages = self._safe_telemetry(
             [{"role": "system", "content": instructions}, *messages]
         )
         invocation_parameters = {"model": model}
-        invocation_parameters.update(getattr(self.model, "extra_body", {}))
+        invocation_parameters.update(
+            getattr(
+                self.model,
+                "invocation_parameters",
+                getattr(self.model, "extra_body", {}),
+            )
+        )
         if getattr(self.model, "api_format", None) == "anthropic":
             invocation_parameters["max_tokens"] = getattr(
                 self.model, "max_tokens", None
@@ -381,10 +396,32 @@ class CoreAgent:
     def _llm_output_attributes(self, response):
         message = {"role": "assistant"}
         attributes = {"llm.output_messages.0.message.role": "assistant"}
+        content_index = 0
+        if response.reasoning:
+            reasoning = self._safe_telemetry(
+                self._bounded_log_value(response.reasoning)
+            )
+            message["contents"] = [{"type": "reasoning", "text": reasoning}]
+            prefix = (
+                "llm.output_messages.0.message.contents.0.message_content"
+            )
+            attributes[f"{prefix}.type"] = "reasoning"
+            attributes[f"{prefix}.text"] = reasoning
+            content_index = 1
         if response.message is not None:
             public_message = self._safe_telemetry(response.message)
             message["content"] = public_message
             attributes["llm.output_messages.0.message.content"] = public_message
+            if response.reasoning:
+                message["contents"].append(
+                    {"type": "text", "text": public_message}
+                )
+                prefix = (
+                    "llm.output_messages.0.message.contents."
+                    f"{content_index}.message_content"
+                )
+                attributes[f"{prefix}.type"] = "text"
+                attributes[f"{prefix}.text"] = public_message
         if response.tool_requests:
             message["tool_calls"] = []
             for index, call in enumerate(response.tool_requests):
@@ -404,6 +441,9 @@ class CoreAgent:
         token_attributes = {
             "llm.token_count.prompt": response.prompt_tokens,
             "llm.token_count.completion": response.completion_tokens,
+            "llm.token_count.completion_details.reasoning": (
+                response.reasoning_tokens
+            ),
             "llm.token_count.total": response.total_tokens,
             "gen_ai.usage.input_tokens": response.prompt_tokens,
             "gen_ai.usage.output_tokens": response.completion_tokens,
@@ -443,6 +483,7 @@ class CoreAgent:
                 for item in response.tool_requests
             ],
             "continue_reasoning": response.continue_reasoning,
+            "reasoning_replay": response.reasoning_replay,
         }
 
     @staticmethod
@@ -451,9 +492,20 @@ class CoreAgent:
         known_tool_calls = set()
         for item in context.active:
             if item.kind == "assistant_tool_calls":
-                calls = json.loads(item.content)
+                payload = json.loads(item.content)
+                if isinstance(payload, list):
+                    calls = payload
+                    reasoning_replay = item.provider_replay
+                else:
+                    calls = payload["tool_calls"]
+                    reasoning_replay = (
+                        item.provider_replay or payload.get("reasoning_replay")
+                    )
                 known_tool_calls.update(call["id"] for call in calls)
-                messages.append({"role": "assistant", "tool_calls": calls})
+                message = {"role": "assistant", "tool_calls": calls}
+                if reasoning_replay:
+                    message["reasoning_replay"] = reasoning_replay
+                messages.append(message)
                 continue
             if item.kind == "tool_result":
                 result = json.loads(item.content)
@@ -738,9 +790,23 @@ class CoreAgent:
         content = json.dumps(
             calls, sort_keys=True, separators=(",", ":"), default=str
         )
+        provider_replay = response.get("reasoning_replay")
+        tokens = self.token_counter(content)
+        if provider_replay:
+            tokens += self.token_counter(
+                json.dumps(
+                    provider_replay,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            )
         context = self._context_from_dict(snapshot["context"])
         item = ContextItem(
-            "assistant_tool_calls", content, self.token_counter(content)
+            "assistant_tool_calls",
+            content,
+            tokens,
+            provider_replay=provider_replay,
         )
         context = ContextState(
             context.active + (item,),
@@ -1241,11 +1307,17 @@ class CoreAgent:
                         prompt_tokens=response.prompt_tokens,
                         completion_tokens=response.completion_tokens,
                         total_tokens=response.total_tokens,
-                        reasoning_private=bool(response.reasoning),
+                        reasoning_available=bool(response.reasoning),
+                        reasoning_tokens=response.reasoning_tokens,
                         tool_calls=tool_calls,
                         **(
                             {"response": response.message}
                             if self.log_content and response.message is not None
+                            else {}
+                        ),
+                        **(
+                            {"reasoning": response.reasoning}
+                            if self.log_content and response.reasoning
                             else {}
                         ),
                     )

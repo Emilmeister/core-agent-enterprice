@@ -92,6 +92,7 @@ MODEL_API_FORMAT=openai \
 MODEL_BASE_URL=https://your-provider.example/v1 \
 MODEL_NAME=your-model \
 MODEL_API_KEY=your-key \
+MODEL_REASONING_EFFORT=high \
 uv run core-agent
 ```
 
@@ -102,8 +103,14 @@ MODEL_API_FORMAT=anthropic \
 MODEL_BASE_URL=https://api.anthropic.com/v1 \
 MODEL_NAME=your-model \
 MODEL_API_KEY=your-key \
+MODEL_REASONING_EFFORT=high \
 uv run core-agent
 ```
+
+`MODEL_REASONING_EFFORT` is optional; an empty value keeps the provider default. Supported values
+use the provider-neutral vocabulary `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`,
+but each provider/model may accept only a subset. OpenAI-compatible requests use
+`reasoning_effort`; Anthropic requests use adaptive thinking and `output_config.effort`.
 
 Production Memory MCP uses its own process and storage mount; Core only receives its MCP
 descriptor. Development can use the deterministic local adapters with `uv run core-agent-memory`.
@@ -165,8 +172,9 @@ The local Compose profile enables bounded, redacted content logging with
 `CORE_AGENT_LOG_CONTENT=true`, so each JSON line shows task transitions, model action states, tool
 names and arguments/results, approvals, subagent/background-task activity, and the public final
 answer. Set it to `false` for the production-safe metadata-only profile. `CORE_AGENT_LOG_LEVEL`
-controls verbosity and `CORE_AGENT_LOG_MAX_CHARS` bounds each content field. Raw chain-of-thought
-and credentials are never logged.
+controls verbosity and `CORE_AGENT_LOG_MAX_CHARS` bounds each content field. With content logging
+enabled, provider-returned visible reasoning is recorded in a separate redacted `reasoning` field;
+provider-hidden/opaque thinking and credentials are never logged.
 
 Compose waits for PostgreSQL, runs `core-agent-db migrate` as a one-shot job, then starts the agent
 with PostgreSQL persistence. It also starts the pinned Arize Phoenix UI at
@@ -176,10 +184,11 @@ and Memory Service traces to its OTLP/HTTP collector. `PHOENIX_PORT` changes the
 per-signal `OTEL_EXPORTER_OTLP_*_ENDPOINT` variables, so a production deployment can route traces,
 metrics, and logs to separate backends without sending unsupported signals to Phoenix.
 The local profile sets `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`, so Phoenix renders
-the agent system prompt, available tool schemas, model input/output, tool calls/results, and token
-usage as OpenInference AGENT/LLM/TOOL spans. Set it to `false` to verify the production-safe view;
+the agent system prompt, available tool schemas, model input/output, tool calls/results,
+provider-visible reasoning in the OpenInference reasoning content slot, and token usage as
+OpenInference AGENT/LLM/TOOL spans. Set it to `false` to verify the production-safe view;
 production must opt in only with explicit access, redaction, sampling, and retention policy. Raw
-chain-of-thought and credentials are never captured.
+provider-hidden/opaque reasoning and credentials are never captured.
 
 Compose deliberately uses the development approve-all operator stub; a production deployment must
 replace that control plane and set `CORE_AGENT_ENVIRONMENT=production`.

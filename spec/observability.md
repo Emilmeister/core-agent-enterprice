@@ -24,7 +24,7 @@ Structured logs описывают operator diagnostics и correlation с trace/
 
 Runtime MUST писать в stdout контейнера однострочные JSON records минимум для Task lifecycle, model turn/action, tool call/outcome, approval, background/subagent lifecycle, compaction и terminal errors. Record содержит canonical tool name, run/task/context IDs и trace/span IDs при наличии. `CORE_AGENT_LOG_CONTENT=false` является безопасным default; explicit local operator profile MAY включить bounded prompt, public model response, tool arguments и normalized output через `CORE_AGENT_LOG_CONTENT=true`. Перед записью content проходит redaction и truncation.
 
-Raw chain-of-thought/private reasoning не логируется даже в content mode. Вместо него model record показывает только безопасное состояние решения (`continue_reasoning`, `request_tools`, `final_answer`), finish reason и token usage. Public reasoning summary MAY логироваться только если provider явно вернул её как пользовательский контент, а не hidden scratchpad.
+Без content mode model record показывает только безопасное состояние решения (`continue_reasoning`, `request_tools`, `final_answer`), наличие reasoning, finish reason и token usage. При `CORE_AGENT_LOG_CONTENT=true` provider-returned visible reasoning/summary MAY записываться отдельным полем `reasoning` после redaction и truncation. Provider-hidden chain-of-thought, encrypted/redacted thinking, signatures и opaque replay data не логируются никогда.
 
 ## OTLP deployment configuration
 
@@ -122,6 +122,7 @@ Phoenix является operator UI, а не только хранилищем 
 
 - `core_agent.task.execute` имеет kind `AGENT`, `agent.name`, `session.id`, A2A task/context IDs, пользовательский input и публичный final output;
 - `gen_ai.chat` имеет kind `LLM`, `llm.system`, `llm.model_name`, JSON `llm.invocation_parameters`, `input.value`/`output.value` с MIME type, flattened `llm.input_messages.<n>.message.*` и `llm.output_messages.<n>.message.*`;
+- configured effort присутствует в `llm.invocation_parameters`; provider-returned visible reasoning/summary публикуется в `llm.output_messages.<n>.message.contents.<n>.message_content` с `type=reasoning`, а известный usage — в `llm.token_count.completion_details.reasoning`;
 - весь фактически доступный модели catalog публикуется как JSON schemas в `llm.tools.<n>.tool.json_schema`; assistant tool calls публикуются в `llm.output_messages.<n>.message.tool_calls.<n>.tool_call.*` с ID, function name и JSON arguments;
 - известный model usage публикуется одновременно в OpenInference `llm.token_count.*` и совместимых `gen_ai.usage.*` attributes;
 - `core_agent.tool.execute` имеет kind `TOOL`, `tool.name`, description, JSON input/parameters, JSON/text output, outcome и tool-call ID;
@@ -130,7 +131,7 @@ Phoenix является operator UI, а не только хранилищем 
 
 Поля `input.value`, `output.value`, message content, tool schemas/descriptions/arguments/results являются content. Runtime MUST фильтровать их как при создании span, так и при последующем добавлении attributes. Deployment включает их только через `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. Отсутствующая переменная эквивалентна `false`; local Compose profile явно включает её для ограниченного operator-only Phoenix и документирует retention. Production MUST оставить её выключенной, пока отдельная policy не определит access control, redaction, sampling и retention.
 
-Даже при content capture запрещено экспортировать provider credentials, secret values, raw chain-of-thought/private reasoning, MCP authorization headers и полный RunRequest с transport credentials. System/kernel/profile instructions разрешены только в этом привилегированном operator channel и не становятся A2A output, log или audit content.
+Даже при content capture запрещено экспортировать provider credentials, secret values, provider-hidden/private reasoning, encrypted/redacted thinking, signatures, opaque replay data, MCP authorization headers и полный RunRequest с transport credentials. Явно возвращённый provider-ом visible reasoning/summary разрешён только в reasoning content slot выше и проходит redaction/truncation. System/kernel/profile instructions разрешены только в этом привилегированном operator channel и не становятся A2A output, log или audit content.
 
 ## Metrics
 
@@ -157,7 +158,7 @@ Metric labels MUST иметь bounded cardinality. Task/run/user/tenant IDs, pro
 - LogRecord содержит timestamp, severity, service/resource, trace ID, span ID, component, safe event name и error code.
 - Structured error сохраняет exception type/stack только в защищённом operator channel.
 - Debug mode не отключает redaction.
-- Notification/message payload, raw stdout/stderr и Markdown content не логируются автоматически; explicit operator content mode MAY писать их bounded/redacted представление в stdout, но не raw chain-of-thought или credentials.
+- Notification/message payload, raw stdout/stderr и Markdown content не логируются автоматически; explicit operator content mode MAY писать их bounded/redacted представление в stdout вместе с provider-visible reasoning, но не provider-hidden/opaque reasoning или credentials.
 - Tenant data classification определяет exporter, region, retention и access.
 
 ## A2A updates и audit

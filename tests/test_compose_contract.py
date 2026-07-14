@@ -51,6 +51,9 @@ class ComposeContractTests(unittest.TestCase):
         self.assertIn("CORE_AGENT_NAME", environment)
         self.assertEqual(environment["CORE_AGENT_PROFILE"], "${CORE_AGENT_PROFILE:-}")
         self.assertEqual(
+            environment["MODEL_REASONING_EFFORT"], "${MODEL_REASONING_EFFORT:-}"
+        )
+        self.assertEqual(
             environment["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"],
             "${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-true}",
         )

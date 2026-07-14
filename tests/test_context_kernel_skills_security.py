@@ -3,7 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core_agent.context import Compactor, ContextBudget, ContextItem, ContextState
+from core_agent.context import (
+    Compactor,
+    ContextBudget,
+    ContextItem,
+    ContextState,
+    StructuredSummarizer,
+)
 from core_agent.errors import CoreError
 from core_agent.kernel import InstructionSource, KernelCompiler
 from core_agent.security import (
@@ -117,6 +123,18 @@ class CompactionTests(unittest.TestCase):
         with self.assertRaises(CoreError) as caught:
             Compactor(self.budget, lambda items, max_tokens: invalid).compact(state)
         self.assertEqual(caught.exception.code, "CONTEXT_UNRECOVERABLE")
+
+    def test_summary_excludes_provider_replay_metadata(self):
+        item = ContextItem(
+            "assistant_tool_calls",
+            "[]",
+            20,
+            provider_replay={"signature": "opaque-provider-replay"},
+        )
+        summary = StructuredSummarizer(lambda text: max(1, len(text) // 4))(
+            (item,), 1_000
+        )
+        self.assertNotIn("opaque-provider-replay", summary.content)
 
 
 class KernelTests(unittest.TestCase):

@@ -378,7 +378,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("reasoning", result.to_dict())
         agent.close()
 
-    def test_structured_logs_show_flow_without_private_reasoning_or_secrets(self):
+    def test_structured_logs_show_opt_in_provider_reasoning_without_secrets(self):
         model = ScriptedModel(
             [
                 ModelResponse(
@@ -391,9 +391,10 @@ class RuntimeTests(unittest.TestCase):
                 ),
                 ModelResponse(
                     message="finished",
-                    reasoning="private chain must not be logged",
+                    reasoning="visible provider reasoning with sk-12345678901234567890",
                     prompt_tokens=20,
                     completion_tokens=5,
+                    reasoning_tokens=3,
                     total_tokens=25,
                     finish_reason="stop",
                 ),
@@ -430,18 +431,39 @@ class RuntimeTests(unittest.TestCase):
         encoded = json.dumps(records)
         self.assertIn('"argv": ["check"]', encoded)
         self.assertIn("finished", encoded)
+        self.assertIn("visible provider reasoning with [REDACTED]", encoded)
         self.assertIn("[REDACTED]", encoded)
-        self.assertNotIn("private chain must not be logged", encoded)
+        self.assertNotIn("sk-12345678901234567890", encoded)
         final_model_record = next(
             record
             for record in records
             if record["event"] == "model.response"
             and record["action"] == "final_answer"
         )
-        self.assertTrue(final_model_record["reasoning_private"])
+        self.assertTrue(final_model_record["reasoning_available"])
+        self.assertEqual(final_model_record["reasoning_tokens"], 3)
         self.assertEqual(final_model_record["prompt_tokens"], 20)
         self.assertEqual(final_model_record["completion_tokens"], 5)
         self.assertEqual(final_model_record["total_tokens"], 25)
+
+    def test_structured_logs_hide_provider_reasoning_without_content_capture(self):
+        model = ScriptedModel(
+            [ModelResponse(message="done", reasoning="operator-only reasoning")]
+        )
+        agent = make_agent(model, memory="disabled", log_content=False)
+        try:
+            with self.assertLogs("core_agent.runtime", level="INFO") as captured:
+                agent.run(run_request(memory=False))
+        finally:
+            agent.close()
+        records = [json.loads(record.getMessage()) for record in captured.records]
+        encoded = json.dumps(records)
+        self.assertNotIn("operator-only reasoning", encoded)
+        model_record = next(
+            record for record in records if record["event"] == "model.response"
+        )
+        self.assertTrue(model_record["reasoning_available"])
+        self.assertNotIn("reasoning", model_record)
 
     def test_terminal_start_failure_returns_to_model_and_task_completes(self):
         exporter = RecordingExporter()
@@ -557,6 +579,158 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertEqual(body["messages"][1]["content"][0]["type"], "tool_use")
         self.assertEqual(body["messages"][2]["content"][0]["type"], "tool_result")
+
+    def test_reasoning_effort_parsing_and_tool_replay_are_provider_native(self):
+        tools = {
+            "core.terminal.exec": {
+                "description": "execute",
+                "input_schema": {"type": "object"},
+            }
+        }
+        openai = CompatibleHttpModel(
+            api_format="openai",
+            provider="minimax",
+            model="MiniMax-M3",
+            reasoning_effort="high",
+            extra_body={"reasoning_effort": "low"},
+        )
+        body, _headers, reverse = openai._request("run", "system", tools)
+        self.assertEqual(body["reasoning_effort"], "high")
+        self.assertTrue(body["reasoning_split"])
+        self.assertEqual(body["thinking"], {"type": "adaptive"})
+        parsed = openai._parse_openai(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "reasoning_content": "Inspect the request.",
+                            "reasoning_details": [
+                                {
+                                    "type": "reasoning.text",
+                                    "text": "Inspect the request.",
+                                    "signature": "opaque-must-not-be-telemetry",
+                                }
+                            ],
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": next(iter(reverse)),
+                                        "arguments": '{"argv":["check"]}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 8,
+                    "total_tokens": 18,
+                    "completion_tokens_details": {"reasoning_tokens": 6},
+                },
+            },
+            reverse,
+        )
+        self.assertEqual(parsed.reasoning, "Inspect the request.")
+        self.assertEqual(parsed.reasoning_tokens, 6)
+        final = openai._parse_openai(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "<think>Check once.</think>Answer."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            reverse,
+        )
+        self.assertEqual(final.reasoning, "Check once.")
+        self.assertEqual(final.message, "Answer.")
+        replay_messages = [
+            {"role": "user", "content": "run"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "core.terminal.exec",
+                            "arguments": {"argv": ["check"]},
+                        },
+                    }
+                ],
+                "reasoning_replay": parsed.reasoning_replay,
+            },
+        ]
+        replay_body, _headers, _reverse = openai._request(
+            "unused", "system", tools, messages=replay_messages
+        )
+        assistant = replay_body["messages"][2]
+        self.assertEqual(
+            assistant["reasoning_details"],
+            parsed.reasoning_replay["fields"]["reasoning_details"],
+        )
+
+        anthropic = CompatibleHttpModel(
+            api_format="anthropic",
+            provider="anthropic",
+            model="claude-test",
+            reasoning_effort="xhigh",
+        )
+        body, _headers, reverse = anthropic._request("run", "system", tools)
+        self.assertEqual(body["output_config"], {"effort": "xhigh"})
+        self.assertEqual(body["thinking"], {"type": "adaptive"})
+        content = [
+            {"type": "thinking", "thinking": "Use the tool.", "signature": "opaque"},
+            {
+                "type": "tool_use",
+                "id": "call-2",
+                "name": next(iter(reverse)),
+                "input": {"argv": ["check"]},
+            },
+        ]
+        parsed = anthropic._parse_anthropic(
+            {
+                "content": content,
+                "usage": {"input_tokens": 7, "output_tokens": 5},
+                "stop_reason": "tool_use",
+            },
+            reverse,
+        )
+        self.assertEqual(parsed.reasoning, "Use the tool.")
+        replay_body, _headers, _reverse = anthropic._request(
+            "unused",
+            "system",
+            tools,
+            messages=[
+                {"role": "user", "content": "run"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-2",
+                            "function": {
+                                "name": "core.terminal.exec",
+                                "arguments": {"argv": ["check"]},
+                            },
+                        }
+                    ],
+                    "reasoning_replay": parsed.reasoning_replay,
+                },
+            ],
+        )
+        self.assertEqual(replay_body["messages"][1]["content"], content)
+
+        with self.assertRaises(CoreError) as caught:
+            CompatibleHttpModel(
+                api_format="openai",
+                model="test",
+                reasoning_effort="unbounded",
+            )
+        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
     def test_provider_wire_alias_adds_hash_only_for_a_real_collision(self):
         model = CompatibleHttpModel(api_format="openai", model="test")
@@ -838,6 +1012,19 @@ class ObservabilityTests(unittest.TestCase):
                     ),
                     prompt_tokens=40,
                     completion_tokens=6,
+                    reasoning="Use the declared terminal tool.",
+                    reasoning_replay={
+                        "format": "openai",
+                        "fields": {
+                            "reasoning_details": [
+                                {
+                                    "text": "Use the declared terminal tool.",
+                                    "signature": "opaque-replay-signature",
+                                }
+                            ]
+                        },
+                    },
+                    reasoning_tokens=4,
                     total_tokens=46,
                     finish_reason="tool_calls",
                 ),
@@ -881,10 +1068,26 @@ class ObservabilityTests(unittest.TestCase):
             "core.terminal.exec",
         )
         self.assertEqual(first.attributes["llm.token_count.total"], 46)
+        reasoning_prefix = (
+            "llm.output_messages.0.message.contents.0.message_content"
+        )
+        self.assertEqual(first.attributes[f"{reasoning_prefix}.type"], "reasoning")
+        self.assertEqual(
+            first.attributes[f"{reasoning_prefix}.text"],
+            "Use the declared terminal tool.",
+        )
+        self.assertEqual(
+            first.attributes["llm.token_count.completion_details.reasoning"], 4
+        )
         self.assertEqual(first.status_code, "OK")
         second = llm_spans[1].attributes
+        self.assertNotIn("opaque-replay-signature", str(first.attributes))
+        self.assertNotIn("opaque-replay-signature", str(second))
         self.assertEqual(second["llm.input_messages.2.message.role"], "assistant")
         self.assertEqual(second["llm.input_messages.3.message.role"], "tool")
+        self.assertEqual(
+            model.calls[1].messages[1]["reasoning_replay"]["format"], "openai"
+        )
         self.assertEqual(
             second["llm.input_messages.3.message.tool_call_id"], "call-1"
         )
@@ -966,6 +1169,9 @@ class ObservabilityTests(unittest.TestCase):
                 "gen_ai.input.messages": "secret prompt",
                 "gen_ai.tool.call.arguments": {"token": "secret"},
                 "llm.input_messages.0.message.content": "secret system prompt",
+                "llm.output_messages.0.message.contents.0.message_content.type": "reasoning",
+                "llm.output_messages.0.message.contents.0.message_content.text": "secret reasoning",
+                "llm.token_count.completion_details.reasoning": 7,
                 "llm.tools.0.tool.json_schema": "secret schema",
                 "core_agent.task.state": "working",
             },
@@ -975,8 +1181,12 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn("gen_ai.input.messages", attrs)
         self.assertNotIn("gen_ai.tool.call.arguments", attrs)
         self.assertNotIn("llm.input_messages.0.message.content", attrs)
+        self.assertNotIn(
+            "llm.output_messages.0.message.contents.0.message_content.text", attrs
+        )
         self.assertNotIn("llm.tools.0.tool.json_schema", attrs)
         self.assertNotIn("output.value", attrs)
+        self.assertEqual(attrs["llm.token_count.completion_details.reasoning"], 7)
         self.assertEqual(attrs["openinference.span.kind"], "LLM")
         self.assertEqual(attrs["core_agent.task.state"], "working")
         with self.assertRaises(CoreError) as caught:

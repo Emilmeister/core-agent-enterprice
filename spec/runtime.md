@@ -68,8 +68,11 @@ Message возобновляет `WAITING_INPUT` или `WAITING_TASK` run. В `
 ## Reasoning
 
 - Ядро MUST использовать reasoning-capable режим модели, если он поддерживается выбранным provider.
-- Уровень reasoning и model route выбираются внутренней политикой на основе сложности, latency target, data classification, capabilities и бюджета; клиент не управляет ими через RunRequest.
-- Raw chain-of-thought, reasoning tokens и скрытые scratchpads MUST NOT попадать в события, логи или tool arguments.
+- Deployment MAY задать `MODEL_REASONING_EFFORT`; отсутствие значения оставляет provider default. OpenAI-compatible adapter передаёт его как `reasoning_effort`, Anthropic Messages — как `output_config.effort` с adaptive thinking. Неподдерживаемое provider-ом значение завершается обычной model error, а не silent downgrade.
+- Уровень reasoning и model route являются Platform/Agent configuration: remote A2A caller не управляет ими через RunRequest, prompt, MCP или skill.
+- Provider-returned visible reasoning/summary не является публичным ответом и не попадает в A2A, audit, memory или tool arguments. Оно MAY появляться только в привилегированных operator logs/traces при соответствующем explicit content capture, после redaction и truncation.
+- Provider-hidden chain-of-thought, encrypted/redacted thinking, signatures и другие opaque replay data MUST NOT попадать в operator telemetry. Adapter MAY сохранить минимальный provider-native replay внутри owned workflow context, когда это требуется для продолжения tool conversation.
+- Известное число reasoning tokens является usage metadata и MAY экспортироваться без reasoning text.
 - Ядро MAY отдавать краткое резюме намерения или основания действия, сформулированное для пользователя.
 - Отсутствие обязательной capability MUST быть известно до запуска и либо компенсировано разрешённым fallback, либо завершаться `MODEL_CAPABILITY_MISSING`.
 

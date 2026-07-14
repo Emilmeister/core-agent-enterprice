@@ -372,13 +372,16 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
 ### Observability и secrets
 
 - Durable audit является product record и не заменяется OTel.
+- `MODEL_REASONING_EFFORT` optional и маппится в native OpenAI-compatible/Anthropic request; пустое значение сохраняет provider default и никогда не управляется через RunRequest/prompt.
+- Provider-visible reasoning остаётся operator-only content: stdout требует `CORE_AGENT_LOG_CONTENT=true`, Phoenix — `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`; hidden/opaque thinking не экспортируется.
 - Incoming A2A call не создаёт отдельный transport/submission trace: agent processing сразу начинается `core_agent.task.execute`, продолжая валидный incoming W3C parent или становясь local root.
 - Child-agent span продолжает parent trace; независимая background/durable
   работа использует новый trace со Span Link. Trace context не является auth.
 - Логи используют canonical tool names, correlation IDs и bounded one-line JSON.
-- Raw chain-of-thought/private reasoning, credentials, secret values, auth
-  headers и raw provider errors никогда не попадают в model context, public
-  errors, logs, spans или artifacts.
+- Provider-hidden/private/opaque reasoning, credentials, secret values, auth
+  headers и raw provider errors никогда не попадают в public errors, logs,
+  spans или artifacts; provider-visible reasoning подчиняется explicit
+  operator-only content gates выше.
 - Content capture включается только явной privileged policy с redaction,
   access, sampling и retention.
 - Не использовать prompt, paths, commands, entities, tenant/user/task IDs как

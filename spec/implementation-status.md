@@ -45,7 +45,7 @@
 | DB-02 | все production rows tenant-scoped и cross-tenant not-found | tenant isolation and artifact tests | implemented |
 | OTL-01 | OTLP traces/metrics/logs, one A2A execution trace without transport/submission trace, per-signal routing и W3C propagation | OTLP HTTP/per-signal collector, Compose contract and A2A/MCP propagation tests | implemented |
 | OTL-02 | bounded labels/content-off и exporter failure isolation | telemetry privacy/failure suite | implemented |
-| OTL-03 | Phoenix отображает OpenInference AGENT/LLM/TOOL, prompt/catalog/calls/results/usage при explicit opt-in | OpenInference attribute/status contract tests, Compose capture contract and live Phoenix smoke | implemented |
+| OTL-03 | Phoenix отображает OpenInference AGENT/LLM/TOOL, prompt/catalog/calls/results/usage и provider-visible reasoning при explicit opt-in | OpenInference reasoning/attribute/status contract tests, Compose capture contract and live Phoenix smoke | implemented |
 | SEC-01 | stable public errors, secret redaction и trust boundaries | adversarial/security suite and secret scan gate | implemented |
 | SEC-02 | retention/coordinated deletion очищает cached derived data | run-family lifecycle and Memory delete E2E | implemented |
 | OPS-01 | non-root image, writable durable mounts, graceful shutdown, probes и separate migration | pinned image/mount smoke, Compose init, health/migration gates | implemented |

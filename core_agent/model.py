@@ -30,6 +30,8 @@ class ModelResponse:
     completion_tokens: int | None = None
     total_tokens: int | None = None
     finish_reason: str | None = None
+    reasoning_tokens: int | None = None
+    reasoning_replay: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,10 @@ class ScriptedModel:
 class CompatibleHttpModel:
     """Small synchronous adapter for OpenAI-compatible and Anthropic Messages APIs."""
 
+    REASONING_EFFORTS = frozenset(
+        {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+    )
+
     def __init__(
         self,
         *,
@@ -77,6 +83,7 @@ class CompatibleHttpModel:
         anthropic_version="2023-06-01",
         context_window=128_000,
         token_chars=3,
+        reasoning_effort=None,
     ):
         if api_format not in {"openai", "anthropic"} or not model:
             raise CoreError("CONFIG_INVALID")
@@ -109,8 +116,40 @@ class CompatibleHttpModel:
         self.anthropic_version = anthropic_version
         self.context_window = int(context_window)
         self.token_chars = int(token_chars)
+        self.reasoning_effort = (
+            reasoning_effort.strip().lower()
+            if isinstance(reasoning_effort, str) and reasoning_effort.strip()
+            else None
+        )
         if self.context_window <= self.max_tokens or self.token_chars <= 0:
             raise CoreError("CONFIG_INVALID")
+        if (
+            reasoning_effort is not None
+            and self.reasoning_effort not in self.REASONING_EFFORTS
+        ):
+            raise CoreError("CONFIG_INVALID", "invalid MODEL_REASONING_EFFORT")
+        self.invocation_parameters
+
+    @property
+    def invocation_parameters(self):
+        parameters = dict(self.extra_body)
+        if self.api_format == "openai":
+            if self.provider.lower() == "minimax":
+                parameters.setdefault("reasoning_split", True)
+                if self.reasoning_effort:
+                    parameters.setdefault("thinking", {"type": "adaptive"})
+            if self.reasoning_effort:
+                parameters["reasoning_effort"] = self.reasoning_effort
+        elif self.reasoning_effort:
+            output_config = parameters.get("output_config", {})
+            if not isinstance(output_config, dict):
+                raise CoreError("CONFIG_INVALID", "output_config must be an object")
+            parameters["output_config"] = {
+                **output_config,
+                "effort": self.reasoning_effort,
+            }
+            parameters.setdefault("thinking", {"type": "adaptive"})
+        return parameters
 
     def count_tokens(self, text):
         """Conservative provider-neutral estimate when no tokenizer endpoint exists."""
@@ -189,10 +228,17 @@ class CompatibleHttpModel:
         result = []
         for message in messages:
             if message["role"] == "assistant" and message.get("tool_calls"):
+                replay = message.get("reasoning_replay") or {}
+                fields = (
+                    replay.get("fields", {})
+                    if replay.get("format") == "openai"
+                    else {}
+                )
                 result.append(
                     {
                         "role": "assistant",
-                        "content": message.get("content"),
+                        **fields,
+                        "content": fields.get("content", message.get("content")),
                         "tool_calls": [
                             {
                                 "id": call["id"],
@@ -223,6 +269,14 @@ class CompatibleHttpModel:
         result = []
         for message in messages:
             if message["role"] == "assistant" and message.get("tool_calls"):
+                replay = message.get("reasoning_replay") or {}
+                if replay.get("format") == "anthropic" and isinstance(
+                    replay.get("content"), list
+                ):
+                    result.append(
+                        {"role": "assistant", "content": replay["content"]}
+                    )
+                    continue
                 result.append(
                     {
                         "role": "assistant",
@@ -258,7 +312,7 @@ class CompatibleHttpModel:
     def _request(self, context, instructions, tools, messages=None):
         schemas, reverse = self._tools(tools)
         messages = list(messages or ({"role": "user", "content": context},))
-        body = dict(self.extra_body)
+        body = self.invocation_parameters
         if self.api_format == "openai":
             body.update(
                 {
@@ -330,14 +384,46 @@ class CompatibleHttpModel:
         return value
 
     @staticmethod
-    def _public_text(value, reverse=None):
-        value = re.sub(r"(?is)<think>.*?</think>\s*", "", value)
-        value = re.sub(r"(?is)<think>.*$", "", value).strip()
+    def _canonical_text(value, reverse=None):
         for wire_name, canonical_name in sorted(
             (reverse or {}).items(), key=lambda item: len(item[0]), reverse=True
         ):
             if wire_name != canonical_name:
                 value = value.replace(wire_name, canonical_name)
+        return value.strip()
+
+    @classmethod
+    def _split_reasoning(cls, value, reverse=None):
+        reasoning = re.findall(r"(?is)<think>(.*?)</think>", value)
+        without_closed = re.sub(r"(?is)<think>.*?</think>", "", value)
+        unclosed = re.search(r"(?is)<think>(.*)$", without_closed)
+        if unclosed:
+            reasoning.append(unclosed.group(1))
+        public = re.sub(r"(?is)<think>.*?</think>\s*", "", value)
+        public = re.sub(r"(?is)<think>.*$", "", public)
+        visible = "\n\n".join(part.strip() for part in reasoning if part.strip())
+        return cls._canonical_text(public, reverse), cls._canonical_text(
+            visible, reverse
+        )
+
+    @classmethod
+    def _visible_reasoning(cls, value, reverse=None):
+        if isinstance(value, str):
+            return cls._canonical_text(value, reverse)
+        if isinstance(value, list):
+            parts = [cls._visible_reasoning(item, reverse) for item in value]
+            return "\n\n".join(part for part in parts if part)
+        if isinstance(value, dict):
+            for key in ("text", "reasoning", "reasoning_content", "summary"):
+                if key in value:
+                    visible = cls._visible_reasoning(value[key], reverse)
+                    if visible:
+                        return visible
+        return ""
+
+    @classmethod
+    def _public_text(cls, value, reverse=None):
+        value, _reasoning = cls._split_reasoning(value, reverse)
         if not value:
             raise CoreError("MODEL_UNAVAILABLE", "model returned no public text")
         return value
@@ -368,18 +454,53 @@ class CompatibleHttpModel:
                 for part in content
                 if isinstance(part, dict) and part.get("type") == "text"
             )
+        public_content, embedded_reasoning = (
+            self._split_reasoning(content, reverse)
+            if isinstance(content, str)
+            else ("", "")
+        )
+        reasoning = self._visible_reasoning(
+            message.get("reasoning_details"), reverse
+        ) or self._visible_reasoning(message.get("reasoning_content"), reverse)
+        reasoning = reasoning or embedded_reasoning or None
         usage = response.get("usage") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
         usage_fields = {
             "prompt_tokens": usage.get("prompt_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
+            "reasoning_tokens": completion_details.get("reasoning_tokens"),
             "total_tokens": usage.get("total_tokens"),
             "finish_reason": response["choices"][0].get("finish_reason"),
         }
         if calls:
-            return ModelResponse(tool_requests=tuple(calls), **usage_fields)
+            replay_fields = {
+                key: message[key]
+                for key in ("content", "reasoning_details", "reasoning_content")
+                if key in message
+            }
+            replay = (
+                {"format": "openai", "fields": replay_fields}
+                if replay_fields
+                and (
+                    reasoning
+                    or "reasoning_details" in message
+                    or "reasoning_content" in message
+                )
+                else None
+            )
+            return ModelResponse(
+                tool_requests=tuple(calls),
+                reasoning=reasoning,
+                reasoning_replay=replay,
+                **usage_fields,
+            )
         if not isinstance(content, str):
             raise CoreError("MODEL_UNAVAILABLE", "model returned no text")
-        return ModelResponse(message=self._public_text(content, reverse), **usage_fields)
+        if not public_content:
+            raise CoreError("MODEL_UNAVAILABLE", "model returned no public text")
+        return ModelResponse(
+            message=public_content, reasoning=reasoning, **usage_fields
+        )
 
     def _parse_anthropic(self, response, reverse):
         content = response.get("content")
@@ -387,11 +508,16 @@ class CompatibleHttpModel:
             raise CoreError("MODEL_UNAVAILABLE", "invalid Anthropic message")
         calls = []
         text = []
+        reasoning = []
         for block in content:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text":
                 text.append(str(block.get("text", "")))
+            elif block.get("type") == "thinking":
+                visible = self._visible_reasoning(block.get("thinking"), reverse)
+                if visible:
+                    reasoning.append(visible)
             elif block.get("type") == "tool_use":
                 try:
                     name = reverse[block["name"]]
@@ -421,9 +547,16 @@ class CompatibleHttpModel:
             "finish_reason": response.get("stop_reason"),
         }
         if calls:
-            return ModelResponse(tool_requests=tuple(calls), **usage_fields)
+            return ModelResponse(
+                tool_requests=tuple(calls),
+                reasoning="\n\n".join(reasoning) or None,
+                reasoning_replay={"format": "anthropic", "content": content},
+                **usage_fields,
+            )
         return ModelResponse(
-            message=self._public_text("".join(text), reverse), **usage_fields
+            message=self._public_text("".join(text), reverse),
+            reasoning="\n\n".join(reasoning) or None,
+            **usage_fields,
         )
 
     def generate(self, *, context, tools, instructions, messages=None):

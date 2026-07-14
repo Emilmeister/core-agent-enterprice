@@ -35,10 +35,12 @@
 - [ ] AgentProfilePrompt, user Message, skill или MCP output не могут изменить rules включённой capability; отключать optional capability может только config/policy.
 - [ ] Runtime enforcement отклоняет запрещённое действие, даже если model output просит обойти kernel instruction.
 - [ ] Child получает ту же kernel version и не может ослабить parent/host policy.
-- [ ] Raw chain-of-thought отсутствует в A2A, telemetry, audit, memory и tool arguments.
+- [ ] Provider-visible reasoning отсутствует в A2A, audit, memory и tool arguments; в logs/Phoenix оно появляется только при соответствующем explicit content capture, тогда как hidden/opaque reasoning не экспортируется никогда.
 
 ## Runtime и durability
 
+- [ ] `MODEL_REASONING_EFFORT` валидируется до первого turn, отображается в model invocation parameters и маппится в нативный OpenAI-compatible/Anthropic request без управления через RunRequest.
+- [ ] Provider adapter отделяет visible reasoning от публичного ответа, сохраняет необходимый provider replay для следующего tool turn и экспортирует известный reasoning token usage.
 - [ ] Capability negotiation отклоняет несовместимый model/adapter до первого turn.
 - [ ] Model fallback не повторяет tool call и compacts context перед меньшим окном.
 - [ ] Pause/passive wait освобождают model worker и продолжаются из checkpoint/notification.
@@ -159,6 +161,7 @@
 - [ ] Core имеет MCP client span; Memory Service продолжает W3C trace и владеет BM25/vector/graph/rerank/NER spans.
 - [ ] OTel semantic-convention version pinned; custom attributes используют `core_agent.*`.
 - [ ] Content/arguments/results/system instructions выключены в telemetry по умолчанию.
+- [ ] При privileged content capture Phoenix получает visible reasoning в OpenInference `message.contents` с `type=reasoning`; без capture reasoning text отсутствует, но safe reasoning token count сохраняется.
 - [ ] Metric labels bounded и не содержат IDs, prompt, path, command, entity или memory text.
 - [ ] Collector outage не повреждает Task/audit; telemetry drops наблюдаемы.
 

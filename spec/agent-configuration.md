@@ -16,6 +16,14 @@ AgentConfig создаёт конкретный экземпляр Core Agent и
 
 `agent.profile_prompt` optional и по умолчанию пуст. Он задаёт роль/стиль, но не повторяет Task prompt: фактический запрос передаётся отдельным user Message.
 
+## Model reasoning
+
+`MODEL_REASONING_EFFORT` является optional deployment setting. Допустимый provider-neutral vocabulary: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; конкретный provider/model MAY поддерживать подмножество и возвращает model error для неподдерживаемого значения. Пустое значение означает provider default. Эта настройка не входит в RunRequest и не может быть изменена prompt-ом.
+
+OpenAI-compatible adapter передаёт effort как `reasoning_effort`; для MiniMax он также запрашивает отделение reasoning от публичного `content`. Anthropic adapter передаёт effort как `output_config.effort` и, если caller не задал более точный provider config, включает adaptive thinking. Explicit `MODEL_REASONING_EFFORT` имеет приоритет над совпадающим полем в `MODEL_EXTRA_BODY_JSON`.
+
+Reasoning text имеет те же privileged capture boundaries, что остальной model content: stdout требует `CORE_AGENT_LOG_CONTENT=true`, Phoenix/OTel — `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. Оба значения безопасно выключены по умолчанию production runtime-ом.
+
 ## Пример
 
 ```yaml

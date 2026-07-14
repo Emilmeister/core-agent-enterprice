@@ -48,6 +48,7 @@ class ContextItem:
     content: str
     tokens: int
     pinned: bool = False
+    provider_replay: dict | None = None
 
 
 @dataclass(frozen=True)
