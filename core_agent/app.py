@@ -733,7 +733,7 @@ def create_app(
             telemetry=telemetry,
         )
 
-    def traced_execution(context, operation, function, request=None):
+    def traced_execution(context, function, request=None):
         headers = context.call_context.state.get("headers", {})
         parent = telemetry.extract(headers)
         task_attributes = {
@@ -755,19 +755,7 @@ def create_app(
                 }
             )
         with telemetry.span(
-            f"core_agent.a2a.{operation}",
-            parent=parent,
-            attributes={
-                "rpc.system": "a2a",
-                "rpc.method": operation,
-                "a2a.task.id": context.task_id,
-                "a2a.context.id": context.context_id,
-            },
-        ):
-            with telemetry.span("core_agent.task.submit") as submission:
-                linked = submission.context
-        with telemetry.start_background_span(
-            "core_agent.task.execute", linked, attributes=task_attributes
+            "core_agent.task.execute", parent=parent, attributes=task_attributes
         ) as execution_span:
             try:
                 result = function()
@@ -818,7 +806,6 @@ def create_app(
         identity = user.user_name if user.is_authenticated else "anonymous"
         result = traced_execution(
             context,
-            "message.send",
             lambda: agent.run(
                 request,
                 task_id=context.task_id,
@@ -861,7 +848,7 @@ def create_app(
 
     def resume(context):
         result = traced_execution(
-            context, "task.resume", lambda: agent.resume_task(context.task_id)
+            context, lambda: agent.resume_task(context.task_id)
         )
         if isinstance(result, ApprovalNeeded):
             return result
@@ -870,7 +857,6 @@ def create_app(
     def dispatch_local(reserved, context):
         result = traced_execution(
             context,
-            "approval.dispatch",
             lambda: agent.dispatch_reserved_approval(
                 context.task_id, reserved.approval_id, reserved.execution_id
             ),

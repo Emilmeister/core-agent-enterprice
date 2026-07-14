@@ -43,7 +43,7 @@
 | CTL-01 | production private operator API с отдельной auth audience | operator JWT authority E2E | implemented |
 | DB-01 | PostgreSQL schema/pool/migration role/readiness без fallback | real PostgreSQL CI suite | implemented |
 | DB-02 | все production rows tenant-scoped и cross-tenant not-found | tenant isolation and artifact tests | implemented |
-| OTL-01 | OTLP traces/metrics/logs, per-signal routing и W3C propagation | OTLP HTTP/per-signal collector, Compose contract and A2A/MCP propagation tests | implemented |
+| OTL-01 | OTLP traces/metrics/logs, one A2A execution trace without transport/submission trace, per-signal routing и W3C propagation | OTLP HTTP/per-signal collector, Compose contract and A2A/MCP propagation tests | implemented |
 | OTL-02 | bounded labels/content-off и exporter failure isolation | telemetry privacy/failure suite | implemented |
 | OTL-03 | Phoenix отображает OpenInference AGENT/LLM/TOOL, prompt/catalog/calls/results/usage при explicit opt-in | OpenInference attribute/status contract tests, Compose capture contract and live Phoenix smoke | implemented |
 | SEC-01 | stable public errors, secret redaction и trust boundaries | adversarial/security suite and secret scan gate | implemented |

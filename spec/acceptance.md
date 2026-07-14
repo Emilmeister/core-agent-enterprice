@@ -155,7 +155,7 @@
 
 - [ ] Traces, metrics и logs создаются OTel SDK и экспортируются OTLP.
 - [ ] W3C Trace Context проходит через A2A, queue, MCP и background/subagent tasks без влияния на authorization.
-- [ ] Durable/background Task использует новый execution trace со Span Link на submission, а не многочасовой request span.
+- [ ] Incoming A2A call создаёт ровно один agent execution trace с root `core_agent.task.execute`; отдельные transport/submission traces отсутствуют, валидный incoming W3C parent продолжается, а независимая background/durable работа использует новый trace со Span Link.
 - [ ] Core имеет MCP client span; Memory Service продолжает W3C trace и владеет BM25/vector/graph/rerank/NER spans.
 - [ ] OTel semantic-convention version pinned; custom attributes используют `core_agent.*`.
 - [ ] Content/arguments/results/system instructions выключены в telemetry по умолчанию.

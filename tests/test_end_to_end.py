@@ -939,6 +939,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_memory_mcp_search_reaches_markdown_indexes_and_graph(self):
         MemoryMcpHandler.trace_carriers.clear()
+        span_offset = len(self.app.state.telemetry.exporter.spans)
         declaration = {
             "name": "memory",
             "role": "memory",
@@ -962,17 +963,22 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tool_calls)
         self.assertTrue(all(item["header"] == item["meta"] for item in tool_calls))
         self.assertTrue(all(item["header"].startswith("00-") for item in tool_calls))
-        spans = self.app.state.telemetry.exporter.spans
-        a2a_span = next(
-            span for span in reversed(spans) if span.name == "core_agent.a2a.message.send"
+        spans = self.app.state.telemetry.exporter.spans[span_offset:]
+        execution_span = next(
+            span for span in spans if span.name == "core_agent.task.execute"
         )
         self.assertEqual(
-            a2a_span.context.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736"
+            execution_span.context.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736"
         )
         names = {span.name for span in spans}
+        self.assertFalse(any(name.startswith("core_agent.a2a.") for name in names))
+        self.assertNotIn("core_agent.task.submit", names)
+        self.assertEqual(
+            {span.context.trace_id for span in spans},
+            {"4bf92f3577b34da6a3ce929d0e0e4736"},
+        )
         self.assertTrue(
             {
-                "core_agent.task.submit",
                 "core_agent.task.execute",
                 "core_agent.context.assemble",
                 "gen_ai.chat",

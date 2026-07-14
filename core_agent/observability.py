@@ -334,7 +334,7 @@ class Telemetry:
     def extract(self, carrier):
         value = carrier.get("traceparent")
         if not value:
-            return TraceContext(_hex(16), _hex(8))
+            return None
         parts = value.split("-")
         if (
             len(parts) != 4
@@ -346,7 +346,7 @@ class Telemetry:
             or int(parts[2], 16) == 0
         ):
             self.dropped_records += 1
-            return TraceContext(_hex(16), _hex(8))
+            return None
         return TraceContext(parts[1], parts[2], parts[3])
 
     def inject(self, context, carrier):

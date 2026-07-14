@@ -372,6 +372,7 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
 ### Observability и secrets
 
 - Durable audit является product record и не заменяется OTel.
+- Incoming A2A call не создаёт отдельный transport/submission trace: agent processing сразу начинается `core_agent.task.execute`, продолжая валидный incoming W3C parent или становясь local root.
 - Child-agent span продолжает parent trace; независимая background/durable
   работа использует новый trace со Span Link. Trace context не является auth.
 - Логи используют canonical tool names, correlation IDs и bounded one-line JSON.

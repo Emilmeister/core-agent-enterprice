@@ -46,7 +46,9 @@ Core Agent MUST использовать W3C Trace Context через OTel propa
 
 ## Async и background traces
 
-Incoming A2A request span завершается после ответа transport-а и не остаётся открытым на часы. Background Task создаёт новый execution trace со `Span Link` на submission span и attributes A2A task/context IDs.
+Incoming A2A call MUST NOT создавать отдельный transport/submission trace. Обработка агента сразу начинается span-ом `core_agent.task.execute`: он продолжает валидный incoming W3C parent, а без `traceparent` становится root span нового execution trace. A2A task/context IDs записываются на этом span-е. Transport-only spans `core_agent.a2a.*` и начальный `core_agent.task.submit` не эмитятся.
+
+Независимая background/durable работа, запущенная уже внутри Task, создаёт новый execution trace со `Span Link` на точку запуска. Сабагент не является такой независимой работой и продолжает parent trace.
 
 Сабагент сохраняет trace parent-а, чтобы Phoenix и другой trace UI показывали child `core_agent.task.execute` внутри дерева main agent. Submission/tool span является его прямым parent даже при asynchronous execution; durable recovery сохраняет только W3C trace/span IDs и продолжает тот же trace без authorization/baggage.
 
@@ -63,10 +65,7 @@ Incoming A2A request span завершается после ответа transpo
 Минимальная span topology:
 
 ```text
-core_agent.a2a.message.send / core_agent.a2a.message.stream
-└── core_agent.task.submit
-
-core_agent.task.execute  (linked to submit)
+core_agent.task.execute  (incoming W3C child or local root)
 ├── core_agent.context.assemble
 │   └── mcp.client memory.search
 ├── gen_ai model operation
