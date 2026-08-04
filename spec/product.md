@@ -14,7 +14,7 @@
 Короткая формула:
 
 ```text
-prompt + MCP + skills -> события выполнения + итоговый ответ
+prompt -> события выполнения + итоговый ответ
 ```
 
 ## Что означает «всё внутри»
@@ -27,7 +27,6 @@ Core Agent MUST владеть следующими обязанностями:
 - учёт токенов, compaction и восстановление контекста;
 - обнаружение, загрузка и применение skills;
 - регистрация, валидация и исполнение встроенных и MCP-инструментов;
-- оценка риска и approval flow;
 - ограничение вывода инструментов;
 - подключение отдельного Memory MCP Service с Markdown, graph/NER и hybrid retrieval;
 - фоновые Tasks, passive wait и делегирование сабагентам;
@@ -46,7 +45,6 @@ Core Agent MUST владеть следующими обязанностями:
 - модель, provider и credentials;
 - рабочая директория и допустимые filesystem roots;
 - local terminal profile, process/resource limits и сетевые ограничения container-а;
-- режим approval и правила риска;
 - secret store;
 - хранилище транскриптов и артефактов;
 - тайм-ауты, денежные и вычислительные бюджеты;
@@ -59,7 +57,7 @@ Core Agent MUST владеть следующими обязанностями:
 
 ### AgentConfig
 
-Создаёт конкретного агента поверх platform runtime: выбирает AgentProfilePrompt, model route, budgets, context thresholds, approval/execution/OTel profiles и effective allowlists built-in tools, MCP и skills. Может полностью отключить memory, terminal, mutations, delegation или background tasks. Полная schema описана в [Конфигурации агента](agent-configuration.md).
+Создаёт конкретного агента поверх platform runtime: выбирает AgentProfilePrompt, model route, budgets, context thresholds, execution/OTel profiles и effective allowlists built-in tools, MCP и skills. Может полностью отключить memory, terminal, mutations, delegation или background tasks. Полная schema описана в [Конфигурации агента](agent-configuration.md).
 
 ### RunRequest
 
@@ -95,11 +93,10 @@ Core Agent MUST владеть следующими обязанностями:
 
 ## Основной сценарий
 
-1. Клиент или peer agent отправляет A2A Message с prompt и Core extension MCP/skills.
+1. Клиент или peer agent отправляет A2A Message с prompt.
 2. Ядро валидирует входы и создаёт неизменяемый snapshot расширений.
 3. Ядро создаёт A2A Task, планирует шаги и стримит status/artifact updates.
 4. Безопасные действия проходят автоматически.
-5. Для рискованного действия ядро приостанавливается и запрашивает approval.
 6. При заполнении контекста ядро выполняет compaction и продолжает задачу.
 7. Независимая долгая работа уходит в background Task; agent продолжает работу или пассивно ждёт notification.
 8. При необходимости ядро создаёт сабагента с узкой инструкцией и явными tool/MCP/skill allowlists.
@@ -111,11 +108,10 @@ Core Agent MUST владеть следующими обязанностями:
 
 Итоговый продукт считается успешным, если:
 
-- интеграция использует стандартные A2A Message/Task/Artifact operations и Core extension;
+- интеграция использует только стандартные A2A Message/Task/Artifact operations, без собственного расширения протокола;
 - клиентский код не содержит собственного agent loop;
 - длинная задача переживает хотя бы два compaction без потери активной цели;
-- ни одно действие, требующее approval, не исполняется до подтверждения;
-- каждый tool call и approval восстанавливается из аудита;
+- каждый tool call восстанавливается из аудита;
 - типовой запуск без MCP и skills работает с одним `prompt`;
 - stateful session не требует от клиента вручную пересылать историю;
 - после рестарта безопасно продолжается ожидающий или вычислительный run;
@@ -149,7 +145,7 @@ Core Agent MUST владеть следующими обязанностями:
 
 ### Durable before clever
 
-Нельзя ускорять agent loop ценой повторных side effects, потери approval или неаудируемого состояния.
+Нельзя ускорять agent loop ценой повторных side effects, потери committed результата или неаудируемого состояния.
 
 ### Provider-neutral semantics
 

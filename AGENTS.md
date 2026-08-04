@@ -146,7 +146,10 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/approvals.py` | Proposal/digest/reservation и development approve-all stub |
 | `core_agent/operator.py` | Private operator control plane и JWT authentication |
 | `core_agent/database.py` | PostgreSQL schema, migrations, pool и stores |
-| `core_agent/artifacts.py`, `core_agent/audit.py` | Tenant-scoped artifacts и append-only audit adapters |
+| `core_agent/artifacts.py`, `core_agent/audit.py` | Tenant-scoped transport artifacts и append-only audit adapters |
+| `core_agent/artifact_service.py` | Named/scoped/versioned artifact model и in-memory, S3, MongoDB backends |
+| `core_agent/remote_agents.py` | Remote A2A agent registry и synchronous JSON-RPC/SSE client |
+| `core_agent/streaming.py` | Stream chunk merge, snapshot buffer и ADK metadata keys |
 | `core_agent/durability.py`, `core_agent/lifecycle.py` | Events, checkpoints, leases, recovery и retention |
 | `core_agent/postgres_approvals.py` | Durable PostgreSQL HITL state |
 | `core_agent/mcp.py` | MCP discovery/calls и Streamable HTTP connector |
@@ -168,9 +171,9 @@ Package entrypoints из `pyproject.toml`:
 - A2A/public input — `spec/a2a-protocol.md`, `spec/public-contract.md`;
 - agent loop и recovery — `spec/runtime.md`;
 - protected instructions — `spec/kernel-instructions.md`;
-- tools/HITL — `spec/tools-and-approvals.md`,
-  `spec/local-operator-hitl.md`;
-- background/subagents — `spec/tasks-and-delegation.md`;
+- tools — `spec/tools.md`;
+- artifact storage — `spec/artifacts.md`;
+- background/subagents и remote A2A agents — `spec/tasks-and-delegation.md`;
 - terminal/workspaces/Python — `spec/execution-environment.md`;
 - context compaction — `spec/context.md`;
 - Memory MCP — `spec/memory-service.md`;
@@ -207,8 +210,8 @@ Target spec может описывать больше текущего runtime.
 - Disabled capability отсутствует в Agent Card/model catalog и повторно
   отклоняется при dispatch. Prompt или stale tool call не расширяет policy.
 - Safety/host/kernel/capability instructions нельзя заменить через
-  `CORE_AGENT_PROFILE`, prompt, skill, MCP, memory или tool output.
-- `CORE_AGENT_PROFILE` optional и по умолчанию пуст; user request передаётся
+  `AGENT_SYSTEM_PROMPT`, prompt, skill, MCP, memory или tool output.
+- `AGENT_SYSTEM_PROMPT` optional и по умолчанию пуст; user request передаётся
   отдельным user Message/context item, а не generic system instruction.
 - Prompt, profile, skill, MCP, memory, peer-agent, file, terminal и network
   content всегда считаются недоверенными данными.
@@ -223,8 +226,14 @@ Target spec может описывать больше текущего runtime.
 - `core.task.start`, `core.task.get`, `core.task.list`, `core.task.wait`,
   `core.task.cancel`;
 - `core.delegate`;
+- `core.artifact.save`, `core.artifact.load`, `core.artifact.list`;
+- `core.agent.send_message`.
 
-Model-callable artifact tools отсутствуют. Обычный model/child text result
+Artifact tools версионируют именованные файлы внутри агента; `user:`-префикс
+даёт cross-session scope, а `ARTIFACT_STORAGE_TYPE` выбирает in-memory, S3 или
+MongoDB backend без управления схемой внешнего хранилища. `core.agent.send_message`
+делегирует задачу удалённому A2A-агенту из `REMOTE_AGENTS` и ретранслирует его
+прогресс в поток корневой Task. Обычный model/child text result по-прежнему
 публикуется A2A adapter-ом как Task Artifact без дополнительного tool call.
 
 `core.terminal.write`, `core.fs.apply_patch` и `core.input.request` описаны в
@@ -372,7 +381,7 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
 ### Observability и secrets
 
 - Durable audit является product record и не заменяется OTel.
-- `MODEL_REASONING_EFFORT` optional и маппится в native OpenAI-compatible/Anthropic request; пустое значение сохраняет provider default и никогда не управляется через RunRequest/prompt.
+- `THINKING_LEVEL` optional и маппится в native OpenAI-compatible/Anthropic request; пустое значение сохраняет provider default и никогда не управляется через RunRequest/prompt.
 - Provider-visible reasoning остаётся operator-only content: stdout требует `CORE_AGENT_LOG_CONTENT=true`, Phoenix — `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`; hidden/opaque thinking не экспортируется.
 - Incoming A2A call не создаёт отдельный transport/submission trace: agent processing сразу начинается `core_agent.task.execute`, продолжая валидный incoming W3C parent или становясь local root.
 - Child-agent span продолжает parent trace; независимая background/durable

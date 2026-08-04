@@ -22,7 +22,7 @@ Streamable HTTP Memory MCP, Markdown indexing/NER/graph search, and explicit ski
 
 ### Runtime prompt
 
-The replaceable role/profile prompt is `CORE_AGENT_PROFILE`; local Compose reads it from `.env`.
+The replaceable role/profile prompt is `AGENT_SYSTEM_PROMPT`; local Compose reads it from `.env`.
 It is optional and empty by default. The actual request is sent separately as a user Message and
 is never copied into system instructions. Effective model instructions are compiled for every run
 from the protected safety, host-policy, kernel and enabled-capability layers, followed by a
@@ -39,7 +39,7 @@ DATABASE_MIGRATION_URL='postgresql://migrator:password@database:5432/core_agent'
 DATABASE_APP_ROLE=core_agent \
 uv run core-agent-db migrate
 CORE_AGENT_ENVIRONMENT=production \
-CORE_AGENT_STATE_BACKEND=postgres \
+SESSION_STORAGE_TYPE=postgres \
 DATABASE_AUTO_MIGRATE=false \
 OPERATOR_JWT_HS256_SECRET='independent-32-byte-minimum-secret' \
 OPERATOR_JWT_ISSUER='https://operator.example' \
@@ -80,34 +80,43 @@ effective built-in/MCP catalog. Python may still use standard-library OS/process
 selected runtime mode or bypass the HITL gate.
 `CORE_AGENT_MAX_DEPTH` may lower delegation depth to `0` or `1`; `2` is the hard maximum, allowing
 main → child → grandchild while rejecting any further delegation.
-The model has no artifact storage tools: child agents return ordinary text results. The A2A adapter
-stores each final result as a tenant-scoped, digest-verified Task Artifact with PostgreSQL metadata;
-`ARTIFACT_MAX_BYTES` bounds that transport-level result. Remove retired `core.artifact.put` and
+`core.artifact.save/load/list` give the model a named, versioned file store. Saving never
+overwrites, a `user:` prefix makes an artifact visible across that user's sessions, and
+`ARTIFACT_STORAGE_TYPE` selects `in-memory`, `s3` or `mongodb`. `core.agent.send_message`
+delegates one task to a remote A2A agent listed in `REMOTE_AGENTS`. The A2A adapter still stores
+each final result as a tenant-scoped, digest-verified Task Artifact; `MAX_RESPONSE_SIZE` bounds it
+and `MAX_CHUNK_SIZE` splits it into append chunks. Remove retired `core.artifact.put` and
 `core.artifact.get` names from an existing `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` value before startup.
+
+Streaming clients get ADK-shaped progress on the A2A 0.3 JSON-RPC binding at `/`: reasoning as a
+`TextPart` marked `adk_thought`, tool calls and results as `DataPart`s marked
+`adk_type=function_call|function_response`, cumulative text snapshots flagged `partial`, and exactly
+one terminal `final:true` frame. `A2A_STREAMING_BUFFER_SIZE` sets how much text accumulates between
+frames, and `A2A_STREAMING_ENABLED=false` turns intermediate frames off.
 
 OpenAI-compatible API (OpenAI, vLLM, Ollama, LM Studio, OpenRouter, or another compatible gateway):
 
 ```bash
-MODEL_API_FORMAT=openai \
-MODEL_BASE_URL=https://your-provider.example/v1 \
-MODEL_NAME=your-model \
-MODEL_API_KEY=your-key \
-MODEL_REASONING_EFFORT=high \
+LLM_API_FORMAT=openai \
+LLM_API_BASE=https://your-provider.example/v1 \
+LLM_MODEL=your-model \
+LLM_API_KEY=your-key \
+THINKING_LEVEL=high \
 uv run core-agent
 ```
 
 Anthropic Messages API:
 
 ```bash
-MODEL_API_FORMAT=anthropic \
-MODEL_BASE_URL=https://api.anthropic.com/v1 \
-MODEL_NAME=your-model \
-MODEL_API_KEY=your-key \
-MODEL_REASONING_EFFORT=high \
+LLM_API_FORMAT=anthropic \
+LLM_API_BASE=https://api.anthropic.com/v1 \
+LLM_MODEL=your-model \
+LLM_API_KEY=your-key \
+THINKING_LEVEL=high \
 uv run core-agent
 ```
 
-`MODEL_REASONING_EFFORT` is optional; an empty value keeps the provider default. Supported values
+`THINKING_LEVEL` is optional; an empty value keeps the provider default. Supported values
 use the provider-neutral vocabulary `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`,
 but each provider/model may accept only a subset. OpenAI-compatible requests use
 `reasoning_effort`; Anthropic requests use adaptive thinking and `output_config.effort`.
@@ -129,14 +138,14 @@ MEMORY_NER_API_KEY=your-ner-key \
 uv run core-agent-memory
 ```
 
-`MODEL_ENDPOINT` overrides the complete request URL. Providers with custom authentication can use
-`MODEL_HEADERS_JSON`; optional provider parameters belong in `MODEL_EXTRA_BODY_JSON`. An API key is
+`LLM_ENDPOINT` overrides the complete request URL. Providers with custom authentication can use
+`LLM_HEADERS_JSON`; optional provider parameters belong in `LLM_EXTRA_BODY_JSON`. An API key is
 not required for a local OpenAI-compatible server:
 
 ```bash
-MODEL_API_FORMAT=openai \
-MODEL_BASE_URL=http://localhost:11434/v1 \
-MODEL_NAME=your-local-model \
+LLM_API_FORMAT=openai \
+LLM_API_BASE=http://localhost:11434/v1 \
+LLM_MODEL=your-local-model \
 uv run core-agent
 ```
 
@@ -156,7 +165,7 @@ operator control plane first. Workspaces default to `/tmp/core-agent/runs` and c
 `LOCAL_WORKSPACE_ROOT`.
 
 For a local Docker smoke run, copy `.env.example` to `.env`, set the database, model credentials,
-and optional `CORE_AGENT_PROFILE`, then run:
+and optional `AGENT_SYSTEM_PROMPT`, then run:
 
 ```bash
 docker compose up --build
@@ -171,7 +180,7 @@ docker compose logs -f agent
 The local Compose profile enables bounded, redacted content logging with
 `CORE_AGENT_LOG_CONTENT=true`, so each JSON line shows task transitions, model action states, tool
 names and arguments/results, approvals, subagent/background-task activity, and the public final
-answer. Set it to `false` for the production-safe metadata-only profile. `CORE_AGENT_LOG_LEVEL`
+answer. Set it to `false` for the production-safe metadata-only profile. `LOG_LEVEL`
 controls verbosity and `CORE_AGENT_LOG_MAX_CHARS` bounds each content field. With content logging
 enabled, provider-returned visible reasoning is recorded in a separate redacted `reasoning` field;
 provider-hidden/opaque thinking and credentials are never logged.

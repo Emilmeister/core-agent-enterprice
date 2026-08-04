@@ -17,7 +17,7 @@ from a2a.types import (
 )
 from cryptography.fernet import Fernet
 
-from core_agent.app import _agent, create_app
+from core_agent.app import create_app
 from core_agent.artifacts import PostgresArtifactStore
 from core_agent.database import (
     PostgresAuditLog,
@@ -27,15 +27,12 @@ from core_agent.database import (
     PostgresTaskStore,
 )
 from core_agent.errors import CoreError
-from core_agent.postgres_approvals import PostgresApprovalManager
 from core_agent.postgres_tasks import PostgresTaskScheduler
 from core_agent.push import (
     DurablePushNotificationSender,
     PostgresPushNotificationConfigStore,
 )
-from core_agent.tools import ToolCall
-from core_agent.approvals import ApproveAllControlPlane
-from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
+from core_agent.model import ModelResponse, ScriptedModel
 from core_agent.lifecycle import PostgresRetentionManager
 from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, WorkflowRecord
 from psycopg.types.json import Jsonb
@@ -47,8 +44,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "CORE_AGENT_STATE_BACKEND": "test",
-                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "SESSION_STORAGE_TYPE": "in-memory",
             },
             clear=True,
         ):
@@ -66,61 +62,13 @@ class ProductionConfigurationTests(unittest.TestCase):
         finally:
             app.state.close()
 
-    def test_production_rejects_test_state_backend(self):
-        model = type("Model", (), {"model": "test-model"})()
-        with patch.dict(
-            os.environ,
-            {
-                "CORE_AGENT_ENVIRONMENT": "production",
-                "CORE_AGENT_STATE_BACKEND": "test",
-            },
-            clear=True,
-        ):
-            with self.assertRaises(CoreError) as caught:
-                create_app(model=model, control_plane=object())
-        self.assertEqual(caught.exception.code, "PRODUCTION_DATABASE_REQUIRED")
-
-    def test_postgres_backend_requires_database_url(self):
-        model = type("Model", (), {"model": "test-model"})()
-        with patch.dict(
-            os.environ,
-            {
-                "CORE_AGENT_ENVIRONMENT": "production",
-                "CORE_AGENT_STATE_BACKEND": "postgres",
-            },
-            clear=True,
-        ):
-            with self.assertRaises(CoreError) as caught:
-                create_app(model=model, control_plane=object())
-        self.assertEqual(caught.exception.code, "DATABASE_URL_REQUIRED")
-
-    def test_production_rejects_in_process_migration(self):
-        class Database:
-            def close(self):
-                pass
-
-        model = type("Model", (), {"model": "test-model"})()
-        with patch.dict(
-            os.environ,
-            {
-                "CORE_AGENT_ENVIRONMENT": "production",
-                "CORE_AGENT_STATE_BACKEND": "postgres",
-                "DATABASE_AUTO_MIGRATE": "true",
-            },
-            clear=True,
-        ):
-            with self.assertRaises(CoreError) as caught:
-                create_app(model=model, control_plane=object(), database=Database())
-        self.assertEqual(caught.exception.code, "PRODUCTION_AUTO_MIGRATE_FORBIDDEN")
-
     def test_builtin_allowlist_removes_disabled_tools_from_card_and_model(self):
         model = ScriptedModel([ModelResponse(message="ok")])
         model.model = "allowlist-model"
         with patch.dict(
             os.environ,
             {
-                "CORE_AGENT_STATE_BACKEND": "test",
-                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.task.list",
             },
             clear=True,
@@ -128,7 +76,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             app = create_app(model=model)
         try:
             result = app.state.core_agent.run(
-                {"prompt": "answer", "mcp": [], "skills": []}
+                {"prompt": "answer"}
             )
             self.assertEqual(result.message, "ok")
             self.assertEqual(model.calls[0].tools, frozenset({"core.task.list"}))
@@ -142,8 +90,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "CORE_AGENT_STATE_BACKEND": "test",
-                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.artifact.get",
             },
             clear=True,
@@ -158,8 +105,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "CORE_AGENT_STATE_BACKEND": "test",
-                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "SESSION_STORAGE_TYPE": "in-memory",
             },
             clear=True,
         ):
@@ -167,7 +113,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         try:
             prompt = "Actual request stays in the user context."
             app.state.core_agent.run(
-                {"prompt": prompt, "mcp": [], "skills": []}
+                {"prompt": prompt}
             )
             call = model.calls[0]
             self.assertIn(prompt, call.context)
@@ -176,7 +122,8 @@ class ProductionConfigurationTests(unittest.TestCase):
                 "Complete the user's task using available tools.", call.instructions
             )
             self.assertIn("Delegate a coherent outcome", call.instructions)
-            self.assertNotIn("PYTHON:", call.instructions)
+            # Python is a plain built-in now: no HITL gate hides it.
+            self.assertIn("PYTHON:", call.instructions)
             self.assertNotIn("core.artifact.put", call.tools)
             self.assertNotIn("core.artifact.get", call.tools)
 
@@ -210,8 +157,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "CORE_AGENT_STATE_BACKEND": "test",
-                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": "without_terminal",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
                     "core.terminal.exec,core.python.exec,core.task.start,core.task.get,"
@@ -224,12 +170,13 @@ class ProductionConfigurationTests(unittest.TestCase):
             app = create_app(model=model)
         try:
             result = app.state.core_agent.run(
-                {"prompt": "answer", "mcp": [], "skills": []}
+                {"prompt": "answer"}
             )
             self.assertEqual(result.message, "ok")
             self.assertNotIn("core.terminal.exec", model.calls[0].tools)
-            self.assertNotIn("core.python.exec", model.calls[0].tools)
             self.assertNotIn("core.task.start", model.calls[0].tools)
+            # without_terminal removes terminal tools, not Python.
+            self.assertIn("core.python.exec", model.calls[0].tools)
             self.assertIn("core.delegate", model.calls[0].tools)
             self.assertIn("core.task.wait", model.calls[0].tools)
             advertised = {
@@ -238,7 +185,8 @@ class ProductionConfigurationTests(unittest.TestCase):
             self.assertEqual(advertised, set(model.calls[0].tools))
             execution = app.state.core_agent.agent_config.to_dict()["execution"]
             self.assertEqual(execution["runtime_mode"], "without_terminal")
-            self.assertEqual(execution["environment_profile"], "no-local-execution")
+            # Python stays available, so the profile honestly reports local execution.
+            self.assertEqual(execution["environment_profile"], "local-python")
         finally:
             app.state.close()
 
@@ -247,8 +195,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "CORE_AGENT_STATE_BACKEND": "test",
-                "LOCAL_APPROVAL_DB_PATH": ":memory:",
+                "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": "maybe",
             },
             clear=True,
@@ -257,24 +204,13 @@ class ProductionConfigurationTests(unittest.TestCase):
                 create_app(model=model)
         self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
-    def test_python_exec_requires_local_operator_to_be_fully_disabled(self):
-        for runtime_mode in ("with_terminal", "without_terminal"):
-            for local_approval, expected in (("true", False), ("false", True)):
-                with self.subTest(
-                    runtime_mode=runtime_mode, local_approval=local_approval
-                ):
-                    self._assert_python_gate(runtime_mode, local_approval, expected)
-
     def _assert_python_gate(self, runtime_mode, local_approval, expected):
         model = ScriptedModel([ModelResponse(message="ok")])
         model.model = "python-gate-model"
         with patch.dict(
             os.environ,
             {
-                "CORE_AGENT_STATE_BACKEND": "test",
-                "LOCAL_APPROVAL_DB_PATH": ":memory:",
-                "LOCAL_APPROVAL_ENABLED": local_approval,
-                "CORE_AGENT_APPROVAL_MODE": "never",
+                "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": runtime_mode,
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.python.exec",
             },
@@ -283,7 +219,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             app = create_app(model=model)
         try:
             app.state.core_agent.run(
-                {"prompt": "answer", "mcp": [], "skills": []}
+                {"prompt": "answer"}
             )
             self.assertEqual("core.python.exec" in model.calls[0].tools, expected)
             advertised = {
@@ -315,11 +251,33 @@ class PostgresRestartTests(unittest.TestCase):
     def _database(self):
         return PostgresDatabase(os.environ["TEST_DATABASE_URL"], min_size=0, max_size=3)
 
+    def test_pool_replaces_a_connection_the_server_closed_while_idle(self):
+        """Managed PostgreSQL drops idle connections; the caller must not see it."""
+        import psycopg
+
+        database = PostgresDatabase(
+            os.environ["TEST_DATABASE_URL"], min_size=1, max_size=1
+        )
+        try:
+            with database.pool.connection() as connection:
+                pid = connection.execute("SELECT pg_backend_pid() AS pid").fetchone()[
+                    "pid"
+                ]
+            # Kill that pooled connection from outside, as an idle timeout would.
+            with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as killer:
+                killer.execute("SELECT pg_terminate_backend(%s)", (pid,))
+            for _ in range(3):
+                with database.pool.connection() as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT 1 AS ok").fetchone()["ok"], 1
+                    )
+        finally:
+            database.close()
+
     def _reset(self, database):
         with database.transaction() as connection:
             connection.execute(
-                """TRUNCATE core_execution_records, core_approval_requests,
-                   core_tool_proposals, core_events, core_checkpoints,
+                """TRUNCATE core_events, core_checkpoints,
                    core_audit_records, core_a2a_tasks, core_runs,
                    core_background_tasks, core_notifications, core_outbox,
                    core_push_notification_configs, core_push_deliveries,
@@ -329,7 +287,6 @@ class PostgresRestartTests(unittest.TestCase):
     def _state(self, database):
         return {
             "database": database,
-            "approvals": PostgresApprovalManager(database),
             "events": PostgresEventStore(database),
             "checkpoints": PostgresCheckpointStore(database),
             "audit": PostgresAuditLog(database),
@@ -337,49 +294,6 @@ class PostgresRestartTests(unittest.TestCase):
             "workflow": PostgresWorkflowStore(database),
             "scheduler": PostgresTaskScheduler,
         }
-
-    def test_all_production_state_survives_pool_restart_and_is_scoped(self):
-        database = self._database()
-        database.migrate()
-        self._reset(database)
-        approvals = PostgresApprovalManager(database)
-        approval = approvals.request(
-            ToolCall("call-1", "core.terminal.exec", {"argv": ["true"]}),
-            risks={"local_execution"},
-            task_id="task-1",
-            context_id="context-1",
-            tenant_id="tenant-1",
-            caller_principal_id="owner-1",
-        )
-        PostgresEventStore(database).append("run-1", "task.started", {"ok": True})
-        PostgresCheckpointStore(database).save("run-1", 1, {"state": "working"})
-        PostgresAuditLog(database).append("run-1", "task.started", {"ok": True})
-        context = ServerCallContext(user=NamedUser(), tenant="tenant-1")
-        task_store = PostgresTaskStore(database)
-        task = Task(
-            id="task-1",
-            context_id="context-1",
-            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
-        )
-        asyncio.run(task_store.save(task, context))
-        database.close()
-
-        reopened = self._database()
-        try:
-            reopened.verify_schema()
-            self.assertEqual(PostgresApprovalManager(reopened).get(approval.id).state, "PENDING")
-            self.assertEqual(PostgresEventStore(reopened).revision("run-1"), 1)
-            self.assertEqual(
-                PostgresCheckpointStore(reopened).load("run-1"),
-                (1, {"state": "working"}),
-            )
-            self.assertEqual(len(PostgresAuditLog(reopened).records("run-1")), 1)
-            reopened_tasks = PostgresTaskStore(reopened)
-            self.assertEqual(asyncio.run(reopened_tasks.get("task-1", context)).id, "task-1")
-            other_tenant = ServerCallContext(user=NamedUser(), tenant="tenant-2")
-            self.assertIsNone(asyncio.run(reopened_tasks.get("task-1", other_tenant)))
-        finally:
-            reopened.close()
 
     def test_terminal_workflow_reconciles_same_a2a_task_and_artifact_after_crash(self):
         database = self._database()
@@ -396,7 +310,7 @@ class PostgresRestartTests(unittest.TestCase):
                 None,
                 "RUNNING",
                 1,
-                {"prompt": "work", "mcp": [], "skills": []},
+                {"prompt": "work"},
                 {"turns": 1},
             )
         )
@@ -425,34 +339,6 @@ class PostgresRestartTests(unittest.TestCase):
         self.assertEqual(task.artifacts[0].parts[0].text, "recovered result")
         self.assertEqual(store.reconcile_from_workflows(), 0)
         database.close()
-
-    def test_stock_production_entrypoint_builds_private_operator_plane(self):
-        database = self._database()
-        database.migrate()
-        model = ScriptedModel([ModelResponse(message="ok")])
-        model.model = "production-model"
-        with tempfile.TemporaryDirectory() as durable, patch.dict(
-            os.environ,
-            {
-                "CORE_AGENT_ENVIRONMENT": "production",
-                "CORE_AGENT_STATE_BACKEND": "postgres",
-                "DATABASE_AUTO_MIGRATE": "false",
-                "OPERATOR_JWT_HS256_SECRET": "x" * 32,
-                "OPERATOR_JWT_ISSUER": "operator-issuer",
-                "OPERATOR_JWT_AUDIENCE": "operator-api",
-                "LOCAL_APPROVAL_EXTENSION_URI": "https://agent.example/extensions/local-approval/v1",
-                "PUSH_NOTIFICATION_ENCRYPTION_KEY": Fernet.generate_key().decode(),
-                "DURABLE_STORAGE_ROOT": durable,
-            },
-            clear=True,
-        ):
-            app = create_app(model=model, database=database)
-        try:
-            paths = {getattr(route, "path", "") for route in app.routes}
-            self.assertIn("/internal/approvals", paths)
-            self.assertFalse(app.state.operator_control_plane.automatic)
-        finally:
-            app.state.close()
 
     def test_push_delivery_is_encrypted_deduplicated_and_retried_after_restart(self):
         database = self._database()
@@ -570,7 +456,7 @@ class PostgresRestartTests(unittest.TestCase):
                 None,
                 "RUNNING",
                 1,
-                {"prompt": "private", "mcp": [], "skills": []},
+                {"prompt": "private"},
                 {"context": "private transcript"},
             ),
             audit=(("task.started", {"content": False}),),
@@ -585,7 +471,7 @@ class PostgresRestartTests(unittest.TestCase):
                 root.run_id,
                 "RUNNING",
                 1,
-                {"prompt": "child private", "mcp": [], "skills": []},
+                {"prompt": "child private"},
                 {"context": "child transcript"},
             )
         )
@@ -653,7 +539,7 @@ class PostgresRestartTests(unittest.TestCase):
                 None,
                 "RUNNING",
                 1,
-                {"prompt": "test", "mcp": [], "skills": []},
+                {"prompt": "test"},
                 {"turns": 0},
             ),
             audit=(("task.started", {"safe": True}),),
@@ -670,7 +556,7 @@ class PostgresRestartTests(unittest.TestCase):
                 created.run_id,
                 "RUNNING",
                 1,
-                {"prompt": "child", "mcp": [], "skills": []},
+                {"prompt": "child"},
                 {"turns": 0},
             ),
             budget_limits=(100, 100),
@@ -771,7 +657,7 @@ class PostgresRestartTests(unittest.TestCase):
                 None,
                 "RUNNING",
                 1,
-                {"prompt": "initial", "mcp": [], "skills": []},
+                {"prompt": "initial"},
                 {"turns": 1},
             )
         )
@@ -860,143 +746,3 @@ class PostgresRestartTests(unittest.TestCase):
         finally:
             reopened.close()
 
-    def test_agent_approval_continues_after_complete_process_state_loss(self):
-        database = self._database()
-        database.migrate()
-        self._reset(database)
-        first_model = ScriptedModel(
-            [
-                ModelResponse(
-                    tool_requests=(
-                        ToolRequest(
-                            "call-restart",
-                            "core.terminal.exec",
-                            {"argv": ["python", "-c", "print('once')"]},
-                        ),
-                    )
-                )
-            ]
-        )
-        first_model.model = "restart-model"
-        environment = {
-            "CORE_AGENT_TRUST_TERMINAL": "0",
-            "CORE_AGENT_APPROVAL_MODE": "on_risk",
-            "LOCAL_WORKSPACE_ROOT": "/tmp/core-agent-restart-test",
-        }
-        with patch.dict(os.environ, environment):
-            first, first_telemetry = _agent(first_model, state=self._state(database))
-            pending = first.run(
-                {"prompt": "run once", "mcp": [], "skills": []},
-                task_id="restart-task",
-                identity="owner-1",
-                session_id="context-1",
-                tenant_id="tenant-1",
-            )
-        approval_id = pending.request.id
-        run_id = pending.run_id
-        first.close()
-        first_telemetry.shutdown()
-        database.close()
-
-        reopened = self._database()
-        second_model = ScriptedModel([ModelResponse(message="continued")])
-        second_model.model = "restart-model"
-        with patch.dict(os.environ, environment):
-            second, second_telemetry = _agent(
-                second_model, state=self._state(reopened)
-            )
-            reserved = second.reserve_local_approval(
-                "restart-task", approval_id, ApproveAllControlPlane()
-            )
-            result = second.dispatch_reserved_approval(
-                "restart-task", approval_id, reserved.execution_id
-            )
-        try:
-            self.assertEqual(result.message, "continued")
-            self.assertEqual(len(second_model.calls), 1)
-            self.assertEqual(
-                PostgresApprovalManager(reopened).execution_for(approval_id).state,
-                "SUCCEEDED",
-            )
-            record = PostgresWorkflowStore(reopened).get(
-                run_id, tenant_id="tenant-1", owner_id="owner-1"
-            )
-            self.assertEqual(record.state, "COMPLETED")
-        finally:
-            second.close()
-            second_telemetry.shutdown()
-            reopened.close()
-
-    def test_dispatched_side_effect_is_aborted_not_retried_after_restart(self):
-        database = self._database()
-        database.migrate()
-        self._reset(database)
-        model = ScriptedModel(
-            [
-                ModelResponse(
-                    tool_requests=(
-                        ToolRequest(
-                            "unknown-call",
-                            "core.terminal.exec",
-                            {"argv": ["python", "-c", "print('must-not-repeat')"]},
-                        ),
-                    )
-                )
-            ]
-        )
-        model.model = "restart-model"
-        environment = {
-            "CORE_AGENT_TRUST_TERMINAL": "0",
-            "CORE_AGENT_APPROVAL_MODE": "on_risk",
-            "LOCAL_WORKSPACE_ROOT": "/tmp/core-agent-unknown-test",
-        }
-        with patch.dict(os.environ, environment):
-            agent, telemetry = _agent(model, state=self._state(database))
-            pending = agent.run(
-                {"prompt": "unknown outcome", "mcp": [], "skills": []},
-                task_id="unknown-task",
-                identity="owner-1",
-                session_id="context-1",
-                tenant_id="tenant-1",
-            )
-            reserved = agent.reserve_local_approval(
-                "unknown-task", pending.request.id, ApproveAllControlPlane()
-            )
-        call = ToolCall(
-            "unknown-call",
-            "core.terminal.exec",
-            {"argv": ["python", "-c", "print('must-not-repeat')"]},
-        )
-        PostgresApprovalManager(database).authorize_dispatch(pending.request.id, call)
-        workflows = PostgresWorkflowStore(database)
-        current = workflows.lookup_task("unknown-task")
-        workflows.transition(
-            current.run_id,
-            tenant_id=current.tenant_id,
-            owner_id=current.owner_id,
-            expected_version=current.version,
-            state="EXECUTING",
-            snapshot={**current.snapshot, "execution_id": reserved.execution_id},
-            event_kind="tool.intent",
-            pending_approval_id=pending.request.id,
-        )
-        agent.close()
-        telemetry.shutdown()
-        database.close()
-
-        reopened = self._database()
-        empty_model = ScriptedModel([])
-        empty_model.model = "restart-model"
-        with patch.dict(os.environ, environment):
-            recovered, recovered_telemetry = _agent(
-                empty_model, state=self._state(reopened)
-            )
-        try:
-            record = PostgresWorkflowStore(reopened).lookup_task("unknown-task")
-            self.assertEqual(record.state, "ABORTED")
-            self.assertEqual(record.error_code, "SIDE_EFFECT_UNKNOWN")
-            self.assertEqual(empty_model.calls, ())
-        finally:
-            recovered.close()
-            recovered_telemetry.shutdown()
-            reopened.close()

@@ -12,11 +12,13 @@
 
 | ID | Требование v1 | Доказательство | Статус |
 |---|---|---|---|
-| A2A-01 | Agent Card, Core extension и version negotiation | `test_a2a_config`, `test_advanced_protocols` | implemented |
+| A2A-01 | Agent Card и version negotiation без собственного расширения протокола | `test_a2a_config`, `test_advanced_protocols` | implemented |
 | A2A-02 | send/stream/get/list/subscribe/cancel используют одну durable Task | `test_end_to_end`, PostgreSQL A2A reconciliation | implemented |
 | A2A-03 | push notification at-least-once и deduplication | encrypted push retry/restart integration | implemented |
 | A2A-04 | active Task принимает durable/idempotent follow-up Messages и доставляет их model loop на safe boundary без completion race | runtime concurrency, A2A HTTP E2E и PostgreSQL inbox/completion-gate tests | implemented |
+| A2A-05 | streaming публикует reasoning, function_call/function_response и кумулятивные partial-снимки, ровно один `final:true`, а partial-кадры не попадают в durable history и push | ADK stream shape E2E, transient-history и push suppression tests | implemented |
 | CFG-01 | Platform/Agent/Run разделены, capability intersection fail closed | effective-config contract suite | implemented |
+| CFG-03 | deployment variables разбираются по фиксированному контракту, а неизвестное или конфликтующее значение fail closed | configuration transfer suite | implemented |
 | CFG-02 | disabled capability отсутствует в card/catalog и stale call denied | built-in allowlist/runtime-mode card and model tests | implemented |
 | KRN-01 | versioned kernel отдельно от profile, runtime enforcement | protected kernel persistence test | implemented |
 | KRN-02 | child наследует kernel и не расширяет policy | delegation E2E and exact catalog tests | implemented |
@@ -34,13 +36,11 @@
 | SUB-01 | child является durable Task с exact capabilities/shared memory policy | delegation and child-memory E2E | implemented |
 | SUB-02 | общий parent budget, hard depth `2`/fan-out и обычный child text result | depth-2 catalog/kernel E2E, stale-call guard and atomic budget/fan-out tests | implemented |
 | SUB-03 | outcome contract сохраняет bounded method autonomy при minimum sufficient/exact capabilities | delegation kernel/description contract tests | implemented |
+| ART-01 | артефакты именованные, scoped и версионируемые внутри агента; save не перезаписывает, load проверяет digest/size/metadata, backends не управляют схемой | artifact service and tool contract suite | implemented |
+| RMT-01 | реестр `REMOTE_AGENTS` fail-open при недоступном peer, tool скрыт без настроенных агентов, downstream получает только allowlist заголовков, прогресс ретранслируется, сбой возвращается tool result | remote agent registry, forwarded header and send_message E2E | implemented |
 | TER-01 | owned PTY/process groups/workspaces и bounded output | local terminal integration suite | implemented |
 | TER-02 | immutable base snapshot, conflict-aware merge и S3 manifest | content-addressed snapshot/merge tests | implemented |
-| PY-01 | bounded Python process вызывает exact built-in/MCP tools через policy/budget/audit/OTel broker только без HITL | Python broker E2E, mode gate and process failure tests | implemented |
-| HITL-01 | private authority, frozen digest и single reservation | approval digest/race suite | implemented |
-| HITL-02 | wait transition, A2A status, checkpoint, audit и outbox atomic | PostgreSQL HITL continuation/reconciliation tests | implemented |
-| HITL-03 | approval/rejection/cancel/recovery сохраняют IDs и at-most-once | operator A2A and crash-at-dispatch tests | implemented |
-| CTL-01 | production private operator API с отдельной auth audience | operator JWT authority E2E | implemented |
+| PY-01 | bounded Python process вызывает exact built-in/MCP tools через policy/budget/audit/OTel broker | Python broker E2E, mode gate and process failure tests | implemented |
 | DB-01 | PostgreSQL schema/pool/migration role/readiness без fallback | real PostgreSQL CI suite | implemented |
 | DB-02 | все production rows tenant-scoped и cross-tenant not-found | tenant isolation and artifact tests | implemented |
 | OTL-01 | OTLP traces/metrics/logs, one A2A execution trace without transport/submission trace, per-signal routing и W3C propagation | OTLP HTTP/per-signal collector, Compose contract and A2A/MCP propagation tests | implemented |

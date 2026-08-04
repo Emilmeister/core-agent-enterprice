@@ -12,7 +12,7 @@ Telemetry не заменяет durable audit: sampling или недоступ�
 
 ### Traces
 
-Показывают causal path A2A request, Task, model turns, tools, MCP, memory pipeline, background jobs, сабагентов, approvals и terminal sessions/processes.
+Показывают causal path A2A request, Task, model turns, tools, MCP, memory pipeline, background jobs, сабагентов и terminal sessions/processes.
 
 ### Metrics
 
@@ -22,13 +22,40 @@ Telemetry не заменяет durable audit: sampling или недоступ�
 
 Structured logs описывают operator diagnostics и correlation с trace/span. Prompt, memory content, tool arguments/output и secrets не логируются по умолчанию.
 
-Runtime MUST писать в stdout контейнера однострочные JSON records минимум для Task lifecycle, model turn/action, tool call/outcome, approval, background/subagent lifecycle, compaction и terminal errors. Record содержит canonical tool name, run/task/context IDs и trace/span IDs при наличии. `CORE_AGENT_LOG_CONTENT=false` является безопасным default; explicit local operator profile MAY включить bounded prompt, public model response, tool arguments и normalized output через `CORE_AGENT_LOG_CONTENT=true`. Перед записью content проходит redaction и truncation.
+Runtime MUST писать в stdout контейнера однострочные JSON records минимум для Task lifecycle, model turn/action, tool call/outcome, background/subagent lifecycle, compaction и terminal errors. Record содержит canonical tool name, run/task/context IDs и trace/span IDs при наличии. `CORE_AGENT_LOG_CONTENT=false` является безопасным default; explicit local operator profile MAY включить bounded prompt, public model response, tool arguments и normalized output через `CORE_AGENT_LOG_CONTENT=true`. Перед записью content проходит redaction и truncation.
 
 Без content mode model record показывает только безопасное состояние решения (`continue_reasoning`, `request_tools`, `final_answer`), наличие reasoning, finish reason и token usage. При `CORE_AGENT_LOG_CONTENT=true` provider-returned visible reasoning/summary MAY записываться отдельным полем `reasoning` после redaction и truncation. Provider-hidden chain-of-thought, encrypted/redacted thinking, signatures и opaque replay data не логируются никогда.
 
+## Диагностика конфигурации при старте
+
+Runtime MUST записать при старте одну структурированную запись `startup.configuration`, описывающую фактически собранную конфигурацию. Она отвечает на вопрос «почему capability отсутствует» без чтения кода и без повторного развёртывания.
+
+Запись MUST содержать как минимум:
+
+- runtime mode и итоговый список built-in tools в каталоге;
+- объявленные MCP-серверы и allowlist их тулов;
+- заданные в конфигурации URL удалённых агентов, имена подключившихся и причины отказа для остальных. Одного списка подключившихся недостаточно: пустой список одинаково выглядит и когда переменная не дошла до контейнера, и когда она дошла, но ни один пир не ответил, а действия оператора в этих случаях противоположны. URL выводится без userinfo.
+- backend артефактов, session/task storage и streaming;
+- фактический OTLP endpoint по каждому сигналу и булев признак наличия credentials, но не их значение;
+- имя модели, её API format и endpoint host.
+
+Дополнительно runtime MUST записать `capabilities.resolved` при первом разрешении capabilities в процессе: она содержит фактический каталог tools модели и, отдельно по серверам, обнаруженные и разрешённые MCP-тулы. Startup-записи недостаточно, потому что MCP-каталог становится известен только при подключении, а расхождение между обнаруженным и разрешённым и есть типичная причина «тул не виден».
+
+Экспорт телеметрии отказывает кодом транспорта, который SDK печатает без адреса. Поэтому конфигурация экспортёра MUST присутствовать в `startup.configuration` отдельно по сигналам: `403` на логах при работающих трассах означает либо другой endpoint, либо недостаточную область ключа, и без адреса эти случаи неразличимы.
+
+Обе записи MUST подчиняться общим правилам редактирования: секреты, полные URL с credentials и содержимое не выводятся. Значение credential MUST NOT попадать в запись; допустимо имя переменной и host.
+
+Записи MUST выводиться независимо от `CORE_AGENT_LOG_CONTENT`: это описание конфигурации, а не содержимого.
+
+Помимо структурированной записи runtime MUST напечатать при старте одну короткую однострочную запись обычным текстом о состоянии `REMOTE_AGENTS`: заданные URL без userinfo и имена подключившихся, а при отсутствии значения — предупреждение о том, что `core.agent.send_message` недоступен, с указанием, переменная не задана вовсе или задана пустой. Эти два случая требуют противоположных действий: в первом переменной нет в развёртывании, во втором платформа не подставила значение, — а трактовка пустого значения как незаданного их уравнивает. В том же предупреждении runtime MUST перечислить имена присутствующих переменных окружения, относящихся к агентам, без значений: платформа развёртывания может публиковать список пиров под собственным именем, и без перечня имён оператор не отличит «платформа ничего не передала» от «передала под другим именем». Значения не выводятся, потому что переменная может оказаться credential. `startup.configuration` — самая длинная строка, которую пишет процесс, и сборщики логов развёртывания усекают или отбрасывают её именно тогда, когда конфигурация сложна; короткая строка сохраняет тот единственный факт, который отличает «переменная не доехала» от «пиры отказали». Требование к длинной записи это не отменяет.
+
+Runtime MUST настроить собственный log handler до эмиссии `startup.configuration` и не полагаться на то, что это сделал внешний entrypoint. Запись рождается при сборке приложения, то есть раньше, чем ASGI-сервер настраивает логирование; без собственной настройки она теряется именно в тех развёртываниях, где нужна больше всего.
+
+`capabilities.resolved` MUST различать «сервер не подключён» и «подключён, но каталог пуст»: это разные причины отсутствия тула и разные действия оператора. Неудача подключения MCP-сервера MUST порождать отдельную запись с именем сервера и кодом ошибки, даже когда сервер не является `required` и его пропуск не прерывает run. Запись MUST называть и причину: транспортный код или сообщение нижнего уровня после редактирования. Один общий код без причины не позволяет отличить неверный URL от отказа TLS, недоступного host и отклонённого протокола, а именно этот выбор определяет, что оператору чинить.
+
 ## OTLP deployment configuration
 
-Runtime MUST поддерживать стандартные OTLP/HTTP environment variables: общий base endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` и точные per-signal endpoints `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. Per-signal value имеет приоритет над общим endpoint. Если задан общий endpoint, runtime добавляет стандартные paths `/v1/traces`, `/v1/metrics`, `/v1/logs`; per-signal value уже является полным URL и не изменяется.
+Runtime MUST поддерживать стандартные OTLP/HTTP environment variables: общий base endpoint `OTEL_ENDPOINT` и точные per-signal endpoints `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. Per-signal value имеет приоритет над общим endpoint. Если задан общий endpoint, runtime добавляет стандартные paths `/v1/traces`, `/v1/metrics`, `/v1/logs`; per-signal value уже является полным URL и не изменяется.
 
 Production profile MUST предоставить destination для всех трёх signals, напрямую или через OTel Collector. Deployment с backend-ом, принимающим только часть signals, MUST задавать только поддерживаемые per-signal endpoints и не отправлять ему неподдерживаемые requests. Отсутствующий endpoint не отключает instrumentation и не влияет на durable audit.
 
@@ -94,7 +121,7 @@ core_agent.notification.deliver
 
 Core Agent MUST NOT создавать fake internal memory spans: он создаёт MCP client span. Memory Service владеет detailed indexing/retrieval spans и продолжает trace через propagated context.
 
-Операция с duration получает span. Point-in-time transition (`approval required`, `task state changed`, `memory revision published`, `compaction completed`) записывается OTel event/log record с timestamp и безопасными attributes.
+Операция с duration получает span. Point-in-time transition (`task state changed`, `memory revision published`, `compaction completed`) записывается OTel event/log record с timestamp и безопасными attributes.
 
 ## Span attributes
 
@@ -105,7 +132,7 @@ Core Agent MUST NOT создавать fake internal memory spans: он созд
 - service/core version, deployment environment и component;
 - operation name, outcome/error type и retry attempt;
 - model provider/model capability route и token usage;
-- tool namespace/type и risk decision без arguments;
+- tool namespace/type и policy decision без arguments;
 - task type/state, parent/child depth и detached flag;
 - memory scope/kind, index revision, retriever type и candidate count;
 - compaction base/working tokens и before/after working occupancy;
@@ -141,7 +168,7 @@ Core Agent MUST публиковать минимум:
 - active/queued/waiting/background Tasks и queue age;
 - model calls, latency, first-token latency, token usage и estimated cost;
 - tool/MCP calls, latency, retries, denials и unknown side effects;
-- approvals/input requested, approved, denied и timed out;
+- input requested, provided и timed out;
 - compaction count, base tokens, working before/after ratio и failures;
 - Memory MCP client latency/outcome и configured/filtered state;
 - background/subagent count, depth, fan-out, duration и budget usage;
@@ -170,7 +197,7 @@ Durable audit хранит:
 - A2A protocol/extension versions, Message/Task/Artifact revisions;
 - kernel/profile/policy versions;
 - model routes без hidden reasoning;
-- tool intents, safe normalized arguments digests, approvals и outcomes;
+- tool intents, safe normalized arguments digests и outcomes;
 - background/subagent contracts и notifications;
 - Memory MCP request/result IDs, server/index revisions и safe mutation outcomes; полный candidate/mutation audit принадлежит Memory Service;
 - NER/embedding/reranker versions и index publication;
@@ -187,6 +214,6 @@ Audit record SHOULD хранить trace/span IDs для перехода от p
 
 ## Evals и quality signals
 
-Versioned eval hooks измеряют task completion, compaction fidelity, hybrid retrieval/rerank quality, NER/entity resolution, tool correctness, false allow/deny, лишние approvals, subagent focus, duplicate side effects и cost/latency.
+Versioned eval hooks измеряют task completion, compaction fidelity, hybrid retrieval/rerank quality, NER/entity resolution, tool correctness, false allow/deny, subagent focus, duplicate side effects и cost/latency.
 
 Eval data подчиняется тем же ACL/retention. Evaluation output не становится memory без отдельного validated memory write.

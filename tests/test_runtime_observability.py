@@ -30,9 +30,6 @@ from core_agent.observability import FailingExporter, RecordingExporter, Telemet
 from core_agent.runtime import CoreAgent
 from core_agent.tasks import TaskScheduler
 from core_agent.tools import (
-    ApprovalManager,
-    ApprovalMode,
-    PolicyEngine,
     ToolDefinition,
     ToolRegistry,
     ToolRuntime,
@@ -86,8 +83,7 @@ def platform():
             "mcp",
             "human_input",
         },
-        a2a_protocol_versions=("1.0",),
-        a2a_bindings=("HTTP+JSON",),
+        a2a_interfaces=(("HTTP+JSON", "1.0"),),
         max_model_turns=10,
         max_tool_calls=10,
     )
@@ -128,7 +124,6 @@ def agent_config(memory="optional", *, max_turns=10):
                 "compact_at_working_ratio": 0.90,
                 "compact_to_working_ratio": 0.15,
             },
-            "approval": {"mode": "on_risk"},
             "execution": {"environment_profile": "local-pty-test"},
             "observability": {"otel_profile": "test"},
             "budgets": {"model_turns": max_turns, "tool_calls": 10},
@@ -136,27 +131,24 @@ def agent_config(memory="optional", *, max_turns=10):
     )
 
 
+MEMORY_MCP = {
+    "name": "memory",
+    "role": "memory",
+    "required": False,
+    "transport": {"type": "streamable_http", "url": "https://memory.test/mcp"},
+}
+
+
 def run_request(memory=True):
-    mcp = []
-    if memory:
-        mcp.append(
-            {
-                "name": "memory",
-                "role": "memory",
-                "required": False,
-                "transport": {
-                    "type": "streamable_http",
-                    "url": "https://memory.test/mcp",
-                },
-            }
-        )
-    return RunRequest.from_dict({"prompt": "Do it", "mcp": mcp, "skills": []})
+    # MCP is deployment configuration now; the flag only picks the agent fixture.
+    return RunRequest.from_dict({"prompt": "Do it"})
 
 
 def make_agent(
     model,
     *,
     memory="optional",
+    platform_mcp=(MEMORY_MCP,),
     connector=None,
     telemetry=None,
     max_turns=10,
@@ -179,8 +171,6 @@ def make_agent(
     )
     tool_runtime = ToolRuntime(
         registry,
-        PolicyEngine(ApprovalMode.ON_RISK),
-        ApprovalManager(),
         ExecutionEnvironmentManager(IsolatedBackend()),
     )
     return CoreAgent(
@@ -194,6 +184,7 @@ def make_agent(
         checkpoint_store=CheckpointStore(),
         audit_log=InMemoryAuditLog(),
         telemetry=telemetry or Telemetry(RecordingExporter()),
+        platform_mcp=platform_mcp,
         **agent_options,
     )
 
@@ -239,7 +230,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(started.wait(1))
         first = agent.enqueue_message(
             RunRequest.from_dict(
-                {"prompt": "first correction", "mcp": [], "skills": []}
+                {"prompt": "first correction"}
             ),
             task_id="steering-task",
             message_id="message-1",
@@ -249,7 +240,7 @@ class RuntimeTests(unittest.TestCase):
         )
         duplicate = agent.enqueue_message(
             RunRequest.from_dict(
-                {"prompt": "first correction", "mcp": [], "skills": []}
+                {"prompt": "first correction"}
             ),
             task_id="steering-task",
             message_id="message-1",
@@ -259,7 +250,7 @@ class RuntimeTests(unittest.TestCase):
         )
         second = agent.enqueue_message(
             RunRequest.from_dict(
-                {"prompt": "second correction", "mcp": [], "skills": []}
+                {"prompt": "second correction"}
             ),
             task_id="steering-task",
             message_id="message-2",
@@ -272,7 +263,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(CoreError) as wrong_context:
             agent.enqueue_message(
                 RunRequest.from_dict(
-                    {"prompt": "wrong context", "mcp": [], "skills": []}
+                    {"prompt": "wrong context"}
                 ),
                 task_id="steering-task",
                 message_id="message-wrong-context",
@@ -284,7 +275,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(CoreError) as wrong_owner:
             agent.enqueue_message(
                 RunRequest.from_dict(
-                    {"prompt": "wrong owner", "mcp": [], "skills": []}
+                    {"prompt": "wrong owner"}
                 ),
                 task_id="steering-task",
                 message_id="message-wrong-owner",
@@ -293,22 +284,6 @@ class RuntimeTests(unittest.TestCase):
                 tenant_id="tenant-1",
             )
         self.assertEqual(wrong_owner.exception.code, "TASK_NOT_FOUND")
-        with self.assertRaises(CoreError) as changed_capabilities:
-            agent.enqueue_message(
-                RunRequest.from_dict(
-                    {
-                        "prompt": "change capabilities",
-                        "mcp": [],
-                        "skills": [{"name": "new-skill"}],
-                    }
-                ),
-                task_id="steering-task",
-                message_id="message-new-capability",
-                identity="owner-1",
-                session_id="context-1",
-                tenant_id="tenant-1",
-            )
-        self.assertEqual(changed_capabilities.exception.code, "INVALID_REQUEST")
         release.set()
         worker.join(2)
         self.assertFalse(worker.is_alive())
@@ -326,7 +301,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(CoreError) as terminal:
             agent.enqueue_message(
                 RunRequest.from_dict(
-                    {"prompt": "too late", "mcp": [], "skills": []}
+                    {"prompt": "too late"}
                 ),
                 task_id="steering-task",
                 message_id="message-3",
@@ -341,7 +316,7 @@ class RuntimeTests(unittest.TestCase):
         model = ScriptedModel([ModelResponse(message="should not run")])
         agent = make_agent(model)
         with self.assertRaises(CoreError) as caught:
-            agent.run({"prompt": "x", "mcp": [], "skills": [], "extra": True})
+            agent.run({"prompt": "x", "extra": True})
         self.assertEqual(caught.exception.code, "INVALID_REQUEST")
         self.assertEqual(model.calls, ())
         self.assertEqual(agent.tool_runtime.execution_count, 0)
@@ -401,13 +376,7 @@ class RuntimeTests(unittest.TestCase):
             ]
         )
         agent = make_agent(model, memory="disabled", log_content=True)
-        request = RunRequest.from_dict(
-            {
-                "prompt": "run with sk-12345678901234567890",
-                "mcp": [],
-                "skills": [],
-            }
-        )
+        request = RunRequest.from_dict({"prompt": "run with sk-12345678901234567890"})
         try:
             with self.assertLogs("core_agent.runtime", level="INFO") as captured:
                 result = agent.run(request)
@@ -445,6 +414,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(final_model_record["prompt_tokens"], 20)
         self.assertEqual(final_model_record["completion_tokens"], 5)
         self.assertEqual(final_model_record["total_tokens"], 25)
+
+    def test_unreported_token_counter_stays_null_instead_of_redacted(self):
+        model = ScriptedModel(
+            [ModelResponse(message="done", prompt_tokens=7, total_tokens=7)]
+        )
+        agent = make_agent(model, memory="disabled")
+        try:
+            with self.assertLogs("core_agent.runtime", level="INFO") as captured:
+                agent.run(RunRequest.from_dict({"prompt": "count"}))
+        finally:
+            agent.close()
+
+        record = next(
+            json.loads(item.getMessage())
+            for item in captured.records
+            if json.loads(item.getMessage())["event"] == "model.response"
+        )
+        self.assertIn("reasoning_tokens", record)
+        self.assertIsNone(record["reasoning_tokens"])
+        self.assertEqual(record["prompt_tokens"], 7)
 
     def test_structured_logs_hide_provider_reasoning_without_content_capture(self):
         model = ScriptedModel(
@@ -971,20 +960,6 @@ class DurabilityTests(unittest.TestCase):
         with self.assertRaises(CoreError):
             leases.renew("run-1", "worker-a", first.token, ttl=1)
 
-    def test_recovery_restores_pending_approval_input_and_notifications(self):
-        events = InMemoryEventStore()
-        checkpoints = CheckpointStore()
-        events.append("run-1", "task.started", {})
-        events.append("run-1", "approval.required", {"approval_id": "apr-1"})
-        events.append("run-1", "input.required", {"input_id": "input-1"})
-        events.append("run-1", "task.notification", {"notification_id": "notice-1"})
-        checkpoints.save("run-1", events.revision("run-1"), {"state": "waiting"})
-        restored = RecoveryManager(events, checkpoints).recover("run-1")
-        self.assertEqual(restored.pending_approvals, ("apr-1",))
-        self.assertEqual(restored.pending_inputs, ("input-1",))
-        self.assertEqual(restored.pending_notifications, ("notice-1",))
-        self.assertEqual(restored.revision, events.revision("run-1"))
-
     def test_unknown_mutating_side_effect_is_not_replayed(self):
         events = InMemoryEventStore()
         checkpoints = CheckpointStore()
@@ -1035,7 +1010,7 @@ class ObservabilityTests(unittest.TestCase):
         agent = make_agent(model, memory="disabled", telemetry=telemetry)
         try:
             request = RunRequest.from_dict(
-                {"prompt": "Do it with provider-secret", "mcp": [], "skills": []}
+                {"prompt": "Do it with provider-secret"}
             )
             agent.run(request, session_id="context-1")
         finally:
@@ -1277,7 +1252,7 @@ class ObservabilityTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "OTEL_EXPORTER_OTLP_ENDPOINT": "",
+                "OTEL_ENDPOINT": "",
                 "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": endpoint,
                 "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "",
                 "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "",

@@ -64,6 +64,7 @@ class OtlpExporter:
         metric_endpoint=None,
         log_endpoint=None,
         service_name="core-agent",
+        api_key=None,
     ):
         from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
         from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
@@ -87,16 +88,28 @@ class OtlpExporter:
         trace_endpoint = trace_endpoint or (f"{base}/v1/traces" if base else None)
         metric_endpoint = metric_endpoint or (f"{base}/v1/metrics" if base else None)
         log_endpoint = log_endpoint or (f"{base}/v1/logs" if base else None)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        # The SDK reports an export failure by status code alone; without the
+        # resolved address a 403 on one signal cannot be told from a wrong URL.
+        self.configuration = {
+            "traces": trace_endpoint,
+            "metrics": metric_endpoint,
+            "logs": log_endpoint,
+            # Boolean only. The value never leaves the exporter.
+            "credentials_configured": bool(api_key),
+        }
         self.trace_provider = TracerProvider(resource=resource)
         if trace_endpoint:
             self.trace_provider.add_span_processor(
-                BatchSpanProcessor(OTLPSpanExporter(endpoint=trace_endpoint))
+                BatchSpanProcessor(
+                    OTLPSpanExporter(endpoint=trace_endpoint, headers=headers)
+                )
             )
         metric_readers = []
         if metric_endpoint:
             metric_readers.append(
                 PeriodicExportingMetricReader(
-                    OTLPMetricExporter(endpoint=metric_endpoint)
+                    OTLPMetricExporter(endpoint=metric_endpoint, headers=headers)
                 )
             )
         self.meter_provider = MeterProvider(
@@ -106,7 +119,9 @@ class OtlpExporter:
         self.logger_provider = LoggerProvider(resource=resource)
         if log_endpoint:
             self.logger_provider.add_log_record_processor(
-                BatchLogRecordProcessor(OTLPLogExporter(endpoint=log_endpoint))
+                BatchLogRecordProcessor(
+                    OTLPLogExporter(endpoint=log_endpoint, headers=headers)
+                )
             )
         self.tracer = self.trace_provider.get_tracer("core_agent", "1.0")
         self.meter = self.meter_provider.get_meter("core_agent", "1.0")
@@ -299,6 +314,7 @@ class Telemetry:
         log_endpoint=None,
         service_name="core-agent",
         content_enabled=False,
+        api_key=None,
     ):
         return cls(
             OtlpExporter(
@@ -307,6 +323,7 @@ class Telemetry:
                 metric_endpoint=metric_endpoint,
                 log_endpoint=log_endpoint,
                 service_name=service_name,
+                api_key=api_key,
             ),
             content_enabled=content_enabled,
         )
@@ -314,7 +331,7 @@ class Telemetry:
     @classmethod
     def otlp_from_env(cls, *, service_name="core-agent", content_enabled=None):
         endpoints = {
-            "endpoint": os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+            "endpoint": os.getenv("OTEL_ENDPOINT"),
             "trace_endpoint": os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
             "metric_endpoint": os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"),
             "log_endpoint": os.getenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"),
@@ -327,8 +344,9 @@ class Telemetry:
             ).lower() in {"1", "true", "yes"}
         return cls.otlp(
             **endpoints,
-            service_name=service_name,
+            service_name=os.getenv("OTEL_SERVICE_NAME") or service_name,
             content_enabled=content_enabled,
+            api_key=os.getenv("OTEL_API_KEY") or os.getenv("OTEL_ENDPOINT_API_KEY"),
         )
 
     def extract(self, carrier):

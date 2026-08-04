@@ -40,7 +40,7 @@ class ComposeContractTests(unittest.TestCase):
             self.assertEqual(
                 environment["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"], expected
             )
-            self.assertNotIn("OTEL_EXPORTER_OTLP_ENDPOINT", environment)
+            self.assertNotIn("OTEL_ENDPOINT", environment)
             self.assertEqual(
                 self.services[service_name]["depends_on"]["phoenix"]["condition"],
                 "service_healthy",
@@ -48,17 +48,17 @@ class ComposeContractTests(unittest.TestCase):
 
     def test_agent_profile_is_explicitly_configurable(self):
         environment = self.services["agent"]["environment"]
-        self.assertIn("CORE_AGENT_NAME", environment)
-        self.assertEqual(environment["CORE_AGENT_PROFILE"], "${CORE_AGENT_PROFILE:-}")
+        self.assertIn("AGENT_NAME", environment)
+        self.assertEqual(environment["AGENT_SYSTEM_PROMPT"], "${AGENT_SYSTEM_PROMPT:-}")
         self.assertEqual(
-            environment["MODEL_REASONING_EFFORT"], "${MODEL_REASONING_EFFORT:-}"
+            environment["THINKING_LEVEL"], "${THINKING_LEVEL:-}"
         )
         self.assertEqual(
             environment["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"],
             "${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-true}",
         )
         self.assertEqual(
-            environment["CORE_AGENT_LOG_LEVEL"], "${CORE_AGENT_LOG_LEVEL:-INFO}"
+            environment["LOG_LEVEL"], "${LOG_LEVEL:-INFO}"
         )
         self.assertEqual(
             environment["CORE_AGENT_LOG_CONTENT"],
@@ -73,11 +73,23 @@ class ComposeContractTests(unittest.TestCase):
             "${CORE_AGENT_RUNTIME_MODE:-with_terminal}",
         )
         self.assertIn("CORE_AGENT_ALLOWED_BUILTIN_TOOLS", environment)
-        self.assertEqual(
-            environment["LOCAL_APPROVAL_ENABLED"],
-            "${LOCAL_APPROVAL_ENABLED:-true}",
-        )
         self.assertIn("core.python.exec", environment["CORE_AGENT_ALLOWED_BUILTIN_TOOLS"])
+
+    def test_transfer_scheme_variables_are_wired_through_compose(self):
+        environment = self.services["agent"]["environment"]
+        for name, expected in (
+            ("AGENT_NAME", "${AGENT_NAME:-core-agent}"),
+            ("THINKING_ENABLED", "${THINKING_ENABLED:-true}"),
+            ("A2A_STREAMING_BUFFER_SIZE", "${A2A_STREAMING_BUFFER_SIZE:-10}"),
+            ("ARTIFACT_STORAGE_TYPE", "${ARTIFACT_STORAGE_TYPE:-in-memory}"),
+            ("REMOTE_AGENTS", "${REMOTE_AGENTS:-}"),
+            ("SEND_MESSAGE_API_KEY", "${SEND_MESSAGE_API_KEY:-}"),
+            ("USER_ID", "${USER_ID:-anonymous}"),
+            ("TASK_STORAGE_TYPE", "${TASK_STORAGE_TYPE:-postgres}"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(environment[name], expected)
+        self.assertEqual(environment["SESSION_STORAGE_TYPE"], "postgres")
 
 
 if __name__ == "__main__":

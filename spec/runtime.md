@@ -2,7 +2,7 @@
 
 ## Состояния запуска
 
-Полная state machine определена в [Архитектуре](architecture.md). Runtime MUST поддерживать durable ожидание approval/input, pause/resume и recovery, а не удерживать worker или model connection открытыми.
+Полная state machine определена в [Архитектуре](architecture.md). Runtime MUST поддерживать durable ожидание input, pause/resume и recovery, а не удерживать worker или model connection открытыми.
 
 Переход в терминальное состояние необратим.
 
@@ -10,7 +10,7 @@
 
 До первого вызова модели ядро MUST:
 
-1. провалидировать A2A Message/Core extension;
+1. провалидировать входящий A2A Message;
 2. вычислить immutable EffectiveConfig;
 3. создать `run_id`, event stream и начальный checkpoint;
 4. разрешить skills и MCP descriptors через effective policy;
@@ -36,7 +36,7 @@
 7. retrieved MCP results и transcript;
 8. данные, полученные от tools/MCP/A2A peers.
 
-Нижний уровень MUST NOT отменять верхний. Memory protocol, обязательные tools, delegation rules, task lifecycle, approvals, TerminalSession ownership/lifecycle и observability принадлежат KernelInstructions и одновременно enforced runtime-ом. AgentProfilePrompt не может их заменить. Полный contract описан в [Kernel instructions](kernel-instructions.md).
+Нижний уровень MUST NOT отменять верхний. Memory protocol, обязательные tools, delegation rules, task lifecycle, TerminalSession ownership/lifecycle и observability принадлежат KernelInstructions и одновременно enforced runtime-ом. AgentProfilePrompt не может их заменить. Полный contract описан в [Kernel instructions](kernel-instructions.md).
 
 Если prompt и skill противоречат друг другу без нарушения уровней 1–3, явный prompt имеет приоритет. Если безопасное разрешение неоднозначно, агент запрашивает уточнение через итоговый ответ, не угадывает.
 
@@ -48,10 +48,9 @@
 2. добавляет каждый принятый Message отдельным user turn с provenance и committed sequence;
 3. оценивает заполнение контекста и при необходимости выполняет compaction;
 4. вызывает модель с активным контекстом и доступными tool schemas;
-5. стримит пользовательский текст без скрытого reasoning;
+5. стримит пользовательский текст, вызовы инструментов и их результаты; provider-visible reasoning помечается отдельной частью, скрытый reasoning не передаётся;
 6. если модель завершила ответ — атомарно проверяет inbound inbox и завершает запуск только при отсутствии более раннего unread Message;
 7. если модель запросила tool — валидирует имя и arguments;
-8. оценивает риск, замораживает exact action и при необходимости durable-переходит в `WAITING_LOCAL_APPROVAL`;
 9. исполняет разрешённый tool, нормализует result и добавляет его в контекст;
 10. продолжает цикл, другую независимую работу или passive wait.
 
@@ -63,14 +62,14 @@
 
 Каждый accepted Message сохраняет исходные `messageId`, task/context IDs, authenticated caller provenance и monotonic inbox sequence, но поступает модели как недоверенный user-role input. Несколько Messages не склеиваются в один prompt и не подменяют system/kernel instructions. Unconsumed Messages pinned при compaction и recovery. Follow-up не сбрасывает и не увеличивает hard budgets.
 
-Message возобновляет `WAITING_INPUT` или `WAITING_TASK` run. В `PAUSED`, `WAITING_AUTH` и `WAITING_LOCAL_APPROVAL` он остаётся queued до разрешённого resume, потому что remote text не может снять host pause, заменить auth flow или изменить frozen action/authority boundary.
+Message возобновляет `WAITING_INPUT` или `WAITING_TASK` run. В `PAUSED` и `WAITING_AUTH` он остаётся queued до разрешённого resume, потому что remote text не может снять host pause или заменить auth flow.
 
 ## Reasoning
 
 - Ядро MUST использовать reasoning-capable режим модели, если он поддерживается выбранным provider.
-- Deployment MAY задать `MODEL_REASONING_EFFORT`; отсутствие значения оставляет provider default. OpenAI-compatible adapter передаёт его как `reasoning_effort`, Anthropic Messages — как `output_config.effort` с adaptive thinking. Неподдерживаемое provider-ом значение завершается обычной model error, а не silent downgrade.
+- Deployment MAY задать `THINKING_LEVEL`; отсутствие значения оставляет provider default. OpenAI-compatible adapter передаёт его как `reasoning_effort`, Anthropic Messages — как `output_config.effort` с adaptive thinking. Неподдерживаемое provider-ом значение завершается обычной model error, а не silent downgrade.
 - Уровень reasoning и model route являются Platform/Agent configuration: remote A2A caller не управляет ими через RunRequest, prompt, MCP или skill.
-- Provider-returned visible reasoning/summary не является публичным ответом и не попадает в A2A, audit, memory или tool arguments. Оно MAY появляться только в привилегированных operator logs/traces при соответствующем explicit content capture, после redaction и truncation.
+- Provider-returned visible reasoning/summary не является публичным ответом и не попадает в audit, memory или tool arguments. В A2A stream оно MAY публиковаться только как отдельная помеченная часть при включённом streaming и MUST вырезаться из терминального кадра и Artifact. В operator logs/traces оно появляется только при explicit content capture, после redaction и truncation.
 - Provider-hidden chain-of-thought, encrypted/redacted thinking, signatures и другие opaque replay data MUST NOT попадать в operator telemetry. Adapter MAY сохранить минимальный provider-native replay внутри owned workflow context, когда это требуется для продолжения tool conversation.
 - Известное число reasoning tokens является usage metadata и MAY экспортироваться без reasoning text.
 - Ядро MAY отдавать краткое резюме намерения или основания действия, сформулированное для пользователя.
@@ -90,7 +89,7 @@ Route описывается требованиями, а не именем мо
 
 ## Human input
 
-Если агенту не хватает факта или выбора, который нельзя безопасно вывести, он создаёт `input.required` со schema ожидаемого ответа и durable-переходит в `WAITING_INPUT`. Это отличается от approval: input даёт данные или решение задачи, approval разрешает уже сформулированный side effect.
+Если агенту не хватает факта или выбора, который нельзя безопасно вывести, он создаёт `input.required` со schema ожидаемого ответа и durable-переходит в `WAITING_INPUT`. Это запрос недостающих данных, а не разрешения: собственного human-in-the-loop для side effects в этом runtime нет.
 
 Runtime SHOULD объединять связанные вопросы в один запрос и не спрашивать то, что можно безопасно обнаружить доступными read-only tools.
 
@@ -104,7 +103,6 @@ Long-running tool, indexing job и сабагент запускаются ка�
 
 - задача выполнена и сформирован итоговый ответ;
 - безопасное продолжение требует новых пользовательских данных;
-- local operator отклонил критически необходимое protected action;
 - ожидаемый human input недоступен после policy timeout;
 - достигнут hard budget;
 - произошла невосстановимая ошибка;
@@ -112,7 +110,7 @@ Long-running tool, indexing job и сабагент запускаются ка�
 
 Наличие pending background task не требует держать run активно вычисляющимся. Agent MAY ничего не делать и ждать. Terminal completion допускается только если pending tasks отменены, detached по policy или явно не нужны результату.
 
-Отклонение approval не является автоматической ошибкой: tool result с отказом возвращается модели, чтобы она могла выбрать безопасную альтернативу или объяснить блокировку.
+Policy deny не является автоматической ошибкой: tool result с отказом возвращается модели, чтобы она могла выбрать альтернативу или объяснить блокировку.
 
 ## Budgets и защита от зацикливания
 
@@ -140,7 +138,7 @@ PlatformConfig/AgentConfig MUST задавать hard limits минимум дл
 - `pause` запрещает новые model/tools после ближайшей безопасной границы и создаёт checkpoint.
 - Worker MUST регулярно обновлять lease; только владелец актуального lease изменяет run.
 - Recovery воспроизводит state из event log, сверяет checkpoint и возвращает run в последнее доказуемо безопасное состояние.
-- Pending approval/input восстанавливаются с теми же IDs и revision.
+- Pending input восстанавливается с теми же IDs и revision.
 - Model streaming MAY быть перезапущен только если незавершённый ответ не породил side effect; частичный пользовательский текст помечается superseded.
 - Любая неопределённость вокруг внешней мутации требует reconciliation или `SIDE_EFFECT_UNKNOWN`, а не оптимистичного продолжения.
 - Доказанная runtime-ом ошибка schema/contract validation либо запуска process до dispatch и завершённые `failed`/`timed_out` tool outcomes записываются в context как tool result и возвращают workflow в `RUNNING`; модель получает следующий turn для исправления вызова или понятного ответа пользователю.

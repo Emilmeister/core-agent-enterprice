@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
+import json
+import logging
 from contextlib import asynccontextmanager
 
 from google.protobuf import json_format
+from google.protobuf.struct_pb2 import Value
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.request_handlers import DefaultRequestHandler
@@ -12,7 +14,12 @@ from a2a.server.request_handlers.request_handler import (
     validate,
     validate_request_params,
 )
-from a2a.server.routes import create_agent_card_routes, create_rest_routes
+from a2a.server.request_handlers.response_helpers import agent_card_to_dict
+from a2a.server.routes import (
+    create_jsonrpc_routes,
+    create_rest_routes,
+)
+from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH, DEFAULT_RPC_URL
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
 from a2a.types import (
     AgentCapabilities as SdkAgentCapabilities,
@@ -21,16 +28,17 @@ from a2a.types import (
     AgentInterface as SdkAgentInterface,
     AgentSkill as SdkAgentSkill,
     Part as SdkPart,
-    Message as SdkMessage,
     Role as SdkRole,
     Task as SdkTask,
     TaskState as SdkTaskState,
     TaskStatus as SdkTaskStatus,
 )
 from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route, request_response
 from a2a.utils.errors import (
     InvalidParamsError,
-    TaskNotCancelableError,
     TaskNotFoundError,
     UnsupportedOperationError,
 )
@@ -38,31 +46,22 @@ from a2a.utils.task import apply_history_length, validate_history_length
 
 from .a2a import (
     Artifact,
-    LOCAL_APPROVAL_STATUS_URI,
     Message,
     Part,
     parse_run_request,
 )
-from .runtime import ApprovalNeeded
+from .streaming import (
+    ADK_THOUGHT_KEY,
+    ADK_TYPE_KEY,
+    DEFAULT_BUFFER_SIZE,
+    FUNCTION_CALL_TYPE,
+    FUNCTION_RESPONSE_TYPE,
+    PARTIAL_KEY,
+    NullStreamPublisher,
+    StreamBuffer,
+)
 
 
-LOCAL_APPROVAL_WAIT_TEXT = (
-    "Execution is waiting for authorization from the serving agent's local "
-    "operator. The caller cannot approve or deny this action. No protected side "
-    "effect has been executed. Wait for a task update, poll GetTask, subscribe "
-    "to the task, or cancel the task."
-)
-LOCAL_APPROVAL_GRANTED_TEXT = (
-    "The serving agent's local operator authorized the protected action. "
-    "Execution is reserved and will start after final policy and digest checks."
-)
-LOCAL_APPROVAL_LOCKED_TEXT = (
-    "The task is locked while awaiting authorization from the serving agent's "
-    "local operator. The caller cannot resolve or modify this authorization. "
-    "No protected side effect has been executed. Follow-up messages are queued "
-    "for the next permitted model turn; use GetTask, SubscribeToTask, push "
-    "notifications, or CancelTask to track or stop the task."
-)
 
 A2A_TERMINAL_STATES = {
     SdkTaskState.TASK_STATE_COMPLETED,
@@ -104,16 +103,15 @@ def to_sdk_agent_card(card, *, base_url):
     )
     return SdkAgentCard(
         name=card.name,
-        description="Policy-enforced core agent runtime",
-        version="1.0.0",
+        description=card.description,
+        version=card.version,
         supported_interfaces=[
             SdkAgentInterface(
                 url=base_url,
                 protocol_binding=binding,
                 protocol_version=version,
             )
-            for version in card.protocol_versions
-            for binding in card.bindings
+            for binding, version in card.interfaces
         ],
         capabilities=capabilities,
         default_input_modes=card.input_modes,
@@ -127,24 +125,253 @@ def to_sdk_agent_card(card, *, base_url):
     )
 
 
+LEGACY_AGENT_CARD_PATH = "/.well-known/agent.json"
+
+
+def public_base_url(request):
+    """Derive the reachable base URL of this agent from one card request.
+
+    A card advertising http://localhost:PORT is discoverable but uncallable, and
+    the deployment cannot know its public address by itself. Returns None when the
+    headers carry nothing usable, so the caller keeps the configured value.
+    """
+    def first(name):
+        return (request.headers.get(name) or "").split(",")[0].strip()
+
+    # Each header stands on its own. A TLS-terminating proxy that already passes the
+    # public name in `Host` sends no `X-Forwarded-Host`, and tying the scheme to that
+    # header advertises http:// for an https-only deployment.
+    # Each header stands on its own. A TLS-terminating proxy that already passes the
+    # public name in `Host` sends no `X-Forwarded-Host`, and tying the scheme to that
+    # header advertises http:// for an https-only deployment.
+    scheme = first("x-forwarded-proto") or request.url.scheme
+    host = first("x-forwarded-host") or first("host")
+    if not host or scheme not in ("http", "https"):
+        return None
+    # "@" would turn the advertised URL into one carrying userinfo; whitespace and
+    # control bytes would make it an invalid URL or split the header.
+    if "@" in host or any(char.isspace() or ord(char) < 0x20 for char in host):
+        return None
+    return f"{scheme}://{host}"
+
+
+JSONRPC_ENVELOPE_FIELDS = ("jsonrpc", "method", "params", "id")
+_reported_extra_fields = set()
+
+
+def _strip_envelope(payload):
+    """Drop unknown top-level members so a hedging client is not rejected outright.
+
+    The dropped value is never interpreted: a top-level contextId must not become
+    a second, undocumented way to set the session.
+    """
+    if isinstance(payload, list):
+        return [_strip_envelope(item) for item in payload]
+    if not isinstance(payload, dict):
+        return payload
+    extra = frozenset(payload) - frozenset(JSONRPC_ENVELOPE_FIELDS)
+    if not extra:
+        return payload
+    if extra not in _reported_extra_fields and len(_reported_extra_fields) < 32:
+        _reported_extra_fields.add(extra)
+        logging.getLogger("core_agent.runtime").warning(
+            "ignoring unknown JSON-RPC fields %s; they are not interpreted",
+            ",".join(sorted(extra)),
+        )
+    return {name: payload[name] for name in payload if name not in extra}
+
+
+def _tolerant_envelope(endpoint):
+    async def wrapper(request):
+        body = await request.body()
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            return await endpoint(request)
+        cleaned = _strip_envelope(payload)
+        if cleaned == payload:
+            return await endpoint(Request(request.scope, _replay(body)))
+        return await endpoint(Request(request.scope, _replay(json.dumps(cleaned).encode())))
+
+    return wrapper
+
+
+def _replay(body):
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return receive
+
+
+def _agent_card_routes(sdk_card, *, derive_base_url):
+    """Serve the card on the canonical and the historical path.
+
+    Registries written before the card was renamed still probe the historical
+    path; a 404 there makes the agent undiscoverable rather than degraded.
+    """
+
+    async def endpoint(request):
+        card = sdk_card
+        base_url = public_base_url(request) if derive_base_url else None
+        if base_url:
+            card = SdkAgentCard()
+            card.CopyFrom(sdk_card)
+            for interface in card.supported_interfaces:
+                interface.url = base_url
+        return JSONResponse(agent_card_to_dict(card))
+
+    return [
+        Route(path, endpoint, methods=["GET"])
+        for path in (AGENT_CARD_WELL_KNOWN_PATH, LEGACY_AGENT_CARD_PATH)
+    ]
+
+
+STREAM_FAILURE_SEPARATOR = "\n\n---\n"
+
+
+def _chunk(text, size):
+    """Split a result into MAX_CHUNK_SIZE artifact chunks; 0 means one chunk."""
+    if size <= 0 or len(text) <= size:
+        return [text]
+    return [text[start : start + size] for start in range(0, len(text), size)]
+
+
+def _struct_value(value):
+    """Wrap an arbitrary JSON-compatible value as a protobuf Value."""
+    wrapper = Value()
+    json_format.ParseDict(value, wrapper)
+    return wrapper
+
+
+class TaskStreamPublisher:
+    """Publish runtime progress from the worker thread onto the A2A event queue.
+
+    The agent loop is synchronous and runs under ``asyncio.to_thread``; every
+    emission is therefore marshalled back onto the serving event loop and awaited
+    so frames keep their order and the producer inherits the queue's back-pressure.
+    """
+
+    enabled = True
+
+    def __init__(self, updater, loop, *, buffer_size=DEFAULT_BUFFER_SIZE, timeout=30):
+        self.updater = updater
+        self.loop = loop
+        self.buffer = StreamBuffer(buffer_size)
+        self.timeout = timeout
+        self.closed = False
+
+    @property
+    def streamed_text(self):
+        return self.buffer.response
+
+    def _submit(self, coroutine):
+        if self.closed:
+            coroutine.close()
+            return
+        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        try:
+            future.result(self.timeout)
+        except RuntimeError:
+            # The task already reached a terminal state; stop relaying quietly.
+            self.closed = True
+
+    def _publish(self, parts, *, partial=False):
+        metadata = {PARTIAL_KEY: True} if partial else None
+        message = self.updater.new_agent_message(parts, metadata=metadata)
+        self._submit(
+            self.updater.update_status(SdkTaskState.TASK_STATE_WORKING, message=message)
+        )
+
+    @staticmethod
+    def _text_parts(response, reasoning):
+        parts = []
+        if reasoning:
+            part = SdkPart(text=reasoning, media_type="text/plain")
+            part.metadata.update({ADK_THOUGHT_KEY: True})
+            parts.append(part)
+        if response:
+            parts.append(SdkPart(text=response, media_type="text/plain"))
+        return parts
+
+    def text(self, response, reasoning):
+        snapshot = self.buffer.update(response, reasoning)
+        if snapshot is None:
+            return
+        parts = self._text_parts(*snapshot)
+        if parts:
+            self._publish(parts, partial=True)
+
+    def flush(self):
+        snapshot = self.buffer.flush()
+        if snapshot is None:
+            return
+        parts = self._text_parts(*snapshot)
+        if parts:
+            self._publish(parts, partial=True)
+
+    def _data_part(self, payload, adk_type):
+        part = SdkPart(data=_struct_value(payload), media_type="application/json")
+        part.metadata.update({ADK_TYPE_KEY: adk_type})
+        return part
+
+    def tool_call(self, call_id, name, arguments):
+        self.flush()
+        self.buffer.reset()
+        self._publish(
+            [
+                self._data_part(
+                    {"id": call_id, "name": name, "args": arguments},
+                    FUNCTION_CALL_TYPE,
+                )
+            ]
+        )
+
+    def tool_result(self, call_id, name, response):
+        self._publish(
+            [
+                self._data_part(
+                    {"id": call_id, "name": name, "response": response},
+                    FUNCTION_RESPONSE_TYPE,
+                )
+            ]
+        )
+
+    def relay(self, parts):
+        """Forward already-shaped downstream parts into this task's stream."""
+        published = []
+        for part in parts:
+            kind = part.get("kind")
+            if kind == "text" and part.get("text"):
+                item = SdkPart(text=part["text"], media_type="text/plain")
+            elif kind == "data" and part.get("data") is not None:
+                item = SdkPart(
+                    data=_struct_value(part["data"]), media_type="application/json"
+                )
+            else:
+                continue
+            if isinstance(part.get("metadata"), dict):
+                item.metadata.update(part["metadata"])
+            published.append(item)
+        if published:
+            self._publish(published, partial=True)
+
+
 class CoreAgentExecutor(AgentExecutor):
     def __init__(
         self,
         handler,
-        local_approval_reserve_handler,
-        local_approval_dispatch_handler,
         cancel_handler,
-        is_waiting_local_approval,
-        local_approval_extension_uri,
         resume_handler,
+        stream_buffer_size=DEFAULT_BUFFER_SIZE,
+        streaming_enabled=True,
+        max_chunk_size=0,
     ):
         self.handler = handler
-        self.local_approval_reserve_handler = local_approval_reserve_handler
-        self.local_approval_dispatch_handler = local_approval_dispatch_handler
         self.cancel_handler = cancel_handler
-        self.is_waiting_local_approval = is_waiting_local_approval
-        self.local_approval_extension_uri = local_approval_extension_uri
         self.resume_handler = resume_handler
+        self.stream_buffer_size = stream_buffer_size
+        self.streaming_enabled = streaming_enabled
+        self.max_chunk_size = max_chunk_size
 
     @staticmethod
     def _from_sdk_message(message, *, context_id=None):
@@ -155,6 +382,16 @@ class CoreAgentExecutor(AgentExecutor):
                 parts.append(Part.text(part.text))
             elif part.HasField("data"):
                 parts.append(Part("data", json_format.MessageToDict(part.data)))
+            elif part.HasField("raw"):
+                parts.append(
+                    Part.file(
+                        part.raw, filename=part.filename, media_type=part.media_type
+                    )
+                )
+            elif part.HasField("url"):
+                # Kept as an unsupported kind on purpose: fetching a caller-chosen
+                # URL would be SSRF with the agent's network reach.
+                parts.append(Part("url", part.url))
         return Message(
             role="user",
             parts=tuple(parts),
@@ -171,64 +408,7 @@ class CoreAgentExecutor(AgentExecutor):
     def _message(cls, context):
         return cls._from_sdk_message(context.message, context_id=context.context_id)
 
-    def _local_approval_message(
-        self, context, approval, *, phase="awaiting_local_operator"
-    ):
-        extension_aware = (
-            self.local_approval_extension_uri in context.requested_extensions
-        )
-        payload = approval.to_public_payload(
-            phase=phase,
-            status_version=approval.request.version
-            + (phase != "awaiting_local_operator"),
-        )
-        message = SdkMessage(
-            message_id=str(uuid.uuid4()),
-            task_id=context.task_id,
-            context_id=context.context_id,
-            role=SdkRole.ROLE_AGENT,
-            parts=[
-                SdkPart(
-                    text=(
-                        LOCAL_APPROVAL_WAIT_TEXT
-                        if phase == "awaiting_local_operator"
-                        else LOCAL_APPROVAL_GRANTED_TEXT
-                    ),
-                    media_type="text/plain",
-                )
-            ],
-        )
-        if extension_aware:
-            message.metadata.update({self.local_approval_extension_uri: payload})
-            message.extensions.append(self.local_approval_extension_uri)
-        return message
-
     async def execute(self, context, event_queue):
-        if context.current_task is not None and self.is_waiting_local_approval(
-            context.task_id
-        ):
-            await TaskUpdater(
-                event_queue, context.task_id, context.context_id
-            ).update_status(
-                SdkTaskState.TASK_STATE_WORKING,
-                message=SdkMessage(
-                    message_id=str(uuid.uuid4()),
-                    task_id=context.task_id,
-                    context_id=context.context_id,
-                    role=SdkRole.ROLE_AGENT,
-                    parts=[
-                        SdkPart(
-                            text=LOCAL_APPROVAL_LOCKED_TEXT,
-                            media_type="text/plain",
-                        )
-                    ],
-                ),
-                metadata={
-                    "reason": "TASK_LOCKED_AWAITING_LOCAL_OPERATOR",
-                    "callerActionRequired": False,
-                },
-            )
-            return
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
         if context.current_task is None:
             await event_queue.enqueue_event(
@@ -240,64 +420,113 @@ class CoreAgentExecutor(AgentExecutor):
                 )
             )
         await updater.start_work()
+        publisher = (
+            TaskStreamPublisher(
+                updater,
+                asyncio.get_running_loop(),
+                buffer_size=self.stream_buffer_size,
+            )
+            if self.streaming_enabled
+            else NullStreamPublisher()
+        )
         try:
             if context.message is None and context.current_task is not None:
-                artifact = await asyncio.to_thread(self.resume_handler, context)
+                artifact = await asyncio.to_thread(
+                    self.resume_handler, context, publisher
+                )
             else:
                 message = self._message(context)
-                command = parse_run_request(message, context.requested_extensions)
-                artifact = await asyncio.to_thread(self.handler, command, context)
-            while isinstance(artifact, ApprovalNeeded):
-                await updater.update_status(
-                    SdkTaskState.TASK_STATE_WORKING,
-                    message=self._local_approval_message(context, artifact),
-                    metadata={"reason": "awaiting_local_operator"},
-                )
-                pending = artifact
-                reserved = await asyncio.to_thread(
-                    self.local_approval_reserve_handler, pending, context
-                )
-                if reserved is None:
-                    return
-                await updater.update_status(
-                    SdkTaskState.TASK_STATE_WORKING,
-                    message=self._local_approval_message(
-                        context, pending, phase="local_operator_approved"
-                    ),
-                    metadata={"reason": "local_operator_approved"},
-                )
+                command = parse_run_request(message)
                 artifact = await asyncio.to_thread(
-                    self.local_approval_dispatch_handler, reserved, context
+                    self.handler, command, context, publisher
                 )
             if not isinstance(artifact, Artifact):
                 artifact = Artifact.text(str(artifact))
-            await updater.add_artifact(
-                [
-                    SdkPart(text=str(part.data), media_type=artifact.media_type)
-                    for part in artifact.parts
-                ],
-                artifact_id=artifact.id,
-                metadata={
-                    "digest": artifact.digest,
-                    "size": artifact.size,
-                    "provenance": artifact.provenance,
-                },
-                last_chunk=True,
+            final_text = "\n".join(str(part.data) for part in artifact.parts)
+            chunks = _chunk(final_text, self.max_chunk_size)
+            for index, chunk in enumerate(chunks):
+                await updater.add_artifact(
+                    [SdkPart(text=chunk, media_type=artifact.media_type)],
+                    artifact_id=artifact.id,
+                    metadata={
+                        "digest": artifact.digest,
+                        "size": artifact.size,
+                        "provenance": artifact.provenance,
+                    },
+                    append=index > 0 or None,
+                    last_chunk=index == len(chunks) - 1,
+                )
+            publisher.closed = True
+            await updater.complete(
+                message=updater.new_agent_message(
+                    [SdkPart(text=final_text, media_type=artifact.media_type)]
+                )
+                if final_text
+                else None
             )
-            await updater.complete()
-        except Exception:
-            await updater.failed()
+        except Exception as error:
+            publisher.closed = True
+            await self._publish_failure(updater, publisher, error)
             raise
+
+    @staticmethod
+    async def _publish_failure(updater, publisher, error):
+        """Keep already-streamed text and append a safe reason, like the ADK stream."""
+        reason = getattr(error, "code", None) or type(error).__name__
+        streamed = getattr(publisher, "streamed_text", "")
+        text = f"{streamed}{STREAM_FAILURE_SEPARATOR}{reason}" if streamed else reason
+        try:
+            await updater.failed(
+                message=updater.new_agent_message(
+                    [SdkPart(text=text, media_type="text/plain")]
+                )
+            )
+        except RuntimeError:
+            # A terminal state was already published; nothing further may be sent.
+            return
 
     async def cancel(self, context, event_queue):
         await asyncio.to_thread(self.cancel_handler, context)
         await TaskUpdater(event_queue, context.task_id, context.context_id).cancel()
 
 
+class TransientStatusTaskStore:
+    """Keep transient streamed snapshots out of the durable Task history.
+
+    The SDK task manager appends the previous status message to `Task.history` on
+    every status update, so persisting each buffered snapshot would rewrite a
+    quadratically growing Task. Only the partial text frames are dropped; tool
+    calls, tool results and terminal messages stay in the durable history.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def save(self, task, context=None):
+        kept = [
+            message
+            for message in task.history
+            if message.role != SdkRole.ROLE_AGENT
+            or not json_format.MessageToDict(message.metadata).get(PARTIAL_KEY)
+        ]
+        if len(kept) != len(task.history):
+            del task.history[:]
+            task.history.extend(kept)
+        return await self.inner.save(task, context)
+
+    async def get(self, task_id, context=None):
+        return await self.inner.get(task_id, context)
+
+    async def list(self, params, context=None):
+        return await self.inner.list(params, context)
+
+    async def delete(self, task_id, context=None):
+        return await self.inner.delete(task_id, context)
+
+
 class CoreRequestHandler(DefaultRequestHandler):
-    def __init__(self, *args, can_cancel, followup_handler, **kwargs):
+    def __init__(self, *args, followup_handler, **kwargs):
         super().__init__(*args, **kwargs)
-        self.can_cancel = can_cancel
         self.followup_handler = followup_handler
 
     async def _accept_followup(self, params, context):
@@ -327,7 +556,7 @@ class CoreRequestHandler(DefaultRequestHandler):
                 raise UnsupportedOperationError(
                     message=f"Task {task_id} is already terminal"
                 ) from None
-            if code in {"INVALID_REQUEST", "A2A_EXTENSION_REQUIRED"}:
+            if code == "INVALID_REQUEST":
                 raise InvalidParamsError(message=str(error)) from None
             raise
         return apply_history_length(task, params.configuration)
@@ -351,10 +580,6 @@ class CoreRequestHandler(DefaultRequestHandler):
             yield event
 
     async def on_cancel_task(self, params, context):
-        if not self.can_cancel(params.id):
-            raise TaskNotCancelableError(
-                message="Task has a committed local-approval execution reservation"
-            )
         return await super().on_cancel_task(params, context)
 
     async def resume_task(self, task_id, context_id, call_context):
@@ -380,12 +605,9 @@ def build_starlette_app(
     *,
     agent_card,
     handler,
-    local_approval_reserve_handler,
-    local_approval_dispatch_handler,
     cancel_handler,
-    is_waiting_local_approval,
-    can_cancel,
     base_url,
+    derive_base_url=False,
     resume_handler,
     followup_handler,
     context_builder=None,
@@ -393,29 +615,42 @@ def build_starlette_app(
     push_config_store=None,
     push_sender=None,
     shutdown_handler=None,
+    stream_buffer_size=DEFAULT_BUFFER_SIZE,
+    streaming_enabled=True,
+    max_chunk_size=0,
 ):
     """Build the official A2A 1.0 HTTP+JSON binding around the domain runtime."""
     sdk_card = to_sdk_agent_card(agent_card, base_url=base_url)
     request_handler = CoreRequestHandler(
         CoreAgentExecutor(
             handler,
-            local_approval_reserve_handler,
-            local_approval_dispatch_handler,
-            cancel_handler,
-            is_waiting_local_approval,
-            agent_card.optional_extensions[0]
-            if agent_card.optional_extensions
-            else LOCAL_APPROVAL_STATUS_URI,
-            resume_handler,
+                    cancel_handler,
+                resume_handler,
+            stream_buffer_size=stream_buffer_size,
+            streaming_enabled=streaming_enabled,
+            max_chunk_size=max_chunk_size,
         ),
-        task_store or InMemoryTaskStore(owner_resolver=resolve_owner_scope),
+        TransientStatusTaskStore(
+            task_store or InMemoryTaskStore(owner_resolver=resolve_owner_scope)
+        ),
         sdk_card,
         push_config_store=push_config_store,
         push_sender=push_sender,
-        can_cancel=can_cancel,
         followup_handler=followup_handler,
     )
-    routes = create_agent_card_routes(sdk_card)
+    routes = _agent_card_routes(sdk_card, derive_base_url=derive_base_url)
+    # The JSON-RPC binding carries the v0.3 compatibility shape (`kind`, `final`,
+    # lowercase states, text/data parts) that ADK-style streaming clients expect.
+    for route in create_jsonrpc_routes(
+        request_handler,
+        DEFAULT_RPC_URL,
+        context_builder=context_builder,
+        enable_v0_3_compat=True,
+    ):
+        # A client that also repeats a field outside `params` must not be rejected.
+        route.endpoint = _tolerant_envelope(route.endpoint)
+        route.app = request_response(route.endpoint)
+        routes.append(route)
     routes.extend(create_rest_routes(request_handler, context_builder=context_builder))
     lifespan = None
     if push_sender or shutdown_handler:

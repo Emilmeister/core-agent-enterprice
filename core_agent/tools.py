@@ -3,16 +3,8 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
 
-from .approvals import ApprovalManager as ApprovalManager
 from .errors import CoreError
-
-
-class ApprovalMode(str, Enum):
-    ON_RISK = "on_risk"
-    ALWAYS = "always"
-    NEVER = "never"
 
 
 @dataclass(frozen=True)
@@ -135,19 +127,6 @@ def _contains_private_reasoning(value):
     return False
 
 
-class PolicyEngine:
-    def __init__(self, approval_mode=ApprovalMode.ON_RISK):
-        self.approval_mode = ApprovalMode(approval_mode)
-
-    def evaluate(self, definition):
-        risky = bool(definition.risk_tags) or definition.mutating
-        if not risky and self.approval_mode != ApprovalMode.ALWAYS:
-            return "allow"
-        if self.approval_mode == ApprovalMode.NEVER:
-            return "deny"
-        return "require_approval"
-
-
 @dataclass(frozen=True)
 class InformationRequest:
     id: str
@@ -160,15 +139,11 @@ class ToolRuntime:
     def __init__(
         self,
         registry,
-        policy,
-        approvals,
         environment_manager,
         event_sink=None,
         handlers=None,
     ):
         self.registry = registry
-        self.policy = policy
-        self.approvals = approvals
         self.environment_manager = environment_manager
         self.event_sink = event_sink or (lambda event: None)
         self.handlers = dict(handlers or {})
@@ -200,23 +175,6 @@ class ToolRuntime:
         definition = self.registry.get(call.name)
         self.validate(call, definition)
         self._emit("tool.validated", call_id=call.id)
-        decision = self.policy.evaluate(definition)
-        if decision == "deny":
-            self._emit("policy.denied", call_id=call.id)
-            return ToolResult(call.id, "denied")
-        if decision == "require_approval":
-            self._emit("approval.requested", call_id=call.id)
-            return self.approvals.request(
-                call,
-                risks=definition.risk_tags,
-                task_id=task_id or run_id,
-                context_id=session_id or run_id,
-                tenant_id=tenant_id or "default",
-                caller_principal_id=identity or "anonymous",
-                environment=environment,
-                policy_version=policy_version,
-            )
-        self._emit("policy.allowed", call_id=call.id)
         return self._execute(call, run_id)
 
     def _execute(self, call, run_id):
@@ -245,30 +203,6 @@ class ToolRuntime:
             status=status,
         )
         return ToolResult(call.id, status, result, error_code)
-
-    def resume_approved(self, call, approval_id, *, run_id):
-        definition = self.registry.get(call.name)
-        self.validate(call, definition)
-        if self.policy.evaluate(definition) == "deny":
-            raise CoreError("POLICY_DENIED")
-        execution = self.approvals.authorize_dispatch(approval_id, call)
-        try:
-            result = self._execute(call, run_id)
-        except Exception as error:
-            self.approvals.finish_execution(
-                execution.id,
-                "FAILED",
-                error_code=getattr(error, "code", type(error).__name__),
-            )
-            raise
-        state = "SUCCEEDED" if result.status == "succeeded" else "FAILED"
-        self.approvals.finish_execution(
-            execution.id,
-            state,
-            outcome=result,
-            error_code=result.error_code,
-        )
-        return result
 
     def request_input(self, prompt, schema, *, run_id):
         return InformationRequest(

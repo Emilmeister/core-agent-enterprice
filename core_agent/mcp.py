@@ -4,11 +4,19 @@ import contextlib
 from dataclasses import dataclass
 import ipaddress
 import json
+import time
 import uuid
 from urllib.parse import urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .errors import CoreError
+from .security import redact
+
+
+# Published MCP revisions this client interoperates with, newest first: the first
+# entry is what we propose, the rest are what we still accept from a server.
+MCP_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 
 
 @dataclass(frozen=True)
@@ -70,6 +78,14 @@ class InMemoryMcpConnector:
 
     def call(self, name, arguments):
         return self.results.get(name, {})
+
+
+def _failure_reason(error):
+    """One short, redacted line naming what actually failed."""
+    if isinstance(error, HTTPError):
+        return f"http status {error.code}"
+    reason = getattr(error, "reason", None) or error
+    return redact(f"{type(error).__name__}: {reason}")[:200]
 
 
 class McpManager:
@@ -157,21 +173,55 @@ class StreamableHttpMcpConnector:
         self,
         *,
         timeout=30,
+        sse_read_timeout=300,
         headers=None,
-        protocol_versions=("2025-11-25",),
+        protocol_versions=MCP_PROTOCOL_VERSIONS,
         telemetry=None,
     ):
         self.timeout = timeout
+        # A Streamable HTTP server may answer with an event stream and hold the
+        # connection open far longer than a single request timeout allows.
+        self.sse_read_timeout = sse_read_timeout
         self.headers = dict(headers or {})
         self._servers = {}
         self._connections = []
         self.protocol_versions = tuple(protocol_versions)
         self._negotiated_versions = {}
+        # Streamable HTTP servers hand out a session on initialize and
+        # reject later requests that do not carry it back.
+        self._sessions = {}
         self.telemetry = telemetry
 
     @property
     def connections(self):
         return tuple(self._connections)
+
+    def _read_event_stream(self, response):
+        """Take the first JSON-RPC payload carried by an SSE response.
+
+        A Streamable HTTP server may answer either with plain JSON or with an
+        event stream; both carry the same envelope.
+        """
+        deadline = time.monotonic() + self.sse_read_timeout
+        data = []
+        while time.monotonic() < deadline:
+            raw = response.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if line.startswith("data:"):
+                data.append(line[len("data:") :].removeprefix(" "))
+                continue
+            if line:
+                continue
+            payload = "\n".join(data)
+            data = []
+            if payload.strip() and payload.strip() != "[DONE]":
+                return json.loads(payload)
+        payload = "\n".join(data).strip()
+        if payload and payload != "[DONE]":
+            return json.loads(payload)
+        raise CoreError("MCP_PROTOCOL_ERROR", "event stream carried no result")
 
     def _rpc(self, server, method, params=None, *, notification=False):
         declaration = self._servers[server]
@@ -185,7 +235,10 @@ class StreamableHttpMcpConnector:
         except ValueError:
             pass
         if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
-            raise CoreError("MCP_CONNECTION_FAILED")
+            raise CoreError(
+                "MCP_CONNECTION_FAILED",
+                f"{parsed.scheme or 'missing'} scheme is not allowed; use https",
+            )
         span = (
             self.telemetry.span(
                 "mcp.client",
@@ -221,6 +274,8 @@ class StreamableHttpMcpConnector:
                 headers["Mcp-Name"] = target_name
             if server in self._negotiated_versions:
                 headers["MCP-Protocol-Version"] = self._negotiated_versions[server]
+            if server in self._sessions:
+                headers["Mcp-Session-Id"] = self._sessions[server]
             request = Request(
                 endpoint,
                 data=json.dumps(payload).encode(),
@@ -229,11 +284,25 @@ class StreamableHttpMcpConnector:
             )
             try:
                 with urlopen(request, timeout=self.timeout) as response:
+                    session = response.headers.get("Mcp-Session-Id")
+                    if session:
+                        self._sessions[server] = session
                     if notification:
                         return None
-                    value = json.load(response)
+                    if "text/event-stream" in (
+                        response.headers.get("Content-Type") or ""
+                    ):
+                        value = self._read_event_stream(response)
+                    else:
+                        value = json.load(response)
             except Exception as error:
-                raise CoreError("MCP_CONNECTION_FAILED", retryable=True) from error
+                # The generic code alone cannot separate a wrong URL from a TLS
+                # refusal, an unreachable host or a rejected protocol.
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED",
+                    f"{method}: {_failure_reason(error)}",
+                    retryable=True,
+                ) from error
         if "error" in value:
             raise CoreError("MCP_PROTOCOL_ERROR", data=value["error"])
         return value.get("result", {})
@@ -253,7 +322,9 @@ class StreamableHttpMcpConnector:
         negotiated = initialized.get("protocolVersion", self.protocol_versions[0])
         if negotiated not in self.protocol_versions:
             raise CoreError(
-                "MCP_PROTOCOL_ERROR", "unsupported negotiated protocol version"
+                "MCP_PROTOCOL_ERROR",
+                f"server negotiated protocol {negotiated!r}; "
+                f"this client accepts {', '.join(self.protocol_versions)}",
             )
         self._negotiated_versions[name] = negotiated
         self._rpc(name, "notifications/initialized", notification=True)

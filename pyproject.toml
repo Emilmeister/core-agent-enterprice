@@ -10,6 +10,7 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http==1.43.0",
     "opentelemetry-sdk==1.43.0",
     "psycopg[binary,pool]>=3.2,<4",
+    "pymongo>=4.17.0",
 ]
 
 [project.scripts]

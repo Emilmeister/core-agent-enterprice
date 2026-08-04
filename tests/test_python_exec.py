@@ -11,15 +11,16 @@ from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 class PythonExecTests(unittest.TestCase):
     def _environment(self, workspace, **extra):
         return {
-            "CORE_AGENT_STATE_BACKEND": "test",
-            "LOCAL_APPROVAL_DB_PATH": ":memory:",
-            "LOCAL_APPROVAL_ENABLED": "false",
+            "SESSION_STORAGE_TYPE": "in-memory",
+
             "CORE_AGENT_RUNTIME_MODE": "without_terminal",
             "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
                 "core.python.exec,core.task.list"
             ),
-            "CORE_AGENT_ALLOWED_MCP_SERVERS": "memory",
-            "CORE_AGENT_ALLOWED_MCP_TOOLS": "memory.search",
+            "MCP_ALLOWED_SERVERS": "memory",
+            # MCP servers are deployment configuration now.
+            "MCP_URL": "https://memory.test/memory",
+            "MCP_ALLOWED_TOOLS": "memory.search",
             "LOCAL_WORKSPACE_ROOT": workspace,
             **extra,
         }
@@ -56,15 +57,6 @@ print(memory["answer"], len(tasks), sorted(tools.names))
         )
         request = {
             "prompt": "use python",
-            "mcp": [
-                {
-                    "name": "memory",
-                    "role": "memory",
-                    "required": True,
-                    "transport": {"type": "test"},
-                }
-            ],
-            "skills": [],
         }
         workspace = tempfile.TemporaryDirectory()
         with patch.dict(
@@ -141,76 +133,13 @@ print(memory["answer"], len(tasks), sorted(tools.names))
                     app = create_app(model=model)
                 try:
                     result = app.state.core_agent.run(
-                        {"prompt": "run failing python", "mcp": [], "skills": []}
+                        {"prompt": "run failing python"}
                     )
                     self.assertEqual(result.message, "recovered")
                     self.assertIn('"status": "', model.calls[1].context)
                     self.assertIn(expected, model.calls[1].context)
                 finally:
                     app.state.close()
-
-    def test_python_nested_risky_tool_is_denied_without_hitl(self):
-        code = """
-try:
-    tools.call("memory.create", {"content": "must not run"})
-except ToolCallError as error:
-    print(error.code)
-"""
-        model = ScriptedModel(
-            [
-                ModelResponse(
-                    tool_requests=(
-                        ToolRequest("python-deny", "core.python.exec", {"code": code}),
-                    )
-                ),
-                ModelResponse(message="denied-safely"),
-            ]
-        )
-        model.model = "python-deny-test"
-        connector = InMemoryMcpConnector(
-            catalogs={
-                "memory": {
-                    "create": {
-                        "type": "object",
-                        "properties": {"content": {"type": "string"}},
-                        "required": ["content"],
-                        "additionalProperties": False,
-                    }
-                }
-            },
-            results={"memory.create": {"unexpected": True}},
-        )
-        request = {
-            "prompt": "verify policy",
-            "mcp": [
-                {
-                    "name": "memory",
-                    "role": "memory",
-                    "required": True,
-                    "transport": {"type": "test"},
-                }
-            ],
-            "skills": [],
-        }
-        with tempfile.TemporaryDirectory() as workspace, patch.dict(
-            os.environ,
-            self._environment(
-                workspace,
-                CORE_AGENT_ALLOWED_BUILTIN_TOOLS="core.python.exec",
-                CORE_AGENT_ALLOWED_MCP_TOOLS="memory.create",
-            ),
-            clear=True,
-        ):
-            app = create_app(model=model, mcp_connector=connector)
-            try:
-                result = app.state.core_agent.run(request)
-                self.assertEqual(result.message, "denied-safely")
-                self.assertIn("POLICY_DENIED", model.calls[1].context)
-                audit = app.state.core_agent.audit_log.records(result.run_id)
-                denied = [item for item in audit if item.kind == "tool.denied"]
-                self.assertEqual(denied[0].data["tool_name"], "memory.create")
-            finally:
-                app.state.close()
 
     def test_python_cannot_be_started_as_background_tool(self):
         model = ScriptedModel(
@@ -246,7 +175,7 @@ except ToolCallError as error:
             app = create_app(model=model)
             try:
                 result = app.state.core_agent.run(
-                    {"prompt": "start python in background", "mcp": [], "skills": []}
+                    {"prompt": "start python in background"}
                 )
                 self.assertEqual(result.message, "background-denied-safely")
                 self.assertIn("CAPABILITY_DISABLED", model.calls[1].context)

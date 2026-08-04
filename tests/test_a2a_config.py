@@ -1,13 +1,10 @@
 import dataclasses
 import json
-import os
 import time
 import unittest
-from unittest.mock import patch
 
 from core_agent.a2a import (
-    CORE_EXTENSION_URI,
-    LOCAL_APPROVAL_STATUS_URI,
+    LEGACY_RUN_CAPABILITIES_URI as CORE_EXTENSION_URI,
     A2AService,
     AgentCard,
     Artifact,
@@ -15,11 +12,8 @@ from core_agent.a2a import (
     Part,
     Task,
     TaskState,
-    map_core_state,
     parse_run_request,
 )
-from core_agent.approvals import ApprovalManager, ApproveAllControlPlane
-from core_agent.app import create_app
 from core_agent.config import (
     AgentConfig,
     PlatformConfig,
@@ -27,8 +21,6 @@ from core_agent.config import (
     compile_effective_config,
 )
 from core_agent.errors import CoreError
-from core_agent.runtime import ApprovalNeeded
-from core_agent.tools import ApprovalMode, ToolCall
 
 
 def platform_config(**changes):
@@ -60,8 +52,7 @@ def platform_config(**changes):
             "skills",
             "human_input",
         },
-        "a2a_protocol_versions": ("1.0",),
-        "a2a_bindings": ("HTTP+JSON",),
+        "a2a_interfaces": (("HTTP+JSON", "1.0"),),
     }
     values.update(changes)
     return PlatformConfig(**values)
@@ -109,7 +100,6 @@ def agent_config(**changes):
             "compact_at_working_ratio": 0.90,
             "compact_to_working_ratio": 0.15,
         },
-        "approval": {"mode": "on_risk"},
         "execution": {"environment_profile": "local-pty-test"},
         "observability": {"otel_profile": "test"},
     }
@@ -118,8 +108,9 @@ def agent_config(**changes):
     return AgentConfig.from_dict(raw)
 
 
-def request(*, memory_required=False, extra_mcp=(), skills=("database-review",)):
-    mcp = [
+def declared_mcp(*, memory_required=False, extra_mcp=()):
+    """MCP servers are deployment configuration, no longer a request field."""
+    return [
         {
             "name": "repo",
             "role": "repository",
@@ -134,15 +125,10 @@ def request(*, memory_required=False, extra_mcp=(), skills=("database-review",))
         },
         *extra_mcp,
     ]
-    return RunRequest.from_dict(
-        {
-            "prompt": "Do the work",
-            "mcp": mcp,
-            "skills": [
-                {"name": name, "source": f"file:///skills/{name}"} for name in skills
-            ],
-        }
-    )
+
+
+def request():
+    return RunRequest.from_dict({"prompt": "Do the work"})
 
 
 DISCOVERED = {
@@ -164,57 +150,60 @@ DISCOVERED = {
 
 class RunRequestTests(unittest.TestCase):
     def test_run_request_has_exactly_prompt_mcp_and_skills(self):
-        parsed = RunRequest.from_dict({"prompt": "ok", "mcp": [], "skills": []})
+        parsed = RunRequest.from_dict({"prompt": "ok"})
         self.assertEqual(parsed.prompt, "ok")
         with self.assertRaises(CoreError) as caught:
             RunRequest.from_dict(
-                {"prompt": "ok", "mcp": [], "skills": [], "session_id": "x"}
+                {"prompt": "ok", "session_id": "x"}
             )
         self.assertEqual(caught.exception.code, "INVALID_REQUEST")
 
     def test_prompt_must_be_nonempty_and_mcp_names_unique(self):
         with self.assertRaises(CoreError):
-            RunRequest.from_dict({"prompt": "", "mcp": [], "skills": []})
-        duplicate = {
-            "prompt": "x",
-            "mcp": [
-                {"name": "same", "transport": {"type": "stdio", "command": "one"}},
-                {"name": "same", "transport": {"type": "stdio", "command": "two"}},
-            ],
-            "skills": [],
-        }
+            RunRequest.from_dict({"prompt": ""})
         with self.assertRaises(CoreError) as caught:
-            RunRequest.from_dict(duplicate)
+            RunRequest.from_dict({"prompt": "x", "mcp": []})
         self.assertEqual(caught.exception.code, "INVALID_REQUEST")
 
     def test_a2a_message_maps_prompt_and_extension_without_duplication(self):
         message = Message(
             role="user",
             parts=(Part.text("Fix the test"),),
+                                    context_id="context-1",
+        )
+        parsed = parse_run_request(message)
+        self.assertEqual(parsed.to_dict(), {"prompt": "Fix the test"})
+
+    def test_plain_message_is_accepted_and_content_type_is_validated(self):
+        # A standard A2A client declares no extension at all.
+        plain = Message(role="user", parts=(Part.text("x"),), metadata={})
+        self.assertEqual(parse_run_request(plain).prompt, "x")
+
+        # The removed extension is ignored while its payload stays empty...
+        stale = Message(
+            role="user",
+            parts=(Part.text("x"),),
             extensions=(CORE_EXTENSION_URI,),
             metadata={CORE_EXTENSION_URI: {"mcp": [], "skills": []}},
-            context_id="context-1",
         )
-        parsed = parse_run_request(message, requested_extensions={CORE_EXTENSION_URI})
-        self.assertEqual(
-            parsed.to_dict(), {"prompt": "Fix the test", "mcp": [], "skills": []}
-        )
-        self.assertNotIn("prompt", message.metadata[CORE_EXTENSION_URI])
+        self.assertEqual(parse_run_request(stale).prompt, "x")
 
-    def test_required_extension_and_content_type_are_validated_before_work(self):
-        missing = Message(role="user", parts=(Part.text("x"),), metadata={})
+        # ...but capabilities sent per request must not be dropped silently.
+        carrying = Message(
+            role="user",
+            parts=(Part.text("x"),),
+            metadata={CORE_EXTENSION_URI: {"mcp": [{"name": "repo"}], "skills": []}},
+        )
         with self.assertRaises(CoreError) as caught:
-            parse_run_request(missing, requested_extensions=set())
-        self.assertEqual(caught.exception.code, "A2A_EXTENSION_REQUIRED")
+            parse_run_request(carrying)
+        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
         unsupported = Message(
             role="user",
             parts=(Part(kind="video", data="artifact://video"),),
-            extensions=(CORE_EXTENSION_URI,),
-            metadata={CORE_EXTENSION_URI: {"mcp": [], "skills": []}},
-        )
+                                )
         with self.assertRaises(CoreError) as caught:
-            parse_run_request(unsupported, requested_extensions={CORE_EXTENSION_URI})
+            parse_run_request(unsupported)
         self.assertEqual(caught.exception.code, "CONTENT_TYPE_NOT_SUPPORTED")
 
     def test_a2a_caller_has_no_approval_decision_schema(self):
@@ -224,83 +213,21 @@ class RunRequestTests(unittest.TestCase):
             extensions=("urn:caller:approval-response",),
             metadata={"urn:caller:approval-response": {"decision": "approve"}},
         )
-        with self.assertRaises(CoreError) as caught:
-            parse_run_request(message, {"urn:caller:approval-response"})
-        self.assertEqual(caught.exception.code, "A2A_EXTENSION_REQUIRED")
-
-    def test_public_local_approval_status_contains_no_action_or_secret(self):
-        manager = ApprovalManager()
-        request = manager.request(
-            ToolCall(
-                "call-1",
-                "external.publish",
-                {
-                    "target": "org/repo",
-                    "access_token": {"secretRef": "secret://publisher/token"},
-                },
-            ),
-            risks={"external_write"},
-            task_id="task-1",
-            context_id="context-1",
-            tenant_id="tenant-1",
-            caller_principal_id="caller-1",
-        )
-        payload = ApprovalNeeded("run-1", request).to_public_payload()
-        self.assertFalse(payload["callerCanApprove"])
-        self.assertFalse(payload["callerActionRequired"])
-        encoded = repr(payload)
-        self.assertNotIn(request.id, encoded)
-        self.assertNotIn("secret://publisher/token", encoded)
-        self.assertNotIn("arguments", payload)
-        manager.close()
-
+        # An unknown caller extension is ignored, never read as an approval.
+        parsed = parse_run_request(message)
+        self.assertNotIn("decision", parsed.to_dict())
 
 class ConfigurationTests(unittest.TestCase):
-    def test_production_refuses_approve_all_stub_and_disabled_hitl_fails_closed(self):
-        model = type("Model", (), {"model": "test-model"})()
-        with patch.dict(
-            os.environ,
-            {
-                "CORE_AGENT_ENVIRONMENT": "production",
-                "LOCAL_APPROVAL_ENABLED": "true",
-            },
-        ):
-            with self.assertRaises(CoreError) as caught:
-                create_app(model=model, control_plane=ApproveAllControlPlane())
-        self.assertEqual(caught.exception.code, "LOCAL_OPERATOR_CONTROL_PLANE_REQUIRED")
-
-        with patch.dict(
-            os.environ,
-            {
-                "CORE_AGENT_ENVIRONMENT": "development",
-                "LOCAL_APPROVAL_ENABLED": "false",
-                "LOCAL_APPROVAL_DB_PATH": ":memory:",
-            },
-        ):
-            app = create_app(model=model)
-        self.assertEqual(
-            app.state.core_agent.tool_runtime.policy.approval_mode,
-            ApprovalMode.NEVER,
-        )
-        self.assertFalse(
-            any(
-                "/internal/approvals" in getattr(route, "path", "")
-                for route in app.routes
-            )
-        )
-        extensions = app.state.a2a_request_handler._agent_card.capabilities.extensions
-        self.assertNotIn(LOCAL_APPROVAL_STATUS_URI, {item.uri for item in extensions})
-        app.state.close()
-
     def test_effective_config_is_intersection_with_deny_precedence(self):
         effective = compile_effective_config(
-            platform_config(), agent_config(), request(), DISCOVERED
+            platform_config(), agent_config(), declared_mcp(), DISCOVERED
         )
         self.assertEqual(
             effective.builtin_tools,
             frozenset(
                 {
                     "core.terminal.exec",
+                    "core.python.exec",
                     "core.fs.apply_patch",
                     "core.task.start",
                     "core.task.get",
@@ -326,7 +253,7 @@ class ConfigurationTests(unittest.TestCase):
         raw = agent_config().to_dict()
         raw["features"]["memory"] = "disabled"
         effective = compile_effective_config(
-            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
+            platform_config(), AgentConfig.from_dict(raw), declared_mcp(), DISCOVERED
         )
         self.assertNotIn("memory", effective.mcp_tools)
         self.assertNotIn("memory", effective.enabled_capability_policies)
@@ -344,16 +271,15 @@ class ConfigurationTests(unittest.TestCase):
             compile_effective_config(
                 platform_config(),
                 AgentConfig.from_dict(raw),
-                request(memory_required=True),
+                declared_mcp(memory_required=True),
                 DISCOVERED,
             )
         self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
 
         raw["features"]["memory"] = "required"
-        no_memory = RunRequest.from_dict({"prompt": "x", "mcp": [], "skills": []})
         with self.assertRaises(CoreError) as caught:
             compile_effective_config(
-                platform_config(), AgentConfig.from_dict(raw), no_memory, {}
+                platform_config(), AgentConfig.from_dict(raw), [], {}
             )
         self.assertEqual(caught.exception.code, "REQUIRED_CAPABILITY_MISSING")
 
@@ -387,7 +313,7 @@ class ConfigurationTests(unittest.TestCase):
         raw = agent_config().to_dict()
         raw["tools"]["builtins"]["deny"] = ["core.terminal.exec"]
         effective = compile_effective_config(
-            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
+            platform_config(), AgentConfig.from_dict(raw), declared_mcp(), DISCOVERED
         )
         self.assertNotIn("core.terminal.exec", effective.model_tool_catalog)
         with self.assertRaises(CoreError) as caught:
@@ -397,10 +323,8 @@ class ConfigurationTests(unittest.TestCase):
     def test_without_terminal_mode_is_enforced_by_effective_config(self):
         raw = agent_config().to_dict()
         raw["execution"]["runtime_mode"] = "without_terminal"
-        raw["approval"]["local_operator"] = {"enabled": False}
-        raw["approval"]["mode"] = "never"
         effective = compile_effective_config(
-            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
+            platform_config(), AgentConfig.from_dict(raw), declared_mcp(), DISCOVERED
         )
         self.assertNotIn("core.terminal.exec", effective.model_tool_catalog)
         self.assertNotIn("core.task.start", effective.model_tool_catalog)
@@ -416,28 +340,12 @@ class ConfigurationTests(unittest.TestCase):
             AgentConfig.from_dict(raw)
         self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
-    def test_python_exec_requires_disabled_local_operator_in_effective_config(self):
-        raw = agent_config().to_dict()
-        effective = compile_effective_config(
-            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
-        )
-        self.assertNotIn("core.python.exec", effective.model_tool_catalog)
-        self.assertNotIn("python", effective.enabled_capability_policies)
-
-        raw["approval"]["local_operator"] = {"enabled": False}
-        raw["approval"]["mode"] = "never"
-        effective = compile_effective_config(
-            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
-        )
-        self.assertIn("core.python.exec", effective.model_tool_catalog)
-        self.assertIn("python", effective.enabled_capability_policies)
-
     def test_effective_digest_is_stable_and_contains_no_secrets(self):
         effective_a = compile_effective_config(
-            platform_config(), agent_config(), request(), DISCOVERED
+            platform_config(), agent_config(), declared_mcp(), DISCOVERED
         )
         effective_b = compile_effective_config(
-            platform_config(), agent_config(), request(), DISCOVERED
+            platform_config(), agent_config(), declared_mcp(), DISCOVERED
         )
         self.assertEqual(effective_a.digest, effective_b.digest)
         self.assertNotIn("TOKEN", effective_a.audit_snapshot)
@@ -445,47 +353,6 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class A2ATests(unittest.TestCase):
-    def test_core_states_map_only_to_standard_a2a_states(self):
-        expected = {
-            "CREATED": TaskState.SUBMITTED,
-            "QUEUED": TaskState.SUBMITTED,
-            "RUNNING": TaskState.WORKING,
-            "WAITING_TASK": TaskState.WORKING,
-            "PAUSED": TaskState.WORKING,
-            "WAITING_INPUT": TaskState.INPUT_REQUIRED,
-            "WAITING_LOCAL_APPROVAL": TaskState.WORKING,
-            "APPROVED_RESERVED": TaskState.WORKING,
-            "WAITING_AUTH": TaskState.AUTH_REQUIRED,
-            "COMPLETED": TaskState.COMPLETED,
-            "FAILED": TaskState.FAILED,
-            "ABORTED": TaskState.FAILED,
-            "CANCELLED": TaskState.CANCELED,
-            "REJECTED": TaskState.REJECTED,
-        }
-        self.assertEqual({key: map_core_state(key) for key in expected}, expected)
-
-    def test_agent_card_reflects_effective_capabilities(self):
-        raw = agent_config().to_dict()
-        raw["features"]["memory"] = "disabled"
-        effective = compile_effective_config(
-            platform_config(), AgentConfig.from_dict(raw), request(), DISCOVERED
-        )
-        card = AgentCard.from_effective_config(effective)
-        encoded = card.to_dict()
-        self.assertEqual(encoded["supportedInterfaces"][0]["protocolVersion"], "1.0")
-        self.assertTrue(encoded["capabilities"]["streaming"])
-        self.assertNotIn("memory", encoded["skills"])
-        self.assertNotIn("memory", str(encoded["capabilities"]).lower())
-        extensions = {item["uri"]: item["required"] for item in encoded["extensions"]}
-        self.assertTrue(extensions[CORE_EXTENSION_URI])
-        self.assertFalse(extensions[LOCAL_APPROVAL_STATUS_URI])
-        local_extension = next(
-            item
-            for item in encoded["extensions"]
-            if item["uri"] == LOCAL_APPROVAL_STATUS_URI
-        )
-        self.assertFalse(local_extension["params"]["callerCanResolve"])
-
     def test_nonblocking_task_survives_stream_disconnect_and_is_queryable(self):
         def handler(run_request, task_context):
             time.sleep(0.02)

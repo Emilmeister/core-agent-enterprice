@@ -10,11 +10,13 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from urllib.parse import urlparse
 
-from .config import RunRequest
+from .config import A2A_INTERFACES, RunRequest
 from .errors import CoreError
 
-CORE_EXTENSION_URI = "urn:core-agent:run-capabilities:v1"
-LOCAL_APPROVAL_STATUS_URI = "urn:core-agent:local-operator-approval:v1"
+ATTACHMENTS_ONLY_PROMPT = "The user sent attachments without any accompanying text."
+# Removed input extension. Still recognised only to reject a payload that would
+# otherwise be silently ignored; never required and never advertised.
+LEGACY_RUN_CAPABILITIES_URI = "urn:core-agent:run-capabilities:v1"
 
 
 class TaskState(str, Enum):
@@ -35,7 +37,6 @@ _STATE_MAP = {
     "WAITING_TASK": TaskState.WORKING,
     "PAUSED": TaskState.WORKING,
     "WAITING_INPUT": TaskState.INPUT_REQUIRED,
-    "WAITING_LOCAL_APPROVAL": TaskState.WORKING,
     "APPROVED_RESERVED": TaskState.WORKING,
     "WAITING_AUTH": TaskState.AUTH_REQUIRED,
     "COMPLETED": TaskState.COMPLETED,
@@ -62,6 +63,12 @@ class Part:
     def text(cls, value):
         return cls("text", value)
 
+    @classmethod
+    def file(cls, data, *, filename=None, media_type=None):
+        return cls(
+            "file", {"bytes": data, "filename": filename, "media_type": media_type}
+        )
+
 
 @dataclass(frozen=True)
 class Message:
@@ -79,39 +86,36 @@ class Message:
 
     @classmethod
     def from_run_request(cls, request, context_id=None):
-        value = request.to_dict()
-        prompt = value.pop("prompt")
-        return cls(
-            "user",
-            (Part.text(prompt),),
-            (CORE_EXTENSION_URI,),
-            {CORE_EXTENSION_URI: value},
-            context_id,
+        return cls("user", (Part.text(request.prompt),), (), {}, context_id)
+
+
+def _reject_stale_capabilities(message):
+    """A client still sending the removed extension must not lose capabilities silently."""
+    payload = message.metadata.get(LEGACY_RUN_CAPABILITIES_URI)
+    if not isinstance(payload, dict):
+        return
+    if payload.get("mcp") or payload.get("skills"):
+        raise CoreError(
+            "CONFIG_INVALID",
+            "mcp and skills are deployment configuration and cannot be sent per request",
         )
 
 
-def parse_run_request(message, requested_extensions):
-    if (
-        CORE_EXTENSION_URI not in requested_extensions
-        or CORE_EXTENSION_URI not in message.extensions
-    ):
-        raise CoreError("A2A_EXTENSION_REQUIRED")
+def parse_run_request(message):
+    _reject_stale_capabilities(message)
     if any(part.kind not in {"text", "file", "data"} for part in message.parts):
         raise CoreError("CONTENT_TYPE_NOT_SUPPORTED")
+    # Binary parts never reach the prompt: the model reads them back as artifacts.
+    attachments = tuple(part.data for part in message.parts if part.kind == "file")
     prompt = "\n".join(
         json.dumps(part.data, sort_keys=True) if part.kind == "data" else str(part.data)
         for part in message.parts
+        if part.kind != "file"
     ).strip()
-    extension = message.metadata.get(CORE_EXTENSION_URI, {})
-    if not isinstance(extension, dict) or set(extension) != {"mcp", "skills"}:
-        raise CoreError("INVALID_REQUEST")
-    return RunRequest.from_dict(
-        {
-            "prompt": prompt,
-            "mcp": extension.get("mcp", []),
-            "skills": extension.get("skills", []),
-        }
-    )
+    if not prompt and attachments:
+        prompt = ATTACHMENTS_ONLY_PROMPT
+    request = RunRequest.from_dict({"prompt": prompt})
+    return replace(request, attachments=attachments) if attachments else request
 
 
 @dataclass(frozen=True)
@@ -172,8 +176,10 @@ class Task:
 @dataclass(frozen=True)
 class AgentCard:
     name: str
-    protocol_versions: tuple[str, ...] = ("1.0",)
-    bindings: tuple[str, ...] = ("HTTP+JSON",)
+    # (binding, version) pairs. A cross product would advertise pairs no endpoint
+    # serves: the JSON-RPC routes are mounted in 0.3 compatibility mode and reject
+    # 1.0, while the REST routes only accept 1.0.
+    interfaces: tuple[tuple[str, str], ...] = A2A_INTERFACES
     capabilities: dict = field(
         default_factory=lambda: {"streaming": True, "pushNotifications": True}
     )
@@ -181,19 +187,33 @@ class AgentCard:
     input_modes: tuple[str, ...] = ("text/plain", "application/json")
     output_modes: tuple[str, ...] = ("text/plain", "application/json")
     authentication: tuple[str, ...] = ()
-    extensions: tuple[str, ...] = (CORE_EXTENSION_URI,)
-    optional_extensions: tuple[str, ...] = (LOCAL_APPROVAL_STATUS_URI,)
+    extensions: tuple[str, ...] = ()
+    optional_extensions: tuple[str, ...] = ()
+    description: str = "Policy-enforced core agent runtime"
+    version: str = "1.0.0"
+
+    @property
+    def protocol_versions(self):
+        return tuple(dict.fromkeys(version for _, version in self.interfaces))
+
+    @property
+    def bindings(self):
+        return tuple(dict.fromkeys(binding for binding, _ in self.interfaces))
 
     @classmethod
     def minimal(cls, name, protocol_versions=("1.0",)):
-        return cls(name, tuple(protocol_versions))
+        versions = set(protocol_versions)
+        return cls(
+            name,
+            tuple(pair for pair in A2A_INTERFACES if pair[1] in versions)
+            or tuple(("JSONRPC", version) for version in protocol_versions),
+        )
 
     @classmethod
     def from_effective_config(cls, effective):
         return cls(
             effective.agent_name,
-            effective.a2a_protocol_versions,
-            effective.a2a_bindings,
+            effective.a2a_interfaces,
             {"streaming": True, "pushNotifications": True},
             tuple(sorted(effective.skills)),
         )
@@ -201,10 +221,11 @@ class AgentCard:
     def to_dict(self):
         return {
             "name": self.name,
+            "description": self.description,
+            "version": self.version,
             "supportedInterfaces": [
                 {"protocolVersion": version, "transport": binding}
-                for version in self.protocol_versions
-                for binding in self.bindings
+                for binding, version in self.interfaces
             ],
             "capabilities": dict(self.capabilities),
             "skills": list(self.skills),
@@ -258,7 +279,9 @@ class A2AService:
     ):
         if protocol_version not in self.agent_card.protocol_versions:
             raise CoreError("A2A_VERSION_UNSUPPORTED")
-        request = parse_run_request(message, {CORE_EXTENSION_URI})
+        request = parse_run_request(message)
+        if request.attachments:
+            raise CoreError("CONTENT_TYPE_NOT_SUPPORTED")
         task = self.create_task(message.context_id)
         thread = threading.Thread(target=self._run, args=(task, request), daemon=True)
         thread.start()

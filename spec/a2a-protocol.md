@@ -15,52 +15,83 @@ Core Agent публикует public Agent Card и, при наличии зак
 - supported input/output media types;
 - authentication schemes;
 - public Agent Skills в терминах A2A;
-- Core Agent extension URI и её required/optional status.
+- optional informational extensions, если они объявлены.
 
 A2A Agent Skill описывает внешнюю capability сервера и не равен runtime skill package из RunRequest. Названия могут совпадать, но lifecycle и trust model различаются.
 
-## Core Agent extension
+### Версия на каждый binding
 
-Логические входы `prompt`, `mcp`, `skills` передаются через A2A:
+Каждый binding MUST объявляться вместе с той protocol version, которую этот endpoint фактически принимает. Card MUST NOT перечислять versions и bindings независимыми списками с последующим декартовым произведением: такая форма выражает пары, которых нет, а объявленная и неподдерживаемая пара является рекламой capability без реализации.
+
+Фактическое сопоставление v1 зафиксировано:
+
+| Binding | Путь | A2A version |
+|---|---|---|
+| `JSONRPC` | корневой RPC-путь | `0.3` |
+| `HTTP+JSON` | REST-пути | `1.0` |
+
+JSON-RPC работает в режиме совместимости `0.3` намеренно: только он даёт ADK-совместимую форму streaming-кадров, описанную ниже. Это осознанный компромисс — ADK-совместимый streaming для v1 важнее единой версии на обоих binding.
+
+Проверка соответствия MUST быть автоматической: для каждой объявленной пары endpoint MUST принимать запрос именно с этой версией. Ручной сверки недостаточно, потому что версия binding задаётся при монтировании routes и расходится с картой незаметно.
+
+Клиент, не приславший `A2A-Version`, обрабатывается как `0.3`. Для REST это означает, что заголовок `A2A-Version: 1.0` обязателен; отсутствие заголовка на REST-пути завершается ошибкой версии, а не молчаливым downgrade.
+
+### Лишние поля JSON-RPC конверта
+
+JSON-RPC 2.0 допускает в конверте ровно `jsonrpc`, `method`, `params` и `id`. Строгая валидация отклоняет запрос целиком при любом лишнем члене верхнего уровня, поэтому клиент, дублирующий поле «на всякий случай» и снаружи, и внутри `params`, не может работать вовсе.
+
+Сервер MUST удалять неизвестные члены верхнего уровня до валидации конверта и обрабатывать запрос по оставшимся четырём. Правило применяется и к batch-массиву поэлементно.
+
+Удалённое поле MUST NOT интерпретироваться. В частности, `contextId` верхнего уровня не становится session id: единственным источником остаётся `params.message.contextId`. Обратное создало бы второй, недокументированный способ задавать сессию.
+
+Факт удаления MUST оставаться наблюдаемым: runtime записывает предупреждение с именами удалённых полей. Повторяющийся набор имён MAY логироваться один раз за процесс, чтобы постоянная ошибка клиента не превращалась в поток одинаковых записей.
+
+Компромисс зафиксирован осознанно. Терпимость к лишним полям облегчает интеграцию, но скрывает ошибку вызывающей стороны: клиент, который кладёт `contextId` **только** снаружи, получит успешный ответ и молча потеряет непрерывность сессии. Именно поэтому предупреждение обязательно, а перекладывание значения внутрь сообщения запрещено — оно замаскировало бы дефект клиента вместо того, чтобы его показать.
+
+### Discovery
+
+Канонический путь публикации — `/.well-known/agent-card.json`.
+
+Тот же документ MUST отдаваться и по историческому пути `/.well-known/agent.json`. Клиенты, каталоги и платформенные регистраторы, написанные до переименования, опрашивают именно его, а `404` там означает не деградацию, а полную необнаруживаемость агента. Оба пути MUST возвращать идентичный документ: исторический путь не является отдельной версией карточки, не расширяет контракт и не может отдавать иной набор capabilities.
+
+Query-параметры при запросе карточки MUST игнорироваться: регистраторы добавляют собственные идентификаторы, и они не влияют на содержимое ответа.
+
+### Advertised URL
+
+Карточка MUST объявлять адрес, по которому удалённый caller действительно может обратиться к агенту. Loopback-адрес вида `http://localhost:{PORT}` таким адресом не является ни при каком развёртывании за прокси: обнаружение формально работает, агент выглядит живым, а вызов завершается отказом соединения. Это молчаливый отказ, поэтому адрес не может оставаться на усмотрение оператора.
+
+Порядок определения адреса фиксирован:
+
+1. `AGENT_URL`, если задан, является authoritative и MUST использоваться без изменений. Никакой заголовок запроса не может его переопределить.
+2. Иначе адрес MUST выводиться из заголовков конкретного запроса карточки: `X-Forwarded-Proto` и `X-Forwarded-Host`, а при их отсутствии — схема запроса и `Host`.
+3. Если пригодного значения нет, используется статический адрес из конфигурации. Запрос карточки MUST завершаться успешно: недоступность адреса не повод отвечать ошибкой на discovery.
+
+Выведенное значение проходит валидацию до попадания в карточку: из списка через запятую берётся первый элемент, значение MUST NOT содержать пробельные и управляющие символы, MUST NOT содержать userinfo, а схема MUST быть `http` или `https`. Непрошедшее проверку значение отбрасывается в пользу шага 3.
+
+Компромисс зафиксирован осознанно: `Host` контролируется вызывающей стороной, поэтому выведенный адрес достоверен ровно настолько, насколько доверенным является прокси перед агентом. Production SHOULD задавать `AGENT_URL` явно. Ограничение обязательно: выведенный адрес MUST использоваться только как advertised URL карточки и MUST NOT влиять на authentication, policy, tenant resolution или исходящие запросы агента.
+
+## Входы запроса
+
+A2A несёт единственный логический вход:
 
 - `prompt` — content A2A `Message.parts`;
-- `mcp` и `skills` — versioned structured data extension `urn:core-agent:run-capabilities:v1` в A2A Message metadata, keyed by extension URI;
 - session — A2A `contextId`;
 - запуск/фоновая работа — A2A `Task`;
 - результат — A2A `Artifact`;
 - пользовательское объяснение или запрос данных — A2A `Message`.
 
-Клиент MUST объявить поддержку required extension. Сервер MUST вернуть стандартную A2A ошибку для неподдерживаемой required extension, а не молча проигнорировать MCP/skills.
+Core Agent MUST NOT требовать собственного расширения протокола для обычного запуска. Любой стандартный A2A-клиент является валидным клиентом: отсутствие расширений в запросе не является ошибкой.
 
-Клиент opt-in использует binding-specific A2A extension mechanism (`A2A-Extensions` service parameter для HTTP), перечисляет URI в `Message.extensions` и кладёт payload под тем же URI в `Message.metadata`.
+MCP-серверы и skills задаются конфигурацией развёртывания и описаны в [Публичном контракте](public-contract.md). Прежнее расширение `urn:core-agent:run-capabilities:v1` удалено вместе с требованием его объявлять; правила обратной совместимости определены там же.
 
-Extension payload содержит ровно:
-
-```json
-{
-  "mcp": [],
-  "skills": []
-}
-```
-
-`prompt` не дублируется в metadata. Auth, tenant, trace context, budgets и policy не становятся extension fields.
-
-## Local operator HITL extension
-
-Protected action разрешает только local operator ServingAgent через private control plane. Remote A2A caller никогда не получает approval request/response capability и не может изменить pending decision сообщением, metadata, extension или credential.
-
-`WAITING_LOCAL_APPROVAL` проецируется как `working`, а не `input-required`/`auth-required`. Current Task status сохраняет понятный text Message: решение принимает local operator; caller не может approve/deny; side effect ещё не выполнен; caller может GetTask/subscribe/push/cancel или отправить follow-up, который останется queued до снятия lock.
-
-Agent Card объявляет одну optional informational extension с configurable owner URI `LOCAL_APPROVAL_EXTENSION_URI`. Она сообщает `authorizationOwner=serving_agent_local_operator`, `callerActionRequired=false`, `callerCanApprove=false`, `callerCanDeny=false`, `protectedActionExecuted=false`, allowed tracking/queued-message/cancel operations, wait timestamp и status version. В extension нет incoming decision schema, approval ID, URL или token. Extension-unaware caller получает тот же core A2A lifecycle и достаточный text status.
-
-Message, адресованный Task в `WAITING_LOCAL_APPROVAL`, принимается в durable inbox, но не изменяет frozen proposal, approval или reservation и не интерпретируется как approve/deny/cancel. Runtime передаёт его модели только после разрешения approval lock. Только A2A `CancelTask` может выиграть race до execution reservation. Полный authority, digest, transaction, recovery и audit contract определён в [Local operator HITL](local-operator-hitl.md).
+Agent Card MAY объявлять optional informational extensions, не влияющие на приём запроса. Такое расширение MUST NOT быть required и MUST NOT блокировать клиента, который о нём не знает.
 
 ## Task mapping
 
 | Core state | A2A Task state | Дополнительная семантика |
 |---|---|---|
 | `CREATED`, `QUEUED` | `submitted` | задача принята, worker ещё не выполняет turn |
-| `RUNNING`, `WAITING_TASK`, `WAITING_LOCAL_APPROVAL`, `APPROVED_RESERVED`, `PAUSED`, `RECOVERING` | `working` | точная причина доступна в безопасном status metadata |
+| `RUNNING`, `WAITING_TASK`, `PAUSED`, `RECOVERING` | `working` | точная причина доступна в безопасном status metadata |
 | `WAITING_INPUT` | `input-required` | caller должен предоставить новые бизнес-данные |
 | `WAITING_AUTH` | `auth-required` | требуется credential/auth flow |
 | `COMPLETED` | `completed` | результаты представлены Artifacts |
@@ -98,9 +129,9 @@ Caller MAY отправлять дополнительные A2A Messages в у�
 - не прерывать уже начатый model call, tool call или side effect;
 - перед terminal commit атомарно проверить inbox: Message, committed раньше terminal transition, MUST быть обработан; Message, проигравший race terminal transition, MUST быть отклонён.
 
-Follow-up не пересобирает EffectiveConfig и не пополняет budgets. Core extension использует ту же version и тот же canonical `mcp`/`skills` snapshot, что исходный Message; попытка добавить, удалить или изменить capability отклоняется с `CONFIG_CONFLICT`. Новейший turn MAY уточнить или изменить желаемый будущий результат, но не отменяет уже committed side effect; для отмены Task используется `CancelTask`.
+Follow-up не пересобирает EffectiveConfig и не пополняет budgets: capabilities принадлежат конфигурации и неизменны на протяжении Task. Новейший turn MAY уточнить или изменить желаемый будущий результат, но не отменяет уже committed side effect; для отмены Task используется `CancelTask`.
 
-`WAITING_INPUT` и `WAITING_TASK` Task возобновляются notification-ом о новом inbox Message. В `RUNNING` Message ждёт следующую safe boundary. В `PAUSED`, `WAITING_AUTH` и `WAITING_LOCAL_APPROVAL` Message сохраняется, но не снимает lock/паузу и не передаётся модели до разрешённого resume.
+`WAITING_INPUT` и `WAITING_TASK` Task возобновляются notification-ом о новом inbox Message. В `RUNNING` Message ждёт следующую safe boundary. В `PAUSED` и `WAITING_AUTH` Message сохраняется, но не снимает паузу и не передаётся модели до разрешённого resume.
 
 ## Blocking, background и ожидание
 
@@ -114,9 +145,78 @@ Follow-up не пересобирает EffectiveConfig и не пополняе
 ## Artifacts и Messages
 
 - Итоговые и промежуточные результаты задачи публикуются как Artifacts с content parts, media type, digest и provenance.
-- Messages используются для общения, progress summary и remote input request; local approval не является A2A Message flow.
+- Messages используются для общения, progress summary и remote input request.
 - Partial artifact updates идемпотентны и имеют stable artifact ID/version.
-- Secret, hidden reasoning и raw sensitive tool output MUST NOT попадать в Message или Artifact без явной data policy.
+- Secret, hidden reasoning и raw sensitive tool output MUST NOT попадать в Message или Artifact без явной data policy. Provider-visible reasoning MAY появляться только как помеченная часть промежуточного status Message при включённом streaming и MUST отсутствовать в терминальном кадре и Artifact.
+
+## Streaming прогресса выполнения
+
+Streaming показывает вызывающей стороне ход выполнения Task: рассуждение модели, вызовы инструментов, их результаты и растущий текст ответа. Формат кадров фиксирован, потому что клиенты собирают из него состояние.
+
+### Binding
+
+Сервер MUST монтировать оба binding: JSON-RPC на корневом RPC-пути и HTTP+JSON REST. ADK-совместимую форму кадров (`kind`, `final`, lowercase `state`, части `kind: "text"|"data"`) даёт JSON-RPC binding в режиме совместимости A2A 0.3; она и является нормативной для этого раздела. Agent Card объявляет оба binding.
+
+### Последовательность кадров
+
+Один streaming-вызов MUST давать ровно такую последовательность:
+
+1. один кадр `kind: "task"` с начальным состоянием;
+2. ноль или больше кадров `kind: "status-update"` со `state: "working"` и `final: false`;
+3. ноль или больше кадров `kind: "artifact-update"` с чанками результата;
+4. ровно один терминальный кадр `kind: "status-update"` с терминальным `state` и `final: true`.
+
+Кадр с `final: true` MUST быть последним. Ни один промежуточный кадр MUST NOT иметь `final: true`.
+
+### Типы промежуточных кадров
+
+Промежуточный `status-update` несёт agent-сообщение, части которого различаются по метаданным:
+
+| Часть | Метаданные части | Содержимое |
+|---|---|---|
+| text | `adk_thought: true` | provider-visible reasoning |
+| text | отсутствуют | публичный текст ответа |
+| data | `adk_type: "function_call"` | `{"id", "name", "args"}` |
+| data | `adk_type: "function_response"` | `{"id", "name", "response"}` |
+
+`response` внутри `function_response` содержит `status` (`succeeded`, `failed`, `denied` или `timed_out`), `output` и, для неуспешного исхода, `error_code`.
+
+Кадр с текстом MUST нести `partial: true` в metadata сообщения. Кадры `function_call` и `function_response` MUST NOT быть partial: они являются дискретными фактами, а не снимками.
+
+Отклонение от исходной ADK-схемы: признак `partial` передаётся в `message.metadata`, а не отдельным полем `Message`, потому что используемые SDK-типы игнорируют неизвестные поля верхнего уровня. Прочие поля и метки совпадают.
+
+### Кумулятивные снимки
+
+Текстовый кадр является полным снимком, а не приращением: клиент MUST заменять ранее показанный текст, а не дописывать его. Снимок содержит обе накопленные строки — reasoning и публичный ответ.
+
+Слияние приходящих от provider фрагментов MUST быть консервативным: фрагмент, начинающийся с уже накопленного буфера, заменяет буфер целиком, иначе он дописывается. Догадки о частичном перекрытии запрещены — они молча удаляют символы из легитимного приращения.
+
+Новый снимок публикуется, только когда хотя бы один из двух каналов вырос не меньше чем на `A2A_STREAMING_BUFFER_SIZE` символов. Накопленный остаток MUST принудительно публиковаться на двух границах: по завершении model turn и непосредственно перед кадром `function_call`. После `function_call` буфер сбрасывается, поэтому текст следующего turn начинается с нуля и не дублирует предыдущий.
+
+### Терминальный кадр и ошибки
+
+Терминальный кадр несёт итоговый текст ответа. Provider-visible reasoning MUST отсутствовать в терминальном кадре и в Artifact.
+
+Результат публикуется как Artifact, разбитый на чанки по `MAX_CHUNK_SIZE` символов; `0` означает один чанк. Только последний чанк помечается `lastChunk`.
+
+При сбое сервер MUST опубликовать терминальный `failed`-кадр, содержащий уже отданный текст, разделитель и безопасный код ошибки, чтобы клиент не остался с оборванным потоком без объяснения. Если терминальное состояние уже опубликовано, повторная публикация не выполняется.
+
+### Durable history и push
+
+Промежуточные снимки являются транспортным прогрессом, а не durable-состоянием:
+
+- agent-сообщения с `partial` MUST удаляться из `Task.history` перед сохранением, иначе история переписывалась бы квадратично растущим объёмом;
+- push notification MUST NOT отправляться для таких кадров.
+
+Оба правила MUST проверять роль сообщения и применяться только к `agent`. Клиент не может подделать `partial` в собственном сообщении и тем самым удалить свой turn из durable истории.
+
+Кадры `function_call`, `function_response`, терминальные и не-agent сообщения сохраняются и доставляются push обычным образом.
+
+### Порядок, back-pressure и отключение
+
+Agent loop синхронный; каждая публикация MUST переноситься на serving event loop и дожидаться постановки в очередь. Это сохраняет порядок кадров и передаёт производителю back-pressure очереди. Публикация после терминального состояния тихо прекращается и не является ошибкой.
+
+`A2A_STREAMING_ENABLED=false` полностью отключает промежуточные кадры: остаются только начальный, artifact и терминальный. Ни один другой контракт при этом не меняется.
 
 ## Notifications
 
@@ -135,6 +235,5 @@ A2A binding MUST принимать и передавать W3C Trace Context ч
 ## Версионирование
 
 - A2A protocol version договаривается стандартным способом binding-а; runtime фиксирует `Major.Minor`, а patch не участвует в compatibility negotiation.
-- Core extension version меняется независимо.
 - Новый optional extension field обратно совместим; новый required field требует новой major extension version.
 - Persisted Task хранит A2A и extension versions, с которыми он был создан.

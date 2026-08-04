@@ -23,7 +23,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -334,6 +334,12 @@ CREATE INDEX core_inbound_pending_idx
     ON core_inbound_messages (run_id, sequence)
     WHERE consumed_at IS NULL;
 """,
+    8: """
+DROP TRIGGER IF EXISTS core_tool_proposals_immutable ON core_tool_proposals;
+DROP TABLE IF EXISTS core_execution_records;
+DROP TABLE IF EXISTS core_approval_requests;
+DROP TABLE IF EXISTS core_tool_proposals;
+""",
 }
 
 
@@ -349,7 +355,10 @@ class PostgresDatabase:
         timeout: float = 10,
     ):
         if not url:
-            raise CoreError("DATABASE_URL_REQUIRED")
+            raise CoreError(
+                "DATABASE_URL_REQUIRED",
+                "set SESSION_DATABASE_URL, SESSION_POSTGRES_HOST or DATABASE_URL",
+            )
         if min_size < 0 or max_size < 1 or min_size > max_size or timeout <= 0:
             raise CoreError("CONFIG_INVALID", "invalid database pool configuration")
         self._closed = False
@@ -361,13 +370,19 @@ class PostgresDatabase:
             open=False,
             name="core-agent",
             kwargs={"autocommit": True, "row_factory": dict_row},
+            # Managed PostgreSQL drops idle connections without telling the client;
+            # without this the first request after a pause fails on a dead socket.
+            check=ConnectionPool.check_connection,
         )
         try:
             self.pool.open(wait=True, timeout=timeout)
             self.check()
         except Exception:
             self.pool.close()
-            raise CoreError("DATABASE_UNAVAILABLE") from None
+            raise CoreError(
+                "DATABASE_UNAVAILABLE",
+                "cannot reach the configured PostgreSQL host",
+            ) from None
 
     @classmethod
     def from_environment(cls, url=None):
@@ -427,7 +442,10 @@ class PostgresDatabase:
             }
             unknown = applied - MIGRATIONS.keys()
             if unknown:
-                raise CoreError("DATABASE_SCHEMA_UNSUPPORTED")
+                raise CoreError(
+                    "DATABASE_SCHEMA_UNSUPPORTED",
+                    "the database carries migrations this build does not know",
+                )
             for version, sql in MIGRATIONS.items():
                 if version not in applied:
                     connection.execute(sql)
@@ -441,7 +459,10 @@ class PostgresDatabase:
         try:
             version = self.schema_version()
         except Exception:
-            raise CoreError("DATABASE_SCHEMA_UNAVAILABLE") from None
+            raise CoreError(
+                "DATABASE_SCHEMA_UNAVAILABLE",
+                "run the migration job before starting the agent",
+            ) from None
         if version != SCHEMA_VERSION:
             raise CoreError(
                 "DATABASE_SCHEMA_MISMATCH",
@@ -453,9 +474,6 @@ class PostgresDatabase:
             raise CoreError("CONFIG_INVALID", "DATABASE_APP_ROLE is required")
         grants = {
             "core_schema_migrations": "SELECT",
-            "core_tool_proposals": "SELECT, INSERT",
-            "core_approval_requests": "SELECT, INSERT, UPDATE",
-            "core_execution_records": "SELECT, INSERT, UPDATE",
             "core_events": "SELECT, INSERT, DELETE",
             "core_checkpoints": "SELECT, INSERT, UPDATE, DELETE",
             "core_audit_records": "SELECT, INSERT",

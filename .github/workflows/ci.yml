@@ -49,18 +49,18 @@ jobs:
           -c "import core_agent, memory_service; print('image-smoke-ok')"
       - run: >-
           POSTGRES_DB=core_agent POSTGRES_USER=core_agent POSTGRES_PASSWORD=test
-          MODEL_API_FORMAT=openai MODEL_BASE_URL=http://model.invalid/v1
-          MODEL_NAME=test MODEL_API_KEY=test docker compose config --quiet
+          LLM_API_FORMAT=openai LLM_API_BASE=http://model.invalid/v1
+          LLM_MODEL=test LLM_API_KEY=test docker compose config --quiet
       - name: Smoke existing Memory volume
         env:
           COMPOSE_PROJECT_NAME: core-agent-ci
           POSTGRES_DB: core_agent
           POSTGRES_USER: core_agent
           POSTGRES_PASSWORD: test
-          MODEL_API_FORMAT: openai
-          MODEL_BASE_URL: http://model.invalid/v1
-          MODEL_NAME: test
-          MODEL_API_KEY: test
+          LLM_API_FORMAT: openai
+          LLM_API_BASE: http://model.invalid/v1
+          LLM_MODEL: test
+          LLM_API_KEY: test
         run: |
           trap 'docker compose down -v' EXIT
           docker volume create core-agent-ci_memory-data

@@ -5,8 +5,13 @@
 ## A2A и публичный контракт
 
 - [ ] Core Agent публикует валидную Agent Card с protocol/binding versions, auth, media types, skills и capabilities.
+- [ ] Карточка доступна и по `/.well-known/agent-card.json`, и по историческому `/.well-known/agent.json`; оба пути возвращают идентичный документ, а query-параметры игнорируются.
+- [ ] Каждая объявленная в карточке пара binding/version принимается соответствующим endpoint: `JSONRPC` отвечает на `0.3`, `HTTP+JSON` — на `1.0`, и карточка не содержит пар, которых нет.
+- [ ] При заданном `AGENT_URL` карточка объявляет именно его, и никакой заголовок запроса это не меняет.
+- [ ] Без `AGENT_URL` карточка объявляет адрес из `X-Forwarded-Proto`/`X-Forwarded-Host`, иначе из схемы и `Host`; непригодное значение отбрасывается, а запрос карточки всё равно завершается успешно.
+- [ ] Лишний член верхнего уровня JSON-RPC конверта не отклоняет запрос, не интерпретируется как session id и попадает в предупреждение с именами удалённых полей.
 - [ ] Внешнее общение использует A2A Message/Task/Artifact; отдельная публичная task state machine отсутствует.
-- [ ] Message Parts отображаются на `prompt`, required Core extension — только на `mcp`/`skills`.
+- [ ] Message Parts отображаются на `prompt`; собственное расширение протокола не требуется и не объявляется в Agent Card.
 - [ ] Неподдерживаемая required extension/version возвращает стандартно отображаемую A2A ошибку до model turn.
 - [ ] A2A `contextId` сохраняет session, но MCP/skills не наследуются в новую Task неявно.
 - [ ] Blocking, `return_immediately`, polling, subscription/streaming и push видят одну durable Task history.
@@ -14,7 +19,7 @@
 - [ ] Follow-up Message с существующим non-terminal `taskId` возвращает ту же Task, durable переживает restart и попадает отдельным user turn перед следующим model call.
 - [ ] Duplicate `messageId` не доставляется дважды; concurrent Messages получают стабильный committed order; context/task mismatch и cross-tenant ID отклоняются.
 - [ ] Уже начатый model/tool/side-effect call не прерывается; completion atomically проигрывает более раннему accepted Message, поэтому подтверждённый input не теряется.
-- [ ] Follow-up не изменяет EffectiveConfig/MCP/skills/budgets. В `WAITING_LOCAL_APPROVAL` он остаётся queued и не действует как approve/deny/cancel.
+- [ ] Follow-up не изменяет EffectiveConfig/MCP/skills/budgets.
 - [ ] Internal states корректно отображаются только на стандартные A2A Task states.
 
 ## Конфигурация агента
@@ -26,6 +31,8 @@
 - [ ] MCP tool filters применяются после discovery, но до model context; deny имеет приоритет.
 - [ ] EffectiveConfig immutable внутри Task и сохраняет config/policy/tool digests в audit.
 - [ ] Agent Card не рекламирует capability, отключённую AgentConfig.
+- [ ] Присутствующая, но пустая deployment-переменная трактуется как отсутствующая и получает документированный default вместо пустого значения.
+- [ ] Невалидная конфигурация не поднимает listener, завершает процесс ненулевым кодом и печатает ровно одну строку с именем настройки и стабильным кодом, без traceback и без значений secret-переменных.
 
 ## Kernel instructions
 
@@ -35,17 +42,18 @@
 - [ ] AgentProfilePrompt, user Message, skill или MCP output не могут изменить rules включённой capability; отключать optional capability может только config/policy.
 - [ ] Runtime enforcement отклоняет запрещённое действие, даже если model output просит обойти kernel instruction.
 - [ ] Child получает ту же kernel version и не может ослабить parent/host policy.
-- [ ] Provider-visible reasoning отсутствует в A2A, audit, memory и tool arguments; в logs/Phoenix оно появляется только при соответствующем explicit content capture, тогда как hidden/opaque reasoning не экспортируется никогда.
+- [ ] Provider-visible reasoning отсутствует в audit, memory и tool arguments; в A2A stream оно появляется только как помеченная `adk_thought` часть при `A2A_STREAMING_ENABLED=true` и вырезается из терминального кадра, а hidden/opaque reasoning не экспортируется никогда.
+- [ ] Streaming-кадры несут reasoning, function_call и function_response с ADK-совместимыми метками, текст идёт кумулятивными снимками с `partial`, и поток заканчивается ровно одним `final:true`.
 
 ## Runtime и durability
 
-- [ ] `MODEL_REASONING_EFFORT` валидируется до первого turn, отображается в model invocation parameters и маппится в нативный OpenAI-compatible/Anthropic request без управления через RunRequest.
+- [ ] `THINKING_LEVEL` валидируется до первого turn, отображается в model invocation parameters и маппится в нативный OpenAI-compatible/Anthropic request без управления через RunRequest.
 - [ ] Provider adapter отделяет visible reasoning от публичного ответа, сохраняет необходимый provider replay для следующего tool turn и экспортирует известный reasoning token usage.
 - [ ] Capability negotiation отклоняет несовместимый model/adapter до первого turn.
 - [ ] Model fallback не повторяет tool call и compacts context перед меньшим окном.
 - [ ] Pause/passive wait освобождают model worker и продолжаются из checkpoint/notification.
 - [ ] Lease не позволяет двум workers одновременно изменить Task.
-- [ ] Pending approval, input и task notifications восстанавливаются с прежними IDs/revisions.
+- [ ] Pending input и task notifications восстанавливаются с прежними IDs/revisions.
 - [ ] Idempotent operation можно продолжить; неоднозначная мутация не повторяется.
 - [ ] Hard limits включают parent и все child/background Tasks.
 
@@ -56,7 +64,7 @@
 - [ ] System prompt и tool schemas не входят в 90%/10–15% threshold.
 - [ ] Ниже 90% working occupancy compaction не запускается; при 90% и выше происходит до model call.
 - [ ] После compaction working occupancy находится в диапазоне 10–15%.
-- [ ] Prompt, policy, approvals, task contracts, active constraints, artifact refs и memory provenance остаются pinned.
+- [ ] Prompt, policy, task contracts, active constraints, artifact refs и memory provenance остаются pinned.
 - [ ] Повторные compactions сохраняют goal и immutable transcript mapping.
 - [ ] Непомещающиеся protected/pinned data дают `CONTEXT_UNRECOVERABLE`, не silent truncation.
 
@@ -129,29 +137,35 @@
 - [ ] Cancel/timeout завершает owned process group, закрывает PTY и фиксирует cleanup outcome.
 - [ ] Secret инжектируется только в environment разрешённого process и не попадает в checkpoint/telemetry/artifact.
 - [ ] Runtime явно сообщает logical/process separation и не рекламирует отдельные OS security namespaces.
-- [ ] `core.python.exec` доступен в `with_terminal` и `without_terminal` при полностью отключённом local operator/HITL; в `without_terminal` Agent Card/model catalog при этом не содержат `core.terminal.exec` и `core.task.start`.
+- [ ] `core.python.exec` доступен в обоих runtime-профилях и управляется только built-in allowlist.
 - [ ] Python process получает только bounded `tools.call`; каждый вложенный built-in/MCP вызов повторно проходит EffectiveConfig, schema, policy, общий budget, owner/tenant, audit и OTel.
 - [ ] Python exception/nonzero exit/timeout возвращается модели как failed tool result, не завершает родительскую Task и не повторяет неоднозначный side effect.
 
-## Tools, MCP и human-in-the-loop
+## Tools и MCP
 
 - [ ] Tool arguments валидируются до policy и execution.
-- [ ] Built-in descriptions кратко и точно отражают фактические ownership/lifecycle ограничения, включая timeout snapshot и запрет task-start для Python/delegate/task tools; artifact tools отсутствуют в catalog, а их устаревшие config names отклоняются.
+- [ ] Built-in descriptions кратко и точно отражают фактические ownership/lifecycle ограничения, включая timeout snapshot и запрет task-start для Python/delegate/task/send_message tools; устаревшие config names `core.artifact.put/get` отклоняются.
+- [ ] `core.artifact.save` создаёт новую версию и никогда не перезаписывает; `user:`-артефакт виден в другой сессии того же пользователя, а `core.artifact.list` разделяет session и user scope.
+- [ ] `core.agent.send_message` ретранслирует прогресс удалённого агента в поток корневой Task, возвращает его финальный текст и пробрасывает downstream только allowlist заголовков.
+- [ ] Делегированный child исполняет artifact tools и `core.agent.send_message` вместо `CAPABILITY_DISABLED`, разделяет session scope артефактов с parent-ом и не наследует credentials вызывающей стороны.
+- [ ] Непустой `ARTIFACT_S3_ENDPOINT_URL`, отличный от `https://s3.cloud.ru`, не роняет startup, а вызывает warning с проигнорированным и применённым значением; хвостовой `/` отбрасывается без warning.
+- [ ] В профиле Cloud.ru итоговый access key без ровно одного `:` или с пустой частью завершает startup `CONFIG_INVALID`; в профиле AWS ключ без `:` принимается.
+- [ ] Ни один входящий A2A Part не теряется молча: binary Part при `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS=false` и любой URL-Part отклоняются `CONTENT_TYPE_NOT_SUPPORTED`, а исходящий запрос по caller-адресу не выполняется.
+- [ ] При `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS=true` вложение сохраняется артефактом session scope до первого model turn, ведущий `user:` в имени нейтрализуется, а prompt получает строку с именем, версией, media type и размером.
 - [ ] MCP tools/resources/prompts/sampling/elicitation проходят local policy независимо от server metadata.
-- [ ] Risky call не начинается до local `APPROVE_ONCE`, exact digest commit и unique execution reservation.
-- [ ] RemoteCaller не меняет approval через text, metadata, A2A extension, caller credential или подставленный operator ID.
-- [ ] Local wait проецируется как `working`, никогда как `input-required`/`auth-required`; GetTask восстанавливает informative current status.
-- [ ] Optional extension сообщает `callerActionRequired=false` и не содержит incoming decision schema, approval ID/URL/token или arguments.
-- [ ] Locked-task `SendMessage` не меняет proposal/approval; только `CancelTask` может отменить до reservation.
-- [ ] Frozen proposal/digest связан с task/tenant/caller/tool/environment/target/arguments/policy; mutation создаёт новый approval.
-- [ ] Duplicate/racing approve/deny создают одно решение и одну reservation; approve/cancel obey first committed transition.
-- [ ] Перед dispatch повторно проверяются active task, policy, expiry, identity scope и recomputed digest.
-- [ ] Deny/expiry/cancel не выполняют action; secret и operator identity отсутствуют в A2A/OTel/public artifacts.
-- [ ] Restart сохраняет approval ID/digest/current status; reserved execution не получает вторую reservation или blind retry.
-- [ ] Internal audit связывает task, proposal, approval, operator actor, digest, execution и outcome и недоступен RemoteCaller.
+- [ ] MCP-сервер, согласовавший любую поддерживаемую ревизию протокола, подключается; отказ по версии называет предложенную и принимаемые.
+- [ ] Выданный сервером `Mcp-Session-Id` возвращается во всех последующих запросах к нему; транспортный отказ называет метод, на котором он произошёл.
+- [ ] `MCP_ALLOWED_TOOLS` принимает и голое имя тула, и форму `server.tool`; подключённый сервер без единого разрешённого тула порождает предупреждение с его именем.
 - [ ] Production без valid `DATABASE_URL`, ожидаемой PostgreSQL schema или database readiness не открывает A2A listener и не использует in-memory/SQLite fallback.
+- [ ] Соединение, закрытое сервером во время простоя, не доходит до caller ошибкой: пул проверяет и заменяет его, а следующий запрос выполняется успешно.
 - [ ] Production serving credential не имеет DDL path: `DATABASE_AUTO_MIGRATE=true` отклоняется, а separate migration credential/app role дают только exact DML grants.
-- [ ] A2A Tasks, events, checkpoints, approval/reservation и audit переживают restart и остаются tenant/owner scoped в одной PostgreSQL transaction boundary.
+- [ ] A2A Tasks, events, checkpoints и audit переживают restart и остаются tenant/owner scoped в одной PostgreSQL transaction boundary.
+
+- [ ] `startup.configuration` описывает runtime mode, built-ins, MCP-серверы с allowlist, удалённых агентов с причинами отказа и storage; `capabilities.resolved` показывает обнаруженные и разрешённые MCP-тулы по серверам. Секреты в обеих записях отсутствуют.
+- [ ] `startup.configuration` выводится и тогда, когда логирование настраивает внешний ASGI-сервер после сборки приложения; неподключившийся MCP-сервер получает отдельную запись с кодом ошибки и отличается в `capabilities.resolved` от подключённого с пустым каталогом.
+- [ ] `startup.configuration` называет OTLP endpoint для traces, metrics и logs по отдельности и булев признак наличия credentials; значение ключа отсутствует ни в каком виде.
+- [ ] `startup.configuration` перечисляет заданные `REMOTE_AGENTS` отдельно от подключившихся и содержит причину отказа каждого неподключившегося; userinfo из URL удаляется.
+- [ ] Помимо `startup.configuration` старт печатает короткую однострочную запись обычным текстом о `REMOTE_AGENTS`: при отсутствии значения — предупреждение о недоступности `core.agent.send_message`, различающее незаданную и заданную пустой переменную и перечисляющее имена присутствующих переменных окружения об агентах без значений, иначе заданные URL без userinfo и имена подключившихся.
 
 ## OpenTelemetry
 
@@ -176,7 +190,7 @@
 ## Сквозные сценарии
 
 1. **A2A background:** клиент отправляет Message с `return_immediately`, закрывает stream и позже получает тот же Task result через subscribe/push.
-2. **Compaction:** working context достигает 90%, сжимается до 10–15%, не считая system/tools, и сохраняет pending Task/approval.
+2. **Compaction:** working context достигает 90%, сжимается до 10–15%, не считая system/tools, и сохраняет pending Task.
 3. **Memory disabled:** Task передаёт optional Memory MCP, AgentConfig его фильтрует, и model не видит memory tools.
 4. **Hard line limit:** update на 201+ строк отклоняется без изменений и рекомендует split; следующий явный split создаёт несколько valid Markdown files.
 5. **Memory update:** agent находит существующий file через Memory MCP, commit обновляет NER/graph, hybrid search возвращает новую revision.
@@ -185,14 +199,13 @@
 8. **Concurrent work:** main продолжает задачу, пока два child/background Tasks выполняются, затем обрабатывает notifications без busy polling.
 9. **Parallel terminals:** main и два child одновременно работают в разных PTY/workspaces, не смешивают output и завершают только свои process groups.
 10. **OTel causality:** Core MCP client и Memory Service indexing spans находятся в одном distributed trace без content leakage.
-11. **Внешнее действие:** MCP write ждёт approval, переживает recovery и выполняется ровно один раз.
-12. **Local operator HITL:** risky terminal call публикует A2A `working`; caller не может resolve/modify approval, local control plane создаёт одну reservation exact argv, а cancel/deny/expiry не запускают process.
+11. **Внешнее действие:** MCP write переживает recovery и выполняется ровно один раз.
 13. **Live steering:** пока Task выполняет model/tool loop, два follow-up Messages приходят с тем же `taskId`, сохраняют committed order и учитываются агентом до terminal result без дублирования уже выполненного side effect.
 
 ## Definition of Done
 
 - Все критерии и сквозные сценарии проходят в CI, integration, chaos и eval suites.
-- A2A/Core extension schemas и examples проверяются против одного источника типов.
+- A2A schemas и examples проверяются против одного источника типов.
 - Recovery tests доказывают отсутствие duplicate side effects и потерянных notifications.
 - Memory Service rebuild test удаляет derived indexes и получает эквивалентный searchable graph из Markdown.
 - Security review охватывает A2A, model, MCP, skills, memory graph, принятую one-container trust model, subagents, OTel и tenancy.

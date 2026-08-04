@@ -71,24 +71,42 @@ class ContextState:
 
 
 class Compactor:
-    def __init__(self, budget, summarizer):
+    """Replace unpinned history with a structured summary once the budget fills.
+
+    `enabled` turns compaction off entirely, `interval` forces a compaction every
+    N model turns even below the ratio threshold, and `overlap` keeps that many of
+    the most recent unpinned items verbatim next to the summary so the model does
+    not lose the immediate conversational thread.
+    """
+
+    def __init__(self, budget, summarizer, *, enabled=True, interval=0, overlap=0):
         self.budget = budget
         self.summarizer = summarizer
+        self.enabled = bool(enabled)
+        self.interval = max(0, int(interval))
+        self.overlap = max(0, int(overlap))
 
-    def maybe_compact(self, state):
-        return (
-            self.compact(state)
-            if self.budget.should_compact(state.working_tokens)
-            else state
-        )
+    def due(self, turns):
+        return bool(self.enabled and self.interval and turns and turns % self.interval == 0)
 
-    def compact(self, state):
+    def maybe_compact(self, state, *, turns=0):
+        if not self.enabled:
+            return state
+        if self.budget.should_compact(state.working_tokens) or self.due(turns):
+            return self.compact(state, forced=self.due(turns))
+        return state
+
+    def compact(self, state, *, forced=False):
         before = state.working_tokens
-        if not self.budget.should_compact(before):
+        if not self.enabled or (not forced and not self.budget.should_compact(before)):
             return state
         pinned = tuple(item for item in state.active if item.pinned)
-        candidates = tuple(item for item in state.active if not item.pinned)
-        pinned_tokens = sum(item.tokens for item in pinned)
+        unpinned = tuple(item for item in state.active if not item.pinned)
+        overlap = unpinned[len(unpinned) - self.overlap :] if self.overlap else ()
+        candidates = unpinned[: len(unpinned) - len(overlap)]
+        if not candidates:
+            return state
+        pinned_tokens = sum(item.tokens for item in pinned + overlap)
         target = int(self.budget.working_capacity * self.budget.compact_to)
         if pinned_tokens > target:
             raise CoreError("CONTEXT_UNRECOVERABLE")
@@ -106,9 +124,11 @@ class Compactor:
             raise CoreError("CONTEXT_UNRECOVERABLE")
         if not all(section in summary.content for section in sections):
             raise CoreError("CONTEXT_UNRECOVERABLE")
-        active = pinned + (summary,)
+        active = pinned + (summary,) + overlap
         after = sum(item.tokens for item in active)
-        if after > target or after < int(self.budget.working_capacity * 0.10):
+        if after > target or (
+            not forced and after < int(self.budget.working_capacity * 0.10)
+        ):
             raise CoreError("CONTEXT_UNRECOVERABLE")
         return ContextState(
             active,

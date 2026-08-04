@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import fnmatch
 import copy
+import inspect
 import logging
+import time
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
@@ -22,14 +26,17 @@ from .context import (
     StructuredSummarizer,
 )
 from .errors import CoreError
-from .approvals import ApprovalRequest
 from .skills import SkillResolver
 from .kernel import KernelCompiler
 from .python_exec import execute_python
+from .remote_agents import build_forwarded_headers
 from .security import redact
+from .streaming import NullStreamPublisher
 from .tasks import DelegationContract
 from .tools import ToolCall, ToolDefinition, ToolResult
 from .workflow import InMemoryWorkflowStore, WorkflowRecord
+
+NULL_STREAM = NullStreamPublisher()
 
 
 def _mcp_read_only(tool_name):
@@ -63,50 +70,6 @@ class RunResult:
         }
 
 
-@dataclass(frozen=True)
-class ApprovalNeeded:
-    run_id: str
-    request: ApprovalRequest
-
-    def to_public_payload(
-        self,
-        *,
-        phase="awaiting_local_operator",
-        status_version=1,
-        suggested_poll_seconds=15,
-    ):
-        allowed_operations = [
-            "get_task",
-            "subscribe_to_task",
-            "create_push_notification_config",
-        ]
-        if phase == "awaiting_local_operator":
-            allowed_operations.append("cancel_task")
-        allowed_operations.append("send_message_queued")
-        return {
-            "schemaVersion": "1.0",
-            "phase": phase,
-            "authorizationOwner": "serving_agent_local_operator",
-            "callerActionRequired": False,
-            "callerCanApprove": False,
-            "callerCanDeny": False,
-            "protectedActionExecuted": False,
-            "allowedCallerOperations": allowed_operations,
-            "waitStartedAt": datetime.fromtimestamp(
-                self.request.created_at, timezone.utc
-            ).isoformat(),
-            "suggestedPollIntervalSeconds": suggested_poll_seconds,
-            "statusVersion": status_version,
-        }
-
-
-@dataclass(frozen=True)
-class ApprovalReserved:
-    run_id: str
-    approval_id: str
-    execution_id: str
-
-
 class CoreAgent:
     def __init__(
         self,
@@ -133,6 +96,12 @@ class CoreAgent:
         logger=None,
         log_content=False,
         log_max_chars=12_000,
+        artifact_service=None,
+        remote_agents=None,
+        send_message_api_key=None,
+        platform_mcp=(),
+        declared_skills=(),
+        model_retries=0,
     ):
         self.platform_config = platform_config
         self.agent_config = agent_config
@@ -171,7 +140,17 @@ class CoreAgent:
         self._run_contexts = {}
         self._run_scopes = {}
         self._runtime_cache = {}
-        self._task_approvals = {}
+        self._task_streams = {}
+        self._task_headers = {}
+        self._model_streams_deltas = self._accepts_deltas(self.model)
+        self.artifact_service = artifact_service
+        self.platform_mcp = tuple(platform_mcp)
+        self.declared_skills = tuple(declared_skills)
+        self._silent_mcp_warned = set()
+        self._capabilities_logged = False
+        self.model_retries = max(0, int(model_retries))
+        self.remote_agents = dict(remote_agents or {})
+        self.send_message_api_key = send_message_api_key
         self.tool_runtime.handlers.update(
             {
                 "core.task.start": self._task_start,
@@ -181,6 +160,10 @@ class CoreAgent:
                 "core.task.cancel": self._task_cancel,
                 "core.python.exec": self._python_exec,
                 "core.delegate": self._delegate,
+                "core.artifact.save": self._artifact_save,
+                "core.artifact.load": self._artifact_load,
+                "core.artifact.list": self._artifact_list,
+                "core.agent.send_message": self._send_message,
             }
         )
         if self.depth == 0 and hasattr(self.task_scheduler, "register"):
@@ -188,6 +171,21 @@ class CoreAgent:
                 "background_tool", self._recover_background_tool
             )
             self.task_scheduler.register("subagent", self._recover_subagent)
+
+    @staticmethod
+    def _accepts_deltas(model):
+        """Only adapters that declare `on_delta` receive live token callbacks."""
+        generate = getattr(model, "generate", None)
+        if generate is None:
+            return False
+        try:
+            parameters = inspect.signature(generate).parameters
+        except (TypeError, ValueError):
+            return False
+        return "on_delta" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
 
     def _bounded_log_value(self, value):
         if isinstance(value, str):
@@ -229,10 +227,15 @@ class CoreAgent:
                 "reasoning_tokens",
                 "total_tokens",
             ):
-                if isinstance(payload.get(key), int) and not isinstance(
-                    payload[key], bool
+                if key not in payload:
+                    continue
+                value = payload[key]
+                # A counter the provider did not report is absent, not secret:
+                # leaving it redacted reads as a leak that never happened.
+                if value is None or (
+                    isinstance(value, int) and not isinstance(value, bool)
                 ):
-                    cleaned[key] = payload[key]
+                    cleaned[key] = value
             payload = cleaned
             self.logger.log(
                 level,
@@ -271,7 +274,7 @@ class CoreAgent:
         memory_mode = raw["features"].get("memory", "disabled")
         discovered = {}
         if raw["features"].get("mcp"):
-            for declaration in request.mcp:
+            for declaration in self.platform_mcp:
                 if declaration.get("role") == "memory" and memory_mode == "disabled":
                     continue
                 if declaration["name"] in self.platform_config.allowed_mcp_servers:
@@ -279,17 +282,69 @@ class CoreAgent:
                         discovered[declaration["name"]] = self.mcp_connector.connect(
                             declaration
                         )
-                    except CoreError:
+                    except CoreError as error:
                         if declaration.get("required"):
                             raise
+                        # An optional server is skipped, not hidden: without this the
+                        # tool simply never appears and nothing says why.
+                        self._warn_mcp_unavailable(declaration["name"], error)
         effective = compile_effective_config(
-            self.platform_config, self.agent_config, request, discovered
+            self.platform_config, self.agent_config, self.platform_mcp, discovered
         )
+        for server, catalog in discovered.items():
+            # A connected server exposing nothing looks healthy but gives the model
+            # no capability at all; only a warning makes the mismatch visible.
+            if catalog and not effective.mcp_tools.get(server):
+                self._warn_silent_mcp(server, catalog)
+        self._log_resolved_capabilities(discovered, effective)
         return raw, discovered, effective
+
+    def _log_resolved_capabilities(self, discovered, effective):
+        """Once per process: what the model actually got, discovered vs allowed."""
+        if self._capabilities_logged:
+            return
+        self._capabilities_logged = True
+        self._log(
+            "capabilities.resolved",
+            builtin_tools=sorted(effective.builtin_tools),
+            model_tool_catalog=sorted(effective.model_tool_catalog),
+            skills=sorted(effective.skills),
+            mcp={
+                server: {
+                    # "connected" separates a failed connection from an empty catalog.
+                    "connected": server in discovered,
+                    "discovered": sorted(discovered.get(server, ())),
+                    "allowed": sorted(effective.mcp_tools.get(server, ())),
+                }
+                for server in sorted(set(discovered) | set(effective.mcp_tools))
+            },
+        )
+
+    def _warn_mcp_unavailable(self, server, error):
+        if server in self._silent_mcp_warned:
+            return
+        self._silent_mcp_warned.add(server)
+        self.logger.warning(
+            "mcp server %r did not connect (%s: %s); its tools are unavailable",
+            server,
+            getattr(error, "code", type(error).__name__),
+            error,
+        )
+
+    def _warn_silent_mcp(self, server, catalog):
+        if server in self._silent_mcp_warned:
+            return
+        self._silent_mcp_warned.add(server)
+        self.logger.warning(
+            "mcp server %r is connected but no tool of it is allowed; "
+            "add one of %s to MCP_ALLOWED_TOOLS",
+            server,
+            ",".join(sorted(catalog)),
+        )
 
     def _activate_skills(self, request, effective):
         resolver = SkillResolver(
-            [item for item in request.skills if item.get("name") in effective.skills]
+            [item for item in self.declared_skills if item["name"] in effective.skills]
         )
         return tuple(
             resolver.activate(skill.name)
@@ -533,7 +588,6 @@ class CoreAgent:
         event_kind,
         event_data=None,
         audit=(),
-        pending_approval_id=None,
         result=None,
         error_code=None,
         lease_token=None,
@@ -552,7 +606,6 @@ class CoreAgent:
                 event_kind=event_kind,
                 event_data=event_data,
                 audit=audit,
-                pending_approval_id=pending_approval_id,
                 result=result,
                 error_code=error_code,
                 lease_token=lease_token,
@@ -741,7 +794,13 @@ class CoreAgent:
             compact_at=context["compact_at_working_ratio"],
             compact_to=context["compact_to_working_ratio"],
         )
-        return Compactor(budget, StructuredSummarizer(self.token_counter))
+        return Compactor(
+            budget,
+            StructuredSummarizer(self.token_counter),
+            enabled=context.get("compaction_enabled", True),
+            interval=context.get("compaction_interval", 0),
+            overlap=context.get("compaction_overlap", 0),
+        )
 
     def _definition(self, call, effective, discovered):
         server, separator, remote_tool = call.name.partition(".")
@@ -1000,6 +1059,17 @@ class CoreAgent:
                 }
             )
         self._append_result(snapshot, result_text)
+        self._stream(record).tool_result(
+            call.id,
+            call.name,
+            {
+                "status": status,
+                "output": self._value(
+                    outcome.output if isinstance(outcome, ToolResult) else outcome
+                ),
+                **({"error_code": error_code} if error_code else {}),
+            },
+        )
         event_kind = (
             "tool.completed"
             if succeeded
@@ -1075,58 +1145,18 @@ class CoreAgent:
             **({"arguments": call.arguments} if self.log_content else {}),
         )
         self.tool_runtime.validate(call, definition)
-        if self.tool_runtime.policy.evaluate(definition) == "deny":
-            return self._record_tool_outcome(
-                record,
-                snapshot,
-                call,
-                ToolResult(call.id, "denied"),
-                lease_token=lease_token,
-                span=span,
-            )
         record = self._record_transition(
             record,
             state="EXECUTING",
             snapshot=snapshot,
             event_kind="tool.intent",
             event_data={"tool_call_id": call.id, "mutating": definition.mutating},
-            audit=(
-                (
-                    "tool.execution.started",
-                    {
-                        "tool_call_id": call.id,
-                        "approval_id": record.pending_approval_id,
-                    },
-                ),
-            ),
-            pending_approval_id=record.pending_approval_id,
+            audit=(("tool.execution.started", {"tool_call_id": call.id}),),
             lease_token=lease_token,
         )
         try:
             if is_mcp:
-                execution = None
-                if approved:
-                    execution = self.tool_runtime.approvals.authorize_dispatch(
-                        record.pending_approval_id, call
-                    )
-                try:
-                    outcome = self.mcp_connector.call(call.name, call.arguments)
-                except Exception:
-                    if execution:
-                        self.tool_runtime.approvals.finish_execution(
-                            execution.id,
-                            "FAILED",
-                            error_code="MCP_EXECUTION_FAILED",
-                        )
-                    raise
-                if execution:
-                    self.tool_runtime.approvals.finish_execution(
-                        execution.id, "SUCCEEDED", outcome=outcome
-                    )
-            elif approved:
-                outcome = self.tool_runtime.resume_approved(
-                    call, record.pending_approval_id, run_id=record.run_id
-                )
+                outcome = self.mcp_connector.call(call.name, call.arguments)
             else:
                 outcome = self.tool_runtime.execute(
                     call,
@@ -1138,8 +1168,6 @@ class CoreAgent:
                     environment=raw["execution"]["environment_profile"],
                     policy_version=effective.digest,
                 )
-                if isinstance(outcome, ApprovalRequest):
-                    raise CoreError("INVALID_TASK_STATE")
         except Exception as error:
             if self._recoverable_tool_error(call, error):
                 outcome = self._failed_tool_outcome(call, error)
@@ -1176,12 +1204,22 @@ class CoreAgent:
             span=span,
         )
 
+    def _stream(self, record):
+        return self._task_streams.get(record.task_id) or NULL_STREAM
+
+    def _generate(self, **call):
+        """Retry a retryable provider failure REFLECT_AND_RETRY_MAX_RETRIES times."""
+        for attempt in range(self.model_retries + 1):
+            try:
+                return self.model.generate(**call)
+            except CoreError as error:
+                if attempt == self.model_retries or not getattr(
+                    error, "retryable", False
+                ):
+                    raise
+                time.sleep(min(2**attempt, 8))
+
     def _continue_workflow(self, record, *, decision=None):
-        if record.state == "WAITING_LOCAL_APPROVAL" and decision is None:
-            return ApprovalNeeded(
-                record.run_id,
-                self.tool_runtime.approvals.get(record.pending_approval_id),
-            )
         lease_token = self.workflow_store.acquire_lease(
             record.run_id,
             tenant_id=record.tenant_id,
@@ -1192,21 +1230,6 @@ class CoreAgent:
         try:
             request, raw, discovered, effective = self._load_workflow_runtime(record)
             snapshot = copy.deepcopy(record.snapshot)
-            if record.state == "APPROVED_RESERVED":
-                with self.telemetry.span(
-                    "core_agent.tool.execute",
-                    attributes={"core_agent.tool.approved": True},
-                ) as tool_span:
-                    record = self._execute_pending(
-                        record,
-                        snapshot,
-                        raw,
-                        discovered,
-                        effective,
-                        approved=True,
-                        lease_token=lease_token,
-                        span=tool_span,
-                    )
             budgets = raw.get("budgets", {})
             max_turns = min(
                 budgets.get("model_turns", self.platform_config.max_model_turns),
@@ -1225,7 +1248,7 @@ class CoreAgent:
                     record, snapshot, lease_token=lease_token
                 )
                 context = self._context_from_dict(snapshot["context"])
-                compacted = compactor.maybe_compact(context)
+                compacted = compactor.maybe_compact(context, turns=snapshot["turns"])
                 if compacted is not context:
                     snapshot["context"] = self._context_to_dict(compacted)
                     record = self._record_transition(
@@ -1273,13 +1296,21 @@ class CoreAgent:
                             session_id=record.context_id,
                         ),
                     ) as model_span:
-                        response = self.model.generate(
+                        stream = self._stream(record)
+                        delta = (
+                            {"on_delta": stream.text}
+                            if stream.enabled and self._model_streams_deltas
+                            else {}
+                        )
+                        response = self._generate(
                             context=model_context,
                             tools=model_tools,
                             instructions=model_instructions,
                             messages=model_messages,
+                            **delta,
                         )
                         model_span.set_attributes(self._llm_output_attributes(response))
+                    stream.flush()
                     action = (
                         "request_tools"
                         if response.tool_requests
@@ -1321,6 +1352,8 @@ class CoreAgent:
                             else {}
                         ),
                     )
+                    for item in response.tool_requests:
+                        stream.tool_call(item.id, item.name, item.arguments)
                     snapshot["turns"] += 1
                     snapshot["pending_response"] = self._response_dict(response)
                     if snapshot["pending_response"]["tool_requests"]:
@@ -1386,78 +1419,6 @@ class CoreAgent:
                                 span=tool_span,
                             )
                         continue
-                    with self.telemetry.span(
-                        "core_agent.policy.evaluate",
-                        attributes={
-                            "core_agent.tool.namespace": pending["name"].split(".", 1)[
-                                0
-                            ]
-                        },
-                    ):
-                        decision_value = self.tool_runtime.policy.evaluate(definition)
-                    if decision_value == "require_approval":
-                        snapshot["pending_call"] = copy.deepcopy(pending)
-                        record, approval = self.workflow_store.enter_approval(
-                            record,
-                            self.tool_runtime.approvals,
-                            call,
-                            risks=definition.risk_tags,
-                            snapshot=snapshot,
-                            environment=raw["execution"]["environment_profile"],
-                            policy_version=effective.digest,
-                            lease_token=lease_token,
-                        )
-                        if not self.workflow_store.atomic:
-                            for kind, data in (
-                                (
-                                    "tool.proposed",
-                                    {
-                                        "task_id": approval.task_id,
-                                        "proposal_id": approval.proposal_id,
-                                        "approval_id": approval.id,
-                                        "tool_call_id": approval.tool_call_id,
-                                        "action_digest": approval.action_digest,
-                                    },
-                                ),
-                                (
-                                    "policy.evaluated",
-                                    {
-                                        "proposal_id": approval.proposal_id,
-                                        "decision": "REQUIRE_LOCAL_APPROVAL",
-                                        "policy_version": approval.policy_version,
-                                    },
-                                ),
-                                (
-                                    "approval.requested",
-                                    {
-                                        "approval_id": approval.id,
-                                        "proposal_id": approval.proposal_id,
-                                        "action_digest": approval.action_digest,
-                                    },
-                                ),
-                            ):
-                                self.audit_log.append(record.run_id, kind, data)
-                            self.event_store.append(
-                                record.run_id,
-                                "approval.required",
-                                {"approval_id": approval.id},
-                            )
-                            self.checkpoint_store.save(
-                                record.run_id,
-                                self.event_store.revision(record.run_id),
-                                {**snapshot, "state": "WAITING_LOCAL_APPROVAL"},
-                            )
-                        self._task_approvals[record.task_id] = approval.id
-                        self._log(
-                            "approval.requested",
-                            run_id=record.run_id,
-                            task_id=record.task_id,
-                            approval_id=approval.id,
-                            tool_call_id=approval.tool_call_id,
-                            tool_name=call.name,
-                            risk_tags=sorted(definition.risk_tags),
-                        )
-                        return ApprovalNeeded(record.run_id, approval)
                     snapshot["pending_call"] = copy.deepcopy(pending)
                     with self.telemetry.span(
                         "core_agent.tool.execute",
@@ -1599,7 +1560,8 @@ class CoreAgent:
         if (
             target not in self._enabled_builtins()
             or target.startswith("core.task.")
-            or target in {"core.delegate", "core.python.exec"}
+            or target
+            in {"core.delegate", "core.python.exec", "core.agent.send_message"}
         ):
             raise CoreError("CAPABILITY_DISABLED")
         task_run_id = f"{run_id}-background-{uuid.uuid4()}"
@@ -1616,8 +1578,6 @@ class CoreAgent:
                 session_id=scope.get("session_id"),
                 tenant_id=scope.get("tenant_id"),
             )
-            if isinstance(outcome, ApprovalRequest):
-                raise CoreError("APPROVAL_REQUIRED")
             return self._value(outcome.output)
 
         task = self.task_scheduler.start(
@@ -1641,11 +1601,8 @@ class CoreAgent:
 
     def _python_exec(self, arguments, run_id):
         cached = self._runtime_cache.get(run_id)
-        raw = self.agent_config.to_dict()
         if (
             cached is None
-            or raw["approval"].get("local_operator", {}).get("enabled", True)
-            or self.tool_runtime.policy.approval_mode.value != "never"
         ):
             raise CoreError("CAPABILITY_DISABLED")
         _raw, discovered, effective = cached
@@ -1739,25 +1696,6 @@ class CoreAgent:
                 error_code=error.code,
             )
             raise
-        if self.tool_runtime.policy.evaluate(definition) != "allow":
-            error = CoreError("POLICY_DENIED")
-            with self.telemetry.span(
-                "core_agent.tool.execute", parent=parent_context
-            ) as span:
-                self._instrument_tool(span, call, definition)
-                span.record_error(error)
-            self.audit_log.append(
-                run_id, "tool.denied", audit_data, tenant_id=tenant_id
-            )
-            self._log(
-                "tool.denied",
-                run_id=run_id,
-                task_id=scope.get("task_id"),
-                tool_call_id=call.id,
-                tool_name=name,
-                source="core.python.exec",
-            )
-            raise error
         self.audit_log.append(
             run_id, "tool.execution.started", audit_data, tenant_id=tenant_id
         )
@@ -1779,8 +1717,6 @@ class CoreAgent:
                         environment="local-pty",
                         policy_version=effective.digest,
                     )
-                    if isinstance(outcome, ApprovalRequest):
-                        raise CoreError("POLICY_DENIED")
                     if outcome.status != "succeeded":
                         raise CoreError(
                             outcome.error_code
@@ -1843,8 +1779,6 @@ class CoreAgent:
             session_id=contract.get("session_id"),
             tenant_id=contract.get("tenant_id", "default"),
         )
-        if isinstance(outcome, ApprovalRequest):
-            raise CoreError("APPROVAL_REQUIRED")
         return self._value(outcome.output)
 
     def _task_get(self, arguments, run_id):
@@ -1884,6 +1818,144 @@ class CoreAgent:
                 arguments["task_id"], owner_id=run_id, tenant_id=tenant_id
             )
         )
+
+    def _artifact_scope(self, run_id):
+        if self.artifact_service is None:
+            raise CoreError("CAPABILITY_DISABLED")
+        scope = self._run_scopes.get(run_id, {})
+        return {
+            "app_name": self.agent_config.agent["name"],
+            "user_id": scope.get("identity") or "anonymous",
+            "session_id": scope.get("session_id") or "",
+        }
+
+    def _artifact_save(self, arguments, run_id):
+        content = arguments["content"]
+        if arguments.get("encoding", "text") == "base64":
+            try:
+                blob = base64.b64decode(content, validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise CoreError(
+                    "TOOL_ARGUMENT_INVALID", "content is not valid base64"
+                ) from error
+        else:
+            blob = content.encode("utf-8")
+        stored = self.artifact_service.save(
+            **self._artifact_scope(run_id),
+            filename=arguments["filename"],
+            content=blob,
+            media_type=arguments.get("mime_type"),
+            metadata=arguments.get("metadata"),
+        )
+        return {
+            "success": True,
+            "artifact_name": arguments["filename"],
+            "version": stored.version,
+            "size": stored.size,
+            "media_type": stored.media_type,
+        }
+
+    def _artifact_load(self, arguments, run_id):
+        stored, content = self.artifact_service.load(
+            **self._artifact_scope(run_id),
+            filename=arguments["filename"],
+            version=arguments.get("version"),
+        )
+        try:
+            text = content.decode("utf-8")
+            encoding = "text"
+        except UnicodeDecodeError:
+            text = base64.b64encode(content).decode("ascii")
+            encoding = "base64"
+        return {
+            "artifact_name": arguments["filename"],
+            "version": stored.version,
+            "media_type": stored.media_type,
+            "encoding": encoding,
+            "content": text,
+            "metadata": stored.metadata,
+        }
+
+    def _artifact_list(self, arguments, run_id):
+        session_artifacts, user_artifacts = self.artifact_service.list_keys(
+            **self._artifact_scope(run_id)
+        )
+        return {
+            "session_artifacts": session_artifacts,
+            "user_artifacts": user_artifacts,
+            "total": len(session_artifacts) + len(user_artifacts),
+        }
+
+    def _send_message(self, arguments, run_id):
+        if not self.remote_agents:
+            raise CoreError("CAPABILITY_DISABLED")
+        name = (arguments.get("agent_name") or "").strip()
+        if not name and len(self.remote_agents) == 1:
+            name = next(iter(self.remote_agents))
+        connection = self.remote_agents.get(name)
+        if connection is None:
+            return {
+                "success": False,
+                "agent_name": name,
+                "result": "",
+                "message": (
+                    "Unknown agent_name; available agents: "
+                    + ", ".join(sorted(self.remote_agents))
+                ),
+            }
+        scope = self._run_scopes.get(run_id, {})
+        stream = self._task_streams.get(scope.get("task_id")) or NULL_STREAM
+        headers = build_forwarded_headers(
+            self._task_headers.get(scope.get("task_id")) or {},
+            api_key=self.send_message_api_key,
+        )
+        call = {
+            "task": arguments["task"],
+            "message_id": str(uuid.uuid4()),
+            "task_id": scope.get("task_id"),
+            "context_id": scope.get("session_id"),
+            "forwarded_headers": headers,
+        }
+        try:
+            if connection.supports_streaming:
+                result = self._relay_remote_stream(connection, call, stream)
+            else:
+                result = connection.send_message(**call).text
+        except CoreError as error:
+            return {
+                "success": False,
+                "agent_name": name,
+                "result": "",
+                "message": f"{error.code}: {error}",
+            }
+        return {
+            "success": bool(result),
+            "agent_name": name,
+            "result": result,
+            "message": (
+                f"{name} returned a result"
+                if result
+                else f"{name} produced no final text"
+            ),
+        }
+
+    def _relay_remote_stream(self, connection, call, stream):
+        """Republish the child's progress into this task and keep its final text."""
+        final_text = ""
+        last_text = ""
+        try:
+            for event in connection.stream_message(**call):
+                if event.parts:
+                    stream.relay(event.parts)
+                if not event.text:
+                    continue
+                last_text = event.text
+                if event.final:
+                    final_text = event.text
+        except CoreError:
+            # A broken stream falls back to the plain call, as the tool contract requires.
+            return connection.send_message(**call).text
+        return final_text or last_text or connection.send_message(**call).text
 
     def _delegate(self, arguments, run_id):
         contract = DelegationContract.from_dict(arguments)
@@ -1967,19 +2039,9 @@ class CoreAgent:
         )
         child = self._child_agent(child_raw, child_tools)
         child_task_id = str(uuid.uuid4())
-        child_request = {
-            "prompt": contract.instruction,
-            "mcp": [
-                declaration
-                for declaration in request.mcp
-                if declaration["name"] in contract.mcp
-            ],
-            "skills": [
-                declaration
-                for declaration in request.skills
-                if declaration["name"] in contract.skills
-            ],
-        }
+        # The child is narrowed through its own AgentConfig; capabilities never
+        # travel in the request.
+        child_request = {"prompt": contract.instruction}
         child_scope = {
             "task_id": child_task_id,
             "identity": scope.get("identity", "anonymous"),
@@ -2030,8 +2092,6 @@ class CoreAgent:
             child_registry.register(self.tool_runtime.registry.get(name))
         child_runtime = type(self.tool_runtime)(
             child_registry,
-            self.tool_runtime.policy,
-            self.tool_runtime.approvals,
             self.tool_runtime.environment_manager,
             self.tool_runtime.event_sink,
         )
@@ -2049,6 +2109,15 @@ class CoreAgent:
             compactor=self.compactor,
             token_counter=self.token_counter,
             depth=self.depth + 1,
+            # Capabilities now travel by configuration, so the child must inherit
+            # them; its own AgentConfig still narrows the set. A delegated tool
+            # whose service is missing would be advertised but answer
+            # CAPABILITY_DISABLED on the first call.
+            platform_mcp=self.platform_mcp,
+            declared_skills=self.declared_skills,
+            artifact_service=self.artifact_service,
+            remote_agents=self.remote_agents,
+            send_message_api_key=self.send_message_api_key,
             workflow_store=self.workflow_store,
             kernel_compiler=self.kernel_compiler,
             context_window=self.context_window,
@@ -2068,6 +2137,19 @@ class CoreAgent:
             copy.deepcopy(contract["agent_config"]), tuple(contract["tools"])
         )
         return child.run(dict(contract["request"]), **dict(contract["scope"]))
+
+    def attach_stream(self, task_id, publisher, headers=None):
+        """Bind the A2A stream and caller headers to a task for one turn."""
+        if task_id is None:
+            return
+        if publisher is not None and publisher.enabled:
+            self._task_streams[task_id] = publisher
+        if headers:
+            self._task_headers[task_id] = dict(headers)
+
+    def detach_stream(self, task_id):
+        self._task_streams.pop(task_id, None)
+        self._task_headers.pop(task_id, None)
 
     def run(
         self,
@@ -2131,14 +2213,6 @@ class CoreAgent:
             task_id, tenant_id=tenant_id, owner_id=owner_id
         )
         context_id = session_id or record.context_id
-        if (
-            request.mcp != tuple(record.request.get("mcp", ()))
-            or request.skills != tuple(record.request.get("skills", ()))
-        ):
-            raise CoreError(
-                "INVALID_REQUEST",
-                "follow-up cannot change the active capability snapshot",
-            )
         message, accepted = self.workflow_store.append_inbound(
             task_id,
             tenant_id=tenant_id,
@@ -2165,83 +2239,6 @@ class CoreAgent:
             tenant_id, run_id, operator_principal_id=operator_principal_id
         )
 
-    def is_waiting_local_approval(self, task_id):
-        try:
-            return (
-                self.workflow_store.lookup_task(task_id).state
-                == "WAITING_LOCAL_APPROVAL"
-            )
-        except CoreError:
-            return False
-
-    def can_cancel_local_approval(self, task_id):
-        try:
-            record = self.workflow_store.lookup_task(task_id)
-        except CoreError:
-            return True
-        return record.state != "APPROVED_RESERVED"
-
-    def reserve_local_approval(self, task_id, approval_id, control_plane):
-        record = self.workflow_store.lookup_task(task_id)
-        if (
-            record.state != "WAITING_LOCAL_APPROVAL"
-            or record.pending_approval_id != approval_id
-        ):
-            raise CoreError("APPROVAL_NOT_FOUND")
-        approval = self.tool_runtime.approvals.get(approval_id)
-        operator_principal_id = getattr(
-            control_plane, "operator_principal_id", "local-operator"
-        )
-        operator_session_id = getattr(
-            control_plane, "operator_session_id", "operator-session"
-        )
-        record, execution = self.workflow_store.reserve_approval(
-            record,
-            self.tool_runtime.approvals,
-            approval,
-            operator_principal_id=operator_principal_id,
-            operator_session_id=operator_session_id,
-            snapshot=copy.deepcopy(record.snapshot),
-        )
-        if not self.workflow_store.atomic:
-            data = {
-                "approval_id": approval_id,
-                "proposal_id": approval.proposal_id,
-                "execution_id": execution.id,
-                "action_digest": execution.action_digest,
-                "actor_type": "local_operator",
-                "actor_principal_id": operator_principal_id,
-            }
-            self.audit_log.append(record.run_id, "operator.approved", data)
-            self.event_store.append(
-                record.run_id,
-                "execution.reserved",
-                {"approval_id": approval_id, "execution_id": execution.id},
-            )
-            self.checkpoint_store.save(
-                record.run_id,
-                self.event_store.revision(record.run_id),
-                {**record.snapshot, "state": "APPROVED_RESERVED"},
-            )
-        self._log(
-            "approval.approved",
-            run_id=record.run_id,
-            task_id=record.task_id,
-            approval_id=approval_id,
-            execution_id=execution.id,
-        )
-        return ApprovalReserved(record.run_id, approval_id, execution.id)
-
-    def dispatch_reserved_approval(self, task_id, approval_id, execution_id):
-        record = self.workflow_store.lookup_task(task_id)
-        if (
-            record.state != "APPROVED_RESERVED"
-            or record.pending_approval_id != approval_id
-            or record.snapshot.get("execution_id") != execution_id
-        ):
-            raise CoreError("APPROVAL_NOT_FOUND")
-        return self._continue_workflow(record)
-
     def resume_task(self, task_id):
         record = self.workflow_store.lookup_task(task_id)
         if record.state == "COMPLETED":
@@ -2255,94 +2252,9 @@ class CoreAgent:
             raise CoreError(record.error_code or "INVALID_TASK_STATE")
         return self._continue_workflow(record)
 
-    def resume_local_approval(self, task_id, approval_id, control_plane):
-        reserved = self.reserve_local_approval(task_id, approval_id, control_plane)
-        return self.dispatch_reserved_approval(
-            task_id, approval_id, reserved.execution_id
-        )
-
-    def deny_local_approval(
-        self,
-        task_id,
-        approval_id,
-        *,
-        operator_principal_id,
-        operator_session_id,
-        continue_run=True,
-    ):
-        record = self.workflow_store.lookup_task(task_id)
-        if (
-            record.state != "WAITING_LOCAL_APPROVAL"
-            or record.pending_approval_id != approval_id
-        ):
-            raise CoreError("APPROVAL_NOT_FOUND")
-        approval = self.tool_runtime.approvals.get(approval_id)
-        self.tool_runtime.approvals.deny(
-            approval_id,
-            action_digest=approval.action_digest,
-            expected_version=approval.version,
-            operator_principal_id=operator_principal_id,
-            operator_session_id=operator_session_id,
-        )
-        snapshot = copy.deepcopy(record.snapshot)
-        self._append_result(
-            snapshot,
-            self._result_text(
-                snapshot["pending_call"]["id"],
-                ToolResult(snapshot["pending_call"]["id"], "denied"),
-                snapshot["pending_call"]["name"],
-            ),
-        )
-        record = self._record_transition(
-            record,
-            state="RUNNING",
-            snapshot=snapshot,
-            event_kind="approval.denied",
-            event_data={"approval_id": approval_id},
-            audit=(
-                (
-                    "operator.denied",
-                    {
-                        "approval_id": approval_id,
-                        "proposal_id": approval.proposal_id,
-                        "actor_type": "local_operator",
-                    },
-                ),
-            ),
-        )
-        return self._continue_workflow(record) if continue_run else record
-
-    def cancel_local_approval(self, task_id):
-        try:
-            record = self.workflow_store.lookup_task(task_id)
-        except CoreError:
-            return
-        if record.state == "APPROVED_RESERVED":
-            raise CoreError("TASK_NOT_CANCELABLE")
-        if record.state != "WAITING_LOCAL_APPROVAL":
-            return
-        self.tool_runtime.approvals.cancel(record.pending_approval_id)
-        snapshot = copy.deepcopy(record.snapshot)
-        self._record_transition(
-            record,
-            state="CANCELLED",
-            snapshot=snapshot,
-            event_kind="task.canceled",
-            event_data={"approval_id": record.pending_approval_id},
-            audit=(
-                (
-                    "approval.canceled",
-                    {"approval_id": record.pending_approval_id},
-                ),
-            ),
-        )
-        self._run_contexts.pop(record.run_id, None)
-        self._run_scopes.pop(record.run_id, None)
-        self._runtime_cache.pop(record.run_id, None)
-
     def cancel_task(self, task_id):
         record = self.workflow_store.lookup_task(task_id)
-        if record.state == "APPROVED_RESERVED" or record.state in {
+        if record.state in {
             "COMPLETED",
             "FAILED",
             "CANCELLED",
@@ -2350,8 +2262,6 @@ class CoreAgent:
             "ABORTED",
         }:
             raise CoreError("TASK_NOT_CANCELABLE")
-        if record.state == "WAITING_LOCAL_APPROVAL":
-            self.tool_runtime.approvals.cancel(record.pending_approval_id)
         for task in self.task_scheduler.list(
             owner_id=record.run_id, tenant_id=record.tenant_id
         ):
@@ -2382,12 +2292,10 @@ class CoreAgent:
         self._runtime_cache.pop(record.run_id, None)
 
     def close(self):
-        self._task_approvals.clear()
         self._run_contexts.clear()
         self._run_scopes.clear()
         self._runtime_cache.clear()
         self.task_scheduler.close()
-        self.tool_runtime.approvals.close()
 
     def recover_durable_tasks(self):
         if hasattr(self.task_scheduler, "recover"):
@@ -2395,83 +2303,11 @@ class CoreAgent:
         return 0
 
     def recover_workflows(self):
+        """A run interrupted mid-dispatch cannot prove the side effect did not happen."""
         recovered = []
         for record in self.workflow_store.recoverable():
-            if record.state == "WAITING_LOCAL_APPROVAL" and record.pending_approval_id:
-                execution = self.tool_runtime.approvals.execution_for(
-                    record.pending_approval_id
-                )
-                if execution and execution.state == "RESERVED":
-                    snapshot = copy.deepcopy(record.snapshot)
-                    snapshot["execution_id"] = execution.id
-                    record = self._record_transition(
-                        record,
-                        state="APPROVED_RESERVED",
-                        snapshot=snapshot,
-                        event_kind="execution.recovered_reserved",
-                        event_data={"execution_id": execution.id},
-                        audit=(("execution.recovered", {"safe": True}),),
-                        pending_approval_id=record.pending_approval_id,
-                    )
             if record.state != "EXECUTING":
                 recovered.append(record)
-                continue
-            execution = (
-                self.tool_runtime.approvals.execution_for(record.pending_approval_id)
-                if record.pending_approval_id
-                else None
-            )
-            if execution and execution.state == "RESERVED":
-                snapshot = copy.deepcopy(record.snapshot)
-                snapshot["execution_id"] = execution.id
-                recovered.append(
-                    self._record_transition(
-                        record,
-                        state="APPROVED_RESERVED",
-                        snapshot=snapshot,
-                        event_kind="execution.recovered_reserved",
-                        event_data={"execution_id": execution.id},
-                        audit=(("execution.recovered", {"safe": True}),),
-                        pending_approval_id=record.pending_approval_id,
-                    )
-                )
-                continue
-            details = (
-                self.tool_runtime.approvals.execution_outcome(
-                    record.pending_approval_id
-                )
-                if record.pending_approval_id
-                and hasattr(self.tool_runtime.approvals, "execution_outcome")
-                else None
-            )
-            if (
-                details
-                and details["state"] == "SUCCEEDED"
-                and details["outcome"] is not None
-            ):
-                snapshot = copy.deepcopy(record.snapshot)
-                outcome = details["outcome"]
-                text = (
-                    json.dumps(outcome, sort_keys=True, default=str)
-                    if isinstance(outcome, dict)
-                    and {"tool_call_id", "status"} <= set(outcome)
-                    else self._result_text(
-                        snapshot["pending_call"]["id"],
-                        outcome,
-                        snapshot["pending_call"]["name"],
-                    )
-                )
-                self._append_result(snapshot, text)
-                recovered.append(
-                    self._record_transition(
-                        record,
-                        state="RUNNING",
-                        snapshot=snapshot,
-                        event_kind="execution.recovered_succeeded",
-                        event_data={"execution_id": execution.id},
-                        audit=(("execution.recovered", {"safe": True}),),
-                    )
-                )
                 continue
             self._record_transition(
                 record,

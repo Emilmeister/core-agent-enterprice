@@ -2,7 +2,6 @@ import threading
 import unittest
 from dataclasses import replace
 
-from core_agent.approvals import ApproveAllControlPlane
 from core_agent.errors import CoreError
 from core_agent.execution import (
     ExecutionEnvironmentManager,
@@ -18,9 +17,6 @@ from core_agent.tasks import (
     derive_child_capabilities,
 )
 from core_agent.tools import (
-    ApprovalManager,
-    ApprovalMode,
-    PolicyEngine,
     ToolCall,
     ToolDefinition,
     ToolRegistry,
@@ -362,11 +358,8 @@ class ToolRuntimeTests(unittest.TestCase):
                 risk_tags=frozenset({"external_write", "acts_as_user"}),
             )
         )
-        self.approvals = ApprovalManager()
         self.runtime = ToolRuntime(
             registry=self.registry,
-            policy=PolicyEngine(approval_mode=ApprovalMode.ON_RISK),
-            approvals=self.approvals,
             environment_manager=self.environment_manager,
             event_sink=lambda event: self.events.append(event.kind),
         )
@@ -386,15 +379,15 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
         self.assertEqual(self.backend.executed, [])
 
-    def test_validation_happens_before_policy_and_execution(self):
+    def test_validation_happens_before_execution(self):
         result = self.runtime.execute(
             ToolCall("call-2", "core.terminal.exec", {"argv": ["python", "-V"]}),
             run_id="run-1",
         )
         self.assertIsInstance(result, ToolResult)
         self.assertEqual(
-            self.events[:4],
-            ["tool.requested", "tool.validated", "policy.allowed", "tool.started"],
+            self.events[:3],
+            ["tool.requested", "tool.validated", "tool.started"],
         )
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(len(self.backend.executed), 1)
@@ -410,81 +403,6 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error_code, "TOOL_RETURNED_FAILED")
         self.assertEqual(self.events[-1], "tool.failed")
-
-    def test_risky_call_does_not_execute_until_exact_arguments_are_approved(self):
-        call = ToolCall(
-            "call-3", "external.publish", {"target": "org/repo", "body": "hello"}
-        )
-        approval = self.runtime.execute(call, run_id="run-1")
-        self.assertEqual(approval.tool_call_id, "call-3")
-        self.assertEqual(approval.risks, ("acts_as_user", "external_write"))
-        self.assertEqual(self.backend.executed, [])
-
-        ApproveAllControlPlane().approve(self.approvals, approval)
-        result = self.runtime.resume_approved(call, approval.id, run_id="run-1")
-        self.assertEqual(result.status, "succeeded")
-        self.assertEqual(len(self.backend.executed), 1)
-
-        changed = ToolCall(
-            "call-3", "external.publish", {"target": "other/repo", "body": "hello"}
-        )
-        with self.assertRaises(CoreError) as caught:
-            self.runtime.resume_approved(changed, approval.id, run_id="run-1")
-        self.assertEqual(caught.exception.code, "APPROVAL_ARGUMENTS_CHANGED")
-
-    def test_approved_failed_outcome_is_recorded_and_returned_to_model(self):
-        call = ToolCall(
-            "call-failed", "external.publish", {"target": "org/repo", "body": "x"}
-        )
-        approval = self.runtime.execute(call, run_id="run-1")
-        ApproveAllControlPlane().approve(self.approvals, approval)
-        self.environment_manager.execute_transient = lambda _request, _run_id: (
-            ExecutionResult(1, "", "failed", (), (), status="failed")
-        )
-
-        result = self.runtime.resume_approved(call, approval.id, run_id="run-1")
-
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(
-            self.approvals.execution_for(approval.id).state,
-            "FAILED",
-        )
-
-    def test_approval_is_single_resolution_and_never_mode_denies_instead_of_allowing(
-        self,
-    ):
-        approval = self.runtime.execute(
-            ToolCall(
-                "call-4", "external.publish", {"target": "org/repo", "body": "hello"}
-            ),
-            run_id="run-1",
-        )
-        denied_approval = self.approvals.deny(
-            approval.id,
-            action_digest=approval.action_digest,
-            expected_version=approval.version,
-            operator_principal_id="operator-1",
-            operator_session_id="session-1",
-        )
-        self.assertEqual(denied_approval.state, "DENIED")
-        with self.assertRaises(CoreError) as caught:
-            ApproveAllControlPlane().approve(self.approvals, approval)
-        self.assertEqual(caught.exception.code, "APPROVAL_ALREADY_RESOLVED")
-
-        never_runtime = ToolRuntime(
-            self.registry,
-            PolicyEngine(approval_mode=ApprovalMode.NEVER),
-            ApprovalManager(),
-            self.environment_manager,
-        )
-        denied = never_runtime.execute(
-            ToolCall(
-                "call-5", "external.publish", {"target": "org/repo", "body": "hello"}
-            ),
-            run_id="run-1",
-        )
-        self.assertEqual(denied.status, "denied")
-        self.assertEqual(self.backend.executed, [])
 
     def test_input_request_is_not_approval(self):
         request = self.runtime.request_input(

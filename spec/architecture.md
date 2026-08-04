@@ -7,7 +7,7 @@ Core Agent — stateful orchestration kernel с портами для модел
 ## Подсистемы
 
 ```text
-Remote caller                 Local operator
+Remote caller
       |                             |
  A2A server                  Private control plane
       |                             |
@@ -49,15 +49,15 @@ A2A является основным внешним контрактом: Agent
 
 Разрешает версии, проверяет integrity/signature, строит discovery catalog и лениво загружает инструкции/resources.
 
-### Policy и local approval
+### Policy
 
-Policy engine принимает нормализованный proposed action и возвращает `AUTO_ALLOW`, `DENY` или `REQUIRE_LOCAL_APPROVAL`. При local approval orchestrator замораживает proposal/digest, durable-переходит в `WAITING_LOCAL_APPROVAL`, а private control plane атомарно создаёт single-use execution reservation. A2A caller не является approver; полный contract определён в [Local operator HITL](local-operator-hitl.md).
+Policy engine принимает нормализованный proposed action и возвращает `AUTO_ALLOW` или `DENY`. Отдельного пути подтверждения человеком нет: этот runtime не содержит human-in-the-loop, и вердикт policy является окончательным. Граница возможностей задаётся tool allowlist, runtime mode и изоляцией контейнера.
 
 ### Durable state
 
 Event log является источником истины для состояния A2A Task/run. Inbound Messages durable сохраняются до model delivery и дедуплицируются по `(task_id, message_id)`; inbox append и terminal transition сериализуются без потери подтверждённого input. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript и artifacts имеют независимые retention policies. Memory принадлежит отдельному MCP Service; Core сохраняет только использованные MCP results/provenance согласно Task retention.
 
-Production adapter хранит A2A Tasks, event log, checkpoints, approvals/reservations и append-only audit в PostgreSQL через один bounded pool. `DATABASE_URL` обязателен и берётся из deployment secret. Нет автоматического fallback на process memory/SQLite при database outage: startup/readiness fail closed, активные protected actions не исполняются. Test adapters не могут быть выбраны production configuration.
+Production adapter хранит A2A Tasks, event log, checkpoints, и append-only audit в PostgreSQL через один bounded pool. `DATABASE_URL` обязателен и берётся из deployment secret. Нет автоматического fallback на process memory/SQLite при database outage: startup/readiness fail closed, активные protected actions не исполняются. Test adapters не могут быть выбраны production configuration.
 
 ## Идентификаторы и иерархия
 
@@ -67,7 +67,6 @@ tenant
     ├── A2A task / run
     │   ├── turn
     │   ├── tool_call
-    │   ├── approval
     │   └── artifact
     └── child A2A task / subagent run
 ```
@@ -79,7 +78,6 @@ tenant
 ```text
 CREATED -> VALIDATING -> QUEUED -> RUNNING
                                 |-> WAITING_INPUT
-                                |-> WAITING_LOCAL_APPROVAL -> APPROVED_RESERVED
                                 |-> WAITING_AUTH
                                 |-> WAITING_TASK
                                 |-> PAUSED
@@ -130,7 +128,6 @@ Adapters объявляют capabilities. Orchestrator MUST проверять �
 
 - зависимости представлены явно;
 - targets не пересекаются либо agents используют отдельные local workspace copies;
-- approval для каждого side effect независим;
 - порядок слияния результатов детерминирован и попадает в audit;
 - отмена одной ветви не оставляет другие без владельца.
 

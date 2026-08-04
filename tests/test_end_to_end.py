@@ -17,12 +17,7 @@ import httpx
 from a2a.client import ClientConfig, ClientFactory
 from a2a.types import GetTaskRequest, Role, SendMessageRequest, TaskState
 from a2a.utils.constants import TransportProtocol
-from google.protobuf import json_format
 
-from core_agent.a2a import (
-    CORE_EXTENSION_URI,
-    LOCAL_APPROVAL_STATUS_URI,
-)
 from core_agent.app import create_app
 from core_agent.model import CompatibleHttpModel
 from memory_service.service import MemoryService
@@ -475,9 +470,13 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             os.environ,
             {
                 "LOCAL_WORKSPACE_ROOT": str(root / "workspaces"),
-                "CORE_AGENT_MAX_MODEL_TURNS": "10",
+                "RUNTIME_MAX_LLM_CALLS": "10",
                 "CORE_AGENT_MAX_TOOL_CALLS": "10",
                 "CORE_AGENT_ALLOWED_SKILLS": "e2e-skill",
+                "SKILLS_ROOT": str(root),
+                "MCP_URL": (
+                    f"http://127.0.0.1:{cls.mcp_server.server_port}/memory"
+                ),
             },
         )
         cls.environment.start()
@@ -491,7 +490,6 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             os.environ,
             {
                 "CORE_AGENT_TRUST_TERMINAL": "0",
-                "CORE_AGENT_APPROVAL_MODE": "on_risk",
             },
         ):
             cls.approval_app = create_app(
@@ -510,18 +508,12 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         cls.environment.stop()
         cls.temp.cleanup()
 
-    async def _send(self, prompt, mcp=(), skills=()):
+    async def _send(self, prompt):
         transport = httpx.ASGITransport(app=self.app)
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://agent.test",
             headers={
-                "A2A-Extensions": ",".join(
-                    (
-                        CORE_EXTENSION_URI,
-                        LOCAL_APPROVAL_STATUS_URI,
-                    )
-                ),
                 "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
             },
         ) as http:
@@ -535,10 +527,6 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             request.message.message_id = str(uuid.uuid4())
             request.message.role = Role.ROLE_USER
             request.message.parts.add().text = prompt
-            request.message.extensions.append(CORE_EXTENSION_URI)
-            request.message.metadata.update(
-                {CORE_EXTENSION_URI: {"mcp": list(mcp), "skills": list(skills)}}
-            )
             events = [event async for event in client.send_message(request)]
         task = events[-1].task
         self.assertEqual(TaskState.Name(task.status.state), "TASK_STATE_COMPLETED")
@@ -562,265 +550,6 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         answer = await self._send("DELEGATE_INVALID_E2E")
         self.assertEqual(answer, "delegate-validation-recovered")
 
-    async def test_local_control_plane_approves_exact_call_once(self):
-        transport = httpx.ASGITransport(app=self.approval_app)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://approval-agent.test",
-            headers={
-                "A2A-Extensions": ",".join(
-                    (CORE_EXTENSION_URI, LOCAL_APPROVAL_STATUS_URI)
-                )
-            },
-        ) as http:
-            client = await ClientFactory(
-                ClientConfig(
-                    streaming=False,
-                    httpx_client=http,
-                    supported_protocol_bindings=[TransportProtocol.HTTP_JSON],
-                )
-            ).create_from_url("http://approval-agent.test")
-            initial = SendMessageRequest()
-            initial.message.message_id = str(uuid.uuid4())
-            initial.message.role = Role.ROLE_USER
-            initial.message.parts.add().text = "APPROVAL_E2E"
-            initial.message.extensions.append(CORE_EXTENSION_URI)
-            initial.message.metadata.update(
-                {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
-            )
-            before = self.approval_app.state.core_agent.tool_runtime.execution_count
-            completed = [event async for event in client.send_message(initial)][-1].task
-        self.assertEqual(TaskState.Name(completed.status.state), "TASK_STATE_COMPLETED")
-        self.assertEqual(
-            self.approval_app.state.core_agent.tool_runtime.execution_count,
-            before + 1,
-        )
-        self.assertEqual(
-            "\n".join(
-                part.text
-                for artifact in completed.artifacts
-                for part in artifact.parts
-                if part.text
-            ),
-            "approval-approved-ok",
-        )
-        approval_id = self.approval_app.state.core_agent._task_approvals[completed.id]
-        approval = self.approval_app.state.core_agent.tool_runtime.approvals.get(
-            approval_id
-        )
-        execution = (
-            self.approval_app.state.core_agent.tool_runtime.approvals.execution_for(
-                approval_id
-            )
-        )
-        self.assertEqual(approval.state, "CONSUMED")
-        self.assertEqual(execution.state, "SUCCEEDED")
-        run_id = json_format.MessageToDict(completed.artifacts[-1].metadata)[
-            "provenance"
-        ]["run_id"]
-        records = self.approval_app.state.core_agent.audit_log.records(run_id)
-        kinds = {record.kind for record in records}
-        self.assertTrue(
-            {
-                "tool.proposed",
-                "policy.evaluated",
-                "approval.requested",
-                "operator.approved",
-                "tool.execution.succeeded",
-            }
-            <= kinds
-        )
-        self.assertNotIn("local-operator-stub", repr(completed))
-
-    async def test_local_wait_is_working_and_caller_cannot_resolve_it(self):
-        transport = httpx.ASGITransport(app=self.approval_app)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://approval-agent.test",
-            headers={
-                "A2A-Extensions": ",".join(
-                    (CORE_EXTENSION_URI, LOCAL_APPROVAL_STATUS_URI)
-                )
-            },
-        ) as http:
-            client = await ClientFactory(
-                ClientConfig(
-                    streaming=False,
-                    httpx_client=http,
-                    supported_protocol_bindings=[TransportProtocol.HTTP_JSON],
-                )
-            ).create_from_url("http://approval-agent.test")
-            request = SendMessageRequest()
-            request.message.message_id = str(uuid.uuid4())
-            request.message.role = Role.ROLE_USER
-            request.message.parts.add().text = "APPROVAL_E2E"
-            request.message.extensions.append(CORE_EXTENSION_URI)
-            request.message.metadata.update(
-                {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
-            )
-            completed = [event async for event in client.send_message(request)][-1].task
-        wait_message = next(
-            message
-            for message in completed.history
-            if message.role == Role.ROLE_AGENT
-            and message.parts
-            and "local operator" in message.parts[0].text
-        )
-        payload = json_format.MessageToDict(wait_message.metadata)[
-            LOCAL_APPROVAL_STATUS_URI
-        ]
-        self.assertFalse(payload["callerActionRequired"])
-        self.assertFalse(payload["callerCanApprove"])
-        self.assertFalse(payload["callerCanDeny"])
-        self.assertFalse(payload["protectedActionExecuted"])
-        self.assertIn("send_message_queued", payload["allowedCallerOperations"])
-        self.assertNotIn("approvalId", repr(payload))
-        approved_message = next(
-            message
-            for message in completed.history
-            if message.role == Role.ROLE_AGENT
-            and message.parts
-            and "authorized the protected action" in message.parts[0].text
-        )
-        approved_payload = json_format.MessageToDict(approved_message.metadata)[
-            LOCAL_APPROVAL_STATUS_URI
-        ]
-        self.assertEqual(approved_payload["phase"], "local_operator_approved")
-        self.assertNotIn("cancel_task", approved_payload["allowedCallerOperations"])
-
-        agent = self.approval_app.state.core_agent
-        before = agent.tool_runtime.execution_count
-        task_id = str(uuid.uuid4())
-        pending = agent.run(
-            {"prompt": "APPROVAL_E2E", "mcp": [], "skills": []},
-            task_id=task_id,
-            identity="remote-caller",
-            session_id="context-locked",
-            tenant_id="tenant-locked",
-        )
-        queued = agent.enqueue_message(
-            {"prompt": "I approve", "mcp": [], "skills": []},
-            task_id=task_id,
-            message_id="locked-followup",
-            identity="remote-caller",
-            session_id="context-locked",
-            tenant_id="tenant-locked",
-        )
-        self.assertEqual(queued["sequence"], 1)
-        record = agent.workflow_store.lookup_task(task_id)
-        self.assertEqual(record.state, "WAITING_LOCAL_APPROVAL")
-        self.assertEqual(
-            agent.workflow_store.pending_inbound(record)[0]["content"], "I approve"
-        )
-        self.assertEqual(
-            agent.tool_runtime.approvals.get(pending.request.id).state, "PENDING"
-        )
-        self.assertEqual(agent.tool_runtime.execution_count, before)
-        agent.cancel_local_approval(task_id)
-        self.assertEqual(
-            agent.tool_runtime.approvals.get(pending.request.id).state, "CANCELED"
-        )
-
-        denied_task_id = str(uuid.uuid4())
-        denied = agent.run(
-            {"prompt": "APPROVAL_E2E", "mcp": [], "skills": []},
-            task_id=denied_task_id,
-            identity="remote-caller",
-            session_id="context-denied",
-            tenant_id="tenant-locked",
-        )
-        result = agent.deny_local_approval(
-            denied_task_id,
-            denied.request.id,
-            operator_principal_id="local-operator-test",
-            operator_session_id="operator-session-test",
-        )
-        self.assertEqual(result.message, "approval-denied-ok")
-        self.assertEqual(agent.tool_runtime.execution_count, before)
-        self.assertEqual(
-            agent.tool_runtime.approvals.get(denied.request.id).state, "DENIED"
-        )
-
-    async def test_extension_unaware_caller_gets_text_only_local_wait_status(self):
-        transport = httpx.ASGITransport(app=self.approval_app)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://approval-agent.test",
-            headers={"A2A-Extensions": CORE_EXTENSION_URI},
-        ) as http:
-            client = await ClientFactory(
-                ClientConfig(
-                    streaming=False,
-                    httpx_client=http,
-                    supported_protocol_bindings=[TransportProtocol.HTTP_JSON],
-                )
-            ).create_from_url("http://approval-agent.test")
-            request = SendMessageRequest()
-            request.message.message_id = str(uuid.uuid4())
-            request.message.role = Role.ROLE_USER
-            request.message.parts.add().text = "APPROVAL_E2E"
-            request.message.extensions.append(CORE_EXTENSION_URI)
-            request.message.metadata.update(
-                {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
-            )
-            completed = [event async for event in client.send_message(request)][-1].task
-        wait_message = next(
-            message
-            for message in completed.history
-            if message.role == Role.ROLE_AGENT
-            and message.parts
-            and "local operator" in message.parts[0].text
-        )
-        self.assertEqual(list(wait_message.extensions), [])
-        self.assertNotIn(
-            LOCAL_APPROVAL_STATUS_URI,
-            json_format.MessageToDict(wait_message.metadata),
-        )
-
-    async def test_a2a_return_immediately_can_fetch_same_task_later(self):
-        transport = httpx.ASGITransport(app=self.app)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://agent.test",
-            headers={
-                "A2A-Extensions": ",".join(
-                    (
-                        CORE_EXTENSION_URI,
-                        LOCAL_APPROVAL_STATUS_URI,
-                    )
-                )
-            },
-        ) as http:
-            client = await ClientFactory(
-                ClientConfig(
-                    streaming=False,
-                    httpx_client=http,
-                    supported_protocol_bindings=[TransportProtocol.HTTP_JSON],
-                )
-            ).create_from_url("http://agent.test")
-            request = SendMessageRequest()
-            request.configuration.return_immediately = True
-            request.message.message_id = str(uuid.uuid4())
-            request.message.role = Role.ROLE_USER
-            request.message.parts.add().text = "SLOW_A2A_E2E"
-            request.message.extensions.append(CORE_EXTENSION_URI)
-            request.message.metadata.update(
-                {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
-            )
-            events = [event async for event in client.send_message(request)]
-            task_id = events[-1].task.id
-            task = events[-1].task
-            for _ in range(50):
-                if TaskState.Name(task.status.state) == "TASK_STATE_COMPLETED":
-                    break
-                await asyncio.sleep(0.01)
-                task = await client.get_task(GetTaskRequest(id=task_id))
-        self.assertEqual(TaskState.Name(task.status.state), "TASK_STATE_COMPLETED")
-        self.assertEqual(
-            [part.text for artifact in task.artifacts for part in artifact.parts],
-            ["slow-a2a-ok"],
-        )
-
     async def test_a2a_followup_steers_same_active_task(self):
         ModelHandler.live_steering_started.clear()
         ModelHandler.live_steering_release.clear()
@@ -828,8 +557,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://agent.test",
-            headers={"A2A-Extensions": CORE_EXTENSION_URI},
-        ) as http:
+                    ) as http:
             client = await ClientFactory(
                 ClientConfig(
                     streaming=False,
@@ -842,10 +570,6 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             initial.message.message_id = str(uuid.uuid4())
             initial.message.role = Role.ROLE_USER
             initial.message.parts.add().text = "LIVE_STEERING_E2E"
-            initial.message.extensions.append(CORE_EXTENSION_URI)
-            initial.message.metadata.update(
-                {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
-            )
             submitted = [event async for event in client.send_message(initial)][-1].task
             self.assertTrue(
                 await asyncio.to_thread(ModelHandler.live_steering_started.wait, 1)
@@ -856,10 +580,6 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             followup.message.context_id = submitted.context_id
             followup.message.role = Role.ROLE_USER
             followup.message.parts.add().text = "LIVE_STEERING_FOLLOWUP"
-            followup.message.extensions.append(CORE_EXTENSION_URI)
-            followup.message.metadata.update(
-                {CORE_EXTENSION_URI: {"mcp": [], "skills": []}}
-            )
             accepted = [
                 event async for event in client.send_message(followup)
             ][-1].task
@@ -915,17 +635,8 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_child_receives_only_explicit_shared_memory_tool(self):
         ModelHandler.child_memory_catalogs.clear()
-        declaration = {
-            "name": "memory",
-            "role": "memory",
-            "required": True,
-            "transport": {
-                "type": "streamable_http",
-                "url": f"http://127.0.0.1:{self.mcp_server.server_port}/mcp",
-            },
-        }
         self.assertEqual(
-            await self._send("DELEGATE_MEMORY_E2E", (declaration,)),
+            await self._send("DELEGATE_MEMORY_E2E"),
             "delegate-memory-ok",
         )
         memory_search = CompatibleHttpModel._wire_name("memory.memory.search")
@@ -940,17 +651,8 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_memory_mcp_search_reaches_markdown_indexes_and_graph(self):
         MemoryMcpHandler.trace_carriers.clear()
         span_offset = len(self.app.state.telemetry.exporter.spans)
-        declaration = {
-            "name": "memory",
-            "role": "memory",
-            "required": True,
-            "transport": {
-                "type": "streamable_http",
-                "url": f"http://127.0.0.1:{self.mcp_server.server_port}/mcp",
-            },
-        }
         self.assertEqual(
-            await self._send("MEMORY_E2E", (declaration,)), "memory-e2e-ok"
+            await self._send("MEMORY_E2E"), "memory-e2e-ok"
         )
         self.assertEqual(self.memory.graph_mentions("Bob"), ("mem-created",))
         status = self.memory.index_status(self.memory.repository_revision)
@@ -982,7 +684,6 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "core_agent.task.execute",
                 "core_agent.context.assemble",
                 "gen_ai.chat",
-                "core_agent.policy.evaluate",
                 "core_agent.tool.execute",
                 "core_agent.task.checkpoint",
                 "mcp.client",
@@ -992,10 +693,9 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_skill_is_validated_and_activated_before_model_call(self):
         ModelHandler.skill_instructions_seen = False
-        declaration = {"name": "e2e-skill", "source": self.skill.as_uri()}
+        # The skill is declared by SKILLS_ROOT + CORE_AGENT_ALLOWED_SKILLS.
         self.assertEqual(
-            await self._send("SKILL_E2E use e2e-skill", skills=(declaration,)),
-            "skill-e2e-ok",
+            await self._send("SKILL_E2E use e2e-skill"), "skill-e2e-ok"
         )
         self.assertTrue(ModelHandler.skill_instructions_seen)
 

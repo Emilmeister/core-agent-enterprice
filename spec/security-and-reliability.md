@@ -14,7 +14,7 @@
 - содержимое файлов workspace;
 - текст, полученный из сети.
 
-Недоверенный текст не может менять policy, выдавать approval или получать секреты только через prompt injection.
+Недоверенный текст не может менять policy или получать секреты только через prompt injection.
 
 ## Local process trust boundary
 
@@ -22,7 +22,7 @@ Terminal, skill scripts, stdio MCP и child-agent commands исполняютс�
 
 ## Секреты
 
-- Core extension содержит только ссылки на секреты.
+- Конфигурация содержит только ссылки на секреты; входящий Message не переносит их вовсе.
 - Secret resolver работает после policy check и непосредственно перед использованием.
 - Значения секретов MUST NOT попадать в model context, events, logs, errors или artifacts.
 - Output проходит redaction известных значений и распространённых credential patterns.
@@ -59,7 +59,7 @@ Terminal, skill scripts, stdio MCP и child-agent commands исполняютс�
 - `MCP_CONNECTION_FAILED`, `MCP_PROTOCOL_ERROR`;
 - `SKILL_INVALID`, `SKILL_RESOURCE_MISSING`;
 - `TOOL_NAME_COLLISION`, `TOOL_ARGUMENT_INVALID`, `TOOL_EXECUTION_FAILED`;
-- `POLICY_DENIED`, `APPROVAL_ALREADY_RESOLVED`;
+- `POLICY_DENIED`;
 - `EXECUTION_ENVIRONMENT_UNAVAILABLE`, `EXECUTION_ENVIRONMENT_COMPROMISED`;
 - `BUDGET_EXCEEDED`, `CONTEXT_UNRECOVERABLE`;
 - `SIDE_EFFECT_UNKNOWN`, `INTERNAL_ERROR`;
@@ -82,7 +82,7 @@ Durable continuation является свойством целевого runtim
 - сохранять сведения о начатых внешних side effects;
 - автоматически продолжать только доказуемо безопасные или идемпотентные операции;
 - переводить неоднозначную внешнюю мутацию в reconciliation, `WAITING_INPUT` или `ABORTED`;
-- сохранять pending approvals/input с исходными IDs и scopes.
+- сохранять pending input с исходными IDs и scopes.
 
 ## Multi-tenancy
 
@@ -96,7 +96,7 @@ Durable continuation является свойством целевого runtim
 
 - Remote skill/MCP artifacts проверяются по integrity и trust policy.
 - Dependency snapshot и signatures сохраняются в audit.
-- Revocation feed MAY заблокировать новый run или приостановить активный до operator decision.
+- Revocation feed MAY заблокировать новый run или приостановить активный.
 - Provider и adapter versions фиксируются для воспроизводимости; security patches могут обновляться с явно записанной migration boundary.
 
 ## Policy versioning

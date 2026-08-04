@@ -8,6 +8,9 @@ from dataclasses import dataclass
 
 from .errors import CoreError
 
+# Advertised (binding, version) pairs; see core_agent/a2a.py for why they pair up.
+A2A_INTERFACES = (("HTTP+JSON", "1.0"), ("JSONRPC", "0.3"))
+
 
 MAX_SUBAGENT_DEPTH = 2
 RUNTIME_MODES = frozenset({"with_terminal", "without_terminal"})
@@ -16,37 +19,23 @@ TERMINAL_MODE_TOOLS = frozenset({"core.terminal.exec", "core.task.start"})
 
 @dataclass(frozen=True)
 class RunRequest:
+    """The only user input. MCP servers and skills come from configuration."""
+
     prompt: str
-    mcp: tuple[dict, ...]
-    skills: tuple[dict, ...]
+    # Incoming binary Parts. Transport-only: never serialized back into a Message,
+    # so a follow-up cannot replay someone else's upload.
+    attachments: tuple = ()
 
     @classmethod
     def from_dict(cls, value):
-        if not isinstance(value, dict) or set(value) != {"prompt", "mcp", "skills"}:
+        if not isinstance(value, dict) or set(value) != {"prompt"}:
             raise CoreError("INVALID_REQUEST")
         if not isinstance(value["prompt"], str) or not value["prompt"].strip():
             raise CoreError("INVALID_REQUEST")
-        if not isinstance(value["mcp"], list) or not isinstance(value["skills"], list):
-            raise CoreError("INVALID_REQUEST")
-        names = [item.get("name") for item in value["mcp"] if isinstance(item, dict)]
-        if (
-            len(names) != len(value["mcp"])
-            or None in names
-            or len(names) != len(set(names))
-        ):
-            raise CoreError("INVALID_REQUEST")
-        return cls(
-            value["prompt"],
-            tuple(copy.deepcopy(value["mcp"])),
-            tuple(copy.deepcopy(value["skills"])),
-        )
+        return cls(value["prompt"])
 
     def to_dict(self):
-        return {
-            "prompt": self.prompt,
-            "mcp": copy.deepcopy(list(self.mcp)),
-            "skills": copy.deepcopy(list(self.skills)),
-        }
+        return {"prompt": self.prompt}
 
 
 class AgentConfig:
@@ -58,7 +47,6 @@ class AgentConfig:
         "tools",
         "skills",
         "context",
-        "approval",
         "execution",
         "observability",
         "budgets",
@@ -80,8 +68,7 @@ class AgentConfig:
             "tools",
             "skills",
             "context",
-            "approval",
-            "execution",
+                "execution",
             "observability",
         }
         if not required <= set(raw):
@@ -93,11 +80,6 @@ class AgentConfig:
             "runtime_mode", "with_terminal"
         )
         if runtime_mode not in RUNTIME_MODES:
-            raise CoreError("CONFIG_INVALID")
-        local_operator = raw.get("approval", {}).get("local_operator", {})
-        if not isinstance(local_operator, dict) or not isinstance(
-            local_operator.get("enabled", True), bool
-        ):
             raise CoreError("CONFIG_INVALID")
         budgets = raw.get("budgets", {})
         if not isinstance(budgets, dict):
@@ -129,8 +111,7 @@ class PlatformConfig:
     denied_mcp_tools: dict[str, set[str]]
     allowed_skills: set[str]
     supported_features: set[str]
-    a2a_protocol_versions: tuple[str, ...] = ("1.0",)
-    a2a_bindings: tuple[str, ...] = ("HTTP+JSON",)
+    a2a_interfaces: tuple[tuple[str, str], ...] = A2A_INTERFACES
     max_model_turns: int = 100
     max_tool_calls: int = 200
 
@@ -152,8 +133,7 @@ class EffectiveConfig:
     model_tool_catalog: frozenset[str]
     digest: str
     audit_snapshot: str
-    a2a_protocol_versions: tuple[str, ...]
-    a2a_bindings: tuple[str, ...]
+    a2a_interfaces: tuple[tuple[str, str], ...]
     agent_name: str
     kernel_version: str = "kernel-v1"
 
@@ -171,10 +151,10 @@ def _expand(patterns, choices):
     }
 
 
-def compile_effective_config(platform, agent, request, discovered):
+def compile_effective_config(platform, agent, declared_mcp, discovered):
     raw = agent.to_dict()
     features = raw["features"]
-    requested_servers = {item["name"]: item for item in request.mcp}
+    requested_servers = {item["name"]: item for item in declared_mcp}
     warnings = []
 
     for feature, value in features.items():
@@ -210,8 +190,6 @@ def compile_effective_config(platform, agent, request, discovered):
     runtime_mode = raw["execution"].get("runtime_mode", "with_terminal")
     if runtime_mode == "without_terminal":
         allowed -= TERMINAL_MODE_TOOLS
-    if raw["approval"].get("local_operator", {}).get("enabled", True):
-        allowed.discard("core.python.exec")
 
     capability_for_prefix = {
         "core.terminal.": "terminal",
@@ -219,6 +197,8 @@ def compile_effective_config(platform, agent, request, discovered):
         "core.fs.": "filesystem_mutation",
         "core.task.": "background_tasks",
         "core.delegate": "delegation",
+        "core.artifact.": "artifacts",
+        "core.agent.": "remote_agents",
     }
     allowed = {
         tool
@@ -256,11 +236,8 @@ def compile_effective_config(platform, agent, request, discovered):
         if server in set(mcp_policy.get("allow_servers", [])):
             mcp_tools[server] = frozenset(server_allowed)
 
-    requested_skills = {item.get("name") for item in request.skills}
     skills = frozenset(
-        requested_skills
-        & set(raw["skills"].get("allow", []))
-        & set(platform.allowed_skills)
+        set(raw["skills"].get("allow", [])) & set(platform.allowed_skills)
     )
     policies = {
         feature
@@ -271,6 +248,10 @@ def compile_effective_config(platform, agent, request, discovered):
         policies.discard("memory")
     if "core.python.exec" not in allowed:
         policies.discard("python")
+    if not any(tool.startswith("core.artifact.") for tool in allowed):
+        policies.discard("artifacts")
+    if "core.agent.send_message" not in allowed:
+        policies.discard("remote_agents")
 
     model_catalog = set(allowed)
     for server, tools in mcp_tools.items():
@@ -286,10 +267,6 @@ def compile_effective_config(platform, agent, request, discovered):
         "model_route": raw["model"].get("route"),
         "budgets": raw.get("budgets", {}),
         "context": raw["context"],
-        "approval_mode": raw["approval"].get("mode"),
-        "local_operator_enabled": raw["approval"]
-        .get("local_operator", {})
-        .get("enabled", True),
         "execution_profile": raw["execution"].get("environment_profile"),
         "runtime_mode": runtime_mode,
         "otel_profile": raw["observability"].get("otel_profile"),
@@ -306,7 +283,6 @@ def compile_effective_config(platform, agent, request, discovered):
         frozenset(model_catalog),
         digest,
         audit_snapshot,
-        platform.a2a_protocol_versions,
-        platform.a2a_bindings,
+        platform.a2a_interfaces,
         raw["agent"]["name"],
     )

@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .errors import CoreError
+from .streaming import integrate_stream_chunk
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,14 @@ class CompatibleHttpModel:
         {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
     )
 
+    SAMPLING_RANGES = {
+        "temperature": (0.0, 2.0),
+        "top_p": (0.0, 1.0),
+        "frequency_penalty": (-2.0, 2.0),
+        "presence_penalty": (-2.0, 2.0),
+    }
+    ANTHROPIC_UNSUPPORTED_SAMPLING = ("frequency_penalty", "presence_penalty")
+
     def __init__(
         self,
         *,
@@ -84,9 +93,21 @@ class CompatibleHttpModel:
         context_window=128_000,
         token_chars=3,
         reasoning_effort=None,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        frequency_penalty=None,
+        presence_penalty=None,
+        stream=False,
+        cache_ttl=None,
+        cache_min_tokens=0,
     ):
-        if api_format not in {"openai", "anthropic"} or not model:
-            raise CoreError("CONFIG_INVALID")
+        if api_format not in {"openai", "anthropic"}:
+            raise CoreError(
+                "CONFIG_INVALID", "LLM_API_FORMAT must be openai or anthropic"
+            )
+        if not model:
+            raise CoreError("CONFIG_INVALID", "LLM_MODEL is required")
         suffix = "/chat/completions" if api_format == "openai" else "/messages"
         default = (
             "https://api.openai.com/v1"
@@ -127,12 +148,47 @@ class CompatibleHttpModel:
             reasoning_effort is not None
             and self.reasoning_effort not in self.REASONING_EFFORTS
         ):
-            raise CoreError("CONFIG_INVALID", "invalid MODEL_REASONING_EFFORT")
+            raise CoreError("CONFIG_INVALID", "invalid THINKING_LEVEL")
+        self.sampling = self._sampling(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+        )
+        self.stream = bool(stream)
+        self.cache_ttl = cache_ttl
+        self.cache_min_tokens = max(0, int(cache_min_tokens))
         self.invocation_parameters
+
+    def _sampling(self, **values):
+        sampling = {}
+        for name, value in values.items():
+            if value is None:
+                continue
+            if name == "top_k":
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise CoreError("CONFIG_INVALID", "LLM_TOP_K must be a positive int")
+            else:
+                low, high = self.SAMPLING_RANGES[name]
+                if not low <= float(value) <= high:
+                    raise CoreError(
+                        "CONFIG_INVALID", f"LLM_{name.upper()} must be in [{low}, {high}]"
+                    )
+            if (
+                self.api_format == "anthropic"
+                and name in self.ANTHROPIC_UNSUPPORTED_SAMPLING
+            ):
+                raise CoreError(
+                    "CONFIG_INVALID", f"Anthropic does not support LLM_{name.upper()}"
+                )
+            sampling[name] = value
+        return sampling
 
     @property
     def invocation_parameters(self):
         parameters = dict(self.extra_body)
+        parameters.update(self.sampling)
         if self.api_format == "openai":
             if self.provider.lower() == "minimax":
                 parameters.setdefault("reasoning_split", True)
@@ -309,6 +365,22 @@ class CompatibleHttpModel:
             result.append({"role": message["role"], "content": message["content"]})
         return result
 
+    def _system_blocks(self, instructions):
+        """Mark the stable instruction prefix cacheable (Anthropic prompt caching).
+
+        OpenAI-compatible providers cache the prefix automatically, so the same
+        settings need no request field there.
+        """
+        if not self.cache_ttl or self.count_tokens(instructions) < self.cache_min_tokens:
+            return instructions
+        return [
+            {
+                "type": "text",
+                "text": instructions,
+                "cache_control": {"type": "ephemeral", "ttl": self.cache_ttl},
+            }
+        ]
+
     def _request(self, context, instructions, tools, messages=None):
         schemas, reverse = self._tools(tools)
         messages = list(messages or ({"role": "user", "content": context},))
@@ -326,7 +398,7 @@ class CompatibleHttpModel:
                 {
                     "model": self.model,
                     "max_tokens": self.max_tokens,
-                    "system": instructions,
+                    "system": self._system_blocks(instructions),
                     "messages": self._anthropic_messages(messages, reverse),
                 }
             )
@@ -341,7 +413,7 @@ class CompatibleHttpModel:
             headers.setdefault("anthropic-version", self.anthropic_version)
         return body, headers, reverse
 
-    def _post(self, body, headers):
+    def _open(self, body, headers):
         request = Request(
             self.endpoint,
             data=json.dumps(body).encode(),
@@ -349,8 +421,7 @@ class CompatibleHttpModel:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                raw = response.read(16_777_217)
+            return urlopen(request, timeout=self.timeout)
         except HTTPError as error:
             detail = error.read(4096).decode(errors="replace")
             retryable = error.code in {408, 409, 429} or error.code >= 500
@@ -361,6 +432,145 @@ class CompatibleHttpModel:
             ) from error
         except (OSError, TimeoutError, URLError) as error:
             raise CoreError("MODEL_UNAVAILABLE", str(error), retryable=True) from error
+
+    @staticmethod
+    def _server_sent_events(stream):
+        """Yield decoded `data:` payloads from a text/event-stream response."""
+        for raw in stream:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:") :].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                yield json.loads(payload)
+            except json.JSONDecodeError as error:
+                raise CoreError(
+                    "MODEL_UNAVAILABLE", "invalid model stream frame"
+                ) from error
+
+    def _stream_openai(self, stream, publish):
+        message = {"content": None, "tool_calls": []}
+        reasoning = ""
+        response = {"choices": [{"message": message, "finish_reason": None}]}
+        for frame in self._server_sent_events(stream):
+            if frame.get("usage"):
+                response["usage"] = frame["usage"]
+            for choice in frame.get("choices") or ():
+                if choice.get("finish_reason"):
+                    response["choices"][0]["finish_reason"] = choice["finish_reason"]
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    message["content"] = integrate_stream_chunk(
+                        message["content"] or "", content
+                    )
+                visible = self._visible_reasoning(
+                    delta.get("reasoning_details")
+                ) or self._visible_reasoning(
+                    delta.get("reasoning_content") or delta.get("reasoning")
+                )
+                if visible:
+                    reasoning = integrate_stream_chunk(reasoning, visible)
+                for call in delta.get("tool_calls") or ():
+                    self._merge_openai_tool_call(message["tool_calls"], call)
+                if content or visible:
+                    publish(message["content"] or "", reasoning)
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if not message["tool_calls"]:
+            message.pop("tool_calls")
+        for call in message.get("tool_calls", ()):
+            # A zero-argument tool may arrive with no argument delta at all.
+            call["function"]["arguments"] = call["function"]["arguments"] or "{}"
+        return response
+
+    @staticmethod
+    def _merge_openai_tool_call(calls, delta):
+        index = delta.get("index", len(calls))
+        while len(calls) <= index:
+            calls.append({"id": None, "function": {"name": "", "arguments": ""}})
+        current = calls[index]
+        if delta.get("id"):
+            current["id"] = delta["id"]
+        function = delta.get("function") or {}
+        if function.get("name"):
+            current["function"]["name"] = (
+                current["function"]["name"] or ""
+            ) + function["name"]
+        if function.get("arguments"):
+            current["function"]["arguments"] += function["arguments"]
+
+    def _stream_anthropic(self, stream, publish):
+        blocks = []
+        response = {"content": blocks, "usage": {}, "stop_reason": None}
+        text = ""
+        reasoning = ""
+        for frame in self._server_sent_events(stream):
+            kind = frame.get("type")
+            if kind == "message_start":
+                response["usage"].update(
+                    (frame.get("message") or {}).get("usage") or {}
+                )
+            elif kind == "content_block_start":
+                block = dict(frame.get("content_block") or {})
+                block.setdefault("type", "text")
+                if block["type"] == "tool_use":
+                    block.setdefault("input", {})
+                    block["_partial_json"] = ""
+                blocks.append(block)
+            elif kind == "content_block_delta":
+                if not blocks:
+                    continue
+                block = blocks[-1]
+                delta = frame.get("delta") or {}
+                if delta.get("type") == "text_delta":
+                    chunk = delta.get("text", "")
+                    block["text"] = integrate_stream_chunk(block.get("text", ""), chunk)
+                    text = integrate_stream_chunk(text, chunk)
+                    publish(text, reasoning)
+                elif delta.get("type") == "thinking_delta":
+                    chunk = delta.get("thinking", "")
+                    block["thinking"] = integrate_stream_chunk(
+                        block.get("thinking", ""), chunk
+                    )
+                    reasoning = integrate_stream_chunk(reasoning, chunk)
+                    publish(text, reasoning)
+                elif delta.get("type") == "signature_delta":
+                    block["signature"] = block.get("signature", "") + delta.get(
+                        "signature", ""
+                    )
+                elif delta.get("type") == "input_json_delta":
+                    block["_partial_json"] += delta.get("partial_json", "")
+            elif kind == "content_block_stop" and blocks:
+                block = blocks[-1]
+                if block.get("type") == "tool_use":
+                    partial = block.pop("_partial_json", "")
+                    block["input"] = json.loads(partial) if partial.strip() else {}
+            elif kind == "message_delta":
+                response["usage"].update(frame.get("usage") or {})
+                stop = (frame.get("delta") or {}).get("stop_reason")
+                if stop:
+                    response["stop_reason"] = stop
+        return response
+
+    def _post_stream(self, body, headers, reverse, on_delta):
+        def publish(content, reasoning):
+            if on_delta is None:
+                return
+            public, embedded = self._split_reasoning(content, reverse)
+            on_delta(public, self._canonical_text(reasoning, reverse) or embedded)
+
+        headers = {**headers, "Accept": "text/event-stream"}
+        with self._open(body, headers) as stream:
+            if self.api_format == "openai":
+                return self._stream_openai(stream, publish)
+            return self._stream_anthropic(stream, publish)
+
+    def _post(self, body, headers):
+        with self._open(body, headers) as response:
+            raw = response.read(16_777_217)
         if len(raw) > 16_777_216:
             raise CoreError("MODEL_UNAVAILABLE", "model response is too large")
         try:
@@ -559,11 +769,17 @@ class CompatibleHttpModel:
             **usage_fields,
         )
 
-    def generate(self, *, context, tools, instructions, messages=None):
+    def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
         body, headers, reverse = self._request(
             context, instructions, tools, messages=messages
         )
-        response = self._post(body, headers)
+        if self.stream:
+            body["stream"] = True
+            if self.api_format == "openai":
+                body.setdefault("stream_options", {"include_usage": True})
+            response = self._post_stream(body, headers, reverse, on_delta)
+        else:
+            response = self._post(body, headers)
         if self.api_format == "openai":
             return self._parse_openai(response, reverse)
         return self._parse_anthropic(response, reverse)

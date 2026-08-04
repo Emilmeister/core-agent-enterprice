@@ -8,8 +8,6 @@ from core_agent.a2a import (
     Artifact,
     Message,
     Part,
-    TaskState,
-    map_core_state,
 )
 from core_agent.errors import CoreError
 from core_agent.execution import EgressPolicy
@@ -70,21 +68,6 @@ class A2AAdvancedTests(unittest.TestCase):
             final.append(
                 Part.text("late"), chunk_id="chunk-3", sequence=3, last_chunk=True
             )
-
-    def test_remote_input_local_approval_and_auth_map_to_distinct_states(self):
-        service = A2AService(
-            lambda request, context: Artifact.text("ok"), AgentCard.minimal("test")
-        )
-        task = service.create_task(context_id="context-1")
-        self.assertEqual(map_core_state("WAITING_LOCAL_APPROVAL"), TaskState.WORKING)
-        information = service.require_input(
-            task.id, reason="information_required", schema={"type": "string"}
-        )
-        self.assertEqual(information.status_metadata["reason"], "information_required")
-        auth = service.require_auth(task.id, scheme="oauth2")
-        self.assertEqual(auth.state, TaskState.AUTH_REQUIRED)
-        service.close()
-
 
 class McpTests(unittest.TestCase):
     def test_initialize_discovery_snapshot_and_safe_catalog_revision(self):

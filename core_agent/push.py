@@ -12,13 +12,14 @@ from urllib.parse import urlparse
 import httpx
 from a2a.server.owner_resolver import resolve_user_scope
 from a2a.server.tasks import PushNotificationConfigStore, PushNotificationSender
-from a2a.types import TaskPushNotificationConfig
+from a2a.types import Role, TaskPushNotificationConfig
 from a2a.utils.proto_utils import to_stream_response
 from cryptography.fernet import Fernet, InvalidToken
 from google.protobuf.json_format import MessageToDict, MessageToJson, Parse
 from psycopg.types.json import Jsonb
 
 from .errors import CoreError
+from .streaming import PARTIAL_KEY
 
 
 def _scope(context):
@@ -243,7 +244,19 @@ class DurablePushNotificationSender(PushNotificationSender):
         configs = await self.config_store.get_info_for_dispatch(task_id)
         return next((item for item in configs if item.id == config_id), None)
 
+    @staticmethod
+    def _is_transient_snapshot(event):
+        """Buffered streaming snapshots are progress, not durable deliveries."""
+        status = getattr(event, "status", None)
+        if status is None or not status.HasField("message"):
+            return False
+        if status.message.role != Role.ROLE_AGENT:
+            return False
+        return bool(MessageToDict(status.message.metadata).get(PARTIAL_KEY))
+
     async def send_notification(self, task_id, event):
+        if self._is_transient_snapshot(event):
+            return
         configs = await self.config_store.get_info_for_dispatch(task_id)
         if not configs:
             return

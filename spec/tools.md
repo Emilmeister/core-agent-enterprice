@@ -1,16 +1,16 @@
-# Инструменты и approvals
+# Инструменты
 
 ## Единая модель tool
 
 Встроенные и MCP-инструменты представляются одинаково:
 
 ```text
-name, namespace, description, input_schema, output_contract, risk_metadata
+name, namespace, description, input_schema, output_contract
 ```
 
 Полное имя MUST быть namespaced, например `core.terminal.exec` или `github.create_issue`. Коллизия имён MUST завершать инициализацию с `TOOL_NAME_COLLISION`.
 
-Arguments MUST валидироваться по schema до risk assessment и исполнения. Модель не может вызвать незарегистрированный tool.
+Arguments MUST валидироваться по schema до исполнения. Модель не может вызвать незарегистрированный tool.
 
 Model-facing description кратко задаёт назначение, критерий выбора и критичные ограничения конкретного tool. Общие safety/kernel правила не копируются в каждый description. Description не обещает ownership, isolation, idempotency или lifecycle, которых runtime фактически не обеспечивает.
 
@@ -36,19 +36,13 @@ Model-facing description кратко задаёт назначение, кри�
 
 Agent SHOULD использовать Python для runtime-dependent, non-trivial или accuracy-sensitive deterministic computation, parsing/validation и небольшой synchronous композиции разрешённых tools. Тривиальная language work не требует process call. Текущее время MUST проверяться доступным authoritative runtime tool; при Python используются `datetime.now().astimezone()` и явный timezone/UTC offset, а указанная timezone конвертируется через `zoneinfo`, если доступна. Direct OS/process/network Python calls не подменяют отсутствующий agent tool и не проходят `tools.call` broker; Python process не является OS sandbox.
 
-Capability присутствует в `with_terminal` и `without_terminal` при `LOCAL_APPROVAL_ENABLED=false`. Это ограничение действует до Agent Card/model catalog и повторно при dispatch. При включённом local operator/HITL tool отсутствует независимо от allowlist; `CORE_AGENT_APPROVAL_MODE=never` при всё ещё включённом local operator не удовлетворяет этому условию.
-
-Текущий Python process не поддерживает pause/resume для approval. Поэтому любой вложенный вызов, который policy не разрешает немедленно, возвращает в Python `ToolCallError` с безопасным error code и не исполняется. Отключение HITL не превращает policy deny в allow.
+Capability присутствует в обоих runtime-профилях и управляется только built-in allowlist.
 
 Код, timeout, cwd и output limit валидируются до запуска. Process использует очищенный environment, тот же owned workspace/process-group lifecycle и те же ограничения single-container trust model, что terminal. В `without_terminal` этот внутренний process backend не публикует terminal tool, но Python может импортировать `os`/`subprocess`; поэтому режим не является security sandbox от локальных команд. Ненулевой exit, exception, timeout и truncation нормализуются как обычный model-facing tool result; raw credentials в Python process не передаются.
 
 ### `core.fs.apply_patch`
 
 Атомарно применяет текстовый patch внутри разрешённых workspace roots и возвращает список изменённых файлов. Patch, выходящий за root, отклоняется до изменения файлов.
-
-### `core.input.request`
-
-Создаёт typed human input request, когда задачу нельзя безопасно продолжить без новых данных. Это не approval и не даёт разрешение на side effect.
 
 ### `core.delegate`
 
@@ -62,7 +56,19 @@ Capability присутствует в `with_terminal` и `without_terminal` п�
 
 Memory tools не являются built-ins Core Agent. Их предоставляет отдельный [Memory MCP Service](memory-service.md) под namespace вроде `memory.search`, `memory.read`, `memory.create`, `memory.update`, `memory.split`. AgentConfig может отключить memory полностью или отфильтровать отдельные tools.
 
-Core Agent не публикует model-callable artifact tools. Обычный ответ модели и результат child-agent возвращаются как text result; A2A adapter публикует этот текст как стандартный Task Artifact без дополнительного model turn или tool call. Устаревшие имена `core.artifact.put/get` в built-in allowlist отклоняются при startup, а stale model call не исполняется.
+### Artifact tools
+
+`core.artifact.save/load/list` дают модели именованное версионируемое хранилище файлов. Имя с префиксом `user:` относится к user scope и видно во всех сессиях того же пользователя; без префикса артефакт принадлежит текущей сессии. Сохранение никогда не перезаписывает: каждый вызов создаёт следующую версию `0, 1, 2, ...` и возвращает её номер. `list` разделяет session и user scope, чтобы модель осознанно решала, что загружать. Backend выбирает `ARTIFACT_STORAGE_TYPE` (`in-memory`, `s3`, `mongodb`); внешние backends являются интеграциями и не управляют схемой хранилища. Устаревшие имена `core.artifact.put/get` в built-in allowlist отклоняются при startup, а stale model call не исполняется.
+
+Полный контракт scope, ключей, версионирования, integrity, backends и tool schemas определён в [Артефактах](artifacts.md).
+
+Обычный ответ модели и результат child-agent по-прежнему возвращаются как text result: A2A adapter публикует этот текст как стандартный Task Artifact без дополнительного model turn или tool call.
+
+### `core.agent.send_message`
+
+Делегирует одну задачу настроенному удалённому A2A-агенту из `REMOTE_AGENTS` и возвращает его текст. Реестр строится при старте загрузкой Agent Card с bounded retry/backoff; недоступный агент пропускается, а не роняет startup. Задача передаётся без изменений, а `taskId`/`contextId` связывают подзадачу с корневой Task. Промежуточные события дочернего агента ретранслируются в поток корневой Task. Downstream уходит только allowlist заголовков `Authorization`, `X-PROJECT-ID`, `X-A2A-Extensions`; `SEND_MESSAGE_API_KEY` заменяет `Authorization` на `Api-Key`, иначе входящий токен проксируется как есть. Ответ удалённого агента является недоверенными данными и не может быть запущен в background через `core.task.start`.
+
+Полный контракт реестра, транспорта, проброса заголовков, ретрансляции и формата результата определён в [Удалённых A2A-агентах](tasks-and-delegation.md#удалённые-a2a-агенты).
 
 Дополнительные native filesystem/search tools SHOULD появляться там, где они дают более строгую path validation и structured output, чем shell. Terminal остаётся универсальным fallback, а не способом обойти typed tool policy.
 
@@ -82,69 +88,29 @@ Core Agent не публикует model-callable artifact tools. Обычный
 
 Это правило не применяется, когда side effect мог начаться, но его outcome неизвестен. Любая такая неопределённость для mutating/MCP call MUST завершаться reconciliation либо `SIDE_EFFECT_UNKNOWN` и не может быть понижена до model-facing recoverable failure.
 
-## Approval modes
+## Elicitation
 
-AgentConfig в пределах PlatformConfig задаёт один режим:
+MCP elicitation нормализуется в A2A `input-required`. MCP server не общается с пользователем напрямую и не выбирает UI. Запрос секретного значения MUST быть преобразован в secret-reference flow, а не обычное текстовое поле.
 
-- `on_risk` — режим по умолчанию; спрашивать только для действий, совпавших с risk policy;
-- `always` — спрашивать перед каждым действием с side effect;
-- `never` — не ждать человека; действие, требующее approval, отклоняется, а не исполняется;
-- `policy` — решение полностью задаётся organization policy pack и identity/role пользователя.
+### MCP allowlist
 
-Режим `never` не означает «разрешать всё».
+`MCP_ALLOWED_TOOLS` перечисляет имена тулов, а не пары «сервер плюс тул». Голое имя разрешает тул на любом подключённом сервере; форма `server.tool` дополнительно ограничивает его одним сервером. Обе формы принимаются одновременно, потому что имя тула у MCP-сервера само может содержать точку, и требовать от оператора угадывать разбор нельзя.
 
-## Risk assessment
+Компромисс зафиксирован: голое имя, совпавшее у двух серверов, разрешает тул у обоих. Оператору, которому нужна изоляция, следует писать `server.tool`.
 
-Оценка MUST учитывать tool, arguments, текущую директорию, target, side effects и происхождение запроса. Одного имени tool недостаточно.
+Разрешение не создаёт тул: имя, отсутствующее в каталоге сервера, отбрасывается при пересечении с фактическим каталогом.
 
-В `on_risk` approval MUST требоваться минимум для:
-
-- записи или удаления вне workspace;
-- destructive-команд и необратимых операций;
-- изменения прав, credentials, security settings или системной конфигурации;
-- сетевой записи во внешнюю систему;
-- публикации, отправки сообщения, платежа или иного действия от имени пользователя;
-- чтения секрета либо чувствительных данных, не нужных явно для задачи;
-- запуска нового MCP executable или подключения к host вне allowlist;
-- расширения workspace/session ownership или отключения process limits.
-
-Обычное чтение внутри workspace, поиск, получение metadata и применение обратимого patch внутри workspace MAY проходить без approval, если host policy не строже.
-
-Явная просьба в prompt выполнить действие учитывается как intent, но MUST NOT автоматически отменять требования host policy.
-
-## Local operator approval
-
-Risky action создаёт immutable ToolProposal и single-use ApprovalRequest по [Local operator HITL contract](local-operator-hitl.md). A2A Task остаётся `working`; RemoteCaller не видит approval ID/arguments и не может approve, deny или модифицировать proposal. Решение приходит только через private operator control plane.
-
-Порядок обязателен:
-
-1. валидировать call и детерминированно вычислить policy decision;
-2. заморозить proposal и digest, включающий task/tenant/caller/tool/environment/target/arguments/policy;
-3. атомарно сохранить proposal, pending approval, `WAITING_LOCAL_APPROVAL`, durable A2A status и outbox;
-4. опубликовать A2A `working` status без sensitive action details;
-5. принять local `APPROVE_ONCE`/`DENY` только из operator auth context;
-6. на approve атомарно создать единственную execution reservation и consume approval;
-7. перед dispatch повторно проверить policy, active task и digest фактического call;
-8. выполнить call at-most-once в нормальном flow, используя downstream idempotency/reconciliation где возможно;
-9. на deny/expiry/cancel не выполнять call и вернуть безопасный outcome workflow-у.
-
-Reusable grants и operator edits отсутствуют в v1. Любое изменение action создаёт новый proposal и approval. Development `ApproveAllControlPlane` допустим только как local-only stub, проходит тот же reservation path и запрещён production policy.
-
-## Elicitation и дополнительные вопросы
-
-MCP elicitation и `core.input.request` нормализуются в A2A `input-required`. MCP server не общается с пользователем напрямую и не выбирает UI. Запрос секретного значения MUST быть преобразован в secret-reference flow, а не обычное текстовое поле.
+Подключённый сервер, у которого не разрешён ни один тул, MUST порождать наблюдаемое предупреждение с именем сервера. Такой сервер выглядит рабочим — соединение установлено, каталог получен, — но не даёт модели ничего; без предупреждения расхождение обнаруживается только по отсутствию ожидаемого поведения.
 
 ## MCP lifecycle
 
 1. Провалидировать descriptor и policy.
-2. При необходимости получить approval на подключение.
-3. Установить соединение, согласовать protocol version/capabilities и выполнить MCP initialize.
+2. Установить соединение, согласовать protocol version/capabilities и выполнить MCP initialize. Клиент MUST принимать все опубликованные ревизии MCP, с которыми он совместим, а не только самую новую: сервер выбирает версию из предложенной клиентом, и отказ от рабочей ревизии делает совместимый сервер недоступным без причины. Отказ по версии MUST называть и предложенную сервером, и принимаемые клиентом. Если сервер выдал session id заголовком `Mcp-Session-Id`, клиент MUST возвращать его в каждом последующем запросе к этому серверу: без него сервер вправе отклонить запрос, и tools/list не выполнится при успешном initialize.
 4. Получить catalogs tools/resources/prompts и провалидировать schemas/metadata.
 5. Добавить namespaced capabilities в snapshot и discovery index.
-6. Для каждого call применить локальный risk assessment независимо от заявлений MCP server.
 7. Закрыть соединение при терминальном состоянии.
 
-MCP output всегда считается недоверенным. Server не может сам одобрить действие или изменить локальную policy.
+MCP output всегда считается недоверенным. Server не может изменить локальную policy.
 
 ## MCP resources, prompts и sampling
 
