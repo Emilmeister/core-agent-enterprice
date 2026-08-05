@@ -175,16 +175,15 @@ class DelegationTests(unittest.TestCase):
         self.parent = CapabilitySet(
             tools=frozenset(
                 {
-                    "core.terminal.exec",
-                    "core.fs.apply_patch",
-                    "core.task.wait",
-                    "core.delegate",
+                    "core_terminal_exec",
+                    "core_fs_apply_patch",
+                    "core_task_wait",
+                    "core_delegate",
+                    "core_memory_search",
+                    "core_memory_read",
                 }
             ),
-            mcp={
-                "repo": frozenset({"search", "read_file"}),
-                "memory": frozenset({"search", "read", "update"}),
-            },
+            mcp={"repo": frozenset({"search", "read_file"})},
             skills=frozenset({"database-review", "release-notes"}),
             features=frozenset({"delegation", "background_tasks", "memory"}),
             budgets={"turns": 100, "tool_calls": 200, "depth": 2, "fan_out": 4},
@@ -196,8 +195,7 @@ class DelegationTests(unittest.TestCase):
     def contract(self, **changes):
         raw = {
             "instruction": "Review database migrations and report concrete risks.",
-            "tools": ["core.terminal.exec"],
-            "mcp": {"repo": ["search"], "memory": ["search", "read", "update"]},
+            "tools": ["core_terminal_exec", "repo_search"],
             "skills": ["database-review"],
             "budget": {"turns": 20, "tool_calls": 40},
         }
@@ -208,33 +206,42 @@ class DelegationTests(unittest.TestCase):
         self,
     ):
         child = derive_child_capabilities(self.parent, self.contract(), current_depth=0)
-        self.assertEqual(child.tools, frozenset({"core.terminal.exec"}))
-        self.assertEqual(
-            child.mcp,
-            {
-                "repo": frozenset({"search"}),
-                "memory": frozenset({"search", "read", "update"}),
-            },
-        )
+        self.assertEqual(child.tools, frozenset({"core_terminal_exec"}))
+        self.assertEqual(child.mcp, {"repo": frozenset({"search"})})
         self.assertEqual(child.skills, frozenset({"database-review"}))
         self.assertEqual(child.budgets["turns"], 20)
         self.assertEqual(child.budgets["tool_calls"], 40)
         self.assertEqual(child.kernel_version, "kernel-v1")
         self.assertEqual(child.tenant_id, "tenant-1")
-        self.assertEqual(child.memory_namespace, "session/context-1")
 
     def test_child_cannot_expand_tools_mcp_skills_or_budget(self):
+        """Each refusal names what was refused: the model has to fix one list."""
         invalid_contracts = [
-            self.contract(tools=["core.terminal.exec", "core.terminal.write"]),
-            self.contract(mcp={"repo": ["delete_repository"]}),
-            self.contract(skills=["unknown"]),
-            self.contract(budget={"turns": 101, "tool_calls": 40}),
+            (
+                self.contract(tools=["core_terminal_exec", "core_terminal_write"]),
+                "core_terminal_write",
+            ),
+            (self.contract(tools=["repo_delete_repository"]), "repo_delete_repository"),
+            (self.contract(tools=["absent_search"]), "absent_search"),
+            (self.contract(skills=["unknown"]), "skill unknown"),
+            (self.contract(budget={"turns": 101, "tool_calls": 40}), "budget turns"),
         ]
-        for contract in invalid_contracts:
-            with self.subTest(contract=contract):
+        for contract, expected in invalid_contracts:
+            with self.subTest(expected=expected):
                 with self.assertRaises(CoreError) as caught:
                     derive_child_capabilities(self.parent, contract, current_depth=0)
                 self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
+                self.assertIn(expected, str(caught.exception))
+
+    def test_one_tool_list_carries_built_ins_and_mcp_tools_alike(self):
+        """The model names tools the way the catalogue showed them, in one list."""
+        child = derive_child_capabilities(
+            self.parent,
+            self.contract(tools=["core_terminal_exec", "repo_search", "repo_read_file"]),
+            current_depth=0,
+        )
+        self.assertEqual(child.tools, frozenset({"core_terminal_exec"}))
+        self.assertEqual(child.mcp, {"repo": frozenset({"search", "read_file"})})
 
     def test_delegate_contract_rejects_ambiguous_budget_and_unknown_fields(self):
         for changes in (
@@ -245,7 +252,6 @@ class DelegationTests(unittest.TestCase):
             raw = {
                 "instruction": "Review",
                 "tools": [],
-                "mcp": {},
                 "skills": [],
                 "budget": {"turns": 2, "tool_calls": 1},
                 **changes,
@@ -259,7 +265,6 @@ class DelegationTests(unittest.TestCase):
             {
                 "instruction": "Review",
                 "tools": [],
-                "mcp": {},
                 "skills": [],
                 "budget": {"turns": 2, "tool_calls": 1},
             }
@@ -268,7 +273,6 @@ class DelegationTests(unittest.TestCase):
             {
                 "instruction": "Review",
                 "tools": [],
-                "mcp": {},
                 "skills": [],
                 "budget": {"turns": 2, "tool_calls": 1},
                 "background": True,
@@ -277,18 +281,31 @@ class DelegationTests(unittest.TestCase):
         self.assertFalse(joined.background)
         self.assertTrue(background.background)
 
-    def test_memory_is_shared_only_when_same_server_tools_and_namespace_are_explicit(
-        self,
-    ):
-        no_memory = self.contract(mcp={"repo": ["search"]})
-        child = derive_child_capabilities(self.parent, no_memory, current_depth=0)
-        self.assertNotIn("memory", child.mcp)
+    def test_memory_is_shared_only_when_a_memory_tool_is_delegated_explicitly(self):
+        # Memory is a built-in tool family now, so a child gets it only by name.
+        child = derive_child_capabilities(self.parent, self.contract(), current_depth=0)
+        self.assertEqual(
+            [tool for tool in child.tools if tool.startswith("core_memory_")], []
+        )
         self.assertIsNone(child.memory_namespace)
 
-        read_only = self.contract(mcp={"memory": ["search", "read"]})
-        child = derive_child_capabilities(self.parent, read_only, current_depth=0)
-        self.assertEqual(child.mcp["memory"], frozenset({"search", "read"}))
+        shared = self.contract(tools=["core_terminal_exec", "core_memory_search"])
+        child = derive_child_capabilities(self.parent, shared, current_depth=0)
+        self.assertEqual(
+            child.tools, frozenset({"core_terminal_exec", "core_memory_search"})
+        )
+        # Delegating one memory tool must not hand over the rest of the family.
+        self.assertNotIn("core_memory_read", child.tools)
         self.assertEqual(child.memory_namespace, "session/context-1")
+
+        # A memory tool the parent does not hold cannot be granted to the child.
+        with self.assertRaises(CoreError) as caught:
+            derive_child_capabilities(
+                self.parent,
+                self.contract(tools=["core_memory_delete"]),
+                current_depth=0,
+            )
+        self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
 
     def test_depth_and_fanout_are_enforced(self):
         child = derive_child_capabilities(
@@ -297,16 +314,16 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(child.budgets["depth"], 2)
         first_level = derive_child_capabilities(
             self.parent,
-            self.contract(tools=["core.delegate"]),
+            self.contract(tools=["core_delegate"]),
             current_depth=0,
         )
         second_level = derive_child_capabilities(
             self.parent,
-            self.contract(tools=["core.delegate"]),
+            self.contract(tools=["core_delegate"]),
             current_depth=1,
         )
-        self.assertIn("core.delegate", first_level.tools)
-        self.assertNotIn("core.delegate", second_level.tools)
+        self.assertIn("core_delegate", first_level.tools)
+        self.assertNotIn("core_delegate", second_level.tools)
 
         with self.assertRaises(CoreError) as caught:
             derive_child_capabilities(self.parent, self.contract(), current_depth=2)
@@ -327,7 +344,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.registry = ToolRegistry()
         self.registry.register(
             ToolDefinition(
-                name="core.terminal.exec",
+                name="core_terminal_exec",
                 description="execute",
                 input_schema={
                     "type": "object",
@@ -366,22 +383,49 @@ class ToolRuntimeTests(unittest.TestCase):
 
     def test_name_collision_unknown_tool_and_invalid_arguments_never_execute(self):
         with self.assertRaises(CoreError) as caught:
-            self.registry.register(self.registry.get("core.terminal.exec"))
+            self.registry.register(self.registry.get("core_terminal_exec"))
         self.assertEqual(caught.exception.code, "TOOL_NAME_COLLISION")
         with self.assertRaises(CoreError) as caught:
             self.runtime.execute(ToolCall("call-0", "missing", {}), run_id="run-1")
         self.assertEqual(caught.exception.code, "TOOL_NOT_FOUND")
         with self.assertRaises(CoreError) as caught:
             self.runtime.execute(
-                ToolCall("call-1", "core.terminal.exec", {"argv": "not-array"}),
+                ToolCall("call-1", "core_terminal_exec", {"argv": "not-array"}),
                 run_id="run-1",
             )
         self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
         self.assertEqual(self.backend.executed, [])
 
+    def test_a_rejected_argument_is_named_and_its_value_is_not(self):
+        """A bare code gives the model nothing to correct, so it starts guessing."""
+        cases = {
+            '{"argv": ["ls"]}': "arguments.argv must be an array, got string",
+            "": "arguments.argv is required",
+        }
+        for argv, expected in cases.items():
+            with self.subTest(argv=argv):
+                arguments = {"argv": argv} if argv else {}
+                with self.assertRaises(CoreError) as caught:
+                    self.runtime.execute(
+                        ToolCall("call-1", "core_terminal_exec", arguments),
+                        run_id="run-1",
+                    )
+                self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
+                self.assertEqual(str(caught.exception), expected)
+        # The path and the type are diagnostics; the value is request content.
+        with self.assertRaises(CoreError) as caught:
+            self.runtime.execute(
+                ToolCall("call-2", "core_terminal_exec", {"argv": ["ls", 7]}),
+                run_id="run-1",
+            )
+        self.assertEqual(
+            str(caught.exception), "arguments.argv[1] must be a string, got integer"
+        )
+        self.assertEqual(self.backend.executed, [])
+
     def test_validation_happens_before_execution(self):
         result = self.runtime.execute(
-            ToolCall("call-2", "core.terminal.exec", {"argv": ["python", "-V"]}),
+            ToolCall("call-2", "core_terminal_exec", {"argv": ["python", "-V"]}),
             run_id="run-1",
         )
         self.assertIsInstance(result, ToolResult)
@@ -397,7 +441,7 @@ class ToolRuntimeTests(unittest.TestCase):
             ExecutionResult(7, "", "bad command", (), (), status="failed")
         )
         result = self.runtime.execute(
-            ToolCall("call-failed", "core.terminal.exec", {"argv": ["false"]}),
+            ToolCall("call-failed", "core_terminal_exec", {"argv": ["false"]}),
             run_id="run-1",
         )
         self.assertEqual(result.status, "failed")

@@ -20,6 +20,12 @@ from .errors import CoreError
 from .security import redact
 
 
+# Recognised only as whole argv elements: `grep "a|b"` is a pattern, `"|"` on
+# its own is a pipe the caller expected a shell to interpret.
+SHELL_OPERATORS = frozenset({"&&", "||", "|", ";", ">", ">>", "<", "&"})
+SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ash", "ksh", "busybox", "env"})
+
+
 @dataclass(frozen=True)
 class ExecutionResult:
     exit_code: int
@@ -320,16 +326,29 @@ class _LocalTerminalSession:
         self.snapshot_store = snapshot_store
         self.final_snapshot = None
 
-    def _cwd(self, requested):
-        candidate = Path(requested or ".")
+    def _contained(self, requested, label):
+        candidate = Path(requested)
         candidate = candidate if candidate.is_absolute() else self.workspace / candidate
         resolved = candidate.resolve(strict=False)
         try:
             resolved.relative_to(self.workspace.resolve())
         except ValueError:
-            raise CoreError("TOOL_ARGUMENT_INVALID", "cwd escapes workspace") from None
+            raise CoreError(
+                "TOOL_ARGUMENT_INVALID", f"{label} escapes workspace"
+            ) from None
+        return resolved
+
+    def _cwd(self, requested):
+        resolved = self._contained(requested or ".", "cwd")
         if not resolved.is_dir():
             raise CoreError("TOOL_ARGUMENT_INVALID", "cwd is not a directory")
+        return resolved
+
+    def resolve_file(self, requested):
+        """An existing file inside this workspace, checked exactly like `cwd`."""
+        resolved = self._contained(requested, "path")
+        if not resolved.is_file():
+            raise CoreError("NOT_FOUND", "no such file in the workspace")
         return resolved
 
     def _environment(self, request):
@@ -364,15 +383,30 @@ class _LocalTerminalSession:
                 isinstance(value, str) and value and "\0" not in value for value in argv
             )
         ):
-            raise CoreError("TOOL_ARGUMENT_INVALID")
+            raise CoreError(
+                "TOOL_ARGUMENT_INVALID", "argv must be a non-empty list of strings"
+            )
+        operator = next((value for value in argv[1:] if value in SHELL_OPERATORS), None)
+        if operator and Path(argv[0]).name not in SHELLS:
+            # Otherwise the operator reaches argv[0] as an argument and the error
+            # comes from whichever utility choked on it — `pwd: invalid option`
+            # for `["pwd", "&&", "ls", "-la"]` — which points nowhere near the
+            # actual mistake.
+            raise CoreError(
+                "TOOL_ARGUMENT_INVALID",
+                f"there is no shell here, so {operator!r} is passed to "
+                f"{argv[0]!r} as an argument; use ['sh', '-lc', '<command>']",
+            )
         max_output = request.get("max_output_bytes", self.spec.max_output_bytes)
         timeout = request.get("timeout")
         if not isinstance(max_output, int) or max_output <= 0:
-            raise CoreError("TOOL_ARGUMENT_INVALID")
+            raise CoreError(
+                "TOOL_ARGUMENT_INVALID", "max_output_bytes must be a positive integer"
+            )
         if timeout is not None and (
             not isinstance(timeout, (int, float)) or timeout <= 0
         ):
-            raise CoreError("TOOL_ARGUMENT_INVALID")
+            raise CoreError("TOOL_ARGUMENT_INVALID", "timeout must be a positive number")
 
         cwd = self._cwd(request.get("cwd"))
         environment = self._environment(request)
@@ -642,6 +676,15 @@ class TerminalSessionManager:
                 environment_id = environment.id
                 self._run_environments[run_id] = environment_id
         return self.execute(environment_id, request, owner_id=run_id)
+
+    def workspace_file(self, run_id, path):
+        """The file a run's own tools wrote, for a caller that owns that run."""
+        with self._lock:
+            environment_id = self._run_environments.get(run_id)
+        environment = self._environments.get(environment_id) if environment_id else None
+        if environment is None:
+            raise CoreError("NOT_FOUND", "this run has no workspace")
+        return environment.resolve_file(path)
 
     def destroy(self, environment_id, *, owner_id=None):
         environment = self._owned(environment_id, owner_id)

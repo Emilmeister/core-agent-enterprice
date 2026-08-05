@@ -95,9 +95,13 @@ Parent и child не должны одновременно изменять од
 
 ## Python CodeAct process
 
-`core.python.exec` переиспользует owned local workspace и process-group lifecycle TerminalSession, но запускает interpreter с очищенным environment и отдельным локальным IPC channel к parent runtime. IPC выдаёт только список разрешённых имён и `tools.call`; MCP credentials, database handles, ToolRuntime objects и operator authority в child process не materialize-ятся.
+`core_python_exec` переиспользует owned local workspace и process-group lifecycle TerminalSession и общается с parent runtime отдельным локальным IPC channel. IPC выдаёт только список разрешённых имён и `tools.call`; MCP credentials, database handles, ToolRuntime objects и operator authority в child process не materialize-ятся. Граница проходит по IPC, а не по module search path.
 
-Этот внутренний process backend работает и в `without_terminal`: model-visible `core.terminal.exec` и `core.task.start` при этом отсутствуют. Python остаётся доверенным локальным кодом и может использовать стандартные OS/process APIs; разделение runtime modes не добавляет OS security boundary.
+Интерпретатор MUST быть тем же, который получает команда в terminal workspace. Разные интерпретаторы у двух тулов означают, что установленный из терминала пакет не импортируется в Python, причём молча: `pip install` завершается успехом, а следующий `import` — `ModuleNotFoundError`, и модель не может связать одно с другим. Собственный virtualenv агента для этого не годится: в нём нет ни pip, ни права на запись. Поэтому user site-packages и `PYTHONPATH` MUST быть видны, а рабочий каталог MUST NOT попадать в `sys.path` автоматически: файл, случайно названный именем модуля stdlib, иначе ломает сам runner.
+
+Этот внутренний process backend работает и в `without_terminal`: model-visible `core_terminal_exec` и `core_task_start` при этом отсутствуют. Python остаётся доверенным локальным кодом и может использовать стандартные OS/process APIs; разделение runtime modes не добавляет OS security boundary.
+
+Граница кадра IPC MUST вмещать самый большой допустимый аргумент tool call. Артефакт размером `MAX_RESPONSE_SIZE`, переданный в `base64`, — это на треть больше байт, и кадр меньше этого превращает разрешённое хранилищем сохранение в отказ, зависящий от того, каким тулом файл сохраняют.
 
 Parent является единственным tool broker: проверяет каждый canonical name/arguments по неизменному EffectiveConfig run-а, списывает общий budget и исполняет вызов через существующий built-in/MCP dispatch. IPC имеет single-run capability token, owner-only local endpoint, bounded JSON frames и закрывается вместе с Python process. Эта схема остаётся process separation, а не OS security boundary.
 
@@ -107,7 +111,7 @@ Parent является единственным tool broker: проверяет
 
 TerminalSession принадлежит ровно одному main/child agent, но несколько sessions MAY работать параллельно в одном container в пределах общего semaphore и aggregate resource budget.
 
-Сессия MAY жить между несколькими tool calls одного agent для REPL, debugger или server process. Обычный `core.terminal.exec` SHOULD запускать отдельный process в той же owned session/workspace; persistent interactive state используется только явно.
+Сессия MAY жить между несколькими tool calls одного agent для REPL, debugger или server process. Обычный `core_terminal_exec` SHOULD запускать отдельный process в той же owned session/workspace; persistent interactive state используется только явно.
 
 После timeout, failed cleanup или terminal agent state session закрывается и не переиспользуется другим agent.
 

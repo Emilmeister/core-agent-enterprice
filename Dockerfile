@@ -11,11 +11,10 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
 COPY core_agent ./core_agent
-COPY memory_service ./memory_service
 RUN uv sync --frozen --no-dev && \
     useradd --create-home --uid 10001 agent && \
-    mkdir -p /data/durable /memory /tmp/core-agent/runs && \
-    chown -R agent:agent /app /data /memory /tmp/core-agent
+    mkdir -p /data/durable /tmp/core-agent/runs && \
+    chown -R agent:agent /app /data /tmp/core-agent
 
 USER agent
 STOPSIGNAL SIGTERM

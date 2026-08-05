@@ -56,59 +56,90 @@ class ToolRegistry:
         return frozenset(self._tools)
 
 
-def _validate(schema, value):
+_JSON_TYPES = {
+    dict: "object",
+    list: "array",
+    str: "string",
+    bool: "boolean",
+    int: "integer",
+    float: "number",
+    type(None): "null",
+}
+
+
+def _kind(value):
+    return _JSON_TYPES.get(type(value), type(value).__name__)
+
+
+def _reason(schema, value, path="arguments"):
+    """Why `value` fails `schema`, or None when it does not.
+
+    One function rather than a validator beside an explainer: the model is asked
+    to correct its arguments, and a bare code tells it nothing to correct, so the
+    reason has to come from the same walk that rejects. The path and the types
+    are named; the value never is, because the value is request content.
+    """
     if "enum" in schema and value not in schema["enum"]:
-        return False
-    if schema.get("type") == "object":
+        return f"{path} must be one of {sorted(map(str, schema['enum']))}"
+    expected = schema.get("type")
+    if expected == "object":
         if not isinstance(value, dict):
-            return False
-        if any(key not in value for key in schema.get("required", [])):
-            return False
+            return f"{path} must be an object, got {_kind(value)}"
+        for key in schema.get("required", []):
+            if key not in value:
+                return f"{path}.{key} is required"
         if len(value) < schema.get("minProperties", 0):
-            return False
-        if schema.get("additionalProperties") is False and set(value) - set(
-            schema.get("properties", {})
-        ):
-            return False
+            return f"{path} needs at least {schema['minProperties']} propert(y|ies)"
         properties = schema.get("properties", {})
         additional = schema.get("additionalProperties", {})
-        return all(
-            _validate(properties[key], item)
-            if key in properties
-            else not isinstance(additional, dict) or _validate(additional, item)
-            for key, item in value.items()
-        )
-    if schema.get("type") == "array":
-        return isinstance(value, list) and all(
-            _validate(schema.get("items", {}), item) for item in value
-        )
-    if schema.get("type") == "string":
-        return (
-            isinstance(value, str)
-            and len(value) >= schema.get("minLength", 0)
-            and len(value) <= schema.get("maxLength", len(value))
-            and (
-                "pattern" not in schema
-                or re.search(schema["pattern"], value) is not None
-            )
-        )
-    if schema.get("type") == "integer":
-        return (
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= schema.get("minimum", value)
-            and value <= schema.get("maximum", value)
-        )
-    if schema.get("type") == "number":
-        return (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and value >= schema.get("minimum", value)
-            and value <= schema.get("maximum", value)
-        )
-    if schema.get("type") == "boolean":
-        return isinstance(value, bool)
-    return True
+        if additional is False:
+            unknown = sorted(set(value) - set(properties))
+            if unknown:
+                return f"{path} does not accept {', '.join(unknown)}"
+        for key, item in value.items():
+            if key in properties:
+                reason = _reason(properties[key], item, f"{path}.{key}")
+            elif isinstance(additional, dict):
+                reason = _reason(additional, item, f"{path}.{key}")
+            else:
+                reason = None
+            if reason:
+                return reason
+        return None
+    if expected == "array":
+        if not isinstance(value, list):
+            return f"{path} must be an array, got {_kind(value)}"
+        for index, item in enumerate(value):
+            reason = _reason(schema.get("items", {}), item, f"{path}[{index}]")
+            if reason:
+                return reason
+        return None
+    if expected == "string":
+        if not isinstance(value, str):
+            return f"{path} must be a string, got {_kind(value)}"
+        if len(value) < schema.get("minLength", 0):
+            return f"{path} is shorter than {schema['minLength']} characters"
+        if len(value) > schema.get("maxLength", len(value)):
+            return f"{path} is longer than {schema['maxLength']} characters"
+        if "pattern" in schema and re.search(schema["pattern"], value) is None:
+            return f"{path} does not match {schema['pattern']}"
+        return None
+    if expected in ("integer", "number"):
+        types = (int,) if expected == "integer" else (int, float)
+        if not isinstance(value, types) or isinstance(value, bool):
+            return f"{path} must be {'an' if expected == 'integer' else 'a'} {expected}, got {_kind(value)}"
+        if value < schema.get("minimum", value):
+            return f"{path} must be at least {schema['minimum']}"
+        if value > schema.get("maximum", value):
+            return f"{path} must be at most {schema['maximum']}"
+        return None
+    if expected == "boolean" and not isinstance(value, bool):
+        return f"{path} must be a boolean, got {_kind(value)}"
+    return None
+
+
+def _validate(schema, value):
+    return _reason(schema, value) is None
 
 
 def validate_json_schema(schema, value):
@@ -154,10 +185,11 @@ class ToolRuntime:
 
     @staticmethod
     def validate(call, definition):
-        if _contains_private_reasoning(call.arguments) or not _validate(
-            definition.input_schema, call.arguments
-        ):
-            raise CoreError("TOOL_ARGUMENT_INVALID")
+        if _contains_private_reasoning(call.arguments):
+            raise CoreError("TOOL_ARGUMENT_INVALID", "arguments carry private reasoning")
+        reason = _reason(definition.input_schema, call.arguments)
+        if reason:
+            raise CoreError("TOOL_ARGUMENT_INVALID", reason)
 
     def execute(
         self,
@@ -185,7 +217,7 @@ class ToolRuntime:
         else:
             request = (
                 call.arguments
-                if call.name == "core.terminal.exec"
+                if call.name == "core_terminal_exec"
                 else {"tool": call.name, "arguments": call.arguments}
             )
             result = self.environment_manager.execute_transient(request, run_id)

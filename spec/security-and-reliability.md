@@ -6,7 +6,7 @@
 
 - prompt;
 - AgentProfilePrompt;
-- Memory MCP content, metadata и derived graph results;
+- memory content, metadata и derived graph results;
 - skill instructions, scripts и resources;
 - MCP metadata, tool schemas и outputs;
 - A2A peer Messages, Agent Cards и Artifacts;
@@ -65,7 +65,7 @@ Terminal, skill scripts, stdio MCP и child-agent commands исполняютс�
 - `SIDE_EFFECT_UNKNOWN`, `INTERNAL_ERROR`;
 - `SESSION_CONFLICT`, `LEASE_LOST`, `CHECKPOINT_INVALID`;
 - `CONFIG_INVALID`, `CONFIG_CONFLICT`, `CAPABILITY_DISABLED`, `REQUIRED_CAPABILITY_MISSING`, `TOOL_FILTER_EMPTY`;
-- proxied Memory MCP errors `MEMORY_FILE_TOO_LARGE`, `MEMORY_CONFLICT`, `MEMORY_INDEX_FAILED`;
+- memory errors `MEMORY_FILE_TOO_LARGE`, `MEMORY_CONFLICT`, `MEMORY_INVALID`;
 - `SKILL_INTEGRITY_FAILED`, `EXTENSION_REVOKED`;
 - `MODEL_ROUTE_UNAVAILABLE`;
 - `TASK_NOT_FOUND`, `TASK_NOT_CANCELABLE`, `TASK_NOTIFICATION_FAILED`;
@@ -87,7 +87,7 @@ Durable continuation является свойством целевого runtim
 ## Multi-tenancy
 
 - Tenant identity устанавливается authenticated transport context, не prompt.
-- Stores, caches, terminal sessions/workspaces, MCP connections и artifact URLs MUST быть tenant-scoped. Memory Service отвечает за tenant isolation Markdown/BM25/vector/graph data.
+- Stores, caches, terminal sessions/workspaces, MCP connections и artifact URLs MUST быть tenant-scoped. Подсистема памяти отвечает за tenant isolation Markdown/BM25/vector/graph data.
 - Cross-tenant identifiers возвращают not-found semantics, если раскрытие существования запрещено.
 - Quotas применяются до выделения дорогого model/execution ресурса.
 - Child runs всегда наследуют tenant и не могут сменить его через arguments.
@@ -105,4 +105,4 @@ Durable continuation является свойством целевого runtim
 
 ## Data retention
 
-Срок хранения транскриптов, checkpoints и artifacts задаёт PlatformConfig. Memory retention/delete выполняет Memory Service; Core обязан удалить свои cached excerpts и transcript-derived copies по coordinated deletion event/policy. Разрешены только агрегированные метрики и обязательные compliance tombstones.
+Срок хранения транскриптов, checkpoints и artifacts задаёт PlatformConfig. Memory retention/delete выполняет подсистема памяти; Core обязан удалить свои cached excerpts и transcript-derived copies в той же публикации. Разрешены только агрегированные метрики и обязательные compliance tombstones.

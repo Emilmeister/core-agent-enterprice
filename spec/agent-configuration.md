@@ -41,18 +41,18 @@ tools:
   builtins:
     default: deny
     allow:
-      - core.terminal.exec
-      - core.terminal.write
-      - core.fs.apply_patch
-      - core.task.*
-      - core.delegate
+      - core_terminal_exec
+      - core_terminal_write
+      - core_fs_apply_patch
+      - core_task_*
+      - core_delegate
+      - core_memory_*
     deny: []
   mcp:
     default: deny
-    allow_servers: [repo, memory]
+    allow_servers: [repo]
     allow_tools:
       repo: [search, read_file]
-      memory: [search, read, create, update, split]
 skills:
   default: deny
   allow: [database-review, release-notes]
@@ -96,18 +96,18 @@ Production deployment MUST задавать `DURABLE_STORAGE_ROOT` как пут
 
 `disabled` memory означает:
 
-- Memory MCP descriptor отклоняется или фильтруется по `required` semantics;
-- memory tools отсутствуют в discovery/model context;
+- backend памяти не создаётся;
+- ни один `core_memory_*` tool не попадает в effective catalog и в model context;
 - memory-specific kernel policy не загружается;
 - Core Agent не выполняет implicit memory retrieval/write.
 
-`optional` разрешает Task передать Memory MCP. `required` требует подходящий descriptor до первого model turn.
+`optional` включает память, если backend доступен. `required` требует работоспособный backend до первого model turn: его отсутствие является ошибкой старта, а не тихой деградацией.
 
 ## Deployment variables
 
 Deployment передаёт конфигурацию переменными окружения. Ниже перечислен полный контракт: имя, значение по умолчанию и нормативная семантика. Пустая строка означает «не задано» и MUST трактоваться как отсутствие значения, а не как пустое значение. Числовая переменная, не разбирающаяся в число, завершает startup с `CONFIG_INVALID`. Булева переменная принимает `true`/`false` без учёта регистра. Переменная-список разделяется запятыми, пробелы вокруг элементов отбрасываются.
 
-Переменные, не перечисленные здесь, документированы в своих разделах: `CORE_AGENT_*` — runtime modes, budgets и tool allowlist ниже по этому документу; `DATABASE_*` и `PUSH_NOTIFICATION_ENCRYPTION_KEY` — production persistence выше и [A2A protocol](a2a-protocol.md); `MEMORY_*` — [Memory MCP Service](memory-service.md).
+Переменные, не перечисленные здесь, документированы в своих разделах: `CORE_AGENT_*` — runtime modes, budgets и tool allowlist ниже по этому документу; `DATABASE_*` и `PUSH_NOTIFICATION_ENCRYPTION_KEY` — production persistence выше и [A2A protocol](a2a-protocol.md); остальные `MEMORY_*` — [Память агента](memory-service.md).
 
 ### Identity и Agent Card
 
@@ -117,7 +117,7 @@ Deployment передаёт конфигурацию переменными ок
 | `AGENT_DESCRIPTION` | `Policy-enforced core agent runtime` | Описание в Agent Card |
 | `AGENT_VERSION` | `1.0.0` | Версия в Agent Card |
 | `AGENT_SYSTEM_PROMPT` | пусто | AgentProfilePrompt; не повторяет Task prompt и не выдаёт capability |
-| `AGENT_URL` | выводится из заголовков запроса | Advertised base URL карточки. Заданное значение authoritative; пустое означает вывод из `X-Forwarded-*`/`Host` на каждый запрос карточки |
+| `AGENT_URL` | выводится из заголовков запроса | Advertised base URL карточки. Заданное значение authoritative; пустое означает вывод из `X-Forwarded-*`/`Host` на каждый запрос карточки. Синоним `URL_AGENT` принимается наравне, `AGENT_URL` имеет приоритет |
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8000` | Bind port |
 | `LOG_LEVEL` | `INFO` | Уровень structured stdout |
@@ -146,9 +146,9 @@ Deployment передаёт конфигурацию переменными ок
 
 | Переменная | По умолчанию | Семантика |
 |---|---|---|
-| `MCP_URL` | пусто | Список Streamable HTTP серверов, принадлежащих deployment. Имя сервера берётся из последнего сегмента пути, иначе из hostname, иначе `mcp_{N}`. Зарезервированное имя `memory` дополнительно получает role `memory` — та же конвенция, что и в `MCP_ALLOWED_SERVERS` |
-| `MCP_ALLOWED_SERVERS` | `memory` | Allowlist серверов; серверы из `MCP_URL` добавляются автоматически |
-| `MCP_ALLOWED_TOOLS` | шесть memory-тулов | Allowlist имён тулов. Голое имя (`get_forecast`) разрешает тул на любом подключённом сервере; форма `server.tool` ограничивает его одним сервером. Тул, отсутствующий в каталоге сервера, просто не появляется |
+| `MCP_URL` | пусто | Список Streamable HTTP серверов, принадлежащих deployment. Имя сервера берётся из последнего сегмента пути, иначе из hostname, иначе `mcp_{N}` |
+| `MCP_ALLOWED_SERVERS` | пусто | Allowlist серверов; серверы из `MCP_URL` добавляются автоматически |
+| `MCP_ALLOWED_TOOLS` | пусто | Allowlist имён тулов. Голое имя (`get_forecast`) разрешает тул на любом подключённом сервере; форма `server.tool` ограничивает его одним сервером. Тул, отсутствующий в каталоге сервера, просто не появляется |
 | `MCP_HEADERS_JSON` | `{}` | Заголовки исходящих MCP-вызовов |
 | `MCP_TIMEOUT` | `30.0` | Таймаут одного вызова, секунды |
 | `MCP_SSE_READ_TIMEOUT` | `300.0` | Таймаут чтения event stream, секунды |
@@ -157,7 +157,7 @@ Deployment передаёт конфигурацию переменными ок
 
 | Переменная | По умолчанию | Семантика |
 |---|---|---|
-| `REMOTE_AGENTS` | пусто | Список базовых URL. Пустой список MUST удалять `core.agent.send_message` из карточки и каталога |
+| `REMOTE_AGENTS` | пусто | Список базовых URL. Пустой список MUST удалять `core_agent_send_message` из карточки и каталога |
 | `REMOTE_AGENTS_TIMEOUT` | `15.0` | Таймаут загрузки карточки и вызова, секунды |
 | `REMOTE_AGENTS_MAX_RETRIES` | `3` | Повторы загрузки карточки при retryable-ошибке |
 | `REMOTE_AGENTS_RETRY_DELAY` | `1.0` | Базовая задержка повтора, секунды |
@@ -181,7 +181,7 @@ Deployment передаёт конфигурацию переменными ок
 |---|---|---|
 | `RUNTIME_MAX_LLM_CALLS` | `100` | Hard limit числа model turns |
 | `USER_ID` | `anonymous` | Identity, когда A2A-вызов не аутентифицирован |
-| `MAX_RESPONSE_SIZE` | `50000000` | Верхняя граница одного артефакта в байтах |
+| `MAX_RESPONSE_SIZE` | `100000000` | Верхняя граница одного артефакта в байтах, одинаковая для `content` и `path` |
 | `MAX_CHUNK_SIZE` | `0` | Символов в одном чанке A2A Artifact; `0` означает один чанк |
 | `ENTITY_ID` | пусто | Добавляется заголовком `X-Internal-Entity-ID` к исходящим provider и MCP вызовам |
 | `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` | `false` | `true` сохраняет входящие binary Parts как артефакты сессии и реферирует их в prompt; `false` отклоняет их `CONTENT_TYPE_NOT_SUPPORTED` |
@@ -216,6 +216,11 @@ Prompt caching является полем запроса только у Anthro
 | `TASK_POSTGRES_URL` | пусто | Fallback URL перед `DATABASE_URL` |
 | `ARTIFACT_STORAGE_TYPE` | `in-memory` | `in-memory`, `s3` или `mongodb` |
 | `ARTIFACT_S3_*`, `ARTIFACT_MONGODB_URL` | см. [Артефакты](artifacts.md) | Параметры backend-интеграций |
+| `MEMORY_STORAGE_TYPE` | `in-memory` | Допустимы ровно `in-memory` и `postgres`. Production с включённой памятью MUST использовать `postgres` |
+| `MEMORY_POSTGRES_*` | см. [Память агента](memory-service.md) | Отдельный DSN памяти; непустой `MEMORY_POSTGRES_HOST` переопределяет общий пул агента целиком |
+| `EMBEDDING_MODEL`, `EMBEDDING_API_BASE`, `EMBEDDING_API_KEY` | пусто | Все три заданные включают слой эмбеддингов; иначе векторный канал поиска деградирует |
+| `EMBEDDING_DIMENSION` | `768` | Ожидаемая размерность вектора |
+| `MEMORY_SEARCH_LIMIT` | `10` | Сколько записей возвращает `core_memory_search` по умолчанию |
 
 Порядок разрешения URL сессионной базы фиксирован: `SESSION_DATABASE_URL`, затем сборка из `SESSION_POSTGRES_*` при непустом host, затем `TASK_POSTGRES_URL`, затем `DATABASE_URL`.
 
@@ -233,12 +238,14 @@ Artifact backends `s3` и `mongodb` являются интеграциями: �
 
 Deployment MUST выбрать один из двух capability-профилей через `CORE_AGENT_RUNTIME_MODE`:
 
-- `with_terminal` — разрешает `core.terminal.exec` и `core.task.start`;
-- `without_terminal` — удаляет `core.terminal.exec` и `core.task.start`, но сохраняет task lifecycle (`get`, `list`, `wait`, `cancel`), delegation, MCP, memory и Python.
+- `with_terminal` — разрешает `core_terminal_exec` и `core_task_start`;
+- `without_terminal` — удаляет `core_terminal_exec` и `core_task_start`, но сохраняет task lifecycle (`get`, `list`, `wait`, `cancel`), delegation, MCP, memory и Python.
 
 Значение по умолчанию — `with_terminal`. Неизвестное значение завершает startup с `CONFIG_INVALID`. Runtime mode является верхней границей capabilities: `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, AgentConfig, Task и delegation contract могут только сузить выбранный профиль. В частности, старый allowlist с terminal tools не может снова включить их в `without_terminal`.
 
-`without_terminal` означает отсутствие model-visible terminal capability, а не OS security sandbox: Python-код всё ещё может использовать стандартные `os`, `subprocess` и filesystem APIs внутри доверенной single-container среды. Shell, stdio MCP и skill scripts не предоставляются как самостоятельные tools в этом профиле. `core.python.exec` управляется только built-in allowlist.
+Имя built-in tool в `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, записанное точками, MUST продолжать называть тот же tool: канонические имена лишились точек, а развёртывания написаны против прежнего написания, и молчаливая потеря capability здесь хуже, чем принятие обоих написаний. Неизвестное имя MUST отклонять startup с перечислением непонятых значений.
+
+`without_terminal` означает отсутствие model-visible terminal capability, а не OS security sandbox: Python-код всё ещё может использовать стандартные `os`, `subprocess` и filesystem APIs внутри доверенной single-container среды. Shell, stdio MCP и skill scripts не предоставляются как самостоятельные tools в этом профиле. `core_python_exec` управляется только built-in allowlist.
 
 ## Tool filters
 
@@ -250,7 +257,7 @@ Built-in и MCP tools фильтруются после discovery, но до mod
 4. Task-provided MCP/skills;
 5. delegation allowlist для child.
 
-На каждом уровне deny имеет приоритет. Wildcard разрешён только в namespaced форме вроде `core.task.*` или `memory.*`; глобальный `*` SHOULD быть запрещён production policy.
+На каждом уровне deny имеет приоритет. Wildcard разрешён только в namespaced форме вроде `core_task_*` или `core_memory_*`; глобальный `*` SHOULD быть запрещён production policy.
 
 Отключённый tool:
 
@@ -263,8 +270,9 @@ Protocol-internal A2A state transitions, policy checks, audit/redaction и owner
 
 Config validation MUST обнаруживать как минимум:
 
-- `delegation: true` при отключённых background tasks или `core.delegate`;
-- `memory: required`, если policy не разрешает ни одного Memory MCP server/tool;
+- `delegation: true` при отключённых background tasks или `core_delegate`;
+- `memory: required`, если tool filters не оставляют ни одного `core_memory_*` tool;
+- включённую память при `CORE_AGENT_ENVIRONMENT=production` и `MEMORY_STORAGE_TYPE=in-memory`;
 - advertised A2A capability без runtime/transport implementation;
 - tool allow pattern, полностью перекрытый deny policy;
 - skill/MCP requirement, несовместимый с execution/network profile.
@@ -273,7 +281,7 @@ Config validation MUST обнаруживать как минимум:
 
 ## MCP policy и roles
 
-MCP descriptor MAY иметь host-validated role, например `memory`, `repository` или `issue_tracker`. Role не доверяется только потому, что пришла от клиента: AgentConfig/tenant policy сверяет server identity, transport target и optional integrity metadata.
+MCP descriptor MAY иметь host-validated role, например `repository` или `issue_tracker`. Role не доверяется только потому, что пришла от клиента: AgentConfig/tenant policy сверяет server identity, transport target и optional integrity metadata.
 
 Для каждого server можно настроить:
 
@@ -285,7 +293,7 @@ MCP descriptor MAY иметь host-validated role, например `memory`, `r
 - network/execution profile;
 - trusted capability policy profile.
 
-Memory mode относится только к MCP server с подтверждённой role `memory`.
+Роль `memory` не назначается ни одному серверу: память является подсистемой Core Agent, а не MCP-интеграцией.
 
 ## Skills policy
 

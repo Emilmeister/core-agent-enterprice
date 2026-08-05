@@ -12,7 +12,6 @@ from core_agent.a2a import (
 from core_agent.errors import CoreError
 from core_agent.execution import EgressPolicy
 from core_agent.mcp import InMemoryMcpConnector, McpManager
-from core_agent.memory_client import MemoryAuthoringClient
 from core_agent.model import ModelCapabilities, ModelRoute, ModelRouter
 from core_agent.skills import SkillResolver
 
@@ -87,7 +86,7 @@ class McpTests(unittest.TestCase):
         )
         self.assertEqual(snapshot.protocol_state, "initialized")
         self.assertEqual(snapshot.catalog_revision, 1)
-        self.assertEqual(snapshot.tools, frozenset({"repo.search"}))
+        self.assertEqual(snapshot.tools, frozenset({"repo_search"}))
         connector.update_catalog(
             "repo", {"search": {"type": "object"}, "read": {"type": "object"}}
         )
@@ -95,7 +94,7 @@ class McpTests(unittest.TestCase):
         manager.accept_notifications_at_safe_point("repo")
         self.assertEqual(manager.snapshot("repo").catalog_revision, 2)
         self.assertEqual(
-            manager.snapshot("repo").tools, frozenset({"repo.search", "repo.read"})
+            manager.snapshot("repo").tools, frozenset({"repo_search", "repo_read"})
         )
 
     def test_optional_server_failure_warns_required_server_failure_stops(self):
@@ -166,63 +165,6 @@ class McpTests(unittest.TestCase):
             {kind for kind, _ in decisions},
             {"tool", "resource", "prompt", "sampling", "elicitation"},
         )
-
-
-class MemoryAuthoringClientTests(unittest.TestCase):
-    def test_authoring_always_searches_before_update_or_create(self):
-        calls = []
-
-        class MemoryMcp:
-            def call(self, tool, arguments):
-                calls.append((tool, arguments))
-                if tool == "memory.search":
-                    return {
-                        "results": [
-                            {"memory_id": "mem-1", "same_topic": True, "revision": 4}
-                        ]
-                    }
-                if tool == "memory.update":
-                    return {"committed": True, "revision": 5}
-                raise AssertionError(tool)
-
-        result = MemoryAuthoringClient(MemoryMcp()).remember(
-            title="Project",
-            content="new fact",
-            namespace="session/context-1",
-        )
-        self.assertTrue(result["committed"])
-        self.assertEqual(
-            [tool for tool, _ in calls], ["memory.search", "memory.update"]
-        )
-        self.assertEqual(calls[1][1]["expected_file_revision"], 4)
-
-    def test_new_topic_creates_only_after_search_and_oversize_recommends_split(self):
-        calls = []
-
-        class MemoryMcp:
-            def call(self, tool, arguments):
-                calls.append(tool)
-                if tool == "memory.search":
-                    return {"results": []}
-                if tool == "memory.create":
-                    raise CoreError(
-                        "MEMORY_FILE_TOO_LARGE",
-                        "too large",
-                        data={
-                            "recommended_action": "split_into_multiple_markdown_files"
-                        },
-                    )
-                raise AssertionError(tool)
-
-        result = MemoryAuthoringClient(MemoryMcp()).remember(
-            title="Large project",
-            content="\n".join(str(i) for i in range(201)),
-            namespace="session/context-1",
-        )
-        self.assertEqual(calls, ["memory.search", "memory.create"])
-        self.assertEqual(result["status"], "split_recommended")
-        self.assertEqual(result["next_tool"], "memory.split")
-        self.assertFalse(result["committed"])
 
 
 class ModelRouterTests(unittest.TestCase):

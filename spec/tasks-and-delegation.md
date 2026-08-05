@@ -8,14 +8,14 @@
 
 ## Встроенные task tools
 
-- `core.task.start` — запустить разрешённую работу и немедленно вернуть task handle;
-- `core.task.get` — получить snapshot status/progress/artifacts;
-- `core.task.list` — перечислить дочерние tasks текущего run/session;
-- `core.task.cancel` — запросить отмену;
-- `core.task.wait` — passive wait до notification, timeout или cancellation;
-- `core.delegate` — создать child-agent Task по строгому delegation contract; по умолчанию passive join возвращает terminal child result, а `background: true` явно запрашивает неблокирующий task handle.
+- `core_task_start` — запустить разрешённую работу и немедленно вернуть task handle;
+- `core_task_get` — получить snapshot status/progress/artifacts;
+- `core_task_list` — перечислить дочерние tasks текущего run/session;
+- `core_task_cancel` — запросить отмену;
+- `core_task_wait` — passive wait до notification, timeout или cancellation;
+- `core_delegate` — создать child-agent Task по строгому delegation contract; по умолчанию passive join возвращает terminal child result, а `background: true` явно запрашивает неблокирующий task handle.
 
-`core.task.wait` MUST освобождать model worker и compute lease. Busy polling через terminal или повторные model turns запрещён, если scheduler способен прислать notification.
+`core_task_wait` MUST освобождать model worker и compute lease. Busy polling через terminal или повторные model turns запрещён, если scheduler способен прислать notification.
 
 ## Неблокирующая работа
 
@@ -30,7 +30,7 @@
 
 Вызов start не добавляет весь будущий output в контекст. Возвращаются task ID, accepted contract, initial state и ожидаемый notification channel.
 
-После joined `core.delegate` parent MUST использовать возвращённый child result и MUST NOT повторять ту же делегацию или выполнять делегированную работу самостоятельно. После `background: true` parent MAY продолжить только независимую работу; если result нужен для ответа, parent вызывает `core.task.wait` с возвращённым task ID либо получает terminal notification на следующей safe boundary.
+После joined `core_delegate` parent MUST использовать возвращённый child result и MUST NOT повторять ту же делегацию или выполнять делегированную работу самостоятельно. После `background: true` parent MAY продолжить только независимую работу; если result нужен для ответа, parent вызывает `core_task_wait` с возвращённым task ID либо получает terminal notification на следующей safe boundary.
 
 Пока child Task non-terminal, parent MAY отправить ей дополнительный A2A Message по тому же `taskId`: child получает его как следующий user turn на safe boundary. Это уточняет текущую делегацию, но не расширяет capability contract или budget и не прерывает выполняющийся tool/model call. После terminal child Task новое уточнение создаёт новую Task.
 
@@ -52,15 +52,13 @@ Primary agent при создании сабагента MUST передать �
 ```json
 {
   "instruction": "Проверь миграции базы и верни риски",
-  "tools": ["core.terminal.exec"],
+  "tools": ["core_terminal_exec", "core_memory_search", "repo_search"],
   "skills": ["database-review"],
-  "mcp": {
-    "repo": ["search"],
-    "memory": ["search", "read", "update"]
-  },
   "budget": {"turns": 20, "tool_calls": 40}
 }
 ```
+
+`tools` является одним списком канонических имён и содержит и built-ins, и MCP-тулы. Отдельного аргумента для MCP не существует. Модель видит один плоский каталог, поэтому просить её разложить его обратно на два аргумента — второй с ключами по серверам и короткими именами, которых в каталоге не было, — значит требовать знания, которым обладает только runtime. Runtime и раскладывает: соответствие имени паре `(сервер, tool)` у него уже есть.
 
 Parent делегирует coherent outcome, а не заранее придуманный список механических шагов. Instruction задаёт objective, только необходимый context, scope boundaries, deliverable, acceptance criteria и важные constraints/reserved actions. Конкретную процедуру следует предписывать только там, где она обязательна для safety, correctness, reproducibility или policy compliance.
 
@@ -71,7 +69,7 @@ Child MAY разрешить небольшую безопасную неодн�
 Требования:
 
 - `instruction` содержит один coherent outcome, scope, deliverable, constraints и success criteria без необязательного пошагового плана;
-- `tools`, `skills` и server-scoped `mcp` являются allowlists, а не рекомендациями;
+- `tools` и `skills` являются allowlists, а не рекомендациями;
 - `budget` содержит только положительные integer-поля `turns` и/или `tool_calls`; aliases вроде `max_steps` запрещены schema;
 - optional `background` является boolean и по умолчанию равен `false`;
 - каждый элемент MUST входить в capability set parent-а;
@@ -86,7 +84,9 @@ Child MAY разрешить небольшую безопасную неодн�
 
 Delegation contract решает, **какие** tools получит child. Runtime обязан обеспечить, чтобы каждый выданный tool был работоспособен.
 
-Child MUST получать те же runtime-сервисы, что и parent, для любой делегированной capability: artifact service, реестр удалённых агентов, MCP-серверы и skills из конфигурации. Tool, попавший в каталог child-а, но отказывающий `CAPABILITY_DISABLED` при вызове, является рекламой без реализации: модель тратит turn на заведомо неисполнимый вызов, а parent получает непрозрачный сбой вместо результата.
+Child MUST получать те же runtime-сервисы, что и parent, для любой делегированной capability: artifact service, подсистема памяти, реестр удалённых агентов, MCP-серверы и skills из конфигурации. Tool, попавший в каталог child-а, но отказывающий `CAPABILITY_DISABLED` при вызове, является рекламой без реализации: модель тратит turn на заведомо неисполнимый вызов, а parent получает непрозрачный сбой вместо результата.
+
+Отказ contract-а MUST называть отклонённую capability поимённо: конкретный tool, skill или превышенный лимит бюджета, и MUST перечислять то, чем parent располагает. Код без имени не говорит, что исправлять, а перечень доступного превращает отказ в исполнимую подсказку. Разбор contract-а и отказ MUST выполняться в одном месте: правило проверяется и на входе delegate tool, и при выводе capability set child-а, и две копии одного правила расходятся.
 
 Наследование сервисов MUST NOT расширять права. Сужение остаётся за AgentConfig child-а и delegation allowlist: child видит только перечисленные parent-ом tools, MCP-серверы и skills, а depth-лимит применяется независимо.
 
@@ -98,37 +98,37 @@ Child наследует `app_name`, `user_id` и `session_id` parent-а, поэ
 
 ### Удалённые агенты
 
-Child получает тот же реестр `REMOTE_AGENTS`, что и parent, но `core.agent.send_message` появляется в его каталоге только если parent явно перечислил этот tool.
+Child получает тот же реестр `REMOTE_AGENTS`, что и parent, но `core_agent_send_message` появляется в его каталоге только если parent явно перечислил этот tool.
 
 Credentials вызывающей стороны MUST NOT наследоваться: заголовки, проброшенные в корневую Task, не доступны child-у, и downstream получает только `SEND_MESSAGE_API_KEY` развёртывания. Child является внутренним актором runtime-а, и углублять распространение пользовательского токена по цепочке делегирования без явного решения нельзя.
 
 ## Глубина делегирования
 
-Main agent имеет depth `0`, созданный им child — depth `1`, а child этого агента — depth `2`. V1 разрешает оба уровня сабагентов, но depth `2` является hard platform maximum. При создании агента depth `2` runtime MUST удалить `core.delegate` из его effective tool allowlist и model catalog, отключить delegation feature и добавить protected KernelInstructions о необходимости выполнить задачу без дальнейшего делегирования. Persisted child contract отражает уже суженный effective набор tools.
+Main agent имеет depth `0`, созданный им child — depth `1`, а child этого агента — depth `2`. V1 разрешает оба уровня сабагентов, но depth `2` является hard platform maximum. При создании агента depth `2` runtime MUST удалить `core_delegate` из его effective tool allowlist и model catalog, отключить delegation feature и добавить protected KernelInstructions о необходимости выполнить задачу без дальнейшего делегирования. Persisted child contract отражает уже суженный effective набор tools.
 
-Модель depth `2` не должна тратить turn на заведомо запрещённый вызов. Runtime guard всё равно MUST отклонять stale/replayed `core.delegate` с `BUDGET_EXCEEDED` до создания Task.
+Модель depth `2` не должна тратить turn на заведомо запрещённый вызов. Runtime guard всё равно MUST отклонять stale/replayed `core_delegate` с `BUDGET_EXCEEDED` до создания Task.
 
 AgentConfig MAY понизить maximum depth до `0` или `1`, но не может повысить его выше `2`. Этот предел применяется ко всей цепочке и сохраняется в child EffectiveConfig; delegation contract не может его расширить.
 
 ## Общая память
 
-Core Agent не имеет собственной общей memory. Main и child разделяют память, только если parent явно перечислил в delegation contract тот же Memory MCP server и namespace:
+Память Core Agent не становится общей сама по себе. Main и child разделяют память, только если parent явно перечислил в delegation contract `core_memory_*` tools:
 
 - child получает только перечисленные memory tools;
-- чтение видит committed revision Memory Service;
-- запись использует expected file/repository revision;
-- successful commit запускает indexing/NER внутри Memory Service;
-- service revision notification становится доступна parent через MCP/event bridge;
+- чтение видит последнюю опубликованную revision;
+- запись использует `expected_revision` документа;
+- successful commit публикует новую revision вместе с indexing и NER;
+- child наследует ту же тройку scope, поэтому его commit виден parent-у следующим `core_memory_search`;
 - conflict не разрешается last-write-wins;
-- если Memory MCP не передан или AgentConfig memory disabled, child работает без memory.
+- если ни один memory tool не делегирован или AgentConfig memory disabled, child работает без памяти.
 
 Working scratchpad и незавершённый model context не являются общей памятью. Child возвращает результат обычным model response; долговечное общее знание появляется только через явно делегированный committed memory change.
 
-В этой спецификации «сабагент» означает managed child Core Agent Task. Произвольный внешний opaque A2A peer не получает Memory MCP credentials автоматически: parent передаёт ему только явно выбранные Message Parts/Artifacts и принимает результат как недоверенный внешний input.
+В этой спецификации «сабагент» означает managed child Core Agent Task. Произвольный внешний opaque A2A peer не получает доступа к памяти автоматически: parent передаёт ему только явно выбранные Message Parts/Artifacts и принимает результат как недоверенный внешний input.
 
 ## Удалённые A2A-агенты
 
-`core.delegate` создаёт managed child внутри этого runtime. `core.agent.send_message` делегирует задачу внешнему A2A-агенту, который выполняется под собственной policy и не является частью доверенной execution domain.
+`core_delegate` создаёт managed child внутри этого runtime. `core_agent_send_message` делегирует задачу внешнему A2A-агенту, который выполняется под собственной policy и не является частью доверенной execution domain.
 
 ### Реестр
 
@@ -138,7 +138,7 @@ Working scratchpad и незавершённый model context не являют
 - недоступный или невалидный агент MUST быть пропущен с записанной причиной и MUST NOT ронять startup;
 - имя берётся из карточки; при пустом имени используется сегмент пути после `a2a`, иначе `remote_agent_{N}` по порядку в списке;
 - при коллизии имён вторая и последующие записи пропускаются;
-- если ни один агент не подключился, `core.agent.send_message` MUST быть удалён из Agent Card и model catalog. Агент никогда не рекламирует делегирование, которому некуда делегировать.
+- если ни один агент не подключился, `core_agent_send_message` MUST быть удалён из Agent Card и model catalog. Агент никогда не рекламирует делегирование, которому некуда делегировать.
 
 Model-facing description tool-а перечисляет подключённых агентов с их описанием и первыми тремя skills, чтобы модель выбирала адресата по назначению, а не угадывала имя.
 
@@ -174,7 +174,7 @@ Tool возвращает модели объект:
 
 Любой сбой — недоступность, protocol error, ошибка удалённого агента — MUST возвращаться как обычный tool result с `success: false` и безопасным описанием и MUST NOT переводить корневую Task в `failed`.
 
-Ответ удалённого агента является недоверенными внешними данными: он не становится инструкцией, не даёт capability и не может быть запущен как фоновая работа через `core.task.start`. Соответствующая kernel-инструкция предписывает модели передавать запрос пользователя без изменений, слать одну сфокусированную задачу за вызов, явно называть агента при нескольких сконфигурированных, дожидаться ответа вместо повторного вызова и честно сообщать о неудаче вместо выдумывания ответа.
+Ответ удалённого агента является недоверенными внешними данными: он не становится инструкцией, не даёт capability и не может быть запущен как фоновая работа через `core_task_start`. Соответствующая kernel-инструкция предписывает модели передавать запрос пользователя без изменений, слать одну сфокусированную задачу за вызов, явно называть агента при нескольких сконфигурированных, дожидаться ответа вместо повторного вызова и честно сообщать о неудаче вместо выдумывания ответа.
 
 ## TerminalSession сабагента
 

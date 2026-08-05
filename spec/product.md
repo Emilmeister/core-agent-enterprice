@@ -28,7 +28,7 @@ Core Agent MUST владеть следующими обязанностями:
 - обнаружение, загрузка и применение skills;
 - регистрация, валидация и исполнение встроенных и MCP-инструментов;
 - ограничение вывода инструментов;
-- подключение отдельного Memory MCP Service с Markdown, graph/NER и hybrid retrieval;
+- ведение долговременной памяти с Markdown, graph/NER и hybrid retrieval;
 - фоновые Tasks, passive wait и делегирование сабагентам;
 - локальные TerminalSessions с отдельными PTY/process groups/workspaces для main и сабагентов;
 - A2A communication и OpenTelemetry observability;
@@ -77,7 +77,7 @@ Core Agent MUST владеть следующими обязанностями:
 
 ### Stateful session
 
-Последовательность запусков с общей A2A history и artifacts. Долговременная session memory существует только через переданный и разрешённый Memory MCP. Тело каждого запуска остаётся `prompt + mcp + skills`.
+Последовательность запусков с общей A2A history и artifacts. Долговременная session memory существует через built-in `core_memory_*` tools, если AgentConfig их не отключил. Тело каждого запуска остаётся `prompt + mcp + skills`.
 
 ### Durable autonomous run
 
@@ -100,9 +100,9 @@ Core Agent MUST владеть следующими обязанностями:
 6. При заполнении контекста ядро выполняет compaction и продолжает задачу.
 7. Независимая долгая работа уходит в background Task; agent продолжает работу или пассивно ждёт notification.
 8. При необходимости ядро создаёт сабагента с узкой инструкцией и явными tool/MCP/skill allowlists.
-9. Если AgentConfig и Task подключили Memory MCP, main/child используют его общий namespace; сам Core Agent не хранит Markdown/graph/indexes.
+9. Если память включена, модель работает с ней через built-in `core_memory_*` tools; сабагент получает общую память только при явном делегировании этих tools.
 10. Runtime создаёт checkpoints до и после внешних side effects.
-11. Task завершается Artifact/Message либо типизированной ошибкой; подтверждённые Memory MCP commits фиксируются в audit по service revision без ложной cross-service atomicity.
+11. Task завершается Artifact/Message либо типизированной ошибкой; подтверждённые memory commits фиксируются в audit по repository revision.
 
 ## Метрики успеха продукта
 

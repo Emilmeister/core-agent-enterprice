@@ -15,7 +15,7 @@ Remote caller
                     |
               Policy/execution gate
      /   |   |   \
- Model Context Tool  Skill/MCP managers ---- Memory MCP Service
+ Model Context Tool  Skill/MCP managers   Memory subsystem
  router engine runtime      |
      \   |   |             /
        Durable tasks + event log + artifacts
@@ -55,7 +55,7 @@ Policy engine принимает нормализованный proposed action 
 
 ### Durable state
 
-Event log является источником истины для состояния A2A Task/run. Inbound Messages durable сохраняются до model delivery и дедуплицируются по `(task_id, message_id)`; inbox append и terminal transition сериализуются без потери подтверждённого input. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript и artifacts имеют независимые retention policies. Memory принадлежит отдельному MCP Service; Core сохраняет только использованные MCP results/provenance согласно Task retention.
+Event log является источником истины для состояния A2A Task/run. Inbound Messages durable сохраняются до model delivery и дедуплицируются по `(task_id, message_id)`; inbox append и terminal transition сериализуются без потери подтверждённого input. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript и artifacts имеют независимые retention policies. Память является подсистемой Core Agent и ведёт собственные revisions вне event log; Core сохраняет только использованные tool results/provenance согласно Task retention.
 
 Production adapter хранит A2A Tasks, event log, checkpoints, и append-only audit в PostgreSQL через один bounded pool. `DATABASE_URL` обязателен и берётся из deployment secret. Нет автоматического fallback на process memory/SQLite при database outage: startup/readiness fail closed, активные protected actions не исполняются. Test adapters не могут быть выбраны production configuration.
 
@@ -135,7 +135,7 @@ Adapters объявляют capabilities. Orchestrator MUST проверять �
 
 ## Multi-agent delegation
 
-Primary agent создаёт сабагента как неблокирующую A2A Task. Сабагент получает ту же kernel policy, но только явно перечисленные parent-ом рабочие tools, MCP capabilities и skills. Общая memory существует лишь когда delegation явно передаёт тот же Memory MCP/namespace. Полный contract описан в [Фоновых задачах и делегировании](tasks-and-delegation.md).
+Primary agent создаёт сабагента как неблокирующую A2A Task. Сабагент получает ту же kernel policy, но только явно перечисленные parent-ом рабочие tools, MCP capabilities и skills. Общая memory существует лишь когда delegation явно передаёт `core_memory_*` tools: child наследует ту же scope-тройку. Полный contract описан в [Фоновых задачах и делегировании](tasks-and-delegation.md).
 
 ## Dependency direction
 

@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 
 from .errors import CoreError
+from .mcp import mcp_tool_name
 
 # Advertised (binding, version) pairs; see core_agent/a2a.py for why they pair up.
 A2A_INTERFACES = (("HTTP+JSON", "1.0"), ("JSONRPC", "0.3"))
@@ -14,7 +15,7 @@ A2A_INTERFACES = (("HTTP+JSON", "1.0"), ("JSONRPC", "0.3"))
 
 MAX_SUBAGENT_DEPTH = 2
 RUNTIME_MODES = frozenset({"with_terminal", "without_terminal"})
-TERMINAL_MODE_TOOLS = frozenset({"core.terminal.exec", "core.task.start"})
+TERMINAL_MODE_TOOLS = frozenset({"core_terminal_exec", "core_task_start"})
 
 
 @dataclass(frozen=True)
@@ -164,17 +165,11 @@ def compile_effective_config(platform, agent, declared_mcp, discovered):
                 raise CoreError("CAPABILITY_DISABLED")
             warnings.append(Warning("CAPABILITY_FILTERED", feature))
 
+    # Feature values are a mix of booleans and mode strings, and "disabled" is a
+    # non-empty string: a truthiness test on the raw value would let a disabled
+    # capability through every gate below.
+    gates = {name: value not in (False, "disabled") for name, value in features.items()}
     memory_mode = features.get("memory", "disabled")
-    memory_servers = {
-        name
-        for name, declaration in requested_servers.items()
-        if declaration.get("role") == "memory"
-    }
-    memory = next((requested_servers[name] for name in memory_servers), None)
-    if memory_mode == "disabled" and memory and memory.get("required"):
-        raise CoreError("CAPABILITY_DISABLED")
-    if memory_mode == "required" and not memory:
-        raise CoreError("REQUIRED_CAPABILITY_MISSING")
 
     builtins = raw["tools"]["builtins"]
     choices = set(platform.allowed_builtin_tools)
@@ -192,18 +187,19 @@ def compile_effective_config(platform, agent, declared_mcp, discovered):
         allowed -= TERMINAL_MODE_TOOLS
 
     capability_for_prefix = {
-        "core.terminal.": "terminal",
-        "core.python.": "python",
-        "core.fs.": "filesystem_mutation",
-        "core.task.": "background_tasks",
-        "core.delegate": "delegation",
-        "core.artifact.": "artifacts",
-        "core.agent.": "remote_agents",
+        "core_terminal_": "terminal",
+        "core_python_": "python",
+        "core_fs_": "filesystem_mutation",
+        "core_task_": "background_tasks",
+        "core_delegate": "delegation",
+        "core_artifact_": "artifacts",
+        "core_agent_": "remote_agents",
+        "core_memory_": "memory",
     }
     allowed = {
         tool
         for tool in allowed
-        if features.get(
+        if gates.get(
             next(
                 (
                     feature
@@ -215,6 +211,10 @@ def compile_effective_config(platform, agent, declared_mcp, discovered):
             True,
         )
     }
+    if memory_mode == "required" and not any(
+        tool.startswith("core_memory_") for tool in allowed
+    ):
+        raise CoreError("REQUIRED_CAPABILITY_MISSING")
 
     mcp_tools = {}
     mcp_policy = raw["tools"]["mcp"]
@@ -224,10 +224,7 @@ def compile_effective_config(platform, agent, declared_mcp, discovered):
                 raise CoreError("CAPABILITY_DISABLED")
             warnings.append(Warning("CAPABILITY_FILTERED", server))
             continue
-        if server in memory_servers and memory_mode == "disabled":
-            warnings.append(Warning("CAPABILITY_FILTERED", "memory"))
-            continue
-        if not features.get("mcp", True):
+        if not gates.get("mcp", True):
             continue
         catalog = set(discovered.get(server, {}))
         explicit = set(mcp_policy.get("allow_tools", {}).get(server, []))
@@ -244,18 +241,18 @@ def compile_effective_config(platform, agent, declared_mcp, discovered):
         for feature, value in features.items()
         if value not in (False, "disabled") and feature in platform.supported_features
     }
-    if memory_mode == "disabled" or not (memory_servers & set(mcp_tools)):
+    if not any(tool.startswith("core_memory_") for tool in allowed):
         policies.discard("memory")
-    if "core.python.exec" not in allowed:
+    if "core_python_exec" not in allowed:
         policies.discard("python")
-    if not any(tool.startswith("core.artifact.") for tool in allowed):
+    if not any(tool.startswith("core_artifact_") for tool in allowed):
         policies.discard("artifacts")
-    if "core.agent.send_message" not in allowed:
+    if "core_agent_send_message" not in allowed:
         policies.discard("remote_agents")
 
     model_catalog = set(allowed)
     for server, tools in mcp_tools.items():
-        model_catalog.update(f"{server}.{tool}" for tool in tools)
+        model_catalog.update(mcp_tool_name(server, tool) for tool in tools)
     snapshot_value = {
         "builtin_tools": sorted(allowed),
         "mcp_tools": {key: sorted(value) for key, value in sorted(mcp_tools.items())},

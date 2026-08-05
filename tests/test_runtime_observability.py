@@ -1,13 +1,11 @@
 import json
 import os
 import copy
-import tempfile
 import time
 import unittest
 import threading
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
 from core_agent.audit import InMemoryAuditLog
 from core_agent.config import AgentConfig, PlatformConfig, RunRequest
@@ -35,7 +33,8 @@ from core_agent.tools import (
     ToolRuntime,
 )
 from core_agent.execution import ExecutionEnvironmentManager, ExecutionResult
-from memory_service.service import MemoryService
+from core_agent.memory import MemoryRegistry
+from core_agent.memory_store import InMemoryMemoryStore
 
 
 class IsolatedBackend:
@@ -66,13 +65,14 @@ class IsolatedBackend:
 def platform():
     return PlatformConfig(
         allowed_builtin_tools={
-            "core.terminal.exec",
-            "core.task.start",
-            "core.task.wait",
-            "core.delegate",
+            "core_terminal_exec",
+            "core_task_start",
+            "core_task_wait",
+            "core_delegate",
+            "core_memory_search",
         },
         denied_builtin_tools=set(),
-        allowed_mcp_servers={"memory"},
+        allowed_mcp_servers={"docs"},
         denied_mcp_tools={},
         allowed_skills=set(),
         supported_features={
@@ -89,7 +89,7 @@ def platform():
     )
 
 
-def agent_config(memory="optional", *, max_turns=10):
+def agent_config(memory="optional", *, max_turns=10, mcp=True):
     return AgentConfig.from_dict(
         {
             "schema_version": "v1alpha1",
@@ -101,21 +101,26 @@ def agent_config(memory="optional", *, max_turns=10):
                 "delegation": True,
                 "terminal": True,
                 "filesystem_mutation": False,
-                "mcp": True,
+                "mcp": mcp,
                 "skills": False,
                 "human_input": True,
             },
             "tools": {
                 "builtins": {
                     "default": "deny",
-                    "allow": ["core.terminal.exec", "core.task.*", "core.delegate"],
+                    "allow": [
+                        "core_terminal_exec",
+                        "core_task_*",
+                        "core_delegate",
+                        "core_memory_*",
+                    ],
                     "deny": [],
                 },
                 "mcp": {
                     "default": "deny",
-                    "allow_servers": ["memory"],
+                    "allow_servers": ["docs"],
                     "allow_tools": {
-                        "memory": ["search", "read", "create", "update", "split"]
+                        "docs": ["search", "read", "create", "update", "split"]
                     },
                 },
             },
@@ -131,11 +136,10 @@ def agent_config(memory="optional", *, max_turns=10):
     )
 
 
-MEMORY_MCP = {
-    "name": "memory",
-    "role": "memory",
+DOCS_MCP = {
+    "name": "docs",
     "required": False,
-    "transport": {"type": "streamable_http", "url": "https://memory.test/mcp"},
+    "transport": {"type": "streamable_http", "url": "https://docs.test/mcp"},
 }
 
 
@@ -148,7 +152,8 @@ def make_agent(
     model,
     *,
     memory="optional",
-    platform_mcp=(MEMORY_MCP,),
+    mcp=True,
+    platform_mcp=(DOCS_MCP,),
     connector=None,
     telemetry=None,
     max_turns=10,
@@ -157,7 +162,7 @@ def make_agent(
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
-            "core.terminal.exec",
+            "core_terminal_exec",
             "execute",
             {
                 "type": "object",
@@ -175,7 +180,7 @@ def make_agent(
     )
     return CoreAgent(
         platform_config=platform(),
-        agent_config=agent_config(memory, max_turns=max_turns),
+        agent_config=agent_config(memory, max_turns=max_turns, mcp=mcp),
         model=model,
         tool_runtime=tool_runtime,
         mcp_connector=connector or InMemoryMcpConnector(),
@@ -328,7 +333,7 @@ class RuntimeTests(unittest.TestCase):
                 ModelResponse(
                     tool_requests=(
                         ToolRequest(
-                            "call-1", "core.terminal.exec", {"argv": ["check"]}
+                            "call-1", "core_terminal_exec", {"argv": ["check"]}
                         ),
                     )
                 ),
@@ -359,7 +364,7 @@ class RuntimeTests(unittest.TestCase):
                 ModelResponse(
                     tool_requests=(
                         ToolRequest(
-                            "call-log", "core.terminal.exec", {"argv": ["check"]}
+                            "call-log", "core_terminal_exec", {"argv": ["check"]}
                         ),
                     ),
                     finish_reason="tool_calls",
@@ -462,7 +467,7 @@ class RuntimeTests(unittest.TestCase):
                     tool_requests=(
                         ToolRequest(
                             "call-1",
-                            "core.terminal.exec",
+                            "core_terminal_exec",
                             {"argv": ["echo && hello-tool-check && pwd"]},
                         ),
                     )
@@ -504,7 +509,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_provider_adapters_preserve_native_tool_call_and_result_messages(self):
         tools = {
-            "core.terminal.exec": {
+            "core_terminal_exec": {
                 "description": "execute",
                 "input_schema": {"type": "object"},
             }
@@ -517,7 +522,7 @@ class RuntimeTests(unittest.TestCase):
                     {
                         "id": "call-1",
                         "function": {
-                            "name": "core.terminal.exec",
+                            "name": "core_terminal_exec",
                             "arguments": {"argv": ["check"]},
                         },
                     }
@@ -526,7 +531,7 @@ class RuntimeTests(unittest.TestCase):
             {
                 "role": "tool",
                 "tool_call_id": "call-1",
-                "name": "core.terminal.exec",
+                "name": "core_terminal_exec",
                 "content": '{"status":"succeeded"}',
             },
         ]
@@ -535,10 +540,11 @@ class RuntimeTests(unittest.TestCase):
             "unused", "system", tools, messages=messages
         )
         self.assertEqual(set(reverse), {"core_terminal_exec"})
-        self.assertIn(
-            "Canonical tool name: core.terminal.exec",
-            body["tools"][0]["function"]["description"],
-        )
+        # Canonical names carry no dots, so the wire name is the canonical name
+        # and the description needs no note explaining a rename.
+        self.assertEqual(body["tools"][0]["function"]["name"], "core_terminal_exec")
+        self.assertEqual(body["tools"][0]["function"]["description"], "execute")
+        self.assertNotIn("Canonical tool name", body["tools"][0]["function"]["description"])
         self.assertEqual(
             [message["role"] for message in body["messages"]],
             ["system", "user", "assistant", "tool"],
@@ -556,7 +562,7 @@ class RuntimeTests(unittest.TestCase):
             },
             reverse,
         )
-        self.assertEqual(parsed.message, "Use core.terminal.exec.")
+        self.assertEqual(parsed.message, "Use core_terminal_exec.")
 
         anthropic = CompatibleHttpModel(api_format="anthropic", model="test")
         body, _headers, _reverse = anthropic._request(
@@ -571,7 +577,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_reasoning_effort_parsing_and_tool_replay_are_provider_native(self):
         tools = {
-            "core.terminal.exec": {
+            "core_terminal_exec": {
                 "description": "execute",
                 "input_schema": {"type": "object"},
             }
@@ -646,7 +652,7 @@ class RuntimeTests(unittest.TestCase):
                     {
                         "id": "call-1",
                         "function": {
-                            "name": "core.terminal.exec",
+                            "name": "core_terminal_exec",
                             "arguments": {"argv": ["check"]},
                         },
                     }
@@ -702,7 +708,7 @@ class RuntimeTests(unittest.TestCase):
                         {
                             "id": "call-2",
                             "function": {
-                                "name": "core.terminal.exec",
+                                "name": "core_terminal_exec",
                                 "arguments": {"argv": ["check"]},
                             },
                         }
@@ -744,7 +750,6 @@ class RuntimeTests(unittest.TestCase):
                 {
                     "instruction": "must not start",
                     "tools": [],
-                    "mcp": {},
                     "skills": [],
                     "budget": {"turns": 1, "tool_calls": 1},
                 },
@@ -771,7 +776,6 @@ class RuntimeTests(unittest.TestCase):
                 {
                     "instruction": "Return child result",
                     "tools": [],
-                    "mcp": {},
                     "skills": [],
                     "budget": {"turns": 2, "tool_calls": 1},
                 },
@@ -831,24 +835,148 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(notification_items), 1)
         self.assertIn("child-notification", notification_items[0].content)
 
-    def test_memory_disabled_never_connects_or_discovers_memory(self):
+    def test_disabled_mcp_feature_never_connects_or_discovers_a_server(self):
         connector = InMemoryMcpConnector(
-            catalogs={"memory": {"search": {"type": "object"}}},
-            results={"memory.search": {"results": [{"text": "secret memory"}]}},
+            catalogs={"docs": {"search": {"type": "object"}}},
+            results={"docs.search": {"results": [{"text": "secret document"}]}},
         )
         model = ScriptedModel([ModelResponse(message="done")])
-        agent = make_agent(model, memory="disabled", connector=connector)
-        result = agent.run(run_request(memory=True))
+        agent = make_agent(model, mcp=False, connector=connector)
+        result = agent.run(run_request())
         self.assertEqual(result.message, "done")
         self.assertEqual(connector.connections, ())
-        self.assertNotIn("memory.search", model.calls[0].tools)
-        self.assertNotIn("MEMORY", model.calls[0].instructions)
+        self.assertNotIn("docs_search", model.calls[0].tools)
         agent.close()
 
-    def test_memory_mcp_is_filtered_and_visible_only_when_enabled(self):
+    def test_content_logging_survives_a_tool_that_returns_a_bare_output(self):
+        """An MCP tool returns its output, not a ToolResult; both must log."""
+        connector = InMemoryMcpConnector(
+            catalogs={"docs": {"search": {"type": "object"}}},
+            results={"docs.search": {"results": [{"text": "leaderboard"}]}},
+        )
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest("call-1", "docs_search", {"query": "x"}),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(message="done", finish_reason="stop"),
+            ]
+        )
+        agent = make_agent(model, connector=connector, log_content=True)
+        try:
+            with self.assertLogs("core_agent.runtime", level="INFO") as captured:
+                result = agent.run(run_request())
+        finally:
+            agent.close()
+        self.assertEqual(result.message, "done")
+        completed = [
+            json.loads(record.getMessage())
+            for record in captured.records
+            if '"tool.completed"' in record.getMessage()
+        ]
+        self.assertEqual(completed[0]["output"], {"results": [{"text": "leaderboard"}]})
+
+    def test_a_tool_reporting_its_own_failure_is_not_a_successful_result(self):
+        """MCP answers a failed tool with 200 and isError, not with a transport error."""
+        connector = InMemoryMcpConnector(
+            catalogs={"docs": {"search": {"type": "object"}}},
+            results={
+                "docs.search": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": "upstream quota exceeded"}],
+                }
+            },
+        )
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest("call-1", "docs_search", {"query": "x"}),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(message="done", finish_reason="stop"),
+            ]
+        )
+        agent = make_agent(model, connector=connector, log_content=True)
+        try:
+            with self.assertLogs("core_agent.runtime", level="INFO") as captured:
+                result = agent.run(run_request())
+        finally:
+            agent.close()
+        # The run continues: a failed tool is the model's problem to solve.
+        self.assertEqual(result.message, "done")
+        failed = [
+            json.loads(record.getMessage())
+            for record in captured.records
+            if '"tool.failed"' in record.getMessage()
+        ]
+        self.assertEqual(failed[0]["error_code"], "TOOL_EXECUTION_FAILED")
+        # The server's own text reaches the model instead of being dressed as data.
+        self.assertIn("quota exceeded", json.dumps(failed[0]["output"]))
+
+    def test_delegate_schema_names_the_capabilities_this_run_actually_has(self):
+        """A free string invites an identifier the parent cannot honour."""
+        connector = InMemoryMcpConnector(
+            catalogs={"docs": {"search": {"type": "object"}, "read": {"type": "object"}}}
+        )
+        model = ScriptedModel([ModelResponse(message="done")])
+        agent = make_agent(model, connector=connector)
+        registered = {
+            "type": "object",
+            "properties": {
+                "tools": {"type": "array", "items": {"type": "string"}},
+                "skills": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["tools", "skills"],
+        }
+        agent.tool_runtime.registry.register(
+            ToolDefinition(
+                "core_delegate",
+                "delegate",
+                registered,
+                mutating=False,
+                risk_tags=frozenset(),
+            )
+        )
+        try:
+            effective = agent._resolve_capabilities(run_request())[2]
+            catalog = agent._tool_catalog(effective, {"docs": connector.catalogs["docs"]})
+        finally:
+            agent.close()
+        schema = catalog["core_delegate"]["input_schema"]
+        # One list, holding both kinds of tool under the names the catalogue
+        # uses — there is nothing left for the model to sort by hand.
+        self.assertEqual(
+            schema["properties"]["tools"]["items"]["enum"],
+            sorted(effective.model_tool_catalog),
+        )
+        self.assertIn("core_terminal_exec", schema["properties"]["tools"]["items"]["enum"])
+        self.assertIn("docs_search", schema["properties"]["tools"]["items"]["enum"])
+        self.assertNotIn("mcp", schema["properties"])
+        # The registered schema is untouched: the enum belongs to this run.
+        self.assertEqual(registered["properties"]["tools"]["items"], {"type": "string"})
+
+    def test_a_dotted_mcp_name_resolves_to_its_own_server(self):
+        """Splitting the canonical name on a dot would name the wrong server."""
+        from core_agent.mcp import mcp_tool_index, mcp_tool_name
+
+        self.assertEqual(mcp_tool_name("docs.eu", "search.v1"), "docs_eu_search_v1")
+        index = mcp_tool_index({"docs.eu": frozenset({"search.v1"})})
+        self.assertEqual(index["docs_eu_search_v1"], ("docs.eu", "search.v1"))
+        # Two different pairs that would share a name are a collision, not a
+        # silent overwrite that sends the call to the wrong server.
+        with self.assertRaises(CoreError) as caught:
+            mcp_tool_index({"a.b": frozenset({"c"}), "a": frozenset({"b_c"})})
+        self.assertEqual(caught.exception.code, "TOOL_NAME_COLLISION")
+
+    def test_mcp_server_is_filtered_to_the_tools_the_agent_allows(self):
         connector = InMemoryMcpConnector(
             catalogs={
-                "memory": {
+                "docs": {
                     "search": {"type": "object"},
                     "read": {"type": "object"},
                     "delete": {"type": "object"},
@@ -857,11 +985,11 @@ class RuntimeTests(unittest.TestCase):
         )
         model = ScriptedModel([ModelResponse(message="done")])
         agent = make_agent(model, connector=connector)
-        agent.run(run_request(memory=True))
-        self.assertEqual(connector.connections, ("memory",))
-        self.assertIn("memory.search", model.calls[0].tools)
-        self.assertIn("memory.read", model.calls[0].tools)
-        self.assertNotIn("memory.delete", model.calls[0].tools)
+        agent.run(run_request())
+        self.assertEqual(connector.connections, ("docs",))
+        self.assertIn("docs_search", model.calls[0].tools)
+        self.assertIn("docs_read", model.calls[0].tools)
+        self.assertNotIn("docs_delete", model.calls[0].tools)
         agent.close()
 
     def test_protected_kernel_is_compiled_persisted_and_cannot_be_replaced_by_profile(
@@ -892,13 +1020,13 @@ class RuntimeTests(unittest.TestCase):
 
     def test_runtime_compacts_twice_and_keeps_prompt_and_full_transcript(self):
         connector = InMemoryMcpConnector(
-            catalogs={"memory": {"search": {"type": "object"}}},
-            results={"memory.search": {"blob": "x" * 3_000}},
+            catalogs={"docs": {"search": {"type": "object"}}},
+            results={"docs.search": {"blob": "x" * 3_000}},
         )
         model = ScriptedModel(
             [
                 ModelResponse(
-                    tool_requests=(ToolRequest(f"call-{index}", "memory.search", {}),)
+                    tool_requests=(ToolRequest(f"call-{index}", "docs_search", {}),)
                 )
                 for index in range(2)
             ]
@@ -982,7 +1110,7 @@ class ObservabilityTests(unittest.TestCase):
                 ModelResponse(
                     tool_requests=(
                         ToolRequest(
-                            "call-1", "core.terminal.exec", {"argv": ["check"]}
+                            "call-1", "core_terminal_exec", {"argv": ["check"]}
                         ),
                     ),
                     prompt_tokens=40,
@@ -1035,12 +1163,12 @@ class ObservabilityTests(unittest.TestCase):
             for key, value in first.attributes.items()
             if key.startswith("llm.tools.")
         ]
-        self.assertTrue(any("core.terminal.exec" in schema for schema in tool_schemas))
+        self.assertTrue(any("core_terminal_exec" in schema for schema in tool_schemas))
         self.assertEqual(
             first.attributes[
                 "llm.output_messages.0.message.tool_calls.0.tool_call.function.name"
             ],
-            "core.terminal.exec",
+            "core_terminal_exec",
         )
         self.assertEqual(first.attributes["llm.token_count.total"], 46)
         reasoning_prefix = (
@@ -1071,7 +1199,7 @@ class ObservabilityTests(unittest.TestCase):
             span for span in exporter.spans if span.name == "core_agent.tool.execute"
         )
         self.assertEqual(tool_span.attributes["openinference.span.kind"], "TOOL")
-        self.assertEqual(tool_span.attributes["tool.name"], "core.terminal.exec")
+        self.assertEqual(tool_span.attributes["tool.name"], "core_terminal_exec")
         self.assertIn('"check"', tool_span.attributes["input.value"])
         self.assertIn("tool-ok", tool_span.attributes["output.value"])
         self.assertEqual(tool_span.status_code, "OK")
@@ -1206,8 +1334,11 @@ class ObservabilityTests(unittest.TestCase):
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_port}"
         telemetry = Telemetry.otlp(
-            endpoint=f"http://127.0.0.1:{server.server_port}",
+            trace_endpoint=f"{base}/v1/traces",
+            metric_endpoint=f"{base}/v1/metrics",
+            log_endpoint=f"{base}/v1/logs",
             service_name="collector-integration-test",
         )
         try:
@@ -1276,42 +1407,42 @@ class ObservabilityTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(Telemetry.otlp_from_env())
 
-    def test_memory_service_continues_core_mcp_trace_and_owns_internal_spans(self):
+    def test_memory_subsystem_owns_in_process_spans_on_the_caller_trace(self):
+        class FixedEmbeddings:
+            version = "fixed-v1"
+
+            def embed(self, text):
+                return (1.0, float(len(text)))
+
         exporter = RecordingExporter()
         telemetry = Telemetry(exporter)
-        with tempfile.TemporaryDirectory() as temp:
-            service = MemoryService(Path(temp), telemetry=telemetry)
-            service.search("bootstrap", namespace="session/context-1")
-            content = (
-                "---\nid: mem-1\ntitle: One\nnamespace: session/context-1\nkind: fact\n"
-                "status: active\ncreated_at: now\nupdated_at: now\nsources: []\n---\nAlice knows Bob.\n"
+        registry = MemoryRegistry(
+            InMemoryMemoryStore(),
+            embedding_provider=FixedEmbeddings(),
+            telemetry=telemetry,
+        )
+        service = registry.service("runtime-test", "user-42")
+        with telemetry.span("core_agent.tool.execute") as caller_span:
+            service.create(
+                title="One", body="Alice knows Bob.", namespace="session/context-1"
             )
-            with telemetry.span(
-                "mcp.client", attributes={"mcp.server": "memory"}
-            ) as client_span:
-                carrier = {}
-                telemetry.inject(client_span.context, carrier)
-                service.create("session/one.md", content, 0, trace_carrier=carrier)
-            names = [span.name for span in exporter.spans]
-            self.assertIn("mcp.client", names)
-            self.assertIn("memory_service.mcp.request", names)
-            self.assertIn("memory_service.ner", names)
-            self.assertIn("memory_service.index_publish", names)
-            self.assertIn("memory_service.search.bm25", names)
-            self.assertIn("memory_service.search.vector", names)
-            self.assertIn("memory_service.search.graph", names)
-            self.assertIn("memory_service.search.rerank", names)
-            core_internal = [
-                name for name in names if name.startswith("core_agent.memory.")
-            ]
-            self.assertEqual(core_internal, [])
-            memory_span = next(
-                span
-                for span in exporter.spans
-                if span.name == "memory_service.mcp.request"
-            )
-            self.assertEqual(memory_span.context.trace_id, client_span.context.trace_id)
-            service.close()
+            service.search("Alice", namespace="session/context-1")
+        names = [span.name for span in exporter.spans]
+        self.assertIn("core_agent.memory.embed", names)
+        self.assertIn("core_agent.memory.index_publish", names)
+        self.assertIn("core_agent.memory.search", names)
+        self.assertIn("core_agent.memory.search.bm25", names)
+        self.assertIn("core_agent.memory.search.vector", names)
+        self.assertIn("core_agent.memory.search.graph", names)
+        self.assertIn("core_agent.memory.search.rerank", names)
+        self.assertEqual(
+            [name for name in names if name.startswith("memory_service.")], []
+        )
+        search_span = next(
+            span for span in exporter.spans if span.name == "core_agent.memory.search"
+        )
+        self.assertEqual(search_span.context.trace_id, caller_span.context.trace_id)
+        registry.close()
 
 
 if __name__ == "__main__":

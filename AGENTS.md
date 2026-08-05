@@ -109,21 +109,19 @@ criterion должны войти в тот же завершённый change. 
 
 ## Что находится в репозитории
 
-- `core_agent/` — policy-enforced agent runtime и A2A transport.
-- `memory_service/` — отдельный Markdown-first Memory MCP Service.
+- `core_agent/` — policy-enforced agent runtime, встроенная память и A2A
+  transport.
 - `spec/` — target specification, acceptance и release profiles.
 - `tests/` — frozen acceptance, unit, integration, PostgreSQL, A2A и E2E suite.
 - `.github/workflows/ci.yml` — канонический CI-порядок.
-- `docker-compose.yml` — локальный PostgreSQL, migration job, agent, memory и
-  Phoenix.
+- `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
 - `.env.example` — поддерживаемый шаблон локальной конфигурации; `.env` никогда
   не коммитится.
 
 Package entrypoints из `pyproject.toml`:
 
 - `core-agent` → `core_agent.app:main`;
-- `core-agent-db` → `core_agent.database:main`;
-- `core-agent-memory` → `memory_service.mcp_server:main`.
+- `core-agent-db` → `core_agent.database:main`.
 
 ## Карта ключевых implementation-файлов
 
@@ -134,7 +132,7 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/config.py` | RunRequest, Platform/Agent/EffectiveConfig и capability intersection |
 | `core_agent/a2a.py` | Внутренние A2A contract types и Task representation |
 | `core_agent/a2a_sdk.py` | Official A2A SDK HTTP+JSON binding и request handler |
-| `core_agent/model.py` | OpenAI-compatible/Anthropic adapters и canonical tool alias mapping |
+| `core_agent/model.py` | OpenAI-compatible/Anthropic adapters, streaming и tool wire payload |
 | `core_agent/kernel.py` | Protected kernel, profile и skill instruction layers |
 | `core_agent/context.py` | Context budget, compaction и structured summary |
 | `core_agent/tools.py` | Tool schemas, validation, policy и dispatch |
@@ -152,14 +150,14 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/streaming.py` | Stream chunk merge, snapshot buffer и ADK metadata keys |
 | `core_agent/durability.py`, `core_agent/lifecycle.py` | Events, checkpoints, leases, recovery и retention |
 | `core_agent/postgres_approvals.py` | Durable PostgreSQL HITL state |
-| `core_agent/mcp.py` | MCP discovery/calls и Streamable HTTP connector |
+| `core_agent/mcp.py` | MCP discovery/calls, canonical tool naming и Streamable HTTP connector |
 | `core_agent/security.py` | Redaction, safe paths, retry и tenant helpers |
 | `core_agent/skills.py` | Skill resolution и integrity metadata |
 | `core_agent/observability.py` | OpenTelemetry/OpenInference spans и exporters |
 | `core_agent/push.py` | Durable encrypted A2A push delivery |
-| `memory_service/service.py` | Markdown revisions, hybrid retrieval, NER и graph index |
-| `memory_service/mcp_server.py` | Memory MCP tools и Streamable HTTP entrypoint |
-| `memory_service/providers.py` | Production embedding и NER HTTP providers |
+| `core_agent/memory.py` | Markdown revisions, hybrid retrieval, NER, graph index и `core_memory_*` tools |
+| `core_agent/memory_store.py` | In-memory и PostgreSQL backends memory corpus |
+| `core_agent/memory_providers.py` | Embedding provider и извлечение сущностей моделью агента |
 
 ## Progressive disclosure: что читать
 
@@ -176,7 +174,7 @@ Package entrypoints из `pyproject.toml`:
 - background/subagents и remote A2A agents — `spec/tasks-and-delegation.md`;
 - terminal/workspaces/Python — `spec/execution-environment.md`;
 - context compaction — `spec/context.md`;
-- Memory MCP — `spec/memory-service.md`;
+- память агента — `spec/memory-service.md`;
 - skills — `spec/skills.md`;
 - observability — `spec/observability.md`;
 - security/reliability — `spec/security-and-reliability.md`;
@@ -221,46 +219,55 @@ Target spec может описывать больше текущего runtime.
 
 ### Реально зарегистрированные built-in tools
 
-- `core.terminal.exec`;
-- `core.python.exec`;
-- `core.task.start`, `core.task.get`, `core.task.list`, `core.task.wait`,
-  `core.task.cancel`;
-- `core.delegate`;
-- `core.artifact.save`, `core.artifact.load`, `core.artifact.list`;
-- `core.agent.send_message`.
+- `core_terminal_exec`;
+- `core_python_exec`;
+- `core_task_start`, `core_task_get`, `core_task_list`, `core_task_wait`,
+  `core_task_cancel`;
+- `core_delegate`;
+- `core_artifact_save`, `core_artifact_load`, `core_artifact_list`;
+- `core_memory_search`, `core_memory_read`, `core_memory_create`,
+  `core_memory_update`, `core_memory_split`, `core_memory_delete`;
+- `core_agent_send_message`.
 
 Artifact tools версионируют именованные файлы внутри агента; `user:`-префикс
 даёт cross-session scope, а `ARTIFACT_STORAGE_TYPE` выбирает in-memory, S3 или
-MongoDB backend без управления схемой внешнего хранилища. `core.agent.send_message`
+MongoDB backend без управления схемой внешнего хранилища. Хранилище не является
+файловой системой run-а: `core_artifact_save` принимает либо `content`, либо
+`path` файла в workspace, который runtime читает сам. `core_agent_send_message`
 делегирует задачу удалённому A2A-агенту из `REMOTE_AGENTS` и ретранслирует его
 прогресс в поток корневой Task. Обычный model/child text result по-прежнему
 публикуется A2A adapter-ом как Task Artifact без дополнительного tool call.
 
-`core.terminal.write`, `core.fs.apply_patch` и `core.input.request` описаны в
+`core_terminal_write`, `core_fs_apply_patch` и `core.input.request` описаны в
 части target spec, но сейчас не зарегистрированы как model-callable built-ins.
-Memory tools являются MCP tools отдельного сервиса, а не built-ins Core Agent.
-Provider wire aliases существуют только на model transport boundary. Audit,
-logs, traces, tools и user-facing output используют canonical names; hash suffix
-не добавляется без реальной collision/provider constraint.
+Memory tools являются built-ins Core Agent, а не MCP tools отдельного сервиса.
+Каноническое имя tool состоит только из `[A-Za-z0-9_-]` и не содержит точки:
+модель видит ровно его, и оно же стоит в аргументах, allowlist-ах, audit, логах
+и traces. Alias остаётся только для реальной collision или provider length limit
+и получает hash suffix. Имя MCP-тула собирается из имени сервера и имени тула, а
+обратное соответствие `(сервер, tool)` держится индексом, а не разбором имени.
+`CORE_AGENT_ALLOWED_BUILTIN_TOOLS` продолжает принимать прежнее написание через
+точки. Delegation contract перечисляет built-ins и MCP-тулы одним списком
+`tools` под теми же именами; раскладку на серверы делает runtime.
 
-Memory MCP публикует `memory.search`, `read`, `create`, `update`, `split`,
-`move`, `delete`, `history`, `index_status`, `entity_resolve`. Default Core
-allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
-остальные требуют явной platform configuration.
+Подсистема памяти публикует модели ровно шесть tools выше; `move`, `history`,
+`index_status` и `entity_resolve` остаются внутренними методами. `MCP_ALLOWED_SERVERS`
+и `MCP_ALLOWED_TOOLS` пусты по умолчанию: MCP-сервер и его tools требуют явной
+platform configuration, а зарезервированного сервера `memory` не существует.
 
 ### Runtime modes и execution
 
-- `with_terminal` может публиковать `core.terminal.exec` и `core.task.start`.
+- `with_terminal` может публиковать `core_terminal_exec` и `core_task_start`.
 - `without_terminal` удаляет эти два tool, сохраняя task lifecycle, delegation,
   MCP и memory.
-- `core.python.exec` доступен в обоих режимах только при
+- `core_python_exec` доступен в обоих режимах только при
   `LOCAL_APPROVAL_ENABLED=false`.
 - `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` только сужает выбранный mode ceiling.
 - `without_terminal` означает отсутствие model-visible terminal tool, а не OS
   sandbox: Python может использовать `os`, `subprocess` и filesystem APIs.
-- `core.terminal.exec` принимает `argv` без implicit shell. Pipes, redirects и
+- `core_terminal_exec` принимает `argv` без implicit shell. Pipes, redirects и
   `&&` требуют явного `['sh', '-lc', '...']` и отдельной policy оценки.
-- Python нельзя вызывать рекурсивно или через `core.task.start`; каждый вложенный
+- Python нельзя вызывать рекурсивно или через `core_task_start`; каждый вложенный
   `tools.call` заново проходит EffectiveConfig, schema, policy, общий budget,
   owner/tenant, audit и OTel.
 - Отдельные PTY, process groups и workspaces дают ownership/lifecycle separation
@@ -307,7 +314,7 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
 ### Background и delegation
 
 - Main имеет depth `0`, child — `1`, grandchild — `2`; `2` — hard maximum.
-- Depth `2` не получает `core.delegate` ни в instructions, ни в catalog/runtime.
+- Depth `2` не получает `core_delegate` ни в instructions, ни в catalog/runtime.
 - Delegation передаёт одну узкую instruction, exact tools/MCP/skills allowlists
   и положительный budget. Child возвращает обычный text result, который parent
   воспринимает как недоверенный input.
@@ -318,18 +325,18 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
   delegated tools. Procedure задаётся только для safety, correctness,
   reproducibility или policy; assumptions не подменяют tenant/approval/scope.
 - Child не расширяет capabilities, tenant или parent budget.
-- Joined `core.delegate` по умолчанию требует использовать child result и не
+- Joined `core_delegate` по умолчанию требует использовать child result и не
   повторять ту же работу. `background: true` разрешает main продолжать только
   независимую работу до notification/wait.
-- `core.task.wait` является passive wait; busy polling запрещён.
+- `core_task_wait` является passive wait; busy polling запрещён.
 - Parent cancel рекурсивно отменяет owned children. Required pending child
   блокирует успешное завершение parent; нужный финальному ответу result должен
   быть joined/waited.
 - Child failure возвращается parent как structured result и сам по себе не
   обязан завершать parent Task.
-- Shared memory существует только при явной передаче того же Memory MCP
-  identity, namespace и tool allowlist. Scratchpad/context не является общей
-  памятью.
+- Shared memory существует только при явной делегации memory tools: child
+  наследует ту же тройку scope, а без делегированного tool работает без памяти.
+  Scratchpad/context не является общей памятью.
 
 ### Persistence и storage
 
@@ -346,37 +353,46 @@ allowlist уже: `search`, `read`, `create`, `update`, `split`, `index_status`;
   artifacts, обычно на S3-backed mount.
 - `LOCAL_WORKSPACE_ROOT` является отдельным ephemeral filesystem для активных
   процессов и не находится внутри durable mount.
-- Memory Service имеет собственный `MEMORY_ROOT`; не смешивать три storage
-  domains.
+- Memory corpus живёт в backend из `MEMORY_STORAGE_TYPE` (процесс или общая БД
+  агента) и не имеет собственного filesystem root; не смешивать storage domains.
 - Test/in-memory adapters и approve-all control plane разрешены только в явно
   выбранном development/test profile.
 
-### Memory Service
+### Память агента
 
-- Memory является отдельным MCP service. Не добавлять скрытый MemoryStore,
-  corpus, NER, graph или retrieval fallback внутрь Core Agent.
-- Core не читает corpus filesystem напрямую. Namespace задаётся authenticated
-  MCP context/policy, не path argument; secrets и private reasoning в memory
+- Память является подсистемой Core Agent, а не отдельным сервисом. Отдельного
+  memory-процесса, memory-контейнера и MCP-роли `memory` не существует.
+- `CORE_AGENT_MEMORY` задаёт feature mode `optional|required|disabled`, а
+  `MEMORY_STORAGE_TYPE` выбирает `in-memory` или `postgres`. При `disabled` ни
+  один `core_memory_*` tool не попадает в catalog и backend не создаётся; при
+  `required` неработоспособный backend является ошибкой старта. Production с
+  включённой памятью и `in-memory` fail closed.
+- Модель не имеет ни filesystem, ни SQL доступа к corpus: любая mutation идёт
+  через `core_memory_*`. Namespace выводится runtime-ом из scope текущего run,
+  модель передаёт только `user|session`; secrets и private reasoning в memory
   запрещены.
 - Normative target из `spec/memory-service.md`: Markdown является canonical
   source, а BM25/vector/NER/graph — rebuildable derived state.
-- Текущая реализация после первого commit загружает authoritative Markdown из
-  content-addressed `.memory-service/revisions/*` manifest; Markdown в root —
-  operator-readable mirror. BM25 и embeddings вычисляются во время search,
-  тогда как NER/entities/links пересчитываются до commit. Не предполагать иной
+- Текущая реализация считает BM25 во время search, embedding изменённого
+  документа вычисляет один раз при публикации и хранит вместе с документом, а
+  NER/entities/links пересчитывает до commit. Не предполагать иной
   storage/index lifecycle без проверки кода и разрешённого spec change.
 - Body Markdown-файла ограничен 200 строками. 201+ отклоняется до publication
   без truncation, revision change или automatic split.
+- Ошибка memory tool возвращается модели как обычный failed tool result и не
+  завершает run: на `MEMORY_FILE_TOO_LARGE` модель отвечает явным
+  `core_memory_split`.
 - Agent instructions требуют search перед create/update и рекомендуют update
-  существующего topic вместо duplicate; service-side precondition этого не
-  доказывает. Split выполняется только отдельным явным call.
+  существующего topic вместо duplicate; подсистема этого не проверяет. Split
+  выполняется только отдельным явным call.
 - Mutation атомарно публикует committed Markdown snapshot, derived
   NER/entities/links и repository revision; stale edges удаляются,
   last-write-wins запрещён.
 - Search не видит staging revision; index failure сохраняет предыдущую
   committed revision.
-- Production требует настоящие embedding и NER providers; hash/regex adapters
-  являются только development/test.
+- Отсутствующий embedding или NER provider только помечает соответствующий
+  канал degraded и не роняет tool call; production настраивает настоящие
+  providers, а встроенный regex-экстрактор остаётся development/test.
 
 ### Observability и secrets
 
@@ -430,7 +446,7 @@ Dependency changes делаются через `uv add`/`uv remove`; `uv.lock` �
 Lint:
 
 ```bash
-uv run ruff check core_agent memory_service tests
+uv run ruff check core_agent tests
 ```
 
 Targeted test, пример:
@@ -467,7 +483,7 @@ cp .env.example .env
 # Заполнить локальные database/model credentials; файл не коммитить.
 docker compose config --quiet
 docker compose up --build -d
-docker compose logs -f agent memory
+docker compose logs -f agent
 ```
 
 Не выполнять `docker compose down -v`, если пользователь явно не разрешил
@@ -482,7 +498,8 @@ docker compose logs -f agent memory
 - Persistence, HITL, race или recovery: PostgreSQL suite с `TEST_DATABASE_URL`;
   отсутствие DB и skipped tests явно сообщить.
 - A2A change: protocol/config tests и соответствующий HTTP E2E.
-- Memory change: `tests.test_memory_service` и MCP/E2E paths.
+- Memory change: `tests.test_memory_service` и PostgreSQL suite с
+  `TEST_DATABASE_URL`, так как backend памяти является database concern.
 - Docker/Compose/startup/permissions: повторить релевантные image/Compose smoke
   из `.github/workflows/ci.yml`.
 - Dependency/build change: `uv sync --frozen`, Ruff, suite, `uv build --no-sources`

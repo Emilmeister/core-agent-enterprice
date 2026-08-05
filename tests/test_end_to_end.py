@@ -1,5 +1,4 @@
 import asyncio
-import dataclasses
 import json
 import os
 import re
@@ -20,7 +19,6 @@ from a2a.utils.constants import TransportProtocol
 
 from core_agent.app import create_app
 from core_agent.model import CompatibleHttpModel
-from memory_service.service import MemoryService
 
 
 def _tool(body, internal_name, arguments):
@@ -84,7 +82,7 @@ class ModelHandler(BaseHTTPRequestHandler):
             else:
                 message = _tool(
                     body,
-                    "core.terminal.exec",
+                    "core_terminal_exec",
                     {
                         "argv": [
                             sys.executable,
@@ -99,7 +97,7 @@ class ModelHandler(BaseHTTPRequestHandler):
                 if '"status": "failed"' in context
                 else _tool(
                     body,
-                    "core.terminal.exec",
+                    "core_terminal_exec",
                     {"argv": ["echo && hello-tool-check && pwd"]},
                 )
             )
@@ -109,11 +107,10 @@ class ModelHandler(BaseHTTPRequestHandler):
                 if "TOOL_ARGUMENT_INVALID" in context
                 else _tool(
                     body,
-                    "core.delegate",
+                    "core_delegate",
                     {
                         "instruction": "invalid contract must return to parent",
-                        "tools": ["core.terminal.exec"],
-                        "mcp": {},
+                        "tools": ["core_terminal_exec"],
                         "skills": [],
                         "budget": {"turns": 3, "tool_calls": 1},
                         "result_schema": '{"type":"object"}',
@@ -125,14 +122,13 @@ class ModelHandler(BaseHTTPRequestHandler):
         elif "DELEGATE_JOIN_E2E" in context:
             if '"mode": "joined"' in context and "joined-child-result" in context:
                 message = _text("delegate-join-ok")
-            elif '"tool_name": "core.delegate"' not in context:
+            elif '"tool_name": "core_delegate"' not in context:
                 message = _tool(
                     body,
-                    "core.delegate",
+                    "core_delegate",
                     {
                         "instruction": "JOIN_CHILD_E2E: return the result as ordinary text",
                         "tools": [],
-                        "mcp": {},
                         "skills": [],
                         "budget": {"turns": 3, "tool_calls": 2},
                     },
@@ -159,11 +155,10 @@ class ModelHandler(BaseHTTPRequestHandler):
             if not task_ids:
                 message = _tool(
                     body,
-                    "core.delegate",
+                    "core_delegate",
                     {
                         "instruction": "DEPTH_TWO_CHILD_E2E",
-                        "tools": ["core.delegate"],
-                        "mcp": {},
+                        "tools": ["core_delegate"],
                         "skills": [],
                         "budget": {"turns": 2, "tool_calls": 1},
                     },
@@ -171,7 +166,7 @@ class ModelHandler(BaseHTTPRequestHandler):
             elif "depth-two-no-delegation-ok" not in context:
                 message = _tool(
                     body,
-                    "core.task.wait",
+                    "core_task_wait",
                     {"task_id": task_ids[-1], "timeout": 2},
                 )
             else:
@@ -181,11 +176,10 @@ class ModelHandler(BaseHTTPRequestHandler):
             if not task_ids:
                 message = _tool(
                     body,
-                    "core.delegate",
+                    "core_delegate",
                     {
                         "instruction": "DEPTH_ONE_CHILD_E2E",
-                        "tools": ["core.delegate", "core.task.wait"],
-                        "mcp": {},
+                        "tools": ["core_delegate", "core_task_wait"],
                         "skills": [],
                         "budget": {"turns": 4, "tool_calls": 3},
                     },
@@ -193,7 +187,7 @@ class ModelHandler(BaseHTTPRequestHandler):
             elif "depth-two-ok" not in context:
                 message = _tool(
                     body,
-                    "core.task.wait",
+                    "core_task_wait",
                     {"task_id": task_ids[-1], "timeout": 2},
                 )
             else:
@@ -203,10 +197,10 @@ class ModelHandler(BaseHTTPRequestHandler):
             message = (
                 _tool(
                     body,
-                    "memory.memory.search",
-                    {"query": "Alice Acme", "namespace": "session/e2e", "limit": 5},
+                    "core_memory_search",
+                    {"query": "Alice Acme", "limit": 5},
                 )
-                if '"memory_id": "mem-e2e"' not in context
+                if '"index_revision"' not in context
                 else _text("child-memory-ok")
             )
         elif "DELEGATE_MEMORY_E2E" in context:
@@ -214,11 +208,10 @@ class ModelHandler(BaseHTTPRequestHandler):
             if not task_ids:
                 message = _tool(
                     body,
-                    "core.delegate",
+                    "core_delegate",
                     {
                         "instruction": "CHILD_MEMORY_E2E: search shared memory",
-                        "tools": [],
-                        "mcp": {"memory": ["memory.search"]},
+                        "tools": ["core_memory_search"],
                         "skills": [],
                         "budget": {"turns": 4, "tool_calls": 2},
                     },
@@ -226,7 +219,7 @@ class ModelHandler(BaseHTTPRequestHandler):
             elif "child-memory-ok" not in context:
                 message = _tool(
                     body,
-                    "core.task.wait",
+                    "core_task_wait",
                     {"task_id": task_ids[-1], "timeout": 2},
                 )
             else:
@@ -234,22 +227,21 @@ class ModelHandler(BaseHTTPRequestHandler):
         elif "CHILD_E2E" in context:
             self.child_catalogs.append(wire_names)
             message = (
-                _tool(body, "core.terminal.exec", {"argv": ["pwd"]})
+                _tool(body, "core_terminal_exec", {"argv": ["pwd"]})
                 if "terminal_session_id" not in context
                 else _text(f"child-ok {self.workspaces[-1]}")
             )
         elif "DELEGATE_E2E" in context:
             task_ids = re.findall(r'"task_id": "([^"]+)"', context)
             if "terminal_session_id" not in context:
-                message = _tool(body, "core.terminal.exec", {"argv": ["pwd"]})
+                message = _tool(body, "core_terminal_exec", {"argv": ["pwd"]})
             elif not task_ids:
                 message = _tool(
                     body,
-                    "core.delegate",
+                    "core_delegate",
                     {
                         "instruction": "CHILD_E2E: run pwd and report the workspace",
-                        "tools": ["core.terminal.exec"],
-                        "mcp": {},
+                        "tools": ["core_terminal_exec"],
                         "skills": [],
                         "budget": {"turns": 4, "tool_calls": 2},
                     },
@@ -257,7 +249,7 @@ class ModelHandler(BaseHTTPRequestHandler):
             elif "child-ok" not in context:
                 message = _tool(
                     body,
-                    "core.task.wait",
+                    "core_task_wait",
                     {"task_id": task_ids[-1], "timeout": 2},
                 )
             else:
@@ -267,9 +259,9 @@ class ModelHandler(BaseHTTPRequestHandler):
             if not task_ids:
                 message = _tool(
                     body,
-                    "core.task.start",
+                    "core_task_start",
                     {
-                        "tool": "core.terminal.exec",
+                        "tool": "core_terminal_exec",
                         "arguments": {
                             "argv": [
                                 sys.executable,
@@ -281,41 +273,45 @@ class ModelHandler(BaseHTTPRequestHandler):
                     },
                 )
             elif len(task_ids) == 1:
-                message = _tool(body, "core.task.list", {})
+                message = _tool(body, "core_task_list", {})
             elif len(task_ids) == 2:
-                message = _tool(body, "core.task.get", {"task_id": task_ids[-1]})
+                message = _tool(body, "core_task_get", {"task_id": task_ids[-1]})
             elif len(task_ids) == 3:
                 message = _tool(
                     body,
-                    "core.task.wait",
+                    "core_task_wait",
                     {"task_id": task_ids[-1], "timeout": 2},
                 )
             else:
                 message = _text("background-e2e-ok")
         elif "MEMORY_E2E" in context:
-            if '"repository_revision": 2' not in context:
+            memory_ids = re.findall(r'"memory_id": "([^"]+)"', context)
+            if not memory_ids:
                 message = _tool(
                     body,
-                    "memory.memory.create",
+                    "core_memory_create",
                     {
-                        "path": "created.md",
-                        "content": _created_markdown(),
-                        "expected_repository_revision": 1,
+                        "title": "Bob and Beta",
+                        "body": "Bob founded Beta.",
+                        "kind": "fact",
                     },
                 )
-            elif '"memory_id": "mem-created"' not in context:
+            elif '"index_revision"' not in context:
                 message = _tool(
                     body,
-                    "memory.memory.search",
-                    {"query": "Bob Beta", "namespace": "session/e2e", "limit": 5},
+                    "core_memory_search",
+                    {"query": "Bob Beta", "limit": 5},
                 )
-            else:
+            elif memory_ids[1:] == memory_ids[:1]:
+                # The search returned exactly the note that create just wrote.
                 message = _text("<think>private memory reasoning</think>memory-e2e-ok")
+            else:
+                message = _text("memory-search-missed")
         else:
             message = (
                 _tool(
                     body,
-                    "core.terminal.exec",
+                    "core_terminal_exec",
                     {"argv": [sys.executable, "-c", "print('terminal-e2e-ok')"]},
                 )
                 if "terminal-e2e-ok" not in context
@@ -333,139 +329,19 @@ class ModelHandler(BaseHTTPRequestHandler):
         pass
 
 
-class MemoryMcpHandler(BaseHTTPRequestHandler):
-    service = None
-    trace_carriers = []
-
-    def do_POST(self):
-        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        self.trace_carriers.append(
-            {
-                "header": self.headers.get("traceparent"),
-                "meta": request.get("params", {}).get("_meta", {}).get("traceparent"),
-                "method": request["method"],
-            }
-        )
-        method = request["method"]
-        if method == "notifications/initialized":
-            self.send_response(202)
-            self.end_headers()
-            return
-        if method == "initialize":
-            result = {
-                "protocolVersion": request["params"]["protocolVersion"],
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "memory-e2e", "version": "1"},
-            }
-        elif method == "tools/list":
-            result = {
-                "tools": [
-                    {
-                        "name": "memory.search",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "query": {"type": "string"},
-                                "namespace": {"type": "string"},
-                                "limit": {"type": "integer"},
-                            },
-                            "required": ["query", "namespace"],
-                        },
-                    },
-                    {
-                        "name": "memory.create",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string"},
-                                "content": {"type": "string"},
-                                "expected_repository_revision": {"type": "integer"},
-                            },
-                            "required": [
-                                "path",
-                                "content",
-                                "expected_repository_revision",
-                            ],
-                        },
-                    },
-                ]
-            }
-        elif method == "tools/call":
-            arguments = request["params"]["arguments"]
-            if request["params"]["name"] == "memory.create":
-                result = dataclasses.asdict(
-                    self.service.create(
-                        arguments["path"],
-                        arguments["content"],
-                        arguments["expected_repository_revision"],
-                    )
-                )
-            else:
-                result = self.service.search(
-                    arguments["query"],
-                    namespace=arguments["namespace"],
-                    limit=arguments.get("limit", 10),
-                ).to_dict()
-        else:
-            self.send_error(400)
-            return
-        data = json.dumps(
-            {"jsonrpc": "2.0", "id": request["id"], "result": result}
-        ).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, *_args):
-        pass
-
-
-def _markdown():
-    return """---
-id: mem-e2e
-title: Alice and Acme
-namespace: session/e2e
-kind: fact
-status: active
-created_at: 2026-07-11T10:00:00Z
-updated_at: 2026-07-11T10:00:00Z
-sources:
-  - task_id: e2e
-    event_revision: 1
----
-Alice founded Acme.
-"""
-
-
-def _created_markdown():
-    return (
-        _markdown()
-        .replace("mem-e2e", "mem-created")
-        .replace("Alice and Acme", "Bob and Beta")
-        .replace("Alice founded Acme.", "Bob founded Beta.")
-    )
-
-
 class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
         root = Path(cls.temp.name)
-        cls.memory = MemoryService(root / "memory")
-        cls.memory.create("facts.md", _markdown(), expected_repository_revision=0)
         cls.skill = root / "e2e-skill"
         cls.skill.mkdir()
         (cls.skill / "SKILL.md").write_text(
             "---\nname: e2e-skill\ndescription: E2E skill\n---\nE2E_SKILL_MARKER\n",
             encoding="utf-8",
         )
-        MemoryMcpHandler.service = cls.memory
         cls.model_server = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
-        cls.mcp_server = ThreadingHTTPServer(("127.0.0.1", 0), MemoryMcpHandler)
-        for server in (cls.model_server, cls.mcp_server):
-            threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.model_server.serve_forever, daemon=True).start()
         cls.environment = patch.dict(
             os.environ,
             {
@@ -474,9 +350,8 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "CORE_AGENT_MAX_TOOL_CALLS": "10",
                 "CORE_AGENT_ALLOWED_SKILLS": "e2e-skill",
                 "SKILLS_ROOT": str(root),
-                "MCP_URL": (
-                    f"http://127.0.0.1:{cls.mcp_server.server_port}/memory"
-                ),
+                # Pins the memory scope so the test can address the same corpus.
+                "USER_ID": "e2e-user",
             },
         )
         cls.environment.start()
@@ -501,10 +376,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         cls.app.state.close()
         cls.approval_app.state.close()
         cls.model_server.shutdown()
-        cls.mcp_server.shutdown()
         cls.model_server.server_close()
-        cls.mcp_server.server_close()
-        cls.memory.close()
         cls.environment.stop()
         cls.temp.cleanup()
 
@@ -605,7 +477,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         ModelHandler.workspaces.clear()
         self.assertEqual(await self._send("DELEGATE_E2E"), "delegate-ok")
         self.assertTrue(ModelHandler.child_catalogs)
-        terminal_name = CompatibleHttpModel._wire_name("core.terminal.exec")
+        terminal_name = CompatibleHttpModel._wire_name("core_terminal_exec")
         self.assertTrue(
             all(catalog == {terminal_name} for catalog in ModelHandler.child_catalogs)
         )
@@ -620,7 +492,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         ModelHandler.depth_two_catalogs.clear()
         ModelHandler.depth_two_instructions.clear()
         self.assertEqual(await self._send("DEPTH_TWO_E2E"), "depth-two-e2e-ok")
-        delegate = CompatibleHttpModel._wire_name("core.delegate")
+        delegate = CompatibleHttpModel._wire_name("core_delegate")
         self.assertTrue(ModelHandler.depth_two_catalogs)
         self.assertTrue(
             all(delegate not in catalog for catalog in ModelHandler.depth_two_catalogs)
@@ -639,7 +511,8 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             await self._send("DELEGATE_MEMORY_E2E"),
             "delegate-memory-ok",
         )
-        memory_search = CompatibleHttpModel._wire_name("memory.memory.search")
+        memory_search = CompatibleHttpModel._wire_name("core_memory_search")
+        memory_create = CompatibleHttpModel._wire_name("core_memory_create")
         self.assertTrue(ModelHandler.child_memory_catalogs)
         self.assertTrue(
             all(
@@ -647,24 +520,32 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 for catalog in ModelHandler.child_memory_catalogs
             )
         )
+        # The memory tool the parent kept for itself never reaches the child.
+        self.assertTrue(
+            all(
+                memory_create not in catalog
+                for catalog in ModelHandler.child_memory_catalogs
+            )
+        )
 
-    async def test_memory_mcp_search_reaches_markdown_indexes_and_graph(self):
-        MemoryMcpHandler.trace_carriers.clear()
+    async def test_memory_search_reaches_markdown_indexes_and_graph(self):
         span_offset = len(self.app.state.telemetry.exporter.spans)
         self.assertEqual(
             await self._send("MEMORY_E2E"), "memory-e2e-ok"
         )
-        self.assertEqual(self.memory.graph_mentions("Bob"), ("mem-created",))
-        status = self.memory.index_status(self.memory.repository_revision)
-        self.assertTrue(all(value == "ready" for value in status.components.values()))
-        tool_calls = [
-            item
-            for item in MemoryMcpHandler.trace_carriers
-            if item["method"] == "tools/call"
-        ]
-        self.assertTrue(tool_calls)
-        self.assertTrue(all(item["header"] == item["meta"] for item in tool_calls))
-        self.assertTrue(all(item["header"].startswith("00-") for item in tool_calls))
+        agent = self.app.state.core_agent
+        memory = agent.memory_registry.service(
+            agent.agent_config.agent["name"], "e2e-user"
+        )
+        written = next(
+            memory_id
+            for memory_id, document in memory.list_documents().items()
+            if document.title == "Bob and Beta"
+        )
+        self.assertEqual(memory.graph_mentions("Bob"), (written,))
+        self.assertTrue(
+            all(value == "ready" for value in memory.index_status().values())
+        )
         spans = self.app.state.telemetry.exporter.spans[span_offset:]
         execution_span = next(
             span for span in spans if span.name == "core_agent.task.execute"
@@ -686,7 +567,8 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "gen_ai.chat",
                 "core_agent.tool.execute",
                 "core_agent.task.checkpoint",
-                "mcp.client",
+                "core_agent.memory.index_publish",
+                "core_agent.memory.search",
             }
             <= names
         )

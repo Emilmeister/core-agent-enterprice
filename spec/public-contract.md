@@ -78,24 +78,22 @@ MCP connection descriptors принадлежат конфигурации ра�
 - descriptor проходит allowlist до подключения;
 - stdio MCP запускается как owned process в TerminalSession текущего agent-а;
 - catalog фиксируется snapshot-ом; notification меняет revision только на safe boundary;
-- ошибка `required: true` завершает Task, optional descriptor создаёт наблюдаемый warning;
-- при memory disabled memory-descriptor не попадает в effective catalog.
+- ошибка `required: true` завершает Task, optional descriptor создаёт наблюдаемый warning.
 
-Memory передаётся обычным MCP descriptor с host-validated role:
+Optional server объявляется тем же descriptor с `required: false`:
 
 ```json
 {
-  "name": "memory",
-  "role": "memory",
+  "name": "docs-search",
   "required": false,
   "transport": {
     "type": "streamable_http",
-    "url": "https://memory.example.test/mcp"
+    "url": "https://docs.example.test/mcp"
   }
 }
 ```
 
-`role` не делает server доверенным сама по себе. PlatformConfig/AgentConfig должны подтвердить identity/target. При memory disabled descriptor не попадает в effective catalog: `required: true` завершает validation с `CAPABILITY_DISABLED`, optional descriptor создаёт наблюдаемый filtered-capability warning.
+Объявление само по себе не делает server доверенным. PlatformConfig/AgentConfig должны подтвердить identity/target. Отфильтрованный конфигурацией descriptor не попадает в effective catalog: `required: true` завершает validation с `CAPABILITY_DISABLED`, optional descriptor создаёт наблюдаемый filtered-capability warning.
 
 ## `skills`
 
@@ -154,7 +152,7 @@ User-facing progress и requests передаются Messages/Task status. Crit
 ## Cancellation и passive wait
 
 - Внешняя отмена использует A2A cancel Task operation.
-- Внутренний agent может вызвать `core.task.cancel` для child/background Task.
+- Внутренний agent может вызвать `core_task_cancel` для child/background Task.
 - Passive wait не создаёт внешней terminal state: Task остаётся `working`, status metadata сообщает `waiting_task`.
 - Task, ожидающая notification, не удерживает model worker, active terminal process или busy loop.
 

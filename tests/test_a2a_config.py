@@ -26,19 +26,25 @@ from core_agent.errors import CoreError
 def platform_config(**changes):
     values = {
         "allowed_builtin_tools": {
-            "core.terminal.exec",
-            "core.python.exec",
-            "core.terminal.write",
-            "core.fs.apply_patch",
-            "core.task.start",
-            "core.task.get",
-            "core.task.list",
-            "core.task.wait",
-            "core.task.cancel",
-            "core.delegate",
+            "core_terminal_exec",
+            "core_python_exec",
+            "core_terminal_write",
+            "core_fs_apply_patch",
+            "core_task_start",
+            "core_task_get",
+            "core_task_list",
+            "core_task_wait",
+            "core_task_cancel",
+            "core_delegate",
+            "core_memory_search",
+            "core_memory_read",
+            "core_memory_create",
+            "core_memory_update",
+            "core_memory_split",
+            "core_memory_delete",
         },
         "denied_builtin_tools": set(),
-        "allowed_mcp_servers": {"repo", "memory"},
+        "allowed_mcp_servers": {"repo", "docs"},
         "denied_mcp_tools": {"repo": {"delete_repository"}},
         "allowed_skills": {"database-review", "release-notes"},
         "supported_features": {
@@ -78,20 +84,21 @@ def agent_config(**changes):
             "builtins": {
                 "default": "deny",
                 "allow": [
-                    "core.terminal.exec",
-                    "core.python.exec",
-                    "core.fs.apply_patch",
-                    "core.task.*",
-                    "core.delegate",
+                    "core_terminal_exec",
+                    "core_python_exec",
+                    "core_fs_apply_patch",
+                    "core_task_*",
+                    "core_delegate",
+                    "core_memory_*",
                 ],
                 "deny": [],
             },
             "mcp": {
                 "default": "deny",
-                "allow_servers": ["repo", "memory"],
+                "allow_servers": ["repo", "docs"],
                 "allow_tools": {
                     "repo": ["search", "read_file", "delete_repository"],
-                    "memory": ["search", "read", "create", "update", "split"],
+                    "docs": ["search", "read", "create", "update", "split"],
                 },
             },
         },
@@ -108,7 +115,7 @@ def agent_config(**changes):
     return AgentConfig.from_dict(raw)
 
 
-def declared_mcp(*, memory_required=False, extra_mcp=()):
+def declared_mcp(*, extra_mcp=()):
     """MCP servers are deployment configuration, no longer a request field."""
     return [
         {
@@ -118,10 +125,10 @@ def declared_mcp(*, memory_required=False, extra_mcp=()):
             "transport": {"type": "streamable_http", "url": "https://repo.test/mcp"},
         },
         {
-            "name": "memory",
-            "role": "memory",
-            "required": memory_required,
-            "transport": {"type": "streamable_http", "url": "https://memory.test/mcp"},
+            "name": "docs",
+            "role": "documentation",
+            "required": False,
+            "transport": {"type": "streamable_http", "url": "https://docs.test/mcp"},
         },
         *extra_mcp,
     ]
@@ -137,7 +144,7 @@ DISCOVERED = {
         "read_file": {"type": "object"},
         "delete_repository": {"type": "object"},
     },
-    "memory": {
+    "docs": {
         "search": {"type": "object"},
         "read": {"type": "object"},
         "create": {"type": "object"},
@@ -226,15 +233,21 @@ class ConfigurationTests(unittest.TestCase):
             effective.builtin_tools,
             frozenset(
                 {
-                    "core.terminal.exec",
-                    "core.python.exec",
-                    "core.fs.apply_patch",
-                    "core.task.start",
-                    "core.task.get",
-                    "core.task.list",
-                    "core.task.wait",
-                    "core.task.cancel",
-                    "core.delegate",
+                    "core_terminal_exec",
+                    "core_python_exec",
+                    "core_fs_apply_patch",
+                    "core_task_start",
+                    "core_task_get",
+                    "core_task_list",
+                    "core_task_wait",
+                    "core_task_cancel",
+                    "core_delegate",
+                    "core_memory_search",
+                    "core_memory_read",
+                    "core_memory_create",
+                    "core_memory_update",
+                    "core_memory_split",
+                    "core_memory_delete",
                 }
             ),
         )
@@ -242,44 +255,74 @@ class ConfigurationTests(unittest.TestCase):
             effective.mcp_tools["repo"], frozenset({"search", "read_file"})
         )
         self.assertEqual(
-            effective.mcp_tools["memory"],
+            effective.mcp_tools["docs"],
             frozenset({"search", "read", "create", "update", "split"}),
         )
         self.assertEqual(effective.skills, frozenset({"database-review"}))
         with self.assertRaises(dataclasses.FrozenInstanceError):
             effective.digest = "changed"
 
-    def test_memory_disabled_removes_optional_server_tools_and_policy(self):
+    def test_memory_disabled_removes_builtin_tools_and_policy(self):
         raw = agent_config().to_dict()
         raw["features"]["memory"] = "disabled"
         effective = compile_effective_config(
             platform_config(), AgentConfig.from_dict(raw), declared_mcp(), DISCOVERED
         )
-        self.assertNotIn("memory", effective.mcp_tools)
+        self.assertEqual(
+            {t for t in effective.builtin_tools if t.startswith("core_memory_")}, set()
+        )
+        self.assertEqual(
+            {t for t in effective.model_tool_catalog if t.startswith("core_memory_")},
+            set(),
+        )
         self.assertNotIn("memory", effective.enabled_capability_policies)
+        # The switch is memory-specific: unrelated MCP capabilities survive.
+        self.assertEqual(
+            effective.mcp_tools["docs"],
+            frozenset({"search", "read", "create", "update", "split"}),
+        )
+
+        # A platform that does not offer memory filters the optional feature and
+        # reports it instead of failing the run.
+        filtered = compile_effective_config(
+            platform_config(
+                supported_features=platform_config().supported_features - {"memory"}
+            ),
+            agent_config(),
+            declared_mcp(),
+            DISCOVERED,
+        )
+        self.assertNotIn("memory", filtered.enabled_capability_policies)
         self.assertTrue(
             any(
                 w.code == "CAPABILITY_FILTERED" and w.capability == "memory"
-                for w in effective.warnings
+                for w in filtered.warnings
             )
         )
 
     def test_required_memory_fails_when_disabled_or_missing(self):
         raw = agent_config().to_dict()
-        raw["features"]["memory"] = "disabled"
+        raw["features"]["memory"] = "required"
         with self.assertRaises(CoreError) as caught:
             compile_effective_config(
-                platform_config(),
+                platform_config(
+                    supported_features=platform_config().supported_features - {"memory"}
+                ),
                 AgentConfig.from_dict(raw),
-                declared_mcp(memory_required=True),
+                declared_mcp(),
                 DISCOVERED,
             )
         self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
 
-        raw["features"]["memory"] = "required"
+        # Required memory with every core_memory_* tool filtered out of the
+        # catalog is a start-up error, not a silent degradation.
+        raw["tools"]["builtins"]["deny"] = ["core_memory_*"]
         with self.assertRaises(CoreError) as caught:
             compile_effective_config(
-                platform_config(), AgentConfig.from_dict(raw), [], {}
+                platform_config(),
+                AgentConfig.from_dict(raw),
+                declared_mcp(),
+                DISCOVERED,
             )
         self.assertEqual(caught.exception.code, "REQUIRED_CAPABILITY_MISSING")
 
@@ -311,13 +354,13 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_disabled_tool_is_not_discoverable_and_stale_call_is_denied(self):
         raw = agent_config().to_dict()
-        raw["tools"]["builtins"]["deny"] = ["core.terminal.exec"]
+        raw["tools"]["builtins"]["deny"] = ["core_terminal_exec"]
         effective = compile_effective_config(
             platform_config(), AgentConfig.from_dict(raw), declared_mcp(), DISCOVERED
         )
-        self.assertNotIn("core.terminal.exec", effective.model_tool_catalog)
+        self.assertNotIn("core_terminal_exec", effective.model_tool_catalog)
         with self.assertRaises(CoreError) as caught:
-            effective.require_tool("core.terminal.exec")
+            effective.require_tool("core_terminal_exec")
         self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
 
     def test_without_terminal_mode_is_enforced_by_effective_config(self):
@@ -326,10 +369,10 @@ class ConfigurationTests(unittest.TestCase):
         effective = compile_effective_config(
             platform_config(), AgentConfig.from_dict(raw), declared_mcp(), DISCOVERED
         )
-        self.assertNotIn("core.terminal.exec", effective.model_tool_catalog)
-        self.assertNotIn("core.task.start", effective.model_tool_catalog)
-        self.assertIn("core.python.exec", effective.model_tool_catalog)
-        self.assertIn("core.task.wait", effective.model_tool_catalog)
+        self.assertNotIn("core_terminal_exec", effective.model_tool_catalog)
+        self.assertNotIn("core_task_start", effective.model_tool_catalog)
+        self.assertIn("core_python_exec", effective.model_tool_catalog)
+        self.assertIn("core_task_wait", effective.model_tool_catalog)
         self.assertEqual(
             json.loads(effective.audit_snapshot)["runtime_mode"],
             "without_terminal",

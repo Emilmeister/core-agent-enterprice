@@ -85,9 +85,11 @@ class OtlpExporter:
             {"service.name": service_name, "telemetry.semconv.version": "1.43.0"}
         )
         base = endpoint.rstrip("/") if endpoint else None
+        # Only traces are derived from a base URL. One address does not mean the
+        # backend accepts all three signals — the common managed collector takes
+        # traces and answers 403 on logs — so metrics and logs travel exclusively
+        # to an endpoint the operator named on purpose.
         trace_endpoint = trace_endpoint or (f"{base}/v1/traces" if base else None)
-        metric_endpoint = metric_endpoint or (f"{base}/v1/metrics" if base else None)
-        log_endpoint = log_endpoint or (f"{base}/v1/logs" if base else None)
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         # The SDK reports an export failure by status code alone; without the
         # resolved address a 403 on one signal cannot be told from a wrong URL.
@@ -330,6 +332,8 @@ class Telemetry:
 
     @classmethod
     def otlp_from_env(cls, *, service_name="core-agent", content_enabled=None):
+        if (os.getenv("ENABLE_OTEL") or "").strip().lower() in {"0", "false", "no"}:
+            return None
         endpoints = {
             "endpoint": os.getenv("OTEL_ENDPOINT"),
             "trace_endpoint": os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
@@ -344,7 +348,9 @@ class Telemetry:
             ).lower() in {"1", "true", "yes"}
         return cls.otlp(
             **endpoints,
-            service_name=os.getenv("OTEL_SERVICE_NAME") or service_name,
+            service_name=os.getenv("OTEL_PROJECT_NAME")
+            or os.getenv("OTEL_SERVICE_NAME")
+            or service_name,
             content_enabled=content_enabled,
             api_key=os.getenv("OTEL_API_KEY") or os.getenv("OTEL_ENDPOINT_API_KEY"),
         )
@@ -384,7 +390,7 @@ class Telemetry:
             return "RERANKER"
         if name.endswith(".embed"):
             return "EMBEDDING"
-        if name.startswith("memory_service.search."):
+        if name.startswith("core_agent.memory.search"):
             return "RETRIEVER"
         return "CHAIN"
 

@@ -16,7 +16,7 @@ class SpecificationQualityTests(unittest.TestCase):
             re.compile(r"sk-[A-Za-z0-9_-]{32,}"),
             re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
         )
-        roots = (ROOT / "core_agent", ROOT / "memory_service", ROOT / "tests")
+        roots = (ROOT / "core_agent", ROOT / "tests")
         files = [ROOT / ".env.example", ROOT / "README.md"]
         for root in roots:
             files.extend(root.rglob("*.py"))

@@ -23,7 +23,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -340,6 +340,48 @@ DROP TABLE IF EXISTS core_execution_records;
 DROP TABLE IF EXISTS core_approval_requests;
 DROP TABLE IF EXISTS core_tool_proposals;
 """,
+    9: """
+CREATE TABLE core_memory_documents (
+    app_name text NOT NULL,
+    user_id text NOT NULL,
+    memory_id text NOT NULL,
+    namespace text NOT NULL,
+    path text NOT NULL,
+    content text NOT NULL,
+    revision integer NOT NULL,
+    embedding real[],
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (app_name, user_id, memory_id)
+);
+
+CREATE INDEX core_memory_namespace_idx
+    ON core_memory_documents (app_name, user_id, namespace);
+
+CREATE TABLE core_memory_document_versions (
+    app_name text NOT NULL,
+    user_id text NOT NULL,
+    memory_id text NOT NULL,
+    namespace text NOT NULL,
+    path text NOT NULL,
+    content text NOT NULL,
+    revision integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (app_name, user_id, memory_id, revision)
+);
+
+CREATE TABLE core_memory_revisions (
+    app_name text NOT NULL,
+    user_id text NOT NULL,
+    repository_revision integer NOT NULL,
+    resolutions jsonb NOT NULL,
+    published_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (app_name, user_id, repository_revision)
+);
+""",
+    10: """
+ALTER TABLE core_memory_documents ADD COLUMN entities jsonb;
+""",
 }
 
 
@@ -487,6 +529,9 @@ class PostgresDatabase:
             "core_artifacts": "SELECT, INSERT, UPDATE, DELETE",
             "core_budget_ledgers": "SELECT, INSERT, UPDATE, DELETE",
             "core_inbound_messages": "SELECT, INSERT, UPDATE, DELETE",
+            "core_memory_documents": "SELECT, INSERT, UPDATE, DELETE",
+            "core_memory_document_versions": "SELECT, INSERT, DELETE",
+            "core_memory_revisions": "SELECT, INSERT, DELETE",
         }
         with self.transaction() as connection:
             connection.execute(

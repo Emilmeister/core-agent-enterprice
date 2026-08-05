@@ -4,6 +4,7 @@ import contextlib
 from dataclasses import dataclass
 import ipaddress
 import json
+import re
 import time
 import uuid
 from urllib.parse import urlparse
@@ -17,6 +18,31 @@ from .security import redact
 # Published MCP revisions this client interoperates with, newest first: the first
 # entry is what we propose, the rest are what we still accept from a server.
 MCP_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+
+
+def mcp_tool_name(server, tool):
+    """The canonical name of one MCP tool, ready for any model API.
+
+    A dot cannot separate server from tool here: a server is free to publish a
+    tool whose own name contains one, and the split would then name the wrong
+    server. The mapping back to `(server, tool)` is kept as an index, so the
+    name itself carries no structure that has to be parsed.
+    """
+    return re.sub(r"[^A-Za-z0-9_-]", "_", f"{server}_{tool}")
+
+
+def mcp_tool_index(mcp_tools):
+    """Canonical name -> (server, tool) for every allowed MCP tool."""
+    index = {}
+    for server, tools in mcp_tools.items():
+        for tool in tools:
+            name = mcp_tool_name(server, tool)
+            if index.setdefault(name, (server, tool)) != (server, tool):
+                raise CoreError(
+                    "TOOL_NAME_COLLISION",
+                    f"{name} names more than one MCP tool",
+                )
+    return index
 
 
 @dataclass(frozen=True)
@@ -76,8 +102,8 @@ class InMemoryMcpConnector:
     def update_catalog(self, name, catalog):
         self.catalogs[name] = dict(catalog)
 
-    def call(self, name, arguments):
-        return self.results.get(name, {})
+    def call(self, server, tool, arguments):
+        return self.results.get(f"{server}.{tool}", {})
 
 
 def _failure_reason(error):
@@ -112,7 +138,7 @@ class McpManager:
             return snapshot
         self._catalog_values[name] = catalog
         snapshot = McpSnapshot(
-            name, "initialized", 1, frozenset(f"{name}.{tool}" for tool in catalog)
+            name, "initialized", 1, frozenset(mcp_tool_name(name, tool) for tool in catalog)
         )
         self._snapshots[name] = snapshot
         return snapshot
@@ -129,7 +155,7 @@ class McpManager:
                 name,
                 "initialized",
                 old.catalog_revision + 1,
-                frozenset(f"{name}.{tool}" for tool in latest),
+                frozenset(mcp_tool_name(name, tool) for tool in latest),
             )
         return self._snapshots[name]
 
@@ -139,7 +165,8 @@ class McpManager:
             raise CoreError("POLICY_DENIED")
         if decision == "require_approval":
             return McpResult("approval_required")
-        return McpResult("succeeded", self.connector.call(target, arguments))
+        server, _, tool = target.partition(".")
+        return McpResult("succeeded", self.connector.call(server, tool, arguments))
 
     def read_resource(self, server, uri):
         if self.policy("resource", uri, {}) == "deny":
@@ -196,14 +223,27 @@ class StreamableHttpMcpConnector:
     def connections(self):
         return tuple(self._connections)
 
-    def _read_event_stream(self, response):
-        """Take the first JSON-RPC payload carried by an SSE response.
+    def _read_event_stream(self, response, request_id):
+        """Take the JSON-RPC payload answering `request_id` from an SSE response.
 
         A Streamable HTTP server may answer either with plain JSON or with an
-        event stream; both carry the same envelope.
+        event stream; both carry the same envelope. The stream is not only the
+        answer: the server may put progress notifications, logs and its own
+        requests in front of it, and a slow tool nearly always does. Those carry
+        no `id`, so taking the first frame returns a result-less envelope — an
+        empty output reported to the model as success, which reads exactly like
+        "the server found nothing".
         """
         deadline = time.monotonic() + self.sse_read_timeout
         data = []
+
+        def answering(payload):
+            text = payload.strip()
+            if not text or text == "[DONE]":
+                return None
+            frame = json.loads(text)
+            return frame if frame.get("id") == request_id else None
+
         while time.monotonic() < deadline:
             raw = response.readline()
             if not raw:
@@ -214,13 +254,13 @@ class StreamableHttpMcpConnector:
                 continue
             if line:
                 continue
-            payload = "\n".join(data)
+            frame = answering("\n".join(data))
             data = []
-            if payload.strip() and payload.strip() != "[DONE]":
-                return json.loads(payload)
-        payload = "\n".join(data).strip()
-        if payload and payload != "[DONE]":
-            return json.loads(payload)
+            if frame is not None:
+                return frame
+        frame = answering("\n".join(data))
+        if frame is not None:
+            return frame
         raise CoreError("MCP_PROTOCOL_ERROR", "event stream carried no result")
 
     def _rpc(self, server, method, params=None, *, notification=False):
@@ -292,7 +332,7 @@ class StreamableHttpMcpConnector:
                     if "text/event-stream" in (
                         response.headers.get("Content-Type") or ""
                     ):
-                        value = self._read_event_stream(response)
+                        value = self._read_event_stream(response, payload.get("id"))
                     else:
                         value = json.load(response)
             except Exception as error:
@@ -335,6 +375,5 @@ class StreamableHttpMcpConnector:
             for tool in result.get("tools", [])
         }
 
-    def call(self, target, arguments):
-        server, tool = target.split(".", 1)
+    def call(self, server, tool, arguments):
         return self._rpc(server, "tools/call", {"name": tool, "arguments": arguments})

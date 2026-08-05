@@ -195,6 +195,28 @@ class LocalTerminalTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "TOOL_START_FAILED")
 
+    def test_a_shell_operator_in_argv_says_so_instead_of_confusing_the_first_tool(self):
+        """`['pwd', '&&', 'ls', '-la']` otherwise fails as `pwd: invalid option -- 'l'`."""
+        session = self.manager.create(
+            spec("run-1", "main", self.snapshot, self.durable_root)
+        )
+        with self.assertRaises(CoreError) as caught:
+            self.manager.execute(
+                session.id, {"argv": ["pwd", "&&", "ls", "-la"]}, owner_id="main"
+            )
+        self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
+        self.assertIn("no shell here", str(caught.exception))
+        self.assertIn("['sh', '-lc'", str(caught.exception))
+
+        # An operator the caller actually passes to a shell is not the mistake,
+        # and a pattern that merely contains one is not either.
+        for argv in (
+            ["sh", "-lc", "pwd && ls"],
+            ["grep", "-E", "a|b", "file"],
+        ):
+            with self.subTest(argv=argv):
+                self.manager.execute(session.id, {"argv": argv}, owner_id="main")
+
         result = self.manager.execute(
             session.id,
             {

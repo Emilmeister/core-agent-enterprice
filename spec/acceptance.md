@@ -7,7 +7,7 @@
 - [ ] Core Agent публикует валидную Agent Card с protocol/binding versions, auth, media types, skills и capabilities.
 - [ ] Карточка доступна и по `/.well-known/agent-card.json`, и по историческому `/.well-known/agent.json`; оба пути возвращают идентичный документ, а query-параметры игнорируются.
 - [ ] Каждая объявленная в карточке пара binding/version принимается соответствующим endpoint: `JSONRPC` отвечает на `0.3`, `HTTP+JSON` — на `1.0`, и карточка не содержит пар, которых нет.
-- [ ] При заданном `AGENT_URL` карточка объявляет именно его, и никакой заголовок запроса это не меняет.
+- [ ] При заданном `AGENT_URL` карточка объявляет именно его, и никакой заголовок запроса это не меняет; `URL_AGENT` принимается как то же значение, а при обоих заданных выигрывает `AGENT_URL`.
 - [ ] Без `AGENT_URL` карточка объявляет адрес из `X-Forwarded-Proto`/`X-Forwarded-Host`, иначе из схемы и `Host`; непригодное значение отбрасывается, а запрос карточки всё равно завершается успешно.
 - [ ] Лишний член верхнего уровня JSON-RPC конверта не отклоняет запрос, не интерпретируется как session id и попадает в предупреждение с именами удалённых полей.
 - [ ] Внешнее общение использует A2A Message/Task/Artifact; отдельная публичная task state machine отсутствует.
@@ -68,20 +68,54 @@
 - [ ] Повторные compactions сохраняют goal и immutable transcript mapping.
 - [ ] Непомещающиеся protected/pinned data дают `CONTEXT_UNRECOVERABLE`, не silent truncation.
 
-## Memory MCP Service и file lifecycle
+## Память агента и file lifecycle
 
-- [ ] Core Agent не содержит MemoryStore/index/NER и использует memory только через разрешённый MCP descriptor.
-- [ ] При memory disabled memory tools/instructions отсутствуют и implicit fallback не выполняется.
-- [ ] Markdown corpus внутри Memory Service является source of truth; BM25/vector/graph indexes полностью перестраиваются из него.
-- [ ] Agent не имеет filesystem access к memory corpus и меняет его только MCP tools.
+- [ ] Память является подсистемой Core Agent: `core_memory_*` являются built-ins, отдельный memory-процесс и MCP-роль `memory` отсутствуют.
+- [ ] При `CORE_AGENT_MEMORY=disabled` memory tools/instructions отсутствуют, backend не создаётся и implicit fallback не выполняется; строка `"disabled"` не проходит gating как включённая capability.
+- [ ] Markdown corpus является source of truth; BM25/vector/graph indexes полностью перестраиваются из него.
+- [ ] Модель не имеет ни filesystem, ни SQL доступа к corpus и меняет его только `core_memory_*` tools.
+- [ ] Namespace выводится из scope текущего run: модель передаёт только `user|session`, а `user_id`/`session_id` подставляет runtime.
+- [ ] Модель передаёт заголовок и тело, а front matter формирует runtime; корректный YAML от модели не требуется.
 - [ ] Перед create/update agent выполняет hybrid search и проверяет top candidates.
-- [ ] Та же тема обновляет существующий file; новый subject/scope создаёт новый file.
+- [ ] Та же тема обновляет существующий документ; новый subject/scope создаёт новый.
 - [ ] Create/update с 201+ body lines жёстко отклоняется без revision/index changes, truncation или automatic split.
-- [ ] `MEMORY_FILE_TOO_LARGE` возвращает actual/max lines и рекомендацию разделить content на несколько Markdown files.
-- [ ] Отдельный `memory.split` принимает явный plan; каждый resulting file также не превышает 200 lines.
+- [ ] `MEMORY_FILE_TOO_LARGE` возвращает actual/max lines и рекомендацию разделить content на несколько документов.
+- [ ] Ошибка memory tool возвращается модели как failed tool result и не завершает run: после `MEMORY_FILE_TOO_LARGE` модель вызывает `core_memory_split` в том же run.
+- [ ] Отдельный `core_memory_split` принимает явный plan; каждый resulting документ также не превышает 200 lines.
 - [ ] Split сохраняет stable IDs/aliases, ссылки и provenance без разрыва semantic block.
 - [ ] Update использует expected revision; concurrent conflict не разрешается last-write-wins.
-- [ ] Delete/tombstone исключает content из Markdown, summaries, BM25, vectors, graph и caches.
+- [ ] Delete исключает content из Markdown, summaries, BM25, vectors, graph и caches.
+- [ ] Перевод строки в `title`, `kind`, `status` или элементе `tags` отклоняется как `MEMORY_INVALID`, повторяющийся ключ front matter — тоже, а разобранные `id` и `namespace` сверяются с подставленными runtime-ом для каждого документа, включая дочерние в `split`; ни одна из этих строк не переписывает чужую заметку и не меняет namespace.
+- [ ] Определение перевода строки совпадает с парсерным: U+2028, U+2029 и U+0085 отклоняются наравне с `\n`.
+- [ ] Элемент `tags` с `,`, `[` или `]` отклоняется, потому что не переживает обратное чтение.
+- [ ] Нечитаемая строка хранилища пропускается с warning и не делает недоступным остальной corpus пользователя.
+- [ ] Атрибут degraded channels на search span совпадает с `degraded_channels` в tool result, включая деградацию, обнаруженную во время самого поиска.
+- [ ] `update` и `split` сохраняют `tags` и `sources` исходного документа.
+
+## Backend памяти и эмбеддинги
+
+- [ ] `MEMORY_STORAGE_TYPE` принимает `in-memory` и `postgres`; доменная семантика лимита, revisions, retrieval и graph одинакова для обоих.
+- [ ] Production с включённой памятью и `MEMORY_STORAGE_TYPE=in-memory` завершается ошибкой конфигурации.
+- [ ] PostgreSQL backend публикует revision одной транзакцией, переживает рестарт и превращает конфликт номера repository revision в `MEMORY_CONFLICT`.
+- [ ] Пул выбирается в порядке `MEMORY_POSTGRES_HOST` → общий пул агента → собственный по `DATABASE_URL`; durable память при `SESSION_STORAGE_TYPE=in-memory` работает, а отсутствие обеих переменных даёт ошибку конфигурации, называющую обе.
+- [ ] Пул, открытый самой подсистемой, проходит миграцию или `verify_schema` до старта, а не падает на первом tool call.
+- [ ] Conflict возвращает фактическую revision backend-а, подсистема перечитывает состояние до возврата ошибки, и предписанный retry успешно выполняется.
+- [ ] `load()` не сочетает новый номер revision со старым corpus: гонка публикации приводит к конфликту, а не к потере чужой записи.
+- [ ] Extraction выполняется только для изменённых документов и только моделью агента через `response_format` с полной JSON-схемой; отдельных `MEMORY_NER_*` переменных не существует.
+- [ ] Отказ extraction не отменяет запись: документ публикуется с `entities IS NULL`, индексируется встроенным regex-экстрактором и остаётся находимым по BM25, а graph-канал сообщает число неизвлечённых документов без их имён.
+- [ ] Сущность, отсутствующая в тексте документа дословно, отбрасывается; offsets вычисляет подсистема, а не модель.
+- [ ] Ответ шлюза с кодом 4xx, кроме 408 и 429, выключает extraction до конца жизни процесса, и следующая запись не делает нового запроса к модели.
+- [ ] Слой extraction включён только при заданных `LLM_MODEL`, `LLM_API_KEY` и адресе; `LLM_ENDPOINT` заменяет производный адрес, а `LLM_API_FORMAT=anthropic` выключает слой на старте.
+- [ ] Сохранённые сущности переживают рестарт: загрузка corpus не выполняет ни одного запроса к модели.
+- [ ] Многословная сущность находится по одному слову запроса; graph-канал сопоставляет токены, а не строку целиком.
+- [ ] `content` в PostgreSQL хранит Markdown целиком, включая front matter; `kind`, `status`, `sources` и timestamps переживают рестарт без реконструкции.
+- [ ] Отсутствие расширения `vector` логируется, понижает векторный канал до вычисления в процессе и не роняет ни миграцию, ни старт.
+- [ ] Слой эмбеддингов включается только при заданных `EMBEDDING_MODEL`, `EMBEDDING_API_KEY` и базе; незаданная `EMBEDDING_API_BASE` берётся из `LLM_API_BASE`, а ключ не выводится ниоткуда.
+- [ ] `OTEL_ENDPOINT` выводит только `/v1/traces`; metrics и logs уходят исключительно по явным per-signal endpoints, а `ENABLE_OTEL=false` отключает экспорт целиком.
+- [ ] Имя сервиса в телеметрии берётся из `OTEL_PROJECT_NAME`, `OTEL_SERVICE_NAME` — синоним с меньшим приоритетом.
+- [ ] `ARTIFACT_STORAGE_ENABLED=false` убирает `core_artifact_*` из каталога, не создаёт backend и не требует ни одной другой `ARTIFACT_*` переменной.
+- [ ] Любая ошибка embedding endpoint не роняет tool call; текст запроса и ключ не попадают в error, audit и telemetry.
+- [ ] Embedding документа вычисляется один раз при публикации и сохраняется; search эмбеддит только запрос.
 
 ## Indexing, NER и graph
 
@@ -101,6 +135,7 @@
 - [ ] Search result возвращает component/final scores, revision и provenance.
 - [ ] Недоступный channel явно помечает degraded search; конфликтующие claims не скрываются ranking-ом.
 - [ ] Candidate set, model/index/reranker versions позволяют воспроизвести retrieval decision.
+- [ ] Поиск находит заметку на нелатинской письменности без настроенного слоя эмбеддингов: токенизация и извлечение сущностей не зависят от алфавита.
 
 ## Background Tasks
 
@@ -137,17 +172,26 @@
 - [ ] Cancel/timeout завершает owned process group, закрывает PTY и фиксирует cleanup outcome.
 - [ ] Secret инжектируется только в environment разрешённого process и не попадает в checkpoint/telemetry/artifact.
 - [ ] Runtime явно сообщает logical/process separation и не рекламирует отдельные OS security namespaces.
-- [ ] `core.python.exec` доступен в обоих runtime-профилях и управляется только built-in allowlist.
+- [ ] `core_python_exec` доступен в обоих runtime-профилях и управляется только built-in allowlist.
 - [ ] Python process получает только bounded `tools.call`; каждый вложенный built-in/MCP вызов повторно проходит EffectiveConfig, schema, policy, общий budget, owner/tenant, audit и OTel.
 - [ ] Python exception/nonzero exit/timeout возвращается модели как failed tool result, не завершает родительскую Task и не повторяет неоднозначный side effect.
+- [ ] Пакет, установленный командой из `core_terminal_exec`, импортируется в `core_python_exec` без правки `sys.path`; рабочий каталог при этом в `sys.path` не попадает.
 
 ## Tools и MCP
 
 - [ ] Tool arguments валидируются до policy и execution.
-- [ ] Built-in descriptions кратко и точно отражают фактические ownership/lifecycle ограничения, включая timeout snapshot и запрет task-start для Python/delegate/task/send_message tools; устаревшие config names `core.artifact.put/get` отклоняются.
-- [ ] `core.artifact.save` создаёт новую версию и никогда не перезаписывает; `user:`-артефакт виден в другой сессии того же пользователя, а `core.artifact.list` разделяет session и user scope.
-- [ ] `core.agent.send_message` ретранслирует прогресс удалённого агента в поток корневой Task, возвращает его финальный текст и пробрасывает downstream только allowlist заголовков.
-- [ ] Делегированный child исполняет artifact tools и `core.agent.send_message` вместо `CAPABILITY_DISABLED`, разделяет session scope артефактов с parent-ом и не наследует credentials вызывающей стороны.
+- [ ] Отказ валидации называет путь аргумента, ожидаемый тип и фактический; переданное значение в сообщение не попадает.
+- [ ] Каноническое имя tool не содержит точки, совпадает с именем в каталоге модели и с именем в аргументах `core_delegate`; alias появляется только при коллизии или превышении длины.
+- [ ] Имя MCP-тула разрешается в пару `(сервер, tool)` индексом; tool, в имени которого есть точка, вызывается на своём сервере.
+- [ ] Schema `core_delegate` перечисляет enum-ом фактический каталог тулов родителя и его skills, а не свободные строки; отдельного аргумента `mcp` нет.
+- [ ] Один список `tools` несёт built-ins и MCP-тулы под именами каталога; runtime раскладывает их сам, а отказ называет отклонённое имя и перечисляет доступные.
+- [ ] Аргумент со значением `null` обрабатывается как непереданный.
+- [ ] Значение `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, записанное точками до переименования, продолжает называть тот же tool; неизвестное имя отклоняется с перечислением.
+- [ ] Shell-синтаксис среди элементов `argv` даёт сообщение про отсутствующий shell, а не ошибку первой попавшейся утилиты.
+- [ ] Built-in descriptions кратко и точно отражают фактические ownership/lifecycle ограничения, включая timeout snapshot и запрет task-start для Python/delegate/task/send_message tools; устаревшие config names `core_artifact_put/get` отклоняются.
+- [ ] `core_artifact_save` создаёт новую версию и никогда не перезаписывает; `user:`-артефакт виден в другой сессии того же пользователя, а `core_artifact_list` разделяет session и user scope.
+- [ ] `core_agent_send_message` ретранслирует прогресс удалённого агента в поток корневой Task, возвращает его финальный текст и пробрасывает downstream только allowlist заголовков.
+- [ ] Делегированный child исполняет artifact tools и `core_agent_send_message` вместо `CAPABILITY_DISABLED`, разделяет session scope артефактов с parent-ом и не наследует credentials вызывающей стороны.
 - [ ] Непустой `ARTIFACT_S3_ENDPOINT_URL`, отличный от `https://s3.cloud.ru`, не роняет startup, а вызывает warning с проигнорированным и применённым значением; хвостовой `/` отбрасывается без warning.
 - [ ] В профиле Cloud.ru итоговый access key без ровно одного `:` или с пустой частью завершает startup `CONFIG_INVALID`; в профиле AWS ключ без `:` принимается.
 - [ ] Ни один входящий A2A Part не теряется молча: binary Part при `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS=false` и любой URL-Part отклоняются `CONTENT_TYPE_NOT_SUPPORTED`, а исходящий запрос по caller-адресу не выполняется.
@@ -155,6 +199,8 @@
 - [ ] MCP tools/resources/prompts/sampling/elicitation проходят local policy независимо от server metadata.
 - [ ] MCP-сервер, согласовавший любую поддерживаемую ревизию протокола, подключается; отказ по версии называет предложенную и принимаемые.
 - [ ] Выданный сервером `Mcp-Session-Id` возвращается во всех последующих запросах к нему; транспортный отказ называет метод, на котором он произошёл.
+- [ ] Ответ выбирается по `id`: нотификации и чужие `id` в event stream пропускаются, и `tools/call` возвращает данные, а не пустой результат.
+- [ ] `isError: true` в результате `tools/call` доходит до модели как failed tool result с текстом сервера, а не как успешный пустой output.
 - [ ] `MCP_ALLOWED_TOOLS` принимает и голое имя тула, и форму `server.tool`; подключённый сервер без единого разрешённого тула порождает предупреждение с его именем.
 - [ ] Production без valid `DATABASE_URL`, ожидаемой PostgreSQL schema или database readiness не открывает A2A listener и не использует in-memory/SQLite fallback.
 - [ ] Соединение, закрытое сервером во время простоя, не доходит до caller ошибкой: пул проверяет и заменяет его, а следующий запрос выполняется успешно.
@@ -164,8 +210,9 @@
 - [ ] `startup.configuration` описывает runtime mode, built-ins, MCP-серверы с allowlist, удалённых агентов с причинами отказа и storage; `capabilities.resolved` показывает обнаруженные и разрешённые MCP-тулы по серверам. Секреты в обеих записях отсутствуют.
 - [ ] `startup.configuration` выводится и тогда, когда логирование настраивает внешний ASGI-сервер после сборки приложения; неподключившийся MCP-сервер получает отдельную запись с кодом ошибки и отличается в `capabilities.resolved` от подключённого с пустым каталогом.
 - [ ] `startup.configuration` называет OTLP endpoint для traces, metrics и logs по отдельности и булев признак наличия credentials; значение ключа отсутствует ни в каком виде.
+- [ ] Старт печатает инвентарь переменных окружения короткими нумерованными строками `i/N`: те, к которым обращался старт, и отдельно присутствующие, к которым он не обращался, обе группы со состоянием `set|empty|missing`; ни одно значение не выводится.
 - [ ] `startup.configuration` перечисляет заданные `REMOTE_AGENTS` отдельно от подключившихся и содержит причину отказа каждого неподключившегося; userinfo из URL удаляется.
-- [ ] Помимо `startup.configuration` старт печатает короткую однострочную запись обычным текстом о `REMOTE_AGENTS`: при отсутствии значения — предупреждение о недоступности `core.agent.send_message`, различающее незаданную и заданную пустой переменную и перечисляющее имена присутствующих переменных окружения об агентах без значений, иначе заданные URL без userinfo и имена подключившихся.
+- [ ] Помимо `startup.configuration` старт печатает короткую однострочную запись обычным текстом о `REMOTE_AGENTS`: при отсутствии значения — предупреждение о недоступности `core_agent_send_message`, различающее незаданную и заданную пустой переменную и перечисляющее имена присутствующих переменных окружения об агентах без значений, иначе заданные URL без userinfo и имена подключившихся.
 
 ## OpenTelemetry
 

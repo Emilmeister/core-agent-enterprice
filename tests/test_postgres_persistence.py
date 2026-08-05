@@ -69,7 +69,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             os.environ,
             {
                 "SESSION_STORAGE_TYPE": "in-memory",
-                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.task.list",
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_task_list",
             },
             clear=True,
         ):
@@ -79,11 +79,11 @@ class ProductionConfigurationTests(unittest.TestCase):
                 {"prompt": "answer"}
             )
             self.assertEqual(result.message, "ok")
-            self.assertEqual(model.calls[0].tools, frozenset({"core.task.list"}))
+            self.assertEqual(model.calls[0].tools, frozenset({"core_task_list"}))
             advertised = {
                 skill.id for skill in app.state.a2a_request_handler._agent_card.skills
             }
-            self.assertEqual(advertised, {"core.task.list"})
+            self.assertEqual(advertised, {"core_task_list"})
         finally:
             app.state.close()
 
@@ -91,7 +91,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             os.environ,
             {
                 "SESSION_STORAGE_TYPE": "in-memory",
-                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.artifact.get",
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_artifact_get",
             },
             clear=True,
         ):
@@ -124,11 +124,11 @@ class ProductionConfigurationTests(unittest.TestCase):
             self.assertIn("Delegate a coherent outcome", call.instructions)
             # Python is a plain built-in now: no HITL gate hides it.
             self.assertIn("PYTHON:", call.instructions)
-            self.assertNotIn("core.artifact.put", call.tools)
-            self.assertNotIn("core.artifact.get", call.tools)
+            self.assertNotIn("core_artifact_put", call.tools)
+            self.assertNotIn("core_artifact_get", call.tools)
 
             registry = app.state.core_agent.tool_runtime.registry
-            delegate = registry.get("core.delegate").description
+            delegate = registry.get("core_delegate").description
             self.assertIn("coherent outcome", delegate)
             self.assertIn("minimum sufficient capabilities", delegate)
             self.assertIn("child receives exactly that set", delegate)
@@ -137,15 +137,15 @@ class ProductionConfigurationTests(unittest.TestCase):
             self.assertNotIn("exactly once", delegate)
             self.assertIn(
                 "non-task, non-delegation, non-Python",
-                registry.get("core.task.start").description,
+                registry.get("core_task_start").description,
             )
             self.assertIn(
                 "timeout returns the current snapshot",
-                registry.get("core.task.wait").description,
+                registry.get("core_task_wait").description,
             )
-            self.assertNotIn("core.artifact.put", registry.names())
-            self.assertNotIn("core.artifact.get", registry.names())
-            python = registry.get("core.python.exec").description
+            self.assertNotIn("core_artifact_put", registry.names())
+            self.assertNotIn("core_artifact_get", registry.names())
+            python = registry.get("core_python_exec").description
             self.assertIn("datetime.now().astimezone()", python)
             self.assertIn("not an OS sandbox", python)
         finally:
@@ -160,9 +160,9 @@ class ProductionConfigurationTests(unittest.TestCase):
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": "without_terminal",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
-                    "core.terminal.exec,core.python.exec,core.task.start,core.task.get,"
-                    "core.task.list,core.task.wait,core.task.cancel,"
-                    "core.delegate"
+                    "core_terminal_exec,core_python_exec,core_task_start,core_task_get,"
+                    "core_task_list,core_task_wait,core_task_cancel,"
+                    "core_delegate"
                 ),
             },
             clear=True,
@@ -173,12 +173,12 @@ class ProductionConfigurationTests(unittest.TestCase):
                 {"prompt": "answer"}
             )
             self.assertEqual(result.message, "ok")
-            self.assertNotIn("core.terminal.exec", model.calls[0].tools)
-            self.assertNotIn("core.task.start", model.calls[0].tools)
+            self.assertNotIn("core_terminal_exec", model.calls[0].tools)
+            self.assertNotIn("core_task_start", model.calls[0].tools)
             # without_terminal removes terminal tools, not Python.
-            self.assertIn("core.python.exec", model.calls[0].tools)
-            self.assertIn("core.delegate", model.calls[0].tools)
-            self.assertIn("core.task.wait", model.calls[0].tools)
+            self.assertIn("core_python_exec", model.calls[0].tools)
+            self.assertIn("core_delegate", model.calls[0].tools)
+            self.assertIn("core_task_wait", model.calls[0].tools)
             advertised = {
                 skill.id for skill in app.state.a2a_request_handler._agent_card.skills
             }
@@ -212,7 +212,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             {
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": runtime_mode,
-                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.python.exec",
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_python_exec",
             },
             clear=True,
         ):
@@ -221,11 +221,11 @@ class ProductionConfigurationTests(unittest.TestCase):
             app.state.core_agent.run(
                 {"prompt": "answer"}
             )
-            self.assertEqual("core.python.exec" in model.calls[0].tools, expected)
+            self.assertEqual("core_python_exec" in model.calls[0].tools, expected)
             advertised = {
                 skill.id for skill in app.state.a2a_request_handler._agent_card.skills
             }
-            self.assertEqual("core.python.exec" in advertised, expected)
+            self.assertEqual("core_python_exec" in advertised, expected)
             if runtime_mode == "without_terminal" and expected:
                 execution = app.state.core_agent.agent_config.to_dict()["execution"]
                 self.assertEqual(execution["environment_profile"], "local-python")

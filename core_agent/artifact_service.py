@@ -26,9 +26,44 @@ _REGION = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]{0,62}\Z")
 _WHITESPACE = re.compile(r"\s+")
 
 
-def _guess_media_type(filename):
+# A slim image ships no /etc/mime.types, so `mimetypes` falls back to its
+# built-in table — which has no OOXML. Without these, every .pptx the agent
+# produces is labelled text/plain, and a client that believes the label decodes
+# a ZIP container as text.
+for _extension, _media_type in {
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".epub": "application/epub+zip",
+    ".rtf": "application/rtf",
+    ".7z": "application/x-7z-compressed",
+    ".webp": "image/webp",
+}.items():
+    mimetypes.add_type(_media_type, _extension)
+
+
+def guess_media_type(filename, *, fallback="text/plain"):
     guessed, _ = mimetypes.guess_type(filename)
-    return guessed or "text/plain"
+    return guessed or fallback
+
+
+def _content_disposition(filename):
+    """Name the download, because the object key ends in the version number.
+
+    Without this the last segment of the object URL is `0`, so the file arrives
+    called `0` with no extension: no application opens it, and a client that
+    decides inline-versus-download by name may never offer to save it at all.
+    """
+    # Header values are ASCII; RFC 5987 carries the real name beside a fallback.
+    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace('"', "_")
+    disposition = f'attachment; filename="{ascii_name}"'
+    if not filename.isascii():
+        disposition += f"; filename*=UTF-8''{quote(filename, safe='')}"
+    return disposition
+
 
 
 def validate_segment(value, label):
@@ -98,7 +133,7 @@ class ArtifactBackend:
     that needs it back on ``get`` must also record it inside ``metadata``.
     """
 
-    def put(self, key, content, *, media_type, metadata):
+    def put(self, key, content, *, media_type, metadata, filename=None):
         raise NotImplementedError
 
     def get(self, key):
@@ -113,7 +148,7 @@ class InMemoryArtifactBackend(ArtifactBackend):
     def __init__(self):
         self._objects = {}
 
-    def put(self, key, content, *, media_type, metadata):
+    def put(self, key, content, *, media_type, metadata, filename=None):
         self._objects[key] = (bytes(content), dict(metadata))
 
     def get(self, key):
@@ -131,7 +166,7 @@ class InMemoryArtifactBackend(ArtifactBackend):
 class ArtifactService:
     """Named, scoped and versioned artifacts on top of any ArtifactBackend."""
 
-    def __init__(self, backend, *, max_bytes=50_000_000):
+    def __init__(self, backend, *, max_bytes=100_000_000):
         if backend is None:
             raise CoreError("CONFIG_INVALID", "artifact backend is required")
         self.backend = backend
@@ -187,7 +222,7 @@ class ArtifactService:
         if len(content) > self.max_bytes:
             raise CoreError("ARTIFACT_TOO_LARGE")
         scope, name, prefix = self._versions_prefix(app_name, user_id, session_id, filename)
-        media_type = _validate_media_type(media_type or _guess_media_type(name))
+        media_type = _validate_media_type(media_type or guess_media_type(name))
         encoded_metadata = _encode_metadata(metadata)
         existing = self._versions(prefix)
         version = len(existing)
@@ -202,7 +237,11 @@ class ArtifactService:
             "metadata": encoded_metadata,
         }
         self.backend.put(
-            f"{prefix}{version}", content, media_type=media_type, metadata=stored
+            f"{prefix}{version}",
+            content,
+            media_type=media_type,
+            metadata=stored,
+            filename=name,
         )
         return ArtifactVersion(
             filename=name,
@@ -239,7 +278,7 @@ class ArtifactService:
                 filename=name,
                 scope=scope,
                 version=version,
-                media_type=stored.get("media-type") or _guess_media_type(name),
+                media_type=stored.get("media-type") or guess_media_type(name),
                 size=size,
                 digest=stored["digest"],
                 metadata=metadata,
@@ -456,8 +495,10 @@ class S3ArtifactBackend(ArtifactBackend):
                 delay = min(delay * 2, self.retry_max_delay)
         raise CoreError("ARTIFACT_BACKEND_UNAVAILABLE", "s3 retries exhausted", retryable=True)
 
-    def put(self, key, content, *, media_type, metadata):
+    def put(self, key, content, *, media_type, metadata, filename=None):
         headers = {"content-type": _validate_media_type(media_type)}
+        if filename:
+            headers["content-disposition"] = _content_disposition(filename)
         for name, value in metadata.items():
             if not _METADATA_KEY.match(name):
                 raise CoreError("TOOL_ARGUMENT_INVALID", "metadata key is not header safe")
@@ -527,7 +568,7 @@ class MongoDbArtifactBackend(ArtifactBackend):
         # An injected collection (tests) may run without pymongo installed.
         self._binary = Binary or bytes
 
-    def put(self, key, content, *, media_type, metadata):
+    def put(self, key, content, *, media_type, metadata, filename=None):
         self.collection.replace_one(
             {"_id": key},
             {
@@ -555,7 +596,7 @@ class MongoDbArtifactBackend(ArtifactBackend):
 def create_artifact_service(
     *,
     storage_type="in-memory",
-    max_bytes=50_000_000,
+    max_bytes=100_000_000,
     s3_bucket=None,
     s3_region="",
     s3_access_key_id=None,

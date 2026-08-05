@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from .config import MAX_SUBAGENT_DEPTH
 from .errors import CoreError
+from .mcp import mcp_tool_index
 
 
 @dataclass(frozen=True)
@@ -218,16 +219,61 @@ class CapabilitySet:
 
 @dataclass(frozen=True)
 class DelegationContract:
+    """One tool list, whatever kind of tool it names.
+
+    Built-in and MCP tools reach the model as one flat catalogue of canonical
+    names, so asking it to sort them back into two arguments — the second keyed
+    by server, under names the catalogue never showed — is asking it to know
+    something only the runtime knows. The runtime holds that index already.
+    """
+
     instruction: str
     tools: tuple[str, ...]
-    mcp: dict[str, tuple[str, ...]]
     skills: tuple[str, ...]
     budget: dict[str, int]
     background: bool = False
 
+    def resolve(self, *, tools, mcp, skills, budgets):
+        """Split the tool list against what the caller can actually delegate.
+
+        The single place any of this is refused, so every refusal names what it
+        refused and the three callers cannot drift apart on the rule.
+        """
+        index = mcp_tool_index(mcp)
+        builtins = []
+        delegated = {}
+        for name in self.tools:
+            if name in index:
+                server, remote_tool = index[name]
+                delegated.setdefault(server, set()).add(remote_tool)
+            elif name in tools:
+                builtins.append(name)
+            else:
+                raise CoreError(
+                    "CAPABILITY_DISABLED",
+                    f"this agent does not hold {name}; it holds "
+                    f"{', '.join(sorted(set(tools) | set(index))) or 'no tools'}",
+                )
+        refused = sorted(set(self.skills) - set(skills))
+        if refused:
+            raise CoreError(
+                "CAPABILITY_DISABLED",
+                f"this agent does not hold skill {', '.join(refused)}",
+            )
+        for key, value in self.budget.items():
+            if value > budgets.get(key, value):
+                raise CoreError(
+                    "CAPABILITY_DISABLED",
+                    f"budget {key} of {value} is above the {budgets[key]} "
+                    "this agent holds",
+                )
+        return tuple(builtins), {
+            server: frozenset(names) for server, names in delegated.items()
+        }
+
     @classmethod
     def from_dict(cls, raw):
-        required = {"instruction", "tools", "mcp", "skills", "budget"}
+        required = {"instruction", "tools", "skills", "budget"}
         allowed = required | {"background"}
         if (
             not isinstance(raw, dict)
@@ -239,13 +285,6 @@ class DelegationContract:
             or not all(isinstance(value, str) for value in raw["tools"])
             or not isinstance(raw["skills"], list)
             or not all(isinstance(value, str) for value in raw["skills"])
-            or not isinstance(raw["mcp"], dict)
-            or not all(
-                isinstance(server, str)
-                and isinstance(tools, list)
-                and all(isinstance(tool, str) for tool in tools)
-                for server, tools in raw["mcp"].items()
-            )
             or not isinstance(raw["budget"], dict)
             or not raw["budget"]
             or set(raw["budget"]) - {"turns", "tool_calls"}
@@ -257,11 +296,17 @@ class DelegationContract:
             )
             or not isinstance(raw.get("background", False), bool)
         ):
-            raise CoreError("TOOL_ARGUMENT_INVALID")
+            # The schema already rejected the shape; reaching here means the
+            # contract has a rule the schema cannot state, and a bare code would
+            # send the model guessing at which one.
+            raise CoreError(
+                "TOOL_ARGUMENT_INVALID",
+                "delegation needs instruction, a list of tools by their catalogue "
+                "names, skills and a budget of turns and/or tool_calls above zero",
+            )
         return cls(
             raw["instruction"],
             tuple(raw["tools"]),
-            {key: tuple(value) for key, value in raw["mcp"].items()},
             tuple(raw["skills"]),
             dict(raw["budget"]),
             raw.get("background", False),
@@ -272,24 +317,17 @@ def derive_child_capabilities(parent, contract, *, current_depth):
     depth_limit = min(parent.budgets.get("depth", 0), MAX_SUBAGENT_DEPTH)
     if current_depth >= depth_limit:
         raise CoreError("BUDGET_EXCEEDED")
-    if not set(contract.tools) <= set(parent.tools) or not set(contract.skills) <= set(
-        parent.skills
-    ):
-        raise CoreError("CAPABILITY_DISABLED")
-    mcp = {}
-    for server, tools in contract.mcp.items():
-        if server not in parent.mcp or not set(tools) <= set(parent.mcp[server]):
-            raise CoreError("CAPABILITY_DISABLED")
-        mcp[server] = frozenset(tools)
-    budgets = dict(parent.budgets)
-    for key, value in contract.budget.items():
-        if value > parent.budgets.get(key, value):
-            raise CoreError("CAPABILITY_DISABLED")
-        budgets[key] = value
+    builtins, mcp = contract.resolve(
+        tools=parent.tools,
+        mcp=parent.mcp,
+        skills=parent.skills,
+        budgets=parent.budgets,
+    )
+    budgets = {**parent.budgets, **contract.budget}
     tools = frozenset(
         tool
-        for tool in contract.tools
-        if tool != "core.delegate" or current_depth + 1 < depth_limit
+        for tool in builtins
+        if tool != "core_delegate" or current_depth + 1 < depth_limit
     )
     return CapabilitySet(
         tools,
@@ -299,5 +337,9 @@ def derive_child_capabilities(parent, contract, *, current_depth):
         budgets,
         parent.kernel_version,
         parent.tenant_id,
-        parent.memory_namespace if "memory" in mcp else None,
+        # Shared memory now travels as a delegated core_memory_* tool, not as an
+        # MCP server the parent handed over.
+        parent.memory_namespace
+        if any(tool.startswith("core_memory_") for tool in tools)
+        else None,
     )

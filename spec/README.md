@@ -14,7 +14,7 @@ Core Agent превращает пользовательский `prompt` в з�
 - встроенные инструменты для терминала и изменения файлов;
 - подключение MCP-серверов;
 - обнаружение и применение skills;
-- подключаемый Memory MCP Service с Markdown, графом, NER и hybrid retrieval;
+- встроенную долговременную память с Markdown, графом, NER и hybrid retrieval;
 - сжатие рабочего контекста при достижении 90% до 10–15%;
 - фоновые задачи и неблокирующие сабагенты;
 - отдельные local PTY/process groups/workspaces main и сабагентов внутри одного managed container;
@@ -32,7 +32,7 @@ Core Agent превращает пользовательский `prompt` в з�
 6. [Kernel instructions](kernel-instructions.md) — защищённые правила ядра и порядок инструкций.
 7. [Runtime и reasoning](runtime.md) — agent loop, model routing и восстановление.
 8. [Фоновые задачи и делегирование](tasks-and-delegation.md) — async tasks, ожидание и сабагенты.
-9. [Memory MCP Service](memory-service.md) — Markdown, graph/NER, hybrid search и file lifecycle.
+9. [Память агента](memory-service.md) — Markdown, graph/NER, hybrid search и file lifecycle.
 10. [Контекст и суммаризация](context.md) — расчёт 90%, compaction до 10–15% и гарантии.
 11. [Skills](skills.md) — формат, registry, выбор и progressive disclosure.
 12. [Инструменты](tools.md) — built-ins и MCP.
@@ -66,9 +66,9 @@ Core Agent превращает пользовательский `prompt` в з�
 - Делегирование дочерним агентам является внутренней возможностью и не добавляет полей клиенту.
 - Основной внешний протокол — A2A; внутренний run и фоновая работа отображаются на A2A Task.
 - Non-terminal A2A Task принимает follow-up Messages по своему `taskId`; runtime durable доставляет их model loop на safe boundaries без interrupt текущей операции или изменения EffectiveConfig.
-- Memory является отдельным MCP service, а не подсистемой Core Agent.
+- Memory является подсистемой Core Agent, а не отдельным MCP service.
 - AgentConfig может отключить memory, built-in tools, отдельные MCP tools, skills, delegation и другие optional capabilities.
-- Main agent и сабагенты используют общую память только когда parent явно передал им один Memory MCP namespace.
+- Main agent и сабагенты используют общую память только когда parent явно делегировал им `core_memory_*` tools.
 - Сабагент получает явный allowlist рабочих tools и skills; обязательные kernel tools нельзя убрать.
 - Команды main и сабагентов выполняются в разных owned TerminalSessions одного managed container; это lifecycle/workspace separation, а не отдельная OS security boundary.
 - Kernel rules для включённых capabilities имеют приоритет над настраиваемым agent prompt; AgentConfig определяет, какие capabilities вообще существуют.

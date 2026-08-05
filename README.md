@@ -10,13 +10,14 @@ approvals, isolation, durability, context management, tasks, and telemetry remai
 uv sync
 uv run python -m unittest discover -s tests -v
 uv run python -m unittest tests.test_end_to_end -v
-uvx ruff check core_agent memory_service
+uvx ruff check core_agent
 uv build --no-sources
 ```
 
 The end-to-end suite runs without external credentials. It crosses the official A2A HTTP binding,
 an OpenAI-compatible model server, real local PTYs, background tasks, focused child agents,
-Streamable HTTP Memory MCP, Markdown indexing/NER/graph search, and explicit skill activation.
+Streamable HTTP MCP, built-in Markdown memory with indexing/NER/graph search, and explicit skill
+activation.
 
 ## Run the agent
 
@@ -70,9 +71,9 @@ configuration. Generate it with
 `DURABLE_STORAGE_ROOT` must be the S3-backed mount used only for immutable snapshots and artifacts;
 `LOCAL_WORKSPACE_ROOT` must be a separate local ephemeral path used by active processes.
 `CORE_AGENT_RUNTIME_MODE=with_terminal` enables the full local execution profile.
-`CORE_AGENT_RUNTIME_MODE=without_terminal` removes `core.terminal.exec` and `core.task.start` from
+`CORE_AGENT_RUNTIME_MODE=without_terminal` removes `core_terminal_exec` and `core_task_start` from
 both the Agent Card and model catalog while retaining task lifecycle, delegation, MCP,
-memory, and Python tools. `core.python.exec` is available in either mode when
+memory, and Python tools. `core_python_exec` is available in either mode when
 `LOCAL_APPROVAL_ENABLED=false`; Python code receives bounded `tools.call(...)` access to the same
 effective built-in/MCP catalog. Python may still use standard-library OS/process APIs, so
 `without_terminal` means that the terminal capability is absent, not that local code is sandboxed.
@@ -80,13 +81,13 @@ effective built-in/MCP catalog. Python may still use standard-library OS/process
 selected runtime mode or bypass the HITL gate.
 `CORE_AGENT_MAX_DEPTH` may lower delegation depth to `0` or `1`; `2` is the hard maximum, allowing
 main → child → grandchild while rejecting any further delegation.
-`core.artifact.save/load/list` give the model a named, versioned file store. Saving never
+`core_artifact_save/load/list` give the model a named, versioned file store. Saving never
 overwrites, a `user:` prefix makes an artifact visible across that user's sessions, and
-`ARTIFACT_STORAGE_TYPE` selects `in-memory`, `s3` or `mongodb`. `core.agent.send_message`
+`ARTIFACT_STORAGE_TYPE` selects `in-memory`, `s3` or `mongodb`. `core_agent_send_message`
 delegates one task to a remote A2A agent listed in `REMOTE_AGENTS`. The A2A adapter still stores
 each final result as a tenant-scoped, digest-verified Task Artifact; `MAX_RESPONSE_SIZE` bounds it
-and `MAX_CHUNK_SIZE` splits it into append chunks. Remove retired `core.artifact.put` and
-`core.artifact.get` names from an existing `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` value before startup.
+and `MAX_CHUNK_SIZE` splits it into append chunks. Remove retired `core_artifact_put` and
+`core_artifact_get` names from an existing `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` value before startup.
 
 Streaming clients get ADK-shaped progress on the A2A 0.3 JSON-RPC binding at `/`: reasoning as a
 `TextPart` marked `adk_thought`, tool calls and results as `DataPart`s marked
@@ -121,21 +122,18 @@ use the provider-neutral vocabulary `none`, `minimal`, `low`, `medium`, `high`, 
 but each provider/model may accept only a subset. OpenAI-compatible requests use
 `reasoning_effort`; Anthropic requests use adaptive thinking and `output_config.effort`.
 
-Production Memory MCP uses its own process and storage mount; Core only receives its MCP
-descriptor. Development can use the deterministic local adapters with `uv run core-agent-memory`.
-Production requires real embedding and NER providers:
+Long-term memory runs inside the agent process, so there is no second service to start and no
+separate storage mount. Development keeps the corpus in process memory and falls back to the
+built-in regex entity extractor. Production stores it in PostgreSQL and uses real embedding and NER
+providers:
 
 ```bash
-MEMORY_ENVIRONMENT=production \
-MEMORY_ROOT=/mounted-s3/memory \
-MEMORY_ALLOWED_NAMESPACE_PREFIXES=session/ \
-MEMORY_EMBEDDING_ENDPOINT=https://embedding.example/v1/embeddings \
-MEMORY_EMBEDDING_MODEL=your-embedding-model \
-MEMORY_EMBEDDING_API_KEY=your-embedding-key \
-MEMORY_NER_ENDPOINT=https://ner.example/v1/extract \
-MEMORY_NER_MODEL=your-ner-model \
-MEMORY_NER_API_KEY=your-ner-key \
-uv run core-agent-memory
+CORE_AGENT_MEMORY=required \
+MEMORY_STORAGE_TYPE=postgres \
+EMBEDDING_API_BASE=https://embedding.example/v1 \
+EMBEDDING_MODEL=your-embedding-model \
+EMBEDDING_API_KEY=your-embedding-key \
+uv run core-agent
 ```
 
 `LLM_ENDPOINT` overrides the complete request URL. Providers with custom authentication can use
@@ -188,7 +186,7 @@ provider-hidden/opaque thinking and credentials are never logged.
 Compose waits for PostgreSQL, runs `core-agent-db migrate` as a one-shot job, then starts the agent
 with PostgreSQL persistence. It also starts the pinned Arize Phoenix UI at
 `http://localhost:6006`, stores Phoenix data in the `phoenix` PostgreSQL schema, and sends Core Agent
-and Memory Service traces to its OTLP/HTTP collector. `PHOENIX_PORT` changes the host UI port and
+traces to its OTLP/HTTP collector. `PHOENIX_PORT` changes the host UI port and
 `PHOENIX_DEFAULT_RETENTION_POLICY_DAYS` controls trace retention. The applications use the standard
 per-signal `OTEL_EXPORTER_OTLP_*_ENDPOINT` variables, so a production deployment can route traces,
 metrics, and logs to separate backends without sending unsupported signals to Phoenix.
@@ -205,15 +203,28 @@ replace that control plane and set `CORE_AGENT_ENVIRONMENT=production`.
 The specification and acceptance suite are frozen together before implementation changes.
 `tests/test_spec_lock.py` also protects every specification file byte-for-byte.
 
-## Memory MCP Service
+## Built-in memory
 
-```bash
-MEMORY_ROOT=/data/memory uv run core-agent-memory
-```
+The model calls six built-in tools: `core_memory_search`, `core_memory_read`, `core_memory_create`,
+`core_memory_update`, `core_memory_split`, and `core_memory_delete`. Markdown is canonical; BM25
+postings, embeddings, entities, and graph edges are derived state rebuilt from it. Documents are
+scoped to `(app_name, user_id)`; the model passes only `scope: "user"` or `scope: "session"` and the
+runtime derives the namespace, so no argument can address another user's memory. A committed body is
+limited to 200 lines: an oversized write is rejected with `MEMORY_FILE_TOO_LARGE` before publication
+and the model answers it with an explicit `core_memory_split`.
 
-The service exposes `memory.search`, `read`, `create`, `update`, `split`, `move`, `delete`,
-`history`, `index_status`, and `entity_resolve` over MCP Streamable HTTP. Markdown is canonical;
-derived retrieval and entity indexes are rebuilt on startup.
+`CORE_AGENT_MEMORY` is `optional` by default; `required` fails startup without a working backend and
+`disabled` removes the tools from both the Agent Card and the model catalog. `MEMORY_STORAGE_TYPE`
+selects `in-memory` (default) or `postgres`, and production refuses `in-memory`. PostgreSQL uses the
+shared `DATABASE_URL` pool unless `MEMORY_POSTGRES_HOST` and the other `MEMORY_POSTGRES_*` parts
+supply a separate DSN. The vector channel needs all three of `EMBEDDING_API_BASE`, `EMBEDDING_MODEL`,
+and `EMBEDDING_API_KEY`; `EMBEDDING_DIMENSION` defaults to `768` and `MEMORY_SEARCH_LIMIT` defaults
+to `10`. The graph channel extracts entities with the agent's own model over
+`LLM_API_BASE`, sending a JSON schema per note and keeping only entities the note contains
+verbatim; the result is stored, so a restart costs no model calls, and a failed extraction
+leaves the note stored and findable. `MEMORY_PROVIDER_TIMEOUT_SECONDS` bounds both provider
+calls and `ENTITY_ID` adds the `X-Internal-Entity-ID` header to them. A missing or failing provider only marks
+that search channel degraded; it never fails the tool call.
 
 ## A2A binding
 

@@ -102,12 +102,14 @@ apps/{app_name}/users/{user_id}/artifacts/{filename}/versions/{version}
 Backend реализует ровно три операции:
 
 ```text
-put(key, content, *, media_type, metadata) -> None
+put(key, content, *, media_type, metadata, filename=None) -> None
 get(key) -> (content, metadata)
 list_prefix(prefix) -> sorted[str]
 ```
 
 `media_type` является native-подсказкой backend-у. Он MAY не возвращаться из `get`, поэтому service дублирует его в `metadata` и восстанавливает оттуда. Отсутствующий ключ MUST возвращать `NOT_FOUND`. Удаление в контракт не входит: v1 не предоставляет модели удаление артефактов.
+
+`filename` — имя, под которым артефакт должен приходить к пользователю. Ключ заканчивается номером версии, поэтому последний сегмент URL объекта равен `0`, и скачивание по этому адресу даёт файл с именем `0` без расширения: приложение такой файл не открывает, а часть клиентов вместо скачивания показывает его как текст. Backend, у которого есть native-механизм имени при выдаче, MUST его использовать; для S3 это `Content-Disposition: attachment` с `filename` и, при неASCII-имени, `filename*` по RFC 5987. Backend без такого механизма MUST игнорировать параметр.
 
 Backend выбирается `ARTIFACT_STORAGE_TYPE`; допустимы ровно `in-memory`, `s3`, `mongodb`, любое иное значение завершает startup с `CONFIG_INVALID`.
 
@@ -139,27 +141,36 @@ Backend выбирается `ARTIFACT_STORAGE_TYPE`; допустимы ров�
 
 ## Model-facing tools
 
-Модели доступны ровно три namespaced tool. Устаревшие имена `core.artifact.put`/`core.artifact.get` MUST отклоняться в built-in allowlist при startup, а восстановленный из stale model output вызов MUST NOT исполняться.
+Модели доступны ровно три namespaced tool. Устаревшие имена `core_artifact_put`/`core_artifact_get` MUST отклоняться в built-in allowlist при startup, а восстановленный из stale model output вызов MUST NOT исполняться.
 
-### `core.artifact.save`
+### `core_artifact_save`
 
 ```json
 {
   "filename": "string, 1..512",
   "content": "string",
+  "path": "string",
   "encoding": "text | base64",
   "mime_type": "string",
   "metadata": {}
 }
 ```
 
-Обязательны `filename` и `content`. `encoding` по умолчанию `text`: содержимое кодируется в UTF-8. При `base64` содержимое MUST декодироваться строгим base64, иначе `TOOL_ARGUMENT_INVALID`. Результат:
+Обязателен `filename` и ровно один из `content` и `path`; оба сразу или ни одного — `TOOL_ARGUMENT_INVALID`.
+
+`content` несёт содержимое, которое модель составила сама. `encoding` по умолчанию `text`: содержимое кодируется в UTF-8. При `base64` содержимое MUST декодироваться строгим base64, иначе `TOOL_ARGUMENT_INVALID`.
+
+`path` называет файл в workspace текущего run-а, и runtime читает его сам. Этот вариант существует потому, что аргументы тула передаются JSON-ом, а в JSON нет байтов: единственный способ довезти готовый файл содержимым — base64, то есть плюс треть объёма и обязательный проход всех байтов через кадр IPC и через контекст модели. Файл, созданный в workspace, не должен ради сохранения превращаться в строку. Путь разрешается относительно workspace и MUST проверяться на выход за его пределы так же, как `cwd`; выход даёт `TOOL_ARGUMENT_INVALID`, отсутствующий файл — `NOT_FOUND`. Незаданный `mime_type` для этого варианта MAY выводиться из расширения имени.
+
+Оба варианта подчиняются одному и тому же `MAX_RESPONSE_SIZE`. Транспорт содержимого не является причиной разного лимита.
+
+Результат:
 
 ```json
 {"success": true, "artifact_name": "...", "version": 0, "size": 0, "media_type": "..."}
 ```
 
-### `core.artifact.load`
+### `core_artifact_load`
 
 ```json
 {"filename": "string, 1..512", "version": "integer >= 0"}
@@ -167,7 +178,7 @@ Backend выбирается `ARTIFACT_STORAGE_TYPE`; допустимы ров�
 
 Обязателен `filename`. Без `version` возвращается последняя. Результат содержит `artifact_name`, `version`, `media_type`, `metadata` и пару `encoding`/`content`: `text` для содержимого, декодируемого как UTF-8, иначе `base64`.
 
-### `core.artifact.list`
+### `core_artifact_list`
 
 Без аргументов. Результат:
 

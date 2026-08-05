@@ -47,7 +47,20 @@ Runtime MUST записать при старте одну структурир�
 
 Записи MUST выводиться независимо от `CORE_AGENT_LOG_CONTENT`: это описание конфигурации, а не содержимого.
 
-Помимо структурированной записи runtime MUST напечатать при старте одну короткую однострочную запись обычным текстом о состоянии `REMOTE_AGENTS`: заданные URL без userinfo и имена подключившихся, а при отсутствии значения — предупреждение о том, что `core.agent.send_message` недоступен, с указанием, переменная не задана вовсе или задана пустой. Эти два случая требуют противоположных действий: в первом переменной нет в развёртывании, во втором платформа не подставила значение, — а трактовка пустого значения как незаданного их уравнивает. В том же предупреждении runtime MUST перечислить имена присутствующих переменных окружения, относящихся к агентам, без значений: платформа развёртывания может публиковать список пиров под собственным именем, и без перечня имён оператор не отличит «платформа ничего не передала» от «передала под другим именем». Значения не выводятся, потому что переменная может оказаться credential. `startup.configuration` — самая длинная строка, которую пишет процесс, и сборщики логов развёртывания усекают или отбрасывают её именно тогда, когда конфигурация сложна; короткая строка сохраняет тот единственный факт, который отличает «переменная не доехала» от «пиры отказали». Требование к длинной записи это не отменяет.
+Помимо структурированной записи runtime MUST напечатать при старте одну короткую однострочную запись обычным текстом о состоянии `REMOTE_AGENTS`: заданные URL без userinfo и имена подключившихся, а при отсутствии значения — предупреждение о том, что `core_agent_send_message` недоступен, с указанием, переменная не задана вовсе или задана пустой. Эти два случая требуют противоположных действий: в первом переменной нет в развёртывании, во втором платформа не подставила значение, — а трактовка пустого значения как незаданного их уравнивает. В том же предупреждении runtime MUST перечислить имена присутствующих переменных окружения, относящихся к агентам, без значений: платформа развёртывания может публиковать список пиров под собственным именем, и без перечня имён оператор не отличит «платформа ничего не передала» от «передала под другим именем». Значения не выводятся, потому что переменная может оказаться credential. `startup.configuration` — самая длинная строка, которую пишет процесс, и сборщики логов развёртывания усекают или отбрасывают её именно тогда, когда конфигурация сложна; короткая строка сохраняет тот единственный факт, который отличает «переменная не доехала» от «пиры отказали». Требование к длинной записи это не отменяет.
+
+Runtime MUST напечатать при старте инвентарь переменных окружения — только имена и состояние, никогда значения — двумя группами:
+
+- переменные, к которым обратился этот старт, с состоянием `set`, `empty` или `missing`;
+- переменные, присутствующие в контейнере, к которым старт не обращался, с тем же состоянием.
+
+Вторая группа отвечает на вопрос, на который первая ответить не может: платформа развёртывания публикует нужное значение под собственным именем, и без перечня присутствующих имён это неотличимо от отсутствия значения вовсе. Именно так обнаруживается пара вроде `URL_AGENT` при читаемом `AGENT_URL`.
+
+Разделение описывает обращение, а не наличие значения, поэтому состояние выводится для обеих групп: переменная, к которой обращается только один путь кода, попадёт во вторую группу на другом пути, и оператору всё равно нужно видеть, задана она или пуста.
+
+Инвентарь MUST разбиваться на короткие нумерованные строки вида `i/N`. Одна длинная строка здесь не годится по той же причине, по которой не годится для `startup.configuration`: сборщики логов развёртывания отбрасывают её тем вероятнее, чем сложнее конфигурация, то есть ровно тогда, когда она нужна. Нумерация делает потерю части строк наблюдаемой.
+
+Значение переменной MUST NOT выводиться ни в каком виде: окружение содержит ключи модели, пароли БД и токены, а состояние `set` несёт всю нужную для диагностики информацию.
 
 Runtime MUST настроить собственный log handler до эмиссии `startup.configuration` и не полагаться на то, что это сделал внешний entrypoint. Запись рождается при сборке приложения, то есть раньше, чем ASGI-сервер настраивает логирование; без собственной настройки она теряется именно в тех развёртываниях, где нужна больше всего.
 
@@ -55,11 +68,17 @@ Runtime MUST настроить собственный log handler до эмис
 
 ## OTLP deployment configuration
 
-Runtime MUST поддерживать стандартные OTLP/HTTP environment variables: общий base endpoint `OTEL_ENDPOINT` и точные per-signal endpoints `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. Per-signal value имеет приоритет над общим endpoint. Если задан общий endpoint, runtime добавляет стандартные paths `/v1/traces`, `/v1/metrics`, `/v1/logs`; per-signal value уже является полным URL и не изменяется.
+Runtime MUST поддерживать стандартные OTLP/HTTP environment variables: общий base endpoint `OTEL_ENDPOINT` и точные per-signal endpoints `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. Per-signal value имеет приоритет над общим endpoint и уже является полным URL, поэтому не изменяется.
 
-Production profile MUST предоставить destination для всех трёх signals, напрямую или через OTel Collector. Deployment с backend-ом, принимающим только часть signals, MUST задавать только поддерживаемые per-signal endpoints и не отправлять ему неподдерживаемые requests. Отсутствующий endpoint не отключает instrumentation и не влияет на durable audit.
+Общий endpoint MUST выводить только `/v1/traces`. Metrics и logs отправляются исключительно по явно заданным per-signal endpoints. Один base URL не означает, что backend принимает все три сигнала: типовой managed collector принимает трассы и отвечает `403` на логи, а выведенный из base адрес превращает это в постоянный поток ошибок экспорта, который оператор не заказывал и по одному коду не диагностирует. Явный per-signal endpoint является утверждением оператора о том, что этот сигнал там принимают.
 
-Local Docker Compose profile MUST запускать version-pinned Arize Phoenix с PostgreSQL persistence в отдельной schema, bounded retention и выключенной Phoenix product telemetry. Core Agent и Memory Service отправляют туда только OTLP traces через `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; Phoenix UI и HTTP collector доступны на configurable host port, по умолчанию `6006`. Metrics/logs этого development profile могут быть направлены в отдельный collector через соответствующие per-signal variables.
+`ENABLE_OTEL=false` MUST полностью отключать OTLP-экспорт независимо от заданных endpoints. Instrumentation при этом продолжает работать внутри процесса, а durable audit не затрагивается ни в каком случае.
+
+Имя сервиса берётся из `OTEL_PROJECT_NAME`, а `OTEL_SERVICE_NAME` принимается как синоним с меньшим приоритетом.
+
+Отсутствующий endpoint не отключает instrumentation и не влияет на durable audit.
+
+Local Docker Compose profile MUST запускать version-pinned Arize Phoenix с PostgreSQL persistence в отдельной schema, bounded retention и выключенной Phoenix product telemetry. Core Agent отправляет туда только OTLP traces через `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; Phoenix UI и HTTP collector доступны на configurable host port, по умолчанию `6006`. Metrics/logs этого development profile могут быть направлены в отдельный collector через соответствующие per-signal variables.
 
 ## Context propagation
 
@@ -94,32 +113,28 @@ Incoming A2A call MUST NOT создавать отдельный transport/submi
 ```text
 core_agent.task.execute  (incoming W3C child or local root)
 ├── core_agent.context.assemble
-│   └── mcp.client memory.search
+│   └── core_agent.memory.search
 ├── gen_ai model operation
 ├── core_agent.policy.evaluate
 ├── core_agent.tool.execute
 │   ├── core_agent.terminal.session
 │   ├── core_agent.terminal.process
+│   ├── core_agent.memory.search
+│   │   ├── core_agent.memory.search.bm25
+│   │   ├── core_agent.memory.search.vector
+│   │   ├── core_agent.memory.search.graph
+│   │   └── core_agent.memory.search.rerank
+│   ├── core_agent.memory.ner
+│   ├── core_agent.memory.embed
+│   ├── core_agent.memory.index_publish
 │   └── mcp operation
 └── core_agent.task.checkpoint
-
-memory_service.mcp.request  (remote child via W3C Trace Context)
-├── memory_service.search.bm25
-├── memory_service.search.vector
-├── memory_service.search.graph
-├── memory_service.search.rerank
-└── memory_service.commit
-    ├── memory_service.chunk
-    ├── memory_service.embed
-    ├── memory_service.ner
-    ├── memory_service.entity_resolve
-    └── memory_service.index_publish
 
 core_agent.subagent.execute  (linked parent/child A2A Tasks)
 core_agent.notification.deliver
 ```
 
-Core Agent MUST NOT создавать fake internal memory spans: он создаёт MCP client span. Memory Service владеет detailed indexing/retrieval spans и продолжает trace через propagated context.
+Memory spans являются обычными spans агента: подсистема памяти работает в том же процессе, поэтому detailed retrieval/indexing spans создаются внутри того же trace, без cross-process trace context propagation в отдельный сервис.
 
 Операция с duration получает span. Point-in-time transition (`task state changed`, `memory revision published`, `compaction completed`) записывается OTel event/log record с timestamp и безопасными attributes.
 
@@ -153,7 +168,7 @@ Phoenix является operator UI, а не только хранилищем 
 - весь фактически доступный модели catalog публикуется как JSON schemas в `llm.tools.<n>.tool.json_schema`; assistant tool calls публикуются в `llm.output_messages.<n>.message.tool_calls.<n>.tool_call.*` с ID, function name и JSON arguments;
 - известный model usage публикуется одновременно в OpenInference `llm.token_count.*` и совместимых `gen_ai.usage.*` attributes;
 - `core_agent.tool.execute` имеет kind `TOOL`, `tool.name`, description, JSON input/parameters, JSON/text output, outcome и tool-call ID;
-- orchestration, policy, checkpoint и protocol spans имеют осмысленный `CHAIN`, а memory retrieval/rerank/embed spans — `RETRIEVER`, `RERANKER` или `EMBEDDING` соответственно;
+- orchestration, policy, checkpoint и protocol spans имеют осмысленный `CHAIN`, а `core_agent.memory.search*`, `*.rerank` и `*.embed` — `RETRIEVER`, `RERANKER` или `EMBEDDING` соответственно;
 - успешный span завершается OTel status `OK`, exception — `ERROR` с безопасным exception type без raw error message.
 
 Поля `input.value`, `output.value`, message content, tool schemas/descriptions/arguments/results являются content. Runtime MUST фильтровать их как при создании span, так и при последующем добавлении attributes. Deployment включает их только через `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. Отсутствующая переменная эквивалентна `false`; local Compose profile явно включает её для ограниченного operator-only Phoenix и документирует retention. Production MUST оставить её выключенной, пока отдельная policy не определит access control, redaction, sampling и retention.
@@ -170,13 +185,13 @@ Core Agent MUST публиковать минимум:
 - tool/MCP calls, latency, retries, denials и unknown side effects;
 - input requested, provided и timed out;
 - compaction count, base tokens, working before/after ratio и failures;
-- Memory MCP client latency/outcome и configured/filtered state;
+- memory tool latency/outcome и configured/filtered state;
 - background/subagent count, depth, fan-out, duration и budget usage;
 - terminal session/process create/reuse/cleanup latency, resource saturation и policy denials;
 - checkpoint/recovery/lease/notification delivery outcomes;
 - OTLP export drops/failures и telemetry queue saturation.
 
-Memory Service отдельно MUST публиковать search candidate counts/channels/rerank latency, write validation, 200-line rejections, indexing/NER/entity-resolution latency, revision publication и backlog.
+Подсистема памяти отдельно MUST публиковать search candidate counts/channels/rerank latency, write validation, 200-line rejections, indexing/NER/entity-resolution latency, revision publication и backlog.
 
 Metric labels MUST иметь bounded cardinality. Task/run/user/tenant IDs, prompt, path, command, entity text, memory ID и raw error message запрещены как labels.
 
@@ -199,7 +214,7 @@ Durable audit хранит:
 - model routes без hidden reasoning;
 - tool intents, safe normalized arguments digests и outcomes;
 - background/subagent contracts и notifications;
-- Memory MCP request/result IDs, server/index revisions и safe mutation outcomes; полный candidate/mutation audit принадлежит Memory Service;
+- memory tool request/result IDs, index revisions и safe mutation outcomes; полный candidate/mutation audit принадлежит подсистеме памяти;
 - NER/embedding/reranker versions и index publication;
 - compaction mappings, checkpoints, recovery и side-effect reconciliation.
 

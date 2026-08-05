@@ -35,7 +35,7 @@ class ComposeContractTests(unittest.TestCase):
         expected = (
             "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://phoenix:6006/v1/traces}"
         )
-        for service_name in ("agent", "memory"):
+        for service_name in ("agent",):
             environment = self.services[service_name]["environment"]
             self.assertEqual(
                 environment["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"], expected
@@ -73,7 +73,7 @@ class ComposeContractTests(unittest.TestCase):
             "${CORE_AGENT_RUNTIME_MODE:-with_terminal}",
         )
         self.assertIn("CORE_AGENT_ALLOWED_BUILTIN_TOOLS", environment)
-        self.assertIn("core.python.exec", environment["CORE_AGENT_ALLOWED_BUILTIN_TOOLS"])
+        self.assertIn("core_python_exec", environment["CORE_AGENT_ALLOWED_BUILTIN_TOOLS"])
 
     def test_transfer_scheme_variables_are_wired_through_compose(self):
         environment = self.services["agent"]["environment"]
@@ -86,6 +86,13 @@ class ComposeContractTests(unittest.TestCase):
             ("SEND_MESSAGE_API_KEY", "${SEND_MESSAGE_API_KEY:-}"),
             ("USER_ID", "${USER_ID:-anonymous}"),
             ("TASK_STORAGE_TYPE", "${TASK_STORAGE_TYPE:-postgres}"),
+            ("CORE_AGENT_MEMORY", "${CORE_AGENT_MEMORY:-optional}"),
+            ("MEMORY_STORAGE_TYPE", "${MEMORY_STORAGE_TYPE:-in-memory}"),
+            ("MEMORY_SEARCH_LIMIT", "${MEMORY_SEARCH_LIMIT:-10}"),
+            ("EMBEDDING_MODEL", "${EMBEDDING_MODEL:-}"),
+            ("EMBEDDING_API_BASE", "${EMBEDDING_API_BASE:-}"),
+            ("EMBEDDING_API_KEY", "${EMBEDDING_API_KEY:-}"),
+            ("EMBEDDING_DIMENSION", "${EMBEDDING_DIMENSION:-768}"),
         ):
             with self.subTest(name=name):
                 self.assertEqual(environment[name], expected)

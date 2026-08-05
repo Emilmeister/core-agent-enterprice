@@ -1,6 +1,6 @@
 services:
   database:
-    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    image: pgvector/pgvector:pg17@sha256:7ae6051efd0e60444282c27c7e141af07f322ce033300e727a49c3dd11075e38
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
@@ -80,6 +80,13 @@ services:
       A2A_STREAMING_ENABLED: ${A2A_STREAMING_ENABLED:-true}
       A2A_STREAMING_BUFFER_SIZE: ${A2A_STREAMING_BUFFER_SIZE:-10}
       ARTIFACT_STORAGE_TYPE: ${ARTIFACT_STORAGE_TYPE:-in-memory}
+      CORE_AGENT_MEMORY: ${CORE_AGENT_MEMORY:-optional}
+      MEMORY_STORAGE_TYPE: ${MEMORY_STORAGE_TYPE:-in-memory}
+      MEMORY_SEARCH_LIMIT: ${MEMORY_SEARCH_LIMIT:-10}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
       REMOTE_AGENTS: ${REMOTE_AGENTS:-}
       SEND_MESSAGE_API_KEY: ${SEND_MESSAGE_API_KEY:-}
       MCP_URL: ${MCP_URL:-}
@@ -87,7 +94,7 @@ services:
       PORT: 8000
       CORE_AGENT_MAX_DEPTH: ${CORE_AGENT_MAX_DEPTH:-2}
       CORE_AGENT_RUNTIME_MODE: ${CORE_AGENT_RUNTIME_MODE:-with_terminal}
-      CORE_AGENT_ALLOWED_BUILTIN_TOOLS: ${CORE_AGENT_ALLOWED_BUILTIN_TOOLS:-core.terminal.exec,core.python.exec,core.task.start,core.task.get,core.task.list,core.task.wait,core.task.cancel,core.delegate}
+      CORE_AGENT_ALLOWED_BUILTIN_TOOLS: ${CORE_AGENT_ALLOWED_BUILTIN_TOOLS:-core_terminal_exec,core_python_exec,core_task_start,core_task_get,core_task_list,core_task_wait,core_task_cancel,core_delegate}
       CORE_AGENT_PYTHON_MAX_CODE_CHARS: ${CORE_AGENT_PYTHON_MAX_CODE_CHARS:-100000}
       CORE_AGENT_PYTHON_MAX_SECONDS: ${CORE_AGENT_PYTHON_MAX_SECONDS:-120}
       CORE_AGENT_PYTHON_MAX_OUTPUT_BYTES: ${CORE_AGENT_PYTHON_MAX_OUTPUT_BYTES:-1000000}
@@ -122,46 +129,6 @@ services:
       retries: 6
     restart: unless-stopped
 
-  memory-volume-init:
-    build: .
-    user: "0:0"
-    command: ["chown", "-R", "agent:agent", "/memory"]
-    network_mode: none
-    volumes:
-      - memory-data:/memory
-    restart: "no"
-
-  memory:
-    build: .
-    command: ["core-agent-memory"]
-    environment:
-      MEMORY_ENVIRONMENT: development
-      MEMORY_ROOT: /memory
-      MEMORY_ALLOWED_NAMESPACE_PREFIXES: session/
-      MEMORY_HOST: 0.0.0.0
-      MEMORY_PORT: 8000
-      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://phoenix:6006/v1/traces}
-    volumes:
-      - memory-data:/memory
-    depends_on:
-      memory-volume-init:
-        condition: service_completed_successfully
-      phoenix:
-        condition: service_healthy
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import socket; socket.create_connection(('127.0.0.1', 8000), 2).close()",
-        ]
-      interval: 10s
-      timeout: 3s
-      retries: 6
-    restart: unless-stopped
-
 volumes:
   postgres-data:
   agent-data:
-  memory-data:

@@ -13,7 +13,10 @@ import threading
 from .errors import CoreError
 
 
-MAX_RPC_BYTES = 2_000_000
+# Sized so the largest artifact the storage accepts still fits in one frame
+# as base64: a smaller limit makes core_artifact_save fail from here for a
+# file it accepts from anywhere else.
+MAX_RPC_BYTES = 140_000_000
 
 RUNNER = r'''
 import json
@@ -21,7 +24,7 @@ import socket
 import sys
 import uuid
 
-MAX_RPC_BYTES = 2_000_000
+MAX_RPC_BYTES = 140_000_000
 
 
 def receive(stream):
@@ -85,7 +88,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             "ToolCallError": ToolCallError,
             "tools": Tools(stream, initial["tools"]),
         }
-        exec(compile(initial["code"], "<core.python.exec>", "exec"), namespace, namespace)
+        exec(compile(initial["code"], "<core_python_exec>", "exec"), namespace, namespace)
 '''
 
 
@@ -235,6 +238,33 @@ class PythonToolBroker:
         shutil.rmtree(self.directory, ignore_errors=True)
 
 
+def _interpreter():
+    """The interpreter a terminal `pip install` writes to, not the agent's own.
+
+    The agent virtualenv has no pip and no writable site-packages, so a package
+    installed from `core_terminal_exec` is invisible to it. The failure is
+    silent in the worst way — the install reports success and the next import
+    does not find the module — so both tools must share one interpreter, and the
+    one that can be installed into is the one outside the virtualenv. Its own
+    bin directory leads the image PATH, hence searching without it rather than
+    asking `which` and getting the virtualenv straight back.
+    """
+    # The directory, then resolve it: resolving the executable first follows the
+    # symlink out of the virtualenv and into the very interpreter being avoided.
+    own = Path(sys.executable).parent.resolve()
+    search = os.pathsep.join(
+        entry
+        for entry in os.environ.get("PATH", os.defpath).split(os.pathsep)
+        if entry and Path(entry).resolve() != own
+    )
+    for name in ("python3", "python"):
+        found = shutil.which(name, path=search)
+        if found:
+            return found
+    # No interpreter besides the virtualenv: it is the deployment's only one.
+    return sys.executable
+
+
 def execute_python(
     environment_manager,
     *,
@@ -249,8 +279,13 @@ def execute_python(
     with PythonToolBroker(code, tool_names, dispatch) as broker:
         request = {
             "argv": [
-                sys.executable,
-                "-I",
+                _interpreter(),
+                # `-P` only, never `-I`: isolated mode also drops user
+                # site-packages and PYTHONPATH, which is precisely what a
+                # `pip install` from the terminal writes to. `-P` alone keeps
+                # the working directory out of sys.path, so a workspace file
+                # named like a stdlib module cannot break the runner itself.
+                "-P",
                 "-u",
                 "-c",
                 RUNNER,

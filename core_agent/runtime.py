@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 import json
 
+from .artifact_service import guess_media_type
 from .config import (
     MAX_SUBAGENT_DEPTH,
     AgentConfig,
@@ -29,6 +30,7 @@ from .errors import CoreError
 from .skills import SkillResolver
 from .kernel import KernelCompiler
 from .python_exec import execute_python
+from .mcp import mcp_tool_index
 from .remote_agents import build_forwarded_headers
 from .security import redact
 from .streaming import NullStreamPublisher
@@ -38,11 +40,17 @@ from .workflow import InMemoryWorkflowStore, WorkflowRecord
 
 NULL_STREAM = NullStreamPublisher()
 
+# Memory failures the model can act on itself. MEMORY_INDEX_FAILED and provider
+# errors are absent on purpose: they mean the answer would be wrong, not that the
+# model asked for the wrong thing.
+RECOVERABLE_MEMORY_ERRORS = frozenset(
+    {"MEMORY_FILE_TOO_LARGE", "MEMORY_CONFLICT", "MEMORY_INVALID", "NOT_FOUND"}
+)
 
-def _mcp_read_only(tool_name):
-    operation = tool_name.rsplit(".", 1)[-1]
+
+def _mcp_read_only(remote_tool):
     # ponytail: name fallback until trusted MCP catalogs expose risk annotations.
-    return operation.startswith(("get", "list", "read", "search", "index", "entity"))
+    return remote_tool.startswith(("get", "list", "read", "search", "index", "entity"))
 
 
 @dataclass(frozen=True)
@@ -97,6 +105,7 @@ class CoreAgent:
         log_content=False,
         log_max_chars=12_000,
         artifact_service=None,
+        memory_registry=None,
         remote_agents=None,
         send_message_api_key=None,
         platform_mcp=(),
@@ -122,8 +131,8 @@ class CoreAgent:
             "Never reveal secrets or hidden reasoning.",
             "Only EffectiveConfig capabilities are authorized.",
             "Validate tools, preserve durable state, and fail closed. When "
-            "core.delegate is absent, complete the task directly and do not try to "
-            "create another agent. core.delegate joins by default; consume its child "
+            "core_delegate is absent, complete the task directly and do not try to "
+            "create another agent. core_delegate joins by default; consume its child "
             "result and never repeat or perform the delegated work yourself. Use "
             "background=true only for independent work and wait when its result is "
             "needed. Provider tool aliases are transport-only; never "
@@ -144,6 +153,7 @@ class CoreAgent:
         self._task_headers = {}
         self._model_streams_deltas = self._accepts_deltas(self.model)
         self.artifact_service = artifact_service
+        self.memory_registry = memory_registry
         self.platform_mcp = tuple(platform_mcp)
         self.declared_skills = tuple(declared_skills)
         self._silent_mcp_warned = set()
@@ -153,17 +163,23 @@ class CoreAgent:
         self.send_message_api_key = send_message_api_key
         self.tool_runtime.handlers.update(
             {
-                "core.task.start": self._task_start,
-                "core.task.get": self._task_get,
-                "core.task.list": self._task_list,
-                "core.task.wait": self._task_wait,
-                "core.task.cancel": self._task_cancel,
-                "core.python.exec": self._python_exec,
-                "core.delegate": self._delegate,
-                "core.artifact.save": self._artifact_save,
-                "core.artifact.load": self._artifact_load,
-                "core.artifact.list": self._artifact_list,
-                "core.agent.send_message": self._send_message,
+                "core_task_start": self._task_start,
+                "core_task_get": self._task_get,
+                "core_task_list": self._task_list,
+                "core_task_wait": self._task_wait,
+                "core_task_cancel": self._task_cancel,
+                "core_python_exec": self._python_exec,
+                "core_delegate": self._delegate,
+                "core_artifact_save": self._artifact_save,
+                "core_artifact_load": self._artifact_load,
+                "core_artifact_list": self._artifact_list,
+                "core_agent_send_message": self._send_message,
+                "core_memory_search": self._memory_search,
+                "core_memory_read": self._memory_read,
+                "core_memory_create": self._memory_create,
+                "core_memory_update": self._memory_update,
+                "core_memory_split": self._memory_split,
+                "core_memory_delete": self._memory_delete,
             }
         )
         if self.depth == 0 and hasattr(self.task_scheduler, "register"):
@@ -271,12 +287,9 @@ class CoreAgent:
 
     def _resolve_capabilities(self, request):
         raw = self.agent_config.to_dict()
-        memory_mode = raw["features"].get("memory", "disabled")
         discovered = {}
         if raw["features"].get("mcp"):
             for declaration in self.platform_mcp:
-                if declaration.get("role") == "memory" and memory_mode == "disabled":
-                    continue
                 if declaration["name"] in self.platform_config.allowed_mcp_servers:
                     try:
                         discovered[declaration["name"]] = self.mcp_connector.connect(
@@ -352,11 +365,28 @@ class CoreAgent:
             if skill.name.lower() in request.prompt.lower()
         )
 
+    @staticmethod
+    def _delegate_schema(schema, effective):
+        """Name the capabilities this run can actually hand a child.
+
+        A bare `{"type": "string"}` tells the model to invent an identifier and
+        leaves the mismatch to be discovered after the call. An enum of the
+        names the parent holds is the same information stated once, in the place
+        the model is already reading.
+        """
+        schema = copy.deepcopy(schema)
+        schema["properties"]["tools"]["items"] = {
+            "enum": sorted(effective.model_tool_catalog)
+        }
+        schema["properties"]["skills"]["items"] = {"enum": sorted(effective.skills)}
+        return schema
+
     def _tool_catalog(self, effective, discovered):
         catalog = {}
+        index = mcp_tool_index(effective.mcp_tools)
         for name in effective.model_tool_catalog:
-            server, separator, remote_tool = name.partition(".")
-            if separator and server in effective.mcp_tools:
+            if name in index:
+                server, remote_tool = index[name]
                 catalog[name] = {
                     "description": name,
                     "input_schema": discovered.get(server, {}).get(remote_tool, {}),
@@ -369,9 +399,12 @@ class CoreAgent:
                         raise
                     catalog[name] = {}
                 else:
+                    schema = definition.input_schema
+                    if name == "core_delegate":
+                        schema = self._delegate_schema(schema, effective)
                     catalog[name] = {
                         "description": definition.description,
-                        "input_schema": definition.input_schema,
+                        "input_schema": schema,
                     }
         return catalog
 
@@ -802,10 +835,19 @@ class CoreAgent:
             overlap=context.get("compaction_overlap", 0),
         )
 
+    @staticmethod
+    def _mcp_target(name, effective):
+        """The (server, tool) pair behind a canonical MCP name, or None."""
+        return mcp_tool_index(effective.mcp_tools).get(name)
+
     def _definition(self, call, effective, discovered):
-        server, separator, remote_tool = call.name.partition(".")
-        if separator and server in effective.mcp_tools:
-            read_only = _mcp_read_only(call.name)
+        target = self._mcp_target(call.name, effective)
+        if target:
+            server, remote_tool = target
+            # The remote name, never the canonical one: `docs_search` starts
+            # with the server, so asking it whether it reads or writes answers
+            # about the wrong word.
+            read_only = _mcp_read_only(remote_tool)
             return (
                 ToolDefinition(
                     call.name,
@@ -1022,25 +1064,50 @@ class CoreAgent:
         return isinstance(error, CoreError) and (
             error.code in {"TOOL_ARGUMENT_INVALID", "TOOL_START_FAILED"}
             or (
-                call.name in {"core.delegate", "core.task.start"}
+                call.name in {"core_delegate", "core_task_start"}
                 and error.code == "CAPABILITY_DISABLED"
+            )
+            # The 200-line protocol is built on the model reading
+            # MEMORY_FILE_TOO_LARGE and answering with core_memory_split; a run
+            # that dies on it cannot complete the very recovery it prescribes.
+            or (
+                call.name.startswith("core_memory_")
+                and error.code in RECOVERABLE_MEMORY_ERRORS
             )
         )
 
     @staticmethod
+    def _mcp_outcome(call, result):
+        """An MCP tool reports its own failure in the result, not by transport.
+
+        The protocol answers a failed tool with HTTP 200 and `isError`, so
+        passing the body through as output hands the model an error message
+        dressed as data.
+        """
+        if isinstance(result, dict) and result.get("isError"):
+            return ToolResult(call.id, "failed", result, "TOOL_EXECUTION_FAILED")
+        return result
+
+    @staticmethod
     def _failed_tool_outcome(call, error):
-        return ToolResult(
-            call.id,
-            "failed",
-            {"error": {"code": error.code, "message": str(error)[:1000]}},
-            error.code,
-        )
+        payload = {"code": error.code, "message": str(error)[:1000]}
+        # The structured payload is the actionable part: line counts and
+        # suggested boundaries are what turn a refusal into the next tool call.
+        if getattr(error, "data", None):
+            payload["details"] = error.data
+        return ToolResult(call.id, "failed", {"error": payload}, error.code)
 
     def _record_tool_outcome(
         self, record, snapshot, call, outcome, *, lease_token, span=None
     ):
         result_text = self._result_text(call.id, outcome, call.name)
-        status = outcome.status if isinstance(outcome, ToolResult) else "succeeded"
+        # A handler may return a ToolResult or the bare output; MCP tools return
+        # the latter. Unwrapped once here because every reader below needs the
+        # same answer, and the one reader that unwrapped it on its own crashed
+        # the run whenever content logging met an MCP tool.
+        is_result = isinstance(outcome, ToolResult)
+        output = outcome.output if is_result else outcome
+        status = outcome.status if is_result else "succeeded"
         succeeded = status == "succeeded"
         denied = status == "denied"
         error_code = None
@@ -1064,9 +1131,7 @@ class CoreAgent:
             call.name,
             {
                 "status": status,
-                "output": self._value(
-                    outcome.output if isinstance(outcome, ToolResult) else outcome
-                ),
+                "output": self._value(output),
                 **({"error_code": error_code} if error_code else {}),
             },
         )
@@ -1088,7 +1153,7 @@ class CoreAgent:
             tool_name=call.name,
             status=status,
             **({"error_code": error_code} if error_code else {}),
-            **({"output": self._value(outcome.output)} if self.log_content else {}),
+            **({"output": self._value(output)} if self.log_content else {}),
         )
         updated = self._record_transition(
             record,
@@ -1109,7 +1174,7 @@ class CoreAgent:
         )
         output = outcome.output if isinstance(outcome, ToolResult) else outcome
         if (
-            call.name in {"core.delegate", "core.task.get", "core.task.wait"}
+            call.name in {"core_delegate", "core_task_get", "core_task_wait"}
             and isinstance(output, dict)
             and output.get("state") in {"completed", "failed", "canceled"}
             and isinstance(output.get("task_id"), str)
@@ -1156,7 +1221,11 @@ class CoreAgent:
         )
         try:
             if is_mcp:
-                outcome = self.mcp_connector.call(call.name, call.arguments)
+                server, remote_tool = self._mcp_target(call.name, effective)
+                outcome = self._mcp_outcome(
+                    call,
+                    self.mcp_connector.call(server, remote_tool, call.arguments),
+                )
             else:
                 outcome = self.tool_runtime.execute(
                     call,
@@ -1559,9 +1628,9 @@ class CoreAgent:
         target = arguments["tool"]
         if (
             target not in self._enabled_builtins()
-            or target.startswith("core.task.")
+            or target.startswith("core_task_")
             or target
-            in {"core.delegate", "core.python.exec", "core.agent.send_message"}
+            in {"core_delegate", "core_python_exec", "core_agent_send_message"}
         ):
             raise CoreError("CAPABILITY_DISABLED")
         task_run_id = f"{run_id}-background-{uuid.uuid4()}"
@@ -1606,12 +1675,12 @@ class CoreAgent:
         ):
             raise CoreError("CAPABILITY_DISABLED")
         _raw, discovered, effective = cached
-        effective.require_tool("core.python.exec")
-        schema = self.tool_runtime.registry.get("core.python.exec").input_schema[
+        effective.require_tool("core_python_exec")
+        schema = self.tool_runtime.registry.get("core_python_exec").input_schema[
             "properties"
         ]
         parent_context = self.telemetry.current_context()
-        tool_names = set(effective.model_tool_catalog) - {"core.python.exec"}
+        tool_names = set(effective.model_tool_catalog) - {"core_python_exec"}
         return execute_python(
             self.tool_runtime.environment_manager,
             run_id=run_id,
@@ -1645,7 +1714,7 @@ class CoreAgent:
         effective,
         parent_context,
     ):
-        if name == "core.python.exec":
+        if name == "core_python_exec":
             raise CoreError("CAPABILITY_DISABLED")
         effective.require_tool(name)
         call = ToolCall(str(uuid.uuid4()), name, arguments)
@@ -1661,7 +1730,7 @@ class CoreAgent:
         audit_data = {
             "tool_call_id": call.id,
             "tool_name": name,
-            "source": "core.python.exec",
+            "source": "core_python_exec",
         }
         self._log(
             "tool.requested",
@@ -1669,7 +1738,7 @@ class CoreAgent:
             task_id=scope.get("task_id"),
             tool_call_id=call.id,
             tool_name=name,
-            source="core.python.exec",
+            source="core_python_exec",
             **({"arguments": arguments} if self.log_content else {}),
         )
         try:
@@ -1692,7 +1761,7 @@ class CoreAgent:
                 task_id=scope.get("task_id"),
                 tool_call_id=call.id,
                 tool_name=name,
-                source="core.python.exec",
+                source="core_python_exec",
                 error_code=error.code,
             )
             raise
@@ -1705,7 +1774,12 @@ class CoreAgent:
             ) as span:
                 self._instrument_tool(span, call, definition)
                 if is_mcp:
-                    output = self.mcp_connector.call(name, arguments)
+                    server, remote_tool = self._mcp_target(name, effective)
+                    output = self.mcp_connector.call(server, remote_tool, arguments)
+                    # The same rule as a failed built-in outcome below: inside
+                    # tools.call a failure has to raise, not return a body.
+                    if isinstance(output, dict) and output.get("isError"):
+                        raise CoreError("TOOL_EXECUTION_FAILED", self._json(output)[:500])
                 else:
                     outcome = self.tool_runtime.execute(
                         call,
@@ -1751,7 +1825,7 @@ class CoreAgent:
                 task_id=scope.get("task_id"),
                 tool_call_id=call.id,
                 tool_name=name,
-                source="core.python.exec",
+                source="core_python_exec",
                 error_code=getattr(error, "code", type(error).__name__),
             )
             raise
@@ -1764,7 +1838,7 @@ class CoreAgent:
             task_id=scope.get("task_id"),
             tool_call_id=call.id,
             tool_name=name,
-            source="core.python.exec",
+            source="core_python_exec",
             **({"output": value} if self.log_content else {}),
         )
         return value
@@ -1819,6 +1893,140 @@ class CoreAgent:
             )
         )
 
+    def _memory(self, run_id, scope_name):
+        """Resolve the per-user corpus and the namespace for one call.
+
+        The model chooses only `user` or `session`; the identity and the session
+        id come from the authenticated run, so no argument can address another
+        user's memory.
+        """
+        if self.memory_registry is None:
+            raise CoreError("CAPABILITY_DISABLED")
+        scope = self._run_scopes.get(run_id, {})
+        user_id = scope.get("identity") or "anonymous"
+        if scope_name == "session":
+            session_id = scope.get("session_id")
+            if not session_id:
+                raise CoreError(
+                    "TOOL_ARGUMENT_INVALID",
+                    "this run has no session; use scope='user'",
+                )
+            namespace = f"session/{session_id}"
+        elif scope_name == "user":
+            namespace = f"subject/{user_id}"
+        else:
+            raise CoreError("TOOL_ARGUMENT_INVALID", "scope must be user or session")
+        service = self.memory_registry.service(
+            self.agent_config.agent["name"], user_id
+        )
+        return service, namespace
+
+    def _memory_sources(self, run_id):
+        scope = self._run_scopes.get(run_id, {})
+        return ({"task_id": scope.get("task_id") or "", "event_revision": 0},)
+
+    def _memory_search(self, arguments, run_id):
+        service, namespace = self._memory(run_id, arguments.get("scope", "user"))
+        response = service.search(
+            arguments["query"],
+            namespace=namespace,
+            filters={"kind": arguments.get("kind")},
+            limit=int(arguments.get("limit") or self.memory_registry.search_limit),
+        )
+        documents = service.list_documents()
+        return {
+            "results": [
+                {
+                    "memory_id": item.memory_id,
+                    "title": item.provenance.get("title", ""),
+                    "kind": getattr(documents.get(item.memory_id), "kind", ""),
+                    "revision": getattr(documents.get(item.memory_id), "revision", 0),
+                    "excerpt": getattr(documents.get(item.memory_id), "body", "")[:400],
+                    "scores": item.scores,
+                }
+                for item in response.results
+            ],
+            "degraded_channels": [
+                {"channel": channel, "reason": reason}
+                for channel, reason in sorted(response.degraded_channels.items())
+            ],
+            "index_revision": service.repository_revision,
+        }
+
+    def _memory_read(self, arguments, run_id):
+        service, _ = self._memory(run_id, arguments.get("scope", "user"))
+        document = service.read(arguments["memory_id"])
+        return {
+            "memory_id": document.id,
+            "title": document.title,
+            "kind": document.kind,
+            "status": document.status,
+            # Without this the model cannot tell whether the note outlives the
+            # session it is reading it in.
+            "scope": "session" if document.namespace.startswith("session/") else "user",
+            "revision": document.revision,
+            "body": document.body,
+            "body_line_count": document.body_line_count,
+        }
+
+    def _memory_create(self, arguments, run_id):
+        service, namespace = self._memory(run_id, arguments.get("scope", "user"))
+        document, result = service.create(
+            title=arguments["title"],
+            body=arguments["body"],
+            namespace=namespace,
+            kind=arguments.get("kind") or "fact",
+            tags=tuple(arguments.get("tags") or ()),
+            sources=self._memory_sources(run_id),
+        )
+        return {
+            "memory_id": document.id,
+            "revision": document.revision,
+            "repository_revision": result.repository_revision,
+            "body_line_count": document.body_line_count,
+        }
+
+    def _memory_update(self, arguments, run_id):
+        service, _ = self._memory(run_id, arguments.get("scope", "user"))
+        document, result = service.update(
+            arguments["memory_id"],
+            body=arguments["body"],
+            expected_revision=int(arguments["expected_revision"]),
+            title=arguments.get("title"),
+            status=arguments.get("status"),
+        )
+        return {
+            "memory_id": document.id,
+            "revision": document.revision,
+            "repository_revision": result.repository_revision,
+            "body_line_count": document.body_line_count,
+        }
+
+    def _memory_split(self, arguments, run_id):
+        service, _ = self._memory(run_id, arguments.get("scope", "user"))
+        memory_ids, result = service.split(
+            arguments["memory_id"],
+            overview=arguments["overview"],
+            children=arguments["children"],
+            expected_revision=int(arguments["expected_revision"]),
+        )
+        return {
+            "memory_ids": list(memory_ids),
+            "repository_revision": result.repository_revision,
+        }
+
+    def _memory_delete(self, arguments, run_id):
+        service, _ = self._memory(run_id, arguments.get("scope", "user"))
+        result = service.delete(
+            arguments["memory_id"],
+            reason=arguments["reason"],
+            expected_revision=int(arguments["expected_revision"]),
+        )
+        return {
+            "committed": result.committed,
+            "repository_revision": result.repository_revision,
+        }
+
     def _artifact_scope(self, run_id):
         if self.artifact_service is None:
             raise CoreError("CAPABILITY_DISABLED")
@@ -1830,8 +2038,23 @@ class CoreAgent:
         }
 
     def _artifact_save(self, arguments, run_id):
-        content = arguments["content"]
-        if arguments.get("encoding", "text") == "base64":
+        content = arguments.get("content")
+        path = arguments.get("path")
+        if (content is None) == (path is None):
+            raise CoreError(
+                "TOOL_ARGUMENT_INVALID", "pass exactly one of content and path"
+            )
+        media_type = arguments.get("mime_type")
+        if path is not None:
+            # The runtime reads the file itself: a finished file has no reason to
+            # become a string, and base64 would put every byte through the IPC
+            # frame on the way here.
+            resolved = self.tool_runtime.environment_manager.workspace_file(
+                run_id, path
+            )
+            blob = resolved.read_bytes()
+            media_type = media_type or guess_media_type(resolved.name)
+        elif arguments.get("encoding", "text") == "base64":
             try:
                 blob = base64.b64decode(content, validate=True)
             except (binascii.Error, ValueError) as error:
@@ -1844,7 +2067,7 @@ class CoreAgent:
             **self._artifact_scope(run_id),
             filename=arguments["filename"],
             content=blob,
-            media_type=arguments.get("mime_type"),
+            media_type=media_type,
             metadata=arguments.get("metadata"),
         )
         return {
@@ -1981,25 +2204,25 @@ class CoreAgent:
                 tenant_id=scope.get("tenant_id", "default"),
             )
             >= parent_budget["fan_out"]
-            or not set(contract.tools) <= self._enabled_builtins()
-            or not set(contract.skills) <= set(effective.skills)
-            or any(
-                server not in effective.mcp_tools
-                or not set(tools) <= set(effective.mcp_tools[server])
-                for server, tools in contract.mcp.items()
-            )
-            or any(
-                value > parent_budget.get(key, value)
-                for key, value in contract.budget.items()
-            )
         ):
-            raise CoreError("CAPABILITY_DISABLED")
+            raise CoreError(
+                "CAPABILITY_DISABLED",
+                f"this agent already has {parent_budget['fan_out']} children running",
+            )
+        # One rule, stated once: the contract splits its own tool list and names
+        # whatever it refuses.
+        builtins, delegated_mcp = contract.resolve(
+            tools=self._enabled_builtins(),
+            mcp=effective.mcp_tools,
+            skills=effective.skills,
+            budgets=parent_budget,
+        )
 
         child_depth = self.depth + 1
         child_tools = tuple(
             tool
-            for tool in contract.tools
-            if tool != "core.delegate" or child_depth < parent_budget["depth"]
+            for tool in builtins
+            if tool != "core_delegate" or child_depth < parent_budget["depth"]
         )
         child_raw = copy.deepcopy(raw)
         child_raw["tools"]["builtins"] = {
@@ -2009,25 +2232,29 @@ class CoreAgent:
         }
         child_raw["tools"]["mcp"] = {
             "default": "deny",
-            "allow_servers": list(contract.mcp),
-            "allow_tools": {key: list(value) for key, value in contract.mcp.items()},
+            "allow_servers": list(delegated_mcp),
+            "allow_tools": {
+                key: sorted(value) for key, value in delegated_mcp.items()
+            },
         }
         child_raw["skills"] = {
             "default": "deny",
             "allow": list(contract.skills),
         }
-        memory_enabled = "memory" in contract.mcp
-        delegation_enabled = "core.delegate" in child_tools
+        # Shared memory is now expressed by delegating memory tools, not by
+        # handing over an MCP server.
+        memory_enabled = any(name.startswith("core_memory_") for name in child_tools)
+        delegation_enabled = "core_delegate" in child_tools
         child_raw["features"].update(
             {
                 "memory": raw["features"].get("memory", "optional")
                 if memory_enabled
                 else "disabled",
-                "mcp": bool(contract.mcp),
+                "mcp": bool(delegated_mcp),
                 "skills": bool(contract.skills),
-                "terminal": "core.terminal.exec" in child_tools,
+                "terminal": "core_terminal_exec" in child_tools,
                 "background_tasks": delegation_enabled
-                or any(name.startswith("core.task.") for name in child_tools),
+                or any(name.startswith("core_task_") for name in child_tools),
                 "delegation": delegation_enabled,
             }
         )
@@ -2076,12 +2303,12 @@ class CoreAgent:
             "mode": "background",
             "notification_channel": "durable_mailbox",
             "next_action": {
-                "tool": "core.task.wait",
+                "tool": "core_task_wait",
                 "arguments": {"task_id": task.id},
             },
             "instruction": (
                 "Continue only independent work. Before using this result or answering "
-                "the delegated objective, call core.task.wait with this task_id. Do not "
+                "the delegated objective, call core_task_wait with this task_id. Do not "
                 "repeat or perform the delegated work yourself."
             ),
         }
@@ -2116,6 +2343,7 @@ class CoreAgent:
             platform_mcp=self.platform_mcp,
             declared_skills=self.declared_skills,
             artifact_service=self.artifact_service,
+            memory_registry=self.memory_registry,
             remote_agents=self.remote_agents,
             send_message_api_key=self.send_message_api_key,
             workflow_store=self.workflow_store,

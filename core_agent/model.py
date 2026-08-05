@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
+import contextlib
 import hashlib
 import json
 import re
 import uuid
 from dataclasses import dataclass
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -433,6 +435,26 @@ class CompatibleHttpModel:
         except (OSError, TimeoutError, URLError) as error:
             raise CoreError("MODEL_UNAVAILABLE", str(error), retryable=True) from error
 
+    @contextlib.contextmanager
+    def _opened(self, body, headers):
+        """Cover the response body, not only the connection.
+
+        The socket timeout applies to every read, so a stalled body — or, on a
+        stream, a gap between chunks longer than LLM_TIMEOUT — raises here and
+        not at connect time. Converting only the connect leaves that as a bare
+        TimeoutError: no stable code, no `retryable`, no reflect-and-retry, and
+        an A2A Task that dies with a traceback instead of a failure.
+        """
+        with self._open(body, headers) as response:
+            try:
+                yield response
+            except CoreError:
+                raise
+            except (OSError, TimeoutError, URLError, HTTPException) as error:
+                raise CoreError(
+                    "MODEL_UNAVAILABLE", str(error), retryable=True
+                ) from error
+
     @staticmethod
     def _server_sent_events(stream):
         """Yield decoded `data:` payloads from a text/event-stream response."""
@@ -466,10 +488,14 @@ class CompatibleHttpModel:
                     message["content"] = integrate_stream_chunk(
                         message["content"] or "", content
                     )
+                # Unstripped, like the content delta beside it: the reasoning
+                # arrives token by token, and trimming each one glues the words
+                # together in the assembled text.
                 visible = self._visible_reasoning(
-                    delta.get("reasoning_details")
+                    delta.get("reasoning_details"), strip=False
                 ) or self._visible_reasoning(
-                    delta.get("reasoning_content") or delta.get("reasoning")
+                    delta.get("reasoning_content") or delta.get("reasoning"),
+                    strip=False,
                 )
                 if visible:
                     reasoning = integrate_stream_chunk(reasoning, visible)
@@ -563,13 +589,13 @@ class CompatibleHttpModel:
             on_delta(public, self._canonical_text(reasoning, reverse) or embedded)
 
         headers = {**headers, "Accept": "text/event-stream"}
-        with self._open(body, headers) as stream:
+        with self._opened(body, headers) as stream:
             if self.api_format == "openai":
                 return self._stream_openai(stream, publish)
             return self._stream_anthropic(stream, publish)
 
     def _post(self, body, headers):
-        with self._open(body, headers) as response:
+        with self._opened(body, headers) as response:
             raw = response.read(16_777_217)
         if len(raw) > 16_777_216:
             raise CoreError("MODEL_UNAVAILABLE", "model response is too large")
@@ -591,16 +617,22 @@ class CompatibleHttpModel:
                 ) from error
         if not isinstance(value, dict):
             raise CoreError("MODEL_UNAVAILABLE", "tool arguments must be an object")
-        return value
+        # An explicit null is the model saying it has nothing for that argument,
+        # which is what omitting it means. Keeping it would fail validation on a
+        # perfectly ordinary call, and it is how a schema that marks optional
+        # fields nullable — as strict mode requires — is answered.
+        return {key: item for key, item in value.items() if item is not None}
 
     @staticmethod
-    def _canonical_text(value, reverse=None):
+    def _canonical_text(value, reverse=None, *, strip=True):
         for wire_name, canonical_name in sorted(
             (reverse or {}).items(), key=lambda item: len(item[0]), reverse=True
         ):
             if wire_name != canonical_name:
                 value = value.replace(wire_name, canonical_name)
-        return value.strip()
+        # Trimming is right for a whole message and wrong for a fragment of one:
+        # the space between two streamed tokens lives at the edge of a chunk.
+        return value.strip() if strip else value
 
     @classmethod
     def _split_reasoning(cls, value, reverse=None):
@@ -617,16 +649,18 @@ class CompatibleHttpModel:
         )
 
     @classmethod
-    def _visible_reasoning(cls, value, reverse=None):
+    def _visible_reasoning(cls, value, reverse=None, *, strip=True):
         if isinstance(value, str):
-            return cls._canonical_text(value, reverse)
+            return cls._canonical_text(value, reverse, strip=strip)
         if isinstance(value, list):
-            parts = [cls._visible_reasoning(item, reverse) for item in value]
+            parts = [
+                cls._visible_reasoning(item, reverse, strip=strip) for item in value
+            ]
             return "\n\n".join(part for part in parts if part)
         if isinstance(value, dict):
             for key in ("text", "reasoning", "reasoning_content", "summary"):
                 if key in value:
-                    visible = cls._visible_reasoning(value[key], reverse)
+                    visible = cls._visible_reasoning(value[key], reverse, strip=strip)
                     if visible:
                         return visible
         return ""

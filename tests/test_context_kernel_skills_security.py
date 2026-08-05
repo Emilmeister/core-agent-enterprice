@@ -98,8 +98,32 @@ class CompactionTests(unittest.TestCase):
         )
         self.assertIs(result, state)
 
-    def test_pinned_data_above_target_fails_instead_of_truncating(self):
+    def _summary(self, tokens):
+        return ContextItem(
+            "summary",
+            "Goal: g\nConstraints: c\nDecisions: d\nCompleted: c\n"
+            "Artifacts: a\nPending: p\nFailures: f",
+            tokens,
+        )
+
+    def test_pinned_above_the_target_still_compacts_while_it_fits_the_window(self):
+        """The target is a goal; the window is the condition for surviving."""
         pinned = (ContextItem("prompt", "must stay", 160, pinned=True),)
+        history = tuple(ContextItem("history", str(i), 100) for i in range(8))
+        state = ContextState(
+            active=(*pinned, *history),
+            transcript=(*pinned, *history),
+            sequence_range=(1, 9),
+        )
+        result = Compactor(
+            self.budget, lambda items, max_tokens: self._summary(0)
+        ).compact(state)
+        # 160 pinned against a 150 target: nothing here is unrecoverable.
+        self.assertEqual(result.working_tokens, 160)
+        self.assertEqual(result.active[0].content, "must stay")
+
+    def test_pinned_data_that_does_not_fit_the_window_fails_instead_of_truncating(self):
+        pinned = (ContextItem("prompt", "must stay", 1_180, pinned=True),)
         history = tuple(ContextItem("history", str(i), 100) for i in range(8))
         state = ContextState(
             active=(*pinned, *history),
@@ -108,10 +132,34 @@ class CompactionTests(unittest.TestCase):
         )
         with self.assertRaises(CoreError) as caught:
             Compactor(
-                self.budget, lambda items, max_tokens: ContextItem("summary", "x", 1)
+                self.budget, lambda items, max_tokens: self._summary(1)
             ).compact(state)
         self.assertEqual(caught.exception.code, "CONTEXT_UNRECOVERABLE")
         self.assertEqual(state.active[0].content, "must stay")
+
+    def test_an_oversized_overlap_is_released_rather_than_ending_the_run(self):
+        """Overlap is unpinned: a big tool result in the tail is not fatal."""
+        pinned = (ContextItem("prompt", "must stay", 20, pinned=True),)
+        history = tuple(ContextItem("history", str(i), 100) for i in range(6))
+        huge = ContextItem("tool_result", "a large python output", 900)
+        state = ContextState(
+            active=(*pinned, *history, huge),
+            transcript=(*pinned, *history, huge),
+            sequence_range=(1, 8),
+        )
+        summarized = []
+
+        def summarize(items, max_tokens):
+            summarized.append(tuple(item.kind for item in items))
+            return self._summary(50)
+
+        result = Compactor(
+            self.budget, summarize, interval=1, overlap=1
+        ).compact(state, forced=True)
+        self.assertEqual(result.working_tokens, 70)
+        # Released, not lost: the tail item becomes a summary candidate.
+        self.assertIn("tool_result", summarized[0])
+        self.assertEqual([item.kind for item in result.active], ["prompt", "summary"])
 
     def test_summary_must_have_required_structured_sections(self):
         state = ContextState(

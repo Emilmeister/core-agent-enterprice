@@ -28,9 +28,9 @@
 | RUN-03 | ambiguous side effect переходит в reconciliation без retry | dispatched-side-effect restart chaos test | implemented |
 | CTX-01 | base/working budget и compaction 90% до 10–15% | context budget boundary tests | implemented |
 | CTX-02 | pinned state и transcript provenance переживают compaction/restart | two-compaction runtime test | implemented |
-| MEM-01 | Markdown schema, optimistic revisions и hard 200-line rejection | Memory MCP limit/concurrency suite | implemented |
-| MEM-02 | atomic BM25/vector/NER/graph publication и stale edge removal | committed revision restart/failure/rebuild tests | implemented |
-| MEM-03 | hybrid candidates, calibrated fusion и provenance rerank | hybrid retrieval and provider tests | implemented |
+| MEM-01 | built-in `core_memory_*` подсистемы Core Agent: Markdown schema, optimistic revisions и hard 200-line rejection как recoverable tool result | `test_memory_service` | implemented |
+| MEM-02 | atomic BM25/vector/NER/graph publication и stale edge removal внутри процесса агента | `test_memory_service` + real PostgreSQL CI suite | implemented |
+| MEM-03 | hybrid candidates, calibrated fusion, provenance rerank и degraded channels вместо отказа | `test_memory_service` | implemented |
 | BGT-01 | background Tasks и mailbox durable, versioned, at-least-once | PostgreSQL recovery/mailbox test | implemented |
 | BGT-02 | passive wait освобождает worker и cancel handles process tree | scheduler and PTY process-group cancel tests | implemented |
 | SUB-01 | child является durable Task с exact capabilities/shared memory policy | delegation and child-memory E2E | implemented |

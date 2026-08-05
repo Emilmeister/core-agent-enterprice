@@ -16,7 +16,7 @@
 4. разрешить skills и MCP descriptors через effective policy;
 5. создать lock snapshot skills, MCP capabilities и отфильтрованных tools;
 6. построить system/kernel/capability instructions;
-7. загрузить session working state и, если разрешено, вызвать retrieval MCP включая Memory Service;
+7. загрузить session working state и, если разрешено, вызвать retrieval MCP и подсистему памяти;
 8. выбрать primary model route и проверить capabilities;
 9. вычислить доступный контекстный бюджет;
 10. перевести A2A Task в `working` и испустить внутреннее `task.started`.

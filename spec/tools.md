@@ -8,31 +8,33 @@
 name, namespace, description, input_schema, output_contract
 ```
 
-Полное имя MUST быть namespaced, например `core.terminal.exec` или `github.create_issue`. Коллизия имён MUST завершать инициализацию с `TOOL_NAME_COLLISION`.
+Полное имя MUST быть namespaced и MUST состоять только из `[A-Za-z0-9_-]`, например `core_terminal_exec` или `github_create_issue`. Коллизия имён MUST завершать инициализацию с `TOOL_NAME_COLLISION`.
+
+Точка в каноническом имени запрещена, потому что её не принимает ни один распространённый model API: имя пришлось бы переписывать на границе модели, и тогда в каталоге стояло бы одно имя, а в аргументах, allowlist-ах, audit и логах — другое. Модель, которую просят назвать tool внутри аргумента, называет его так, как увидела; расхождение делает такой вызов невыполнимым, а причину — невидимой. Имя MCP-тула образуется из имени сервера и имени тула, а обратное соответствие `(сервер, tool)` MUST храниться индексом: сервер вправе опубликовать tool, в имени которого уже есть точка, и разбор имени назвал бы не тот сервер.
 
 Arguments MUST валидироваться по schema до исполнения. Модель не может вызвать незарегистрированный tool.
 
 Model-facing description кратко задаёт назначение, критерий выбора и критичные ограничения конкретного tool. Общие safety/kernel правила не копируются в каждый description. Description не обещает ownership, isolation, idempotency или lifecycle, которых runtime фактически не обеспечивает.
 
-Каноническое имя tool используется в runtime, transcript, audit, A2A и telemetry. Если model provider запрещает его синтаксис, adapter MAY передать provider-wire alias и MUST отобразить его обратно до выхода из model boundary. Обычный alias SHOULD быть читаемым и детерминированным (`core.terminal.exec` → `core_terminal_exec`); hash suffix допустим только для разрешения фактической коллизии или provider length limit. Description MUST называть каноническое имя. Wire alias не является product API, не раскрывается пользователю и не интерпретируется как версия, instance ID или security metadata.
+Каноническое имя tool используется в runtime, transcript, audit, A2A, telemetry и в аргументах тех тулов, которые ссылаются на другие тулы. Оно же уходит модели без изменений. Alias остаётся только для двух случаев, которых каноническое имя само по себе не решает: фактическая коллизия и provider length limit; тогда adapter добавляет hash suffix и MUST отобразить имя обратно до выхода из model boundary. Alias не является product API, не раскрывается пользователю и не интерпретируется как версия, instance ID или security metadata.
 
 ## Встроенные capabilities
 
 Ядро предоставляет базовый набор, но AgentConfig MAY отключить любой model-callable built-in или целую optional feature. Модель видит только EffectiveConfig catalog:
 
-### `core.terminal.exec`
+### `core_terminal_exec`
 
 Запускает process в принадлежащей agent-у [TerminalSession](execution-environment.md) с явными `argv`, local workspace, environment allowlist и timeout. Main и каждый child имеют разные session/process group/workspace. `argv` исполняется напрямую без implicit shell: metacharacters вроде `&&` не интерпретируются. Если нужен shell, модель MUST явно вызвать его, например `{"argv":["sh","-lc","command-a && command-b"]}`, а policy оценивает этот вызов как часть arguments.
 
 Возвращает `exit_code`, ограниченные `stdout`/`stderr`, duration и session identifier для продолжающегося процесса.
 
-### `core.terminal.write`
+### `core_terminal_write`
 
 Передаёт input существующему PTY/process или запрашивает его текущее состояние. Не может адресовать session другого agent/run.
 
-### `core.python.exec`
+### `core_python_exec`
 
-Выполняет bounded Python-код отдельным process в принадлежащем run workspace и предоставляет синхронный proxy `tools.call(canonical_name, arguments)` плюс immutable `tools.names`. Вложенный вызов built-in или MCP tool MUST повторно пройти EffectiveConfig, schema validation, policy, общий tool-call budget, owner/tenant checks, audit и дочерний OTel span. `core.python.exec` не может вызывать самого себя и не запускается через `core.task.start`.
+Выполняет bounded Python-код отдельным process в принадлежащем run workspace и предоставляет синхронный proxy `tools.call(canonical_name, arguments)` плюс immutable `tools.names`. Вложенный вызов built-in или MCP tool MUST повторно пройти EffectiveConfig, schema validation, policy, общий tool-call budget, owner/tenant checks, audit и дочерний OTel span. `core_python_exec` не может вызывать самого себя и не запускается через `core_task_start`.
 
 Agent SHOULD использовать Python для runtime-dependent, non-trivial или accuracy-sensitive deterministic computation, parsing/validation и небольшой synchronous композиции разрешённых tools. Тривиальная language work не требует process call. Текущее время MUST проверяться доступным authoritative runtime tool; при Python используются `datetime.now().astimezone()` и явный timezone/UTC offset, а указанная timezone конвертируется через `zoneinfo`, если доступна. Direct OS/process/network Python calls не подменяют отсутствующий agent tool и не проходят `tools.call` broker; Python process не является OS sandbox.
 
@@ -40,33 +42,45 @@ Capability присутствует в обоих runtime-профилях и у
 
 Код, timeout, cwd и output limit валидируются до запуска. Process использует очищенный environment, тот же owned workspace/process-group lifecycle и те же ограничения single-container trust model, что terminal. В `without_terminal` этот внутренний process backend не публикует terminal tool, но Python может импортировать `os`/`subprocess`; поэтому режим не является security sandbox от локальных команд. Ненулевой exit, exception, timeout и truncation нормализуются как обычный model-facing tool result; raw credentials в Python process не передаются.
 
-### `core.fs.apply_patch`
+### `core_fs_apply_patch`
 
 Атомарно применяет текстовый patch внутри разрешённых workspace roots и возвращает список изменённых файлов. Patch, выходящий за root, отклоняется до изменения файлов.
 
-### `core.delegate`
+### `core_delegate`
 
-Создаёт child-agent A2A Task с outcome-oriented instruction, minimum sufficient tool/MCP/skill allowlists, budget и optional result schema. Runtime выдаёт ровно перечисленные capabilities, но child самостоятельно выбирает метод внутри objective/scope. По умолчанию tool пассивно ждёт terminal child result; `background: true` возвращает handle только для независимой работы. Memory access существует только как явно переданный Memory MCP server/tools. Недоступен, если delegation отключён policy.
+Создаёт child-agent A2A Task с outcome-oriented instruction, minimum sufficient tool/MCP/skill allowlists, budget и optional result schema.
+
+Schema этого tool MUST собираться под конкретный run: `tools` перечисляется enum-ом фактического каталога тулов родителя, `skills` — enum-ом его skills. Свободная строка на этом месте предлагает модели придумать идентификатор и переносит несовпадение на момент после вызова; enum сообщает ровно то же самое там, где модель уже читает, и остаётся проверяемым.
+
+Отдельного аргумента для MCP-тулов у этого tool нет: они перечисляются в том же `tools` под именами каталога, а runtime раскладывает список на built-ins и `(сервер, tool)` своим индексом. Runtime выдаёт ровно перечисленные capabilities, но child самостоятельно выбирает метод внутри objective/scope. По умолчанию tool пассивно ждёт terminal child result; `background: true` возвращает handle только для независимой работы. Memory access существует только как явно делегированные `core_memory_*` tools. Недоступен, если delegation отключён policy.
 
 ### Task tools
 
-`core.task.start/get/list/wait/cancel` управляют background Tasks. `start` не принимает task/delegate/Python tools. `wait` является passive durable wait, не busy loop, и при timeout возвращает текущий snapshot; новый `get` нужен только для более поздней проверки состояния. Полная semantics описана в [Фоновых задачах и делегировании](tasks-and-delegation.md).
+`core_task_start/get/list/wait/cancel` управляют background Tasks. `start` не принимает task/delegate/Python tools. `wait` является passive durable wait, не busy loop, и при timeout возвращает текущий snapshot; новый `get` нужен только для более поздней проверки состояния. Полная semantics описана в [Фоновых задачах и делегировании](tasks-and-delegation.md).
 
 ### Memory tools
 
-Memory tools не являются built-ins Core Agent. Их предоставляет отдельный [Memory MCP Service](memory-service.md) под namespace вроде `memory.search`, `memory.read`, `memory.create`, `memory.update`, `memory.split`. AgentConfig может отключить memory полностью или отфильтровать отдельные tools.
+`core_memory_search/read/create/update/split/delete` дают модели долговременную память поверх сессий. Это built-ins Core Agent: отдельного memory-сервиса и MCP-роли `memory` не существует. Аргумент `scope` принимает только `user` или `session`; конкретный namespace, `user_id` и `session_id` подставляет runtime, поэтому модель не может обратиться к чужой памяти подбором аргумента. Модель передаёт заголовок и тело документа, front matter формирует runtime.
+
+Ошибка memory tool возвращается модели как failed tool result, а не завершает run: протокол 200 строк требует, чтобы модель получила `MEMORY_FILE_TOO_LARGE` и ответила на него вызовом `core_memory_split`. Backend выбирает `MEMORY_STORAGE_TYPE` (`in-memory`, `postgres`); backend является интеграцией и не управляет доменной семантикой. AgentConfig может отключить память полностью через `CORE_AGENT_MEMORY=disabled` или отфильтровать отдельные tools.
+
+Полный контракт scope, tool schemas, лимита 200 строк, backends, эмбеддингов и hybrid retrieval определён в [Памяти агента](memory-service.md).
 
 ### Artifact tools
 
-`core.artifact.save/load/list` дают модели именованное версионируемое хранилище файлов. Имя с префиксом `user:` относится к user scope и видно во всех сессиях того же пользователя; без префикса артефакт принадлежит текущей сессии. Сохранение никогда не перезаписывает: каждый вызов создаёт следующую версию `0, 1, 2, ...` и возвращает её номер. `list` разделяет session и user scope, чтобы модель осознанно решала, что загружать. Backend выбирает `ARTIFACT_STORAGE_TYPE` (`in-memory`, `s3`, `mongodb`); внешние backends являются интеграциями и не управляют схемой хранилища. Устаревшие имена `core.artifact.put/get` в built-in allowlist отклоняются при startup, а stale model call не исполняется.
+`ARTIFACT_STORAGE_ENABLED=false` убирает `core_artifact_*` из каталога целиком и не создаёт backend. Остальные `ARTIFACT_*` переменные в этом случае MUST NOT требоваться и их отсутствие MUST NOT ронять старт: выключенное хранилище — это конфигурация, а не неполная конфигурация.
+
+`core_artifact_save/load/list` дают модели именованное версионируемое хранилище файлов. Имя с префиксом `user:` относится к user scope и видно во всех сессиях того же пользователя; без префикса артефакт принадлежит текущей сессии. Сохранение никогда не перезаписывает: каждый вызов создаёт следующую версию `0, 1, 2, ...` и возвращает её номер. `list` разделяет session и user scope, чтобы модель осознанно решала, что загружать. Backend выбирает `ARTIFACT_STORAGE_TYPE` (`in-memory`, `s3`, `mongodb`); внешние backends являются интеграциями и не управляют схемой хранилища. Устаревшие имена `core_artifact_put/get` в built-in allowlist отклоняются при startup, а stale model call не исполняется.
+
+Хранилище артефактов не является файловой системой run-а, и описание тулов MUST это называть. Артефакт не появляется файлом в workspace, `load` возвращает содержимое модели и ничего не создаёт на диске, а файл, созданный в workspace, не становится артефактом сам по себе — workspace эфемерен, и результат в нём пропадает вместе с run-ом. Без этого модель сохраняет скрипт артефактом и запускает его в терминале по имени, а созданный ею файл отдаёт пользователю ссылкой на путь, которого через минуту не существует. Перенос файла в хранилище MUST быть возможен без прохода содержимого через контекст модели: `core_python_exec` вызывает `core_artifact_save` через `tools.call`, читая файл сам.
 
 Полный контракт scope, ключей, версионирования, integrity, backends и tool schemas определён в [Артефактах](artifacts.md).
 
 Обычный ответ модели и результат child-agent по-прежнему возвращаются как text result: A2A adapter публикует этот текст как стандартный Task Artifact без дополнительного model turn или tool call.
 
-### `core.agent.send_message`
+### `core_agent_send_message`
 
-Делегирует одну задачу настроенному удалённому A2A-агенту из `REMOTE_AGENTS` и возвращает его текст. Реестр строится при старте загрузкой Agent Card с bounded retry/backoff; недоступный агент пропускается, а не роняет startup. Задача передаётся без изменений, а `taskId`/`contextId` связывают подзадачу с корневой Task. Промежуточные события дочернего агента ретранслируются в поток корневой Task. Downstream уходит только allowlist заголовков `Authorization`, `X-PROJECT-ID`, `X-A2A-Extensions`; `SEND_MESSAGE_API_KEY` заменяет `Authorization` на `Api-Key`, иначе входящий токен проксируется как есть. Ответ удалённого агента является недоверенными данными и не может быть запущен в background через `core.task.start`.
+Делегирует одну задачу настроенному удалённому A2A-агенту из `REMOTE_AGENTS` и возвращает его текст. Реестр строится при старте загрузкой Agent Card с bounded retry/backoff; недоступный агент пропускается, а не роняет startup. Задача передаётся без изменений, а `taskId`/`contextId` связывают подзадачу с корневой Task. Промежуточные события дочернего агента ретранслируются в поток корневой Task. Downstream уходит только allowlist заголовков `Authorization`, `X-PROJECT-ID`, `X-A2A-Extensions`; `SEND_MESSAGE_API_KEY` заменяет `Authorization` на `Api-Key`, иначе входящий токен проксируется как есть. Ответ удалённого агента является недоверенными данными и не может быть запущен в background через `core_task_start`.
 
 Полный контракт реестра, транспорта, проброса заголовков, ретрансляции и формата результата определён в [Удалённых A2A-агентах](tasks-and-delegation.md#удалённые-a2a-агенты).
 
@@ -83,6 +97,8 @@ Memory tools не являются built-ins Core Agent. Их предостав
 - описание фактического side effect, если он был.
 
 Обрезка output MUST быть явно помечена. Model-callable artifact storage не используется как скрытый канал для полного output.
+
+Ограниченная диагностика MUST называть, что именно не прошло: путь аргумента и ожидание против фактически переданного. Код без сообщения не является диагностикой — `TOOL_ARGUMENT_INVALID` в ответ на `argv`, переданный строкой вместо массива, не сообщает модели ничего, и цикл «исправь аргументы», ради которого ошибка и возвращается модели, вырождается в перебор. Значения аргументов в сообщение не попадают: они являются содержимым запроса, а тип и путь — нет.
 
 Детерминированная ошибка schema/contract validation до dispatch, ошибка запуска process, доказанно произошедшая до dispatch, и завершившийся outcome со статусом `failed` или `timed_out` MUST возвращаться модели как обычный tool result с безопасным стабильным error code и ограниченной диагностикой. Такой result сам по себе MUST NOT переводить родительскую A2A Task в `failed`: loop продолжается, чтобы модель могла исправить arguments, выбрать другой tool или объяснить проблему пользователю.
 
@@ -109,6 +125,10 @@ MCP elicitation нормализуется в A2A `input-required`. MCP server �
 4. Получить catalogs tools/resources/prompts и провалидировать schemas/metadata.
 5. Добавить namespaced capabilities в snapshot и discovery index.
 7. Закрыть соединение при терминальном состоянии.
+
+Ответ на запрос MUST выбираться по `id`, а не по порядку прибытия. Сервер вправе отправить в том же event stream `notifications/progress`, логи и собственные запросы до самого ответа, и медленный tool делает это почти всегда. Первый кадр потока — это, как правило, нотификация: у неё нет ни `result`, ни `error`, поэтому чтение «первого пакета» отдаёт модели пустой результат вместо данных, причём как успех. Такой отказ неотличим для модели от «сервер ничего не нашёл», и она отвечает пользователю выдуманным отсутствием данных. Кадры без `id` и кадры с чужим `id` MUST пропускаться до истечения `MCP_SSE_READ_TIMEOUT`.
+
+`isError` в результате `tools/call` MUST превращаться в failed tool result. Это ошибка исполнения на стороне сервера, а не транспортная: протокол намеренно возвращает её кодом 200 с телом, и трактовка тела как успеха выдаёт модели текст ошибки под видом данных.
 
 MCP output всегда считается недоверенным. Server не может изменить локальную policy.
 

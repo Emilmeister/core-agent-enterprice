@@ -106,11 +106,25 @@ class Compactor:
         candidates = unpinned[: len(unpinned) - len(overlap)]
         if not candidates:
             return state
-        pinned_tokens = sum(item.tokens for item in pinned + overlap)
+        pinned_tokens = sum(item.tokens for item in pinned)
         target = int(self.budget.working_capacity * self.budget.compact_to)
-        if pinned_tokens > target:
+        if pinned_tokens + self.budget.output_reserve > self.budget.total_tokens:
+            # The window, not the target: the target is a fraction of working
+            # capacity, so comparing against it ends runs whose pinned data fits
+            # the context with room to spare.
             raise CoreError("CONTEXT_UNRECOVERABLE")
-        summary = self.summarizer(candidates, target - pinned_tokens)
+        # Overlap is unpinned by definition — the verbatim tail is a courtesy to
+        # the model, not data that must survive. Releasing the oldest of it back
+        # into the summary is always better than ending the run, and one large
+        # tool result landing in that tail is exactly how this used to happen.
+        while overlap and pinned_tokens + sum(i.tokens for i in overlap) > target:
+            overlap = overlap[1:]
+            candidates = unpinned[: len(unpinned) - len(overlap)]
+        floor = pinned_tokens + sum(item.tokens for item in overlap)
+        # A goal, not a survival condition: pinned data alone may exceed the
+        # target and still leave the run perfectly workable.
+        limit = max(target, floor)
+        summary = self.summarizer(candidates, limit - floor)
         sections = (
             "Goal:",
             "Constraints:",
@@ -126,7 +140,7 @@ class Compactor:
             raise CoreError("CONTEXT_UNRECOVERABLE")
         active = pinned + (summary,) + overlap
         after = sum(item.tokens for item in active)
-        if after > target or (
+        if after > limit or (
             not forced and after < int(self.budget.working_capacity * 0.10)
         ):
             raise CoreError("CONTEXT_UNRECOVERABLE")

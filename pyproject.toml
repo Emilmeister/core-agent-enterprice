@@ -1,7 +1,7 @@
 [project]
 name = "core-agent"
 version = "0.1.0"
-description = "A2A agent runtime and MCP memory service"
+description = "A2A agent runtime with built-in long-term memory"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,7 +16,6 @@ dependencies = [
 [project.scripts]
 core-agent = "core_agent.app:main"
 core-agent-db = "core_agent.database:main"
-core-agent-memory = "memory_service.mcp_server:main"
 
 [build-system]
 requires = ["uv_build>=0.11.6,<0.12"]
@@ -26,7 +25,7 @@ build-backend = "uv_build"
 package = true
 
 [tool.uv.build-backend]
-module-name = ["core_agent", "memory_service"]
+module-name = ["core_agent"]
 module-root = ""
 
 [dependency-groups]

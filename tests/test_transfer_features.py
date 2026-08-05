@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +17,7 @@ import httpx
 from core_agent.a2a import ATTACHMENTS_ONLY_PROMPT
 from core_agent.app import create_app
 from core_agent.artifact_service import ArtifactService, InMemoryArtifactBackend
+from core_agent.config import RunRequest
 from core_agent.errors import CoreError
 from core_agent.model import CompatibleHttpModel
 from core_agent.remote_agents import (
@@ -90,6 +92,117 @@ class ModelHandler(BaseHTTPRequestHandler):
         payload = json.dumps({"choices": [{"delta": delta}]}).encode()
         self.wfile.write(b"data: " + payload + b"\n\n")
         self.wfile.flush()
+
+
+class StreamedReasoningTests(unittest.TestCase):
+    def test_a_reasoning_delta_keeps_the_space_it_arrived_with(self):
+        """Trimming each token glues the words of the assembled reasoning."""
+        model = CompatibleHttpModel(
+            api_format="openai",
+            model="m",
+            base_url="https://model.test/v1",
+            api_key="k",
+        )
+        words = ["Мне", " нужно", " сначала", " найти", " информацию."]
+        frames = [
+            b"data: " + json.dumps({"choices": [{"delta": delta}]}).encode() + b"\n\n"
+            for delta in [{"reasoning_content": word} for word in words]
+        ]
+        frames.append(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+        frames.append(b"data: [DONE]\n\n")
+        response = model._stream_openai(iter(frames), lambda *args: None)
+        self.assertEqual(
+            response["choices"][0]["message"]["reasoning_content"],
+            "Мне нужно сначала найти информацию.",
+        )
+
+    def test_the_assembled_reasoning_is_still_trimmed_as_a_whole(self):
+        model = CompatibleHttpModel(
+            api_format="openai",
+            model="m",
+            base_url="https://model.test/v1",
+            api_key="k",
+        )
+        frames = [
+            b"data: "
+            + json.dumps(
+                {"choices": [{"delta": {"reasoning_content": "  Думаю.  "}}]}
+            ).encode()
+            + b"\n\n",
+            b"data: "
+            + json.dumps({"choices": [{"delta": {"content": "Готово."}}]}).encode()
+            + b"\n\n",
+            b"data: [DONE]\n\n",
+        ]
+        response = model._stream_openai(iter(frames), lambda *args: None)
+        self.assertEqual(
+            model._parse_openai(response, {}).reasoning, "Думаю."
+        )
+
+
+class ModelTransportFailureTests(unittest.TestCase):
+    def _model(self, port, **options):
+        return CompatibleHttpModel(
+            api_format="openai",
+            model="m",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="k",
+            timeout=0.3,
+            **options,
+        )
+
+    def _serve(self, handler):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_port
+
+    def test_a_body_that_stops_arriving_is_a_provider_failure(self):
+        """The socket timeout fires on the read, long after the connect succeeded."""
+
+        class StallingHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "4096")
+                self.end_headers()
+                self.wfile.write(b"{")
+                self.wfile.flush()
+                time.sleep(2)
+
+        port = self._serve(StallingHandler)
+        with self.assertRaises(CoreError) as caught:
+            self._model(port).generate(context="c", tools=(), instructions="i")
+        self.assertEqual(caught.exception.code, "MODEL_UNAVAILABLE")
+        self.assertTrue(caught.exception.retryable)
+
+    def test_a_stream_that_goes_quiet_between_chunks_is_a_provider_failure(self):
+        """A bare TimeoutError here kills the A2A Task instead of failing it."""
+
+        class QuietStreamHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                frame = json.dumps({"choices": [{"delta": {"content": "partial"}}]})
+                self.wfile.write(f"data: {frame}\n\n".encode())
+                self.wfile.flush()
+                time.sleep(2)
+
+        port = self._serve(QuietStreamHandler)
+        with self.assertRaises(CoreError) as caught:
+            self._model(port, stream=True).generate(
+                context="c", tools=(), instructions="i"
+            )
+        self.assertEqual(caught.exception.code, "MODEL_UNAVAILABLE")
+        self.assertTrue(caught.exception.retryable)
 
 
 class StreamBufferTests(unittest.TestCase):
@@ -420,7 +533,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_tool_calls_and_results_stream_as_adk_data_parts(self):
-        ModelHandler.tool_call = ("core.artifact.list", {})
+        ModelHandler.tool_call = ("core_artifact_list", {})
         frames = await self._frames(self._app(), "list my files")
         typed = [
             (part["metadata"]["adk_type"], part["data"])
@@ -431,12 +544,12 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [kind for kind, _data in typed], ["function_call", "function_response"]
         )
-        self.assertEqual(typed[0][1]["name"], "core.artifact.list")
+        self.assertEqual(typed[0][1]["name"], "core_artifact_list")
         self.assertEqual(typed[1][1]["response"]["status"], "succeeded")
 
     async def test_artifact_tools_round_trip_through_the_model_catalog(self):
         ModelHandler.tool_call = (
-            "core.artifact.save",
+            "core_artifact_save",
             {"filename": "user:notes.txt", "content": "remember"},
         )
         frames = await self._frames(self._app(), "save a note")
@@ -455,7 +568,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(peer.server_close)
         self.addCleanup(peer.shutdown)
         ModelHandler.tool_call = (
-            "core.agent.send_message",
+            "core_agent_send_message",
             {"agent_name": "weather-agent", "task": "What is the weather?"},
         )
         frames = await self._frames(
@@ -485,9 +598,9 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
     async def test_send_message_is_absent_when_no_remote_agent_is_configured(self):
         app = self._app()
         advertised = {skill.id for skill in app.state.a2a_request_handler._agent_card.skills}
-        self.assertNotIn("core.agent.send_message", advertised)
+        self.assertNotIn("core_agent_send_message", advertised)
         self.assertNotIn(
-            "core.agent.send_message",
+            "core_agent_send_message",
             app.state.core_agent.platform_config.allowed_builtin_tools,
         )
 
@@ -591,6 +704,26 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                         item["url"] for item in card["supportedInterfaces"]
                     }
             return found
+
+        # Hosting platforms publish the public address under either spelling;
+        # a transposed name is otherwise indistinguishable from an unset one.
+        app = build(URL_AGENT="https://platform.example")
+        try:
+            found = await urls(app, {"Host": "attacker.example"})
+            self.assertEqual(list(found.values()), [{"https://platform.example"}] * 2)
+        finally:
+            app.state.close()
+
+        app = build(
+            AGENT_URL="https://documented.example",
+            URL_AGENT="https://platform.example",
+        )
+        try:
+            found = await urls(app, {"Host": "attacker.example"})
+            # The documented name wins when a deployment sets both.
+            self.assertEqual(list(found.values()), [{"https://documented.example"}] * 2)
+        finally:
+            app.state.close()
 
         # An explicit AGENT_URL wins over any header a caller can forge.
         app = build(AGENT_URL="https://configured.example")
@@ -871,13 +1004,17 @@ class ConfigurationTransferTests(unittest.TestCase):
             return [
                 item
                 for item in logs.output
-                if "REMOTE_AGENTS" in item and "startup.configuration" not in item
+                if "REMOTE_AGENTS" in item
+                and "startup.configuration" not in item
+                # The environment inventory names the variable too; the subject
+                # here is the short plain warning, not the inventory line.
+                and "startup.env" not in item
             ]
 
         unset = startup()
         self.assertEqual(len(unset), 1)
         self.assertTrue(unset[0].startswith("WARNING:"))
-        self.assertIn("core.agent.send_message", unset[0])
+        self.assertIn("core_agent_send_message", unset[0])
         self.assertIn("not set", unset[0])
         # The state must precede the variable names: a collector that truncates the
         # line still delivers the fact the operator acts on.
@@ -897,6 +1034,143 @@ class ConfigurationTransferTests(unittest.TestCase):
         self.assertEqual(len(configured), 1)
         self.assertIn("https://peer.test", configured[0])
         self.assertNotIn("p4ssw0rd", configured[0])
+
+    def test_startup_inventories_the_environment_without_any_value(self):
+        """Names and state only: the environment holds every credential there is."""
+        from core_agent.model import ModelResponse, ScriptedModel
+
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "inventory-model"
+        with patch.dict(
+            os.environ,
+            {
+                **BASE_ENVIRONMENT,
+                "LLM_MODEL": "inventory-model",
+                "LLM_API_BASE": "https://model.test/v1",
+                "LLM_API_KEY": "sk-super-secret-value",
+                "REMOTE_AGENTS": "",
+                "SOME_PLATFORM_TOKEN": "platform-secret",
+            },
+            clear=True,
+        ):
+            with self.assertLogs("core_agent.runtime", "INFO") as captured:
+                # The real path, so the model variables are genuinely consulted.
+                app = create_app()
+        app.state.close()
+        del model
+        lines = [item for item in captured.output if "startup.env" in item]
+        self.assertTrue(lines)
+        encoded = "\n".join(lines)
+
+        # Every line is numbered, so a collector dropping some of them shows.
+        total = int(re.search(r"startup\.env \d+/(\d+)", lines[0]).group(1))
+        self.assertEqual(len(lines), total)
+        self.assertEqual(
+            [int(re.search(r"startup\.env (\d+)/", item).group(1)) for item in lines],
+            list(range(1, total + 1)),
+        )
+        # Short enough that no single line carries the whole inventory.
+        for item in lines:
+            self.assertLess(len(item), 400)
+
+        self.assertIn("LLM_API_KEY=set", encoded)
+        # Present-but-blank is the case a plain getenv default hides.
+        self.assertIn("REMOTE_AGENTS=empty", encoded)
+        self.assertIn("MEMORY_STORAGE_TYPE=missing", encoded)
+        # A variable the platform sent that nothing reads: this is how a
+        # transposed name becomes visible instead of looking like an absent one.
+        self.assertIn("not-consulted", encoded)
+        self.assertIn("SOME_PLATFORM_TOKEN=set", encoded)
+
+        for secret in ("sk-super-secret-value", "platform-secret"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, encoded)
+
+    def test_inventory_calls_every_variable_the_startup_reads_consulted(self):
+        """A name read outside app.py is still read by this startup."""
+        import ast
+
+        from core_agent.app import _EXTERNAL_VARIABLES
+
+        root = Path(__file__).resolve().parent.parent / "core_agent"
+        # Only the modules app.py hands configuration to. Variables read later,
+        # while a tool runs, are not part of what this startup consulted.
+        for name in ("database.py", "observability.py"):
+            for node in ast.walk(ast.parse((root / name).read_text())):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                target = getattr(node.func, "attr", None)
+                if target not in ("getenv", "get"):
+                    continue
+                if not isinstance(node.args[0], ast.Constant):
+                    continue
+                variable = node.args[0].value
+                if not isinstance(variable, str) or not variable.isupper():
+                    continue
+                with self.subTest(module=name, variable=variable):
+                    self.assertIn(variable, _EXTERNAL_VARIABLES)
+
+    def test_a_tool_name_written_with_dots_still_names_the_same_tool(self):
+        """Canonical names lost their dots; deployments were written before that."""
+        from core_agent.model import ModelResponse, ScriptedModel
+
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "legacy-model"
+        with patch.dict(
+            os.environ,
+            {
+                **BASE_ENVIRONMENT,
+                "LLM_MODEL": "legacy-model",
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core.memory.search,core_python_exec",
+            },
+            clear=True,
+        ):
+            app = create_app(model=model)
+        try:
+            allow = app.state.core_agent.agent_config.to_dict()["tools"]["builtins"][
+                "allow"
+            ]
+        finally:
+            app.state.close()
+        self.assertEqual(sorted(allow), ["core_memory_search", "core_python_exec"])
+
+        with patch.dict(
+            os.environ,
+            {
+                **BASE_ENVIRONMENT,
+                "LLM_MODEL": "legacy-model",
+                "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_no_such_tool",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(CoreError) as caught:
+                create_app(model=ScriptedModel([]))
+        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+        # Naming the value is what turns a rejected startup into a fixable one.
+        self.assertIn("core_no_such_tool", str(caught.exception))
+
+    def test_an_argument_the_model_left_null_is_an_argument_it_omitted(self):
+        openai = CompatibleHttpModel(api_format="openai", model="m")
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {
+                                    "name": "core_terminal_exec",
+                                    "arguments": '{"argv": ["ls"], "cwd": null}',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        parsed = openai._parse_openai(response, {"core_terminal_exec": "core_terminal_exec"})
+        self.assertEqual(parsed.tool_requests[0].arguments, {"argv": ["ls"]})
 
     def test_startup_reports_otlp_endpoints_and_never_the_key(self):
         """A 403 on one signal is only actionable with the resolved address."""
@@ -920,17 +1194,114 @@ class ConfigurationTransferTests(unittest.TestCase):
             OTEL_ENDPOINT="https://collector.test", OTEL_API_KEY="sk-never-logged"
         )
         self.assertEqual(
-            record["telemetry"]["logs"], "https://collector.test/v1/logs"
-        )
-        self.assertEqual(
             record["telemetry"]["traces"], "https://collector.test/v1/traces"
         )
+        # A base URL is not a claim that the backend takes every signal; the
+        # managed collector that takes traces answers 403 on logs.
+        self.assertIsNone(record["telemetry"]["logs"])
+        self.assertIsNone(record["telemetry"]["metrics"])
         self.assertTrue(record["telemetry"]["credentials_configured"])
         # The value must never appear, in any form.
         self.assertNotIn("sk-never-logged", line)
 
+        # An explicit per-signal endpoint is the operator saying it is accepted.
+        explicit, _ = startup(
+            OTEL_ENDPOINT="https://collector.test",
+            OTEL_EXPORTER_OTLP_LOGS_ENDPOINT="https://logs.test/v1/logs",
+        )
+        self.assertEqual(explicit["telemetry"]["logs"], "https://logs.test/v1/logs")
+
         record, _ = startup(OTEL_ENDPOINT="https://collector.test")
         self.assertFalse(record["telemetry"]["credentials_configured"])
+
+    def test_telemetry_can_be_switched_off_and_named_by_the_platform(self):
+        from core_agent.observability import Telemetry
+
+        with patch.dict(
+            os.environ,
+            {"OTEL_ENDPOINT": "https://collector.test", "ENABLE_OTEL": "false"},
+            clear=True,
+        ):
+            self.assertIsNone(Telemetry.otlp_from_env())
+        with patch.dict(
+            os.environ,
+            {
+                "OTEL_ENDPOINT": "https://collector.test",
+                "OTEL_PROJECT_NAME": "platform-project",
+                "OTEL_SERVICE_NAME": "legacy-name",
+            },
+            clear=True,
+        ):
+            telemetry = Telemetry.otlp_from_env()
+        resource = telemetry.exporter.trace_provider.resource
+        # The platform publishes the project name; the standard name is a synonym.
+        self.assertEqual(resource.attributes["service.name"], "platform-project")
+
+    def test_embedding_base_falls_back_to_the_model_gateway(self):
+        from core_agent.model import ModelResponse, ScriptedModel
+
+        def build(**environment):
+            model = ScriptedModel([ModelResponse(message="ok")])
+            model.model = "embed-model"
+            with patch.dict(
+                os.environ,
+                {
+                    **BASE_ENVIRONMENT,
+                    "LLM_MODEL": "m",
+                    "LLM_API_BASE": "https://gateway.test/v1",
+                    "LLM_API_KEY": "sk-model",
+                    **environment,
+                },
+                clear=True,
+            ):
+                return create_app(model=model)
+
+        app = build(EMBEDDING_MODEL="bge-m3", EMBEDDING_API_KEY="sk-embed")
+        try:
+            provider = app.state.core_agent.memory_registry.embedding_provider
+            self.assertEqual(provider.endpoint, "https://gateway.test/v1/embeddings")
+        finally:
+            app.state.close()
+
+        # The key is never inherited: rights on embeddings may differ.
+        app = build(EMBEDDING_MODEL="bge-m3")
+        try:
+            self.assertIsNone(app.state.core_agent.memory_registry.embedding_provider)
+        finally:
+            app.state.close()
+
+    def test_disabled_artifact_storage_needs_no_other_artifact_variable(self):
+        from core_agent.model import ModelResponse, ScriptedModel
+
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "artifact-model"
+        with patch.dict(
+            os.environ,
+            {
+                **BASE_ENVIRONMENT,
+                "LLM_MODEL": "m",
+                "LLM_API_BASE": "https://gateway.test/v1",
+                "LLM_API_KEY": "sk-model",
+                "ARTIFACT_STORAGE_ENABLED": "false",
+                # Deliberately no ARTIFACT_STORAGE_TYPE and no ARTIFACT_S3_*.
+                "ARTIFACT_STORAGE_TYPE": "s3",
+            },
+            clear=True,
+        ):
+            app = create_app(model=model)
+        try:
+            agent = app.state.core_agent
+            allowed = agent.agent_config.to_dict()["tools"]["builtins"]["allow"]
+            self.assertIsNone(agent.artifact_service)
+            self.assertFalse(
+                [name for name in allowed if name.startswith("core_artifact_")]
+            )
+            effective = agent._resolve_capabilities(
+                RunRequest.from_dict({"prompt": "x"})
+            )[2]
+            self.assertNotIn("artifacts", effective.enabled_capability_policies)
+        finally:
+            app.state.close()
 
     def test_mcp_server_answering_with_an_event_stream_connects(self):
         """A Streamable HTTP server may answer JSON or SSE; both must work."""
@@ -986,6 +1357,68 @@ class ConfigurationTransferTests(unittest.TestCase):
             }
         )
         self.assertEqual(sorted(catalog), ["get_forecast"])
+
+    def test_progress_notifications_do_not_become_the_tool_result(self):
+        """A slow tool narrates first; the answer is the frame carrying our id."""
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        class NarratingMcpHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                method = request.get("method")
+                if method == "initialize":
+                    result = {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "search", "version": "1"},
+                    }
+                elif method == "tools/list":
+                    result = {"tools": [{"name": "search_web", "inputSchema": {}}]}
+                else:
+                    result = {"content": [{"type": "text", "text": "leaderboard"}]}
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                if method == "tools/call":
+                    for frame in (
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/progress",
+                            "params": {"progress": 1},
+                        },
+                        # A server request of its own, with an id that is not ours.
+                        {"jsonrpc": "2.0", "id": "server-1", "method": "ping"},
+                    ):
+                        self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
+                    self.wfile.flush()
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
+                )
+                self.wfile.write(f"event: message\ndata: {body}\n\n".encode())
+                self.wfile.flush()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), NarratingMcpHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connector = StreamableHttpMcpConnector(timeout=5)
+        declaration = {
+            "name": "mcp",
+            "transport": {
+                "type": "streamable_http",
+                "url": f"http://127.0.0.1:{server.server_port}/mcp",
+            },
+        }
+        connector.connect(declaration)
+        result = connector.call("mcp", "search_web", {"query": "terminal bench"})
+        # Before the id match this returned {} — reported to the model as a
+        # successful search that found nothing.
+        self.assertEqual(result, {"content": [{"type": "text", "text": "leaderboard"}]})
 
     def test_mcp_accepts_every_published_protocol_revision(self):
         """A server picks the revision; refusing a working one hides it for nothing."""
@@ -1193,26 +1626,53 @@ class ConfigurationTransferTests(unittest.TestCase):
     def test_mcp_allowlist_takes_bare_names_and_warns_on_a_silent_server(self):
         """A connected server exposing nothing looks healthy but gives nothing."""
         from core_agent.app import _allowed_mcp_tools
+        from core_agent.mcp import InMemoryMcpConnector
+        from core_agent.model import ModelResponse, ScriptedModel
 
         with patch.dict(
             os.environ,
             {**BASE_ENVIRONMENT, "MCP_ALLOWED_TOOLS": "get_current,weather.get_forecast"},
             clear=True,
         ):
-            grouped = _allowed_mcp_tools({"weather", "memory"})
+            grouped = _allowed_mcp_tools({"weather", "docs"})
         # A bare name reaches every server; "server.tool" also keeps its scope.
         self.assertIn("get_current", grouped["weather"])
-        self.assertIn("get_current", grouped["memory"])
+        self.assertIn("get_current", grouped["docs"])
         self.assertIn("get_forecast", grouped["weather"])
-        self.assertNotIn("get_forecast", grouped["memory"])
+        self.assertNotIn("get_forecast", grouped["docs"])
 
-        # The default still names the memory tools and nothing else.
+        # Without an allowlist no tool is allowed anywhere: nothing is allowed by
+        # default, so a connected server must say so instead of looking healthy.
         with patch.dict(os.environ, BASE_ENVIRONMENT, clear=True):
-            default = _allowed_mcp_tools({"weather", "memory"})
-        self.assertIn("memory.search", default["memory"])
-        self.assertEqual(
-            [name for name in default["weather"] if not name.startswith("memory.")], []
+            self.assertEqual(_allowed_mcp_tools({"weather", "docs"}), {
+                "weather": [],
+                "docs": [],
+            })
+
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "silent-mcp-model"
+        connector = InMemoryMcpConnector(
+            catalogs={"docs": {"search": {"type": "object"}}}
         )
+        with patch.dict(
+            os.environ,
+            {**BASE_ENVIRONMENT, "MCP_URL": "https://docs.test/docs"},
+            clear=True,
+        ):
+            app = create_app(model=model, mcp_connector=connector)
+        try:
+            with self.assertLogs("core_agent.runtime", "WARNING") as logs:
+                app.state.core_agent._resolve_capabilities(
+                    type("R", (), {"prompt": "x"})()
+                )
+            self.assertEqual(connector.connections, ("docs",))
+            silent = [line for line in logs.output if "no tool of it is allowed" in line]
+            self.assertEqual(len(silent), 1)
+            # The warning must name the server and what could be allowed.
+            self.assertIn("'docs'", silent[0])
+            self.assertIn("search", silent[0])
+        finally:
+            app.state.close()
 
     def test_subagent_inherits_artifact_and_remote_agent_services(self):
         """A delegated tool whose service is missing answers CAPABILITY_DISABLED."""
@@ -1238,7 +1698,7 @@ class ConfigurationTransferTests(unittest.TestCase):
             parent = app.state.core_agent
             self.assertTrue(parent.remote_agents)
             child_raw = parent.agent_config.to_dict()
-            child = parent._child_agent(child_raw, ["core.artifact.save"])
+            child = parent._child_agent(child_raw, ["core_artifact_save"])
 
             # Every service backing a delegable tool must reach the child.
             self.assertIs(child.artifact_service, parent.artifact_service)
@@ -1339,6 +1799,50 @@ class ConfigurationTransferTests(unittest.TestCase):
             self.assertEqual(service.load(**scope, filename="profile.json")[1], b"png")
         finally:
             app.state.close()
+
+    def test_a_stored_object_names_itself_for_the_download(self):
+        """The key ends in the version, so the URL alone would name the file `0`."""
+        from core_agent.artifact_service import ArtifactService, S3ArtifactBackend
+
+        sent = {}
+
+        class Recorder(S3ArtifactBackend):
+            def _request(self, method, path, *, body=b"", headers=None, query=None):
+                sent[method] = {"path": path, "headers": dict(headers or {})}
+                return b"", []
+
+            def list_prefix(self, prefix):
+                return []
+
+        backend = Recorder(
+            bucket="demo",
+            region="ru-central-1",
+            access_key_id="tenant:key",
+            secret_access_key="s",
+            endpoint_url="https://s3.cloud.ru",
+        )
+        service = ArtifactService(backend)
+        for filename, expected in (
+            ("deck.pptx", 'attachment; filename="deck.pptx"'),
+            ("Отчёт.docx", "filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82.docx"),
+        ):
+            with self.subTest(filename=filename):
+                service.save(
+                    app_name="a",
+                    user_id="u",
+                    session_id="s",
+                    filename=filename,
+                    content=b"x",
+                )
+                headers = sent["PUT"]["headers"]
+                self.assertTrue(sent["PUT"]["path"].endswith("/versions/0"))
+                self.assertIn(expected, headers["content-disposition"])
+                # Header values stay ASCII whatever the model named the file.
+                self.assertTrue(headers["content-disposition"].isascii())
+        self.assertEqual(
+            sent["PUT"]["headers"]["content-type"],
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
 
     def test_s3_endpoint_and_access_key_follow_the_cloud_ru_profile(self):
         from core_agent.artifact_service import CLOUD_RU_ENDPOINT, S3ArtifactBackend

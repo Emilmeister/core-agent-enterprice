@@ -14,11 +14,11 @@ Prompt-only enforcement недостаточен: даже ошибочная м
 ## Неотменяемые kernel protocols
 
 - trust boundaries, local process ownership и secret handling;
-- правила включённых trusted capability profiles, включая Memory MCP authoring contract;
+- правила включённых trusted capability profiles, включая memory authoring contract;
 - compaction threshold и pinned context;
 - tool schema validation;
 - delegation contract, minimum sufficient tool/skill allowlists, child budgets и bounded autonomy: точный outcome/scope при свободном выборе child-ом метода внутри выданных границ;
-- если следующий delegation level запрещён, явное указание работать без новых сабагентов при отсутствии `core.delegate` в model catalog;
+- если следующий delegation level запрещён, явное указание работать без новых сабагентов при отсутствии `core_delegate` в model catalog;
 - background task lifecycle, cancellation, notifications и passive wait;
 - durable checkpoints и защита от duplicate side effects;
 - audit, redaction и OpenTelemetry instrumentation;
@@ -67,7 +67,7 @@ AgentProfilePrompt MAY задавать:
 
 - добавлять tool/skill/MCP, отсутствующий в capability snapshot;
 - адресовать чужую TerminalSession или расширять назначенные workspace/network capabilities;
-- менять contract trusted Memory MCP, если memory включена;
+- менять memory authoring contract, если memory включена;
 - скрывать обязательные task/status события;
 - разрешать child agent больше, чем parent capability set.
 
