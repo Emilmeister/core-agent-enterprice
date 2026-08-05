@@ -32,6 +32,59 @@
 
 После joined `core_delegate` parent MUST использовать возвращённый child result и MUST NOT повторять ту же делегацию или выполнять делегированную работу самостоятельно. После `background: true` parent MAY продолжить только независимую работу; если result нужен для ответа, parent вызывает `core_task_wait` с возвращённым task ID либо получает terminal notification на следующей safe boundary.
 
+Scheduler handle, `taskId` child workflow, ID в `core_delegate`/`core_task_*`,
+mailbox notifications, logs и traces MUST быть одним и тем же стабильным ID.
+Runtime не создаёт второй внутренний child ID, который caller не может связать
+с возвращённым handle.
+
+Child, исчерпавший execution budget, завершает свой run как `COMPLETED` с
+`completion_reason: "budget_exhausted"` и `complete: false`, а не как `FAILED`.
+Joined `core_delegate`, `core_task_get`, `core_task_wait` и terminal notification
+MUST вернуть один и тот же persisted result, usage и exhausted dimension.
+Parent воспринимает его как недоверенный неполный input: передаёт пользователю
+проверенный промежуточный результат и перечисляет незавершённую часть, не
+повторяет уже выполненную работу и не выдумывает отсутствующий outcome. Parent
+MAY продолжить только ещё не выполненный scope и только в пределах оставшегося
+общего budget.
+
+Scheduler handle, child workflow и его финальный turn принимаются одной durable
+транзакцией; worker запускается только после commit. Reserve учитывается внутри
+child budget и общего root ledger. Если общей ёмкости уже нет, ни child workflow,
+ни scheduler handle не создаются: `core_delegate` получает обычный pre-dispatch
+failed tool result `BUDGET_EXCEEDED`, а parent использует собственный заранее
+удержанный turn для честного ответа. Полусозданные scheduler/workflow records и
+утёкшая reservation запрещены. Неиспользованный reserve нормально завершившегося
+child возвращается общему ledger вместе с его terminal transition.
+
+Каждый выполняющий durable scheduler record имеет отдельный expiring worker
+lease. Start и recovery получают его compare-and-set переходом до запуска
+пользовательской функции, heartbeat продлевает во время долгой работы, а stale
+worker без актуального token не может продлить claim или записать terminal
+state; сам expiry является fencing boundary, даже если другой worker ещё не
+успел получить новый token. PostgreSQL вычисляет и сравнивает expiry по своему
+текущему серверному времени после возможного ожидания row lock; часы
+process/replica и timestamp начала statement не участвуют в fencing. Поэтому два
+процесса recovery не выполняют один contract одновременно; crash после commit,
+но до запуска worker оставляет `submitted` record, который может забрать другой
+worker без повторного admission или budget reservation.
+
+`cancel_requested` при recovery не доказывает outcome уже начатой внешней
+мутации. Recoverable contract сначала согласует своё durable состояние под
+scheduler lease и только затем становится `canceled`. Non-recoverable mutating
+contract переходит в reconciliation с безопасным error code, а не маскирует
+неизвестный outcome состоянием `canceled`.
+Решение о reconciliation использует `cancel_requested` и прочие поля записи,
+возвращённой атомарным claim, а не более ранний scan: cancel, committed между
+scan и claim, не может обойти recovery handler.
+Provenance о том, что claim забрал прежнее состояние `working`, сохраняет
+reconciliation mode независимо от того, был ли cancel уже установлен в момент
+claim или committed сразу после него. Поздний cancel не может преобразовать
+ошибку recovery handler в `canceled` или очистить reconciliation error.
+Workflow в `EXECUTING` также никогда не resume-ит persisted tool queue и не
+переходит напрямую в `CANCELLED`: recovery/cancel сначала фиксирует
+`SIDE_EFFECT_UNKNOWN`, а scheduler task сохраняет этот error даже при уже
+установленном cancellation signal.
+
 Пока child Task non-terminal, parent MAY отправить ей дополнительный A2A Message по тому же `taskId`: child получает его как следующий user turn на safe boundary. Это уточняет текущую делегацию, но не расширяет capability contract или budget и не прерывает выполняющийся tool/model call. После terminal child Task новое уточнение создаёт новую Task.
 
 ## Durable mailbox и notifications
@@ -64,13 +117,29 @@ Parent делегирует coherent outcome, а не заранее приду�
 
 Parent выбирает minimum sufficient tools/MCP/skills и budget для результата; runtime предоставляет child ровно этот набор и не больше. Внутри objective, scope и выданных capabilities child самостоятельно выбирает strategy, sequencing, intermediate analysis и используемые delegated tools. Exactness относится к permissions, side effects, boundaries, budget и result requirements, но не к micromanagement внутреннего плана.
 
+Parent применяет balanced decision rule и делегирует, только когда работа может
+независимо выполняться параллельно с материальной экономией времени, когда
+большой отделимый context полезно изолировать либо когда нужен самостоятельный
+bounded deliverable, который можно проверить независимо. Во всех случаях
+outcome обязан быть coherent, parent должен уметь проверить и интегрировать
+результат, ожидаемая польза должна превышать coordination overhead, а budget
+parent-а должен сохранить ёмкость для проверки и интеграции.
+
+Parent MUST NOT делегировать простую или короткую работу, ближайший строго
+последовательный шаг, mechanical microstep, неясную или тесно связанную с его
+текущим контекстом работу, уже запущенный/завершённый scope, попытку обойти
+policy/approval/capability boundary либо общий «второй взгляд» без конкретного
+независимого deliverable.
+
 Child MAY разрешить небольшую безопасную неоднозначность разумным assumption и обязан перечислить его в результате. Child MUST остановиться с blocker, если продолжение расширит scope, потребует невыданную capability или создаст существенный риск неверного результата. Assumption никогда не подменяет tenant, authorization или product decision.
 
 Требования:
 
 - `instruction` содержит один coherent outcome, scope, deliverable, constraints и success criteria без необязательного пошагового плана;
 - `tools` и `skills` являются allowlists, а не рекомендациями;
-- `budget` содержит только положительные integer-поля `turns` и/или `tool_calls`; aliases вроде `max_steps` запрещены schema;
+- `budget` всегда содержит оба обязательных integer-поля `turns >= 1` и
+  `tool_calls >= 1`; пропуск любого поля, zero, boolean и aliases вроде
+  `max_steps` запрещены schema и повторно отклоняются runtime validation;
 - optional `background` является boolean и по умолчанию равен `false`;
 - каждый элемент MUST входить в capability set parent-а;
 - child не видит остальные рабочие tools/skills даже на discovery;
@@ -87,6 +156,15 @@ Delegation contract решает, **какие** tools получит child. Run
 Child MUST получать те же runtime-сервисы, что и parent, для любой делегированной capability: artifact service, подсистема памяти, реестр удалённых агентов, MCP-серверы и skills из конфигурации. Tool, попавший в каталог child-а, но отказывающий `CAPABILITY_DISABLED` при вызове, является рекламой без реализации: модель тратит turn на заведомо неисполнимый вызов, а parent получает непрозрачный сбой вместо результата.
 
 Отказ contract-а MUST называть отклонённую capability поимённо: конкретный tool, skill или превышенный лимит бюджета, и MUST перечислять то, чем parent располагает. Код без имени не говорит, что исправлять, а перечень доступного превращает отказ в исполнимую подсказку. Разбор contract-а и отказ MUST выполняться в одном месте: правило проверяется и на входе delegate tool, и при выводе capability set child-а, и две копии одного правила расходятся.
+
+Model-facing schema каждого поля `core_delegate` MUST кратко объяснять его роль;
+`tools` и `skills` перечисляют фактические enum-ы parent-а. Отказ по tool или
+skill возвращает отклонённое имя и полный доступный соответствующий enum, а
+отказ по budget — dimension, requested value и доступный limit.
+Delegation template MUST прямо требовать всегда задавать одновременно
+`budget.turns >= 1` и `budget.tool_calls >= 1`; это не optional defaults.
+Если доступных skills нет, schema MUST требовать пустой массив через
+`maxItems: 0`, а не публиковать невалидный JSON Schema `enum: []`.
 
 Наследование сервисов MUST NOT расширять права. Сужение остаётся за AgentConfig child-а и delegation allowlist: child видит только перечисленные parent-ом tools, MCP-серверы и skills, а depth-лимит применяется независимо.
 
@@ -189,6 +267,13 @@ Child MAY перейти в `input-required`, но запрос маршрути
 ## Cancellation и завершение
 
 - Cancel parent рекурсивно запрашивает cancel children, кроме явно detached durable tasks с owner/orphan policy.
+- Child agent получает scheduler cancellation signal и проверяет его на каждой
+  safe boundary до нового model/tool dispatch; после сигнала новый вызов не
+  начинается, а scheduler и child workflow сходятся в `canceled`, не `failed`.
+- При budget exhaustion parent ждёт подтверждение отмены только bounded grace.
+  Некооперативная Task остаётся durable и `cancel_requested`, её ID входит в
+  partial result как `pending_tasks`; runtime не выдаёт ей ложный terminal state
+  и не теряет её поздний result/notification.
 - Task cancellation кооперативна до grace period, затем executor завершает process group и закрывает PTY.
 - Parent MUST проверить terminal status до использования результата.
 - Child failure не обязан завершать parent: модель получает structured failure и выбирает fallback.

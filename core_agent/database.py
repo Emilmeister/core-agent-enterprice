@@ -23,7 +23,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -382,6 +382,18 @@ CREATE TABLE core_memory_revisions (
     10: """
 ALTER TABLE core_memory_documents ADD COLUMN entities jsonb;
 """,
+    11: """
+ALTER TABLE core_background_tasks
+    ADD COLUMN claim_owner text,
+    ADD COLUMN claim_token text,
+    ADD COLUMN claim_expires_at double precision,
+    ADD COLUMN mutating boolean NOT NULL DEFAULT true;
+
+DROP INDEX core_background_recovery_idx;
+CREATE INDEX core_background_recovery_idx
+    ON core_background_tasks (state, claim_expires_at, updated_at)
+    WHERE state IN ('submitted', 'working');
+""",
 }
 
 
@@ -432,7 +444,9 @@ class PostgresDatabase:
             try:
                 return int(os.getenv(name, default))
             except ValueError:
-                raise CoreError("CONFIG_INVALID", f"{name} must be an integer") from None
+                raise CoreError(
+                    "CONFIG_INVALID", f"{name} must be an integer"
+                ) from None
 
         try:
             timeout = float(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "10"))
@@ -459,7 +473,9 @@ class PostgresDatabase:
 
     def schema_version(self):
         with self.pool.connection() as connection:
-            row = connection.execute("SELECT to_regclass('core_schema_migrations') AS name").fetchone()
+            row = connection.execute(
+                "SELECT to_regclass('core_schema_migrations') AS name"
+            ).fetchone()
             if not row["name"]:
                 return 0
             row = connection.execute(
@@ -688,10 +704,13 @@ class PostgresTaskStore(TaskStore):
         reconciled = 0
         with self.database.transaction() as connection:
             rows = connection.execute(
-                """SELECT task.payload, task.owner, task.tenant,
-                          run.state AS run_state, run.result, run.error_code
+                """SELECT task.payload, task.owner, task.tenant, run.run_id,
+                          run.task_id, run.state AS run_state, run.result,
+                          run.error_code
                    FROM core_a2a_tasks task
                    JOIN core_runs run ON run.task_id = task.task_id
+                    AND run.owner_id = task.owner
+                    AND run.tenant_id = task.tenant
                    WHERE task.state NOT IN (%s, %s, %s, %s)
                      AND run.state IN ('COMPLETED','FAILED','ABORTED','CANCELLED','REJECTED')
                    FOR UPDATE OF task""",
@@ -708,17 +727,52 @@ class PostgresTaskStore(TaskStore):
                 task.status.timestamp.GetCurrentTime()
                 result = row["result"] or {}
                 message = result.get("message")
-                if row["run_state"] == "COMPLETED" and message and not task.artifacts:
+                if row["run_state"] == "COMPLETED" and message:
                     encoded = message.encode()
                     digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
-                    artifact = task.artifacts.add()
+                    artifact = next(
+                        (
+                            item
+                            for item in task.artifacts
+                            if item.artifact_id == digest
+                        ),
+                        None,
+                    )
+                    if artifact is None:
+                        artifact = task.artifacts.add()
+                    else:
+                        del artifact.parts[:]
+                        artifact.metadata.Clear()
                     artifact.artifact_id = digest
                     part = artifact.parts.add()
                     part.text = message
                     part.media_type = "text/plain"
-                    artifact.metadata.update(
-                        {"digest": digest, "size": len(encoded), "recovered": True}
-                    )
+                    provenance = {
+                        "run_id": row["run_id"],
+                        "task_id": row["task_id"],
+                        "complete": result.get("complete", True),
+                        "completion_reason": result.get(
+                            "completion_reason", "completed"
+                        ),
+                        "usage": result.get(
+                            "usage", {"model_turns": 0, "tool_calls": 0}
+                        ),
+                    }
+                    if result.get("exhausted_dimension"):
+                        provenance["exhausted_dimension"] = result[
+                            "exhausted_dimension"
+                        ]
+                    if result.get("shared_budget") is not None:
+                        provenance["shared_budget"] = result["shared_budget"]
+                    if result.get("pending_tasks"):
+                        provenance["pending_tasks"] = result["pending_tasks"]
+                    metadata = {
+                        "digest": digest,
+                        "size": len(encoded),
+                        "recovered": True,
+                        "provenance": provenance,
+                    }
+                    artifact.metadata.update(metadata)
                 connection.execute(
                     """UPDATE core_a2a_tasks SET state = %s,
                            status_timestamp = %s, payload = %s, updated_at = now()
@@ -800,7 +854,9 @@ class PostgresTaskStore(TaskStore):
                 raise InvalidParamsError(f"Invalid page token: {params.page_token}")
         page_size = params.page_size or DEFAULT_LIST_TASKS_PAGE_SIZE
         end_idx = start_idx + page_size
-        next_token = encode_page_token(tasks[end_idx].id) if end_idx < total_size else None
+        next_token = (
+            encode_page_token(tasks[end_idx].id) if end_idx < total_size else None
+        )
         return a2a_pb2.ListTasksResponse(
             next_page_token=next_token,
             tasks=tasks[start_idx:end_idx],
@@ -831,7 +887,9 @@ class PostgresTaskStore(TaskStore):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Manage core-agent PostgreSQL schema")
-    parser.add_argument("command", nargs="?", default="migrate", choices=("migrate", "check"))
+    parser.add_argument(
+        "command", nargs="?", default="migrate", choices=("migrate", "check")
+    )
     args = parser.parse_args(argv)
     database = PostgresDatabase.from_environment(
         os.getenv("DATABASE_MIGRATION_URL") or os.getenv("DATABASE_URL", "")

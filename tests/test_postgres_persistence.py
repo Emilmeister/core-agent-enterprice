@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -9,6 +11,7 @@ import httpx
 from a2a.auth.user import User
 from a2a.server.context import ServerCallContext
 from a2a.types import (
+    Artifact,
     Task,
     TaskPushNotificationConfig,
     TaskState,
@@ -75,9 +78,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         ):
             app = create_app(model=model)
         try:
-            result = app.state.core_agent.run(
-                {"prompt": "answer"}
-            )
+            result = app.state.core_agent.run({"prompt": "answer"})
             self.assertEqual(result.message, "ok")
             self.assertEqual(model.calls[0].tools, frozenset({"core_task_list"}))
             advertised = {
@@ -112,9 +113,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             app = create_app(model=model)
         try:
             prompt = "Actual request stays in the user context."
-            app.state.core_agent.run(
-                {"prompt": prompt}
-            )
+            app.state.core_agent.run({"prompt": prompt})
             call = model.calls[0]
             self.assertIn(prompt, call.context)
             self.assertNotIn(prompt, call.instructions)
@@ -134,7 +133,46 @@ class ProductionConfigurationTests(unittest.TestCase):
             self.assertIn("child receives exactly that set", delegate)
             self.assertIn("independently chooses its method", delegate)
             self.assertIn("ordinary text result", delegate)
+            self.assertIn(
+                "Always set both budget.turns >= 1 and budget.tool_calls >= 1",
+                delegate,
+            )
             self.assertNotIn("exactly once", delegate)
+            budget_schema = registry.get("core_delegate").input_schema["properties"][
+                "budget"
+            ]
+            self.assertEqual(
+                budget_schema["required"], ["turns", "tool_calls"]
+            )
+            for field in budget_schema["required"]:
+                self.assertEqual(
+                    budget_schema["properties"][field]["minimum"], 1
+                )
+            self.assertIn(
+                "Always set both budget.turns >= 1 and budget.tool_calls >= 1",
+                call.instructions,
+            )
+            for guidance in (delegate, call.instructions):
+                self.assertIn(
+                    "independent work can run in parallel with a material latency benefit",
+                    guidance,
+                )
+                self.assertIn(
+                    "large separable context should be isolated",
+                    guidance,
+                )
+                self.assertIn(
+                    "bounded independently verifiable deliverable",
+                    guidance,
+                )
+                self.assertIn("coordination overhead", guidance)
+                self.assertIn("immediate serial next steps", guidance)
+                self.assertIn(
+                    "generic second opinions without a concrete deliverable",
+                    guidance,
+                )
+                self.assertNotIn("more appropriate tools", guidance)
+                self.assertNotIn("minimum number of child agents", guidance)
             self.assertIn(
                 "non-task, non-delegation, non-Python",
                 registry.get("core_task_start").description,
@@ -169,9 +207,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         ):
             app = create_app(model=model)
         try:
-            result = app.state.core_agent.run(
-                {"prompt": "answer"}
-            )
+            result = app.state.core_agent.run({"prompt": "answer"})
             self.assertEqual(result.message, "ok")
             self.assertNotIn("core_terminal_exec", model.calls[0].tools)
             self.assertNotIn("core_task_start", model.calls[0].tools)
@@ -218,9 +254,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         ):
             app = create_app(model=model)
         try:
-            app.state.core_agent.run(
-                {"prompt": "answer"}
-            )
+            app.state.core_agent.run({"prompt": "answer"})
             self.assertEqual("core_python_exec" in model.calls[0].tools, expected)
             advertised = {
                 skill.id for skill in app.state.a2a_request_handler._agent_card.skills
@@ -234,13 +268,16 @@ class ProductionConfigurationTests(unittest.TestCase):
 
 
 class NamedUser(User):
+    def __init__(self, name="owner-1"):
+        self.name = name
+
     @property
     def is_authenticated(self):
         return True
 
     @property
     def user_name(self):
-        return "owner-1"
+        return self.name
 
 
 @unittest.skipUnless(
@@ -283,6 +320,22 @@ class PostgresRestartTests(unittest.TestCase):
                    core_push_notification_configs, core_push_deliveries,
                    core_artifacts, core_budget_ledgers CASCADE"""
             )
+
+    def _wait_for_blocked_query(self, database, fragment):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with database.pool.connection() as connection:
+                blocked = connection.execute(
+                    """SELECT 1 FROM pg_stat_activity
+                       WHERE pid <> pg_backend_pid() AND query LIKE %s
+                         AND cardinality(pg_blocking_pids(pid)) > 0
+                       LIMIT 1""",
+                    (f"%{fragment}%",),
+                ).fetchone()
+            if blocked is not None:
+                return
+            time.sleep(0.01)
+        self.fail(f"query did not block: {fragment}")
 
     def _state(self, database):
         return {
@@ -331,14 +384,175 @@ class PostgresRestartTests(unittest.TestCase):
                 """UPDATE core_runs SET state = 'COMPLETED',
                        result = %s, version = version + 1
                    WHERE run_id = 'reconcile-run'""",
-                (Jsonb({"message": "recovered result", "usage": {"model_turns": 1, "tool_calls": 0}}),),
+                (
+                    Jsonb(
+                        {
+                            "message": "recovered result",
+                            "usage": {"model_turns": 1, "tool_calls": 0},
+                            "complete": False,
+                            "completion_reason": "budget_exhausted",
+                            "exhausted_dimension": "model_turns",
+                            "shared_budget": {
+                                "scope": "root",
+                                "used": {"model_turns": 3, "tool_calls": 1},
+                                "limits": {"model_turns": 3, "tool_calls": 2},
+                            },
+                        }
+                    ),
+                ),
             )
         self.assertEqual(store.reconcile_from_workflows(), 1)
         task = asyncio.run(store.get("reconcile-task", context))
         self.assertEqual(task.status.state, TaskState.TASK_STATE_COMPLETED)
         self.assertEqual(task.artifacts[0].parts[0].text, "recovered result")
+        provenance = task.artifacts[0].metadata["provenance"]
+        self.assertFalse(provenance["complete"])
+        self.assertEqual(
+            provenance["completion_reason"], "budget_exhausted"
+        )
+        self.assertEqual(
+            provenance["exhausted_dimension"], "model_turns"
+        )
+        self.assertEqual(
+            provenance["usage"], {"model_turns": 1, "tool_calls": 0}
+        )
+        self.assertEqual(
+            provenance["shared_budget"]["used"],
+            {"model_turns": 3, "tool_calls": 1},
+        )
         self.assertEqual(store.reconcile_from_workflows(), 0)
         database.close()
+
+    def test_workflow_reconciliation_matches_task_owner_and_tenant(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        store = PostgresTaskStore(database)
+        scopes = (
+            ("scope-run-1", "owner-1", "tenant-1"),
+            ("scope-run-2", "owner-2", "tenant-1"),
+            ("scope-run-3", "owner-1", "tenant-2"),
+        )
+        try:
+            for run_id, owner, tenant in scopes:
+                workflows.create(
+                    WorkflowRecord(
+                        run_id,
+                        "shared-task-id",
+                        f"{run_id}-context",
+                        tenant,
+                        owner,
+                        None,
+                        "RUNNING",
+                        1,
+                        {"prompt": "work"},
+                        {"turns": 1},
+                    )
+                )
+                context = ServerCallContext(user=NamedUser(owner), tenant=tenant)
+                asyncio.run(
+                    store.save(
+                        Task(
+                            id="shared-task-id",
+                            context_id=f"{run_id}-context",
+                            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                        ),
+                        context,
+                    )
+                )
+                with database.transaction() as connection:
+                    connection.execute(
+                        """UPDATE core_runs SET state = 'COMPLETED', result = %s,
+                                  version = version + 1 WHERE run_id = %s""",
+                        (
+                            Jsonb(
+                                {
+                                    "message": f"result for {run_id}",
+                                    "usage": {"model_turns": 1, "tool_calls": 0},
+                                }
+                            ),
+                            run_id,
+                        ),
+                    )
+
+            self.assertEqual(store.reconcile_from_workflows(), len(scopes))
+            for run_id, owner, tenant in scopes:
+                context = ServerCallContext(user=NamedUser(owner), tenant=tenant)
+                task = asyncio.run(store.get("shared-task-id", context))
+                self.assertEqual(
+                    task.artifacts[0].parts[0].text, f"result for {run_id}"
+                )
+                self.assertEqual(
+                    task.artifacts[0].metadata["provenance"]["run_id"], run_id
+                )
+        finally:
+            database.close()
+
+    def test_workflow_reconciliation_repairs_partial_final_artifact(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        message = "complete recovered result"
+        digest = "sha256:" + hashlib.sha256(message.encode()).hexdigest()
+        try:
+            workflows.create(
+                WorkflowRecord(
+                    "partial-artifact-run",
+                    "partial-artifact-task",
+                    "partial-artifact-context",
+                    "tenant-1",
+                    "owner-1",
+                    None,
+                    "RUNNING",
+                    1,
+                    {"prompt": "work"},
+                    {"turns": 1},
+                )
+            )
+            context = ServerCallContext(user=NamedUser(), tenant="tenant-1")
+            partial = Artifact(artifact_id=digest)
+            partial.parts.add(text="complete rec", media_type="text/plain")
+            store = PostgresTaskStore(database)
+            asyncio.run(
+                store.save(
+                    Task(
+                        id="partial-artifact-task",
+                        context_id="partial-artifact-context",
+                        status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                        artifacts=[partial],
+                    ),
+                    context,
+                )
+            )
+            with database.transaction() as connection:
+                connection.execute(
+                    """UPDATE core_runs SET state = 'COMPLETED', result = %s,
+                              version = version + 1
+                       WHERE run_id = 'partial-artifact-run'""",
+                    (
+                        Jsonb(
+                            {
+                                "message": message,
+                                "usage": {"model_turns": 1, "tool_calls": 0},
+                                "complete": True,
+                                "completion_reason": "completed",
+                            }
+                        ),
+                    ),
+                )
+
+            self.assertEqual(store.reconcile_from_workflows(), 1)
+            task = asyncio.run(store.get("partial-artifact-task", context))
+            self.assertEqual(len(task.artifacts), 1)
+            self.assertEqual(task.artifacts[0].parts[0].text, message)
+            self.assertEqual(
+                task.artifacts[0].metadata["provenance"]["completion_reason"],
+                "completed",
+            )
+        finally:
+            database.close()
 
     def test_push_delivery_is_encrypted_deduplicated_and_retried_after_restart(self):
         database = self._database()
@@ -543,9 +757,12 @@ class PostgresRestartTests(unittest.TestCase):
                 {"turns": 0},
             ),
             audit=(("task.started", {"safe": True}),),
-            budget_limits=(2, 2),
+            budget_limits=(4, 2),
         )
         self.assertEqual(created.version, 1)
+        # Runtime charges each accepted run's finalization turn up front.
+        workflows.consume_budget(created, model_turns=1)
+        workflows.consume_budget(created, model_turns=1)
         child = workflows.create(
             WorkflowRecord(
                 "run-child",
@@ -569,6 +786,21 @@ class PostgresRestartTests(unittest.TestCase):
         with self.assertRaises(CoreError) as caught:
             workflows.consume_budget(child, model_turns=1)
         self.assertEqual(caught.exception.code, "BUDGET_EXCEEDED")
+        workflows.release_budget(child, model_turns=1)
+        workflows.consume_budget(child, model_turns=1)
+        completed_child = workflows.transition(
+            child.run_id,
+            tenant_id=child.tenant_id,
+            owner_id=child.owner_id,
+            expected_version=child.version,
+            state="COMPLETED",
+            snapshot=child.snapshot,
+            event_kind="task.completed",
+            result={"message": "done", "usage": {"model_turns": 1, "tool_calls": 0}},
+            release_model_turns=1,
+        )
+        self.assertEqual(completed_child.state, "COMPLETED")
+        workflows.consume_budget(created, model_turns=1)
         token = workflows.acquire_lease(
             "run-1",
             tenant_id="tenant-1",
@@ -603,22 +835,40 @@ class PostgresRestartTests(unittest.TestCase):
 
         now = time.time()
         with database.transaction() as connection:
-            for task_id, recoverable in (("read-task", True), ("write-task", False)):
+            for task_id, kind, recoverable, cancel_requested in (
+                ("read-task", "test-read", True, False),
+                ("write-task", "test-read", False, False),
+                ("cancel-task", "test-cancel", True, True),
+                ("cancel-write-task", "test-read", False, True),
+            ):
                 connection.execute(
                     """INSERT INTO core_background_tasks
                        (id, owner_run_id, tenant_id, kind, state, required,
-                        recoverable, contract, created_at, updated_at)
-                       VALUES (%s, 'run-1', 'tenant-1', 'test-read', 'working',
-                               true, %s, %s, %s, %s)""",
-                    (task_id, recoverable, Jsonb({"value": task_id}), now, now),
+                        recoverable, contract, cancel_requested, created_at, updated_at)
+                       VALUES (%s, 'run-1', 'tenant-1', %s, 'working',
+                               true, %s, %s, %s, %s, %s)""",
+                    (
+                        task_id,
+                        kind,
+                        recoverable,
+                        Jsonb({"value": task_id}),
+                        cancel_requested,
+                        now,
+                        now,
+                    ),
                 )
         database.close()
 
         reopened = self._database()
         try:
             scheduler = PostgresTaskScheduler(reopened)
+            cancel_reconciled = []
             scheduler.register(
                 "test-read", lambda contract, cancel: {"value": contract["value"]}
+            )
+            scheduler.register(
+                "test-cancel",
+                lambda contract, cancel: cancel_reconciled.append(cancel.is_set()),
             )
             self.assertEqual(scheduler.recover(), 1)
             read = scheduler.wait(
@@ -626,21 +876,1330 @@ class PostgresRestartTests(unittest.TestCase):
             )
             self.assertEqual(read.state, "completed")
             self.assertEqual(read.result, {"value": "read-task"})
-            write = scheduler.get(
-                "write-task", owner_id="run-1", tenant_id="tenant-1"
-            )
+            write = scheduler.get("write-task", owner_id="run-1", tenant_id="tenant-1")
             self.assertEqual(write.state, "failed")
-            self.assertEqual(write.error.code, "RECOVERY_REQUIRES_RECONCILIATION")
+            self.assertEqual(write.error.code, "SIDE_EFFECT_UNKNOWN")
+            canceled = scheduler.wait(
+                "cancel-task",
+                owner_id="run-1",
+                tenant_id="tenant-1",
+                timeout=2,
+            )
+            self.assertEqual(canceled.state, "canceled")
+            self.assertEqual(cancel_reconciled, [True])
+            canceled_write = scheduler.get(
+                "cancel-write-task", owner_id="run-1", tenant_id="tenant-1"
+            )
+            self.assertEqual(canceled_write.state, "failed")
+            self.assertEqual(
+                canceled_write.error.code, "SIDE_EFFECT_UNKNOWN"
+            )
             notifications = scheduler.mailbox("run-1", "tenant-1").poll()
-            self.assertEqual({item.task_id for item in notifications}, {"read-task", "write-task"})
+            self.assertEqual(
+                {item.task_id for item in notifications},
+                {"read-task", "write-task", "cancel-task", "cancel-write-task"},
+            )
 
             published = []
-            dispatcher = OutboxDispatcher(reopened, lambda event: published.append(event["id"]))
-            self.assertGreaterEqual(dispatcher.drain_once(), 3)
+            dispatcher = OutboxDispatcher(
+                reopened, lambda event: published.append(event["id"])
+            )
+            self.assertGreaterEqual(dispatcher.drain_once(), 4)
             self.assertEqual(len(published), len(set(published)))
             scheduler.close()
         finally:
             reopened.close()
+
+    def test_workflow_recovery_skips_run_with_live_lease(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.create(
+            WorkflowRecord(
+                "leased-run",
+                "leased-task",
+                "leased-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "EXECUTING",
+                1,
+                {"prompt": "work"},
+                {"turns": 1, "pending_call": {"id": "call-1"}},
+            )
+        )
+        workflows.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id="live-worker",
+            ttl=30,
+        )
+        selected = record.run_id in {
+            item.run_id for item in workflows.recoverable()
+        }
+        model = ScriptedModel([])
+        model.model = "lease-recovery-model"
+        app = None
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "SESSION_STORAGE_TYPE": "postgres",
+                    "DATABASE_AUTO_MIGRATE": "false",
+                    "CORE_AGENT_MEMORY": "disabled",
+                    "ARTIFACT_STORAGE_ENABLED": "false",
+                },
+                clear=True,
+            ):
+                app = create_app(model=model, database=database)
+            persisted = app.state.core_agent.workflow_store.get(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+            )
+            self.assertEqual((selected, persisted.state), (False, "EXECUTING"))
+        finally:
+            if app is not None:
+                app.state.close()
+            else:
+                database.close()
+
+    def test_workflow_lease_acquire_and_recovery_use_database_clock(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        slow = PostgresWorkflowStore(database, clock=lambda: 0.0)
+        fast = PostgresWorkflowStore(database, clock=lambda: 10**12)
+        record = slow.create(
+            WorkflowRecord(
+                "skewed-workflow",
+                "skewed-workflow-task",
+                "skewed-workflow-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "work"},
+                {"turns": 0},
+            )
+        )
+        try:
+            slow.acquire_lease(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+                worker_id="slow-worker",
+                ttl=30,
+            )
+            self.assertNotIn(
+                record.run_id, {candidate.run_id for candidate in fast.recoverable()}
+            )
+            with self.assertRaises(CoreError) as caught:
+                fast.acquire_lease(
+                    record.run_id,
+                    tenant_id=record.tenant_id,
+                    owner_id=record.owner_id,
+                    worker_id="fast-worker",
+                    ttl=30,
+                )
+            self.assertEqual(caught.exception.code, "LEASE_LOST")
+        finally:
+            database.close()
+
+    def test_workflow_lease_renew_and_transition_use_database_clock(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database, clock=lambda: 10**12)
+        record = workflows.create(
+            WorkflowRecord(
+                "skewed-transition",
+                "skewed-transition-task",
+                "skewed-transition-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "work"},
+                {"turns": 0},
+            )
+        )
+        token = "server-timed-token"
+        with database.transaction() as connection:
+            connection.execute(
+                """UPDATE core_runs SET lease_owner = 'worker-1', lease_token = %s,
+                          lease_expires_at = EXTRACT(EPOCH FROM clock_timestamp()) + 30
+                       WHERE run_id = %s""",
+                (token, record.run_id),
+            )
+        try:
+            workflows.renew_lease(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                worker_id="worker-1",
+                token=token,
+                ttl=30,
+            )
+            transitioned = workflows.transition(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+                expected_version=record.version,
+                state="WAITING_TASK",
+                snapshot={**record.snapshot, "waiting": "task-1"},
+                event_kind="task.waiting",
+                lease_token=token,
+            )
+            self.assertEqual(transitioned.state, "WAITING_TASK")
+        finally:
+            database.close()
+
+    def test_workflow_renew_rechecks_database_clock_after_row_lock_wait(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.create(
+            WorkflowRecord(
+                "blocked-workflow-renew",
+                "blocked-workflow-task",
+                "blocked-workflow-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "work"},
+                {"turns": 0},
+            )
+        )
+        token = workflows.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id="worker-1",
+            ttl=0.2,
+        )
+        outcome = []
+
+        def renew():
+            try:
+                workflows.renew_lease(
+                    record.run_id,
+                    tenant_id=record.tenant_id,
+                    worker_id="worker-1",
+                    token=token,
+                    ttl=30,
+                )
+            except CoreError as error:
+                outcome.append(error.code)
+            else:
+                outcome.append("renewed")
+
+        try:
+            with database.pool.connection() as connection:
+                with connection.transaction():
+                    connection.execute(
+                        "SELECT 1 FROM core_runs WHERE run_id = %s FOR UPDATE",
+                        (record.run_id,),
+                    ).fetchone()
+                    worker = threading.Thread(target=renew)
+                    worker.start()
+                    self._wait_for_blocked_query(
+                        database, "SELECT lease_owner, lease_token, lease_expires_at"
+                    )
+                    connection.execute(
+                        """SELECT pg_sleep(GREATEST(
+                             lease_expires_at
+                             - EXTRACT(EPOCH FROM clock_timestamp()) + 0.05, 0))
+                           FROM core_runs WHERE run_id = %s""",
+                        (record.run_id,),
+                    ).fetchone()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(outcome, ["LEASE_LOST"])
+        finally:
+            database.close()
+
+    def test_workflow_transition_rechecks_lease_after_budget_lock_wait(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.create(
+            WorkflowRecord(
+                "blocked-transition",
+                "blocked-transition-task",
+                "blocked-transition-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "work"},
+                {"turns": 0, "finalization_turn_reserved": True},
+            ),
+            budget_limits=(3, 1),
+            reserve_model_turns=1,
+        )
+        token = workflows.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id="worker-1",
+            ttl=0.3,
+        )
+        outcome = []
+
+        def transition():
+            try:
+                workflows.transition(
+                    record.run_id,
+                    tenant_id=record.tenant_id,
+                    owner_id=record.owner_id,
+                    expected_version=record.version,
+                    state="RUNNING",
+                    snapshot={**record.snapshot, "turns": 1},
+                    event_kind="model.attempt.started",
+                    lease_token=token,
+                    consume_model_turns=1,
+                )
+            except CoreError as error:
+                outcome.append(error.code)
+            else:
+                outcome.append("transitioned")
+
+        try:
+            with database.pool.connection() as connection:
+                with connection.transaction():
+                    expiry = connection.execute(
+                        "SELECT lease_expires_at FROM core_runs WHERE run_id = %s",
+                        (record.run_id,),
+                    ).fetchone()["lease_expires_at"]
+                    connection.execute(
+                        """SELECT 1 FROM core_budget_ledgers
+                           WHERE root_run_id = %s FOR UPDATE""",
+                        (record.run_id,),
+                    ).fetchone()
+                    worker = threading.Thread(target=transition)
+                    worker.start()
+                    self._wait_for_blocked_query(
+                        database, "UPDATE core_budget_ledgers SET"
+                    )
+                    connection.execute(
+                        """SELECT pg_sleep(GREATEST(
+                             %s - EXTRACT(EPOCH FROM clock_timestamp()) + 0.05, 0))""",
+                        (expiry,),
+                    ).fetchone()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(outcome, ["LEASE_LOST"])
+
+            persisted = workflows.get(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+            )
+            with database.pool.connection() as connection:
+                effects = connection.execute(
+                    """SELECT
+                         (SELECT used_model_turns FROM core_budget_ledgers
+                          WHERE root_run_id = %s) AS used_model_turns,
+                         (SELECT count(*) FROM core_events
+                          WHERE run_id = %s AND kind = 'model.attempt.started')
+                           AS events,
+                         (SELECT count(*) FROM core_outbox
+                          WHERE aggregate_id = %s
+                            AND event_type = 'model.attempt.started') AS outbox""",
+                    (record.run_id, record.run_id, record.run_id),
+                ).fetchone()
+            self.assertEqual(persisted.version, record.version)
+            self.assertEqual(persisted.state, record.state)
+            self.assertEqual(persisted.snapshot, record.snapshot)
+            self.assertEqual(
+                dict(effects), {"used_model_turns": 1, "events": 0, "outbox": 0}
+            )
+        finally:
+            database.close()
+
+    def test_postgres_scheduler_preserves_id_and_cancel_wins_over_worker_error(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        scheduler = PostgresTaskScheduler(database)
+        started = threading.Event()
+        cleaned = []
+
+        def work(cancel_event):
+            started.set()
+            self.assertTrue(cancel_event.wait(2))
+            raise RuntimeError("raised after cancellation")
+
+        try:
+            task = scheduler.start(
+                work,
+                owner_id="parent-run",
+                accepts_cancel_event=True,
+                kind="cancel-test",
+                contract={},
+                task_id="stable-child-id",
+                tenant_id="tenant-1",
+                on_cancel=lambda: cleaned.append("stable-child-id"),
+            )
+            self.assertEqual(task.id, "stable-child-id")
+            self.assertTrue(started.wait(1))
+            scheduler.cancel(task.id, owner_id="parent-run", tenant_id="tenant-1")
+            terminal = scheduler.wait(
+                task.id,
+                owner_id="parent-run",
+                tenant_id="tenant-1",
+                timeout=2,
+            )
+            self.assertEqual(terminal.state, "canceled")
+            self.assertIsNone(terminal.error)
+            self.assertEqual(cleaned, ["stable-child-id"])
+        finally:
+            scheduler.close()
+            database.close()
+
+    def test_postgres_recovery_claim_is_renewed_and_exclusive(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        now = time.time()
+        with database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO core_background_tasks
+                   (id, owner_run_id, tenant_id, kind, state, required,
+                    recoverable, contract, created_at, updated_at)
+                   VALUES ('claimed-task', 'parent-run', 'tenant-1', 'claimed',
+                           'working', true, true, '{}'::jsonb, %s, %s)""",
+                (now, now),
+            )
+        first = PostgresTaskScheduler(
+            database, task_lease_ttl=0.2, task_lease_heartbeat_interval=0.05
+        )
+        second = PostgresTaskScheduler(
+            database, task_lease_ttl=0.2, task_lease_heartbeat_interval=0.05
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def recover(_contract, _cancel_event):
+            calls.append("called")
+            entered.set()
+            release.wait(2)
+            return "done"
+
+        first.register("claimed", recover)
+        second.register("claimed", recover)
+        try:
+            self.assertEqual(first.recover(), 1)
+            self.assertTrue(entered.wait(1))
+            time.sleep(0.35)
+            self.assertEqual(second.recover(), 0)
+            self.assertEqual(calls, ["called"])
+            release.set()
+            terminal = first.wait(
+                "claimed-task",
+                owner_id="parent-run",
+                tenant_id="tenant-1",
+                timeout=2,
+            )
+            self.assertEqual(terminal.state, "completed")
+        finally:
+            release.set()
+            first.close()
+            second.close()
+            database.close()
+
+    def test_scheduler_claim_and_recovery_use_database_clock(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        now = time.time()
+        with database.transaction() as connection:
+            for task_id in ("skewed-claim", "skewed-recovery"):
+                connection.execute(
+                    """INSERT INTO core_background_tasks
+                       (id, owner_run_id, tenant_id, kind, state, required,
+                        recoverable, contract, mutating, created_at, updated_at)
+                       VALUES (%s, 'parent-run', 'tenant-1', 'skewed-clock',
+                               'submitted', true, true, '{}'::jsonb, false, %s, %s)""",
+                    (task_id, now, now),
+                )
+        slow = PostgresTaskScheduler(
+            database,
+            clock=lambda: 0.0,
+            task_lease_ttl=30,
+            task_lease_heartbeat_interval=10,
+        )
+        fast = PostgresTaskScheduler(
+            database,
+            clock=lambda: 10**12,
+            task_lease_ttl=30,
+            task_lease_heartbeat_interval=10,
+        )
+        calls = []
+        fast.register("skewed-clock", lambda _contract, _cancel: calls.append("run"))
+        try:
+            token, claimed = slow._claim(
+                "skewed-claim", "tenant-1", allow_working=False
+            )
+            self.assertIsNotNone(token)
+            self.assertIsNotNone(claimed)
+            stolen_token, stolen = fast._claim(
+                "skewed-claim", "tenant-1", allow_working=True
+            )
+            self.assertIsNone(stolen_token)
+            self.assertIsNone(stolen)
+
+            slow._claim("skewed-recovery", "tenant-1", allow_working=False)
+            self.assertEqual(fast.recover(), 0)
+            self.assertEqual(calls, [])
+        finally:
+            slow.close()
+            fast.close()
+            database.close()
+
+    def test_scheduler_renew_and_finish_use_database_clock(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        scheduler = PostgresTaskScheduler(
+            database,
+            clock=lambda: 10**12,
+            task_lease_ttl=30,
+            task_lease_heartbeat_interval=10,
+        )
+        now = time.time()
+        with database.transaction() as connection:
+            for task_id in ("skewed-renew", "skewed-finish"):
+                connection.execute(
+                    """INSERT INTO core_background_tasks
+                       (id, owner_run_id, tenant_id, kind, state, required,
+                        recoverable, contract, mutating, claim_owner, claim_token,
+                        claim_expires_at, created_at, updated_at)
+                       VALUES (%s, 'parent-run', 'tenant-1', 'skewed-clock',
+                               'working', true, true, '{}'::jsonb, false, %s, %s,
+                               EXTRACT(EPOCH FROM clock_timestamp()) + 30, %s, %s)""",
+                    (task_id, scheduler._worker_id, f"{task_id}-token", now, now),
+                )
+        try:
+            scheduler._renew_claim(
+                "skewed-renew", "tenant-1", "skewed-renew-token"
+            )
+            self.assertTrue(
+                scheduler._finish(
+                    "skewed-finish",
+                    "tenant-1",
+                    "skewed-finish-token",
+                    "completed",
+                    "done",
+                    None,
+                )
+            )
+        finally:
+            scheduler.close()
+            database.close()
+
+    def test_scheduler_renew_rechecks_database_clock_after_row_lock_wait(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        scheduler = PostgresTaskScheduler(
+            database, task_lease_ttl=0.2, task_lease_heartbeat_interval=0.05
+        )
+        now = time.time()
+        with database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO core_background_tasks
+                   (id, owner_run_id, tenant_id, kind, state, required,
+                    recoverable, contract, mutating, created_at, updated_at)
+                   VALUES ('blocked-renew', 'parent-run', 'tenant-1', 'blocked',
+                           'submitted', true, true, '{}'::jsonb, false, %s, %s)""",
+                (now, now),
+            )
+        token, _ = scheduler._claim(
+            "blocked-renew", "tenant-1", allow_working=False
+        )
+        outcome = []
+
+        def renew():
+            try:
+                scheduler._renew_claim("blocked-renew", "tenant-1", token)
+            except CoreError as error:
+                outcome.append(error.code)
+            else:
+                outcome.append("renewed")
+
+        try:
+            with database.pool.connection() as connection:
+                with connection.transaction():
+                    connection.execute(
+                        """SELECT 1 FROM core_background_tasks
+                           WHERE id = 'blocked-renew' FOR UPDATE"""
+                    ).fetchone()
+                    worker = threading.Thread(target=renew)
+                    worker.start()
+                    self._wait_for_blocked_query(
+                        database,
+                        "SELECT state, claim_owner, claim_token",
+                    )
+                    connection.execute(
+                        """SELECT pg_sleep(GREATEST(
+                             claim_expires_at
+                             - EXTRACT(EPOCH FROM clock_timestamp()) + 0.05, 0))
+                           FROM core_background_tasks WHERE id = 'blocked-renew'"""
+                    ).fetchone()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(outcome, ["LEASE_LOST"])
+        finally:
+            scheduler.close()
+            database.close()
+
+    def test_scheduler_finish_rechecks_database_clock_after_row_lock_wait(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        scheduler = PostgresTaskScheduler(
+            database, task_lease_ttl=0.2, task_lease_heartbeat_interval=0.05
+        )
+        now = time.time()
+        with database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO core_background_tasks
+                   (id, owner_run_id, tenant_id, kind, state, required,
+                    recoverable, contract, mutating, created_at, updated_at)
+                   VALUES ('blocked-finish', 'parent-run', 'tenant-1', 'blocked',
+                           'submitted', true, true, '{}'::jsonb, false, %s, %s)""",
+                (now, now),
+            )
+        token, _ = scheduler._claim(
+            "blocked-finish", "tenant-1", allow_working=False
+        )
+        outcome = []
+
+        def finish():
+            outcome.append(
+                scheduler._finish(
+                    "blocked-finish",
+                    "tenant-1",
+                    token,
+                    "completed",
+                    "stale",
+                    None,
+                )
+            )
+
+        try:
+            with database.pool.connection() as connection:
+                with connection.transaction():
+                    connection.execute(
+                        """SELECT 1 FROM core_background_tasks
+                           WHERE id = 'blocked-finish' FOR UPDATE"""
+                    ).fetchone()
+                    worker = threading.Thread(target=finish)
+                    worker.start()
+                    self._wait_for_blocked_query(
+                        database, "SELECT * FROM core_background_tasks"
+                    )
+                    connection.execute(
+                        """SELECT pg_sleep(GREATEST(
+                             claim_expires_at
+                             - EXTRACT(EPOCH FROM clock_timestamp()) + 0.05, 0))
+                           FROM core_background_tasks WHERE id = 'blocked-finish'"""
+                    ).fetchone()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(outcome, [False])
+        finally:
+            scheduler.close()
+            database.close()
+
+    def test_cancel_between_recovery_read_and_claim_runs_reconciliation(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        now = time.time()
+        with database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO core_background_tasks
+                   (id, owner_run_id, tenant_id, kind, state, required,
+                    recoverable, contract, mutating, claim_expires_at,
+                    created_at, updated_at)
+                   VALUES ('cancel-race', 'parent-run', 'tenant-1', 'reconcile',
+                           'working', true, true, '{}'::jsonb, false, %s, %s, %s)""",
+                (now - 1, now, now),
+            )
+        canceler = PostgresTaskScheduler(database)
+
+        class CancelBeforeClaimScheduler(PostgresTaskScheduler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.cancel_injected = False
+
+            def _claim(self, task_id, tenant_id, *, allow_working):
+                if task_id == "cancel-race" and not self.cancel_injected:
+                    self.cancel_injected = True
+                    canceler.cancel(
+                        task_id, owner_id="parent-run", tenant_id=tenant_id
+                    )
+                return super()._claim(
+                    task_id, tenant_id, allow_working=allow_working
+                )
+
+        scheduler = CancelBeforeClaimScheduler(database)
+        reconciled = []
+
+        def reconcile(_contract, cancel_event):
+            reconciled.append(cancel_event.is_set())
+            raise CoreError("SIDE_EFFECT_UNKNOWN")
+
+        scheduler.register("reconcile", reconcile)
+        try:
+            scheduler.recover()
+            terminal = scheduler.wait(
+                "cancel-race",
+                owner_id="parent-run",
+                tenant_id="tenant-1",
+                timeout=2,
+            )
+            self.assertEqual(reconciled, [True])
+            self.assertEqual(terminal.state, "failed")
+            self.assertEqual(terminal.error.code, "SIDE_EFFECT_UNKNOWN")
+        finally:
+            canceler.close()
+            scheduler.close()
+            database.close()
+
+    def test_cancel_after_recovery_claim_does_not_mask_reconciliation_failure(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        now = time.time()
+        with database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO core_background_tasks
+                   (id, owner_run_id, tenant_id, kind, state, required,
+                    recoverable, contract, mutating, claim_expires_at,
+                    created_at, updated_at)
+                   VALUES ('post-claim-cancel', 'parent-run', 'tenant-1',
+                           'post-claim-reconcile', 'working', true, true,
+                           '{}'::jsonb, false, %s, %s, %s)""",
+                (now - 1, now, now),
+            )
+        scheduler = PostgresTaskScheduler(
+            database, task_lease_ttl=1, task_lease_heartbeat_interval=0.02
+        )
+        canceler = PostgresTaskScheduler(database)
+        entered = threading.Event()
+
+        def reconcile(_contract, cancel_event):
+            entered.set()
+            self.assertTrue(cancel_event.wait(2))
+            raise RuntimeError("reconciliation failed")
+
+        scheduler.register("post-claim-reconcile", reconcile)
+        try:
+            self.assertEqual(scheduler.recover(), 1)
+            self.assertTrue(entered.wait(1))
+            canceler.cancel(
+                "post-claim-cancel",
+                owner_id="parent-run",
+                tenant_id="tenant-1",
+            )
+            terminal = scheduler.wait(
+                "post-claim-cancel",
+                owner_id="parent-run",
+                tenant_id="tenant-1",
+                timeout=2,
+            )
+            self.assertEqual(terminal.state, "failed")
+            self.assertEqual(
+                terminal.error.code, "RECOVERY_REQUIRES_RECONCILIATION"
+            )
+        finally:
+            scheduler.close()
+            canceler.close()
+            database.close()
+
+    def test_expired_scheduler_claim_must_be_reclaimed_before_renew_or_finish(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        first = PostgresTaskScheduler(
+            database,
+            task_lease_ttl=10,
+            task_lease_heartbeat_interval=5,
+        )
+        second = PostgresTaskScheduler(
+            database,
+            task_lease_ttl=10,
+            task_lease_heartbeat_interval=5,
+        )
+        now = time.time()
+        with database.transaction() as connection:
+            for task_id in ("expired-renew", "expired-finish"):
+                connection.execute(
+                    """INSERT INTO core_background_tasks
+                       (id, owner_run_id, tenant_id, kind, state, required,
+                        recoverable, contract, created_at, updated_at)
+                       VALUES (%s, 'parent-run', 'tenant-1', 'lease-fence',
+                               'submitted', true, true, '{}'::jsonb, %s, %s)""",
+                    (task_id, now, now),
+                )
+        renew_token, _ = first._claim(
+            "expired-renew", "tenant-1", allow_working=False
+        )
+        finish_token, _ = first._claim(
+            "expired-finish", "tenant-1", allow_working=False
+        )
+        with database.transaction() as connection:
+            connection.execute(
+                """UPDATE core_background_tasks SET claim_expires_at =
+                           EXTRACT(EPOCH FROM statement_timestamp()) - 1
+                   WHERE id IN ('expired-renew', 'expired-finish')"""
+            )
+
+        renew_error = None
+        try:
+            first._renew_claim("expired-renew", "tenant-1", renew_token)
+        except CoreError as error:
+            renew_error = error.code
+        stale_finish = first._finish(
+            "expired-finish",
+            "tenant-1",
+            finish_token,
+            "completed",
+            "stale result",
+            None,
+        )
+
+        reclaimed = []
+        finished = []
+        for task_id in ("expired-renew", "expired-finish"):
+            token, row = second._claim(task_id, "tenant-1", allow_working=True)
+            reclaimed.append(row is not None)
+            finished.append(
+                row is not None
+                and second._finish(
+                    task_id,
+                    "tenant-1",
+                    token,
+                    "completed",
+                    "reclaimed result",
+                    None,
+                )
+            )
+        states = [
+            second.get(task_id, owner_id="parent-run", tenant_id="tenant-1").state
+            for task_id in ("expired-renew", "expired-finish")
+        ]
+        try:
+            self.assertEqual(
+                {
+                    "renew_error": renew_error,
+                    "stale_finish": stale_finish,
+                    "reclaimed": reclaimed,
+                    "finished": finished,
+                    "states": states,
+                },
+                {
+                    "renew_error": "LEASE_LOST",
+                    "stale_finish": False,
+                    "reclaimed": [True, True],
+                    "finished": [True, True],
+                    "states": ["completed", "completed"],
+                },
+            )
+        finally:
+            first.close()
+            second.close()
+            database.close()
+
+    def test_distributed_cancel_preserves_late_result_and_notification(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        first = PostgresTaskScheduler(
+            database, task_lease_ttl=0.2, task_lease_heartbeat_interval=0.02
+        )
+        second = PostgresTaskScheduler(
+            database, task_lease_ttl=0.2, task_lease_heartbeat_interval=0.02
+        )
+        started = threading.Event()
+        cancel_seen = threading.Event()
+        release = threading.Event()
+        cleaned = []
+
+        def work(cancel_event):
+            started.set()
+            cancel_event.wait(2)
+            cancel_seen.set()
+            release.wait(2)
+            return "late durable result"
+
+        try:
+            task = first.start(
+                work,
+                owner_id="parent-run",
+                kind="distributed-cancel",
+                contract={},
+                accepts_cancel_event=True,
+                tenant_id="tenant-1",
+                on_cancel=lambda: cleaned.append("destroyed"),
+                mutating=False,
+            )
+            self.assertTrue(started.wait(1))
+            second.cancel(
+                task.id, owner_id="parent-run", tenant_id="tenant-1"
+            )
+            self.assertTrue(cancel_seen.wait(1))
+            observer = PostgresTaskScheduler(database)
+            self.assertEqual(
+                observer.get(
+                    task.id, owner_id="parent-run", tenant_id="tenant-1"
+                ).state,
+                "working",
+            )
+            release.set()
+            terminal = first.wait(
+                task.id,
+                owner_id="parent-run",
+                tenant_id="tenant-1",
+                timeout=2,
+            )
+            self.assertEqual(terminal.state, "canceled")
+            self.assertEqual(terminal.result, "late durable result")
+            self.assertEqual(cleaned, ["destroyed"])
+            notice = observer.mailbox("parent-run", "tenant-1").poll()[-1]
+            self.assertEqual(notice.payload["result"], "late durable result")
+            observer.close()
+        finally:
+            release.set()
+            first.close()
+            second.close()
+            database.close()
+
+    def test_committed_task_is_recovered_when_launch_fails_before_worker_start(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        scheduler = PostgresTaskScheduler(database)
+        root = workflows.create(
+            WorkflowRecord(
+                "launch-root",
+                "launch-root-task",
+                "launch-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "root"},
+                {"turns": 0, "finalization_turn_reserved": True},
+            ),
+            budget_limits=(3, 1),
+            reserve_model_turns=1,
+        )
+        child = WorkflowRecord(
+            "launch-child",
+            "launch-child-task",
+            "launch-context",
+            "tenant-1",
+            "owner-1",
+            root.run_id,
+            "RUNNING",
+            1,
+            {"prompt": "child"},
+            {"turns": 0, "finalization_turn_reserved": True},
+        )
+
+        def admit(connection):
+            workflows.create(
+                child,
+                reserve_model_turns=1,
+                connection=connection,
+            )
+
+        try:
+            with patch.object(
+                scheduler, "_launch", side_effect=RuntimeError("thread unavailable")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                    scheduler.start(
+                        lambda: "unused",
+                        owner_id=root.run_id,
+                        task_id=child.task_id,
+                        kind="recover-child",
+                        contract={},
+                        recoverable=True,
+                        tenant_id="tenant-1",
+                        admission=admit,
+                    )
+            with database.pool.connection() as connection:
+                counts = connection.execute(
+                    """SELECT
+                         (SELECT count(*) FROM core_background_tasks
+                          WHERE id = 'launch-child-task') AS tasks,
+                         (SELECT count(*) FROM core_runs
+                          WHERE run_id = 'launch-child') AS workflows,
+                         (SELECT used_model_turns FROM core_budget_ledgers
+                          WHERE root_run_id = 'launch-root') AS used"""
+                ).fetchone()
+            self.assertEqual(dict(counts), {"tasks": 1, "workflows": 1, "used": 2})
+
+            scheduler.register("recover-child", lambda _contract, _cancel: "recovered")
+            self.assertEqual(scheduler.recover(), 1)
+            terminal = scheduler.wait(
+                child.task_id,
+                owner_id=root.run_id,
+                tenant_id="tenant-1",
+                timeout=2,
+            )
+            self.assertEqual(terminal.result, "recovered")
+            with database.pool.connection() as connection:
+                used = connection.execute(
+                    """SELECT used_model_turns FROM core_budget_ledgers
+                       WHERE root_run_id = 'launch-root'"""
+                ).fetchone()["used_model_turns"]
+            self.assertEqual(used, 2)
+        finally:
+            scheduler.close()
+            database.close()
+
+    def test_shared_budget_snapshot_locks_ledger_until_terminal_transition(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.create(
+            WorkflowRecord(
+                "snapshot-run",
+                "snapshot-task",
+                "snapshot-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "work"},
+                {"turns": 1, "finalization_turn_reserved": False},
+            ),
+            budget_limits=(2, 1),
+            reserve_model_turns=1,
+        )
+        finished = threading.Event()
+        outcome = []
+
+        def complete():
+            try:
+                outcome.append(
+                    workflows.transition(
+                        record.run_id,
+                        tenant_id=record.tenant_id,
+                        owner_id=record.owner_id,
+                        expected_version=record.version,
+                        state="COMPLETED",
+                        snapshot=record.snapshot,
+                        event_kind="task.completed",
+                        result={
+                            "message": "done",
+                            "usage": {"model_turns": 1, "tool_calls": 0},
+                        },
+                        include_shared_budget=True,
+                    )
+                )
+            finally:
+                finished.set()
+
+        try:
+            with database.pool.connection() as connection:
+                with connection.transaction():
+                    connection.execute(
+                        """SELECT 1 FROM core_budget_ledgers
+                           WHERE root_run_id = %s FOR UPDATE""",
+                        (record.run_id,),
+                    ).fetchone()
+                    worker = threading.Thread(target=complete)
+                    worker.start()
+                    self.assertFalse(finished.wait(0.15))
+            self.assertTrue(finished.wait(2))
+            worker.join(1)
+            self.assertEqual(
+                outcome[0].result["shared_budget"]["used"]["model_turns"], 1
+            )
+        finally:
+            database.close()
+
+    def test_model_attempt_charge_and_checkpoint_commit_together(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.create(
+            WorkflowRecord(
+                "attempt-run",
+                "attempt-task",
+                "attempt-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "work"},
+                {"turns": 0, "finalization_turn_reserved": True},
+            ),
+            budget_limits=(2, 1),
+            reserve_model_turns=1,
+        )
+        token = workflows.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id="attempt-worker",
+            ttl=30,
+        )
+        attempt_snapshot = {
+            **record.snapshot,
+            "turns": 1,
+            "model_attempt_in_flight": {"turn": 1, "finalizing": False},
+        }
+        try:
+            started = workflows.transition(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+                expected_version=record.version,
+                state="RUNNING",
+                snapshot=attempt_snapshot,
+                event_kind="model.attempt.started",
+                lease_token=token,
+                consume_model_turns=1,
+            )
+            with database.pool.connection() as connection:
+                ledger = connection.execute(
+                    """SELECT used_model_turns FROM core_budget_ledgers
+                       WHERE root_run_id = %s""",
+                    (record.run_id,),
+                ).fetchone()
+            self.assertEqual(started.snapshot["turns"], 1)
+            self.assertEqual(ledger["used_model_turns"], 2)
+
+            rejected_snapshot = {
+                **started.snapshot,
+                "turns": 2,
+                "model_attempt_in_flight": {"turn": 2, "finalizing": False},
+            }
+            with self.assertRaises(CoreError) as caught:
+                workflows.transition(
+                    started.run_id,
+                    tenant_id=started.tenant_id,
+                    owner_id=started.owner_id,
+                    expected_version=started.version,
+                    state="RUNNING",
+                    snapshot=rejected_snapshot,
+                    event_kind="model.attempt.started",
+                    lease_token=token,
+                    consume_model_turns=1,
+                )
+            self.assertEqual(caught.exception.code, "BUDGET_EXCEEDED")
+            persisted = workflows.get(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+            )
+            self.assertEqual(persisted.version, started.version)
+            self.assertEqual(persisted.snapshot["turns"], 1)
+            with database.pool.connection() as connection:
+                used = connection.execute(
+                    """SELECT used_model_turns FROM core_budget_ledgers
+                       WHERE root_run_id = %s""",
+                    (record.run_id,),
+                ).fetchone()["used_model_turns"]
+            self.assertEqual(used, 2)
+        finally:
+            database.close()
+
+    def test_tool_call_charge_and_pending_marker_commit_together(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.create(
+            WorkflowRecord(
+                "tool-charge-run",
+                "tool-charge-task",
+                "tool-charge-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "MODEL_RESPONDED",
+                1,
+                {"prompt": "work"},
+                {"turns": 1, "tool_calls": 0, "pending_call": None},
+            ),
+            budget_limits=(2, 2),
+        )
+        token = workflows.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id="tool-worker",
+            ttl=30,
+        )
+        first_snapshot = {
+            **record.snapshot,
+            "tool_calls": 1,
+            "pending_call": {"id": "call-1", "name": "read"},
+        }
+        try:
+            started = workflows.transition(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+                expected_version=record.version,
+                state="EXECUTING",
+                snapshot=first_snapshot,
+                event_kind="tool.dispatch.started",
+                lease_token=token,
+                consume_tool_calls=1,
+            )
+            with database.pool.connection() as connection:
+                used = connection.execute(
+                    """SELECT used_tool_calls FROM core_budget_ledgers
+                       WHERE root_run_id = %s""",
+                    (record.run_id,),
+                ).fetchone()["used_tool_calls"]
+            self.assertEqual(used, 1)
+            self.assertEqual(started.snapshot["pending_call"]["id"], "call-1")
+
+            second_snapshot = {
+                **started.snapshot,
+                "tool_calls": 2,
+                "pending_call": {"id": "call-2", "name": "read"},
+            }
+            with patch.object(
+                workflows, "_event", side_effect=RuntimeError("injected failure")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                    workflows.transition(
+                        started.run_id,
+                        tenant_id=started.tenant_id,
+                        owner_id=started.owner_id,
+                        expected_version=started.version,
+                        state="EXECUTING",
+                        snapshot=second_snapshot,
+                        event_kind="tool.dispatch.started",
+                        lease_token=token,
+                        consume_tool_calls=1,
+                    )
+            persisted = workflows.get(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+            )
+            with database.pool.connection() as connection:
+                used_after_rollback = connection.execute(
+                    """SELECT used_tool_calls FROM core_budget_ledgers
+                       WHERE root_run_id = %s""",
+                    (record.run_id,),
+                ).fetchone()["used_tool_calls"]
+            self.assertEqual(persisted.version, started.version)
+            self.assertEqual(persisted.snapshot["pending_call"]["id"], "call-1")
+            self.assertEqual(used_after_rollback, 1)
+        finally:
+            database.close()
+
+    def test_postgres_child_admission_rolls_back_scheduler_workflow_and_reserve(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        scheduler = PostgresTaskScheduler(database)
+        root = workflows.create(
+            WorkflowRecord(
+                "admission-root",
+                "admission-root-task",
+                "admission-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "root"},
+                {"turns": 0, "finalization_turn_reserved": True},
+            ),
+            budget_limits=(2, 2),
+            reserve_model_turns=1,
+        )
+        child = WorkflowRecord(
+            "admission-child",
+            "admission-child-task",
+            "admission-context",
+            "tenant-1",
+            "owner-1",
+            root.run_id,
+            "RUNNING",
+            1,
+            {"prompt": "child"},
+            {"turns": 0, "finalization_turn_reserved": True},
+        )
+
+        def reject(connection):
+            workflows.create(
+                child,
+                reserve_model_turns=1,
+                connection=connection,
+            )
+            raise CoreError("TOOL_START_FAILED", "reject admission")
+
+        try:
+            with self.assertRaises(CoreError) as caught:
+                scheduler.start(
+                    lambda: None,
+                    owner_id=root.run_id,
+                    task_id=child.task_id,
+                    kind="subagent",
+                    contract={"scope": {"task_id": child.task_id}},
+                    recoverable=True,
+                    tenant_id="tenant-1",
+                    admission=reject,
+                )
+            self.assertEqual(caught.exception.code, "TOOL_START_FAILED")
+            with database.pool.connection() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) AS count FROM core_background_tasks "
+                        "WHERE id = %s",
+                        (child.task_id,),
+                    ).fetchone()["count"],
+                    0,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) AS count FROM core_runs WHERE run_id = %s",
+                        (child.run_id,),
+                    ).fetchone()["count"],
+                    0,
+                )
+                ledger = connection.execute(
+                    "SELECT used_model_turns FROM core_budget_ledgers "
+                    "WHERE root_run_id = %s",
+                    (root.run_id,),
+                ).fetchone()
+            self.assertEqual(ledger["used_model_turns"], 1)
+        finally:
+            scheduler.close()
+            database.close()
 
     def test_inbound_inbox_is_durable_idempotent_and_gates_completion(self):
         database = self._database()
@@ -745,4 +2304,3 @@ class PostgresRestartTests(unittest.TestCase):
             self.assertIsNotNone(rows[0]["consumed_at"])
         finally:
             reopened.close()
-

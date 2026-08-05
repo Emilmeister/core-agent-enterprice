@@ -66,6 +66,7 @@ class TaskScheduler:
         self._mailboxes = {}
         self._closed = False
         self._kinds = {}
+        self._cancel_callbacks = {}
         self.telemetry = telemetry
         self.active_compute_waiters = 0
 
@@ -77,6 +78,7 @@ class TaskScheduler:
         function,
         *,
         owner_id,
+        task_id=None,
         required=False,
         accepts_cancel_event=False,
         trace_context=None,
@@ -85,16 +87,25 @@ class TaskScheduler:
         recoverable=False,
         tenant_id="default",
         continue_trace=False,
+        admission=None,
+        on_cancel=None,
+        mutating=False,
     ):
-        task = BackgroundTask(str(uuid.uuid4()), owner_id, required)
-        self._tasks[task.id] = task
-        self._kinds[task.id] = kind
+        task_id = task_id or str(uuid.uuid4())
+        if not isinstance(task_id, str) or not task_id or task_id in self._tasks:
+            raise CoreError("SESSION_CONFLICT", "task_id must be unique")
+        task = BackgroundTask(task_id, owner_id, required)
         linked_context = trace_context
         if self.telemetry and linked_context is None:
             with self.telemetry.span("core_agent.task.submit") as submission:
                 linked_context = submission.context
+        ready = threading.Event()
+        admitted = threading.Event()
 
         def run():
+            ready.wait()
+            if not admitted.is_set():
+                return
             span = None
             if self.telemetry:
                 span = (
@@ -121,8 +132,11 @@ class TaskScheduler:
                     captured_error = None
                 except Exception as error:
                     value = None
-                    final_state = "failed"
-                    captured_error = error
+                    canceled = task.cancel_event.is_set() and getattr(
+                        error, "code", None
+                    ) not in {"SIDE_EFFECT_UNKNOWN", "RECOVERY_REQUIRES_RECONCILIATION"}
+                    final_state = "canceled" if canceled else "failed"
+                    captured_error = None if canceled else error
             with task.condition:
                 task.result = value
                 task.error = captured_error
@@ -137,9 +151,21 @@ class TaskScheduler:
                     {"result": task.result},
                 )
                 self.mailbox(owner_id).deliver(event)
+                self._cancel_callbacks.pop(task.id, None)
                 task.condition.notify_all()
 
-        threading.Thread(target=run, daemon=True).start()
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        try:
+            if admission is not None:
+                admission(None)
+            self._tasks[task.id] = task
+            self._kinds[task.id] = kind
+            if on_cancel is not None:
+                self._cancel_callbacks[task.id] = on_cancel
+            admitted.set()
+        finally:
+            ready.set()
         return task
 
     def count(self, *, owner_id, kind=None, active_only=False, tenant_id="default"):
@@ -182,6 +208,9 @@ class TaskScheduler:
         ):
             raise CoreError("TASK_NOT_CANCELABLE")
         task.cancel_event.set()
+        callback = self._cancel_callbacks.pop(task.id, None)
+        if callback is not None:
+            callback()
         return task
 
     def assert_can_complete_parent(self, owner_id, tenant_id="default"):
@@ -258,7 +287,8 @@ class DelegationContract:
         if refused:
             raise CoreError(
                 "CAPABILITY_DISABLED",
-                f"this agent does not hold skill {', '.join(refused)}",
+                f"this agent does not hold skill {', '.join(refused)}; it holds "
+                f"{', '.join(sorted(skills)) or 'no skills'}",
             )
         for key, value in self.budget.items():
             if value > budgets.get(key, value):
@@ -286,8 +316,7 @@ class DelegationContract:
             or not isinstance(raw["skills"], list)
             or not all(isinstance(value, str) for value in raw["skills"])
             or not isinstance(raw["budget"], dict)
-            or not raw["budget"]
-            or set(raw["budget"]) - {"turns", "tool_calls"}
+            or set(raw["budget"]) != {"turns", "tool_calls"}
             or not all(
                 isinstance(value, int)
                 and not isinstance(value, bool)
@@ -302,7 +331,7 @@ class DelegationContract:
             raise CoreError(
                 "TOOL_ARGUMENT_INVALID",
                 "delegation needs instruction, a list of tools by their catalogue "
-                "names, skills and a budget of turns and/or tool_calls above zero",
+                "names, skills and both budget.turns and budget.tool_calls above zero",
             )
         return cls(
             raw["instruction"],
@@ -316,7 +345,15 @@ class DelegationContract:
 def derive_child_capabilities(parent, contract, *, current_depth):
     depth_limit = min(parent.budgets.get("depth", 0), MAX_SUBAGENT_DEPTH)
     if current_depth >= depth_limit:
-        raise CoreError("BUDGET_EXCEEDED")
+        raise CoreError(
+            "BUDGET_EXCEEDED",
+            f"delegation depth budget exhausted ({current_depth}/{depth_limit})",
+            data={
+                "dimension": "depth",
+                "used": current_depth,
+                "limit": depth_limit,
+            },
+        )
     builtins, mcp = contract.resolve(
         tools=parent.tools,
         mcp=parent.mcp,

@@ -200,6 +200,10 @@ Target spec может описывать больше текущего runtime.
 - Follow-up не прерывает текущий model/tool call, не меняет EffectiveConfig или
   budgets и дедуплицируется по `(task_id, message_id)`. После terminal state
   продолжение создаёт новую Task в том же context.
+- Terminal A2A Artifact различает полное и budget-exhausted завершение через
+  `complete`, `completion_reason`, local `usage`, root `shared_budget` и при
+  необходимости `exhausted_dimension`/`pending_tasks`; live и recovery path
+  публикуют одинаковую provenance shape.
 - Любая tool/side-effect/background/subagent работа принадлежит A2A Task.
   Закрытие stream не отменяет Task; critical wait/status сохраняется durable и
   восстанавливается через GetTask.
@@ -263,6 +267,8 @@ platform configuration, а зарезервированного сервера `
 - `core_python_exec` доступен в обоих режимах только при
   `LOCAL_APPROVAL_ENABLED=false`.
 - `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` только сужает выбранный mode ceiling.
+- `CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS` задаёт положительное bounded ожидание
+  подтверждения cancel owned Tasks перед возвратом budget-partial результата.
 - `without_terminal` означает отсутствие model-visible terminal tool, а не OS
   sandbox: Python может использовать `os`, `subprocess` и filesystem APIs.
 - `core_terminal_exec` принимает `argv` без implicit shell. Pipes, redirects и
@@ -316,15 +322,42 @@ platform configuration, а зарезервированного сервера `
 - Main имеет depth `0`, child — `1`, grandchild — `2`; `2` — hard maximum.
 - Depth `2` не получает `core_delegate` ни в instructions, ни в catalog/runtime.
 - Delegation передаёт одну узкую instruction, exact tools/MCP/skills allowlists
-  и положительный budget. Child возвращает обычный text result, который parent
-  воспринимает как недоверенный input.
+  и оба обязательных лимита `budget.turns >= 1` и `budget.tool_calls >= 1`.
+  Child возвращает обычный text result, который parent воспринимает как
+  недоверенный input.
 - Parent делегирует coherent outcome, scope, deliverable и acceptance criteria,
   а не mechanical microsteps. Он выбирает minimum sufficient capability set;
   runtime предоставляет exactly этот set.
+- Balanced delegation применяется для materially useful parallel work, изоляции
+  большого отделимого context или bounded independently verifiable deliverable,
+  только когда parent может проверить/интегрировать result и польза выше
+  coordination overhead. Simple, immediate serial, tightly coupled, duplicate,
+  policy-bypass и generic second-opinion работа остаётся у parent.
 - Внутри objective/scope child самостоятельно выбирает strategy, sequencing и
   delegated tools. Procedure задаётся только для safety, correctness,
   reproducibility или policy; assumptions не подменяют tenant/approval/scope.
 - Child не расширяет capabilities, tenant или parent budget.
+- Root и каждый child заранее занимают один finalization model turn в общем
+  root ledger. Перед каждой физической provider attempt и каждым model-issued
+  tool request charge, local usage и dispatch marker коммитятся одной
+  workflow-транзакцией; retry является новой attempt, а не бесплатным
+  продолжением.
+- Исчерпание execution budget завершает workflow как `COMPLETED` с
+  `complete=false`: tool batch получает structured failures, финализатор видит
+  пустой catalog и сообщает проверенный промежуточный результат и unfinished
+  scope. Provider outage даёт детерминированный fallback, а не `FAILED` и не
+  выдуманный результат.
+- Scheduler handle, child workflow и finalization reserve принимаются одной
+  PostgreSQL-транзакцией до worker start и используют один task ID. Durable
+  worker владеет expiring fenced claim с heartbeat; истёкший token не может
+  renew-иться или записать terminal state. PostgreSQL lease/claim expiry
+  проверяется по текущему server clock после row lock, независимо от часов
+  replica и времени начала statement. Workflow recovery пропускает live lease и
+  само получает lease перед reconciliation; scheduler принимает recovery/cancel
+  решение по provenance atomic claim, а late cancel не стирает reconciliation
+  error. Workflow transition делает fenced `core_runs` update последней записью
+  транзакции; expiry во время budget/audit/outbox lock wait откатывает transition
+  и его budget charge целиком.
 - Joined `core_delegate` по умолчанию требует использовать child result и не
   повторять ту же работу. `background: true` разрешает main продолжать только
   независимую работу до notification/wait.
@@ -332,6 +365,13 @@ platform configuration, а зарезервированного сервера `
 - Parent cancel рекурсивно отменяет owned children. Required pending child
   блокирует успешное завершение parent; нужный финальному ответу result должен
   быть joined/waited.
+- При budget exhaustion cancel ждётся только настроенный grace period.
+  Неподтверждённая Task остаётся durable/cancel-requested, перечисляется в
+  `pending_tasks`, а её поздний result/notification сохраняется; owned terminal
+  process group получает teardown callback.
+- Workflow в `EXECUTING` не resume-ит persisted tool call: mutating exception,
+  recovery или cancel сохраняют `SIDE_EFFECT_UNKNOWN`, а scheduler не маскирует
+  его состоянием `canceled`.
 - Child failure возвращается parent как structured result и сам по себе не
   обязан завершать parent Task.
 - Shared memory существует только при явной делегации memory tools: child

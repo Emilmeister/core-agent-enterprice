@@ -352,6 +352,18 @@ class ConfigurationTests(unittest.TestCase):
                 AgentConfig.from_dict(raw)
             self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
+    def test_model_turn_budget_must_include_the_finalization_turn(self):
+        raw = agent_config().to_dict()
+        raw["budgets"] = {"model_turns": 1}
+        self.assertEqual(AgentConfig.from_dict(raw).budgets["model_turns"], 1)
+
+        for value in (0, -1, True, "1"):
+            raw = agent_config().to_dict()
+            raw["budgets"] = {"model_turns": value}
+            with self.subTest(value=value), self.assertRaises(CoreError) as caught:
+                AgentConfig.from_dict(raw)
+            self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+
     def test_disabled_tool_is_not_discoverable_and_stale_call_is_denied(self):
         raw = agent_config().to_dict()
         raw["tools"]["builtins"]["deny"] = ["core_terminal_exec"]

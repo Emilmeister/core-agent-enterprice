@@ -85,6 +85,13 @@ class AgentConfig:
         budgets = raw.get("budgets", {})
         if not isinstance(budgets, dict):
             raise CoreError("CONFIG_INVALID")
+        model_turns = budgets.get("model_turns")
+        if model_turns is not None and (
+            not isinstance(model_turns, int)
+            or isinstance(model_turns, bool)
+            or model_turns < 1
+        ):
+            raise CoreError("CONFIG_INVALID")
         depth = budgets.get("depth", MAX_SUBAGENT_DEPTH)
         if (
             not isinstance(depth, int)

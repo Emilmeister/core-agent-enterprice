@@ -129,6 +129,27 @@ Agent Card MUST NOT объявлять `urn:core-agent:run-capabilities:v1` ни
 - Закрытие stream не отменяет Task.
 - Main agent также использует этот lifecycle для внутренних background/subagent tasks.
 
+## Неполное завершение по budget
+
+Исчерпание execution budget не меняет форму запроса и не вводит новый A2A
+terminal state. Runtime публикует обычный text Artifact и завершает Task как
+`completed`, но Artifact/result metadata содержит
+`completion_reason: "budget_exhausted"`, `complete: false` и исчерпанную
+dimension. Сам текст явно отделяет проверенный промежуточный результат от того,
+что агент намеревался, но не успел выполнить; отсутствующие tool outcomes не
+достраиваются.
+
+Result metadata также содержит локальный `usage`, атомарный snapshot общего
+root ledger `shared_budget` и, если cancel не подтвердился за bounded grace,
+`pending_tasks`. Live delivery и recovery после crash публикуют эти поля в одной
+и той же `provenance` metadata Artifact-а.
+
+Это аддитивное обратно совместимое поле: клиент, не читающий metadata, всё равно
+получает самодостаточный текст о неполноте. Отсутствие этих полей в ранее
+сохранённом результате означает `completion_reason: "completed"` и
+`complete: true`; новая версия публичного binding или миграция JSON rows не
+требуются.
+
 ## Follow-up в активную Task
 
 Клиент не обязан ждать завершения Task, чтобы написать снова. Follow-up Message указывает существующий `taskId` и тот же `contextId`; A2A adapter сохраняет его в durable inbox текущего run и возвращает ту же Task. `contextId` без `taskId` начинает отдельную Task в той же conversation context.

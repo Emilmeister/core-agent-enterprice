@@ -102,9 +102,10 @@ Long-running tool, indexing job и сабагент запускаются ка�
 Агент завершает запуск, когда:
 
 - задача выполнена и сформирован итоговый ответ;
+- дальнейшая работа остановлена hard budget, а сохранённый финальный turn
+  сформировал честный промежуточный ответ;
 - безопасное продолжение требует новых пользовательских данных;
 - ожидаемый human input недоступен после policy timeout;
-- достигнут hard budget;
 - произошла невосстановимая ошибка;
 - получена команда отмены.
 
@@ -125,7 +126,79 @@ PlatformConfig/AgentConfig MUST задавать hard limits минимум дл
 - числа compaction/retrieval операций;
 - времени ожидания человека отдельно от active compute time.
 
-При достижении 90% любого hard limit ядро SHOULD дать модели сигнал завершить задачу кратчайшим безопасным способом. При 100% запуск MUST остановиться с `BUDGET_EXCEEDED`; бесконечное автоматическое увеличение запрещено.
+Эффективный лимит model turns MUST быть не меньше `1`, потому что этот ход
+является обязательным финализирующим reserve. Меньшее значение отклоняется как
+`CONFIG_INVALID` до создания workflow или budget ledger.
+
+При достижении 90% любого hard limit ядро SHOULD дать модели сигнал завершить
+задачу кратчайшим безопасным способом. Runtime MUST заранее удержать внутри
+общего parent budget один model turn и соответствующий output reserve для
+финализации каждого принятого run. Этот reserve учитывается в hard limit и не
+является автоматическим увеличением бюджета; рабочие model calls не могут его
+занять. Если budget допускает только один turn, run сразу выполняет финализацию
+без рабочих tools.
+
+Если run завершился обычным полным ответом и удержанный turn не использовал,
+runtime MUST вернуть reserve в общий ledger атомарно с terminal transition.
+Последовательные короткие child Tasks не должны исчерпывать parent budget только
+из-за уже ненужных резервов завершённых children.
+
+Когда следующий рабочий model call превысил бы лимит, runtime использует
+удержанный turn с пустым tool catalog и protected instruction вернуть только:
+
+- уже проверенный промежуточный результат;
+- действия, которые модель собиралась выполнить, но не успела;
+- явное утверждение, что задача не завершена полностью.
+
+Модель MUST NOT достраивать отсутствующие tool results, выдавать намерение за
+выполненное действие или продолжать работу в финализирующем turn. Если модель не
+вернула пригодный text либо после разрешённых retry вернула `MODEL_UNAVAILABLE`,
+runtime создаёт только детерминированное безопасное сообщение об исчерпанном
+budget и отсутствии финальной сводки; hidden reasoning и raw tool output не
+становятся публичным результатом.
+
+Follow-up, принятый во время уже выполняющегося финализирующего turn, сохраняется
+и доставляется в transcript, но не создаёт второй model call сверх hard limit.
+Terminal partial result детерминированно сообщает, что этот follow-up записан,
+но не обработан из-за исчерпанного budget; missing outcome не достраивается.
+
+Когда следующий tool call превысил бы локальный или общий parent tool budget,
+runtime MUST NOT dispatch-ить его. Каждый ещё не выполненный tool request из
+того же assistant message получает обычный structured failed tool result с
+`BUDGET_EXCEEDED`, dimension, фактическим usage, limit и instruction немедленно
+передать проверенный промежуточный результат выше. Эти synthetic outcomes не
+являются tool dispatch, retry или новым side effect. После них используется
+удержанный финальный model turn без tools.
+
+Исчерпание execution budget само по себе MUST NOT переводить run в `FAILED` и
+MUST NOT уничтожать уже committed context, Artifacts или child results. Run
+терминально переходит в `COMPLETED`, а persisted result содержит
+`completion_reason: "budget_exhausted"`, `complete: false`, исчерпанную dimension
+и фактический usage. Обратно совместимое поле `usage` содержит локальные
+счётчики model loop этого run. Поле `shared_budget` содержит атомарный snapshot
+общего root ledger после возврата неиспользованного terminal reserve:
+`scope: "root"`, `used` и `limits` для model turns и tool calls. Обычное полное завершение содержит
+`completion_reason: "completed"`, `complete: true`. Это не разрешает скрывать
+неполноту: text result обязан явно отделять выполненное от незавершённого.
+
+Перед budget finalization runtime запрашивает cancel всех owned Tasks и ждёт их
+не дольше одного bounded cancellation grace. Не ответивший на cancel worker не
+получает ложный terminal status и не блокирует partial result бесконечно: его
+durable row сохраняет `cancel_requested`, а persisted result перечисляет такой
+task ID в `pending_tasks` и прямо говорит, что отмена/outcome не подтверждены.
+Поздний terminal outcome остаётся в task row, mailbox и outbox. Неиспользованный
+finalization reserve отменённого child возвращается общему ledger атомарно с
+его `CANCELLED` transition; reserve уже начатого finalizer не возвращается.
+
+Hard limits остаются абсолютными: runtime не начинает вызов, для которого не
+зарезервирована ёмкость, не сбрасывает usage и не увеличивает budget. Если
+outcome уже начатой мутации неизвестен, `SIDE_EFFECT_UNKNOWN` и reconciliation
+имеют приоритет над частичным завершением по budget.
+
+Поля result являются аддитивной persisted metadata и не меняют RunRequest или
+A2A protocol version. При чтении результата, записанного прежней версией без
+`completion_reason`/`complete`, runtime MUST трактовать его как обычное полное
+завершение (`completed`/`true`). JSON-хранилища не требуют data migration.
 
 ## Повторные попытки
 
@@ -136,7 +209,28 @@ PlatformConfig/AgentConfig MUST задавать hard limits минимум дл
 ## Pause, recovery и lease
 
 - `pause` запрещает новые model/tools после ближайшей безопасной границы и создаёт checkpoint.
-- Worker MUST регулярно обновлять lease; только владелец актуального lease изменяет run.
+- Worker MUST регулярно обновлять lease, в том числе во время долгого model/tool
+  call и joined delegation; только владелец актуального lease изменяет run.
+- Recovery MUST пропускать workflow с ещё действующим lease и само получать
+  новый fenced lease перед reconciliation; совпадение worker ID не разрешает
+  заменить живой token. Истёкший token не может быть продлён или записать
+  terminal transition даже до того, как его забрал другой worker. PostgreSQL
+  вычисляет и сравнивает expiry по текущему времени сервера БД в момент fenced
+  write после возможного ожидания row lock, а не по часам replica или времени
+  начала SQL statement. Поэтому clock skew и lock wait не сокращают и не
+  продлевают fencing window. Workflow transition повторно проверяет token и
+  expiry на финальном `core_runs` write после всех budget/outbox/audit locks;
+  ранняя проверка перед потенциальной блокировкой не является fencing.
+- Перед каждой физической provider attempt runtime MUST одной транзакцией
+  списать общий model budget и сохранить local attempt counter/dispatch marker.
+  Для заранее оплаченного finalizer та же транзакция снимает reserve marker без
+  второго списания. Crash после marker не теряет usage и не разрешает бесплатный
+  повтор; неизвестный finalizer завершается детерминированным partial fallback.
+- Перед обработкой каждого model-issued tool request runtime MUST одной
+  workflow-транзакцией списать общий tool budget и сохранить local usage,
+  выбранный request и pre-dispatch marker. Crash между charge и dispatch не
+  списывает request повторно; rollback не оставляет расхождение ledger и
+  checkpoint.
 - Recovery воспроизводит state из event log, сверяет checkpoint и возвращает run в последнее доказуемо безопасное состояние.
 - Pending input восстанавливается с теми же IDs и revision.
 - Model streaming MAY быть перезапущен только если незавершённый ответ не породил side effect; частичный пользовательский текст помечается superseded.

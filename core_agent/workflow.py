@@ -43,7 +43,14 @@ class InMemoryWorkflowStore:
         self._budgets = {}
         self._inbound = {}
 
-    def create(self, record, *, budget_limits=(100, 200), **_metadata):
+    def create(
+        self,
+        record,
+        *,
+        budget_limits=(100, 200),
+        reserve_model_turns=0,
+        **_metadata,
+    ):
         with self._lock:
             if record.run_id in self._records:
                 raise CoreError("SESSION_CONFLICT")
@@ -55,6 +62,22 @@ class InMemoryWorkflowStore:
             else:
                 root_run_id = record.run_id
                 self._budgets[root_run_id] = [*budget_limits, 0, 0]
+            budget = self._budgets[root_run_id]
+            if reserve_model_turns < 0:
+                raise CoreError("INVALID_TASK_STATE")
+            if budget[2] + reserve_model_turns > budget[0]:
+                if not record.parent_run_id:
+                    self._budgets.pop(root_run_id, None)
+                raise CoreError(
+                    "BUDGET_EXCEEDED",
+                    f"model_turns budget exhausted ({budget[2]}/{budget[0]})",
+                    data={
+                        "dimension": "model_turns",
+                        "used": budget[2],
+                        "limit": budget[0],
+                    },
+                )
+            budget[2] += reserve_model_turns
             record = WorkflowRecord(
                 **{
                     **record.__dict__,
@@ -77,9 +100,7 @@ class InMemoryWorkflowStore:
         provenance,
     ):
         with self._lock:
-            record = self.by_task(
-                task_id, tenant_id=tenant_id, owner_id=owner_id
-            )
+            record = self.by_task(task_id, tenant_id=tenant_id, owner_id=owner_id)
             messages = self._inbound[record.run_id]
             duplicate = next(
                 (item for item in messages if item["message_id"] == message_id),
@@ -157,10 +178,42 @@ class InMemoryWorkflowStore:
         with self._lock:
             root = record.snapshot["budget_root_id"]
             budget = self._budgets[root]
-            if budget[2] + model_turns > budget[0] or budget[3] + tool_calls > budget[1]:
-                raise CoreError("BUDGET_EXCEEDED")
+            if budget[2] + model_turns > budget[0]:
+                raise CoreError(
+                    "BUDGET_EXCEEDED",
+                    f"model_turns budget exhausted ({budget[2]}/{budget[0]})",
+                    data={
+                        "dimension": "model_turns",
+                        "used": budget[2],
+                        "limit": budget[0],
+                    },
+                )
+            if budget[3] + tool_calls > budget[1]:
+                raise CoreError(
+                    "BUDGET_EXCEEDED",
+                    f"tool_calls budget exhausted ({budget[3]}/{budget[1]})",
+                    data={
+                        "dimension": "tool_calls",
+                        "used": budget[3],
+                        "limit": budget[1],
+                    },
+                )
             budget[2] += model_turns
             budget[3] += tool_calls
+
+    def release_budget(self, record, *, model_turns=0, tool_calls=0):
+        with self._lock:
+            root = record.snapshot["budget_root_id"]
+            budget = self._budgets[root]
+            if (
+                model_turns < 0
+                or tool_calls < 0
+                or budget[2] < model_turns
+                or budget[3] < tool_calls
+            ):
+                raise CoreError("INVALID_TASK_STATE")
+            budget[2] -= model_turns
+            budget[3] -= tool_calls
 
     def get(self, run_id, *, tenant_id, owner_id=None, **_options):
         with self._lock:
@@ -206,6 +259,10 @@ class InMemoryWorkflowStore:
         result=None,
         error_code=None,
         lease_token=None,
+        consume_model_turns=0,
+        consume_tool_calls=0,
+        release_model_turns=0,
+        include_shared_budget=False,
         **_metadata,
     ):
         with self._lock:
@@ -222,6 +279,54 @@ class InMemoryWorkflowStore:
                 lease = self._leases.get(run_id)
                 if not lease or lease[1] != lease_token or lease[2] <= self.clock():
                     raise CoreError("LEASE_LOST")
+            root = current.snapshot["budget_root_id"]
+            budget = self._budgets[root]
+            if (
+                consume_model_turns < 0
+                or consume_tool_calls < 0
+                or release_model_turns < 0
+            ):
+                raise CoreError("INVALID_TASK_STATE")
+            if budget[2] + consume_model_turns > budget[0]:
+                raise CoreError(
+                    "BUDGET_EXCEEDED",
+                    f"model_turns budget exhausted ({budget[2]}/{budget[0]})",
+                    data={
+                        "dimension": "model_turns",
+                        "used": budget[2],
+                        "limit": budget[0],
+                    },
+                )
+            next_model_turns = budget[2] + consume_model_turns - release_model_turns
+            if next_model_turns < 0:
+                raise CoreError("INVALID_TASK_STATE")
+            if budget[3] + consume_tool_calls > budget[1]:
+                raise CoreError(
+                    "BUDGET_EXCEEDED",
+                    f"tool_calls budget exhausted ({budget[3]}/{budget[1]})",
+                    data={
+                        "dimension": "tool_calls",
+                        "used": budget[3],
+                        "limit": budget[1],
+                    },
+                )
+            budget[2] = next_model_turns
+            budget[3] += consume_tool_calls
+            if include_shared_budget and result is not None:
+                result = {
+                    **result,
+                    "shared_budget": {
+                        "scope": "root",
+                        "used": {
+                            "model_turns": budget[2],
+                            "tool_calls": budget[3],
+                        },
+                        "limits": {
+                            "model_turns": budget[0],
+                            "tool_calls": budget[1],
+                        },
+                    },
+                }
             record = WorkflowRecord(
                 **{
                     **current.__dict__,
@@ -310,7 +415,7 @@ class InMemoryWorkflowStore:
             self.get(run_id, tenant_id=tenant_id, owner_id=owner_id)
             current = self._leases.get(run_id)
             now = self.clock()
-            if current and current[2] > now and current[0] != worker_id:
+            if current and current[2] > now:
                 raise CoreError("LEASE_LOST")
             token = str(uuid.uuid4())
             self._leases[run_id] = (worker_id, token, now + ttl)
@@ -341,6 +446,10 @@ class InMemoryWorkflowStore:
                 record
                 for record in self._records.values()
                 if record.state not in TERMINAL_STATES
+                and (
+                    record.run_id not in self._leases
+                    or self._leases[record.run_id][2] <= self.clock()
+                )
             )[:limit]
 
 
@@ -356,10 +465,7 @@ class PostgresWorkflowStore:
     @staticmethod
     def _record(row):
         return WorkflowRecord(
-            **{
-                key: row[key]
-                for key in WorkflowRecord.__dataclass_fields__
-            }
+            **{key: row[key] for key in WorkflowRecord.__dataclass_fields__}
         )
 
     @staticmethod
@@ -435,13 +541,19 @@ class PostgresWorkflowStore:
         audit=(),
         outbox_payload=None,
         budget_limits=(100, 200),
+        reserve_model_turns=0,
+        connection=None,
     ):
         now = self.clock()
         if record.version != 1:
             raise CoreError("INVALID_TASK_STATE")
-        with self.database.transaction() as connection:
+        if reserve_model_turns < 0:
+            raise CoreError("INVALID_TASK_STATE")
+
+        def create(db):
+            nonlocal record
             if record.parent_run_id:
-                parent = connection.execute(
+                parent = db.execute(
                     """SELECT snapshot FROM core_runs
                        WHERE run_id = %s AND tenant_id = %s FOR SHARE""",
                     (record.parent_run_id, record.tenant_id),
@@ -453,25 +565,71 @@ class PostgresWorkflowStore:
                 )
             else:
                 root_run_id = record.run_id
-                connection.execute(
+                if reserve_model_turns > budget_limits[0]:
+                    raise CoreError(
+                        "BUDGET_EXCEEDED",
+                        f"model_turns budget exhausted (0/{budget_limits[0]})",
+                        data={
+                            "dimension": "model_turns",
+                            "used": 0,
+                            "limit": budget_limits[0],
+                        },
+                    )
+                db.execute(
                     """INSERT INTO core_budget_ledgers
                        (root_run_id, tenant_id, max_model_turns, max_tool_calls,
-                        updated_at) VALUES (%s, %s, %s, %s, %s)""",
+                        used_model_turns, updated_at)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
                     (
                         root_run_id,
                         record.tenant_id,
                         budget_limits[0],
                         budget_limits[1],
+                        reserve_model_turns,
                         now,
                     ),
                 )
+            if record.parent_run_id and reserve_model_turns:
+                reserved = db.execute(
+                    """UPDATE core_budget_ledgers SET
+                         used_model_turns = used_model_turns + %s,
+                         updated_at = %s
+                       WHERE root_run_id = %s AND tenant_id = %s
+                         AND used_model_turns + %s <= max_model_turns""",
+                    (
+                        reserve_model_turns,
+                        now,
+                        root_run_id,
+                        record.tenant_id,
+                        reserve_model_turns,
+                    ),
+                )
+                if reserved.rowcount != 1:
+                    budget = db.execute(
+                        """SELECT max_model_turns, used_model_turns
+                           FROM core_budget_ledgers
+                           WHERE root_run_id = %s AND tenant_id = %s""",
+                        (root_run_id, record.tenant_id),
+                    ).fetchone()
+                    if budget is None:
+                        raise CoreError("TASK_NOT_FOUND")
+                    raise CoreError(
+                        "BUDGET_EXCEEDED",
+                        "model_turns budget exhausted "
+                        f"({budget['used_model_turns']}/{budget['max_model_turns']})",
+                        data={
+                            "dimension": "model_turns",
+                            "used": budget["used_model_turns"],
+                            "limit": budget["max_model_turns"],
+                        },
+                    )
             record = WorkflowRecord(
                 **{
                     **record.__dict__,
                     "snapshot": {**record.snapshot, "budget_root_id": root_run_id},
                 }
             )
-            connection.execute(
+            db.execute(
                 """INSERT INTO core_runs
                    (run_id, task_id, context_id, tenant_id, owner_id,
                     parent_run_id, state, version, request, snapshot,
@@ -496,9 +654,9 @@ class PostgresWorkflowStore:
                 ),
             )
             revision = self._event(
-                connection, record, "task.created", {"state": record.state}, now
+                db, record, "task.created", {"state": record.state}, now
             )
-            connection.execute(
+            db.execute(
                 """INSERT INTO core_checkpoints
                    (run_id, revision, state, tenant_id)
                    VALUES (%s, %s, %s, %s)""",
@@ -509,16 +667,21 @@ class PostgresWorkflowStore:
                     record.tenant_id,
                 ),
             )
-            self._audit(connection, record, audit, now)
+            self._audit(db, record, audit, now)
             self._outbox(
-                connection,
+                db,
                 record,
                 "task.created",
                 revision,
                 outbox_payload or {"task_id": record.task_id, "state": record.state},
                 now,
             )
-        return self.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            return record
+
+        if connection is not None:
+            return create(connection)
+        with self.database.transaction() as transaction:
+            return create(transaction)
 
     def consume_budget(self, record, *, model_turns=0, tool_calls=0):
         now = self.clock()
@@ -543,7 +706,54 @@ class PostgresWorkflowStore:
                 ),
             )
         if updated.rowcount != 1:
-            raise CoreError("BUDGET_EXCEEDED")
+            with self.database.pool.connection() as connection:
+                budget = connection.execute(
+                    """SELECT max_model_turns, max_tool_calls, used_model_turns,
+                              used_tool_calls
+                       FROM core_budget_ledgers
+                       WHERE root_run_id = %s AND tenant_id = %s""",
+                    (root_run_id, record.tenant_id),
+                ).fetchone()
+            if budget is None:
+                raise CoreError("TASK_NOT_FOUND")
+            dimension = (
+                "model_turns"
+                if budget["used_model_turns"] + model_turns > budget["max_model_turns"]
+                else "tool_calls"
+            )
+            used = budget[f"used_{dimension}"]
+            limit = budget[f"max_{dimension}"]
+            raise CoreError(
+                "BUDGET_EXCEEDED",
+                f"{dimension} budget exhausted ({used}/{limit})",
+                data={"dimension": dimension, "used": used, "limit": limit},
+            )
+
+    def release_budget(self, record, *, model_turns=0, tool_calls=0):
+        if model_turns < 0 or tool_calls < 0:
+            raise CoreError("INVALID_TASK_STATE")
+        root_run_id = record.snapshot["budget_root_id"]
+        with self.database.transaction() as connection:
+            updated = connection.execute(
+                """UPDATE core_budget_ledgers SET
+                     used_model_turns = used_model_turns - %s,
+                     used_tool_calls = used_tool_calls - %s,
+                     updated_at = %s
+                   WHERE root_run_id = %s AND tenant_id = %s
+                     AND used_model_turns >= %s
+                     AND used_tool_calls >= %s""",
+                (
+                    model_turns,
+                    tool_calls,
+                    self.clock(),
+                    root_run_id,
+                    record.tenant_id,
+                    model_turns,
+                    tool_calls,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CoreError("INVALID_TASK_STATE")
 
     def get(self, run_id, *, tenant_id, owner_id=None, connection=None, lock=False):
         def query(db):
@@ -743,6 +953,10 @@ class PostgresWorkflowStore:
         error_code=None,
         outbox_payload=None,
         lease_token=None,
+        consume_model_turns=0,
+        consume_tool_calls=0,
+        release_model_turns=0,
+        include_shared_budget=False,
     ):
         now = self.clock()
         if current.version != expected_version:
@@ -759,35 +973,129 @@ class PostgresWorkflowStore:
                 raise CoreError("INBOUND_MESSAGE_PENDING")
         if lease_token is not None:
             lease = connection.execute(
-                """SELECT lease_token, lease_expires_at FROM core_runs
-                   WHERE run_id = %s""",
-                (current.run_id,),
+                """SELECT 1 FROM core_runs
+                   WHERE run_id = %s AND tenant_id = %s AND lease_token = %s
+                     AND lease_expires_at >
+                         EXTRACT(EPOCH FROM clock_timestamp())""",
+                (current.run_id, current.tenant_id, lease_token),
             ).fetchone()
-            if lease["lease_token"] != lease_token or (
-                lease["lease_expires_at"] or 0
-            ) <= now:
+            if lease is None:
                 raise CoreError("LEASE_LOST")
-        updated = connection.execute(
-            """UPDATE core_runs SET state = %s, version = version + 1,
-                   snapshot = %s, pending_approval_id = %s, result = %s,
-                   error_code = %s, updated_at = %s
-               WHERE run_id = %s AND tenant_id = %s AND owner_id = %s
-                 AND version = %s""",
-            (
-                state,
-                Jsonb(dict(snapshot)),
-                pending_approval_id,
-                Jsonb(result) if result is not None else None,
-                error_code,
-                now,
-                current.run_id,
-                current.tenant_id,
-                current.owner_id,
-                expected_version,
-            ),
-        )
-        if updated.rowcount != 1:
-            raise CoreError("SESSION_CONFLICT")
+        if (
+            consume_model_turns < 0
+            or consume_tool_calls < 0
+            or release_model_turns < 0
+        ):
+            raise CoreError("INVALID_TASK_STATE")
+        if consume_model_turns:
+            consumed = connection.execute(
+                """UPDATE core_budget_ledgers SET
+                     used_model_turns = used_model_turns + %s,
+                     updated_at = %s
+                   WHERE root_run_id = %s AND tenant_id = %s
+                     AND used_model_turns + %s <= max_model_turns""",
+                (
+                    consume_model_turns,
+                    now,
+                    current.snapshot["budget_root_id"],
+                    current.tenant_id,
+                    consume_model_turns,
+                ),
+            )
+            if consumed.rowcount != 1:
+                budget = connection.execute(
+                    """SELECT max_model_turns, used_model_turns
+                       FROM core_budget_ledgers
+                       WHERE root_run_id = %s AND tenant_id = %s FOR UPDATE""",
+                    (current.snapshot["budget_root_id"], current.tenant_id),
+                ).fetchone()
+                if budget is None:
+                    raise CoreError("TASK_NOT_FOUND")
+                raise CoreError(
+                    "BUDGET_EXCEEDED",
+                    "model_turns budget exhausted "
+                    f"({budget['used_model_turns']}/{budget['max_model_turns']})",
+                    data={
+                        "dimension": "model_turns",
+                        "used": budget["used_model_turns"],
+                        "limit": budget["max_model_turns"],
+                    },
+                )
+        if consume_tool_calls:
+            consumed = connection.execute(
+                """UPDATE core_budget_ledgers SET
+                     used_tool_calls = used_tool_calls + %s,
+                     updated_at = %s
+                   WHERE root_run_id = %s AND tenant_id = %s
+                     AND used_tool_calls + %s <= max_tool_calls""",
+                (
+                    consume_tool_calls,
+                    now,
+                    current.snapshot["budget_root_id"],
+                    current.tenant_id,
+                    consume_tool_calls,
+                ),
+            )
+            if consumed.rowcount != 1:
+                budget = connection.execute(
+                    """SELECT max_tool_calls, used_tool_calls
+                       FROM core_budget_ledgers
+                       WHERE root_run_id = %s AND tenant_id = %s FOR UPDATE""",
+                    (current.snapshot["budget_root_id"], current.tenant_id),
+                ).fetchone()
+                if budget is None:
+                    raise CoreError("TASK_NOT_FOUND")
+                raise CoreError(
+                    "BUDGET_EXCEEDED",
+                    "tool_calls budget exhausted "
+                    f"({budget['used_tool_calls']}/{budget['max_tool_calls']})",
+                    data={
+                        "dimension": "tool_calls",
+                        "used": budget["used_tool_calls"],
+                        "limit": budget["max_tool_calls"],
+                    },
+                )
+        if release_model_turns:
+            released = connection.execute(
+                """UPDATE core_budget_ledgers SET
+                     used_model_turns = used_model_turns - %s,
+                     updated_at = %s
+                   WHERE root_run_id = %s AND tenant_id = %s
+                     AND used_model_turns >= %s""",
+                (
+                    release_model_turns,
+                    now,
+                    current.snapshot["budget_root_id"],
+                    current.tenant_id,
+                    release_model_turns,
+                ),
+            )
+            if released.rowcount != 1:
+                raise CoreError("INVALID_TASK_STATE")
+        if include_shared_budget and result is not None:
+            budget = connection.execute(
+                """SELECT max_model_turns, max_tool_calls, used_model_turns,
+                          used_tool_calls
+                   FROM core_budget_ledgers
+                   WHERE root_run_id = %s AND tenant_id = %s FOR UPDATE""",
+                (current.snapshot["budget_root_id"], current.tenant_id),
+            ).fetchone()
+            if budget is None:
+                raise CoreError("TASK_NOT_FOUND")
+            result = {
+                **result,
+                "shared_budget": {
+                    "scope": "root",
+                    "used": {
+                        "model_turns": budget["used_model_turns"],
+                        "tool_calls": budget["used_tool_calls"],
+                    },
+                    "limits": {
+                        "model_turns": budget["max_model_turns"],
+                        "tool_calls": budget["max_tool_calls"],
+                    },
+                },
+            }
         next_record = WorkflowRecord(
             **{
                 **current.__dict__,
@@ -829,6 +1137,34 @@ class PostgresWorkflowStore:
             outbox_payload or {"task_id": current.task_id, "state": state},
             now,
         )
+        lease_fence = ""
+        parameters = [
+            state,
+            Jsonb(dict(snapshot)),
+            pending_approval_id,
+            Jsonb(result) if result is not None else None,
+            error_code,
+            now,
+            current.run_id,
+            current.tenant_id,
+            current.owner_id,
+            expected_version,
+        ]
+        if lease_token is not None:
+            lease_fence = """ AND lease_token = %s
+                AND lease_expires_at > EXTRACT(EPOCH FROM clock_timestamp())"""
+            parameters.append(lease_token)
+        updated = connection.execute(
+            """UPDATE core_runs SET state = %s, version = version + 1,
+                   snapshot = %s, pending_approval_id = %s, result = %s,
+                   error_code = %s, updated_at = %s
+               WHERE run_id = %s AND tenant_id = %s AND owner_id = %s
+                 AND version = %s"""
+            + lease_fence,
+            parameters,
+        )
+        if updated.rowcount != 1:
+            raise CoreError("LEASE_LOST" if lease_token is not None else "SESSION_CONFLICT")
         return next_record
 
     def enter_approval(
@@ -979,6 +1315,10 @@ class PostgresWorkflowStore:
         error_code=None,
         outbox_payload=None,
         lease_token=None,
+        consume_model_turns=0,
+        consume_tool_calls=0,
+        release_model_turns=0,
+        include_shared_budget=False,
     ):
         with self.database.transaction() as connection:
             current = self.get(
@@ -1002,46 +1342,66 @@ class PostgresWorkflowStore:
                 error_code=error_code,
                 outbox_payload=outbox_payload,
                 lease_token=lease_token,
+                consume_model_turns=consume_model_turns,
+                consume_tool_calls=consume_tool_calls,
+                release_model_turns=release_model_turns,
+                include_shared_budget=include_shared_budget,
             )
+
     def acquire_lease(self, run_id, *, tenant_id, owner_id, worker_id, ttl):
-        now = self.clock()
         token = str(uuid.uuid4())
         with self.database.transaction() as connection:
             row = connection.execute(
+                """SELECT state, lease_expires_at FROM core_runs
+                   WHERE run_id = %s AND tenant_id = %s AND owner_id = %s
+                   FOR UPDATE""",
+                (run_id, tenant_id, owner_id),
+            ).fetchone()
+            now = connection.execute(
+                """SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision
+                          AS now"""
+            ).fetchone()["now"]
+            if (
+                row is None
+                or row["state"] in TERMINAL_STATES
+                or (
+                    row["lease_expires_at"] is not None
+                    and row["lease_expires_at"] > now
+                )
+            ):
+                raise CoreError("LEASE_LOST")
+            connection.execute(
                 """UPDATE core_runs SET lease_owner = %s, lease_token = %s,
                        lease_expires_at = %s, updated_at = %s
-                   WHERE run_id = %s AND tenant_id = %s AND owner_id = %s
-                     AND state NOT IN ('COMPLETED','FAILED','CANCELLED','REJECTED','ABORTED')
-                     AND (lease_expires_at IS NULL OR lease_expires_at <= %s
-                          OR lease_owner = %s)
-                   RETURNING run_id""",
-                (
-                    worker_id,
-                    token,
-                    now + ttl,
-                    now,
-                    run_id,
-                    tenant_id,
-                    owner_id,
-                    now,
-                    worker_id,
-                ),
-            ).fetchone()
-            if row is None:
-                raise CoreError("LEASE_LOST")
+                   WHERE run_id = %s AND tenant_id = %s""",
+                (worker_id, token, now + ttl, now, run_id, tenant_id),
+            )
         return token
 
     def renew_lease(self, run_id, *, tenant_id, worker_id, token, ttl):
-        now = self.clock()
         with self.database.transaction() as connection:
-            updated = connection.execute(
-                """UPDATE core_runs SET lease_expires_at = %s, updated_at = %s
-                   WHERE run_id = %s AND tenant_id = %s AND lease_owner = %s
-                     AND lease_token = %s AND lease_expires_at > %s""",
-                (now + ttl, now, run_id, tenant_id, worker_id, token, now),
-            )
-            if updated.rowcount != 1:
+            row = connection.execute(
+                """SELECT lease_owner, lease_token, lease_expires_at
+                   FROM core_runs WHERE run_id = %s AND tenant_id = %s
+                   FOR UPDATE""",
+                (run_id, tenant_id),
+            ).fetchone()
+            now = connection.execute(
+                """SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision
+                          AS now"""
+            ).fetchone()["now"]
+            if (
+                row is None
+                or row["lease_owner"] != worker_id
+                or row["lease_token"] != token
+                or (row["lease_expires_at"] or 0) <= now
+            ):
                 raise CoreError("LEASE_LOST")
+            connection.execute(
+                """UPDATE core_runs SET lease_expires_at = %s, updated_at = %s
+                   WHERE run_id = %s AND tenant_id = %s""",
+                (now + ttl, now, run_id, tenant_id),
+            )
 
     def release_lease(self, run_id, *, tenant_id, worker_id, token):
         with self.database.transaction() as connection:
@@ -1060,6 +1420,8 @@ class PostgresWorkflowStore:
             rows = connection.execute(
                 """SELECT * FROM core_runs
                    WHERE state NOT IN ('COMPLETED','FAILED','CANCELLED','REJECTED','ABORTED')
+                     AND (lease_expires_at IS NULL OR lease_expires_at <=
+                          EXTRACT(EPOCH FROM clock_timestamp()))
                    ORDER BY updated_at LIMIT %s""",
                 (limit,),
             ).fetchall()

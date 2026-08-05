@@ -24,18 +24,21 @@
 | KRN-02 | child наследует kernel и не расширяет policy | delegation E2E and exact catalog tests | implemented |
 | KRN-03 | пустой profile не дублирует user prompt; conditional prompt/tool guidance не обещает отсутствующие capabilities | kernel and built-in description contract tests | implemented |
 | RUN-01 | сериализуемая state machine и irreversible terminal states | workflow transition suite | implemented |
-| RUN-02 | lease, checkpoint replay и recovery безопасной границы | PostgreSQL process-state-loss tests | implemented |
-| RUN-03 | ambiguous side effect переходит в reconciliation без retry | dispatched-side-effect restart chaos test | implemented |
+| RUN-02 | lease heartbeat, checkpoint replay и recovery безопасной границы | long-call heartbeat, live-lease recovery exclusion, post-lock final transition fencing and PostgreSQL process-state-loss tests; PostgreSQL long model/tool/join proof отсутствует | partial |
+| RUN-04 | hard budget резервирует финальный turn; каждый provider/tool attempt атомарно учитывается, exhausted tools не dispatch-ятся, а truthful partial result завершается с `complete=false` | retry/crash markers, atomic PostgreSQL model/tool charges, shared ledger/admission and live/recovered A2A partial tests | implemented |
+| RUN-03 | ambiguous side effect переходит в reconciliation без retry или cancel masking | mutating exception/resume/cancel regressions and dispatched-side-effect restart chaos test | implemented |
 | CTX-01 | base/working budget и compaction 90% до 10–15% | context budget boundary tests | implemented |
 | CTX-02 | pinned state и transcript provenance переживают compaction/restart | two-compaction runtime test | implemented |
+| CTX-03 | крупный tool result offload-ится из active context без потери immutable transcript | in-memory artifact/excerpt runtime test; PostgreSQL restart proof отсутствует | partial |
 | MEM-01 | built-in `core_memory_*` подсистемы Core Agent: Markdown schema, optimistic revisions и hard 200-line rejection как recoverable tool result | `test_memory_service` | implemented |
 | MEM-02 | atomic BM25/vector/NER/graph publication и stale edge removal внутри процесса агента | `test_memory_service` + real PostgreSQL CI suite | implemented |
 | MEM-03 | hybrid candidates, calibrated fusion, provenance rerank и degraded channels вместо отказа | `test_memory_service` | implemented |
 | BGT-01 | background Tasks и mailbox durable, versioned, at-least-once | PostgreSQL recovery/mailbox test | implemented |
-| BGT-02 | passive wait освобождает worker и cancel handles process tree | scheduler and PTY process-group cancel tests | implemented |
-| SUB-01 | child является durable Task с exact capabilities/shared memory policy | delegation and child-memory E2E | implemented |
+| BGT-02 | passive wait освобождает worker; recursive cancel останавливает child agent loop и process tree | scheduler, child/grandchild safe-boundary and PTY process-group cancel tests | partial |
+| BGT-03 | durable scheduler recovery использует server-clock expiry-fenced claim/heartbeat, сохраняет late result и не маскирует неизвестную мутацию cancel state-ом | concurrent/expired/skewed-clock и row-lock-wait fencing, scan/claim/post-claim cancel races, distributed cancel/restart и `SIDE_EFFECT_UNKNOWN` PostgreSQL tests | implemented |
+| SUB-01 | child является durable Task с одним ID, exact capabilities/shared memory policy | stable-ID delegation and child-memory E2E | partial |
 | SUB-02 | общий parent budget, hard depth `2`/fan-out и обычный child text result | depth-2 catalog/kernel E2E, stale-call guard and atomic budget/fan-out tests | implemented |
-| SUB-03 | outcome contract сохраняет bounded method autonomy при minimum sufficient/exact capabilities | delegation kernel/description contract tests | implemented |
+| SUB-03 | balanced decision rule выбирает materially useful parallel/isolated/verifiable outcome, сохраняет bounded method autonomy при exact capabilities и требует оба положительных child budget limits | delegation kernel/description/schema/runtime validation contract tests | implemented |
 | ART-01 | артефакты именованные, scoped и версионируемые внутри агента; save не перезаписывает, load проверяет digest/size/metadata, backends не управляют схемой | artifact service and tool contract suite | implemented |
 | RMT-01 | реестр `REMOTE_AGENTS` fail-open при недоступном peer, tool скрыт без настроенных агентов, downstream получает только allowlist заголовков, прогресс ретранслируется, сбой возвращается tool result | remote agent registry, forwarded header and send_message E2E | implemented |
 | TER-01 | owned PTY/process groups/workspaces и bounded output | local terminal integration suite | implemented |

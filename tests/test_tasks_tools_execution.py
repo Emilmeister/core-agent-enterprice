@@ -1,6 +1,7 @@
 import threading
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 from core_agent.errors import CoreError
 from core_agent.execution import (
@@ -67,6 +68,24 @@ class MissingTerminalBackend:
 
 
 class BackgroundTaskTests(unittest.TestCase):
+    def test_thread_start_failure_does_not_admit_or_register_task(self):
+        scheduler = TaskScheduler()
+        admissions = []
+
+        with patch(
+            "core_agent.tasks.threading.Thread.start",
+            side_effect=RuntimeError("thread unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                scheduler.start(
+                    lambda: "done",
+                    owner_id="parent",
+                    admission=lambda _connection: admissions.append("admitted"),
+                )
+
+        self.assertEqual(admissions, [])
+        self.assertEqual(scheduler.list(owner_id="parent"), ())
+
     def test_start_returns_immediately_and_main_can_continue(self):
         gate = threading.Event()
         scheduler = TaskScheduler()
@@ -84,6 +103,22 @@ class BackgroundTaskTests(unittest.TestCase):
         self.assertEqual(terminal.state, "completed")
         self.assertEqual(terminal.result, "finished")
         scheduler.close()
+
+    def test_start_preserves_caller_supplied_task_id(self):
+        scheduler = TaskScheduler()
+        try:
+            task = scheduler.start(
+                lambda: "done",
+                owner_id="parent",
+                task_id="caller-task-id",
+            )
+            self.assertEqual(task.id, "caller-task-id")
+            self.assertEqual(
+                scheduler.wait("caller-task-id", timeout=1).state,
+                "completed",
+            )
+        finally:
+            scheduler.close()
 
     def test_wait_is_passive_and_mailbox_delivery_is_at_least_once_until_ack(self):
         scheduler = TaskScheduler()
@@ -134,6 +169,45 @@ class BackgroundTaskTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "TASK_NOT_CANCELABLE")
         release.set()
         scheduler.close()
+
+    def test_cancel_invokes_owned_process_cleanup_once(self):
+        cleaned = []
+        scheduler = TaskScheduler()
+
+        def work(cancel_event):
+            cancel_event.wait(1)
+            return "stopped"
+
+        task = scheduler.start(
+            work,
+            owner_id="parent",
+            accepts_cancel_event=True,
+            on_cancel=lambda: cleaned.append(task.id),
+        )
+        scheduler.cancel(task.id)
+        self.assertEqual(scheduler.wait(task.id, timeout=1).state, "canceled")
+        self.assertEqual(cleaned, [task.id])
+        with self.assertRaises(CoreError):
+            scheduler.cancel(task.id)
+        self.assertEqual(cleaned, [task.id])
+
+    def test_cancel_wins_when_cancel_aware_function_raises(self):
+        started = threading.Event()
+        scheduler = TaskScheduler()
+
+        def work(cancel_event):
+            started.set()
+            cancel_event.wait(1)
+            raise RuntimeError("stopped after cancellation")
+
+        task = scheduler.start(work, owner_id="parent", accepts_cancel_event=True)
+        try:
+            self.assertTrue(started.wait(1))
+            scheduler.cancel(task.id)
+            terminal = scheduler.wait(task.id, timeout=1)
+            self.assertEqual(terminal.state, "canceled")
+        finally:
+            scheduler.close()
 
     def test_required_pending_child_prevents_parent_completion(self):
         gate = threading.Event()
@@ -246,6 +320,10 @@ class DelegationTests(unittest.TestCase):
     def test_delegate_contract_rejects_ambiguous_budget_and_unknown_fields(self):
         for changes in (
             {"budget": {"max_steps": 3}},
+            {"budget": {"turns": 2}},
+            {"budget": {"tool_calls": 1}},
+            {"budget": {"turns": 0, "tool_calls": 1}},
+            {"budget": {"turns": 2, "tool_calls": False}},
             {"result_schema": '{"type":"object"}'},
             {"background": "yes"},
         ):

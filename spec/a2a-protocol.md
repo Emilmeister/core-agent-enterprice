@@ -94,12 +94,23 @@ Agent Card MAY объявлять optional informational extensions, не вли
 | `RUNNING`, `WAITING_TASK`, `PAUSED`, `RECOVERING` | `working` | точная причина доступна в безопасном status metadata |
 | `WAITING_INPUT` | `input-required` | caller должен предоставить новые бизнес-данные |
 | `WAITING_AUTH` | `auth-required` | требуется credential/auth flow |
-| `COMPLETED` | `completed` | результаты представлены Artifacts |
+| `COMPLETED` | `completed` | результаты представлены Artifacts; `completion_reason=budget_exhausted` и `complete=false` явно помечают честный неполный результат |
 | `FAILED`, `ABORTED` | `failed` | error metadata различает обычную ошибку и unsafe continuation |
 | `CANCELLED` | `canceled` | отмена подтверждена runtime |
 | `REJECTED` | `rejected` | policy отказала до выполнения |
 
 Internal state не добавляет новые A2A terminal states. Client, понимающий только стандартный A2A, остаётся корректным.
+
+Budget exhaustion не добавляет отдельного A2A state и не отображается в
+`failed`: Task завершила разрешённую работу и публикует partial Artifact со
+stable metadata `completion_reason: "budget_exhausted"`, `complete: false` и
+exhausted dimension. Текст Artifact MUST явно говорить, что objective выполнен
+не полностью. Полное завершение использует `completion_reason: "completed"` и
+`complete: true`.
+
+Artifact metadata и при live completion, и при recovery имеет одинаковую форму:
+top-level `digest`/`size` и вложенный `provenance` с completion fields, локальным
+`usage`, общим `shared_budget` и optional `pending_tasks`.
 
 ## Операции
 

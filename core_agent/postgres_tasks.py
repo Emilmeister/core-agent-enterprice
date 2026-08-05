@@ -13,6 +13,7 @@ from .tasks import BackgroundTask, Notification
 
 
 TERMINAL = {"completed", "failed", "canceled"}
+DEFAULT_TASK_LEASE_TTL = 600.0
 
 
 def _value(value):
@@ -62,12 +63,33 @@ class PostgresMailbox:
 class PostgresTaskScheduler:
     """Durable task registry/mailbox with in-process execution workers."""
 
-    def __init__(self, database, telemetry=None, clock=time.time):
+    def __init__(
+        self,
+        database,
+        telemetry=None,
+        clock=time.time,
+        task_lease_ttl=DEFAULT_TASK_LEASE_TTL,
+        task_lease_heartbeat_interval=None,
+    ):
         self.database = database
         self.telemetry = telemetry
         self.clock = clock
+        self.task_lease_ttl = float(task_lease_ttl)
+        self.task_lease_heartbeat_interval = float(
+            task_lease_heartbeat_interval
+            if task_lease_heartbeat_interval is not None
+            else self.task_lease_ttl / 3
+        )
+        if (
+            self.task_lease_ttl <= 0
+            or self.task_lease_heartbeat_interval <= 0
+            or self.task_lease_heartbeat_interval >= self.task_lease_ttl
+        ):
+            raise CoreError("CONFIG_INVALID", "invalid task lease timing")
+        self._worker_id = str(uuid.uuid4())
         self._handlers = {}
         self._cancel_events = {}
+        self._cancel_callbacks = {}
         self._conditions = {}
         self._threads = set()
         self._lock = threading.Lock()
@@ -103,11 +125,19 @@ class PostgresTaskScheduler:
         with self._lock:
             return self._cancel_events.setdefault(task_id, threading.Event())
 
+    def _signal_cancel(self, task_id, tenant_id):
+        self._cancel_event(task_id).set()
+        with self._lock:
+            callback = self._cancel_callbacks.pop((tenant_id, task_id), None)
+        if callback is not None:
+            callback()
+
     def start(
         self,
         function,
         *,
         owner_id,
+        task_id=None,
         required=False,
         accepts_cancel_event=False,
         trace_context=None,
@@ -116,6 +146,9 @@ class PostgresTaskScheduler:
         recoverable=False,
         tenant_id="default",
         continue_trace=False,
+        admission=None,
+        on_cancel=None,
+        mutating=True,
     ):
         if self._closed:
             raise CoreError("INVALID_TASK_STATE")
@@ -126,7 +159,10 @@ class PostgresTaskScheduler:
             with self.telemetry.span("core_agent.task.submit") as submission:
                 linked_context = submission.context
         now = self.clock()
-        task = BackgroundTask(str(uuid.uuid4()), owner_id, required)
+        task_id = task_id or str(uuid.uuid4())
+        if not isinstance(task_id, str) or not task_id:
+            raise CoreError("CONFIG_INVALID", "task_id must be a non-empty string")
+        task = BackgroundTask(task_id, owner_id, required)
         stored_contract = dict(contract)
         if continue_trace and linked_context is not None:
             stored_contract["_trace_parent"] = {
@@ -138,8 +174,8 @@ class PostgresTaskScheduler:
             connection.execute(
                 """INSERT INTO core_background_tasks
                    (id, owner_run_id, tenant_id, kind, state, required,
-                    recoverable, contract, created_at, updated_at)
-                   VALUES (%s, %s, %s, %s, 'submitted', %s, %s, %s, %s, %s)""",
+                    recoverable, contract, mutating, created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, 'submitted', %s, %s, %s, %s, %s, %s)""",
                 (
                     task.id,
                     owner_id,
@@ -148,19 +184,113 @@ class PostgresTaskScheduler:
                     required,
                     recoverable,
                     Jsonb(_value(stored_contract)),
+                    bool(mutating),
                     now,
                     now,
                 ),
             )
-        self._launch(
-            task.id,
-            tenant_id,
-            function,
-            accepts_cancel_event=accepts_cancel_event,
-            trace_context=linked_context,
-            continue_trace=continue_trace,
-        )
+            if admission is not None:
+                admission(connection)
+        if on_cancel is not None:
+            with self._lock:
+                self._cancel_callbacks[(tenant_id, task.id)] = on_cancel
+        try:
+            self._launch(
+                task.id,
+                tenant_id,
+                function,
+                accepts_cancel_event=accepts_cancel_event,
+                trace_context=linked_context,
+                continue_trace=continue_trace,
+            )
+        except BaseException:
+            with self._lock:
+                self._cancel_callbacks.pop((tenant_id, task.id), None)
+            raise
         return task
+
+    def _claim(self, task_id, tenant_id, *, allow_working):
+        token = str(uuid.uuid4())
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                """SELECT * FROM core_background_tasks
+                   WHERE id = %s AND tenant_id = %s FOR UPDATE""",
+                (task_id, tenant_id),
+            ).fetchone()
+            now = connection.execute(
+                """SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision
+                          AS now"""
+            ).fetchone()["now"]
+            if row is None or not (
+                row["state"] == "submitted"
+                or (
+                    allow_working
+                    and row["state"] == "working"
+                    and (
+                        row["claim_expires_at"] is None
+                        or row["claim_expires_at"] <= now
+                    )
+                )
+            ):
+                return None, None
+            claimed_from_state = row["state"]
+            claimed = connection.execute(
+                """UPDATE core_background_tasks SET state = 'working',
+                       claim_owner = %s, claim_token = %s,
+                       claim_expires_at = %s, updated_at = %s
+                   WHERE id = %s AND tenant_id = %s RETURNING *""",
+                (
+                    self._worker_id,
+                    token,
+                    now + self.task_lease_ttl,
+                    now,
+                    task_id,
+                    tenant_id,
+                ),
+            ).fetchone()
+            claimed = {**claimed, "claimed_from_state": claimed_from_state}
+        return token, claimed
+
+    def _renew_claim(self, task_id, tenant_id, token):
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                """SELECT state, claim_owner, claim_token, claim_expires_at,
+                          cancel_requested
+                   FROM core_background_tasks
+                   WHERE id = %s AND tenant_id = %s FOR UPDATE""",
+                (task_id, tenant_id),
+            ).fetchone()
+            now = connection.execute(
+                """SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision
+                          AS now"""
+            ).fetchone()["now"]
+            if (
+                row is None
+                or row["state"] != "working"
+                or row["claim_owner"] != self._worker_id
+                or row["claim_token"] != token
+                or (row["claim_expires_at"] or 0) <= now
+            ):
+                raise CoreError("LEASE_LOST")
+            connection.execute(
+                """UPDATE core_background_tasks SET claim_expires_at = %s,
+                       updated_at = %s WHERE id = %s AND tenant_id = %s""",
+                (now + self.task_lease_ttl, now, task_id, tenant_id),
+            )
+        if row["cancel_requested"]:
+            self._signal_cancel(task_id, tenant_id)
+
+    def _release_claim(self, task_id, tenant_id, token):
+        with self.database.transaction() as connection:
+            connection.execute(
+                """UPDATE core_background_tasks SET state = 'submitted',
+                       claim_owner = NULL, claim_token = NULL,
+                       claim_expires_at = NULL,
+                       updated_at = EXTRACT(EPOCH FROM clock_timestamp())
+                   WHERE id = %s AND tenant_id = %s AND state = 'working'
+                     AND claim_owner = %s AND claim_token = %s""",
+                (task_id, tenant_id, self._worker_id, token),
+            )
 
     def _launch(
         self,
@@ -171,28 +301,42 @@ class PostgresTaskScheduler:
         accepts_cancel_event,
         trace_context=None,
         continue_trace=False,
+        allow_working=False,
+        reconcile_cancel=False,
     ):
+        token, row = self._claim(task_id, tenant_id, allow_working=allow_working)
+        if row is None:
+            return False
         cancel_event = self._cancel_event(task_id)
-        with self.database.transaction() as connection:
-            row = connection.execute(
-                """UPDATE core_background_tasks SET state = 'working',
-                       updated_at = %s
-                   WHERE id = %s AND tenant_id = %s
-                     AND state IN ('submitted', 'working')
-                   RETURNING owner_run_id""",
-                (self.clock(), task_id, tenant_id),
-            ).fetchone()
-            if row is None:
-                raise CoreError("INVALID_TASK_STATE")
-            owner_id = row["owner_run_id"]
+        if row["cancel_requested"]:
+            self._signal_cancel(task_id, tenant_id)
+        reconcile_cancel = bool(
+            reconcile_cancel
+            or (allow_working and row["claimed_from_state"] == "working")
+        )
 
         def run():
+            heartbeat_stop = threading.Event()
+            heartbeat_failures = []
+
+            def heartbeat():
+                while not heartbeat_stop.wait(self.task_lease_heartbeat_interval):
+                    try:
+                        self._renew_claim(task_id, tenant_id, token)
+                    except Exception as error:
+                        heartbeat_failures.append(error)
+                        return
+
+            heartbeat_thread = threading.Thread(
+                target=heartbeat,
+                daemon=True,
+                name=f"core-task-lease-{task_id[:8]}",
+            )
+            heartbeat_thread.start()
             span = None
             if self.telemetry:
                 span = (
-                    self.telemetry.span(
-                        "core_agent.task.execute", parent=trace_context
-                    )
+                    self.telemetry.span("core_agent.task.execute", parent=trace_context)
                     if continue_trace
                     else self.telemetry.start_background_span(
                         "core_agent.task.execute", trace_context
@@ -201,8 +345,10 @@ class PostgresTaskScheduler:
             context = span if span else _NullContext()
             try:
                 with context:
-                    if cancel_event.is_set():
-                        self._finish(task_id, tenant_id, "canceled", None, None)
+                    if cancel_event.is_set() and not reconcile_cancel:
+                        self._finish(
+                            task_id, tenant_id, token, "canceled", None, None
+                        )
                         return
                     try:
                         result = (
@@ -214,10 +360,28 @@ class PostgresTaskScheduler:
                         error_code = None
                     except Exception as error:
                         result = None
-                        state = "failed"
                         error_code = getattr(error, "code", type(error).__name__)
-                    self._finish(task_id, tenant_id, state, result, error_code)
+                        canceled = (
+                            cancel_event.is_set()
+                            and not reconcile_cancel
+                            and error_code
+                            not in {
+                                "SIDE_EFFECT_UNKNOWN",
+                                "RECOVERY_REQUIRES_RECONCILIATION",
+                            }
+                        )
+                        state = "canceled" if canceled else "failed"
+                        if canceled:
+                            error_code = None
+                        if reconcile_cancel and error_code != "SIDE_EFFECT_UNKNOWN":
+                            error_code = "RECOVERY_REQUIRES_RECONCILIATION"
+                    if not heartbeat_failures:
+                        self._finish(
+                            task_id, tenant_id, token, state, result, error_code
+                        )
             finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1)
                 with self._lock:
                     self._threads.discard(threading.current_thread())
 
@@ -226,24 +390,47 @@ class PostgresTaskScheduler:
         )
         with self._lock:
             self._threads.add(thread)
-        thread.start()
-        return owner_id
+        try:
+            thread.start()
+        except BaseException:
+            with self._lock:
+                self._threads.discard(thread)
+            self._release_claim(task_id, tenant_id, token)
+            raise
+        return True
 
-    def _finish(self, task_id, tenant_id, state, result, error_code):
-        now = self.clock()
+    def _finish(self, task_id, tenant_id, token, state, result, error_code):
         with self.database.transaction() as connection:
             row = connection.execute(
                 """SELECT * FROM core_background_tasks
                    WHERE id = %s AND tenant_id = %s FOR UPDATE""",
                 (task_id, tenant_id),
             ).fetchone()
-            if row is None or row["state"] in TERMINAL:
-                return
+            now = connection.execute(
+                """SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision
+                          AS now"""
+            ).fetchone()["now"]
+            if (
+                row is None
+                or row["state"] in TERMINAL
+                or row["claim_owner"] != self._worker_id
+                or row["claim_token"] != token
+                or (row["claim_expires_at"] or 0) <= now
+            ):
+                return False
+            if row["cancel_requested"] and error_code not in {
+                "SIDE_EFFECT_UNKNOWN",
+                "RECOVERY_REQUIRES_RECONCILIATION",
+            }:
+                state = "canceled"
+                error_code = None
             revision = row["revision"] + 1
             payload = {"result": _value(result), "error_code": error_code}
             connection.execute(
                 """UPDATE core_background_tasks SET state = %s, result = %s,
-                       error_code = %s, revision = %s, updated_at = %s
+                       error_code = %s, revision = %s, updated_at = %s,
+                       claim_owner = NULL, claim_token = NULL,
+                       claim_expires_at = NULL
                    WHERE id = %s AND tenant_id = %s""",
                 (
                     state,
@@ -293,8 +480,11 @@ class PostgresTaskScheduler:
                     now,
                 ),
             )
+        with self._lock:
+            self._cancel_callbacks.pop((tenant_id, task_id), None)
         with self._condition(task_id):
             self._condition(task_id).notify_all()
+        return True
 
     def get(self, task_id, *, owner_id=None, tenant_id="default"):
         with self.database.pool.connection() as connection:
@@ -355,7 +545,7 @@ class PostgresTaskScheduler:
             updated = connection.execute(sql, values)
             if updated.rowcount != 1:
                 raise CoreError("TASK_NOT_CANCELABLE")
-        self._cancel_event(task_id).set()
+        self._signal_cancel(task_id, tenant_id)
         return self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
 
     def assert_can_complete_parent(self, owner_id, tenant_id="default"):
@@ -373,21 +563,38 @@ class PostgresTaskScheduler:
         with self.database.pool.connection() as connection:
             rows = connection.execute(
                 """SELECT * FROM core_background_tasks
-                   WHERE state IN ('submitted','working') ORDER BY created_at"""
+                   WHERE state = 'submitted'
+                      OR (state = 'working'
+                          AND (claim_expires_at IS NULL OR claim_expires_at <=
+                               EXTRACT(EPOCH FROM clock_timestamp())))
+                   ORDER BY created_at""",
             ).fetchall()
         recovered = 0
         for row in rows:
-            if row["cancel_requested"]:
-                self._finish(row["id"], row["tenant_id"], "canceled", None, None)
-                continue
             handler = self._handlers.get(row["kind"])
             if not row["recoverable"] or handler is None:
+                token, claimed = self._claim(
+                    row["id"], row["tenant_id"], allow_working=True
+                )
+                if claimed is None:
+                    continue
+                claimed_from_state = claimed["claimed_from_state"]
+                if claimed["cancel_requested"] and claimed_from_state == "submitted":
+                    state, error_code = "canceled", None
+                elif claimed_from_state == "working" and claimed["mutating"]:
+                    state, error_code = "failed", "SIDE_EFFECT_UNKNOWN"
+                else:
+                    state, error_code = (
+                        "failed",
+                        "RECOVERY_REQUIRES_RECONCILIATION",
+                    )
                 self._finish(
                     row["id"],
                     row["tenant_id"],
-                    "failed",
+                    token,
+                    state,
                     None,
-                    "RECOVERY_REQUIRES_RECONCILIATION",
+                    error_code,
                 )
                 continue
 
@@ -399,15 +606,17 @@ class PostgresTaskScheduler:
                 TraceContext(**trace_parent) if trace_parent is not None else None
             )
 
-            self._launch(
+            launched = self._launch(
                 row["id"],
                 row["tenant_id"],
                 execute,
                 accepts_cancel_event=True,
                 trace_context=trace_context,
                 continue_trace=trace_context is not None,
+                allow_working=True,
             )
-            recovered += 1
+            if launched and not row["cancel_requested"]:
+                recovered += 1
         return recovered
 
     def close(self):

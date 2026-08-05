@@ -53,9 +53,27 @@
 - [ ] Model fallback не повторяет tool call и compacts context перед меньшим окном.
 - [ ] Pause/passive wait освобождают model worker и продолжаются из checkpoint/notification.
 - [ ] Lease не позволяет двум workers одновременно изменить Task.
+- [ ] Lease регулярно продлевается во время model/tool/join работы дольше одного TTL; длинный joined child не завершает исправный parent с `LEASE_LOST`.
 - [ ] Pending input и task notifications восстанавливаются с прежними IDs/revisions.
 - [ ] Idempotent operation можно продолжить; неоднозначная мутация не повторяется.
 - [ ] Hard limits включают parent и все child/background Tasks.
+- [ ] Последний model turn заранее удержан внутри общего hard budget и вызывается с пустым tool catalog только для честного финального ответа; provider calls никогда не превышают limit.
+- [ ] Charge каждого initial/retry provider attempt, local usage и pre-dispatch marker коммитятся атомарно; crash не создаёт бесплатный повтор, а неизвестный reserved finalizer не dispatch-ится второй раз.
+- [ ] Charge model-issued tool request, local tool usage и pre-dispatch marker коммитятся атомарно; crash не списывает и не dispatch-ит один queued request повторно, rollback не расходится с root ledger.
+- [ ] При исчерпанном tool budget ни один оставшийся call из assistant batch не dispatch-ится, каждый получает structured `BUDGET_EXCEEDED` с `tool_calls`, used/limit и указанием передать промежуточный результат выше.
+- [ ] Исчерпание execution budget завершает Task как `completed` с `completion_reason=budget_exhausted`, `complete=false`, фактическим usage и текстом, разделяющим проверенное и незавершённое; Task не переходит в `failed` и модель не выдумывает недостающие results.
+- [ ] Если финализирующая модель не вернула text или после retry недоступна, runtime публикует только детерминированное сообщение о неполноте без hidden reasoning/raw tool output; ambiguous mutation по-прежнему даёт `SIDE_EFFECT_UNKNOWN`.
+- [ ] Follow-up, принятый во время reserved finalizer, durable попадает в transcript, не вызывает второй provider call сверх hard limit и явно помечается как необработанный в terminal partial result.
+- [ ] Неиспользованный finalization reserve возвращается общему ledger атомарно с нормальным terminal transition; неудавшийся start child не оставляет ни task/workflow, ни занятую ёмкость.
+- [ ] Scheduler handle, child workflow и его finalization reserve коммитятся одной транзакцией до запуска worker; ошибка admission не оставляет ни одной из трёх записей.
+- [ ] Durable scheduler claim принадлежит одному worker, продлевается heartbeat-ом и не позволяет concurrent recovery запустить один contract дважды или stale worker записать terminal state.
+- [ ] Live workflow lease исключает run из recovery даже при старте другой replica; совпадающий worker ID не заменяет живой token, а истёкшие workflow/scheduler tokens не renew-ятся и не terminalize-ят state; PostgreSQL expiry вычисляется по текущему server clock после ожидания row lock, независимо от clock skew replica и времени начала statement.
+- [ ] Workflow transition повторно проверяет lease token/expiry на финальном `core_runs` update после ожидания shared budget или других transaction locks; lock wait через TTL даёт `LEASE_LOST` и откатывает весь transition/charge.
+- [ ] Mutating exception после committed intent, resume/recovery или cancel workflow в `EXECUTING` дают `SIDE_EFFECT_UNKNOWN` без redispatch и без ложного `CANCELLED`, включая scheduler notification.
+- [ ] При restart `cancel_requested` recoverable Task согласует durable child state один раз, а non-recoverable mutating Task получает reconciliation error вместо ложного `canceled` outcome; cancel между scan и claim либо сразу после claim не обходит reconciliation и не стирает её ошибку.
+- [ ] Cancelled child атомарно возвращает неиспользованный finalization reserve; начатый finalizer остаётся учтённым как provider call.
+- [ ] Budget finalization ждёт owned Tasks только bounded grace; некооперативная Task остаётся durable/cancel-requested, а partial result возвращается и перечисляет её в `pending_tasks` без выдуманного outcome.
+- [ ] Persisted result различает local `usage` и общий `shared_budget`; live и crash-recovered A2A Artifacts публикуют их в одинаковой provenance metadata.
 
 ## Context и compaction
 
@@ -67,6 +85,7 @@
 - [ ] Prompt, policy, task contracts, active constraints, artifact refs и memory provenance остаются pinned.
 - [ ] Повторные compactions сохраняют goal и immutable transcript mapping.
 - [ ] Непомещающиеся protected/pinned data дают `CONTEXT_UNRECOVERABLE`, не silent truncation.
+- [ ] Крупный tool result целиком сохраняется в tenant-scoped artifact и immutable transcript, а active model context получает bounded JSON-ссылку, digest, размер и краткую выдержку вместо полного output.
 
 ## Память агента и file lifecycle
 
@@ -150,8 +169,11 @@
 ## Сабагенты
 
 - [ ] Сабагент создаётся как неблокирующая A2A Task.
+- [ ] Child workflow, scheduler handle, task tools, notifications, logs и traces используют один стабильный task ID.
 - [ ] Delegation contract содержит узкую instruction, exact tool/MCP/skill allowlists, memory policy и budget; child возвращает обычный text result без artifact tool/schema handoff.
+- [ ] Delegation template и model-facing schema всегда требуют оба поля `budget.turns >= 1` и `budget.tool_calls >= 1`; runtime повторно отклоняет missing, zero и boolean до создания child Task.
 - [ ] Parent делегирует coherent outcome и minimum sufficient capabilities, а не необязательные mechanical microsteps; runtime предоставляет exactly выбранный capability set.
+- [ ] Model-visible delegation prompt/description применяют balanced decision rule: положительные triggers — materially useful parallel work, изоляция большого отделимого context или independently verifiable bounded deliverable; simple/serial/tightly coupled/duplicate/policy-bypass/generic-second-opinion работа явно остаётся у parent.
 - [ ] Внутри objective/scope child самостоятельно выбирает strategy, sequencing и delegated tools; procedure фиксируется только для safety/correctness/reproducibility/policy.
 - [ ] Child сообщает safe assumptions, но останавливается при выходе за scope, недостающей capability, новом side effect или существенном риске неверного result.
 - [ ] Child не видит невыданные рабочие capabilities даже на discovery.
@@ -160,7 +182,9 @@
 - [ ] Без переданного Memory MCP child работает без memory.
 - [ ] Child memory write проходит service revision/index/NER pipeline и уведомляет parent.
 - [ ] Parent воспринимает child text result как недоверенный input; child не общается наружу без capability.
+- [ ] Budget-exhausted child возвращает через join/get/wait/notification одинаковый обычный text result с `complete=false`; parent передаёт проверенную часть выше, явно перечисляет unfinished scope и не повторяет выполненное.
 - [ ] Depth/fan-out и child budgets ограничены общим parent budget.
+- [ ] Cancel root рекурсивно сигнализирует child/grandchild; после ближайшей safe boundary новые model/tools не запускаются, scheduler и workflow имеют terminal `canceled`, а не `failed`.
 
 ## Local terminal sessions
 
@@ -184,6 +208,7 @@
 - [ ] Каноническое имя tool не содержит точки, совпадает с именем в каталоге модели и с именем в аргументах `core_delegate`; alias появляется только при коллизии или превышении длины.
 - [ ] Имя MCP-тула разрешается в пару `(сервер, tool)` индексом; tool, в имени которого есть точка, вызывается на своём сервере.
 - [ ] Schema `core_delegate` перечисляет enum-ом фактический каталог тулов родителя и его skills, а не свободные строки; отдельного аргумента `mcp` нет.
+- [ ] Поля `core_delegate` имеют model-facing descriptions; отказ называет отклонённый tool/skill/budget dimension и перечисляет доступный соответствующий набор или limit.
 - [ ] Один список `tools` несёт built-ins и MCP-тулы под именами каталога; runtime раскладывает их сам, а отказ называет отклонённое имя и перечисляет доступные.
 - [ ] Аргумент со значением `null` обрабатывается как непереданный.
 - [ ] Значение `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, записанное точками до переименования, продолжает называть тот же tool; неизвестное имя отклоняется с перечислением.

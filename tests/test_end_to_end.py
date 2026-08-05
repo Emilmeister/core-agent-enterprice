@@ -70,6 +70,10 @@ class ModelHandler(BaseHTTPRequestHandler):
 
         if "LIVE_STEERING_FOLLOWUP" in context:
             message = _text("live-steering-ok")
+        elif "BUDGET_PARTIAL_E2E" in context:
+            message = _text(
+                "Verified: no tool work ran. Unfinished: the requested work remains."
+            )
         elif "LIVE_STEERING_E2E" in context:
             type(self).live_steering_started.set()
             type(self).live_steering_release.wait(2)
@@ -380,8 +384,8 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         cls.environment.stop()
         cls.temp.cleanup()
 
-    async def _send(self, prompt):
-        transport = httpx.ASGITransport(app=self.app)
+    async def _send_task(self, prompt, app=None):
+        transport = httpx.ASGITransport(app=app or self.app)
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://agent.test",
@@ -402,6 +406,10 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in client.send_message(request)]
         task = events[-1].task
         self.assertEqual(TaskState.Name(task.status.state), "TASK_STATE_COMPLETED")
+        return task
+
+    async def _send(self, prompt):
+        task = await self._send_task(prompt)
         return "\n".join(
             part.text
             for artifact in task.artifacts
@@ -413,6 +421,44 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         answer = await self._send("TERMINAL_E2E")
         self.assertEqual(answer, "terminal-e2e-ok")
         self.assertNotIn("private terminal reasoning", answer)
+
+    async def test_live_a2a_result_exposes_local_and_shared_budget_metadata(self):
+        task = await self._send_task("TERMINAL_METADATA_E2E")
+        provenance = task.artifacts[0].metadata["provenance"]
+        self.assertTrue(provenance["complete"])
+        self.assertEqual(provenance["completion_reason"], "completed")
+        self.assertEqual(
+            provenance["usage"], {"model_turns": 2.0, "tool_calls": 1.0}
+        )
+        self.assertEqual(provenance["shared_budget"]["scope"], "root")
+        self.assertEqual(
+            provenance["shared_budget"]["used"],
+            {"model_turns": 2.0, "tool_calls": 1.0},
+        )
+
+    async def test_live_a2a_budget_partial_matches_recovery_provenance_contract(self):
+        model = CompatibleHttpModel(
+            api_format="openai",
+            model="budget-e2e-model",
+            base_url=f"http://127.0.0.1:{self.model_server.server_port}/v1",
+        )
+        with patch.dict(os.environ, {"RUNTIME_MAX_LLM_CALLS": "1"}):
+            app = create_app(model=model, base_url="http://agent.test")
+        try:
+            task = await self._send_task("BUDGET_PARTIAL_E2E", app=app)
+            provenance = task.artifacts[0].metadata["provenance"]
+        finally:
+            app.state.close()
+        self.assertFalse(provenance["complete"])
+        self.assertEqual(provenance["completion_reason"], "budget_exhausted")
+        self.assertEqual(provenance["exhausted_dimension"], "model_turns")
+        self.assertEqual(
+            provenance["usage"], {"model_turns": 1.0, "tool_calls": 0.0}
+        )
+        self.assertEqual(
+            provenance["shared_budget"]["used"],
+            {"model_turns": 1.0, "tool_calls": 0.0},
+        )
 
     async def test_a2a_tool_start_failure_returns_to_model_and_task_completes(self):
         answer = await self._send("TOOL_FAILURE_E2E")

@@ -6,6 +6,7 @@ import fnmatch
 import copy
 import inspect
 import logging
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass
@@ -31,6 +32,7 @@ from .skills import SkillResolver
 from .kernel import KernelCompiler
 from .python_exec import execute_python
 from .mcp import mcp_tool_index
+from .model import ModelResponse
 from .remote_agents import build_forwarded_headers
 from .security import redact
 from .streaming import NullStreamPublisher
@@ -39,6 +41,25 @@ from .tools import ToolCall, ToolDefinition, ToolResult
 from .workflow import InMemoryWorkflowStore, WorkflowRecord
 
 NULL_STREAM = NullStreamPublisher()
+WORKFLOW_LEASE_TTL = 600
+WORKFLOW_LEASE_HEARTBEAT_INTERVAL = WORKFLOW_LEASE_TTL / 3
+DEFAULT_BUDGET_CANCEL_GRACE_SECONDS = 5.0
+BUDGET_FINALIZATION_INSTRUCTION = (
+    "BUDGET FINALIZATION: The work budget is exhausted. Return a concise, truthful "
+    "verified intermediate result and explicitly list what you intended to do but "
+    "could not finish. Do not call tools, continue working, infer missing results, "
+    "or claim that the task is complete."
+)
+BUDGET_FALLBACK_MESSAGE = (
+    "Budget exhausted; this task is incomplete. The model produced no verified final "
+    "summary. Completed durable work remains recorded, but no missing result was "
+    "invented."
+)
+BUDGET_FOLLOWUP_MESSAGE = (
+    "Budget exhausted; this task is incomplete. A follow-up message arrived during "
+    "finalization and was recorded but could not be processed within the budget. "
+    "Completed durable work remains recorded, and no missing result was invented."
+)
 
 # Memory failures the model can act on itself. MEMORY_INDEX_FAILED and provider
 # errors are absent on purpose: they mean the answer would be wrong, not that the
@@ -65,12 +86,34 @@ class RunResult:
     message: str
     terminal_state: str
     usage: Usage
+    complete: bool = True
+    completion_reason: str = "completed"
+    exhausted_dimension: str | None = None
+    shared_budget: dict | None = None
+    pending_tasks: tuple[str, ...] = ()
 
     def to_dict(self):
         return {
             "run_id": self.run_id,
             "message": self.message,
             "terminal_state": self.terminal_state,
+            "complete": self.complete,
+            "completion_reason": self.completion_reason,
+            **(
+                {"exhausted_dimension": self.exhausted_dimension}
+                if self.exhausted_dimension
+                else {}
+            ),
+            **(
+                {"shared_budget": self.shared_budget}
+                if self.shared_budget is not None
+                else {}
+            ),
+            **(
+                {"pending_tasks": list(self.pending_tasks)}
+                if self.pending_tasks
+                else {}
+            ),
             "usage": {
                 "model_turns": self.usage.model_turns,
                 "tool_calls": self.usage.tool_calls,
@@ -111,6 +154,7 @@ class CoreAgent:
         platform_mcp=(),
         declared_skills=(),
         model_retries=0,
+        budget_cancel_grace_seconds=DEFAULT_BUDGET_CANCEL_GRACE_SECONDS,
     ):
         self.platform_config = platform_config
         self.agent_config = agent_config
@@ -159,6 +203,11 @@ class CoreAgent:
         self._silent_mcp_warned = set()
         self._capabilities_logged = False
         self.model_retries = max(0, int(model_retries))
+        self.budget_cancel_grace_seconds = float(budget_cancel_grace_seconds)
+        if self.budget_cancel_grace_seconds <= 0:
+            raise CoreError(
+                "CONFIG_INVALID", "budget cancel grace seconds must be positive"
+            )
         self.remote_agents = dict(remote_agents or {})
         self.send_message_api_key = send_message_api_key
         self.tool_runtime.handlers.update(
@@ -210,8 +259,7 @@ class CoreAgent:
             return value[: self.log_max_chars] + "...[TRUNCATED]"
         if isinstance(value, dict):
             return {
-                str(key): self._bounded_log_value(item)
-                for key, item in value.items()
+                str(key): self._bounded_log_value(item) for key, item in value.items()
             }
         if isinstance(value, (list, tuple)):
             return [self._bounded_log_value(item) for item in value[:100]]
@@ -375,10 +423,49 @@ class CoreAgent:
         the model is already reading.
         """
         schema = copy.deepcopy(schema)
+        descriptions = {
+            "instruction": (
+                "One coherent child objective with context, scope, deliverable, "
+                "acceptance criteria, and required constraints."
+            ),
+            "tools": (
+                "Minimum sufficient canonical tool names copied exactly from this "
+                "catalogue; use an empty list when no tool is needed."
+            ),
+            "skills": (
+                "Skills the child may use, copied exactly from this run's enum; use "
+                "an empty list when no skill is available or needed."
+            ),
+            "budget": (
+                "Both required positive child work limits inside the shared parent "
+                "budget; one model turn is retained for truthful finalization."
+            ),
+            "background": (
+                "True only when the parent can continue independent work before the "
+                "child result is needed; false joins passively."
+            ),
+        }
+        for name, description in descriptions.items():
+            if name in schema["properties"]:
+                schema["properties"][name]["description"] = description
+        budget_properties = schema["properties"].get("budget", {}).get("properties", {})
+        if "turns" in budget_properties:
+            budget_properties["turns"]["description"] = (
+                "Maximum child model turns including its reserved finalization turn."
+            )
+        if "tool_calls" in budget_properties:
+            budget_properties["tool_calls"]["description"] = (
+                "Maximum child tool dispatches; exhausted calls return failed results."
+            )
         schema["properties"]["tools"]["items"] = {
             "enum": sorted(effective.model_tool_catalog)
         }
-        schema["properties"]["skills"]["items"] = {"enum": sorted(effective.skills)}
+        if effective.skills:
+            schema["properties"]["skills"]["items"] = {
+                "enum": sorted(effective.skills)
+            }
+        else:
+            schema["properties"]["skills"]["maxItems"] = 0
         return schema
 
     def _tool_catalog(self, effective, discovered):
@@ -419,7 +506,9 @@ class CoreAgent:
             default=str,
         )
 
-    def _llm_input_attributes(self, *, model, messages, instructions, tools, session_id):
+    def _llm_input_attributes(
+        self, *, model, messages, instructions, tools, session_id
+    ):
         messages = [
             {key: value for key, value in message.items() if key != "reasoning_replay"}
             for message in messages
@@ -490,9 +579,7 @@ class CoreAgent:
                 self._bounded_log_value(response.reasoning)
             )
             message["contents"] = [{"type": "reasoning", "text": reasoning}]
-            prefix = (
-                "llm.output_messages.0.message.contents.0.message_content"
-            )
+            prefix = "llm.output_messages.0.message.contents.0.message_content"
             attributes[f"{prefix}.type"] = "reasoning"
             attributes[f"{prefix}.text"] = reasoning
             content_index = 1
@@ -501,9 +588,7 @@ class CoreAgent:
             message["content"] = public_message
             attributes["llm.output_messages.0.message.content"] = public_message
             if response.reasoning:
-                message["contents"].append(
-                    {"type": "text", "text": public_message}
-                )
+                message["contents"].append({"type": "text", "text": public_message})
                 prefix = (
                     "llm.output_messages.0.message.contents."
                     f"{content_index}.message_content"
@@ -529,9 +614,7 @@ class CoreAgent:
         token_attributes = {
             "llm.token_count.prompt": response.prompt_tokens,
             "llm.token_count.completion": response.completion_tokens,
-            "llm.token_count.completion_details.reasoning": (
-                response.reasoning_tokens
-            ),
+            "llm.token_count.completion_details.reasoning": (response.reasoning_tokens),
             "llm.token_count.total": response.total_tokens,
             "gen_ai.usage.input_tokens": response.prompt_tokens,
             "gen_ai.usage.output_tokens": response.completion_tokens,
@@ -586,8 +669,8 @@ class CoreAgent:
                     reasoning_replay = item.provider_replay
                 else:
                     calls = payload["tool_calls"]
-                    reasoning_replay = (
-                        item.provider_replay or payload.get("reasoning_replay")
+                    reasoning_replay = item.provider_replay or payload.get(
+                        "reasoning_replay"
                     )
                 known_tool_calls.update(call["id"] for call in calls)
                 message = {"role": "assistant", "tool_calls": calls}
@@ -624,7 +707,16 @@ class CoreAgent:
         result=None,
         error_code=None,
         lease_token=None,
+        consume_model_turns=0,
+        consume_tool_calls=0,
+        release_model_turns=0,
+        include_shared_budget=False,
     ):
+        if state in {"FAILED", "CANCELLED", "REJECTED", "ABORTED"} and snapshot.get(
+            "finalization_turn_reserved", False
+        ):
+            snapshot = {**snapshot, "finalization_turn_reserved": False}
+            release_model_turns += 1
         with self.telemetry.span(
             "core_agent.task.checkpoint",
             attributes={"core_agent.task.state": state},
@@ -642,6 +734,10 @@ class CoreAgent:
                 result=result,
                 error_code=error_code,
                 lease_token=lease_token,
+                consume_model_turns=consume_model_turns,
+                consume_tool_calls=consume_tool_calls,
+                release_model_turns=release_model_turns,
+                include_shared_budget=include_shared_budget,
             )
         if not self.workflow_store.atomic:
             for kind, data in audit:
@@ -658,6 +754,8 @@ class CoreAgent:
         if not self.log_content:
             for key in ("message", "prompt", "arguments", "output", "content"):
                 transition_data.pop(key, None)
+        for key in ("run_id", "task_id", "context_id", "state", "transition_event"):
+            transition_data.pop(key, None)
         self._log(
             "workflow.transition",
             run_id=record.run_id,
@@ -670,13 +768,32 @@ class CoreAgent:
         return updated
 
     def _new_workflow(
-        self, request, *, task_id, identity, session_id, tenant_id, parent_run_id=None
+        self,
+        request,
+        *,
+        task_id,
+        identity,
+        session_id,
+        tenant_id,
+        parent_run_id=None,
+        finalization_reserved=False,
+        connection=None,
     ):
         if isinstance(request, dict):
             request = RunRequest.from_dict(request)
         if not isinstance(request, RunRequest):
             raise CoreError("INVALID_REQUEST")
         raw, discovered, effective = self._resolve_capabilities(request)
+        budgets = raw.get("budgets", {})
+        max_model_turns = min(
+            budgets.get("model_turns", self.platform_config.max_model_turns),
+            self.platform_config.max_model_turns,
+        )
+        if max_model_turns < 1:
+            raise CoreError(
+                "CONFIG_INVALID",
+                "effective model_turns budget must include one finalization turn",
+            )
         skills = self._activate_skills(request, effective)
         run_id = str(uuid.uuid4())
         owner_id = identity or "anonymous"
@@ -700,7 +817,10 @@ class CoreAgent:
             "pending_response": None,
             "tool_queue": [],
             "pending_call": None,
+            "pending_mutating": None,
             "execution_id": None,
+            "finalization_turn_reserved": True,
+            "budget_exhausted": None,
         }
         compiled = self._compile_instructions(raw, effective, snapshot)
         snapshot["compiled_instructions"] = compiled.text
@@ -731,20 +851,18 @@ class CoreAgent:
             ),
             ("task.started", {}),
         )
-        budgets = raw.get("budgets", {})
         record = self.workflow_store.create(
             record,
             audit=audit,
             budget_limits=(
-                min(
-                    budgets.get("model_turns", self.platform_config.max_model_turns),
-                    self.platform_config.max_model_turns,
-                ),
+                max_model_turns,
                 min(
                     budgets.get("tool_calls", self.platform_config.max_tool_calls),
                     self.platform_config.max_tool_calls,
                 ),
             ),
+            reserve_model_turns=0 if finalization_reserved else 1,
+            connection=connection,
         )
         if not self.workflow_store.atomic:
             for kind, data in audit:
@@ -888,9 +1006,7 @@ class CoreAgent:
             }
             for item in response["tool_requests"]
         ]
-        content = json.dumps(
-            calls, sort_keys=True, separators=(",", ":"), default=str
-        )
+        content = json.dumps(calls, sort_keys=True, separators=(",", ":"), default=str)
         provider_replay = response.get("reasoning_replay")
         tokens = self.token_counter(content)
         if provider_replay:
@@ -926,12 +1042,84 @@ class CoreAgent:
         )
         snapshot["context"] = self._context_to_dict(context)
 
-    def _append_result(self, snapshot, text):
-        self._append_context_item(snapshot, "tool_result", text)
+    def _active_tool_result(self, record, call, text, token_limit):
+        if (
+            self.artifact_store is None
+            or token_limit is None
+            or self.token_counter(text) <= token_limit
+        ):
+            return text
+        stored = self.artifact_store.put(
+            record.tenant_id,
+            text.encode(),
+            media_type="application/json",
+            provenance={
+                "run_id": record.run_id,
+                "task_id": record.task_id,
+                "kind": "tool_result",
+                "tool_call_id": call.id,
+                "tool_name": call.name,
+            },
+        )
+        payload = json.loads(text)
+        output = json.dumps(
+            payload.get("output"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        excerpt = output[: max(0, token_limit * 2)]
+        while True:
+            active = {
+                key: payload[key]
+                for key in ("tool_call_id", "tool_name", "status", "error_code")
+                if key in payload
+            }
+            active["output"] = {
+                "artifact": {
+                    "id": stored.id,
+                    "media_type": stored.media_type,
+                    "size": stored.size,
+                    "digest": stored.digest,
+                },
+                "excerpt": excerpt,
+                "truncated": True,
+            }
+            rendered = json.dumps(
+                active,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            if self.token_counter(rendered) <= token_limit or not excerpt:
+                return rendered
+            excerpt = excerpt[: len(excerpt) // 2]
+
+    def _append_result(self, record, snapshot, call, text, *, token_limit=None):
+        active_text = self._active_tool_result(record, call, text, token_limit)
+        context = self._context_from_dict(snapshot["context"])
+        transcript_item = ContextItem("tool_result", text, self.token_counter(text))
+        active_item = (
+            transcript_item
+            if active_text == text
+            else ContextItem(
+                "tool_result", active_text, self.token_counter(active_text)
+            )
+        )
+        context = ContextState(
+            context.active + (active_item,),
+            context.transcript + (transcript_item,),
+            (context.sequence_range[0], context.sequence_range[1] + 1),
+        )
+        snapshot["context"] = self._context_to_dict(context)
         snapshot["pending_call"] = None
+        snapshot["pending_mutating"] = None
         snapshot["execution_id"] = None
         if snapshot["tool_queue"]:
             snapshot["tool_queue"].pop(0)
+        return active_text
 
     def _ack_task_notifications(self, run_id, tenant_id, task_id):
         mailbox = self.task_scheduler.mailbox(run_id, tenant_id)
@@ -943,16 +1131,12 @@ class CoreAgent:
                     if error.code != "TASK_NOT_FOUND":
                         raise
 
-    def _consume_task_notifications(
-        self, record, snapshot, *, lease_token
-    ):
+    def _consume_task_notifications(self, record, snapshot, *, lease_token):
         mailbox = self.task_scheduler.mailbox(record.run_id, record.tenant_id)
         notifications = mailbox.poll()
         if not notifications:
             return record, snapshot
-        seen = {
-            tuple(item) for item in snapshot.get("task_notification_revisions", ())
-        }
+        seen = {tuple(item) for item in snapshot.get("task_notification_revisions", ())}
         consumed = []
         for notification in notifications:
             key = (notification.task_id, notification.kind, notification.revision)
@@ -972,9 +1156,7 @@ class CoreAgent:
                 self._append_context_item(snapshot, "task_notification", content)
                 seen.add(key)
                 consumed.append(notification)
-        snapshot["task_notification_revisions"] = [
-            list(item) for item in sorted(seen)
-        ]
+        snapshot["task_notification_revisions"] = [list(item) for item in sorted(seen)]
         if consumed:
             record = self._record_transition(
                 record,
@@ -1067,6 +1249,7 @@ class CoreAgent:
                 call.name in {"core_delegate", "core_task_start"}
                 and error.code == "CAPABILITY_DISABLED"
             )
+            or (call.name == "core_delegate" and error.code == "BUDGET_EXCEEDED")
             # The 200-line protocol is built on the model reading
             # MEMORY_FILE_TOO_LARGE and answering with core_memory_split; a run
             # that dies on it cannot complete the very recovery it prescribes.
@@ -1098,7 +1281,15 @@ class CoreAgent:
         return ToolResult(call.id, "failed", {"error": payload}, error.code)
 
     def _record_tool_outcome(
-        self, record, snapshot, call, outcome, *, lease_token, span=None
+        self,
+        record,
+        snapshot,
+        call,
+        outcome,
+        *,
+        lease_token,
+        span=None,
+        active_result_token_limit=None,
     ):
         result_text = self._result_text(call.id, outcome, call.name)
         # A handler may return a ToolResult or the bare output; MCP tools return
@@ -1125,14 +1316,25 @@ class CoreAgent:
                     "output.mime_type": "application/json",
                 }
             )
-        self._append_result(snapshot, result_text)
+        active_result_text = self._append_result(
+            record,
+            snapshot,
+            call,
+            result_text,
+            token_limit=active_result_token_limit,
+        )
+        active_result = json.loads(active_result_text)
         self._stream(record).tool_result(
             call.id,
             call.name,
             {
-                "status": status,
-                "output": self._value(output),
-                **({"error_code": error_code} if error_code else {}),
+                "status": active_result["status"],
+                "output": active_result["output"],
+                **(
+                    {"error_code": active_result["error_code"]}
+                    if active_result.get("error_code")
+                    else {}
+                ),
             },
         )
         event_kind = (
@@ -1195,6 +1397,7 @@ class CoreAgent:
         approved=False,
         lease_token,
         span=None,
+        active_result_token_limit=None,
     ):
         pending = snapshot["pending_call"]
         call = ToolCall(pending["id"], pending["name"], dict(pending["arguments"]))
@@ -1210,6 +1413,7 @@ class CoreAgent:
             **({"arguments": call.arguments} if self.log_content else {}),
         )
         self.tool_runtime.validate(call, definition)
+        snapshot["pending_mutating"] = definition.mutating
         record = self._record_transition(
             record,
             state="EXECUTING",
@@ -1239,9 +1443,45 @@ class CoreAgent:
                 )
         except Exception as error:
             if self._recoverable_tool_error(call, error):
+                if (
+                    isinstance(error, CoreError)
+                    and error.code == "BUDGET_EXCEEDED"
+                    and error.data.get("dimension") in {"model_turns", "tool_calls"}
+                ):
+                    details = self._mark_budget_exhausted(
+                        snapshot,
+                        error,
+                        dimension=error.data["dimension"],
+                        used=error.data.get("used", 0),
+                        limit=error.data.get("limit", 0),
+                    )
+                    error.data = details
                 outcome = self._failed_tool_outcome(call, error)
                 if span:
                     span.record_error(error)
+            elif definition.mutating:
+                unknown = CoreError(
+                    "SIDE_EFFECT_UNKNOWN",
+                    "mutating tool outcome is unknown and requires reconciliation",
+                )
+                if span:
+                    span.record_error(unknown)
+                self._record_transition(
+                    record,
+                    state="ABORTED",
+                    snapshot=snapshot,
+                    event_kind="execution.side_effect_unknown",
+                    event_data={"tool_call_id": call.id},
+                    audit=(
+                        (
+                            "execution.reconciliation_required",
+                            {"tool_call_id": call.id},
+                        ),
+                    ),
+                    error_code=unknown.code,
+                    lease_token=lease_token,
+                )
+                raise unknown from error
             else:
                 self._record_transition(
                     record,
@@ -1271,12 +1511,13 @@ class CoreAgent:
             outcome,
             lease_token=lease_token,
             span=span,
+            active_result_token_limit=active_result_token_limit,
         )
 
     def _stream(self, record):
         return self._task_streams.get(record.task_id) or NULL_STREAM
 
-    def _generate(self, **call):
+    def _generate(self, *, before_retry=None, **call):
         """Retry a retryable provider failure REFLECT_AND_RETRY_MAX_RETRIES times."""
         for attempt in range(self.model_retries + 1):
             try:
@@ -1287,16 +1528,216 @@ class CoreAgent:
                 ):
                     raise
                 time.sleep(min(2**attempt, 8))
+                if before_retry is not None:
+                    before_retry()
 
-    def _continue_workflow(self, record, *, decision=None):
+    @staticmethod
+    def _budget_error(dimension, used, limit):
+        return CoreError(
+            "BUDGET_EXCEEDED",
+            f"{dimension} budget exhausted ({used}/{limit})",
+            data={
+                "dimension": dimension,
+                "used": used,
+                "limit": limit,
+                "instruction": (
+                    "Stop work and pass the verified intermediate result upward. "
+                    "State what remains unfinished and do not invent missing results."
+                ),
+            },
+        )
+
+    @staticmethod
+    def _mark_budget_exhausted(snapshot, error, *, dimension, used, limit):
+        details = dict(getattr(error, "data", None) or {})
+        details.setdefault("dimension", dimension)
+        details.setdefault("used", used)
+        details.setdefault("limit", limit)
+        details.setdefault(
+            "instruction",
+            "Stop work and pass the verified intermediate result upward. "
+            "State what remains unfinished and do not invent missing results.",
+        )
+        snapshot["budget_exhausted"] = snapshot.get("budget_exhausted") or details
+        return details
+
+    def _record_budget_exhausted_tools(self, record, snapshot, *, lease_token, details):
+        while snapshot["tool_queue"]:
+            pending = snapshot["tool_queue"][0]
+            call = ToolCall(pending["id"], pending["name"], dict(pending["arguments"]))
+            error = CoreError(
+                "BUDGET_EXCEEDED",
+                f"{details['dimension']} budget exhausted "
+                f"({details['used']}/{details['limit']})",
+                data=details,
+            )
+            record = self._record_tool_outcome(
+                record,
+                snapshot,
+                call,
+                self._failed_tool_outcome(call, error),
+                lease_token=lease_token,
+            )
+        snapshot["pending_response"] = None
+        return record
+
+    def _cancel_at_boundary(self, record, snapshot, cancel_event, *, lease_token):
+        if cancel_event is None or not cancel_event.is_set():
+            return
+        current = self.workflow_store.get(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+        )
+        if current.state == "ABORTED":
+            raise CoreError(current.error_code or "SIDE_EFFECT_UNKNOWN")
+        if current.state != "CANCELLED":
+            self._record_transition(
+                current,
+                state="CANCELLED",
+                snapshot=copy.deepcopy(snapshot),
+                event_kind="task.canceled",
+                event_data={"requested": True},
+                audit=(("task.canceled", {"content": False}),),
+                lease_token=lease_token,
+            )
+        destroy_run = getattr(
+            self.tool_runtime.environment_manager, "destroy_run", None
+        )
+        if destroy_run:
+            destroy_run(record.run_id)
+        self._run_contexts.pop(record.run_id, None)
+        self._run_scopes.pop(record.run_id, None)
+        self._runtime_cache.pop(record.run_id, None)
+        raise CoreError("TASK_CANCELLED")
+
+    def _abort_ambiguous_execution(self, record, *, lease_token=None):
+        if record.state == "ABORTED" and record.error_code == "SIDE_EFFECT_UNKNOWN":
+            return record
+        pending = record.snapshot.get("pending_call") or {}
+        return self._record_transition(
+            record,
+            state="ABORTED",
+            snapshot=copy.deepcopy(record.snapshot),
+            event_kind="execution.side_effect_unknown",
+            event_data={"tool_call_id": pending.get("id")},
+            audit=(
+                (
+                    "execution.reconciliation_required",
+                    {"tool_call_id": pending.get("id")},
+                ),
+            ),
+            error_code="SIDE_EFFECT_UNKNOWN",
+            lease_token=lease_token,
+        )
+
+    def _start_lease_heartbeat(self, record, lease_token):
+        stop = threading.Event()
+        failures = []
+
+        def heartbeat():
+            while not stop.wait(WORKFLOW_LEASE_HEARTBEAT_INTERVAL):
+                try:
+                    self.workflow_store.renew_lease(
+                        record.run_id,
+                        tenant_id=record.tenant_id,
+                        worker_id=self._worker_id,
+                        token=lease_token,
+                        ttl=WORKFLOW_LEASE_TTL,
+                    )
+                except Exception as error:
+                    failures.append(error)
+                    return
+
+        thread = threading.Thread(
+            target=heartbeat,
+            daemon=True,
+            name=f"core-lease-{record.run_id[:8]}",
+        )
+        thread.start()
+        return stop, thread, failures
+
+    def _settle_owned_tasks_for_budget(self, record):
+        tasks = self.task_scheduler.list(
+            owner_id=record.run_id, tenant_id=record.tenant_id
+        )
+        terminal = {"completed", "failed", "canceled"}
+        deadline = time.monotonic() + self.budget_cancel_grace_seconds
+        for task in tasks:
+            if task.state in terminal:
+                continue
+            try:
+                self.task_scheduler.cancel(
+                    task.id,
+                    owner_id=record.run_id,
+                    tenant_id=record.tenant_id,
+                )
+            except CoreError as error:
+                if error.code not in {"TASK_NOT_CANCELABLE", "TASK_NOT_FOUND"}:
+                    raise
+            try:
+                child = self.workflow_store.lookup_task(task.id)
+            except CoreError as error:
+                if error.code != "TASK_NOT_FOUND":
+                    raise
+            else:
+                if child.parent_run_id == record.run_id and child.state not in {
+                    "COMPLETED",
+                    "FAILED",
+                    "CANCELLED",
+                    "REJECTED",
+                    "ABORTED",
+                }:
+                    self.cancel_task(task.id)
+        pending = []
+        for task in tasks:
+            current = self.task_scheduler.get(
+                task.id,
+                owner_id=record.run_id,
+                tenant_id=record.tenant_id,
+            )
+            if current.state not in terminal:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        current = self.task_scheduler.wait(
+                            task.id,
+                            timeout=remaining,
+                            owner_id=record.run_id,
+                            tenant_id=record.tenant_id,
+                        )
+                    except TimeoutError:
+                        current = self.task_scheduler.get(
+                            task.id,
+                            owner_id=record.run_id,
+                            tenant_id=record.tenant_id,
+                        )
+            if current.state not in terminal:
+                pending.append(current.id)
+        return len(tasks), tuple(pending)
+
+    def _continue_workflow(self, record, *, decision=None, cancel_event=None):
         lease_token = self.workflow_store.acquire_lease(
             record.run_id,
             tenant_id=record.tenant_id,
             owner_id=record.owner_id,
             worker_id=self._worker_id,
-            ttl=600,
+            ttl=WORKFLOW_LEASE_TTL,
+        )
+        heartbeat_stop, heartbeat_thread, heartbeat_failures = (
+            self._start_lease_heartbeat(record, lease_token)
         )
         try:
+            record = self.workflow_store.get(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+            )
+            if record.state == "EXECUTING":
+                record = self._abort_ambiguous_execution(
+                    record, lease_token=lease_token
+                )
+                raise CoreError("SIDE_EFFECT_UNKNOWN")
             request, raw, discovered, effective = self._load_workflow_runtime(record)
             snapshot = copy.deepcopy(record.snapshot)
             budgets = raw.get("budgets", {})
@@ -1309,13 +1750,83 @@ class CoreAgent:
                 self.platform_config.max_tool_calls,
             )
             compactor = self._context_compactor(raw, effective, discovered, snapshot)
-            while snapshot["turns"] < max_turns:
+            active_result_token_limit = min(
+                compactor.budget.output_reserve,
+                max(64, int(compactor.budget.working_capacity * 0.10)),
+            )
+            while True:
+                if heartbeat_failures:
+                    raise heartbeat_failures[0]
+                self._cancel_at_boundary(
+                    record, snapshot, cancel_event, lease_token=lease_token
+                )
                 record, snapshot = self._consume_task_notifications(
                     record, snapshot, lease_token=lease_token
                 )
-                record, snapshot, _ = self._consume_inbound_messages(
-                    record, snapshot, lease_token=lease_token
+                record, snapshot, delivered_at_boundary = (
+                    self._consume_inbound_messages(
+                        record, snapshot, lease_token=lease_token
+                    )
                 )
+                if delivered_at_boundary and snapshot.get("finalizing_response"):
+                    snapshot["pending_response"]["message"] = BUDGET_FOLLOWUP_MESSAGE
+                    snapshot["budget_followup_unprocessed"] = True
+                in_flight = snapshot.get("model_attempt_in_flight")
+                if in_flight and not in_flight.get("finalizing", False):
+                    snapshot["model_attempt_in_flight"] = None
+                    record = self._record_transition(
+                        record,
+                        state="RUNNING",
+                        snapshot=snapshot,
+                        event_kind="model.attempt.unknown",
+                        event_data={"turn": in_flight["turn"]},
+                        lease_token=lease_token,
+                    )
+                exhausted = snapshot.get("budget_exhausted")
+                if exhausted is None and snapshot["turns"] >= max_turns - 1:
+                    error = self._budget_error("model_turns", max_turns, max_turns)
+                    exhausted = self._mark_budget_exhausted(
+                        snapshot,
+                        error,
+                        dimension="model_turns",
+                        used=max_turns,
+                        limit=max_turns,
+                    )
+                if exhausted and not snapshot.get("budget_children_settled"):
+                    settled, pending = self._settle_owned_tasks_for_budget(record)
+                    snapshot["budget_children_settled"] = True
+                    snapshot["budget_pending_tasks"] = list(pending)
+                    if pending:
+                        self._append_context_item(
+                            snapshot,
+                            "task_notification",
+                            json.dumps(
+                                {
+                                    "budget_pending_tasks": list(pending),
+                                    "status": "cancel_requested",
+                                    "instruction": (
+                                        "Cancellation is not confirmed. Do not use or "
+                                        "invent these task outcomes."
+                                    ),
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    record = self._record_transition(
+                        record,
+                        state="RUNNING",
+                        snapshot=snapshot,
+                        event_kind="budget.children.settled",
+                        event_data={
+                            "count": settled,
+                            "pending_tasks": list(pending),
+                        },
+                        lease_token=lease_token,
+                    )
+                    record, snapshot = self._consume_task_notifications(
+                        record, snapshot, lease_token=lease_token
+                    )
                 context = self._context_from_dict(snapshot["context"])
                 compacted = compactor.maybe_compact(context, turns=snapshot["turns"])
                 if compacted is not context:
@@ -1338,22 +1849,131 @@ class CoreAgent:
                     )
                     context = compacted
                 if snapshot["pending_response"] is None:
-                    self.workflow_store.consume_budget(record, model_turns=1)
+                    finalizing = exhausted is not None
+                    call_finalizer_model = True
+                    if not finalizing:
+                        attempt_snapshot = copy.deepcopy(snapshot)
+                        attempt_snapshot["turns"] += 1
+                        attempt_snapshot["model_attempt_in_flight"] = {
+                            "turn": attempt_snapshot["turns"],
+                            "finalizing": False,
+                        }
+                        try:
+                            record = self._record_transition(
+                                record,
+                                state="RUNNING",
+                                snapshot=attempt_snapshot,
+                                event_kind="model.attempt.started",
+                                event_data={
+                                    "turn": attempt_snapshot["turns"],
+                                    "retry": False,
+                                    "finalizing": False,
+                                },
+                                lease_token=lease_token,
+                                consume_model_turns=1,
+                            )
+                        except CoreError as error:
+                            if error.code != "BUDGET_EXCEEDED":
+                                raise
+                            exhausted = self._mark_budget_exhausted(
+                                snapshot,
+                                error,
+                                dimension="model_turns",
+                                used=max_turns,
+                                limit=max_turns,
+                            )
+                            record = self._record_transition(
+                                record,
+                                state="RUNNING",
+                                snapshot=snapshot,
+                                event_kind="budget.exhausted",
+                                event_data={
+                                    "dimension": exhausted["dimension"],
+                                    "used": exhausted["used"],
+                                    "limit": exhausted["limit"],
+                                },
+                                lease_token=lease_token,
+                            )
+                            continue
+                        snapshot = attempt_snapshot
+                    elif snapshot.get("finalization_turn_reserved", False):
+                        attempt_snapshot = copy.deepcopy(snapshot)
+                        attempt_snapshot["finalization_turn_reserved"] = False
+                        attempt_snapshot["turns"] += 1
+                        attempt_snapshot["model_attempt_in_flight"] = {
+                            "turn": attempt_snapshot["turns"],
+                            "finalizing": True,
+                        }
+                        record = self._record_transition(
+                            record,
+                            state="RUNNING",
+                            snapshot=attempt_snapshot,
+                            event_kind="budget.finalization.started",
+                            event_data={
+                                "dimension": exhausted["dimension"],
+                                "turn": attempt_snapshot["turns"],
+                            },
+                            lease_token=lease_token,
+                        )
+                        snapshot = attempt_snapshot
+                    else:
+                        # A crash after the durable start marker leaves it unknown
+                        # whether the provider received the reserved call. Do not
+                        # spend another turn; the deterministic fallback is honest.
+                        call_finalizer_model = False
                     with self.telemetry.span("core_agent.context.assemble"):
                         model_context = "\n".join(
                             item.content for item in context.active
                         )
                         model_messages = self._model_messages(context)
-                        model_tools = self._tool_catalog(effective, discovered)
+                        model_tools = (
+                            {}
+                            if finalizing
+                            else self._tool_catalog(effective, discovered)
+                        )
                         model_instructions = self._instructions(snapshot)
+                    if finalizing:
+                        model_instructions = (
+                            f"{model_instructions}\n\n{BUDGET_FINALIZATION_INSTRUCTION}"
+                        )
+                    retry_limit = max_turns if finalizing else max_turns - 1
+
+                    def reserve_retry():
+                        nonlocal record, snapshot
+                        if snapshot["turns"] >= retry_limit:
+                            raise self._budget_error(
+                                "model_turns", max_turns, max_turns
+                            )
+                        attempt_snapshot = copy.deepcopy(snapshot)
+                        attempt_snapshot["turns"] += 1
+                        attempt_snapshot["model_attempt_in_flight"] = {
+                            "turn": attempt_snapshot["turns"],
+                            "finalizing": finalizing,
+                        }
+                        record = self._record_transition(
+                            record,
+                            state="RUNNING",
+                            snapshot=attempt_snapshot,
+                            event_kind="model.attempt.started",
+                            event_data={
+                                "turn": attempt_snapshot["turns"],
+                                "retry": True,
+                                "finalizing": finalizing,
+                            },
+                            lease_token=lease_token,
+                            consume_model_turns=1,
+                        )
+                        snapshot = attempt_snapshot
+
                     self._log(
                         "model.requested",
                         run_id=record.run_id,
                         task_id=record.task_id,
-                        turn=snapshot["turns"] + 1,
+                        turn=snapshot["turns"],
                         model=raw["model"].get("route", "unknown"),
                         available_tools=sorted(model_tools),
                         context_items=len(context.active),
+                        finalization=finalizing,
                     )
                     with self.telemetry.span(
                         "gen_ai.chat",
@@ -1368,40 +1988,105 @@ class CoreAgent:
                         stream = self._stream(record)
                         delta = (
                             {"on_delta": stream.text}
-                            if stream.enabled and self._model_streams_deltas
+                            if (
+                                not finalizing
+                                and stream.enabled
+                                and self._model_streams_deltas
+                            )
                             else {}
                         )
-                        response = self._generate(
-                            context=model_context,
-                            tools=model_tools,
-                            instructions=model_instructions,
-                            messages=model_messages,
-                            **delta,
-                        )
+                        try:
+                            response = (
+                                self._generate(
+                                    before_retry=reserve_retry,
+                                    context=model_context,
+                                    tools=model_tools,
+                                    instructions=model_instructions,
+                                    messages=model_messages,
+                                    **delta,
+                                )
+                                if call_finalizer_model
+                                else ModelResponse()
+                            )
+                        except CoreError as error:
+                            snapshot["model_attempt_in_flight"] = None
+                            if error.code == "BUDGET_EXCEEDED":
+                                model_span.record_error(error)
+                                if finalizing:
+                                    response = ModelResponse()
+                                else:
+                                    exhausted = self._mark_budget_exhausted(
+                                        snapshot,
+                                        error,
+                                        dimension="model_turns",
+                                        used=max_turns,
+                                        limit=max_turns,
+                                    )
+                                    record = self._record_transition(
+                                        record,
+                                        state="RUNNING",
+                                        snapshot=snapshot,
+                                        event_kind="budget.exhausted",
+                                        event_data={
+                                            "dimension": exhausted["dimension"],
+                                            "used": exhausted["used"],
+                                            "limit": exhausted["limit"],
+                                        },
+                                        lease_token=lease_token,
+                                    )
+                                    continue
+                            elif not finalizing or error.code != "MODEL_UNAVAILABLE":
+                                raise
+                            else:
+                                model_span.record_error(error)
+                                response = ModelResponse()
                         model_span.set_attributes(self._llm_output_attributes(response))
+                    self._cancel_at_boundary(
+                        record, snapshot, cancel_event, lease_token=lease_token
+                    )
+                    if finalizing:
+                        text = (
+                            response.message.strip()
+                            if isinstance(response.message, str)
+                            and response.message.strip()
+                            else BUDGET_FALLBACK_MESSAGE
+                        )
+                        prefix = "Budget exhausted; this task is incomplete."
+                        if not text.startswith(prefix):
+                            text = f"{prefix}\n\n{text}"
+                        response_data = self._response_dict(response)
+                        response_data["message"] = text
+                        response_data["tool_requests"] = []
+                        stream.text(text, None)
+                    else:
+                        response_data = self._response_dict(response)
                     stream.flush()
                     action = (
                         "request_tools"
-                        if response.tool_requests
+                        if response_data["tool_requests"]
                         else (
                             "final_answer"
-                            if response.message is not None
+                            if response_data["message"] is not None
                             else "continue_reasoning"
                         )
                     )
                     tool_calls = [
                         {
-                            "tool_call_id": item.id,
-                            "tool_name": item.name,
-                            **({"arguments": item.arguments} if self.log_content else {}),
+                            "tool_call_id": item["id"],
+                            "tool_name": item["name"],
+                            **(
+                                {"arguments": item["arguments"]}
+                                if self.log_content
+                                else {}
+                            ),
                         }
-                        for item in response.tool_requests
+                        for item in response_data["tool_requests"]
                     ]
                     self._log(
                         "model.response",
                         run_id=record.run_id,
                         task_id=record.task_id,
-                        turn=snapshot["turns"] + 1,
+                        turn=snapshot["turns"],
                         action=action,
                         finish_reason=response.finish_reason,
                         prompt_tokens=response.prompt_tokens,
@@ -1410,9 +2095,10 @@ class CoreAgent:
                         reasoning_available=bool(response.reasoning),
                         reasoning_tokens=response.reasoning_tokens,
                         tool_calls=tool_calls,
+                        finalization=finalizing,
                         **(
-                            {"response": response.message}
-                            if self.log_content and response.message is not None
+                            {"response": response_data["message"]}
+                            if self.log_content and response_data["message"] is not None
                             else {}
                         ),
                         **(
@@ -1422,9 +2108,11 @@ class CoreAgent:
                         ),
                     )
                     for item in response.tool_requests:
-                        stream.tool_call(item.id, item.name, item.arguments)
-                    snapshot["turns"] += 1
-                    snapshot["pending_response"] = self._response_dict(response)
+                        if not finalizing:
+                            stream.tool_call(item.id, item.name, item.arguments)
+                    snapshot["model_attempt_in_flight"] = None
+                    snapshot["pending_response"] = response_data
+                    snapshot["finalizing_response"] = finalizing
                     if snapshot["pending_response"]["tool_requests"]:
                         self._append_assistant_tool_calls(
                             snapshot, snapshot["pending_response"]
@@ -1441,17 +2129,72 @@ class CoreAgent:
                         audit=(("model.completed", {"turn": snapshot["turns"]}),),
                         lease_token=lease_token,
                     )
+                self._cancel_at_boundary(
+                    record, snapshot, cancel_event, lease_token=lease_token
+                )
                 if snapshot["tool_queue"]:
-                    if snapshot["tool_calls"] >= max_tools:
-                        raise CoreError("BUDGET_EXCEEDED")
-                    self.workflow_store.consume_budget(record, tool_calls=1)
-                    pending = snapshot["tool_queue"][0]
+                    if snapshot["pending_call"] is None:
+                        if snapshot["tool_calls"] >= max_tools:
+                            error = self._budget_error(
+                                "tool_calls", snapshot["tool_calls"], max_tools
+                            )
+                            details = self._mark_budget_exhausted(
+                                snapshot,
+                                error,
+                                dimension="tool_calls",
+                                used=snapshot["tool_calls"],
+                                limit=max_tools,
+                            )
+                            record = self._record_budget_exhausted_tools(
+                                record,
+                                snapshot,
+                                lease_token=lease_token,
+                                details=details,
+                            )
+                            continue
+                        attempt_snapshot = copy.deepcopy(snapshot)
+                        attempt_snapshot["pending_call"] = copy.deepcopy(
+                            snapshot["tool_queue"][0]
+                        )
+                        attempt_snapshot["tool_calls"] += 1
+                        try:
+                            record = self._record_transition(
+                                record,
+                                state="MODEL_RESPONDED",
+                                snapshot=attempt_snapshot,
+                                event_kind="tool.attempt.started",
+                                event_data={
+                                    "tool_call_id": attempt_snapshot["pending_call"][
+                                        "id"
+                                    ]
+                                },
+                                lease_token=lease_token,
+                                consume_tool_calls=1,
+                            )
+                        except CoreError as error:
+                            if error.code != "BUDGET_EXCEEDED":
+                                raise
+                            details = self._mark_budget_exhausted(
+                                snapshot,
+                                error,
+                                dimension="tool_calls",
+                                used=snapshot["tool_calls"],
+                                limit=max_tools,
+                            )
+                            record = self._record_budget_exhausted_tools(
+                                record,
+                                snapshot,
+                                lease_token=lease_token,
+                                details=details,
+                            )
+                            continue
+                        snapshot = attempt_snapshot
+                    pending = snapshot["pending_call"]
                     effective.require_tool(pending["name"])
                     call = ToolCall(
                         pending["id"], pending["name"], dict(pending["arguments"])
                     )
                     definition, _is_mcp = self._definition(call, effective, discovered)
-                    snapshot["tool_calls"] += 1
                     try:
                         self.tool_runtime.validate(call, definition)
                     except CoreError as error:
@@ -1486,9 +2229,9 @@ class CoreAgent:
                                 self._failed_tool_outcome(call, error),
                                 lease_token=lease_token,
                                 span=tool_span,
+                                active_result_token_limit=active_result_token_limit,
                             )
                         continue
-                    snapshot["pending_call"] = copy.deepcopy(pending)
                     with self.telemetry.span(
                         "core_agent.tool.execute",
                         attributes={
@@ -1505,45 +2248,106 @@ class CoreAgent:
                             effective,
                             lease_token=lease_token,
                             span=tool_span,
+                            active_result_token_limit=active_result_token_limit,
                         )
                     continue
                 response = snapshot["pending_response"]
                 if response["message"] is not None:
+                    if snapshot.get("budget_exhausted") and not snapshot.get(
+                        "finalizing_response"
+                    ):
+                        snapshot["pending_response"] = None
+                        snapshot["finalizing_response"] = False
+                        record = self._record_transition(
+                            record,
+                            state="RUNNING",
+                            snapshot=snapshot,
+                            event_kind="budget.finalization.requested",
+                            event_data={
+                                "dimension": snapshot["budget_exhausted"]["dimension"]
+                            },
+                            lease_token=lease_token,
+                        )
+                        continue
                     record, snapshot, delivered = self._consume_inbound_messages(
                         record,
                         snapshot,
                         lease_token=lease_token,
-                        discard_pending_response=True,
+                        discard_pending_response=not snapshot.get(
+                            "finalizing_response"
+                        ),
                     )
                     if delivered:
-                        continue
-                    self.task_scheduler.assert_can_complete_parent(
-                        record.run_id, tenant_id=record.tenant_id
-                    )
+                        if not snapshot.get("finalizing_response"):
+                            continue
+                        response = snapshot["pending_response"]
+                        response["message"] = BUDGET_FOLLOWUP_MESSAGE
+                        snapshot["budget_followup_unprocessed"] = True
+                    exhausted = snapshot.get("budget_exhausted")
+                    if not exhausted:
+                        self.task_scheduler.assert_can_complete_parent(
+                            record.run_id, tenant_id=record.tenant_id
+                        )
                     result = {
                         "message": response["message"],
+                        "complete": exhausted is None,
+                        "completion_reason": (
+                            "completed" if exhausted is None else "budget_exhausted"
+                        ),
+                        **(
+                            {"exhausted_dimension": exhausted["dimension"]}
+                            if exhausted
+                            else {}
+                        ),
                         "usage": {
                             "model_turns": snapshot["turns"],
                             "tool_calls": snapshot["tool_calls"],
                         },
+                        **(
+                            {"pending_tasks": snapshot["budget_pending_tasks"]}
+                            if snapshot.get("budget_pending_tasks")
+                            else {}
+                        ),
                     }
+                    if snapshot.get("budget_pending_tasks"):
+                        pending_text = ", ".join(snapshot["budget_pending_tasks"])
+                        result["message"] = (
+                            f"{result['message']}\n\nBackground task cancellation is not "
+                            f"confirmed for: {pending_text}. Their outcomes were not used."
+                        )
+                    completion_snapshot = copy.deepcopy(snapshot)
+                    release_model_turns = int(
+                        exhausted is None
+                        and completion_snapshot.get("finalization_turn_reserved", False)
+                    )
+                    completion_snapshot["finalization_turn_reserved"] = False
                     try:
                         record = self._record_transition(
                             record,
                             state="COMPLETED",
-                            snapshot=snapshot,
+                            snapshot=completion_snapshot,
                             event_kind="task.completed",
                             event_data={"message": response["message"]},
                             audit=(("task.completed", {"content_persisted": False}),),
                             result=result,
                             lease_token=lease_token,
+                            release_model_turns=release_model_turns,
+                            include_shared_budget=True,
                         )
                     except CoreError as error:
                         if error.code != "INBOUND_MESSAGE_PENDING":
                             raise
-                        snapshot["pending_response"] = None
+                        if exhausted and snapshot.get("finalizing_response"):
+                            snapshot["pending_response"] = response
+                            snapshot["pending_response"]["message"] = (
+                                BUDGET_FOLLOWUP_MESSAGE
+                            )
+                            snapshot["budget_followup_unprocessed"] = True
+                        else:
+                            snapshot["pending_response"] = None
                         snapshot["tool_queue"] = []
                         continue
+                    result = record.result
                     self._run_contexts.pop(record.run_id, None)
                     self._run_scopes.pop(record.run_id, None)
                     self._runtime_cache.pop(record.run_id, None)
@@ -1552,8 +2356,14 @@ class CoreAgent:
                         result["message"],
                         "completed",
                         Usage(**result["usage"]),
+                        result["complete"],
+                        result["completion_reason"],
+                        result.get("exhausted_dimension"),
+                        result.get("shared_budget"),
+                        tuple(result.get("pending_tasks", ())),
                     )
                 snapshot["pending_response"] = None
+                snapshot["finalizing_response"] = False
                 record = self._record_transition(
                     record,
                     state="RUNNING",
@@ -1562,19 +2372,9 @@ class CoreAgent:
                     event_data={"turn": snapshot["turns"]},
                     lease_token=lease_token,
                 )
-            error = CoreError("BUDGET_EXCEEDED")
-            self._record_transition(
-                record,
-                state="FAILED",
-                snapshot=snapshot,
-                event_kind="task.failed",
-                event_data={"error_code": error.code},
-                audit=(("task.failed", {"error_code": error.code}),),
-                error_code=error.code,
-                lease_token=lease_token,
-            )
-            raise error
         finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
             try:
                 self.workflow_store.release_lease(
                     record.run_id,
@@ -1610,9 +2410,13 @@ class CoreAgent:
     @staticmethod
     def _value(value):
         if hasattr(value, "to_dict"):
-            return value.to_dict()
+            return CoreAgent._value(value.to_dict())
         if is_dataclass(value):
-            return asdict(value)
+            return CoreAgent._value(asdict(value))
+        if isinstance(value, dict):
+            return {str(key): CoreAgent._value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [CoreAgent._value(item) for item in value]
         return value
 
     def _task_snapshot(self, task):
@@ -1665,14 +2469,18 @@ class CoreAgent:
             },
             recoverable=not definition.mutating,
             tenant_id=scope.get("tenant_id", "default"),
+            mutating=definition.mutating,
+            on_cancel=(
+                lambda: self.tool_runtime.environment_manager.destroy_run(task_run_id)
+            )
+            if target == "core_terminal_exec"
+            else None,
         )
         return self._task_snapshot(task)
 
     def _python_exec(self, arguments, run_id):
         cached = self._runtime_cache.get(run_id)
-        if (
-            cached is None
-        ):
+        if cached is None:
             raise CoreError("CAPABILITY_DISABLED")
         _raw, discovered, effective = cached
         effective.require_tool("core_python_exec")
@@ -1779,7 +2587,9 @@ class CoreAgent:
                     # The same rule as a failed built-in outcome below: inside
                     # tools.call a failure has to raise, not return a body.
                     if isinstance(output, dict) and output.get("isError"):
-                        raise CoreError("TOOL_EXECUTION_FAILED", self._json(output)[:500])
+                        raise CoreError(
+                            "TOOL_EXECUTION_FAILED", self._json(output)[:500]
+                        )
                 else:
                     outcome = self.tool_runtime.execute(
                         call,
@@ -1916,9 +2726,7 @@ class CoreAgent:
             namespace = f"subject/{user_id}"
         else:
             raise CoreError("TOOL_ARGUMENT_INVALID", "scope must be user or session")
-        service = self.memory_registry.service(
-            self.agent_config.agent["name"], user_id
-        )
+        service = self.memory_registry.service(self.agent_config.agent["name"], user_id)
         return service, namespace
 
     def _memory_sources(self, run_id):
@@ -2195,7 +3003,16 @@ class CoreAgent:
         }
         scope = self._run_scopes.get(run_id, {})
         if self.depth >= parent_budget["depth"]:
-            raise CoreError("BUDGET_EXCEEDED")
+            raise CoreError(
+                "BUDGET_EXCEEDED",
+                f"delegation depth budget exhausted "
+                f"({self.depth}/{parent_budget['depth']})",
+                data={
+                    "dimension": "depth",
+                    "used": self.depth,
+                    "limit": parent_budget["depth"],
+                },
+            )
         if (
             self.task_scheduler.count(
                 owner_id=run_id,
@@ -2233,9 +3050,7 @@ class CoreAgent:
         child_raw["tools"]["mcp"] = {
             "default": "deny",
             "allow_servers": list(delegated_mcp),
-            "allow_tools": {
-                key: sorted(value) for key, value in delegated_mcp.items()
-            },
+            "allow_tools": {key: sorted(value) for key, value in delegated_mcp.items()},
         }
         child_raw["skills"] = {
             "default": "deny",
@@ -2258,13 +3073,8 @@ class CoreAgent:
                 "delegation": delegation_enabled,
             }
         )
-        child_raw["budgets"]["model_turns"] = contract.budget.get(
-            "turns", parent_budget["turns"]
-        )
-        child_raw["budgets"]["tool_calls"] = contract.budget.get(
-            "tool_calls", parent_budget["tool_calls"]
-        )
-        child = self._child_agent(child_raw, child_tools)
+        child_raw["budgets"]["model_turns"] = contract.budget["turns"]
+        child_raw["budgets"]["tool_calls"] = contract.budget["tool_calls"]
         child_task_id = str(uuid.uuid4())
         # The child is narrowed through its own AgentConfig; capabilities never
         # travel in the request.
@@ -2276,10 +3086,27 @@ class CoreAgent:
             "tenant_id": scope.get("tenant_id", "default"),
             "parent_run_id": run_id,
         }
+        child = self._child_agent(child_raw, child_tools)
+
+        def admit(connection):
+            child._new_workflow(
+                child_request,
+                task_id=child_task_id,
+                identity=child_scope["identity"],
+                session_id=child_scope["session_id"],
+                tenant_id=child_scope["tenant_id"],
+                parent_run_id=run_id,
+                connection=connection,
+            )
+
         task = self.task_scheduler.start(
-            lambda: child.run(child_request, **child_scope),
+            lambda cancel_event: child.run(
+                child_request, cancel_event=cancel_event, **child_scope
+            ),
             owner_id=run_id,
+            task_id=child_task_id,
             required=True,
+            accepts_cancel_event=True,
             kind="subagent",
             contract={
                 "request": child_request,
@@ -2290,6 +3117,8 @@ class CoreAgent:
             recoverable=True,
             tenant_id=scope.get("tenant_id", "default"),
             continue_trace=True,
+            admission=admit,
+            mutating=False,
         )
         if not contract.background:
             task = self.task_scheduler.wait(
@@ -2355,16 +3184,63 @@ class CoreAgent:
             logger=self.logger,
             log_content=self.log_content,
             log_max_chars=self.log_max_chars,
+            budget_cancel_grace_seconds=self.budget_cancel_grace_seconds,
         )
         return child
 
     def _recover_subagent(self, contract, cancel_event):
-        if cancel_event.is_set():
-            return None
+        scope = dict(contract["scope"])
+        task_id = scope["task_id"]
         child = self._child_agent(
             copy.deepcopy(contract["agent_config"]), tuple(contract["tools"])
         )
-        return child.run(dict(contract["request"]), **dict(contract["scope"]))
+        try:
+            record = self.workflow_store.by_task(
+                task_id,
+                tenant_id=scope.get("tenant_id", "default"),
+                owner_id=scope.get("identity", "anonymous"),
+            )
+        except CoreError as error:
+            if error.code != "TASK_NOT_FOUND":
+                raise
+            if cancel_event.is_set():
+                return None
+            return child.run(
+                dict(contract["request"]), cancel_event=cancel_event, **scope
+            )
+        if cancel_event.is_set() and record.state not in {
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "REJECTED",
+            "ABORTED",
+        }:
+            self.cancel_task(task_id)
+            record = self.workflow_store.by_task(
+                task_id,
+                tenant_id=scope.get("tenant_id", "default"),
+                owner_id=scope.get("identity", "anonymous"),
+            )
+        if record.state == "COMPLETED":
+            result = record.result
+            return RunResult(
+                record.run_id,
+                result["message"],
+                "completed",
+                Usage(**result["usage"]),
+                result.get("complete", True),
+                result.get("completion_reason", "completed"),
+                result.get("exhausted_dimension"),
+                result.get("shared_budget"),
+                tuple(result.get("pending_tasks", ())),
+            )
+        if record.state in {"FAILED", "REJECTED", "ABORTED"}:
+            raise CoreError(record.error_code or "INVALID_TASK_STATE")
+        if record.state == "CANCELLED":
+            if cancel_event.is_set():
+                return None
+            raise CoreError(record.error_code or "TASK_CANCELLED")
+        return child._continue_workflow(record, cancel_event=cancel_event)
 
     def attach_stream(self, task_id, publisher, headers=None):
         """Bind the A2A stream and caller headers to a task for one turn."""
@@ -2388,6 +3264,8 @@ class CoreAgent:
         session_id=None,
         tenant_id=None,
         parent_run_id=None,
+        finalization_reserved=False,
+        cancel_event=None,
     ):
         if task_id is not None:
             try:
@@ -2410,7 +3288,7 @@ class CoreAgent:
                     "ABORTED",
                 }:
                     raise CoreError("INVALID_TASK_STATE")
-                return self._continue_workflow(existing)
+                return self._continue_workflow(existing, cancel_event=cancel_event)
         record, _raw, _discovered, _effective = self._new_workflow(
             request,
             task_id=task_id,
@@ -2418,8 +3296,9 @@ class CoreAgent:
             session_id=session_id,
             tenant_id=tenant_id,
             parent_run_id=parent_run_id,
+            finalization_reserved=finalization_reserved,
         )
-        return self._continue_workflow(record)
+        return self._continue_workflow(record, cancel_event=cancel_event)
 
     def enqueue_message(
         self,
@@ -2470,11 +3349,17 @@ class CoreAgent:
     def resume_task(self, task_id):
         record = self.workflow_store.lookup_task(task_id)
         if record.state == "COMPLETED":
+            result = record.result
             return RunResult(
                 record.run_id,
-                record.result["message"],
+                result["message"],
                 "completed",
-                Usage(**record.result["usage"]),
+                Usage(**result["usage"]),
+                result.get("complete", True),
+                result.get("completion_reason", "completed"),
+                result.get("exhausted_dimension"),
+                result.get("shared_budget"),
+                tuple(result.get("pending_tasks", ())),
             )
         if record.state in {"FAILED", "ABORTED", "CANCELLED", "REJECTED"}:
             raise CoreError(record.error_code or "INVALID_TASK_STATE")
@@ -2490,6 +3375,16 @@ class CoreAgent:
             "ABORTED",
         }:
             raise CoreError("TASK_NOT_CANCELABLE")
+        if record.parent_run_id:
+            try:
+                self.task_scheduler.cancel(
+                    record.task_id,
+                    owner_id=record.parent_run_id,
+                    tenant_id=record.tenant_id,
+                )
+            except CoreError as error:
+                if error.code not in {"TASK_NOT_CANCELABLE", "TASK_NOT_FOUND"}:
+                    raise
         for task in self.task_scheduler.list(
             owner_id=record.run_id, tenant_id=record.tenant_id
         ):
@@ -2502,19 +3397,43 @@ class CoreAgent:
                     )
                 except CoreError:
                     pass
+                try:
+                    child = self.workflow_store.lookup_task(task.id)
+                except CoreError as error:
+                    if error.code != "TASK_NOT_FOUND":
+                        raise
+                else:
+                    if child.parent_run_id == record.run_id and child.state not in {
+                        "COMPLETED",
+                        "FAILED",
+                        "CANCELLED",
+                        "REJECTED",
+                        "ABORTED",
+                    }:
+                        self.cancel_task(task.id)
         destroy_run = getattr(
             self.tool_runtime.environment_manager, "destroy_run", None
         )
         if destroy_run:
             destroy_run(record.run_id)
-        self._record_transition(
-            record,
-            state="CANCELLED",
-            snapshot=copy.deepcopy(record.snapshot),
-            event_kind="task.canceled",
-            event_data={"task_id": task_id},
-            audit=(("task.canceled", {"content": False}),),
-        )
+        record = self.workflow_store.lookup_task(task_id)
+        if record.state == "EXECUTING":
+            self._abort_ambiguous_execution(record)
+        elif record.state not in {
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "REJECTED",
+            "ABORTED",
+        }:
+            self._record_transition(
+                record,
+                state="CANCELLED",
+                snapshot=copy.deepcopy(record.snapshot),
+                event_kind="task.canceled",
+                event_data={"requested": True},
+                audit=(("task.canceled", {"content": False}),),
+            )
         self._run_contexts.pop(record.run_id, None)
         self._run_scopes.pop(record.run_id, None)
         self._runtime_cache.pop(record.run_id, None)
@@ -2533,17 +3452,37 @@ class CoreAgent:
     def recover_workflows(self):
         """A run interrupted mid-dispatch cannot prove the side effect did not happen."""
         recovered = []
-        for record in self.workflow_store.recoverable():
-            if record.state != "EXECUTING":
-                recovered.append(record)
-                continue
-            self._record_transition(
-                record,
-                state="ABORTED",
-                snapshot=record.snapshot,
-                event_kind="execution.side_effect_unknown",
-                event_data={"tool_call_id": record.snapshot["pending_call"]["id"]},
-                audit=(("execution.reconciliation_required", {}),),
-                error_code="SIDE_EFFECT_UNKNOWN",
-            )
+        for candidate in self.workflow_store.recoverable():
+            try:
+                lease_token = self.workflow_store.acquire_lease(
+                    candidate.run_id,
+                    tenant_id=candidate.tenant_id,
+                    owner_id=candidate.owner_id,
+                    worker_id=self._worker_id,
+                    ttl=WORKFLOW_LEASE_TTL,
+                )
+            except CoreError as error:
+                if error.code == "LEASE_LOST":
+                    continue
+                raise
+            try:
+                record = self.workflow_store.get(
+                    candidate.run_id,
+                    tenant_id=candidate.tenant_id,
+                    owner_id=candidate.owner_id,
+                )
+                if record.state != "EXECUTING":
+                    recovered.append(record)
+                    continue
+                self._abort_ambiguous_execution(record, lease_token=lease_token)
+            finally:
+                try:
+                    self.workflow_store.release_lease(
+                        candidate.run_id,
+                        tenant_id=candidate.tenant_id,
+                        worker_id=self._worker_id,
+                        token=lease_token,
+                    )
+                except CoreError:
+                    pass
         return tuple(recovered)
