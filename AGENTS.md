@@ -298,6 +298,10 @@ run получает отдельные MCP session и negotiated version; пе�
   данных, архивов, сети и PDF, включая Mike Farah `yq` и команду `fd`. Краткий
   model-facing перечень не является allowlist; non-root agent может добавлять
   инструменты только в workspace и только при разрешённых policy и сети.
+- Группа зависимостей `python-tool` устанавливается в системный
+  `/usr/local/bin/python3`, который запускает `core_python_exec`, отдельно от
+  `/app/.venv`. В неё входят библиотеки для HTTP, проверки и разбора данных,
+  HTML/XML, PDF, Office, изображений и таблиц, включая DuckDB, NumPy и pandas.
 - Python нельзя вызывать рекурсивно или через `core_task_start`; каждый вложенный
   `tools.call` заново проходит EffectiveConfig, schema, policy, общий budget,
   owner/tenant, audit и OTel.

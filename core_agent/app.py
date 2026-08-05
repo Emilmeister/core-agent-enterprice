@@ -867,6 +867,12 @@ def _agent(model, mcp_connector=None, *, state=None):
                 "simulate an unavailable capability; this process is not an OS sandbox. "
                 "This interpreter is the one core_terminal_exec installs into, so a "
                 "package installed there imports here without touching sys.path. "
+                "Preinstalled imports: pydantic/jsonschema, httpx/httpx_sse/h2/websockets, "
+                "yaml/jmespath/dateutil, bs4/lxml/markdownify/defusedxml, ftfy/rapidfuzz, "
+                "duckdb/numpy/pandas/openpyxl/python_calamine, pypdf/docx/pptx/PIL. "
+                "This list is not exhaustive; "
+                "use other installed libraries or install workspace-local packages when "
+                "policy and network access allow. "
                 "Never call core_python_exec recursively and print only the values needed "
                 "by the model."
             ),

@@ -48,8 +48,18 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
     rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project && \
+    uv export --frozen --only-group python-tool --no-emit-project \
+        --output-file /tmp/python-tool-requirements.txt && \
+    uv pip install --python /usr/local/bin/python3 \
+        --require-hashes --no-deps --only-binary :all: \
+        --requirements /tmp/python-tool-requirements.txt && \
+    rm /tmp/python-tool-requirements.txt && \
+    uv cache clean
+
 COPY core_agent ./core_agent
 RUN uv sync --frozen --no-dev && \
+    uv cache clean && \
     useradd --create-home --uid 10001 agent && \
     mkdir -p /data/durable /tmp/core-agent/runs && \
     chown -R agent:agent /app /data /tmp/core-agent

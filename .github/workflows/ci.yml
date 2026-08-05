@@ -60,6 +60,14 @@ jobs:
             yq --version | grep -F "mikefarah/yq" >/dev/null
             echo terminal-cli-smoke-ok
           '
+      - name: Check preinstalled Python libraries
+        run: >-
+          docker run --rm --entrypoint /usr/local/bin/python3 core-agent:ci -P -c
+          'import bs4, dateutil, defusedxml, docx, duckdb, ftfy, h2, httpx, httpx_sse;
+          import jmespath, jsonschema, lxml, markdownify, numpy, openpyxl, pandas, PIL;
+          import pptx, pydantic, pypdf, python_calamine, rapidfuzz, websockets, yaml;
+          assert duckdb.sql("select 1").fetchone() == (1,);
+          print("python-libraries-smoke-ok")'
       - run: >-
           POSTGRES_DB=core_agent POSTGRES_USER=core_agent POSTGRES_PASSWORD=test
           LLM_API_FORMAT=openai LLM_API_BASE=http://model.invalid/v1
