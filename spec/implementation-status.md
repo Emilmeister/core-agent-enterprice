@@ -42,7 +42,7 @@
 | ART-01 | артефакты именованные, scoped и версионируемые внутри агента; save не перезаписывает, load проверяет digest/size/metadata, backends не управляют схемой | artifact service and tool contract suite | implemented |
 | RMT-01 | реестр `REMOTE_AGENTS` fail-open при недоступном peer, tool скрыт без настроенных агентов, downstream получает только allowlist заголовков, прогресс ретранслируется, сбой возвращается tool result | remote agent registry, forwarded header and send_message E2E | implemented |
 | MCP-01 | новый запрос durable ожидает transient cold start Streamable HTTP MCP до общего для run deadline, изолирует и очищает session, различает permanent failures и не расходует model/tool budget | transport/config, runtime и A2A E2E tests; PostgreSQL restart, cross-worker cancel, reconnect catalog/deadline, required failure и atomic terminal-disposition tests | implemented |
-| TER-01 | owned PTY/process groups/workspaces и bounded output | local terminal integration suite | implemented |
+| TER-01 | owned PTY/process groups/workspaces, bounded output и основной CLI-набор | local terminal integration suite, model-facing description contract и Docker CLI smoke | implemented |
 | TER-02 | immutable base snapshot, conflict-aware merge и S3 manifest | content-addressed snapshot/merge tests | implemented |
 | PY-01 | bounded Python process вызывает exact built-in/MCP tools через policy/budget/audit/OTel broker | Python broker E2E, mode gate and process failure tests | implemented |
 | DB-01 | PostgreSQL schema/pool/migration role/readiness без fallback | real PostgreSQL CI suite | implemented |

@@ -208,6 +208,7 @@
 - [ ] Python process получает только bounded `tools.call`; каждый вложенный built-in/MCP вызов повторно проходит EffectiveConfig, schema, policy, общий budget, owner/tenant, audit и OTel.
 - [ ] Python exception/nonzero exit/timeout возвращается модели как failed tool result, не завершает родительскую Task и не повторяет неоднозначный side effect.
 - [ ] Пакет, установленный командой из `core_terminal_exec`, импортируется в `core_python_exec` без правки `sys.path`; рабочий каталог при этом в `sys.path` не попадает.
+- [ ] Образ v1 проходит реальную проверку основного набора CLI, включая Mike Farah `yq` и PDF-команды; краткое описание `core_terminal_exec` называет набор, явно не считает его allowlist и разрешает дополнительные workspace-инструменты только при допустимых policy и сети.
 
 ## Tools и MCP
 

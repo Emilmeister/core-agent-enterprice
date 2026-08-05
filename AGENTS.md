@@ -294,6 +294,10 @@ run получает отдельные MCP session и negotiated version; пе�
   sandbox: Python может использовать `os`, `subprocess` и filesystem APIs.
 - `core_terminal_exec` принимает `argv` без implicit shell. Pipes, redirects и
   `&&` требуют явного `['sh', '-lc', '...']` и отдельной policy оценки.
+- Образ v1 содержит основной CLI-набор для текста, файлов, структурированных
+  данных, архивов, сети и PDF, включая Mike Farah `yq` и команду `fd`. Краткий
+  model-facing перечень не является allowlist; non-root agent может добавлять
+  инструменты только в workspace и только при разрешённых policy и сети.
 - Python нельзя вызывать рекурсивно или через `core_task_start`; каждый вложенный
   `tools.call` заново проходит EffectiveConfig, schema, policy, общий budget,
   owner/tenant, audit и OTel.

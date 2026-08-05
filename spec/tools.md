@@ -26,6 +26,16 @@ Model-facing description кратко задаёт назначение, кри�
 
 Запускает process в принадлежащей agent-у [TerminalSession](execution-environment.md) с явными `argv`, local workspace, environment allowlist и timeout. Main и каждый child имеют разные session/process group/workspace. `argv` исполняется напрямую без implicit shell: metacharacters вроде `&&` не интерпретируются. Если нужен shell, модель MUST явно вызвать его, например `{"argv":["sh","-lc","command-a && command-b"]}`, а policy оценивает этот вызов как часть arguments.
 
+Образ v1 MUST предоставлять GNU coreutils/findutils/gawk/sed/grep, `rg`, `fd`, `file`,
+`tree`, `xxd`, `uchardet`, `jq`, Mike Farah `yq`, `xmlstarlet`, `sqlite3`,
+`curl`, `bsdtar`, `zip`/`unzip`/`7z`, `zstd`/`xz`/`bzip2`,
+`ip`/`ss`/`nc`, `openssl`, `pdftotext`/`pdfinfo`/`pdftoppm`/`pdfimages` и
+`qpdf`. Model-facing description MUST
+кратко называть этот набор и говорить, что он не является allowlist: модель MAY
+использовать другие доступные команды и устанавливать дополнительные инструменты
+в workspace, если это разрешают policy и сеть. Description MUST NOT обещать
+системную установку пакетов или права `root`.
+
 Возвращает `exit_code`, ограниченные `stdout`/`stderr`, duration и session identifier для продолжающегося процесса.
 
 ### `core_terminal_write`

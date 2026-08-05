@@ -829,7 +829,14 @@ def _agent(model, mcp_connector=None, *, state=None):
                 "Execute bounded argv directly in the owned terminal workspace when "
                 "a runtime or workspace command materially improves the result. There "
                 "is no implicit shell: use ['sh', '-lc', '...'] only when shell syntax "
-                "such as pipes, redirects, or && is actually required."
+                "such as pipes, redirects, or && is actually required. Preinstalled "
+                "CLI: GNU coreutils/findutils/gawk/sed/grep, rg, fd, file, tree, "
+                "xxd, uchardet, jq, Mike Farah yq, xmlstarlet, sqlite3, curl, "
+                "bsdtar, zip/unzip/7z, "
+                "zstd/xz/bzip2, ip/ss/nc, openssl, "
+                "pdftotext/pdfinfo/pdftoppm/pdfimages, and qpdf. This list is not "
+                "exhaustive; use other installed commands or install workspace-local "
+                "tools when policy and network access allow."
             ),
             {
                 "type": "object",

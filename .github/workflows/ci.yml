@@ -46,6 +46,20 @@ jobs:
       - run: >-
           docker run --rm --entrypoint python core-agent:ci
           -c "import core_agent; print('image-smoke-ok')"
+      - name: Check preinstalled terminal CLI
+        run: |
+          docker run --rm --entrypoint sh core-agent:ci -ec '
+            for command in \
+              ls find gawk sed grep rg fd file tree xxd uchardet \
+              jq yq xmlstarlet sqlite3 curl bsdtar zip unzip 7z \
+              zstd xz bzip2 ip ss nc openssl \
+              pdftotext pdfinfo pdftoppm pdfimages qpdf
+            do
+              command -v "$command" >/dev/null
+            done
+            yq --version | grep -F "mikefarah/yq" >/dev/null
+            echo terminal-cli-smoke-ok
+          '
       - run: >-
           POSTGRES_DB=core_agent POSTGRES_USER=core_agent POSTGRES_PASSWORD=test
           LLM_API_FORMAT=openai LLM_API_BASE=http://model.invalid/v1

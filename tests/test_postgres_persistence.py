@@ -183,6 +183,22 @@ class ProductionConfigurationTests(unittest.TestCase):
             python = registry.get("core_python_exec").description
             self.assertIn("datetime.now().astimezone()", python)
             self.assertIn("not an OS sandbox", python)
+            terminal = registry.get("core_terminal_exec").description
+            self.assertIn(
+                "Preinstalled CLI: GNU coreutils/findutils/gawk/sed/grep, rg, fd",
+                terminal,
+            )
+            self.assertIn("Mike Farah yq", terminal)
+            self.assertIn(
+                "pdftotext/pdfinfo/pdftoppm/pdfimages, and qpdf", terminal
+            )
+            self.assertIn("This list is not exhaustive", terminal)
+            self.assertIn(
+                "install workspace-local tools when policy and network access allow",
+                terminal,
+            )
+            self.assertNotIn("root", terminal)
+            self.assertLessEqual(len(terminal), 700)
         finally:
             app.state.close()
 
