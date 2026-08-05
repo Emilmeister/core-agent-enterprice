@@ -1,6 +1,6 @@
 FROM ghcr.io/astral-sh/uv:0.11.6 AS uv
 
-FROM mikefarah/yq:4.53.3@sha256:11a1f0b604b13dbbdc662260d8db6f644b22d8553122a25c1b5b2e8713ca6977 AS yq
+FROM mikefarah/yq:4.53.3 AS yq
 
 FROM python:3.12-slim
 COPY --from=uv /uv /uvx /bin/
@@ -63,6 +63,15 @@ RUN uv sync --frozen --no-dev && \
     useradd --create-home --uid 10001 agent && \
     mkdir -p /data/durable /tmp/core-agent/runs && \
     chown -R agent:agent /app /data /tmp/core-agent
+
+COPY --chown=0:0 third_party/skills/ /opt/core-agent/skills/
+RUN cd /opt/core-agent/skills && \
+    sha256sum --check SHA256SUMS && \
+    test -z "$(find . -type l -print -quit)" && \
+    chmod -R a-w .
+
+ENV SKILLS_ROOT=/opt/core-agent/skills \
+    CORE_AGENT_ALLOWED_SKILLS=systematic-debugging,verification-before-completion,knowledge-synthesis,explore-data,validate-data,statistical-analysis,sql-queries
 
 USER agent
 STOPSIGNAL SIGTERM

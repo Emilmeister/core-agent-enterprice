@@ -30,6 +30,7 @@
 | CTX-01 | base/working budget и compaction 90% до 10–15% | context budget boundary tests | implemented |
 | CTX-02 | pinned state и transcript provenance переживают compaction/restart | two-compaction runtime test | implemented |
 | CTX-03 | крупный tool result offload-ится из active context без потери immutable transcript | in-memory artifact/excerpt runtime test; PostgreSQL restart proof отсутствует | partial |
+| SKL-01 | модель семантически подключает только effective skills, поэтапно получает `SKILL.md` и ограниченные ресурсы immutable package; служебные вызовы учитываются общим budget и выводятся для child из exact skill allowlist | effective-config gate and reserved-name collision; resolver lock/security; activation-boundary crash, streaming, legacy snapshot and context-budget runtime tests; delegation E2E; vendored package, Compose and image smoke tests | implemented |
 | MEM-01 | built-in `core_memory_*` подсистемы Core Agent: Markdown schema, optimistic revisions и hard 200-line rejection как recoverable tool result | `test_memory_service` | implemented |
 | MEM-02 | atomic BM25/vector/NER/graph publication и stale edge removal внутри процесса агента | `test_memory_service` + real PostgreSQL CI suite | implemented |
 | MEM-03 | hybrid candidates, calibrated fusion, provenance rerank и degraded channels вместо отказа | `test_memory_service` | implemented |

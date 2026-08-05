@@ -7,7 +7,8 @@ import json
 from dataclasses import dataclass
 
 from .errors import CoreError
-from .mcp import mcp_tool_name
+from .mcp import mcp_tool_index
+from .skills import SKILL_TOOLS
 
 # Advertised (binding, version) pairs; see core_agent/a2a.py for why they pair up.
 A2A_INTERFACES = (("HTTP+JSON", "1.0"), ("JSONRPC", "0.3"))
@@ -159,7 +160,9 @@ def _expand(patterns, choices):
     }
 
 
-def compile_effective_config(platform, agent, declared_mcp, discovered):
+def compile_effective_config(
+    platform, agent, declared_mcp, discovered, *, legacy_ungated_skills=False
+):
     raw = agent.to_dict()
     features = raw["features"]
     requested_servers = {item["name"]: item for item in declared_mcp}
@@ -240,9 +243,13 @@ def compile_effective_config(platform, agent, declared_mcp, discovered):
         if server in set(mcp_policy.get("allow_servers", [])):
             mcp_tools[server] = frozenset(server_allowed)
 
-    skills = frozenset(
-        set(raw["skills"].get("allow", [])) & set(platform.allowed_skills)
-    )
+    skills = frozenset()
+    if legacy_ungated_skills or (
+        gates.get("skills", True) and "skills" in platform.supported_features
+    ):
+        skills = frozenset(
+            set(raw["skills"].get("allow", [])) & set(platform.allowed_skills)
+        )
     policies = {
         feature
         for feature, value in features.items()
@@ -258,8 +265,9 @@ def compile_effective_config(platform, agent, declared_mcp, discovered):
         policies.discard("remote_agents")
 
     model_catalog = set(allowed)
-    for server, tools in mcp_tools.items():
-        model_catalog.update(mcp_tool_name(server, tool) for tool in tools)
+    model_catalog.update(
+        mcp_tool_index(mcp_tools, reserved_names=model_catalog | SKILL_TOOLS)
+    )
     snapshot_value = {
         "builtin_tools": sorted(allowed),
         "mcp_tools": {key: sorted(value) for key, value in sorted(mcp_tools.items())},

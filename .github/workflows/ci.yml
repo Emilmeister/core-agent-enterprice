@@ -46,6 +46,28 @@ jobs:
       - run: >-
           docker run --rm --entrypoint python core-agent:ci
           -c "import core_agent; print('image-smoke-ok')"
+      - name: Check preinstalled skills
+        run: |
+          docker run --rm --entrypoint sh core-agent:ci -ec '
+            cd "$SKILLS_ROOT"
+            sha256sum --check SHA256SUMS
+            test -z "$(find . -type l -print -quit)"
+            test -z "$(find . -perm /222 -print -quit)"
+            old_ifs=$IFS
+            IFS=,
+            for skill in $CORE_AGENT_ALLOWED_SKILLS
+            do
+              test -f "$skill/SKILL.md"
+            done
+            IFS=$old_ifs
+          '
+          docker run --rm --entrypoint python core-agent:ci -c '
+          import os; from pathlib import Path; from core_agent.skills import SkillResolver;
+          root = Path(os.environ["SKILLS_ROOT"]); names = os.environ["CORE_AGENT_ALLOWED_SKILLS"].split(",");
+          resolver = SkillResolver([{"name": name, "source": (root / name).as_uri()} for name in names]);
+          assert {skill.name for skill in resolver.discover()} == set(names);
+          assert set(resolver.resolve_lock()) == set(names);
+          print("preinstalled-skills-smoke-ok")'
       - name: Check preinstalled terminal CLI
         run: |
           docker run --rm --entrypoint sh core-agent:ci -ec '

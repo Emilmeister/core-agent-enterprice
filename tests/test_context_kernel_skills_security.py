@@ -294,10 +294,17 @@ class SkillTests(unittest.TestCase):
             self.assertEqual(discovery[0].description, "Creates release notes.")
             self.assertIsNone(discovery[0].instructions)
             self.assertEqual(resolver.loaded_resources, ())
+            with self.assertRaises(CoreError) as inactive:
+                resolver.list_resources("release-notes")
+            self.assertEqual(inactive.exception.code, "CAPABILITY_DISABLED")
 
             snapshot = resolver.activate("release-notes")
             self.assertIn("Read references/format.md", snapshot.instructions)
             self.assertEqual(resolver.loaded_resources, ("release-notes/SKILL.md",))
+            self.assertEqual(
+                resolver.list_resources("release-notes"),
+                ("references/format.md",),
+            )
             (path / "SKILL.md").write_text("changed", encoding="utf-8")
             self.assertIn(
                 "Read references/format.md",
@@ -310,6 +317,25 @@ class SkillTests(unittest.TestCase):
                 resolver.loaded_resources,
                 ("release-notes/SKILL.md", "release-notes/references/format.md"),
             )
+            with self.assertRaises(CoreError) as oversized:
+                resolver.read_resource(
+                    "release-notes", "references/format.md", max_bytes=4
+                )
+            self.assertEqual(oversized.exception.code, "SKILL_RESOURCE_INVALID")
+
+    def test_binary_resource_is_not_returned_as_model_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = self._make_skill(temp)
+            (path / "references" / "binary.bin").write_bytes(b"\xff\xfe")
+            resolver = SkillResolver(
+                [{"name": "release-notes", "source": path.as_uri()}]
+            )
+            resolver.activate("release-notes")
+
+            with self.assertRaises(CoreError) as caught:
+                resolver.read_resource("release-notes", "references/binary.bin")
+
+            self.assertEqual(caught.exception.code, "SKILL_RESOURCE_INVALID")
 
     def test_invalid_frontmatter_and_symlink_escape_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

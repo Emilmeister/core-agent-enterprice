@@ -22,6 +22,31 @@ Model-facing description кратко задаёт назначение, кри�
 
 Ядро предоставляет базовый набор, но AgentConfig MAY отключить любой model-callable built-in или целую optional feature. Модель видит только EffectiveConfig catalog:
 
+### Служебные инструменты skills
+
+`core_skill_activate` и `core_skill_read_resource` реализуют progressive
+disclosure пакетов навыков. Это условные model-callable tools, а не независимые
+capabilities: они отсутствуют при пустом effective-каталоге skills, не входят в
+operator built-in allowlist и не перечисляются отдельно в
+`core_delegate.tools`.
+
+`core_skill_activate` принимает непустой список имён, enum которого строится из
+skills текущего EffectiveConfig. Он закрепляет `SKILL.md` выбранных пакетов и со
+следующего model turn добавляет их полные инструкции в контекст. До активации
+контекст содержит только имена и краткие descriptions всех доступных skills.
+Выбор выполняется моделью по смыслу задачи; буквальное присутствие имени в prompt
+или slash-команда не требуются.
+
+`core_skill_read_resource` появляется только для ресурсов уже активированных
+skills и принимает один enum-идентификатор `<skill>/<relative-path>`. Он читает
+bounded UTF-8 текст через SkillResolver, не принимает filesystem paths и не
+исполняет scripts. Результат содержит идентификатор, content и digest; package
+root, абсолютные пути и внешние файлы модели не раскрываются.
+
+Оба tool проходят обычные schema, capability, budget, audit и OTel gates. Каждая
+попытка расходует общий `tool_calls` budget. Ошибка активации или чтения
+возвращается как structured failed tool result и сама по себе не завершает Task.
+
 ### `core_terminal_exec`
 
 Запускает process в принадлежащей agent-у [TerminalSession](execution-environment.md) с явными `argv`, local workspace, environment allowlist и timeout. Main и каждый child имеют разные session/process group/workspace. `argv` исполняется напрямую без implicit shell: metacharacters вроде `&&` не интерпретируются. Если нужен shell, модель MUST явно вызвать его, например `{"argv":["sh","-lc","command-a && command-b"]}`, а policy оценивает этот вызов как часть arguments.

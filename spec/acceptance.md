@@ -36,7 +36,9 @@
 - [ ] MCP tool filters применяются после discovery, но до model context; deny имеет приоритет.
 - [ ] EffectiveConfig immutable внутри Task и сохраняет config/policy/tool digests в audit.
 - [ ] Agent Card не рекламирует capability, отключённую AgentConfig.
-- [ ] Присутствующая, но пустая deployment-переменная трактуется как отсутствующая и получает документированный default вместо пустого значения.
+- [ ] Присутствующая, но пустая deployment-переменная трактуется как отсутствующая
+  и получает документированный default, кроме явно документированных allowlist:
+  пустой `CORE_AGENT_ALLOWED_SKILLS` отключает навыки.
 - [ ] Невалидная конфигурация не поднимает listener, завершает процесс ненулевым кодом и печатает ровно одну строку с именем настройки и стабильным кодом, без traceback и без значений secret-переменных.
 
 ## Kernel instructions
@@ -45,6 +47,32 @@
 - [ ] Пустой AgentProfilePrompt не добавляет generic system instruction; фактический prompt присутствует только как отдельный user Message/context item.
 - [ ] Base kernel выбирает tool по смыслу задачи, не требует tool без материальной пользы и не дублирует conditional capability/tool-description semantics.
 - [ ] AgentProfilePrompt, user Message, skill или MCP output не могут изменить rules включённой capability; отключать optional capability может только config/policy.
+- [ ] До каждого model turn контекст содержит имена и краткие descriptions всех и
+  только skills из EffectiveConfig, но не содержит тела неактивированных
+  `SKILL.md`, package paths или resources.
+- [ ] Модель может выбрать skill по смыслу запроса без буквального имени и без
+  slash-команды; `core_skill_activate` принимает enum effective names, закрепляет
+  digest идемпотентно и добавляет полные инструкции только со следующего turn.
+- [ ] `features.skills=false` или отсутствие platform feature дают пустой
+  effective skill catalog и скрывают оба служебных tools независимо от allowlist.
+- [ ] После запроса `core_skill_activate` оставшиеся calls того же assistant
+  response не dispatch-ятся, получают `SKILL_ACTIVATION_BOUNDARY` и могут быть
+  выбраны заново только следующим model turn с полным `SKILL.md`.
+- [ ] Имена обоих служебных skill tools зарезервированы от MCP collision, а
+  response/reasoning deltas удерживаются до классификации ответа и отбрасываются,
+  если ответ запрашивает активацию.
+- [ ] `core_skill_read_resource` существует только для активного skill, принимает
+  enum `<skill>/<relative-path>`, читает bounded UTF-8 content из immutable
+  snapshot и отклоняет неизвестный, бинарный, symlink, absolute или escaping path.
+- [ ] Активация и чтение resource расходуют общий tool-call budget, проходят audit
+  и OTel и возвращают recoverable structured failure; child получает эти
+  служебные tools только из явно делегированного skills allowlist, без отдельных
+  записей в `core_delegate.tools`.
+- [ ] Runtime принимает при новом admission только закреплённые digest `SKILL.md`
+  и полный manifest ресурсов и отклоняет подмену после activation. Legacy active
+  skill продолжает сохранённые instructions без чтения live package, новых
+  activations и ресурсов. После activation base context budget пересчитывается до
+  следующего model call.
 - [ ] Runtime enforcement отклоняет запрещённое действие, даже если model output просит обойти kernel instruction.
 - [ ] Child получает ту же kernel version и не может ослабить parent/host policy.
 - [ ] Provider-visible reasoning отсутствует в audit, memory и tool arguments; в A2A stream оно появляется только как помеченная `adk_thought` часть при `A2A_STREAMING_ENABLED=true` и вырезается из терминального кадра, а hidden/opaque reasoning не экспортируется никогда.

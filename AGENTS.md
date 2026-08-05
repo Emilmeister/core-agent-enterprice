@@ -115,6 +115,8 @@ criterion должны войти в тот же завершённый change. 
 - `tests/` — frozen acceptance, unit, integration, PostgreSQL, A2A и E2E suite.
 - `.github/workflows/ci.yml` — канонический CI-порядок.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
+- `third_party/skills/` — закреплённые пакеты навыков, происхождение, лицензии и
+  контрольные суммы для образа.
 - `.env.example` — поддерживаемый шаблон локальной конфигурации; `.env` никогда
   не коммитится.
 
@@ -149,7 +151,7 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/durability.py`, `core_agent/lifecycle.py` | Events, checkpoints, leases, recovery и retention |
 | `core_agent/mcp.py` | MCP discovery/calls, canonical tool naming и Streamable HTTP connector |
 | `core_agent/security.py` | Redaction, safe paths, retry и tenant helpers |
-| `core_agent/skills.py` | Skill resolution и integrity metadata |
+| `core_agent/skills.py` | Обнаружение, закрепление и безопасное чтение ресурсов навыков |
 | `core_agent/observability.py` | OpenTelemetry/OpenInference spans и exporters |
 | `core_agent/push.py` | Durable encrypted A2A push delivery |
 | `core_agent/memory.py` | Markdown revisions, hybrid retrieval, NER, graph index и `core_memory_*` tools |
@@ -239,7 +241,17 @@ Target spec может описывать больше текущего runtime.
 - `core_artifact_save`, `core_artifact_load`, `core_artifact_list`;
 - `core_memory_search`, `core_memory_read`, `core_memory_create`,
   `core_memory_update`, `core_memory_split`, `core_memory_delete`;
-- `core_agent_send_message`.
+- `core_agent_send_message`;
+- условные `core_skill_activate` и `core_skill_read_resource`.
+
+`core_skill_activate` появляется в каталоге модели только при непустом наборе
+навыков в `EffectiveConfig`, а `core_skill_read_resource` — только после
+подключения навыка с объявленными ресурсами. Это служебные инструменты
+поэтапного раскрытия, а не самостоятельные возможности: они не входят в
+`CORE_AGENT_ALLOWED_BUILTIN_TOOLS` и не передаются отдельно в
+`core_delegate.tools`. Их вызовы расходуют общий лимит вызовов инструментов.
+Оба имени зарезервированы runtime: совпадающее каноническое имя MCP-tool
+отклоняется с `TOOL_NAME_COLLISION` при построении `EffectiveConfig`.
 
 Artifact tools версионируют именованные файлы внутри агента; `user:`-префикс
 даёт cross-session scope, а `ARTIFACT_STORAGE_TYPE` выбирает in-memory, S3 или
@@ -261,6 +273,37 @@ Memory tools являются built-ins Core Agent, а не MCP tools отдел
 `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` продолжает принимать прежнее написание через
 точки. Delegation contract перечисляет built-ins и MCP-тулы одним списком
 `tools` под теми же именами; раскладку на серверы делает runtime.
+
+### Пакеты навыков
+
+- Образ содержит семь пакетов только для чтения из `third_party/skills/`;
+  при сборке проверяются `SHA256SUMS`, отсутствие символических ссылок и
+  отсутствие прав на запись у пользователя `agent`.
+- Перед каждым обращением к модели контекст содержит имена и краткие описания
+  всех и только навыков из `EffectiveConfig`. Тело неактивного `SKILL.md` и его
+  ресурсы не раскрываются.
+- Модель выбирает минимальный набор по смыслу описаний. Совпадение имени с частью
+  запроса или специальная команда не подключают навык автоматически.
+- Успешный `core_skill_activate` закрепляет контрольную сумму и добавляет полное
+  содержимое со следующего хода. Повторное подключение не дублирует инструкции.
+- Запрос подключения является границей хода: последующие вызовы из того же
+  ответа не выполняются, получают `SKILL_ACTIVATION_BOUNDARY` и требуют нового
+  решения модели с полной инструкцией. Их попытки учитываются общим лимитом.
+- Пока подключение доступно, потоковый текст и рассуждение удерживаются до
+  классификации полного ответа и отбрасываются, если ответ запросил подключение.
+- `core_skill_read_resource` принимает только идентификатор из перечня ресурсов
+  активного навыка, читает ограниченный по размеру текст UTF-8, возвращает
+  контрольную сумму и не запускает сценарии.
+- Новая задача принимает только закреплённые контрольную сумму `SKILL.md` и
+  полный перечень ресурсов; среда проверяет их до модели и при обращении.
+  Старый активный снимок продолжает только сохранённые инструкции без чтения
+  текущего пакета. После подключения бюджет контекста рассчитывается заново.
+- Содержимое навыков и ресурсов считается недоверенным: оно не повышает
+  приоритет инструкций, не расширяет `EffectiveConfig` и не открывает пути вне
+  закреплённого пакета.
+- Дочерний агент получает доступ только к навыкам из поля `skills`, переданного
+  при делегировании. Подключённые родителем навыки он не наследует; служебные
+  инструменты выводятся из этого списка автоматически.
 
 Подсистема памяти публикует модели ровно шесть tools выше; `move`, `history`,
 `index_status` и `entity_resolve` остаются внутренними методами. `MCP_ALLOWED_SERVERS`

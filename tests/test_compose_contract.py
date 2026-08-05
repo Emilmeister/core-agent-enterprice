@@ -106,6 +106,19 @@ class ComposeContractTests(unittest.TestCase):
                 self.assertEqual(environment[name], expected)
         self.assertEqual(environment["SESSION_STORAGE_TYPE"], "postgres")
 
+    def test_preinstalled_skills_are_enabled_by_explicit_defaults(self):
+        environment = self.services["agent"]["environment"]
+        self.assertEqual(
+            environment["SKILLS_ROOT"],
+            "${SKILLS_ROOT:-/opt/core-agent/skills}",
+        )
+        self.assertEqual(
+            environment["CORE_AGENT_ALLOWED_SKILLS"],
+            "${CORE_AGENT_ALLOWED_SKILLS-systematic-debugging,"
+            "verification-before-completion,knowledge-synthesis,explore-data,"
+            "validate-data,statistical-analysis,sql-queries}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

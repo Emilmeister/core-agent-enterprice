@@ -159,12 +159,40 @@ class ModelHandler(BaseHTTPRequestHandler):
             time.sleep(0.1)
             message = _text("slow-a2a-ok")
         elif "SKILL_E2E" in context:
-            type(self).skill_instructions_seen = (
-                "E2E_SKILL_MARKER" in body["messages"][0]["content"]
-            )
-            message = _text(
-                "skill-e2e-ok" if self.skill_instructions_seen else "missing-skill"
-            )
+            if "E2E_SKILL_MARKER" in body["messages"][0]["content"]:
+                type(self).skill_instructions_seen = True
+                message = _text("skill-e2e-ok")
+            else:
+                message = _tool(
+                    body,
+                    "core_skill_activate",
+                    {"names": ["e2e-skill"]},
+                )
+        elif "DELEGATE_PACKAGE_E2E" in context:
+            if "child-package-ok" in context:
+                message = _text("delegated-package-ok")
+            else:
+                message = _tool(
+                    body,
+                    "core_delegate",
+                    {
+                        "instruction": (
+                            "CHILD_PACKAGE_E2E apply the specialized response procedure"
+                        ),
+                        "tools": [],
+                        "skills": ["e2e-skill"],
+                        "budget": {"turns": 3, "tool_calls": 1},
+                    },
+                )
+        elif "CHILD_PACKAGE_E2E" in context:
+            if "E2E_SKILL_MARKER" in body["messages"][0]["content"]:
+                message = _text("child-package-ok")
+            else:
+                message = _tool(
+                    body,
+                    "core_skill_activate",
+                    {"names": ["e2e-skill"]},
+                )
         elif "DEPTH_TWO_CHILD_E2E" in context:
             self.depth_two_catalogs.append(wire_names)
             self.depth_two_instructions.append(body["messages"][0]["content"])
@@ -356,7 +384,11 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         cls.skill = root / "e2e-skill"
         cls.skill.mkdir()
         (cls.skill / "SKILL.md").write_text(
-            "---\nname: e2e-skill\ndescription: E2E skill\n---\nE2E_SKILL_MARKER\n",
+            "---\n"
+            "name: e2e-skill\n"
+            "description: Applies the specialized response procedure.\n"
+            "---\n"
+            "E2E_SKILL_MARKER\n",
             encoding="utf-8",
         )
         cls.model_server = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
@@ -1205,11 +1237,20 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             <= names
         )
 
-    async def test_explicit_skill_is_validated_and_activated_before_model_call(self):
+    async def test_skill_is_selected_by_meaning_and_activated_during_the_loop(self):
         ModelHandler.skill_instructions_seen = False
         # The skill is declared by SKILLS_ROOT + CORE_AGENT_ALLOWED_SKILLS.
-        self.assertEqual(await self._send("SKILL_E2E use e2e-skill"), "skill-e2e-ok")
+        self.assertEqual(
+            await self._send("SKILL_E2E apply the specialized response procedure"),
+            "skill-e2e-ok",
+        )
         self.assertTrue(ModelHandler.skill_instructions_seen)
+
+    async def test_delegated_skill_implies_child_activation_tool(self):
+        self.assertEqual(
+            await self._send("DELEGATE_PACKAGE_E2E"),
+            "delegated-package-ok",
+        )
 
 
 if __name__ == "__main__":

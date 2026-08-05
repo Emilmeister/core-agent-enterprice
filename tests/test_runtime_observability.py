@@ -1,6 +1,7 @@
 import json
 import os
 import copy
+import hashlib
 import time
 import unittest
 import threading
@@ -11,7 +12,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core_agent.audit import InMemoryAuditLog
 from core_agent.artifacts import InMemoryArtifactStore
-from core_agent.config import AgentConfig, PlatformConfig, RunRequest
+from core_agent.config import (
+    AgentConfig,
+    PlatformConfig,
+    RunRequest,
+    compile_effective_config,
+)
 from core_agent.durability import (
     CheckpointStore,
     InMemoryEventStore,
@@ -230,6 +236,23 @@ def make_agent(
         platform_mcp=platform_mcp,
         **agent_options,
     )
+
+
+def locked_skill_declaration(path, name):
+    skill = (path / "SKILL.md").read_bytes()
+    resources = {}
+    for resource in path.rglob("*"):
+        if resource.is_file() and resource.name != "SKILL.md":
+            relative = resource.relative_to(path).as_posix()
+            resources[relative] = "sha256:" + hashlib.sha256(
+                resource.read_bytes()
+            ).hexdigest()
+    return {
+        "name": name,
+        "source": path.as_uri(),
+        "digest": "sha256:" + hashlib.sha256(skill).hexdigest(),
+        "resources": resources,
+    }
 
 
 class RuntimeTests(unittest.TestCase):
@@ -859,7 +882,733 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.message, "continued without denied tool")
         self.assertNotIn("docs_search", model.calls[0].tools)
 
-    def test_recovery_removes_newly_denied_skill_instructions(self):
+    def test_skill_is_selected_semantically_and_reads_an_active_resource(self):
+        class CatalogModel(ScriptedModel):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.catalogs = []
+
+            def generate(self, *, context, tools, instructions, messages=None):
+                self.catalogs.append(copy.deepcopy(tools))
+                return super().generate(
+                    context=context,
+                    tools=tools,
+                    instructions=instructions,
+                    messages=messages,
+                )
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-notes"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: release-notes\n"
+                "description: Creates a structured changelog from release changes.\n"
+                "---\n"
+                "SKILL_BODY_MARKER\nRead references/format.md before writing.\n",
+                encoding="utf-8",
+            )
+            (path / "references").mkdir()
+            (path / "references" / "format.md").write_text(
+                "Use headings.\n", encoding="utf-8"
+            )
+            model = CatalogModel(
+                [
+                    ModelResponse(
+                        tool_requests=(
+                            ToolRequest(
+                                "activate",
+                                "core_skill_activate",
+                                {"names": ["release-notes"]},
+                            ),
+                        )
+                    ),
+                    ModelResponse(
+                        tool_requests=(
+                            ToolRequest(
+                                "read",
+                                "core_skill_read_resource",
+                                {"resource": "release-notes/references/format.md"},
+                            ),
+                        )
+                    ),
+                    ModelResponse(message="done"),
+                ]
+            )
+            agent = make_agent(
+                model,
+                memory="disabled",
+                declared_skills=(locked_skill_declaration(path, "release-notes"),),
+            )
+            raw = agent.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["release-notes"]
+            agent.agent_config = AgentConfig.from_dict(raw)
+            agent.platform_config.allowed_skills.add("release-notes")
+            agent.platform_config.supported_features.add("skills")
+            try:
+                result = agent.run(
+                    {"prompt": "Prepare a structured changelog for this release"}
+                )
+                record = agent.workflow_store.get(
+                    result.run_id, tenant_id="default", owner_id="anonymous"
+                )
+                audit = agent.audit_log.records(result.run_id)
+            finally:
+                agent.close()
+
+        self.assertEqual(result.message, "done")
+        self.assertTrue(result.complete)
+        self.assertEqual(result.usage.tool_calls, 2)
+        self.assertIn("core_skill_activate", model.catalogs[0])
+        self.assertNotIn("core_skill_read_resource", model.catalogs[0])
+        self.assertEqual(
+            model.catalogs[0]["core_skill_activate"]["input_schema"]["properties"][
+                "names"
+            ]["items"]["enum"],
+            ["release-notes"],
+        )
+        self.assertIn("release-notes", model.calls[0].instructions)
+        self.assertIn(
+            "Creates a structured changelog from release changes.",
+            model.calls[0].instructions,
+        )
+        self.assertNotIn("SKILL_BODY_MARKER", model.calls[0].instructions)
+        self.assertIn("SKILL_BODY_MARKER", model.calls[1].instructions)
+        self.assertEqual(
+            model.catalogs[1]["core_skill_read_resource"]["input_schema"][
+                "properties"
+            ]["resource"]["enum"],
+            ["release-notes/references/format.md"],
+        )
+        self.assertIn("Use headings.", model.calls[2].context)
+        self.assertNotIn("Use headings.", model.calls[2].instructions)
+        self.assertEqual(
+            [skill["name"] for skill in record.snapshot["skills"]],
+            ["release-notes"],
+        )
+        resource_audit = next(
+            item
+            for item in audit
+            if item.data.get("resource")
+            == "release-notes/references/format.md"
+        )
+        self.assertEqual(len(resource_audit.data["digest"]), 64)
+        self.assertNotIn("content", resource_audit.data)
+        lock_audit = next(item for item in audit if item.kind == "skill.lock.snapshot")
+        self.assertEqual(lock_audit.data["skills"][0]["name"], "release-notes")
+        self.assertEqual(len(lock_audit.data["skills"][0]["digest"]), 71)
+        self.assertEqual(len(lock_audit.data["skills"][0]["manifest_digest"]), 64)
+
+    def test_skill_activation_blocks_remaining_calls_until_next_model_turn(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-notes"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: release-notes\n"
+                "description: Creates a structured changelog.\n"
+                "---\n"
+                "SKILL_BODY_MARKER\n",
+                encoding="utf-8",
+            )
+            model = ScriptedModel(
+                [
+                    ModelResponse(
+                        message="premature answer",
+                        tool_requests=(
+                            ToolRequest(
+                                "activate",
+                                "core_skill_activate",
+                                {"names": ["release-notes"]},
+                            ),
+                            ToolRequest(
+                                "premature-tool",
+                                "core_terminal_exec",
+                                {"argv": ["printf", "must-not-run"]},
+                            ),
+                        ),
+                    ),
+                    ModelResponse(message="done after reviewing the skill"),
+                ]
+            )
+            agent = make_agent(
+                model,
+                memory="disabled",
+                declared_skills=(locked_skill_declaration(path, "release-notes"),),
+            )
+            raw = agent.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["release-notes"]
+            agent.agent_config = AgentConfig.from_dict(raw)
+            agent.platform_config.allowed_skills.add("release-notes")
+            agent.platform_config.supported_features.add("skills")
+            try:
+                result = agent.run({"prompt": "Prepare a changelog"})
+            finally:
+                agent.close()
+
+        self.assertEqual(result.message, "done after reviewing the skill")
+        self.assertEqual(result.usage.tool_calls, 2)
+        self.assertEqual(agent.tool_runtime.execution_count, 0)
+        self.assertEqual(len(model.calls), 2)
+        self.assertIn("SKILL_BODY_MARKER", model.calls[1].instructions)
+        self.assertIn("SKILL_ACTIVATION_BOUNDARY", model.calls[1].context)
+        self.assertNotIn("tool-ok", model.calls[1].context)
+
+    def test_skill_activation_discards_streamed_text_from_the_old_instruction_turn(self):
+        class StreamingSkillModel(ScriptedModel):
+            def generate(
+                self, *, context, tools, instructions, messages=None, on_delta=None
+            ):
+                response = super().generate(
+                    context=context,
+                    tools=tools,
+                    instructions=instructions,
+                    messages=messages,
+                )
+                if response.tool_requests:
+                    on_delta("premature streamed answer", "premature reasoning")
+                else:
+                    on_delta(response.message, response.reasoning)
+                return response
+
+        class RecordingStream:
+            enabled = True
+
+            def __init__(self):
+                self.text_updates = []
+
+            def text(self, response, reasoning):
+                self.text_updates.append((response, reasoning))
+
+            def tool_call(self, *_args):
+                pass
+
+            def tool_result(self, *_args):
+                pass
+
+            def flush(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-notes"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: release-notes\n"
+                "description: Creates a structured changelog.\n"
+                "---\n"
+                "STREAM_SAFE_SKILL_MARKER\n",
+                encoding="utf-8",
+            )
+            model = StreamingSkillModel(
+                [
+                    ModelResponse(
+                        message="premature terminal answer",
+                        tool_requests=(
+                            ToolRequest(
+                                "activate",
+                                "core_skill_activate",
+                                {"names": ["release-notes"]},
+                            ),
+                        ),
+                    ),
+                    ModelResponse(
+                        message="done after reviewing the skill",
+                        reasoning="verified reasoning",
+                    ),
+                ]
+            )
+            agent = make_agent(
+                model,
+                memory="disabled",
+                declared_skills=(locked_skill_declaration(path, "release-notes"),),
+            )
+            raw = agent.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["release-notes"]
+            agent.agent_config = AgentConfig.from_dict(raw)
+            agent.platform_config.allowed_skills.add("release-notes")
+            agent.platform_config.supported_features.add("skills")
+            stream = RecordingStream()
+            agent.attach_stream("skill-stream-boundary", stream)
+            try:
+                result = agent.run(
+                    {"prompt": "Prepare a changelog"},
+                    task_id="skill-stream-boundary",
+                )
+            finally:
+                agent.close()
+
+        self.assertEqual(result.message, "done after reviewing the skill")
+        self.assertEqual(
+            stream.text_updates,
+            [("done after reviewing the skill", "verified reasoning")],
+        )
+
+    def test_skill_stream_buffer_discards_deltas_from_a_failed_model_attempt(self):
+        class RetryWithoutDeltaModel:
+            def __init__(self):
+                self.calls = 0
+
+            def generate(
+                self, *, context, tools, instructions, messages=None, on_delta=None
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    on_delta("stale failed-attempt text", "stale reasoning")
+                    raise CoreError("MODEL_UNAVAILABLE", retryable=True)
+                return ModelResponse(message="final after retry")
+
+        class RecordingStream:
+            enabled = True
+
+            def __init__(self):
+                self.text_updates = []
+
+            def text(self, response, reasoning):
+                self.text_updates.append((response, reasoning))
+
+            def tool_call(self, *_args):
+                pass
+
+            def tool_result(self, *_args):
+                pass
+
+            def flush(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-notes"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: release-notes\n"
+                "description: Creates a structured changelog.\n"
+                "---\n"
+                "RETRY_SAFE_SKILL_MARKER\n",
+                encoding="utf-8",
+            )
+            model = RetryWithoutDeltaModel()
+            agent = make_agent(
+                model,
+                memory="disabled",
+                model_retries=1,
+                declared_skills=(locked_skill_declaration(path, "release-notes"),),
+            )
+            raw = agent.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["release-notes"]
+            agent.agent_config = AgentConfig.from_dict(raw)
+            agent.platform_config.allowed_skills.add("release-notes")
+            agent.platform_config.supported_features.add("skills")
+            stream = RecordingStream()
+            agent.attach_stream("skill-stream-retry", stream)
+            try:
+                result = agent.run(
+                    {"prompt": "Prepare a changelog"},
+                    task_id="skill-stream-retry",
+                )
+            finally:
+                agent.close()
+
+        self.assertEqual(result.message, "final after retry")
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(stream.text_updates, [])
+
+    def test_skill_activation_boundary_survives_crash_before_queue_tail(self):
+        from core_agent.workflow import InMemoryWorkflowStore
+
+        class CrashAfterActivationStore(InMemoryWorkflowStore):
+            def __init__(self):
+                super().__init__()
+                self.crashed = False
+
+            def transition(self, *args, **kwargs):
+                record = super().transition(*args, **kwargs)
+                if kwargs.get("event_kind") == "tool.completed" and not self.crashed:
+                    self.crashed = True
+                    raise KeyboardInterrupt("simulated process crash")
+                return record
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-notes"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: release-notes\n"
+                "description: Creates a structured changelog.\n"
+                "---\n"
+                "CRASH_SAFE_SKILL_MARKER\n",
+                encoding="utf-8",
+            )
+            model = ScriptedModel(
+                [
+                    ModelResponse(
+                        tool_requests=(
+                            ToolRequest(
+                                "activate-crash",
+                                "core_skill_activate",
+                                {"names": ["release-notes"]},
+                            ),
+                            ToolRequest(
+                                "blocked-after-crash",
+                                "core_terminal_exec",
+                                {"argv": ["printf", "must-not-run"]},
+                            ),
+                        )
+                    ),
+                    ModelResponse(message="recovered after activation"),
+                ]
+            )
+            store = CrashAfterActivationStore()
+            agent = make_agent(
+                model,
+                memory="disabled",
+                workflow_store=store,
+                declared_skills=(locked_skill_declaration(path, "release-notes"),),
+            )
+            raw = agent.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["release-notes"]
+            agent.agent_config = AgentConfig.from_dict(raw)
+            agent.platform_config.allowed_skills.add("release-notes")
+            agent.platform_config.supported_features.add("skills")
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    agent.run(
+                        {"prompt": "Prepare a changelog"},
+                        task_id="skill-activation-crash",
+                    )
+                persisted = store.lookup_task("skill-activation-crash")
+                self.assertEqual(
+                    persisted.snapshot["tool_queue"][0][
+                        "blocked_by_skill_activation"
+                    ],
+                    "activate-crash",
+                )
+                result = agent.resume_task("skill-activation-crash")
+            finally:
+                agent.close()
+
+        self.assertEqual(result.message, "recovered after activation")
+        self.assertEqual(result.usage.tool_calls, 2)
+        self.assertEqual(agent.tool_runtime.execution_count, 0)
+        self.assertIn("CRASH_SAFE_SKILL_MARKER", model.calls[1].instructions)
+        self.assertIn("SKILL_ACTIVATION_BOUNDARY", model.calls[1].context)
+
+    def test_new_workflow_requires_and_rechecks_locked_skill_package(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-notes"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: release-notes\n"
+                "description: Creates a structured changelog.\n"
+                "---\n"
+                "Use the evidence.\n",
+                encoding="utf-8",
+            )
+            (path / "reference.md").write_text("original\n", encoding="utf-8")
+
+            for declaration, mutate in (
+                ({"name": "release-notes", "source": path.as_uri()}, False),
+                (locked_skill_declaration(path, "release-notes"), True),
+            ):
+                with self.subTest(mutate=mutate):
+                    model = ScriptedModel([ModelResponse(message="must not run")])
+                    agent = make_agent(
+                        model,
+                        memory="disabled",
+                        declared_skills=(declaration,),
+                    )
+                    raw = agent.agent_config.to_dict()
+                    raw["features"]["skills"] = True
+                    raw["skills"]["allow"] = ["release-notes"]
+                    agent.agent_config = AgentConfig.from_dict(raw)
+                    agent.platform_config.allowed_skills.add("release-notes")
+                    agent.platform_config.supported_features.add("skills")
+                    if mutate:
+                        (path / "reference.md").write_text(
+                            "mutated after lock\n", encoding="utf-8"
+                        )
+                    try:
+                        with self.assertRaises(CoreError) as caught:
+                            agent.run({"prompt": "Prepare a changelog"})
+                    finally:
+                        agent.close()
+                    self.assertEqual(caught.exception.code, "SKILL_INVALID")
+                    self.assertEqual(len(model.calls), 0)
+                    (path / "reference.md").write_text("original\n", encoding="utf-8")
+
+    def test_skill_activation_recalculates_base_context_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "large-skill"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: large-skill\n"
+                "description: Applies a deliberately large procedure.\n"
+                "---\n"
+                + ("X" * 200_000)
+                + "\n",
+                encoding="utf-8",
+            )
+            model = ScriptedModel(
+                [
+                    ModelResponse(
+                        tool_requests=(
+                            ToolRequest(
+                                "activate-large",
+                                "core_skill_activate",
+                                {"names": ["large-skill"]},
+                            ),
+                        )
+                    ),
+                    ModelResponse(message="must not reach the provider"),
+                ]
+            )
+            agent = make_agent(
+                model,
+                memory="disabled",
+                context_window=50_000,
+                output_reserve=1_000,
+                declared_skills=(locked_skill_declaration(path, "large-skill"),),
+            )
+            raw = agent.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["large-skill"]
+            agent.agent_config = AgentConfig.from_dict(raw)
+            agent.platform_config.allowed_skills.add("large-skill")
+            agent.platform_config.supported_features.add("skills")
+            try:
+                with self.assertRaises(CoreError) as caught:
+                    agent.run({"prompt": "Apply the procedure"})
+            finally:
+                agent.close()
+
+        self.assertEqual(caught.exception.code, "CONTEXT_UNRECOVERABLE")
+        self.assertEqual(len(model.calls), 1)
+
+    def test_legacy_active_skill_recovers_without_reading_live_package(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "legacy-skill"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: legacy-skill\n"
+                "description: Legacy recovery procedure.\n"
+                "---\n"
+                "LEGACY_SKILL_MARKER\n",
+                encoding="utf-8",
+            )
+            (path / "reference.md").write_text("legacy resource\n", encoding="utf-8")
+            declaration = locked_skill_declaration(path, "legacy-skill")
+            first = make_agent(
+                ScriptedModel([]),
+                memory="disabled",
+                declared_skills=(declaration,),
+            )
+            raw = first.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["legacy-skill"]
+            first.agent_config = AgentConfig.from_dict(raw)
+            first.platform_config.allowed_skills.add("legacy-skill")
+            first.platform_config.supported_features.add("skills")
+            record, raw, discovered, effective = first._new_workflow(
+                {"prompt": "Resume legacy work"},
+                task_id="legacy-skill-task",
+                identity="anonymous",
+                session_id="legacy-skill-context",
+                tenant_id="default",
+            )
+            snapshot = copy.deepcopy(record.snapshot)
+            snapshot.pop("skill_contract_version", None)
+            snapshot.pop("skill_catalog", None)
+            snapshot.pop("effective_platform_config", None)
+            snapshot["admission"]["platform_config"]["supported_features"] = [
+                feature
+                for feature in snapshot["admission"]["platform_config"][
+                    "supported_features"
+                ]
+                if feature != "skills"
+            ]
+            snapshot["admission"]["declared_skills"] = [
+                {"name": "legacy-skill", "source": path.as_uri()}
+            ]
+            snapshot["skills"] = [
+                {"name": "legacy-skill", "instructions": "LEGACY_SKILL_MARKER\n"}
+            ]
+            legacy_platform = first._platform_from_snapshot(
+                snapshot["admission"]["platform_config"]
+            )
+            legacy_effective = compile_effective_config(
+                legacy_platform,
+                AgentConfig.from_dict(snapshot["admission"]["agent_config"]),
+                tuple(snapshot["admission"]["mcp"]),
+                discovered,
+                legacy_ungated_skills=True,
+            )
+            snapshot["effective_config_digest"] = legacy_effective.digest
+            compiled = first._compile_instructions(raw, effective, snapshot)
+            snapshot["compiled_instructions"] = compiled.text
+            snapshot["protected_kernel_digest"] = compiled.protected_digest
+            record = first._record_transition(
+                record,
+                state="RUNNING",
+                snapshot=snapshot,
+                event_kind="test.legacy-snapshot",
+            )
+            store = first.workflow_store
+            first.close()
+
+            model = ScriptedModel([ModelResponse(message="continued legacy work")])
+            second = make_agent(
+                model,
+                memory="disabled",
+                workflow_store=store,
+            )
+            second_raw = second.agent_config.to_dict()
+            second_raw["features"]["skills"] = True
+            second_raw["skills"]["allow"] = ["legacy-skill"]
+            second.agent_config = AgentConfig.from_dict(second_raw)
+            second.platform_config.allowed_skills.add("legacy-skill")
+            second.platform_config.supported_features.add("skills")
+            try:
+                result = second.resume_task(record.task_id)
+            finally:
+                second.close()
+
+        self.assertEqual(result.message, "continued legacy work")
+        self.assertIn("LEGACY_SKILL_MARKER", model.calls[0].instructions)
+        self.assertNotIn("core_skill_activate", model.calls[0].tools)
+        self.assertNotIn("core_skill_read_resource", model.calls[0].tools)
+
+    def test_skill_resource_requires_activation_and_failure_is_recoverable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-notes"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: release-notes\n"
+                "description: Creates a structured changelog.\n"
+                "---\n"
+                "SECRET_SKILL_BODY\n",
+                encoding="utf-8",
+            )
+            (path / "private.md").write_text(
+                "SECRET_RESOURCE_BODY\n", encoding="utf-8"
+            )
+            model = ScriptedModel(
+                [
+                    ModelResponse(
+                        tool_requests=(
+                            ToolRequest(
+                                "read-before-activation",
+                                "core_skill_read_resource",
+                                {"resource": "release-notes/private.md"},
+                            ),
+                        )
+                    ),
+                    ModelResponse(message="continued after denial"),
+                ]
+            )
+            agent = make_agent(
+                model,
+                memory="disabled",
+                declared_skills=(locked_skill_declaration(path, "release-notes"),),
+            )
+            raw = agent.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["release-notes"]
+            agent.agent_config = AgentConfig.from_dict(raw)
+            agent.platform_config.allowed_skills.add("release-notes")
+            agent.platform_config.supported_features.add("skills")
+            try:
+                result = agent.run({"prompt": "Prepare a changelog"})
+                record = agent.workflow_store.get(
+                    result.run_id, tenant_id="default", owner_id="anonymous"
+                )
+            finally:
+                agent.close()
+
+        self.assertEqual(result.message, "continued after denial")
+        self.assertEqual(result.usage.tool_calls, 1)
+        self.assertIn("CAPABILITY_DISABLED", model.calls[1].context)
+        self.assertNotIn("SECRET_RESOURCE_BODY", model.calls[1].context)
+        self.assertNotIn("SECRET_SKILL_BODY", model.calls[1].instructions)
+        self.assertEqual(record.snapshot["skills"], [])
+
+    def test_skill_activation_respects_exhausted_tool_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-notes"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: release-notes\n"
+                "description: Creates a structured changelog.\n"
+                "---\n"
+                "MUST_NOT_BE_ACTIVATED\n",
+                encoding="utf-8",
+            )
+            model = ScriptedModel(
+                [
+                    ModelResponse(
+                        tool_requests=(
+                            ToolRequest(
+                                "over-budget-activation",
+                                "core_skill_activate",
+                                {"names": ["release-notes"]},
+                            ),
+                        )
+                    ),
+                    ModelResponse(
+                        message=(
+                            "Verified: the skill was not activated. "
+                            "Unfinished: the skill-guided work was not performed."
+                        )
+                    ),
+                ]
+            )
+            agent = make_agent(
+                model,
+                memory="disabled",
+                max_tools=0,
+                declared_skills=(locked_skill_declaration(path, "release-notes"),),
+            )
+            raw = agent.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["release-notes"]
+            agent.agent_config = AgentConfig.from_dict(raw)
+            agent.platform_config.allowed_skills.add("release-notes")
+            agent.platform_config.supported_features.add("skills")
+            try:
+                result = agent.run({"prompt": "Prepare a changelog"})
+                record = agent.workflow_store.get(
+                    result.run_id, tenant_id="default", owner_id="anonymous"
+                )
+            finally:
+                agent.close()
+
+        self.assertFalse(result.complete)
+        self.assertEqual(result.completion_reason, "budget_exhausted")
+        self.assertEqual(result.usage.tool_calls, 0)
+        self.assertEqual(record.snapshot["skills"], [])
+        self.assertEqual(model.calls[1].tools, frozenset())
+
+    def test_skill_tools_are_absent_without_effective_skills(self):
+        model = ScriptedModel([ModelResponse(message="done")])
+        agent = make_agent(model, memory="disabled")
+        try:
+            agent.run({"prompt": "Answer directly"})
+        finally:
+            agent.close()
+
+        self.assertNotIn("core_skill_activate", model.calls[0].tools)
+        self.assertNotIn("core_skill_read_resource", model.calls[0].tools)
+
+    def test_recovery_removes_newly_denied_skill_catalog(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "recovery-skill"
             path.mkdir()
@@ -871,7 +1620,7 @@ class RuntimeTests(unittest.TestCase):
                 "DENIED_SKILL_MARKER\n",
                 encoding="utf-8",
             )
-            declaration = {"name": "recovery-skill", "source": path.as_uri()}
+            declaration = locked_skill_declaration(path, "recovery-skill")
             first = make_agent(
                 ScriptedModel([]),
                 memory="disabled",
@@ -891,7 +1640,8 @@ class RuntimeTests(unittest.TestCase):
                 tenant_id="default",
             )
             self.assertIn("recovery-skill", effective.skills)
-            self.assertIn(
+            self.assertIn("Recovery test skill.", record.snapshot["compiled_instructions"])
+            self.assertNotIn(
                 "DENIED_SKILL_MARKER", record.snapshot["compiled_instructions"]
             )
             store = first.workflow_store
@@ -909,6 +1659,7 @@ class RuntimeTests(unittest.TestCase):
                 second.close()
 
         self.assertEqual(result.message, "continued safely")
+        self.assertNotIn("Recovery test skill.", model.calls[0].instructions)
         self.assertNotIn("DENIED_SKILL_MARKER", model.calls[0].instructions)
 
     def test_recovery_reconnects_only_servers_in_the_persisted_catalog(self):

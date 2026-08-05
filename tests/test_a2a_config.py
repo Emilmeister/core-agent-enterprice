@@ -262,6 +262,63 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(dataclasses.FrozenInstanceError):
             effective.digest = "changed"
 
+    def test_skill_feature_gate_overrides_allowlists(self):
+        raw = agent_config().to_dict()
+        raw["features"]["skills"] = False
+        disabled = compile_effective_config(
+            platform_config(), AgentConfig.from_dict(raw), declared_mcp(), DISCOVERED
+        )
+        self.assertEqual(disabled.skills, frozenset())
+
+        unsupported = compile_effective_config(
+            platform_config(
+                supported_features=platform_config().supported_features - {"skills"}
+            ),
+            agent_config(),
+            declared_mcp(),
+            DISCOVERED,
+        )
+        self.assertEqual(unsupported.skills, frozenset())
+        self.assertTrue(
+            any(
+                warning.code == "CAPABILITY_FILTERED"
+                and warning.capability == "skills"
+                for warning in unsupported.warnings
+            )
+        )
+
+    def test_mcp_cannot_claim_reserved_skill_tool_names(self):
+        for remote_tool in ("activate", "read_resource"):
+            for skills_enabled in (True, False):
+                raw = agent_config().to_dict()
+                raw["features"]["skills"] = skills_enabled
+                raw["tools"]["mcp"]["allow_servers"].append("core_skill")
+                raw["tools"]["mcp"]["allow_tools"]["core_skill"] = [remote_tool]
+                discovered = {**DISCOVERED, "core_skill": {remote_tool: {}}}
+                declarations = declared_mcp(
+                    extra_mcp=(
+                        {
+                            "name": "core_skill",
+                            "required": False,
+                            "transport": {
+                                "type": "streamable_http",
+                                "url": "https://skills.test/mcp",
+                            },
+                        },
+                    )
+                )
+                with self.subTest(tool=remote_tool, skills=skills_enabled):
+                    with self.assertRaises(CoreError) as caught:
+                        compile_effective_config(
+                            platform_config(
+                                allowed_mcp_servers={"repo", "docs", "core_skill"}
+                            ),
+                            AgentConfig.from_dict(raw),
+                            declarations,
+                            discovered,
+                        )
+                    self.assertEqual(caught.exception.code, "TOOL_NAME_COLLISION")
+
     def test_memory_disabled_removes_builtin_tools_and_policy(self):
         raw = agent_config().to_dict()
         raw["features"]["memory"] = "disabled"

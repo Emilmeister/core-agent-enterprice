@@ -109,6 +109,10 @@ def _reason(schema, value, path="arguments"):
     if expected == "array":
         if not isinstance(value, list):
             return f"{path} must be an array, got {_kind(value)}"
+        if len(value) < schema.get("minItems", 0):
+            return f"{path} needs at least {schema['minItems']} item(s)"
+        if len(value) > schema.get("maxItems", len(value)):
+            return f"{path} accepts at most {schema['maxItems']} item(s)"
         for index, item in enumerate(value):
             reason = _reason(schema.get("items", {}), item, f"{path}[{index}]")
             if reason:

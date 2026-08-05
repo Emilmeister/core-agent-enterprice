@@ -105,7 +105,7 @@ Production deployment MUST задавать `DURABLE_STORAGE_ROOT` как пут
 
 ## Deployment variables
 
-Deployment передаёт конфигурацию переменными окружения. Ниже перечислен полный контракт: имя, значение по умолчанию и нормативная семантика. Пустая строка означает «не задано» и MUST трактоваться как отсутствие значения, а не как пустое значение. Числовая переменная, не разбирающаяся в число, завершает startup с `CONFIG_INVALID`. Булева переменная принимает `true`/`false` без учёта регистра. Переменная-список разделяется запятыми, пробелы вокруг элементов отбрасываются.
+Deployment передаёт конфигурацию переменными окружения. Ниже перечислен полный контракт: имя, значение по умолчанию и нормативная семантика. Пустая строка означает «не задано» и MUST трактоваться как отсутствие значения, а не как пустое значение, кроме явно документированных allowlist-переменных, где пустой список отключает capability. `CORE_AGENT_ALLOWED_SKILLS` является таким исключением. Числовая переменная, не разбирающаяся в число, завершает startup с `CONFIG_INVALID`. Булева переменная принимает `true`/`false` без учёта регистра. Переменная-список разделяется запятыми, пробелы вокруг элементов отбрасываются.
 
 Переменные, не перечисленные здесь, документированы в своих разделах: `CORE_AGENT_*` — runtime modes, budgets и tool allowlist ниже по этому документу; `DATABASE_*` и `PUSH_NOTIFICATION_ENCRYPTION_KEY` — production persistence выше и [A2A protocol](a2a-protocol.md); остальные `MEMORY_*` — [Память агента](memory-service.md).
 
@@ -300,6 +300,12 @@ MCP descriptor MAY иметь host-validated role, например `repository`
 ## Skills policy
 
 AgentConfig задаёт allowed sources, names, versions, permissions и default deny/allow. Task передаёт желаемые skills, но effective catalog содержит только пересечение Task request и AgentConfig/tenant policy.
+
+Для local filesystem packages `SKILLS_ROOT` задаёт корень каталогов, а
+`CORE_AGENT_ALLOWED_SKILLS` — точный deployment allowlist имён. Пустой allowlist
+отключает discovery независимо от содержимого root. Runtime валидирует каждый
+пакет и закрепляет его digests до первого model call; установка или обновление
+пакетов во время Task запрещены.
 
 ## EffectiveConfig snapshot
 

@@ -39,6 +39,10 @@ working_occupancy = active_working_tokens / working_capacity
 
 System prompt и tool schemas MUST NOT учитываться в 90%/10–15% working threshold. Они всё равно физически занимают `C`, поэтому сначала вычитаются вместе с output reserve. Если `base_tokens` не оставляет минимальную working capacity, model route отклоняется.
 
+`base_tokens` пересчитывается перед каждым model call из фактически активных
+инструкций и публикуемых schemas. Подключение полного `SKILL.md` или появление
+`core_skill_read_resource` не может использовать расчёт предыдущего turn.
+
 ## Порог 90%
 
 Compaction MUST запускаться до model call, если прогнозируемый `working_occupancy >= 0.90`.

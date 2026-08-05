@@ -50,12 +50,17 @@ def mcp_tool_name(server, tool):
     return re.sub(r"[^A-Za-z0-9_-]", "_", f"{server}_{tool}")
 
 
-def mcp_tool_index(mcp_tools):
+def mcp_tool_index(mcp_tools, *, reserved_names=()):
     """Canonical name -> (server, tool) for every allowed MCP tool."""
     index = {}
     for server, tools in mcp_tools.items():
         for tool in tools:
             name = mcp_tool_name(server, tool)
+            if name in reserved_names:
+                raise CoreError(
+                    "TOOL_NAME_COLLISION",
+                    f"{name} collides with a runtime tool",
+                )
             if index.setdefault(name, (server, tool)) != (server, tool):
                 raise CoreError(
                     "TOOL_NAME_COLLISION",

@@ -1,0 +1,13 @@
+cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  ./LICENSES/knowledge-work-plugins-Apache-2.0.txt
+a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400  ./LICENSES/superpowers-MIT.txt
+d809ce2ff28322736f499e7e57193239d2fa2ca819e0034c914f413c623f59b0  ./PROVENANCE.md
+0087068cf8274ade2b1044e30063af061e0aab115e1eb34c7dfd87304aa0b280  ./explore-data/SKILL.md
+8e64f4a1916f6bf76be783a093acef05f95c7807420fbb15d8fd1ed367c0641c  ./knowledge-synthesis/SKILL.md
+9864e5dee4a4426be875c68ee8f79ced8f549ed29f3bce5544f3905e6186c0e7  ./sql-queries/SKILL.md
+0c0e7e1fa30dc2d38583e441d0b3e153ee669f4f5b7af00eb7beb9b41e2f61b5  ./statistical-analysis/SKILL.md
+d32fbe29ba228c3d334b51010e2fe9a1f5467cbc6bdd7c09e925de01ca9f35c3  ./systematic-debugging/SKILL.md
+56697660ee817a80de30b1710f0bf69cae3c11690c58da9cad5db9ae82a9a2a4  ./systematic-debugging/references/condition-based-waiting.md
+310a973b3c72a160a44affda19b2d8a5a07cd9cd8deca174813867cff4a2ec49  ./systematic-debugging/references/defense-in-depth.md
+83a995296319a058ac600b3433396619f300f545a6e883e0d3044451b9f0ea8e  ./systematic-debugging/references/root-cause-tracing.md
+32db2d496aef16163847791637a1327c2898dc9b4fdb035beb7e8309ac31c562  ./validate-data/SKILL.md
+f3296ca30de5e49a1e33bf4ffac5decb47a175aa4ed4786412e96d4d5fdf740c  ./verification-before-completion/SKILL.md

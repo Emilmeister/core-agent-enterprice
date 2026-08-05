@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import math
@@ -54,6 +55,7 @@ from .push import DurablePushNotificationSender, PostgresPushNotificationConfigS
 from .remote_agents import RemoteAgentRegistry
 from .runtime import CoreAgent
 from .security import redact
+from .skills import SkillResolver
 from .tasks import TaskScheduler
 from .tools import (
     ToolDefinition,
@@ -619,11 +621,47 @@ def _declared_skills(allowed):
     """Config-declared local skill packages: one directory per allowed name."""
     root = _env("SKILLS_ROOT")
     if not root:
+        if allowed:
+            raise CoreError(
+                "CONFIG_INVALID",
+                "SKILLS_ROOT is required when CORE_AGENT_ALLOWED_SKILLS is set",
+            )
         return ()
     base = Path(root).resolve()
-    return tuple(
-        {"name": name, "source": f"file://{base / name}"} for name in sorted(allowed)
-    )
+    declarations = []
+    for name in sorted(allowed):
+        if re.fullmatch(r"[A-Za-z0-9_-]+", name) is None:
+            raise CoreError("CONFIG_INVALID", "invalid skill name")
+        package = base / name
+        if not package.is_dir() or package.is_symlink():
+            raise CoreError("SKILL_INVALID")
+        try:
+            resources = {}
+            for path in package.rglob("*"):
+                if path.is_symlink():
+                    raise CoreError("SKILL_INVALID")
+                relative = path.relative_to(package).as_posix()
+                if path.is_file() and relative != "SKILL.md":
+                    with path.open("rb") as source:
+                        resources[relative] = (
+                            "sha256:"
+                            + hashlib.file_digest(source, "sha256").hexdigest()
+                        )
+            content = (package / "SKILL.md").read_bytes()
+        except OSError:
+            raise CoreError("SKILL_INVALID") from None
+        declarations.append(
+            {
+                "name": name,
+                "source": package.as_uri(),
+                "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+                "resources": resources,
+            }
+        )
+    resolver = SkillResolver(declarations)
+    resolver.discover()
+    resolver.resolve_lock()
+    return tuple(declarations)
 
 
 def _mcp_name(url, index):
@@ -734,6 +772,7 @@ def _agent(model, mcp_connector=None, *, state=None):
             "python",
             "artifacts",
             "remote_agents",
+            "skills",
         },
         max_model_turns=int(_env("RUNTIME_MAX_LLM_CALLS", "100")),
         max_tool_calls=int(_env("CORE_AGENT_MAX_TOOL_CALLS", "200")),
