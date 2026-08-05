@@ -131,6 +131,16 @@ MCP elicitation нормализуется в A2A `input-required`. MCP server �
 
 `MCP_ALLOWED_TOOLS` перечисляет имена тулов, а не пары «сервер плюс тул». Голое имя разрешает тул на любом подключённом сервере; форма `server.tool` дополнительно ограничивает его одним сервером. Обе формы принимаются одновременно, потому что имя тула у MCP-сервера само может содержать точку, и требовать от оператора угадывать разбор нельзя.
 
+`MCP_READ_ONLY_TOOLS` использует формы голого `tool` и `server.tool`, но является
+отдельной доверенной политикой развёртывания для классификации побочных эффектов.
+Здесь scoped-форма читается однозначно и только для названного подключённого
+сервера: в отличие от совместимого allowlist она не дублируется как голое имя с
+точкой на остальных серверах. Любой MCP-инструмент, которого нет в этом списке,
+MUST считаться изменяющим независимо от его имени и заявленных сервером
+annotations. Серверная metadata MAY использоваться только как дополнительный
+сигнал для оператора и не может сама разрешить автоматический повтор вызова с
+неизвестным outcome.
+
 Компромисс зафиксирован: голое имя, совпавшее у двух серверов, разрешает тул у обоих. Оператору, которому нужна изоляция, следует писать `server.tool`.
 
 Разрешение не создаёт тул: имя, отсутствующее в каталоге сервера, отбрасывается при пересечении с фактическим каталогом.
@@ -144,6 +154,54 @@ MCP elicitation нормализуется в A2A `input-required`. MCP server �
 4. Получить catalogs tools/resources/prompts и провалидировать schemas/metadata.
 5. Добавить namespaced capabilities в snapshot и discovery index.
 7. Закрыть соединение при терминальном состоянии.
+
+Новый run MUST заново выполнить безопасные `initialize` и `tools/list`. Если
+Streamable HTTP server масштабирован в ноль, transient transport failure при
+этой фазе MUST запускать bounded exponential backoff до одного общего для всего
+discovery данного run monotonic deadline `MCP_COLD_START_TIMEOUT_SECONDS`, по
+умолчанию 300 секунд. Несколько последовательно проверяемых серверов не умножают
+этот предел. Deadline включает сетевые попытки и паузы между ними; отдельная
+попытка не может продлить его через `MCP_TIMEOUT` или
+`MCP_SSE_READ_TIMEOUT`. До первой сетевой попытки workflow, исходные AgentConfig,
+platform capability ceiling, MCP declarations и абсолютный срок ожидания MUST
+быть сохранены durable, чтобы follow-up, cancel и recovery видели тот же Task и
+не расширяли принятые capabilities после изменения deployment configuration.
+Новая platform deny MAY дополнительно сузить этот ceiling. Перед первым
+initialize каждого нового run и перед каждой повторной попыткой клиент MUST
+удалить прежние session id и negotiated protocol version, потому что новый
+экземпляр сервера не обязан знать состояние остановленного.
+Новый session id и negotiated version принадлежат ровно одному run; параллельный
+root/child/tenant run не может удалить, прочитать или заменить их.
+
+Cold-start retry разрешён только для временной недоступности transport, включая
+connection refusal/reset, преждевременное закрытие ответа, timeout, HTTP 408/429
+и 5xx. Ошибка descriptor, TLS
+verification, authentication/authorization, несовместимая protocol version,
+невалидный JSON или schema/protocol error MUST завершить попытку сразу. Отмена
+Task MUST прерывать ожидание. Повторы discovery не являются model turn или tool
+call и не расходуют соответствующие budgets.
+
+Дополнительные `MCP_HEADERS_JSON` не могут задавать или переопределять
+управляемые transport-ом заголовки `Content-Type`, `Accept`, `Mcp-Method`,
+`Mcp-Name`, `Mcp-Session-Id` и `MCP-Protocol-Version` независимо от регистра.
+Такой конфликт MUST завершить startup ошибкой `CONFIG_INVALID`, а не нарушить
+изоляцию session или согласование протокола.
+
+После истечения deadline optional server исключается из effective catalog с
+наблюдаемым `MCP_CONNECTION_FAILED`; run продолжается без его capabilities.
+Required server возвращает тот же structured error. Уже отправленный
+mutating `tools/call` не является cold-start discovery: при неизвестном outcome
+он MUST перейти в reconciliation/`SIDE_EFFECT_UNKNOWN`, а не запускаться снова.
+
+Успешно найденный catalog сохраняется в immutable snapshot. После потери
+process-local connection восстановление создаёт отдельный durable cold-start
+deadline и переподключается, но пересобирает EffectiveConfig из сохранённого
+catalog, а не из временной доступности optional server. Поэтому временно
+недоступный optional server не превращает checkpoint в `CHECKPOINT_INVALID` и
+не расширяет либо молча сужает tools. Read-only вызов такого server возвращает
+модели structured transport failure; mutating вызов сохраняет правило
+`SIDE_EFFECT_UNKNOWN`. Ошибка required reconnect или несовместимый checkpoint
+фиксирует терминальный outcome, а не оставляет Task в бесконечном `RUNNING`.
 
 Ответ на запрос MUST выбираться по `id`, а не по порядку прибытия. Сервер вправе отправить в том же event stream `notifications/progress`, логи и собственные запросы до самого ответа, и медленный tool делает это почти всегда. Первый кадр потока — это, как правило, нотификация: у неё нет ни `result`, ни `error`, поэтому чтение «первого пакета» отдаёт модели пустой результат вместо данных, причём как успех. Такой отказ неотличим для модели от «сервер ничего не нашёл», и она отвечает пользователю выдуманным отсутствием данных. Кадры без `id` и кадры с чужим `id` MUST пропускаться до истечения `MCP_SSE_READ_TIMEOUT`.
 

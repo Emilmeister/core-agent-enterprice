@@ -23,7 +23,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -394,6 +394,10 @@ CREATE INDEX core_background_recovery_idx
     ON core_background_tasks (state, claim_expires_at, updated_at)
     WHERE state IN ('submitted', 'working');
 """,
+    12: """
+ALTER TABLE core_runs
+    ADD COLUMN cancel_requested boolean NOT NULL DEFAULT false;
+""",
 }
 
 
@@ -693,7 +697,7 @@ class PostgresTaskStore(TaskStore):
             owner if context.user.is_authenticated and owner else "anonymous"
         ), context.tenant or "default"
 
-    def reconcile_from_workflows(self):
+    def reconcile_from_workflows(self, *, enqueue_notification=None):
         terminal = {
             "COMPLETED": a2a_pb2.TASK_STATE_COMPLETED,
             "FAILED": a2a_pb2.TASK_STATE_FAILED,
@@ -725,17 +729,33 @@ class PostgresTaskStore(TaskStore):
                 task = a2a_pb2.Task.FromString(bytes(row["payload"]))
                 task.status.state = terminal[row["run_state"]]
                 task.status.timestamp.GetCurrentTime()
+                if row["run_state"] in {"FAILED", "ABORTED", "REJECTED"}:
+                    reason = (
+                        row["error_code"]
+                        or {
+                            "FAILED": "TASK_FAILED",
+                            "ABORTED": "SIDE_EFFECT_UNKNOWN",
+                            "REJECTED": "POLICY_DENIED",
+                        }[row["run_state"]]
+                    )
+                    task.status.message.Clear()
+                    task.status.message.message_id = (
+                        f"{task.id}:{row['run_state'].lower()}"
+                    )
+                    task.status.message.task_id = task.id
+                    task.status.message.context_id = task.context_id
+                    task.status.message.role = a2a_pb2.ROLE_AGENT
+                    task.status.message.parts.add(
+                        text=reason,
+                        media_type="text/plain",
+                    )
                 result = row["result"] or {}
                 message = result.get("message")
                 if row["run_state"] == "COMPLETED" and message:
                     encoded = message.encode()
                     digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
                     artifact = next(
-                        (
-                            item
-                            for item in task.artifacts
-                            if item.artifact_id == digest
-                        ),
+                        (item for item in task.artifacts if item.artifact_id == digest),
                         None,
                     )
                     if artifact is None:
@@ -786,6 +806,14 @@ class PostgresTaskStore(TaskStore):
                         row["tenant"],
                     ),
                 )
+                if enqueue_notification is not None:
+                    enqueue_notification(
+                        task.id,
+                        task,
+                        owner=row["owner"],
+                        tenant=row["tenant"],
+                        connection=connection,
+                    )
                 reconciled += 1
         return reconciled
 
@@ -804,7 +832,8 @@ class PostgresTaskStore(TaskStore):
                      state = EXCLUDED.state,
                      status_timestamp = EXCLUDED.status_timestamp,
                      payload = EXCLUDED.payload,
-                     updated_at = now()""",
+                     updated_at = now()
+                   WHERE core_a2a_tasks.state NOT IN (%s, %s, %s, %s)""",
                 (
                     task.id,
                     owner,
@@ -813,6 +842,10 @@ class PostgresTaskStore(TaskStore):
                     int(task.status.state),
                     timestamp,
                     task.SerializeToString(),
+                    int(a2a_pb2.TASK_STATE_COMPLETED),
+                    int(a2a_pb2.TASK_STATE_FAILED),
+                    int(a2a_pb2.TASK_STATE_CANCELED),
+                    int(a2a_pb2.TASK_STATE_REJECTED),
                 ),
             )
 

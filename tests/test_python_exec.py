@@ -58,14 +58,12 @@ class PythonExecTests(unittest.TestCase):
     def _environment(self, workspace, **extra):
         return {
             "SESSION_STORAGE_TYPE": "in-memory",
-
             "CORE_AGENT_RUNTIME_MODE": "without_terminal",
-            "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
-                "core_python_exec,core_task_list"
-            ),
+            "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": ("core_python_exec,core_task_list"),
             "MCP_ALLOWED_SERVERS": "docs",
             # MCP servers are deployment configuration now.
             "MCP_URL": "https://docs.test/docs",
+            "MCP_COLD_START_TIMEOUT_SECONDS": "0",
             "MCP_ALLOWED_TOOLS": "docs.search",
             "LOCAL_WORKSPACE_ROOT": workspace,
             **extra,
@@ -203,9 +201,7 @@ print(docs["answer"], len(tasks), sorted(tools.names))
             "prompt": "use python",
         }
         workspace = tempfile.TemporaryDirectory()
-        with patch.dict(
-            os.environ, self._environment(workspace.name), clear=True
-        ):
+        with patch.dict(os.environ, self._environment(workspace.name), clear=True):
             app = create_app(model=model, mcp_connector=connector)
         try:
             result = app.state.core_agent.run(request)
@@ -219,9 +215,7 @@ print(docs["answer"], len(tasks), sorted(tools.names))
             self.assertIn("core_task_list", model.calls[1].context)
             audit = app.state.core_agent.audit_log.records(result.run_id)
             nested = [
-                item
-                for item in audit
-                if item.data.get("source") == "core_python_exec"
+                item for item in audit if item.data.get("source") == "core_python_exec"
             ]
             self.assertEqual(
                 [(item.kind, item.data["tool_name"]) for item in nested],
@@ -233,7 +227,9 @@ print(docs["answer"], len(tasks), sorted(tools.names))
                 ],
             )
             spans = app.state.core_agent.telemetry.exporter.spans
-            tool_spans = [span for span in spans if span.name == "core_agent.tool.execute"]
+            tool_spans = [
+                span for span in spans if span.name == "core_agent.tool.execute"
+            ]
             names = {span.attributes.get("tool.name") for span in tool_spans}
             self.assertTrue(
                 {"core_python_exec", "docs_search", "core_task_list"} <= names
@@ -262,23 +258,17 @@ print(docs["answer"], len(tasks), sorted(tools.names))
                     [
                         ModelResponse(
                             tool_requests=(
-                                ToolRequest(
-                                    call_id, "core_python_exec", arguments
-                                ),
+                                ToolRequest(call_id, "core_python_exec", arguments),
                             )
                         ),
                         ModelResponse(message="recovered"),
                     ]
                 )
                 model.model = "python-failure-test"
-                with patch.dict(
-                    os.environ, self._environment(root), clear=True
-                ):
+                with patch.dict(os.environ, self._environment(root), clear=True):
                     app = create_app(model=model)
                 try:
-                    result = app.state.core_agent.run(
-                        {"prompt": "run failing python"}
-                    )
+                    result = app.state.core_agent.run({"prompt": "run failing python"})
                     self.assertEqual(result.message, "recovered")
                     self.assertIn('"status": "', model.calls[1].context)
                     self.assertIn(expected, model.calls[1].context)
@@ -305,16 +295,19 @@ print(docs["answer"], len(tasks), sorted(tools.names))
             ]
         )
         model.model = "python-background-test"
-        with tempfile.TemporaryDirectory() as workspace, patch.dict(
-            os.environ,
-            self._environment(
-                workspace,
-                CORE_AGENT_RUNTIME_MODE="with_terminal",
-                CORE_AGENT_ALLOWED_BUILTIN_TOOLS=(
-                    "core_python_exec,core_task_start,core_task_wait"
+        with (
+            tempfile.TemporaryDirectory() as workspace,
+            patch.dict(
+                os.environ,
+                self._environment(
+                    workspace,
+                    CORE_AGENT_RUNTIME_MODE="with_terminal",
+                    CORE_AGENT_ALLOWED_BUILTIN_TOOLS=(
+                        "core_python_exec,core_task_start,core_task_wait"
+                    ),
                 ),
+                clear=True,
             ),
-            clear=True,
         ):
             app = create_app(model=model)
             try:

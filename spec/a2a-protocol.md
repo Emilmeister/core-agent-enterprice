@@ -126,6 +126,15 @@ Core Agent MUST поддерживать A2A operations, необходимые 
 
 Конкретный binding MAY временно поддерживать подмножество optional operations только если Agent Card честно отражает capability.
 
+После потери process-local stream новая подписка является пассивным наблюдением,
+а не командой resume. Она сначала публикует сохранённый Task, затем только его
+durable изменения и не снимает `WAITING_*`, `PAUSED` или `auth-required`.
+Безопасные root workflow продолжает recovery coordinator; terminal update не
+может предшествовать начальному снимку или сопровождаться более поздним
+`working`-кадром. Подписка на process-local active Task также начинает с уже
+прочитанного persisted snapshot и прекращается сразу после первого terminal
+события: никакой artifact/status frame не публикуется после terminal.
+
 ## Сообщения активной Task
 
 Caller MAY отправлять дополнительные A2A Messages в уже существующую non-terminal Task, указывая её server-generated `taskId`. Если передан `contextId`, он MUST совпадать с context Task; `contextId` без `taskId` создаёт новую Task и не steer-ит существующую. После terminal state Message отклоняется стандартной A2A terminal-task ошибкой.
@@ -138,7 +147,7 @@ Caller MAY отправлять дополнительные A2A Messages в у�
 - вернуть ту же Task, а не создать параллельный run;
 - доставить принятые Messages в commit order на ближайшей safe boundary перед следующим model turn;
 - не прерывать уже начатый model call, tool call или side effect;
-- перед terminal commit атомарно проверить inbox: Message, committed раньше terminal transition, MUST быть обработан; Message, проигравший race terminal transition, MUST быть отклонён.
+- перед terminal commit атомарно проверить inbox: Message, committed раньше успешного terminal transition, MUST быть доставлен модели; перед `failed`/`canceled` он MUST быть durable перенесён в transcript с явной причиной, что остался необработанным, без нового model/tool call; Message, проигравший race terminal transition, MUST быть отклонён.
 
 Follow-up не пересобирает EffectiveConfig и не пополняет budgets: capabilities принадлежат конфигурации и неизменны на протяжении Task. Новейший turn MAY уточнить или изменить желаемый будущий результат, но не отменяет уже committed side effect; для отмены Task используется `CancelTask`.
 
@@ -152,6 +161,22 @@ Follow-up не пересобирает EffectiveConfig и не пополняе
 - Закрытие streaming connection MUST NOT отменять Task.
 - Агент MAY перейти в пассивное `WAITING_TASK`; это остаётся A2A `working`, не потребляет model/CPU и возобновляется notification-ом.
 - Critical state не полагается только на transient Message: она сохраняется в Task status/history или Artifact.
+- Terminal reconciliation после recovery атомарно обновляет durable A2A Task и
+  ставит настроенное push notification в idempotent delivery ledger. Ошибка
+  любой из этих записей откатывает обе и повторяется последующей сверкой.
+  Восстановленный `failed`/`rejected` status содержит тот же безопасный stable
+  error code, что и live terminal path, без raw exception или чувствительных
+  деталей.
+- Потеря workflow lease и graceful shutdown worker-а не публикуют `failed` или
+  иной terminal A2A state. Stale process прекращает локальный producer, а durable
+  итог публикует действующий lease-owner либо последующая reconciliation. Если
+  workflow ещё не был durable создан, adapter вместо этого публикует безопасный
+  `failed`: невосстановимая A2A Task не остаётся навсегда в `working`.
+- Если `CancelTask` пересекается с уже сохранённым terminal workflow, adapter не
+  заменяет этот итог на `failed`: локальный producer публикует свой сохранённый
+  результат, а при отсутствии локального producer adapter восстанавливает его из
+  durable workflow. Внутренняя координация отмены не накапливает process-local
+  записи для чужих или уже неактивных Task.
 
 ## Artifacts и Messages
 

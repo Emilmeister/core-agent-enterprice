@@ -1,239 +1,364 @@
 # Core Agent
 
-Policy-enforced Python agent runtime implemented from the immutable [product specification](spec/README.md).
-Its task input contains only `prompt`, `mcp`, and `skills`; platform policy, kernel behavior,
-approvals, isolation, durability, context management, tasks, and telemetry remain inside the runtime.
+Core Agent — среда выполнения автономных агентов на Python с обязательным
+применением политик. Она принимает пользовательский `prompt` через стандартный
+интерфейс A2A и сама управляет жизненным циклом задачи: вызывает модель и
+инструменты, следит за контекстом и лимитами, запускает фоновые и дочерние
+задачи, сохраняет состояние, ведёт аудит и публикует телеметрию.
 
-## Development
+Коротко:
 
-```bash
-uv sync
-uv run python -m unittest discover -s tests -v
-uv run python -m unittest tests.test_end_to_end -v
-uvx ruff check core_agent
-uv build --no-sources
+```text
+prompt -> сохраняемая задача A2A -> события выполнения -> проверяемый результат
 ```
 
-The end-to-end suite runs without external credentials. It crosses the official A2A HTTP binding,
-an OpenAI-compatible model server, real local PTYs, background tasks, focused child agents,
-Streamable HTTP MCP, built-in Markdown memory with indexing/NER/graph search, and explicit skill
-activation.
+Клиенту не нужно реализовывать собственный цикл работы агента. Логический
+`RunRequest` содержит только `prompt`. MCP-серверы, пакеты навыков, модель,
+лимиты, политики и доступные инструменты задаются доверенной конфигурацией
+развёртывания, а учётная запись и область клиента определяются проверенным
+транспортным контекстом.
 
-## Run the agent
+> **Статус:** v1 является кандидатом на выпуск. Большая часть требований
+> подтверждена автоматическими проверками, но несколько гарантий всё ещё имеют
+> статус `partial` и
+> блокируют выпуск для промышленной эксплуатации. Актуальный список находится
+> в [матрице реализации](spec/implementation-status.md).
 
-### Runtime prompt
+## Реализованные возможности
 
-The replaceable role/profile prompt is `AGENT_SYSTEM_PROMPT`; local Compose reads it from `.env`.
-It is optional and empty by default. The actual request is sent separately as a user Message and
-is never copied into system instructions. Effective model instructions are compiled for every run
-from the protected safety, host-policy, kernel and enabled-capability layers, followed by a
-non-empty profile and selected skills. The protected layers are assembled in
-[`core_agent/app.py`](core_agent/app.py), compiled in [`core_agent/runtime.py`](core_agent/runtime.py),
-and specified in [`spec/kernel-instructions.md`](spec/kernel-instructions.md). The protected layers
-cannot be replaced through `.env`, A2A input, MCP, memory, skills, or tool output.
+### Защищённый цикл выполнения
 
-Production state requires PostgreSQL. Apply the versioned schema before starting the app:
+- Входящее сообщение A2A преобразуется в `RunRequest {"prompt": "..."}`.
+- Для каждого запуска собираются неизменяемый `EffectiveConfig` и защищённые
+  `KernelInstructions`.
+- Аргументы инструмента проходят проверку схемы, политик, лимитов и принадлежности
+  клиенту до передачи на выполнение.
+- Отключённый инструмент отсутствует в каталоге модели и повторно отклоняется
+  непосредственно перед выполнением.
+- Пользовательский запрос, результаты MCP и инструментов, пакеты навыков,
+  память, артефакты и ответы дочерних агентов считаются недоверенными данными.
+- Неоднозначный результат внешнего изменения переводится в
+  `SIDE_EFFECT_UNKNOWN`; слепая повторная попытка запрещена.
+
+### Модели
+
+- Поддерживаются API, совместимые с OpenAI, и Anthropic Messages API.
+- Поддерживаются потоковые ответы, вызовы инструментов и сведения о рассуждении,
+  которые поставщик модели явно включает в ответ.
+- `THINKING_LEVEL` задаётся при развёртывании и не может быть изменён
+  пользовательским запросом.
+- Пустой `THINKING_LEVEL` сохраняет значение по умолчанию выбранного поставщика
+  модели.
+
+### Жизненный цикл A2A
+
+Сервер построен на официальном SDK A2A, поддерживает HTTP+JSON 1.0 и совместим с
+JSON-RPC 0.3. Карточка агента доступна по
+`/.well-known/agent-card.json`. JSON-RPC 0.3 принимает запросы на `/`, а
+HTTP+JSON 1.0 использует стандартные маршруты A2A SDK.
+
+Одна сохраняемая задача A2A используется для потоковой выдачи, опроса состояния,
+подписки, отмены и отправки уведомлений клиенту. Незавершённая задача принимает
+дополнительное сообщение с тем же `taskId`; оно доставляется модели на безопасной
+границе без прерывания текущего вызова модели или инструмента.
+
+### Встроенные инструменты
+
+Фактически зарегистрированные инструменты:
+
+| Группа | Инструменты |
+|---|---|
+| Выполнение | `core_terminal_exec`, `core_python_exec` |
+| Фоновые задачи | `core_task_start`, `core_task_get`, `core_task_list`, `core_task_wait`, `core_task_cancel` |
+| Делегирование | `core_delegate` |
+| Артефакты | `core_artifact_save`, `core_artifact_load`, `core_artifact_list` |
+| Память | `core_memory_search`, `core_memory_read`, `core_memory_create`, `core_memory_update`, `core_memory_split`, `core_memory_delete` |
+| Удалённые агенты | `core_agent_send_message` |
+
+`CORE_AGENT_ALLOWED_BUILTIN_TOOLS` может только сузить этот набор.
+`with_terminal` разрешает публикацию `core_terminal_exec` и
+`core_task_start`; `without_terminal` удаляет их, но сохраняет управление
+задачами, делегирование, MCP, память и Python, если они разрешены конфигурацией.
+Python остаётся локальным процессом с доступом к системным API, поэтому
+`without_terminal` не создаёт изоляцию на уровне операционной системы.
+
+### Делегирование и лимиты
+
+Защищённые инструкции ядра и описание инструмента задают модели правила выбора
+делегирования. Среда выполнения не выбирает дочернего агента вместо модели, но
+независимо проверяет условия делегирования, разрешения, глубину и лимиты.
+Делегирование уместно, когда есть хотя бы одна из трёх причин:
+
+- независимую работу можно выполнить параллельно с заметной выгодой по времени;
+- большой отделимый контекст полезно изолировать от родительского агента;
+- нужен ограниченный и независимо проверяемый результат.
+
+Родительский агент должен уметь проверить и использовать результат, польза должна
+превышать издержки координации, а общего лимита должно хватать на проверку и
+подготовку итогового ответа.
+
+Родительский агент оставляет работу у себя, если она простая, короткая, строго
+последовательная, тесно связана с его текущим состоянием, дублирует уже
+выполняемую работу или пытается обойти политику. Для дочернего агента задаются
+цель, необходимый контекст, границы, ожидаемый результат, критерии приёмки,
+точный список инструментов и пакетов навыков, а также оба лимита со значением
+не менее `1`:
+`budget.turns >= 1` и `budget.tool_calls >= 1`. Стратегию внутри этих границ
+дочерний агент выбирает сам.
+
+Основной агент имеет глубину `0`, его дочерний агент — `1`, агент следующего
+уровня — `2`. Глубина `2` является жёстким пределом и не получает
+`core_delegate`. Все агенты расходуют общий лимит корневой задачи.
+
+Исчерпание лимита вызовов модели или инструментов не переводит задачу в
+состояние ошибки и не стирает промежуточную работу:
+
+1. Новый вызов инструмента не передаётся на выполнение и получает
+   структурированный результат `BUDGET_EXCEEDED`.
+2. Зарезервированный заключительный вызов модели формирует сводку только из
+   подтверждённых результатов.
+3. Задача завершается с `completion_reason: "budget_exhausted"` и
+   `complete: false`.
+4. Результат явно перечисляет выполненное, незавершённое и задачи с ещё не
+   подтверждённым результатом.
+
+Модель не должна придумывать отсутствующие результаты инструментов или выдавать
+намерение за выполненное действие.
+
+### Контекст, память и артефакты
+
+- Когда рабочий контекст достигает 90% доступного объёма, он сжимается до
+  10–15% с сохранением закреплённых данных и полной неизменяемой истории вне
+  рабочего контекста.
+- Память встроена в процесс Core Agent, а не вынесена в отдельный MCP-сервис.
+  Markdown является первичным источником; BM25, векторный поиск, извлечение
+  именованных сущностей и граф являются производными данными, которые можно
+  перестроить.
+- Запись памяти длиннее 200 строк отклоняется без изменения данных; для явного
+  разбиения существует `core_memory_split`.
+- Недоступность службы векторизации или извлечения сущностей ухудшает только
+  соответствующий канал поиска и не приводит к ошибке вызова инструмента памяти.
+- Артефакты имеют имя, область видимости и версии. Поддерживаются хранилища
+  `in-memory`, `s3` и `mongodb`.
+
+### Выполнение и расширения
+
+- Терминал принимает `argv` и не запускает командную оболочку неявно.
+  Конвейеры, перенаправления и `&&` требуют явного `sh -lc`.
+- Основной и каждый дочерний агент получают отдельные PTY, группу процессов и
+  рабочий каталог внутри одного контейнера.
+- `core_python_exec` запускает процесс Python с заданными ограничениями и
+  может синхронно вызывать разрешённые инструменты через `tools.call(...)`.
+  Каждый вложенный вызов снова проходит проверку политик, лимитов, аудита и
+  телеметрии.
+- Подключение MCP поддерживает Streamable HTTP. Серверы и списки разрешённых
+  инструментов задаются конфигурацией развёртывания и не могут быть добавлены
+  пользовательским запросом. Если сервер был остановлен из-за отсутствия
+  нагрузки, новый запрос ждёт его запуска с увеличивающейся паузой между
+  попытками. Один предел на проверку всех серверов задаёт
+  `MCP_COLD_START_TIMEOUT_SECONDS`, по умолчанию это 300 секунд. Задача
+  сохраняется до начала ожидания, отмена прерывает его, а каждый запуск получает
+  отдельный сеанс MCP. Ожидание не расходует лимиты модели и инструментов;
+  неоднозначный результат изменяющего вызова автоматически не повторяется.
+  Любой инструмент по умолчанию считается изменяющим. Только доверенный список
+  `MCP_READ_ONLY_TOOLS` отмечает инструменты, которые можно безопасно повторить
+  после обрыва соединения; запись `server.tool` действует лишь для указанного
+  сервера.
+- Локальные пакеты навыков выбираются через `SKILLS_ROOT` и
+  `CORE_AGENT_ALLOWED_SKILLS`; пакет навыков не расширяет `EffectiveConfig`.
+- `REMOTE_AGENTS` подключает удалённых агентов A2A. Недоступный агент не
+  прерывает запуск, а `core_agent_send_message` скрывается, если нет доступных
+  удалённых агентов.
+
+### Хранение состояния и наблюдаемость
+
+В промышленном режиме используется PostgreSQL. Запуск завершается ошибкой, если
+база недоступна или версия схемы не совпадает. Реализации с хранением в памяти
+процесса предназначены только для разработки и тестирования. Основной серверный
+процесс не обновляет схему промышленной базы.
+
+После перезапуска координатор автоматически продолжает безопасные корневые
+задачи с сохранённой границы. Новая подписка только наблюдает сохранённое
+состояние и не запускает работу сама. Потеря аренды или штатная остановка процесса
+не превращает восстанавливаемую задачу в ошибку; следующий владелец публикует её
+итог и уведомление клиенту. Если отмена пересеклась с уже сохранённым завершением,
+сохраняется настоящий результат, а не ложное состояние ошибки.
+
+Дописываемый журнал аудита является продуктовой записью и не заменяется
+телеметрией.
+OpenTelemetry связывает задачу A2A, вызовы модели, инструменты, MCP, фоновые и
+дочерние задачи. Совместимые с OpenInference трассировки можно смотреть в
+Phoenix. Запись содержимого в промышленном режиме допустима только при явно
+настроенных правилах доступа, маскирования чувствительных данных, выборки и срока
+хранения.
+
+## Быстрый старт
+
+Требования:
+
+- Python 3.12+;
+- [uv](https://docs.astral.sh/uv/);
+- Docker и Docker Compose для полного локального набора служб.
+
+### Локальный процесс
 
 ```bash
-export DATABASE_URL='postgresql://core_agent:password@database:5432/core_agent'
-DATABASE_MIGRATION_URL='postgresql://migrator:password@database:5432/core_agent' \
-DATABASE_APP_ROLE=core_agent \
-uv run core-agent-db migrate
-CORE_AGENT_ENVIRONMENT=production \
-SESSION_STORAGE_TYPE=postgres \
-DATABASE_AUTO_MIGRATE=false \
-OPERATOR_JWT_HS256_SECRET='independent-32-byte-minimum-secret' \
-OPERATOR_JWT_ISSUER='https://operator.example' \
-OPERATOR_JWT_AUDIENCE='core-agent-operator' \
-LOCAL_APPROVAL_EXTENSION_URI='https://agent.example/a2a/extensions/local-operator-approval/v1' \
-PUSH_NOTIFICATION_ENCRYPTION_KEY='replace-with-generated-fernet-key' \
-DURABLE_STORAGE_ROOT='/mounted-s3/core-agent' \
-LOCAL_WORKSPACE_ROOT='/tmp/core-agent/runs' \
-uv run core-agent
-```
+uv sync --frozen
 
-`DATABASE_URL` must come from the deployment secret store. Production startup fails closed when
-the credential is missing, PostgreSQL is unavailable, or the schema version differs. A bounded
-pool is configured with `DATABASE_POOL_MIN`, `DATABASE_POOL_MAX`, and
-`DATABASE_CONNECT_TIMEOUT_SECONDS`; there is no production fallback to process memory or SQLite.
-A2A tasks, workflow events, checkpoints, approval reservations, and append-only audit records all
-use that pool. `/health/live` checks the process and `/health/ready` checks PostgreSQL and schema
-readiness.
-The migration job may use the separate `DATABASE_MIGRATION_URL`; with `DATABASE_APP_ROLE` it grants
-that runtime role only the table-specific DML privileges it needs. Production rejects in-process
-auto-migration so the serving credential does not require DDL rights.
-The built-in private operator API verifies a separately-audienced HS256 JWT with `sub`, `jti`,
-`exp`, and the `agent_operator` role. Its approve/deny endpoints require `If-Match` and the exact
-action digest; A2A callers cannot use their credentials on this route.
-`PUSH_NOTIFICATION_ENCRYPTION_KEY` is a separate Fernet key used to encrypt durable A2A webhook
-configuration. Generate it with
-`uv run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`.
-`DURABLE_STORAGE_ROOT` must be the S3-backed mount used only for immutable snapshots and artifacts;
-`LOCAL_WORKSPACE_ROOT` must be a separate local ephemeral path used by active processes.
-`CORE_AGENT_RUNTIME_MODE=with_terminal` enables the full local execution profile.
-`CORE_AGENT_RUNTIME_MODE=without_terminal` removes `core_terminal_exec` and `core_task_start` from
-both the Agent Card and model catalog while retaining task lifecycle, delegation, MCP,
-memory, and Python tools. `core_python_exec` is available in either mode when
-`LOCAL_APPROVAL_ENABLED=false`; Python code receives bounded `tools.call(...)` access to the same
-effective built-in/MCP catalog. Python may still use standard-library OS/process APIs, so
-`without_terminal` means that the terminal capability is absent, not that local code is sandboxed.
-`CORE_AGENT_ALLOWED_BUILTIN_TOOLS` can further remove individual tools but cannot widen the
-selected runtime mode or bypass the HITL gate.
-`CORE_AGENT_MAX_DEPTH` may lower delegation depth to `0` or `1`; `2` is the hard maximum, allowing
-main → child → grandchild while rejecting any further delegation.
-`core_artifact_save/load/list` give the model a named, versioned file store. Saving never
-overwrites, a `user:` prefix makes an artifact visible across that user's sessions, and
-`ARTIFACT_STORAGE_TYPE` selects `in-memory`, `s3` or `mongodb`. `core_agent_send_message`
-delegates one task to a remote A2A agent listed in `REMOTE_AGENTS`. The A2A adapter still stores
-each final result as a tenant-scoped, digest-verified Task Artifact; `MAX_RESPONSE_SIZE` bounds it
-and `MAX_CHUNK_SIZE` splits it into append chunks. Remove retired `core_artifact_put` and
-`core_artifact_get` names from an existing `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` value before startup.
-
-Streaming clients get ADK-shaped progress on the A2A 0.3 JSON-RPC binding at `/`: reasoning as a
-`TextPart` marked `adk_thought`, tool calls and results as `DataPart`s marked
-`adk_type=function_call|function_response`, cumulative text snapshots flagged `partial`, and exactly
-one terminal `final:true` frame. `A2A_STREAMING_BUFFER_SIZE` sets how much text accumulates between
-frames, and `A2A_STREAMING_ENABLED=false` turns intermediate frames off.
-
-OpenAI-compatible API (OpenAI, vLLM, Ollama, LM Studio, OpenRouter, or another compatible gateway):
-
-```bash
-LLM_API_FORMAT=openai \
-LLM_API_BASE=https://your-provider.example/v1 \
-LLM_MODEL=your-model \
-LLM_API_KEY=your-key \
-THINKING_LEVEL=high \
-uv run core-agent
-```
-
-Anthropic Messages API:
-
-```bash
-LLM_API_FORMAT=anthropic \
-LLM_API_BASE=https://api.anthropic.com/v1 \
-LLM_MODEL=your-model \
-LLM_API_KEY=your-key \
-THINKING_LEVEL=high \
-uv run core-agent
-```
-
-`THINKING_LEVEL` is optional; an empty value keeps the provider default. Supported values
-use the provider-neutral vocabulary `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`,
-but each provider/model may accept only a subset. OpenAI-compatible requests use
-`reasoning_effort`; Anthropic requests use adaptive thinking and `output_config.effort`.
-
-Long-term memory runs inside the agent process, so there is no second service to start and no
-separate storage mount. Development keeps the corpus in process memory and falls back to the
-built-in regex entity extractor. Production stores it in PostgreSQL and uses real embedding and NER
-providers:
-
-```bash
-CORE_AGENT_MEMORY=required \
-MEMORY_STORAGE_TYPE=postgres \
-EMBEDDING_API_BASE=https://embedding.example/v1 \
-EMBEDDING_MODEL=your-embedding-model \
-EMBEDDING_API_KEY=your-embedding-key \
-uv run core-agent
-```
-
-`LLM_ENDPOINT` overrides the complete request URL. Providers with custom authentication can use
-`LLM_HEADERS_JSON`; optional provider parameters belong in `LLM_EXTRA_BODY_JSON`. An API key is
-not required for a local OpenAI-compatible server:
-
-```bash
 LLM_API_FORMAT=openai \
 LLM_API_BASE=http://localhost:11434/v1 \
-LLM_MODEL=your-local-model \
+LLM_MODEL=model-name \
 uv run core-agent
 ```
 
-The A2A Agent Card is then available at `http://localhost:8000/.well-known/agent-card.json`.
-Terminal execution is trusted by default for the single-container deployment; set
-`CORE_AGENT_TRUST_TERMINAL=0` to require local-operator approval instead of automatic execution.
-The explicit test/development state profile may use SQLite/in-memory, and the development operator
-profile uses an in-process approve-all control-plane stub; the remote A2A caller
-cannot approve or deny. Local wait is exposed as A2A `WORKING`, while the private approval records
-and single-use execution reservations use the selected state backend.
+Ключ API для локальной конечной точки, совместимой с OpenAI, не обязателен. Для
+Anthropic используйте `LLM_API_FORMAT=anthropic` и соответствующие
+`LLM_API_BASE`, `LLM_MODEL`, `LLM_API_KEY`.
 
-`LOCAL_APPROVAL_DB_PATH` only configures the non-production SQLite test adapter.
-`LOCAL_APPROVAL_EXTENSION_URI` configures the optional informational A2A extension.
-`LOCAL_APPROVAL_ENABLED=false` fails protected actions closed.
-`CORE_AGENT_ENVIRONMENT=production` refuses to start with the approve-all stub; inject a real
-operator control plane first. Workspaces default to `/tmp/core-agent/runs` and can be moved with
-`LOCAL_WORKSPACE_ROOT`.
+Команда `core-agent` не загружает `.env` автоматически: при локальном
+запуске переменные должны быть переданы в окружение процесса. По умолчанию
+состояние в режиме разработки хранится в памяти процесса.
 
-For a local Docker smoke run, copy `.env.example` to `.env`, set the database, model credentials,
-and optional `AGENT_SYSTEM_PROMPT`, then run:
+После запуска:
+
+- карточка агента: <http://localhost:8000/.well-known/agent-card.json>;
+- проверка работоспособности: <http://localhost:8000/health/live>;
+- проверка готовности: <http://localhost:8000/health/ready>.
+
+Минимальный вызов через JSON-RPC 0.3:
 
 ```bash
+curl -sS http://localhost:8000/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 0.3' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "role": "user",
+        "messageId": "00000000-0000-4000-8000-000000000001",
+        "parts": [{"kind": "text", "text": "Кратко опиши Core Agent"}]
+      }
+    }
+  }'
+```
+
+### Docker Compose
+
+```bash
+cp .env.example .env
+# Заполните POSTGRES_PASSWORD и LLM_API_FORMAT/LLM_API_BASE/LLM_MODEL/LLM_API_KEY.
 docker compose up --build
 ```
 
-Follow the agent's structured runtime log with:
+Логи агента:
 
 ```bash
 docker compose logs -f agent
 ```
 
-The local Compose profile enables bounded, redacted content logging with
-`CORE_AGENT_LOG_CONTENT=true`, so each JSON line shows task transitions, model action states, tool
-names and arguments/results, approvals, subagent/background-task activity, and the public final
-answer. Set it to `false` for the production-safe metadata-only profile. `LOG_LEVEL`
-controls verbosity and `CORE_AGENT_LOG_MAX_CHARS` bounds each content field. With content logging
-enabled, provider-returned visible reasoning is recorded in a separate redacted `reasoning` field;
-provider-hidden/opaque thinking and credentials are never logged.
+Docker Compose запускает PostgreSQL/pgvector, одноразовое обновление схемы,
+Core Agent и Phoenix. Агент доступен на <http://localhost:8000>, Phoenix — на
+<http://localhost:6006>. Эта конфигурация использует
+`CORE_AGENT_ENVIRONMENT=development` и предназначена только для разработки.
 
-Compose waits for PostgreSQL, runs `core-agent-db migrate` as a one-shot job, then starts the agent
-with PostgreSQL persistence. It also starts the pinned Arize Phoenix UI at
-`http://localhost:6006`, stores Phoenix data in the `phoenix` PostgreSQL schema, and sends Core Agent
-traces to its OTLP/HTTP collector. `PHOENIX_PORT` changes the host UI port and
-`PHOENIX_DEFAULT_RETENTION_POLICY_DAYS` controls trace retention. The applications use the standard
-per-signal `OTEL_EXPORTER_OTLP_*_ENDPOINT` variables, so a production deployment can route traces,
-metrics, and logs to separate backends without sending unsupported signals to Phoenix.
-The local profile sets `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`, so Phoenix renders
-the agent system prompt, available tool schemas, model input/output, tool calls/results,
-provider-visible reasoning in the OpenInference reasoning content slot, and token usage as
-OpenInference AGENT/LLM/TOOL spans. Set it to `false` to verify the production-safe view;
-production must opt in only with explicit access, redaction, sampling, and retention policy. Raw
-provider-hidden/opaque reasoning and credentials are never captured.
+## Конфигурация
 
-Compose deliberately uses the development approve-all operator stub; a production deployment must
-replace that control plane and set `CORE_AGENT_ENVIRONMENT=production`.
+Основной шаблон находится в [`.env.example`](.env.example).
 
-The specification and acceptance suite are frozen together before implementation changes.
-`tests/test_spec_lock.py` also protects every specification file byte-for-byte.
+| Область | Основные переменные |
+|---|---|
+| Агент и HTTP | `AGENT_NAME`, `AGENT_SYSTEM_PROMPT`, `AGENT_URL`, `HOST`, `PORT` |
+| Модель | `LLM_API_FORMAT`, `LLM_API_BASE`, `LLM_MODEL`, `LLM_API_KEY`, `THINKING_LEVEL` |
+| Возможности | `CORE_AGENT_RUNTIME_MODE`, `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, `CORE_AGENT_MAX_DEPTH`, `CORE_AGENT_MAX_FAN_OUT` |
+| Лимиты | `RUNTIME_MAX_LLM_CALLS`, `CORE_AGENT_MAX_TOOL_CALLS`, `CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS` |
+| MCP, пакеты навыков и удалённые агенты | `MCP_URL`, `MCP_ALLOWED_SERVERS`, `MCP_ALLOWED_TOOLS`, `MCP_READ_ONLY_TOOLS`, `MCP_COLD_START_TIMEOUT_SECONDS`, `SKILLS_ROOT`, `CORE_AGENT_ALLOWED_SKILLS`, `REMOTE_AGENTS` |
+| Сохраняемое состояние | `SESSION_STORAGE_TYPE`, `TASK_STORAGE_TYPE`, `DATABASE_URL`, `DURABLE_STORAGE_ROOT`, `LOCAL_WORKSPACE_ROOT` |
+| Память и артефакты | `CORE_AGENT_MEMORY`, `MEMORY_STORAGE_TYPE`, `ARTIFACT_STORAGE_TYPE`, `EMBEDDING_API_BASE`, `EMBEDDING_MODEL`, `EMBEDDING_API_KEY`, `EMBEDDING_DIMENSION` |
+| Наблюдаемость | `ENABLE_OTEL`, `OTEL_EXPORTER_OTLP_*_ENDPOINT`, `CORE_AGENT_LOG_CONTENT` |
 
-## Built-in memory
+`AGENT_SYSTEM_PROMPT` — необязательный слой инструкций роли или профиля. Он не
+заменяет защищённые правила безопасности, платформы и ядра. `THINKING_LEVEL`
+также принадлежит конфигурации развёртывания и не управляется через `prompt`.
 
-The model calls six built-in tools: `core_memory_search`, `core_memory_read`, `core_memory_create`,
-`core_memory_update`, `core_memory_split`, and `core_memory_delete`. Markdown is canonical; BM25
-postings, embeddings, entities, and graph edges are derived state rebuilt from it. Documents are
-scoped to `(app_name, user_id)`; the model passes only `scope: "user"` or `scope: "session"` and the
-runtime derives the namespace, so no argument can address another user's memory. A committed body is
-limited to 200 lines: an oversized write is rejected with `MEMORY_FILE_TOO_LARGE` before publication
-and the model answers it with an explicit `core_memory_split`.
+### Требования к промышленному развёртыванию
 
-`CORE_AGENT_MEMORY` is `optional` by default; `required` fails startup without a working backend and
-`disabled` removes the tools from both the Agent Card and the model catalog. `MEMORY_STORAGE_TYPE`
-selects `in-memory` (default) or `postgres`, and production refuses `in-memory`. PostgreSQL uses the
-shared `DATABASE_URL` pool unless `MEMORY_POSTGRES_HOST` and the other `MEMORY_POSTGRES_*` parts
-supply a separate DSN. The vector channel needs all three of `EMBEDDING_API_BASE`, `EMBEDDING_MODEL`,
-and `EMBEDDING_API_KEY`; `EMBEDDING_DIMENSION` defaults to `768` and `MEMORY_SEARCH_LIMIT` defaults
-to `10`. The graph channel extracts entities with the agent's own model over
-`LLM_API_BASE`, sending a JSON schema per note and keeping only entities the note contains
-verbatim; the result is stored, so a restart costs no model calls, and a failed extraction
-leaves the note stored and findable. `MEMORY_PROVIDER_TIMEOUT_SECONDS` bounds both provider
-calls and `ENTITY_ID` adds the `X-Internal-Entity-ID` header to them. A missing or failing provider only marks
-that search channel degraded; it never fails the tool call.
+При запуске в промышленном режиме проверяются как минимум:
 
-## A2A binding
+- `CORE_AGENT_ENVIRONMENT=production`;
+- `SESSION_STORAGE_TYPE=postgres` и доступная строка подключения PostgreSQL
+  через `SESSION_DATABASE_URL`, `SESSION_POSTGRES_*`, `TASK_POSTGRES_URL`
+  или `DATABASE_URL`;
+- заранее применённая схема и `DATABASE_AUTO_MIGRATE=false`;
+- отдельные `DURABLE_STORAGE_ROOT` и `LOCAL_WORKSPACE_ROOT`, причём активный
+  рабочий каталог не расположен внутри постоянного хранилища;
+- действующий `PUSH_NOTIFICATION_ENCRYPTION_KEY`;
+- `MEMORY_STORAGE_TYPE=postgres`, если память не отключена.
 
-`core_agent.a2a_sdk.build_starlette_app` wraps a runtime handler with the official A2A 1.0
-HTTP+JSON routes, Agent Card, streaming, polling, subscription, and task operations. Production
-deployments should pass their authenticated call-context builder and durable SDK task store.
+Обновление и проверку схемы выполняет отдельная команда:
 
-Terminal commands, skills, and stdio-MCP processes run through
-`core_agent.execution.LocalTerminalBackend`. Each main or child agent gets a separate PTY,
-process group, clean environment, and workspace copy inside the single application container.
-These sessions are operationally separated but share one OS security boundary. An S3-backed mount
-is reserved for durable snapshots, checkpoints, and artifacts rather than active workspaces.
+```bash
+DATABASE_MIGRATION_URL=postgresql://... \
+uv run core-agent-db migrate
+
+DATABASE_URL=postgresql://... \
+uv run core-agent-db check
+```
+
+В промышленном режиме нет автоматического перехода на SQLite или хранение в
+памяти процесса.
+
+## Разработка и проверки
+
+Основные команды проверок:
+
+```bash
+uv sync --frozen
+uv run ruff check core_agent tests
+uv run python -m unittest discover -s tests -v
+uv build --no-sources
+```
+
+Интеграционные проверки PostgreSQL требуют `TEST_DATABASE_URL`. Автоматическая
+проверка поднимает PostgreSQL/pgvector, применяет схему, затем запускает
+статическую проверку, весь набор тестов, сборку пакета, проверку образа Docker и
+`docker compose config --quiet`.
+
+Отдельный сквозной тест:
+
+```bash
+uv run python -m unittest tests.test_end_to_end -v
+```
+
+## Ограничения v1
+
+- Промышленный выпуск пока блокируют четыре требования со статусом `partial`:
+  подтверждение продления аренды во время долгого вызова модели, инструмента или
+  ожидания дочерней задачи; сохранение крупного результата инструмента после
+  перезапуска при хранении в PostgreSQL; полная рекурсивная отмена; единый
+  идентификатор дочерней задачи во всех представлениях.
+- В v1 нет выбора между несколькими поставщиками модели, автоматического
+  перехода на запасного поставщика и продолжения уже запущенного локального
+  процесса после аварийного завершения.
+- Операторское подтверждение действий не входит в текущий профиль выпуска:
+  запрет политики окончателен, полноценный механизм операторского подтверждения
+  не подключён.
+- Возможности MCP `resources`, `prompts`, `sampling`, `elicitation` и
+  удалённый реестр пакетов навыков остаются запланированными.
+- Отдельные рабочие каталоги и группы процессов обеспечивают разделение
+  владения и жизненного цикла, но весь управляемый контейнер остаётся одной
+  границей безопасности на уровне операционной системы.
+
+## Документация
+
+- [Навигатор спецификации](spec/README.md)
+- [Публичный контракт](spec/public-contract.md)
+- [Архитектура](spec/architecture.md)
+- [Цикл выполнения и восстановление](spec/runtime.md)
+- [Фоновые задачи и делегирование](spec/tasks-and-delegation.md)
+- [Профиль выпуска v1](spec/releases/v1.md)
+- [Матрица реализации](spec/implementation-status.md)
+- [Инструкция для разработчиков-агентов](AGENTS.md)

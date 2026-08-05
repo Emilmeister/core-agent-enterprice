@@ -13,8 +13,8 @@
 | ID | Требование v1 | Доказательство | Статус |
 |---|---|---|---|
 | A2A-01 | Agent Card и version negotiation без собственного расширения протокола | `test_a2a_config`, `test_advanced_protocols` | implemented |
-| A2A-02 | send/stream/get/list/subscribe/cancel используют одну durable Task | `test_end_to_end`, PostgreSQL A2A reconciliation | implemented |
-| A2A-03 | push notification at-least-once и deduplication | encrypted push retry/restart integration | implemented |
+| A2A-02 | send/stream/get/list/subscribe/cancel используют одну durable Task | active/passive subscription ordering, lease-loss, late-cancel и PostgreSQL terminal reconciliation tests | implemented |
+| A2A-03 | push notification at-least-once и deduplication | encrypted push retry/restart и atomic recovery reconciliation tests | implemented |
 | A2A-04 | active Task принимает durable/idempotent follow-up Messages и доставляет их model loop на safe boundary без completion race | runtime concurrency, A2A HTTP E2E и PostgreSQL inbox/completion-gate tests | implemented |
 | A2A-05 | streaming публикует reasoning, function_call/function_response и кумулятивные partial-снимки, ровно один `final:true`, а partial-кадры не попадают в durable history и push | ADK stream shape E2E, transient-history и push suppression tests | implemented |
 | CFG-01 | Platform/Agent/Run разделены, capability intersection fail closed | effective-config contract suite | implemented |
@@ -24,7 +24,7 @@
 | KRN-02 | child наследует kernel и не расширяет policy | delegation E2E and exact catalog tests | implemented |
 | KRN-03 | пустой profile не дублирует user prompt; conditional prompt/tool guidance не обещает отсутствующие capabilities | kernel and built-in description contract tests | implemented |
 | RUN-01 | сериализуемая state machine и irreversible terminal states | workflow transition suite | implemented |
-| RUN-02 | lease heartbeat, checkpoint replay и recovery безопасной границы | long-call heartbeat, live-lease recovery exclusion, post-lock final transition fencing and PostgreSQL process-state-loss tests; PostgreSQL long model/tool/join proof отсутствует | partial |
+| RUN-02 | lease heartbeat, checkpoint replay и recovery безопасной границы | automatic root recovery, graceful shutdown, single-attempt lost claim, live-lease exclusion, post-lock final fencing and PostgreSQL process-state-loss tests; PostgreSQL long model/tool/join proof отсутствует | partial |
 | RUN-04 | hard budget резервирует финальный turn; каждый provider/tool attempt атомарно учитывается, exhausted tools не dispatch-ятся, а truthful partial result завершается с `complete=false` | retry/crash markers, atomic PostgreSQL model/tool charges, shared ledger/admission and live/recovered A2A partial tests | implemented |
 | RUN-03 | ambiguous side effect переходит в reconciliation без retry или cancel masking | mutating exception/resume/cancel regressions and dispatched-side-effect restart chaos test | implemented |
 | CTX-01 | base/working budget и compaction 90% до 10–15% | context budget boundary tests | implemented |
@@ -41,6 +41,7 @@
 | SUB-03 | balanced decision rule выбирает materially useful parallel/isolated/verifiable outcome, сохраняет bounded method autonomy при exact capabilities и требует оба положительных child budget limits | delegation kernel/description/schema/runtime validation contract tests | implemented |
 | ART-01 | артефакты именованные, scoped и версионируемые внутри агента; save не перезаписывает, load проверяет digest/size/metadata, backends не управляют схемой | artifact service and tool contract suite | implemented |
 | RMT-01 | реестр `REMOTE_AGENTS` fail-open при недоступном peer, tool скрыт без настроенных агентов, downstream получает только allowlist заголовков, прогресс ретранслируется, сбой возвращается tool result | remote agent registry, forwarded header and send_message E2E | implemented |
+| MCP-01 | новый запрос durable ожидает transient cold start Streamable HTTP MCP до общего для run deadline, изолирует и очищает session, различает permanent failures и не расходует model/tool budget | transport/config, runtime и A2A E2E tests; PostgreSQL restart, cross-worker cancel, reconnect catalog/deadline, required failure и atomic terminal-disposition tests | implemented |
 | TER-01 | owned PTY/process groups/workspaces и bounded output | local terminal integration suite | implemented |
 | TER-02 | immutable base snapshot, conflict-aware merge и S3 manifest | content-addressed snapshot/merge tests | implemented |
 | PY-01 | bounded Python process вызывает exact built-in/MCP tools через policy/budget/audit/OTel broker | Python broker E2E, mode gate and process failure tests | implemented |

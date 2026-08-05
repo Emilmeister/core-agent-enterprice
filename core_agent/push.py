@@ -62,7 +62,11 @@ class PostgresPushNotificationConfigStore(PushNotificationConfigStore):
     def __init__(self, database, encryption_key):
         self.database = database
         try:
-            self._cipher = Fernet(encryption_key.encode() if isinstance(encryption_key, str) else encryption_key)
+            self._cipher = Fernet(
+                encryption_key.encode()
+                if isinstance(encryption_key, str)
+                else encryption_key
+            )
         except (TypeError, ValueError):
             raise CoreError("PUSH_ENCRYPTION_KEY_INVALID") from None
 
@@ -93,7 +97,14 @@ class PostgresPushNotificationConfigStore(PushNotificationConfigStore):
                    ON CONFLICT (task_id, config_id, owner, tenant_id) DO UPDATE SET
                      encrypted_payload = EXCLUDED.encrypted_payload,
                      updated_at = EXCLUDED.updated_at""",
-                (task_id, stored.id, owner, tenant, self._serialize(stored), time.time()),
+                (
+                    task_id,
+                    stored.id,
+                    owner,
+                    tenant,
+                    self._serialize(stored),
+                    time.time(),
+                ),
             )
         config.CopyFrom(stored)
 
@@ -173,29 +184,57 @@ class DurablePushNotificationSender(PushNotificationSender):
         return key, payload
 
     def _enqueue(self, task_id, configs, event_key, payload):
-        now = time.time()
         with self.database.transaction() as connection:
-            for config in configs:
-                delivery_id = hashlib.sha256(
-                    f"{task_id}\0{config.id}\0{event_key}".encode()
-                ).hexdigest()
-                connection.execute(
-                    """INSERT INTO core_push_deliveries
-                       (id, task_id, config_id, event_key, payload, state, attempts,
-                        available_at, created_at, updated_at)
-                       VALUES (%s, %s, %s, %s, %s, 'pending', 0, %s, %s, %s)
-                       ON CONFLICT (task_id, config_id, event_key) DO NOTHING""",
-                    (
-                        delivery_id,
-                        task_id,
-                        config.id,
-                        event_key,
-                        Jsonb(payload),
-                        now,
-                        now,
-                        now,
-                    ),
-                )
+            self._enqueue_with_connection(
+                connection,
+                task_id,
+                (config.id for config in configs),
+                event_key,
+                payload,
+            )
+
+    @staticmethod
+    def _enqueue_with_connection(connection, task_id, config_ids, event_key, payload):
+        now = time.time()
+        for config_id in config_ids:
+            delivery_id = hashlib.sha256(
+                f"{task_id}\0{config_id}\0{event_key}".encode()
+            ).hexdigest()
+            connection.execute(
+                """INSERT INTO core_push_deliveries
+                   (id, task_id, config_id, event_key, payload, state, attempts,
+                    available_at, created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, 'pending', 0, %s, %s, %s)
+                   ON CONFLICT (task_id, config_id, event_key) DO NOTHING""",
+                (
+                    delivery_id,
+                    task_id,
+                    config_id,
+                    event_key,
+                    Jsonb(payload),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+    def enqueue_notification(self, task_id, event, *, owner, tenant, connection):
+        if self._is_transient_snapshot(event):
+            return
+        configs = connection.execute(
+            """SELECT config_id FROM core_push_notification_configs
+               WHERE task_id = %s AND owner = %s AND tenant_id = %s
+               ORDER BY config_id""",
+            (task_id, owner, tenant),
+        ).fetchall()
+        event_key, payload = self._event(event)
+        self._enqueue_with_connection(
+            connection,
+            task_id,
+            (config["config_id"] for config in configs),
+            event_key,
+            payload,
+        )
 
     def _claim(self, limit):
         now = time.time()

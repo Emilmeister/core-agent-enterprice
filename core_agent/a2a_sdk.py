@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from google.protobuf import json_format
 from google.protobuf.struct_pb2 import Value
 
-from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.agent_execution import AgentExecutor
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.request_handlers.request_handler import (
     validate,
@@ -30,8 +30,10 @@ from a2a.types import (
     Part as SdkPart,
     Role as SdkRole,
     Task as SdkTask,
+    SubscribeToTaskRequest,
     TaskState as SdkTaskState,
     TaskStatus as SdkTaskStatus,
+    TaskStatusUpdateEvent as SdkTaskStatusUpdateEvent,
 )
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -60,7 +62,6 @@ from .streaming import (
     NullStreamPublisher,
     StreamBuffer,
 )
-
 
 
 A2A_TERMINAL_STATES = {
@@ -135,6 +136,7 @@ def public_base_url(request):
     the deployment cannot know its public address by itself. Returns None when the
     headers carry nothing usable, so the caller keeps the configured value.
     """
+
     def first(name):
         return (request.headers.get(name) or "").split(",")[0].strip()
 
@@ -191,7 +193,9 @@ def _tolerant_envelope(endpoint):
         cleaned = _strip_envelope(payload)
         if cleaned == payload:
             return await endpoint(Request(request.scope, _replay(body)))
-        return await endpoint(Request(request.scope, _replay(json.dumps(cleaned).encode())))
+        return await endpoint(
+            Request(request.scope, _replay(json.dumps(cleaned).encode()))
+        )
 
     return wrapper
 
@@ -362,16 +366,20 @@ class CoreAgentExecutor(AgentExecutor):
         handler,
         cancel_handler,
         resume_handler,
+        cancel_signal=None,
         stream_buffer_size=DEFAULT_BUFFER_SIZE,
         streaming_enabled=True,
         max_chunk_size=0,
     ):
         self.handler = handler
         self.cancel_handler = cancel_handler
+        self.cancel_signal = cancel_signal
         self.resume_handler = resume_handler
         self.stream_buffer_size = stream_buffer_size
         self.streaming_enabled = streaming_enabled
         self.max_chunk_size = max_chunk_size
+        self._cancel_publications = {}
+        self._active_executions = set()
 
     @staticmethod
     def _from_sdk_message(message, *, context_id=None):
@@ -429,45 +437,88 @@ class CoreAgentExecutor(AgentExecutor):
             if self.streaming_enabled
             else NullStreamPublisher()
         )
+        self._active_executions.add(context.task_id)
         try:
             if context.message is None and context.current_task is not None:
-                artifact = await asyncio.to_thread(
-                    self.resume_handler, context, publisher
+                worker = asyncio.create_task(
+                    asyncio.to_thread(self.resume_handler, context, publisher)
                 )
             else:
                 message = self._message(context)
                 command = parse_run_request(message)
-                artifact = await asyncio.to_thread(
-                    self.handler, command, context, publisher
+                worker = asyncio.create_task(
+                    asyncio.to_thread(self.handler, command, context, publisher)
                 )
-            if not isinstance(artifact, Artifact):
-                artifact = Artifact.text(str(artifact))
-            final_text = "\n".join(str(part.data) for part in artifact.parts)
-            chunks = _chunk(final_text, self.max_chunk_size)
-            for index, chunk in enumerate(chunks):
-                await updater.add_artifact(
-                    [SdkPart(text=chunk, media_type=artifact.media_type)],
-                    artifact_id=artifact.id,
-                    metadata={
-                        "digest": artifact.digest,
-                        "size": artifact.size,
-                        "provenance": artifact.provenance,
-                    },
-                    append=index > 0 or None,
-                    last_chunk=index == len(chunks) - 1,
-                )
+            try:
+                artifact = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                publication = self._cancel_publications.get(context.task_id)
+                if publication is None:
+                    raise
+                try:
+                    artifact = await worker
+                finally:
+                    await publication.wait()
             publisher.closed = True
-            await updater.complete(
-                message=updater.new_agent_message(
-                    [SdkPart(text=final_text, media_type=artifact.media_type)]
-                )
-                if final_text
-                else None
+            artifact_publication = asyncio.create_task(
+                self._publish_artifact(updater, artifact)
             )
+            try:
+                await asyncio.shield(artifact_publication)
+            except asyncio.CancelledError:
+                publication = self._cancel_publications.get(context.task_id)
+                if publication is None:
+                    artifact_publication.cancel()
+                    await asyncio.gather(artifact_publication, return_exceptions=True)
+                    raise
+                try:
+                    await artifact_publication
+                finally:
+                    await publication.wait()
         except Exception as error:
             publisher.closed = True
+            code = getattr(error, "code", None)
+            if code == "LEASE_LOST" or (
+                code == "WORKER_STOPPED"
+                and getattr(error, "data", {}).get("workflow_admitted")
+            ):
+                return
+            if code == "TASK_CANCELLED":
+                try:
+                    await updater.cancel()
+                except RuntimeError:
+                    pass
+                return
             await self._publish_failure(updater, publisher, error)
             raise
+        finally:
+            self._active_executions.discard(context.task_id)
+            self._cancel_publications.pop(context.task_id, None)
+
+    async def _publish_artifact(self, updater, artifact):
+        if not isinstance(artifact, Artifact):
+            artifact = Artifact.text(str(artifact))
+        final_text = "\n".join(str(part.data) for part in artifact.parts)
+        chunks = _chunk(final_text, self.max_chunk_size)
+        for index, chunk in enumerate(chunks):
+            await updater.add_artifact(
+                [SdkPart(text=chunk, media_type=artifact.media_type)],
+                artifact_id=artifact.id,
+                metadata={
+                    "digest": artifact.digest,
+                    "size": artifact.size,
+                    "provenance": artifact.provenance,
+                },
+                append=index > 0 or None,
+                last_chunk=index == len(chunks) - 1,
+            )
+        await updater.complete(
+            message=updater.new_agent_message(
+                [SdkPart(text=final_text, media_type=artifact.media_type)]
+            )
+            if final_text
+            else None
+        )
 
     @staticmethod
     async def _publish_failure(updater, publisher, error):
@@ -486,8 +537,43 @@ class CoreAgentExecutor(AgentExecutor):
             return
 
     async def cancel(self, context, event_queue):
-        await asyncio.to_thread(self.cancel_handler, context)
-        await TaskUpdater(event_queue, context.task_id, context.context_id).cancel()
+        publication = None
+        if context.task_id in self._active_executions:
+            publication = self._cancel_publications.setdefault(
+                context.task_id, asyncio.Event()
+            )
+        updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+        try:
+            if self.cancel_signal is not None:
+                self.cancel_signal(context)
+            try:
+                await asyncio.to_thread(self.cancel_handler, context)
+            except Exception as error:
+                if getattr(error, "code", None) != "TASK_NOT_CANCELABLE":
+                    raise
+                if publication is None:
+                    await self._restore_terminal(context, updater)
+                return
+            await updater.cancel()
+        finally:
+            if publication is not None:
+                publication.set()
+
+    async def _restore_terminal(self, context, updater):
+        publisher = NullStreamPublisher()
+        try:
+            artifact = await asyncio.to_thread(self.resume_handler, context, publisher)
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if code == "TASK_CANCELLED":
+                try:
+                    await updater.cancel()
+                except RuntimeError:
+                    pass
+            elif code not in {"LEASE_LOST", "WORKER_STOPPED"}:
+                await self._publish_failure(updater, publisher, error)
+            return
+        await self._publish_artifact(updater, artifact)
 
 
 class TransientStatusTaskStore:
@@ -582,23 +668,68 @@ class CoreRequestHandler(DefaultRequestHandler):
     async def on_cancel_task(self, params, context):
         return await super().on_cancel_task(params, context)
 
-    async def resume_task(self, task_id, context_id, call_context):
-        active_task = await self._active_task_registry.get_or_create(
-            task_id,
-            context_id=context_id,
-            call_context=call_context,
-            create_task_if_missing=False,
-        )
-        result = await active_task.enqueue_request(
-            RequestContext(
-                call_context=call_context,
-                task_id=task_id,
-                context_id=context_id,
-            )
-        )
-        if self._push_sender and result is not None:
-            await self._push_sender.send_notification(task_id, result)
-        return result
+    @validate_request_params
+    @validate(
+        lambda self: self._agent_card.capabilities.streaming,
+        "Streaming is not supported by the agent",
+    )
+    async def on_subscribe_to_task(self, params: SubscribeToTaskRequest, context):
+        task = await self.task_store.get(params.id, context)
+        if task is None:
+            raise TaskNotFoundError(message=f"Task {params.id} not found")
+        existing = await self._active_task_registry.get(params.id)
+        live_stream = None
+        next_live = None
+        if existing is not None and task.status.state not in A2A_TERMINAL_STATES:
+            live_stream = existing.subscribe(include_initial_task=False)
+            next_live = asyncio.create_task(anext(live_stream))
+            await asyncio.sleep(0)
+        previous = task.SerializeToString(deterministic=True)
+        try:
+            yield task
+            if task.status.state in A2A_TERMINAL_STATES:
+                return
+            while True:
+                if next_live is None:
+                    await asyncio.sleep(0.25)
+                else:
+                    done, _pending = await asyncio.wait((next_live,), timeout=0.25)
+                    if done:
+                        try:
+                            event = next_live.result()
+                        except (StopAsyncIteration, InvalidParamsError):
+                            next_live = None
+                        else:
+                            next_live = None
+                            terminal = (
+                                isinstance(event, SdkTask)
+                                and event.status.state in A2A_TERMINAL_STATES
+                            ) or (
+                                isinstance(event, SdkTaskStatusUpdateEvent)
+                                and event.status.state in A2A_TERMINAL_STATES
+                            )
+                            if not terminal:
+                                next_live = asyncio.create_task(anext(live_stream))
+                            yield event
+                            if terminal:
+                                return
+                task = await self.task_store.get(params.id, context)
+                if task is None:
+                    raise TaskNotFoundError(message=f"Task {params.id} not found")
+                current = task.SerializeToString(deterministic=True)
+                if current == previous:
+                    continue
+                previous = current
+                if next_live is None or task.status.state in A2A_TERMINAL_STATES:
+                    yield task
+                    if task.status.state in A2A_TERMINAL_STATES:
+                        return
+        finally:
+            if next_live is not None:
+                next_live.cancel()
+                await asyncio.gather(next_live, return_exceptions=True)
+            if live_stream is not None:
+                await live_stream.aclose()
 
 
 def build_starlette_app(
@@ -606,6 +737,7 @@ def build_starlette_app(
     agent_card,
     handler,
     cancel_handler,
+    cancel_signal=None,
     base_url,
     derive_base_url=False,
     resume_handler,
@@ -624,8 +756,9 @@ def build_starlette_app(
     request_handler = CoreRequestHandler(
         CoreAgentExecutor(
             handler,
-                    cancel_handler,
-                resume_handler,
+            cancel_handler,
+            resume_handler,
+            cancel_signal=cancel_signal,
             stream_buffer_size=stream_buffer_size,
             streaming_enabled=streaming_enabled,
             max_chunk_size=max_chunk_size,

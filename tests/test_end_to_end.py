@@ -14,11 +14,26 @@ from unittest.mock import patch
 
 import httpx
 from a2a.client import ClientConfig, ClientFactory
-from a2a.types import GetTaskRequest, Role, SendMessageRequest, TaskState
+from a2a.server.context import ServerCallContext
+from a2a.types import (
+    CancelTaskRequest,
+    GetTaskRequest,
+    Role,
+    SendMessageRequest,
+    SubscribeToTaskRequest,
+    Task,
+    TaskState,
+    TaskStatus,
+)
 from a2a.utils.constants import TransportProtocol
 
 from core_agent.app import create_app
+from core_agent.a2a import AgentCard, Artifact
+from core_agent.a2a_sdk import build_starlette_app
+from core_agent.errors import CoreError
+from core_agent.mcp import InMemoryMcpConnector
 from core_agent.model import CompatibleHttpModel
+from core_agent.model import ModelResponse, ScriptedModel
 
 
 def _tool(body, internal_name, arguments):
@@ -427,9 +442,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         provenance = task.artifacts[0].metadata["provenance"]
         self.assertTrue(provenance["complete"])
         self.assertEqual(provenance["completion_reason"], "completed")
-        self.assertEqual(
-            provenance["usage"], {"model_turns": 2.0, "tool_calls": 1.0}
-        )
+        self.assertEqual(provenance["usage"], {"model_turns": 2.0, "tool_calls": 1.0})
         self.assertEqual(provenance["shared_budget"]["scope"], "root")
         self.assertEqual(
             provenance["shared_budget"]["used"],
@@ -452,9 +465,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(provenance["complete"])
         self.assertEqual(provenance["completion_reason"], "budget_exhausted")
         self.assertEqual(provenance["exhausted_dimension"], "model_turns")
-        self.assertEqual(
-            provenance["usage"], {"model_turns": 1.0, "tool_calls": 0.0}
-        )
+        self.assertEqual(provenance["usage"], {"model_turns": 1.0, "tool_calls": 0.0})
         self.assertEqual(
             provenance["shared_budget"]["used"],
             {"model_turns": 1.0, "tool_calls": 0.0},
@@ -475,7 +486,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://agent.test",
-                    ) as http:
+        ) as http:
             client = await ClientFactory(
                 ClientConfig(
                     streaming=False,
@@ -498,9 +509,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             followup.message.context_id = submitted.context_id
             followup.message.role = Role.ROLE_USER
             followup.message.parts.add().text = "LIVE_STEERING_FOLLOWUP"
-            accepted = [
-                event async for event in client.send_message(followup)
-            ][-1].task
+            accepted = [event async for event in client.send_message(followup)][-1].task
             self.assertEqual(accepted.id, submitted.id)
             ModelHandler.live_steering_release.set()
             task = accepted
@@ -514,6 +523,585 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             [part.text for artifact in task.artifacts for part in artifact.parts],
             ["live-steering-ok"],
         )
+
+    async def test_a2a_followup_and_cancel_work_during_mcp_cold_start(self):
+        started = threading.Event()
+
+        class StartingConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                started.set()
+                cancel_event.wait(2)
+                raise CoreError("TASK_CANCELLED")
+
+        model = ScriptedModel([ModelResponse(message="must not run")])
+        model.model = "cold-start-e2e-model"
+        with patch.dict(
+            os.environ,
+            {"MCP_URL": "http://127.0.0.1:1/mcp", "CORE_AGENT_MEMORY": "disabled"},
+        ):
+            app = create_app(
+                model=model,
+                mcp_connector=StartingConnector(),
+                base_url="http://cold-start-agent.test",
+            )
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://cold-start-agent.test"
+            ) as http:
+                client = await ClientFactory(
+                    ClientConfig(
+                        streaming=False,
+                        httpx_client=http,
+                        supported_protocol_bindings=[TransportProtocol.HTTP_JSON],
+                    )
+                ).create_from_url("http://cold-start-agent.test")
+                initial = SendMessageRequest()
+                initial.configuration.return_immediately = True
+                initial.message.message_id = str(uuid.uuid4())
+                initial.message.role = Role.ROLE_USER
+                initial.message.parts.add().text = "COLD_START_E2E"
+                submitted = [event async for event in client.send_message(initial)][
+                    -1
+                ].task
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                working = await client.get_task(GetTaskRequest(id=submitted.id))
+                self.assertEqual(
+                    TaskState.Name(working.status.state), "TASK_STATE_WORKING"
+                )
+
+                followup = SendMessageRequest()
+                followup.message.message_id = str(uuid.uuid4())
+                followup.message.task_id = submitted.id
+                followup.message.context_id = submitted.context_id
+                followup.message.role = Role.ROLE_USER
+                followup.message.parts.add().text = "COLD_START_FOLLOWUP"
+                accepted = [event async for event in client.send_message(followup)][
+                    -1
+                ].task
+                self.assertEqual(accepted.id, submitted.id)
+
+                cancelled = await client.cancel_task(CancelTaskRequest(id=submitted.id))
+                self.assertEqual(cancelled.id, submitted.id)
+                self.assertEqual(
+                    TaskState.Name(cancelled.status.state), "TASK_STATE_CANCELED"
+                )
+        finally:
+            app.state.close()
+        self.assertEqual(model.calls, ())
+
+    async def test_shutdown_during_admitted_mcp_discovery_stays_recoverable(self):
+        started = threading.Event()
+
+        class StartingConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                started.set()
+                cancel_event.wait(2)
+                raise CoreError(cancel_event.error_code)
+
+        model = ScriptedModel([ModelResponse(message="must not run")])
+        model.model = "shutdown-discovery-model"
+        with patch.dict(
+            os.environ,
+            {"MCP_URL": "http://127.0.0.1:1/mcp", "CORE_AGENT_MEMORY": "disabled"},
+        ):
+            app = create_app(
+                model=model,
+                mcp_connector=StartingConnector(),
+                base_url="http://shutdown-discovery.test",
+            )
+        handler = app.state.a2a_request_handler
+        context = ServerCallContext()
+        request = SendMessageRequest()
+        request.configuration.return_immediately = True
+        request.message.message_id = str(uuid.uuid4())
+        request.message.role = Role.ROLE_USER
+        request.message.parts.add().text = "shutdown during MCP discovery"
+        submitted = await handler.on_message_send(request, context)
+        self.assertTrue(await asyncio.to_thread(started.wait, 1))
+
+        await asyncio.to_thread(app.state.close)
+        deadline = time.monotonic() + 1
+        while True:
+            persisted = await handler.task_store.get(submitted.id, context)
+            if (
+                persisted.status.state != TaskState.TASK_STATE_WORKING
+                or time.monotonic() >= deadline
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual(persisted.status.state, TaskState.TASK_STATE_WORKING)
+        workflow = app.state.core_agent.workflow_store.lookup_task(submitted.id)
+        self.assertEqual(workflow.state, "RUNNING")
+        self.assertEqual(model.calls, ())
+
+    async def test_a2a_immediate_cancel_waits_for_durable_admission(self):
+        entered_handler = threading.Event()
+        release_handler = threading.Event()
+        model = ScriptedModel([ModelResponse(message="must not run")])
+        model.model = "immediate-cancel-model"
+        with patch.dict(
+            os.environ,
+            {"MCP_URL": "http://127.0.0.1:1/mcp", "CORE_AGENT_MEMORY": "disabled"},
+        ):
+            app = create_app(
+                model=model,
+                mcp_connector=InMemoryMcpConnector(catalogs={"mcp": {}}),
+                base_url="http://immediate-cancel.test",
+            )
+        original_run = app.state.core_agent.run
+
+        def delayed_run(*args, **kwargs):
+            entered_handler.set()
+            release_handler.wait(5)
+            return original_run(*args, **kwargs)
+
+        app.state.core_agent.run = delayed_run
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://immediate-cancel.test"
+            ) as http:
+                client = await ClientFactory(
+                    ClientConfig(
+                        streaming=False,
+                        httpx_client=http,
+                        supported_protocol_bindings=[TransportProtocol.HTTP_JSON],
+                    )
+                ).create_from_url("http://immediate-cancel.test")
+                initial = SendMessageRequest()
+                initial.configuration.return_immediately = True
+                initial.message.message_id = str(uuid.uuid4())
+                initial.message.role = Role.ROLE_USER
+                initial.message.parts.add().text = "IMMEDIATE_CANCEL_E2E"
+                submitted = [event async for event in client.send_message(initial)][
+                    -1
+                ].task
+                self.assertTrue(await asyncio.to_thread(entered_handler.wait, 1))
+
+                cancellation = asyncio.create_task(
+                    client.cancel_task(CancelTaskRequest(id=submitted.id))
+                )
+                await asyncio.sleep(2.1)
+                self.assertFalse(cancellation.done())
+                release_handler.set()
+                cancelled = await cancellation
+
+                self.assertEqual(cancelled.id, submitted.id)
+                self.assertEqual(
+                    TaskState.Name(cancelled.status.state), "TASK_STATE_CANCELED"
+                )
+        finally:
+            release_handler.set()
+            app.state.close()
+        self.assertEqual(model.calls, ())
+
+    async def test_fresh_subscription_is_passive_and_observes_durable_updates(self):
+        resume_calls = []
+
+        def resume(context, _publisher):
+            resume_calls.append(context.task_id)
+            return Artifact.text("unexpected resume")
+
+        app = build_starlette_app(
+            agent_card=AgentCard.minimal("subscription-test"),
+            handler=lambda *_args: Artifact.text("unused"),
+            cancel_handler=lambda _context: None,
+            base_url="http://subscription.test",
+            resume_handler=resume,
+            followup_handler=lambda *_args: None,
+        )
+        handler = app.state.a2a_request_handler
+        context = ServerCallContext()
+        waiting = Task(
+            id="passive-subscription",
+            context_id="passive-context",
+            status=TaskStatus(state=TaskState.TASK_STATE_INPUT_REQUIRED),
+        )
+        await handler.task_store.save(waiting, context)
+
+        stream = handler.on_subscribe_to_task(
+            SubscribeToTaskRequest(id=waiting.id), context
+        )
+        first = await anext(stream)
+        self.assertEqual(first.status.state, TaskState.TASK_STATE_INPUT_REQUIRED)
+        await stream.aclose()
+        await asyncio.sleep(0.05)
+        self.assertEqual(resume_calls, [])
+
+        working = Task(
+            id="recovered-subscription",
+            context_id="recovered-context",
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        )
+        await handler.task_store.save(working, context)
+        stream = handler.on_subscribe_to_task(
+            SubscribeToTaskRequest(id=working.id), context
+        )
+        first = await anext(stream)
+        self.assertEqual(first.status.state, TaskState.TASK_STATE_WORKING)
+        completed = Task()
+        completed.CopyFrom(working)
+        completed.status.state = TaskState.TASK_STATE_COMPLETED
+        await handler.task_store.save(completed, context)
+        terminal = await asyncio.wait_for(anext(stream), timeout=1)
+        await stream.aclose()
+
+        self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
+        self.assertEqual(resume_calls, [])
+
+    async def test_active_subscription_starts_with_persisted_task_and_stops_at_terminal(
+        self,
+    ):
+        app = build_starlette_app(
+            agent_card=AgentCard.minimal("active-subscription-test"),
+            handler=lambda *_args: Artifact.text("unused"),
+            cancel_handler=lambda _context: None,
+            base_url="http://active-subscription.test",
+            resume_handler=lambda *_args: Artifact.text("unused"),
+            followup_handler=lambda *_args: None,
+        )
+        handler = app.state.a2a_request_handler
+        context = ServerCallContext()
+        working = Task(
+            id="active-subscription",
+            context_id="active-context",
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        )
+        completed = Task()
+        completed.CopyFrom(working)
+        completed.status.state = TaskState.TASK_STATE_COMPLETED
+        trailing = Task()
+        trailing.CopyFrom(working)
+        include_initial = []
+
+        class Active:
+            async def subscribe(self, *, include_initial_task):
+                include_initial.append(include_initial_task)
+                yield completed
+                yield trailing
+
+        await handler.task_store.save(working, context)
+        handler._active_task_registry._active_tasks[working.id] = Active()
+        stream = handler.on_subscribe_to_task(
+            SubscribeToTaskRequest(id=working.id), context
+        )
+
+        first = await anext(stream)
+        terminal = await anext(stream)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
+        self.assertEqual(first.status.state, TaskState.TASK_STATE_WORKING)
+        self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
+        self.assertEqual(include_initial, [False])
+
+    async def test_active_subscription_recovers_terminal_completed_before_attach(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def complete(*_args):
+            entered.set()
+            release.wait(1)
+            return Artifact.text("completed before attach")
+
+        app = build_starlette_app(
+            agent_card=AgentCard.minimal("active-subscription-race-test"),
+            handler=complete,
+            cancel_handler=lambda _context: None,
+            base_url="http://active-subscription-race.test",
+            resume_handler=complete,
+            followup_handler=lambda *_args: None,
+        )
+        handler = app.state.a2a_request_handler
+        context = ServerCallContext()
+        request = SendMessageRequest()
+        request.configuration.return_immediately = True
+        request.message.message_id = str(uuid.uuid4())
+        request.message.role = Role.ROLE_USER
+        request.message.parts.add().text = "complete before subscribe attaches"
+        submitted = await handler.on_message_send(request, context)
+        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        active = await handler._active_task_registry.get(submitted.id)
+
+        stream = handler.on_subscribe_to_task(
+            SubscribeToTaskRequest(id=submitted.id), context
+        )
+        initial = await anext(stream)
+        release.set()
+        await asyncio.wait_for(active._is_finished.wait(), 1)
+        events = []
+        while True:
+            event = await asyncio.wait_for(anext(stream), 1)
+            events.append(event)
+            if (
+                isinstance(event, Task)
+                and event.status.state
+                in {
+                    TaskState.TASK_STATE_COMPLETED,
+                    TaskState.TASK_STATE_FAILED,
+                    TaskState.TASK_STATE_CANCELED,
+                    TaskState.TASK_STATE_REJECTED,
+                }
+            ) or (
+                hasattr(event, "status")
+                and event.status.state
+                in {
+                    TaskState.TASK_STATE_COMPLETED,
+                    TaskState.TASK_STATE_FAILED,
+                    TaskState.TASK_STATE_CANCELED,
+                    TaskState.TASK_STATE_REJECTED,
+                }
+            ):
+                break
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
+        self.assertEqual(initial.status.state, TaskState.TASK_STATE_WORKING)
+        self.assertEqual(events[-1].status.state, TaskState.TASK_STATE_COMPLETED)
+        persisted = await handler.task_store.get(submitted.id, context)
+        self.assertEqual(
+            persisted.artifacts[0].parts[0].text, "completed before attach"
+        )
+
+    async def test_active_subscription_observes_terminal_from_recovery_worker(self):
+        def hand_off(*_args):
+            raise CoreError("LEASE_LOST")
+
+        app = build_starlette_app(
+            agent_card=AgentCard.minimal("active-subscription-handoff-test"),
+            handler=hand_off,
+            cancel_handler=lambda _context: None,
+            base_url="http://active-subscription-handoff.test",
+            resume_handler=hand_off,
+            followup_handler=lambda *_args: None,
+        )
+        handler = app.state.a2a_request_handler
+        context = ServerCallContext()
+        request = SendMessageRequest()
+        request.configuration.return_immediately = True
+        request.message.message_id = str(uuid.uuid4())
+        request.message.role = Role.ROLE_USER
+        request.message.parts.add().text = "handoff to another worker"
+        submitted = await handler.on_message_send(request, context)
+        active = await handler._active_task_registry.get(submitted.id)
+        deadline = time.monotonic() + 1
+        while True:
+            persisted = await handler.task_store.get(submitted.id, context)
+            if (
+                persisted.status.state == TaskState.TASK_STATE_WORKING
+                or time.monotonic() >= deadline
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+        stream = handler.on_subscribe_to_task(
+            SubscribeToTaskRequest(id=submitted.id), context
+        )
+        initial = await anext(stream)
+        completed = Task()
+        completed.CopyFrom(initial)
+        completed.status.state = TaskState.TASK_STATE_COMPLETED
+        await handler.task_store.save(completed, context)
+        terminal = await asyncio.wait_for(anext(stream), 1)
+        await stream.aclose()
+        active._producer_task.cancel()
+        await asyncio.wait_for(active._is_finished.wait(), 1)
+
+        self.assertEqual(initial.status.state, TaskState.TASK_STATE_WORKING)
+        self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
+
+    async def test_a2a_handoff_errors_only_stay_working_after_durable_admission(self):
+        cases = (
+            ("LEASE_LOST", {}, TaskState.TASK_STATE_WORKING),
+            (
+                "WORKER_STOPPED",
+                {"workflow_admitted": True},
+                TaskState.TASK_STATE_WORKING,
+            ),
+            ("WORKER_STOPPED", {}, TaskState.TASK_STATE_FAILED),
+        )
+        for index, (code, data, expected) in enumerate(cases):
+            with self.subTest(code=code, data=data):
+
+                def fail(*_args, code=code, data=data):
+                    raise CoreError(code, data=data)
+
+                app = build_starlette_app(
+                    agent_card=AgentCard.minimal(f"handoff-{index}"),
+                    handler=fail,
+                    cancel_handler=lambda _context: None,
+                    base_url=f"http://handoff-{index}.test",
+                    resume_handler=fail,
+                    followup_handler=lambda *_args: None,
+                )
+                handler = app.state.a2a_request_handler
+                context = ServerCallContext()
+                request = SendMessageRequest()
+                request.configuration.return_immediately = True
+                request.message.message_id = str(uuid.uuid4())
+                request.message.role = Role.ROLE_USER
+                request.message.parts.add().text = code
+                submitted = await handler.on_message_send(request, context)
+
+                deadline = time.monotonic() + 1
+                while True:
+                    persisted = await handler.task_store.get(submitted.id, context)
+                    if persisted.status.state == expected:
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(0.01)
+
+                self.assertEqual(persisted.status.state, expected)
+                if expected == TaskState.TASK_STATE_WORKING:
+                    await handler.on_cancel_task(
+                        CancelTaskRequest(id=submitted.id), context
+                    )
+
+    async def test_late_cancel_preserves_the_completed_worker_result(self):
+        committed = threading.Event()
+        release = threading.Event()
+
+        def complete(*_args):
+            committed.set()
+            release.wait(1)
+            return Artifact.text("already completed")
+
+        def reject_late_cancel(_context):
+            release.set()
+            raise CoreError("TASK_NOT_CANCELABLE")
+
+        app = build_starlette_app(
+            agent_card=AgentCard.minimal("late-cancel-test"),
+            handler=complete,
+            cancel_handler=reject_late_cancel,
+            base_url="http://late-cancel.test",
+            resume_handler=complete,
+            followup_handler=lambda *_args: None,
+        )
+        handler = app.state.a2a_request_handler
+        context = ServerCallContext()
+        request = SendMessageRequest()
+        request.configuration.return_immediately = True
+        request.message.message_id = str(uuid.uuid4())
+        request.message.role = Role.ROLE_USER
+        request.message.parts.add().text = "finish while cancel arrives"
+        submitted = await handler.on_message_send(request, context)
+        self.assertTrue(await asyncio.to_thread(committed.wait, 1))
+
+        try:
+            terminal = await handler.on_cancel_task(
+                CancelTaskRequest(id=submitted.id), context
+            )
+        finally:
+            release.set()
+
+        self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
+        self.assertEqual(terminal.artifacts[0].parts[0].text, "already completed")
+
+    async def test_late_cancel_during_publication_preserves_completed_result(self):
+        def complete(*_args):
+            return Artifact.text("durable result")
+
+        def reject_late_cancel(_context):
+            raise CoreError("TASK_NOT_CANCELABLE")
+
+        app = build_starlette_app(
+            agent_card=AgentCard.minimal("publication-cancel-test"),
+            handler=complete,
+            cancel_handler=reject_late_cancel,
+            base_url="http://publication-cancel.test",
+            resume_handler=complete,
+            followup_handler=lambda *_args: None,
+        )
+        handler = app.state.a2a_request_handler
+        executor = handler._active_task_registry._agent_executor
+        original_publish = executor._publish_artifact
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_publish(updater, artifact):
+            entered.set()
+            await release.wait()
+            await original_publish(updater, artifact)
+
+        executor._publish_artifact = delayed_publish
+        context = ServerCallContext()
+        request = SendMessageRequest()
+        request.configuration.return_immediately = True
+        request.message.message_id = str(uuid.uuid4())
+        request.message.role = Role.ROLE_USER
+        request.message.parts.add().text = "cancel during result publication"
+        submitted = await handler.on_message_send(request, context)
+        await asyncio.wait_for(entered.wait(), 1)
+
+        cancellation = asyncio.create_task(
+            handler.on_cancel_task(CancelTaskRequest(id=submitted.id), context)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        terminal = await asyncio.wait_for(cancellation, 2)
+        persisted = await handler.task_store.get(submitted.id, context)
+
+        self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
+        self.assertEqual(persisted.status.state, TaskState.TASK_STATE_COMPLETED)
+        self.assertEqual(terminal.artifacts[0].parts[0].text, "durable result")
+
+    async def test_cancel_of_idle_task_does_not_leak_publication_state(self):
+        app = build_starlette_app(
+            agent_card=AgentCard.minimal("idle-cancel-test"),
+            handler=lambda *_args: Artifact.text("unused"),
+            cancel_handler=lambda _context: None,
+            base_url="http://idle-cancel.test",
+            resume_handler=lambda *_args: Artifact.text("unused"),
+            followup_handler=lambda *_args: None,
+        )
+        handler = app.state.a2a_request_handler
+        context = ServerCallContext()
+        task = Task(
+            id="idle-cancel",
+            context_id="idle-cancel-context",
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        )
+        await handler.task_store.save(task, context)
+
+        cancelled = await handler.on_cancel_task(CancelTaskRequest(id=task.id), context)
+        executor = handler._active_task_registry._agent_executor
+
+        self.assertEqual(cancelled.status.state, TaskState.TASK_STATE_CANCELED)
+        self.assertNotIn(task.id, executor._cancel_publications)
+
+    async def test_late_cancel_without_local_worker_restores_durable_result(self):
+        def reject_late_cancel(_context):
+            raise CoreError("TASK_NOT_CANCELABLE")
+
+        app = build_starlette_app(
+            agent_card=AgentCard.minimal("remote-late-cancel-test"),
+            handler=lambda *_args: Artifact.text("unused"),
+            cancel_handler=reject_late_cancel,
+            base_url="http://remote-late-cancel.test",
+            resume_handler=lambda *_args: Artifact.text("durable result"),
+            followup_handler=lambda *_args: None,
+        )
+        handler = app.state.a2a_request_handler
+        context = ServerCallContext()
+        task = Task(
+            id="remote-late-cancel",
+            context_id="remote-late-cancel-context",
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        )
+        await handler.task_store.save(task, context)
+
+        terminal = await handler.on_cancel_task(CancelTaskRequest(id=task.id), context)
+
+        self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
+        self.assertEqual(terminal.artifacts[0].parts[0].text, "durable result")
 
     async def test_background_task_starts_and_passively_waits_for_terminal_result(self):
         self.assertEqual(await self._send("BACKGROUND_E2E"), "background-e2e-ok")
@@ -576,9 +1164,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_memory_search_reaches_markdown_indexes_and_graph(self):
         span_offset = len(self.app.state.telemetry.exporter.spans)
-        self.assertEqual(
-            await self._send("MEMORY_E2E"), "memory-e2e-ok"
-        )
+        self.assertEqual(await self._send("MEMORY_E2E"), "memory-e2e-ok")
         agent = self.app.state.core_agent
         memory = agent.memory_registry.service(
             agent.agent_config.agent["name"], "e2e-user"
@@ -622,9 +1208,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_skill_is_validated_and_activated_before_model_call(self):
         ModelHandler.skill_instructions_seen = False
         # The skill is declared by SKILLS_ROOT + CORE_AGENT_ALLOWED_SKILLS.
-        self.assertEqual(
-            await self._send("SKILL_E2E use e2e-skill"), "skill-e2e-ok"
-        )
+        self.assertEqual(await self._send("SKILL_E2E use e2e-skill"), "skill-e2e-ok")
         self.assertTrue(ModelHandler.skill_instructions_seen)
 
 

@@ -156,7 +156,7 @@ root ledger `shared_budget` и, если cancel не подтвердился з
 
 Follow-up содержит новый text turn. Он не может изменить EffectiveConfig, tenant, model route, policy или budgets активной Task. Повторный `messageId` идемпотентен; concurrent Messages упорядочиваются server-side sequence.
 
-Runtime добавляет принятый input в model transcript как user-role Message на ближайшей safe boundary. Уже выполняющийся model/tool call не прерывается. Перед завершением Task runtime обязан атомарно проверить, что нет более раннего непрочитанного input. После terminal state продолжение диалога создаёт новую Task в том же `contextId`.
+Runtime добавляет принятый input в model transcript как user-role Message на ближайшей safe boundary. Уже выполняющийся model/tool call не прерывается. Перед завершением Task runtime обязан атомарно проверить, что нет более раннего непрочитанного input. Успешное завершение доставляет такой input модели; при ошибке или отмене runtime durable учитывает его в transcript как необработанный с причиной failure/cancel, не начинает новую работу и только затем фиксирует terminal state. После terminal state продолжение диалога создаёт новую Task в том же `contextId`.
 
 ## Результаты
 

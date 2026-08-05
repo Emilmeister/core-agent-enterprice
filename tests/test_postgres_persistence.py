@@ -30,6 +30,7 @@ from core_agent.database import (
     PostgresTaskStore,
 )
 from core_agent.errors import CoreError
+from core_agent.mcp import InMemoryMcpConnector
 from core_agent.postgres_tasks import PostgresTaskScheduler
 from core_agent.push import (
     DurablePushNotificationSender,
@@ -141,13 +142,9 @@ class ProductionConfigurationTests(unittest.TestCase):
             budget_schema = registry.get("core_delegate").input_schema["properties"][
                 "budget"
             ]
-            self.assertEqual(
-                budget_schema["required"], ["turns", "tool_calls"]
-            )
+            self.assertEqual(budget_schema["required"], ["turns", "tool_calls"])
             for field in budget_schema["required"]:
-                self.assertEqual(
-                    budget_schema["properties"][field]["minimum"], 1
-                )
+                self.assertEqual(budget_schema["properties"][field]["minimum"], 1)
             self.assertIn(
                 "Always set both budget.turns >= 1 and budget.tool_calls >= 1",
                 call.instructions,
@@ -288,6 +285,12 @@ class PostgresRestartTests(unittest.TestCase):
     def _database(self):
         return PostgresDatabase(os.environ["TEST_DATABASE_URL"], min_size=0, max_size=3)
 
+    def _stop_workflow_recovery(self, app):
+        agent = app.state.core_agent
+        agent._recovery_stop.set()
+        if agent._recovery_thread is not None:
+            agent._recovery_thread.join(timeout=1)
+
     def test_pool_replaces_a_connection_the_server_closed_while_idle(self):
         """Managed PostgreSQL drops idle connections; the caller must not see it."""
         import psycopg
@@ -348,6 +351,569 @@ class PostgresRestartTests(unittest.TestCase):
             "scheduler": PostgresTaskScheduler,
         }
 
+    def test_mcp_cold_start_begins_after_durable_admission_commit(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        started = threading.Event()
+
+        class StartingConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                started.set()
+                cancel_event.wait(2)
+                raise CoreError("TASK_CANCELLED")
+
+        model = ScriptedModel([ModelResponse(message="must not run")])
+        model.model = "postgres-cold-start-model"
+        app = None
+        failures = []
+        with patch.dict(
+            os.environ,
+            {
+                "CORE_AGENT_ENVIRONMENT": "development",
+                "CORE_AGENT_MEMORY": "disabled",
+                "DATABASE_AUTO_MIGRATE": "false",
+                "MCP_URL": "http://127.0.0.1:1/mcp",
+                "SESSION_STORAGE_TYPE": "postgres",
+                "TASK_STORAGE_TYPE": "postgres",
+            },
+        ):
+            try:
+                app = create_app(
+                    model=model,
+                    mcp_connector=StartingConnector(),
+                    database=database,
+                )
+
+                def run():
+                    try:
+                        app.state.core_agent.run(
+                            {"prompt": "wait for MCP"},
+                            task_id="postgres-cold-start",
+                            tenant_id="tenant-1",
+                            identity="owner-1",
+                        )
+                    except Exception as error:
+                        failures.append(error)
+
+                thread = threading.Thread(target=run)
+                thread.start()
+                self.assertTrue(started.wait(1))
+                with database.pool.connection() as connection:
+                    row = connection.execute(
+                        "SELECT run_id, state, snapshot FROM core_runs WHERE task_id = %s",
+                        ("postgres-cold-start",),
+                    ).fetchone()
+                    checkpoint = connection.execute(
+                        "SELECT state FROM core_checkpoints WHERE run_id = %s",
+                        (row["run_id"],),
+                    ).fetchone()
+                self.assertEqual(row["state"], "RUNNING")
+                self.assertTrue(row["snapshot"]["initializing"])
+                self.assertIn("platform_config", row["snapshot"]["admission"])
+                self.assertEqual(len(row["snapshot"]["admission"]["mcp"]), 1)
+                self.assertGreater(
+                    row["snapshot"]["mcp_cold_start_expires_at"], time.time()
+                )
+                self.assertTrue(checkpoint["state"]["initializing"])
+
+                app.state.core_agent.cancel_task("postgres-cold-start")
+                thread.join(1)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual([error.code for error in failures], ["TASK_CANCELLED"])
+                self.assertEqual(
+                    app.state.core_agent.workflow_store.lookup_task(
+                        "postgres-cold-start"
+                    ).state,
+                    "CANCELLED",
+                )
+                self.assertEqual(model.calls, ())
+            finally:
+                if app is not None:
+                    app.state.close()
+                else:
+                    database.close()
+
+    def test_mcp_zero_cold_start_timeout_resumes_automatically_after_restart(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        push_key = Fernet.generate_key()
+
+        class ZeroTimeoutConnector(InMemoryMcpConnector):
+            cold_start_timeout = 0.0
+
+        environment = {
+            "CORE_AGENT_ENVIRONMENT": "development",
+            "CORE_AGENT_MEMORY": "disabled",
+            "DATABASE_AUTO_MIGRATE": "false",
+            "MCP_URL": "http://127.0.0.1:1/mcp",
+            "PUSH_NOTIFICATION_ENCRYPTION_KEY": push_key.decode(),
+            "SESSION_STORAGE_TYPE": "postgres",
+            "TASK_STORAGE_TYPE": "postgres",
+        }
+        first = None
+        first_model = ScriptedModel([])
+        first_model.model = "postgres-zero-timeout-first"
+        with patch.dict(os.environ, environment):
+            try:
+                first = create_app(
+                    model=first_model,
+                    mcp_connector=ZeroTimeoutConnector(),
+                    database=database,
+                )
+                self._stop_workflow_recovery(first)
+                record, _raw, _discovered, _effective = (
+                    first.state.core_agent._new_workflow(
+                        {"prompt": "one attempt"},
+                        task_id="postgres-zero-timeout",
+                        identity="owner-1",
+                        session_id="postgres-zero-timeout-context",
+                        tenant_id="tenant-1",
+                        defer_initialization=True,
+                    )
+                )
+                self.assertIsNone(record.snapshot["mcp_cold_start_expires_at"])
+                context = ServerCallContext(user=NamedUser(), tenant="tenant-1")
+                asyncio.run(
+                    PostgresTaskStore(database).save(
+                        Task(
+                            id=record.task_id,
+                            context_id=record.context_id,
+                            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                        ),
+                        context,
+                    )
+                )
+                push_config = TaskPushNotificationConfig(
+                    task_id=record.task_id,
+                    url="https://push.example/hook",
+                )
+                with patch(
+                    "core_agent.push.socket.getaddrinfo",
+                    return_value=[(2, 1, 6, "", ("93.184.216.34", 443))],
+                ):
+                    asyncio.run(
+                        PostgresPushNotificationConfigStore(
+                            database, push_key
+                        ).set_info(record.task_id, push_config, context)
+                    )
+            finally:
+                if first is not None:
+                    first.state.close()
+                else:
+                    database.close()
+
+        class CapturingConnector(InMemoryMcpConnector):
+            cold_start_timeout = 300.0
+
+            def __init__(self):
+                super().__init__()
+                self.deadlines = []
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                self.deadlines.append(deadline)
+                return super().connect(
+                    declaration, cancel_event=cancel_event, deadline=deadline
+                )
+
+        connector = CapturingConnector()
+        database = self._database()
+        second = None
+        model = ScriptedModel([ModelResponse(message="continued without retries")])
+        model.model = "postgres-zero-timeout-second"
+        with patch.dict(os.environ, environment):
+            try:
+                second = create_app(
+                    model=model,
+                    mcp_connector=connector,
+                    database=database,
+                )
+                deadline = time.monotonic() + 2
+                while True:
+                    persisted = second.state.core_agent.workflow_store.lookup_task(
+                        record.task_id
+                    )
+                    with database.pool.connection() as connection:
+                        deliveries = connection.execute(
+                            "SELECT state, attempts, payload FROM core_push_deliveries"
+                        ).fetchall()
+                    if (
+                        persisted.state == "COMPLETED"
+                        and deliveries
+                        or time.monotonic() >= deadline
+                    ):
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(persisted.state, "COMPLETED")
+                self.assertEqual(
+                    persisted.result["message"], "continued without retries"
+                )
+                self.assertEqual(connector.deadlines, [0.0])
+                task = asyncio.run(
+                    PostgresTaskStore(database).get(record.task_id, context)
+                )
+                self.assertEqual(task.status.state, TaskState.TASK_STATE_COMPLETED)
+                self.assertEqual(
+                    task.artifacts[0].parts[0].text, persisted.result["message"]
+                )
+                self.assertEqual(len(deliveries), 1)
+                self.assertEqual(deliveries[0]["state"], "pending")
+                self.assertEqual(deliveries[0]["attempts"], 0)
+                self.assertIn(
+                    persisted.result["message"], str(deliveries[0]["payload"])
+                )
+                self.assertEqual(
+                    PostgresTaskStore(database).reconcile_from_workflows(
+                        enqueue_notification=second.state.push_sender.enqueue_notification
+                    ),
+                    0,
+                )
+                with database.pool.connection() as connection:
+                    delivery_count = connection.execute(
+                        "SELECT count(*) AS count FROM core_push_deliveries"
+                    ).fetchone()["count"]
+                self.assertEqual(delivery_count, 1)
+            finally:
+                if second is not None:
+                    second.state.close()
+                else:
+                    database.close()
+
+    def test_mcp_cold_start_observes_cancel_from_another_postgres_worker(self):
+        database_a = self._database()
+        database_a.migrate()
+        self._reset(database_a)
+        started = threading.Event()
+
+        class BlockingConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                started.set()
+                if cancel_event.wait(3):
+                    raise CoreError("TASK_CANCELLED")
+                raise CoreError("MCP_CONNECTION_FAILED", retryable=True)
+
+        environment = {
+            "CORE_AGENT_ENVIRONMENT": "development",
+            "CORE_AGENT_MEMORY": "disabled",
+            "DATABASE_AUTO_MIGRATE": "false",
+            "MCP_URL": "http://127.0.0.1:1/mcp",
+            "SESSION_STORAGE_TYPE": "postgres",
+            "TASK_STORAGE_TYPE": "postgres",
+        }
+        app_a = None
+        app_b = None
+        database_b = None
+        failures = []
+        model = ScriptedModel([ModelResponse(message="must not run")])
+        model.model = "postgres-cross-worker-first"
+        with patch.dict(os.environ, environment):
+            try:
+                app_a = create_app(
+                    model=model,
+                    mcp_connector=BlockingConnector(),
+                    database=database_a,
+                )
+
+                def run():
+                    try:
+                        app_a.state.core_agent.run(
+                            {"prompt": "wait for MCP"},
+                            task_id="postgres-cross-worker-cancel",
+                            tenant_id="tenant-1",
+                            identity="owner-1",
+                        )
+                    except Exception as error:
+                        failures.append(error)
+
+                thread = threading.Thread(target=run)
+                thread.start()
+                self.assertTrue(started.wait(1))
+
+                database_b = self._database()
+                cancel_model = ScriptedModel([])
+                cancel_model.model = "postgres-cross-worker-second"
+                app_b = create_app(
+                    model=cancel_model,
+                    mcp_connector=InMemoryMcpConnector(),
+                    database=database_b,
+                )
+                app_b.state.core_agent.cancel_task("postgres-cross-worker-cancel")
+                thread.join(2)
+
+                self.assertFalse(thread.is_alive())
+                self.assertEqual([error.code for error in failures], ["TASK_CANCELLED"])
+                self.assertEqual(model.calls, ())
+                self.assertEqual(
+                    app_b.state.core_agent.workflow_store.lookup_task(
+                        "postgres-cross-worker-cancel"
+                    ).state,
+                    "CANCELLED",
+                )
+            finally:
+                if app_b is not None:
+                    app_b.state.close()
+                elif database_b is not None:
+                    database_b.close()
+                if app_a is not None:
+                    app_a.state.close()
+                else:
+                    database_a.close()
+
+    def test_terminal_followup_disposition_rolls_back_with_terminal_transition(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.create(
+            WorkflowRecord(
+                "terminal-disposition-run",
+                "terminal-disposition-task",
+                "terminal-disposition-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "start"},
+                {"context": {}, "turns": 0},
+            )
+        )
+        workflows.append_inbound(
+            record.task_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            message_id="accepted-before-failure",
+            context_id=record.context_id,
+            content="correction",
+            provenance={},
+        )
+        original_event = workflows._event
+
+        def crash_on_terminal(connection, current, kind, data, now):
+            if kind == "task.failed":
+                raise RuntimeError("injected crash before terminal commit")
+            return original_event(connection, current, kind, data, now)
+
+        try:
+            with (
+                patch.object(workflows, "_event", side_effect=crash_on_terminal),
+                self.assertRaisesRegex(RuntimeError, "injected crash"),
+            ):
+                workflows.consume_inbound(
+                    record,
+                    expected_version=record.version,
+                    snapshot={"context": {"disposed": True}, "turns": 0},
+                    sequences=(1,),
+                    lease_token=None,
+                    state="FAILED",
+                    event_kind="task.failed",
+                    inbound_event_kind="input.dispositioned",
+                    error_code="MCP_PROTOCOL_ERROR",
+                )
+
+            persisted = workflows.get(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+            )
+            self.assertEqual(persisted.state, "RUNNING")
+            self.assertEqual(
+                [item["message_id"] for item in workflows.pending_inbound(persisted)],
+                ["accepted-before-failure"],
+            )
+        finally:
+            database.close()
+
+    def test_initialized_mcp_catalog_and_reconnect_deadline_survive_restart(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        environment = {
+            "CORE_AGENT_ENVIRONMENT": "development",
+            "CORE_AGENT_MEMORY": "disabled",
+            "DATABASE_AUTO_MIGRATE": "false",
+            "MCP_URL": "http://127.0.0.1:1/mcp",
+            "MCP_ALLOWED_TOOLS": "search",
+            "SESSION_STORAGE_TYPE": "postgres",
+            "TASK_STORAGE_TYPE": "postgres",
+        }
+        first = None
+        first_model = ScriptedModel([])
+        first_model.model = "postgres-mcp-catalog-first"
+        with patch.dict(os.environ, environment):
+            try:
+                first = create_app(
+                    model=first_model,
+                    mcp_connector=InMemoryMcpConnector(
+                        catalogs={"mcp": {"search": {"type": "object"}}}
+                    ),
+                    database=database,
+                )
+                self._stop_workflow_recovery(first)
+                record, _raw, _discovered, _effective = (
+                    first.state.core_agent._new_workflow(
+                        {"prompt": "use the saved catalog"},
+                        task_id="postgres-mcp-catalog-recovery",
+                        identity="owner-1",
+                        session_id="postgres-mcp-catalog-context",
+                        tenant_id="tenant-1",
+                    )
+                )
+                digest = record.snapshot["effective_config_digest"]
+                snapshot = {
+                    **record.snapshot,
+                    "mcp_reconnect_started": True,
+                    "mcp_reconnect_expires_at": time.time() - 1,
+                }
+                first.state.core_agent.workflow_store.transition(
+                    record.run_id,
+                    tenant_id=record.tenant_id,
+                    owner_id=record.owner_id,
+                    expected_version=record.version,
+                    state=record.state,
+                    snapshot=snapshot,
+                    event_kind="test.process.stopped",
+                )
+            finally:
+                if first is not None:
+                    first.state.close()
+                else:
+                    database.close()
+
+        class UnavailableConnector(InMemoryMcpConnector):
+            cold_start_timeout = 300.0
+
+            def __init__(self):
+                super().__init__()
+                self.deadlines = []
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                self.deadlines.append(deadline)
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED",
+                    "server is still starting",
+                    retryable=True,
+                )
+
+        connector = UnavailableConnector()
+        model = ScriptedModel([ModelResponse(message="used persisted catalog")])
+        model.model = "postgres-mcp-catalog-second"
+        database = self._database()
+        second = None
+        with patch.dict(os.environ, environment):
+            try:
+                second = create_app(
+                    model=model,
+                    mcp_connector=connector,
+                    database=database,
+                )
+                result = second.state.core_agent.resume_task(record.task_id)
+                persisted = second.state.core_agent.workflow_store.lookup_task(
+                    record.task_id
+                )
+                self.assertEqual(result.message, "used persisted catalog")
+                self.assertEqual(len(connector.deadlines), 1)
+                self.assertLessEqual(connector.deadlines[0], time.monotonic())
+                self.assertIn("mcp_search", model.calls[0].tools)
+                self.assertEqual(persisted.snapshot["effective_config_digest"], digest)
+                self.assertEqual(
+                    persisted.snapshot["mcp_catalogs"],
+                    {"mcp": {"search": {"type": "object"}}},
+                )
+                self.assertNotIn("mcp_reconnect_expires_at", persisted.snapshot)
+            finally:
+                if second is not None:
+                    second.state.close()
+                else:
+                    database.close()
+
+    def test_required_mcp_reconnect_failure_is_terminal_after_restart(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        environment = {
+            "CORE_AGENT_ENVIRONMENT": "development",
+            "CORE_AGENT_MEMORY": "disabled",
+            "DATABASE_AUTO_MIGRATE": "false",
+            "MCP_URL": "http://127.0.0.1:1/mcp",
+            "MCP_ALLOWED_TOOLS": "search",
+            "SESSION_STORAGE_TYPE": "postgres",
+            "TASK_STORAGE_TYPE": "postgres",
+        }
+        first = None
+        first_model = ScriptedModel([])
+        first_model.model = "postgres-required-mcp-first"
+        with patch.dict(os.environ, environment):
+            try:
+                first = create_app(
+                    model=first_model,
+                    mcp_connector=InMemoryMcpConnector(
+                        catalogs={"mcp": {"search": {"type": "object"}}}
+                    ),
+                    database=database,
+                )
+                self._stop_workflow_recovery(first)
+                declaration = {
+                    **first.state.core_agent.platform_mcp[0],
+                    "required": True,
+                }
+                first.state.core_agent.platform_mcp = (declaration,)
+                record, _raw, _discovered, _effective = (
+                    first.state.core_agent._new_workflow(
+                        {"prompt": "required MCP"},
+                        task_id="postgres-required-mcp-recovery",
+                        identity="owner-1",
+                        session_id="postgres-required-mcp-context",
+                        tenant_id="tenant-1",
+                    )
+                )
+            finally:
+                if first is not None:
+                    first.state.close()
+                else:
+                    database.close()
+
+        class UnavailableConnector(InMemoryMcpConnector):
+            cold_start_timeout = 0.0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED",
+                    "required server unavailable",
+                    retryable=True,
+                )
+
+        model = ScriptedModel([ModelResponse(message="must not run")])
+        model.model = "postgres-required-mcp-second"
+        database = self._database()
+        second = None
+        with patch.dict(os.environ, environment):
+            try:
+                second = create_app(
+                    model=model,
+                    mcp_connector=UnavailableConnector(),
+                    database=database,
+                )
+                with self.assertRaises(CoreError) as caught:
+                    second.state.core_agent.resume_task(record.task_id)
+                terminal = second.state.core_agent.workflow_store.lookup_task(
+                    record.task_id
+                )
+                self.assertEqual(caught.exception.code, "MCP_CONNECTION_FAILED")
+                self.assertEqual(terminal.state, "FAILED")
+                self.assertEqual(terminal.error_code, "MCP_CONNECTION_FAILED")
+                self.assertEqual(model.calls, ())
+            finally:
+                if second is not None:
+                    second.state.close()
+                else:
+                    database.close()
+
     def test_terminal_workflow_reconciles_same_a2a_task_and_artifact_after_crash(self):
         database = self._database()
         database.migrate()
@@ -401,27 +967,112 @@ class PostgresRestartTests(unittest.TestCase):
                     ),
                 ),
             )
+
+        def fail_enqueue(*_args, **_kwargs):
+            raise RuntimeError("push enqueue failed")
+
+        with self.assertRaisesRegex(RuntimeError, "push enqueue failed"):
+            store.reconcile_from_workflows(enqueue_notification=fail_enqueue)
+        unchanged = asyncio.run(store.get("reconcile-task", context))
+        self.assertEqual(unchanged.status.state, TaskState.TASK_STATE_WORKING)
+        self.assertEqual(list(unchanged.artifacts), [])
         self.assertEqual(store.reconcile_from_workflows(), 1)
         task = asyncio.run(store.get("reconcile-task", context))
         self.assertEqual(task.status.state, TaskState.TASK_STATE_COMPLETED)
         self.assertEqual(task.artifacts[0].parts[0].text, "recovered result")
         provenance = task.artifacts[0].metadata["provenance"]
         self.assertFalse(provenance["complete"])
-        self.assertEqual(
-            provenance["completion_reason"], "budget_exhausted"
-        )
-        self.assertEqual(
-            provenance["exhausted_dimension"], "model_turns"
-        )
-        self.assertEqual(
-            provenance["usage"], {"model_turns": 1, "tool_calls": 0}
-        )
+        self.assertEqual(provenance["completion_reason"], "budget_exhausted")
+        self.assertEqual(provenance["exhausted_dimension"], "model_turns")
+        self.assertEqual(provenance["usage"], {"model_turns": 1, "tool_calls": 0})
         self.assertEqual(
             provenance["shared_budget"]["used"],
             {"model_turns": 3, "tool_calls": 1},
         )
         self.assertEqual(store.reconcile_from_workflows(), 0)
         database.close()
+
+    def test_failed_workflow_reconciliation_preserves_safe_error_code(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        context = ServerCallContext(user=NamedUser(), tenant="tenant-1")
+        store = PostgresTaskStore(database)
+        try:
+            workflows.create(
+                WorkflowRecord(
+                    "failed-reconcile-run",
+                    "failed-reconcile-task",
+                    "failed-reconcile-context",
+                    "tenant-1",
+                    "owner-1",
+                    None,
+                    "RUNNING",
+                    1,
+                    {"prompt": "work"},
+                    {},
+                )
+            )
+            asyncio.run(
+                store.save(
+                    Task(
+                        id="failed-reconcile-task",
+                        context_id="failed-reconcile-context",
+                        status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                    ),
+                    context,
+                )
+            )
+            with database.transaction() as connection:
+                connection.execute(
+                    """UPDATE core_runs SET state = 'ABORTED',
+                              error_code = 'SIDE_EFFECT_UNKNOWN', version = version + 1
+                       WHERE run_id = 'failed-reconcile-run'"""
+                )
+
+            self.assertEqual(store.reconcile_from_workflows(), 1)
+            task = asyncio.run(store.get("failed-reconcile-task", context))
+
+            self.assertEqual(task.status.state, TaskState.TASK_STATE_FAILED)
+            self.assertEqual(task.status.message.parts[0].text, "SIDE_EFFECT_UNKNOWN")
+        finally:
+            database.close()
+
+    def test_postgres_task_store_does_not_regress_a_terminal_task(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        context = ServerCallContext(user=NamedUser(), tenant="tenant-1")
+        store = PostgresTaskStore(database)
+        try:
+            asyncio.run(
+                store.save(
+                    Task(
+                        id="terminal-monotonic-task",
+                        context_id="terminal-monotonic-context",
+                        status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
+                    ),
+                    context,
+                )
+            )
+            asyncio.run(
+                store.save(
+                    Task(
+                        id="terminal-monotonic-task",
+                        context_id="terminal-monotonic-context",
+                        status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                    ),
+                    context,
+                )
+            )
+            persisted = asyncio.run(store.get("terminal-monotonic-task", context))
+            self.assertEqual(
+                persisted.status.state,
+                TaskState.TASK_STATE_COMPLETED,
+            )
+        finally:
+            database.close()
 
     def test_workflow_reconciliation_matches_task_owner_and_tenant(self):
         database = self._database()
@@ -891,9 +1542,7 @@ class PostgresRestartTests(unittest.TestCase):
                 "cancel-write-task", owner_id="run-1", tenant_id="tenant-1"
             )
             self.assertEqual(canceled_write.state, "failed")
-            self.assertEqual(
-                canceled_write.error.code, "SIDE_EFFECT_UNKNOWN"
-            )
+            self.assertEqual(canceled_write.error.code, "SIDE_EFFECT_UNKNOWN")
             notifications = scheduler.mailbox("run-1", "tenant-1").poll()
             self.assertEqual(
                 {item.task_id for item in notifications},
@@ -936,9 +1585,7 @@ class PostgresRestartTests(unittest.TestCase):
             worker_id="live-worker",
             ttl=30,
         )
-        selected = record.run_id in {
-            item.run_id for item in workflows.recoverable()
-        }
+        selected = record.run_id in {item.run_id for item in workflows.recoverable()}
         model = ScriptedModel([])
         model.model = "lease-recovery-model"
         app = None
@@ -965,6 +1612,134 @@ class PostgresRestartTests(unittest.TestCase):
                 app.state.close()
             else:
                 database.close()
+
+    def test_cross_worker_cancel_waits_for_the_fenced_lease_owner(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        record = workflows.create(
+            WorkflowRecord(
+                "cancel-fenced-run",
+                "cancel-fenced-task",
+                "cancel-fenced-context",
+                "tenant-1",
+                "owner-1",
+                None,
+                "RUNNING",
+                1,
+                {"prompt": "work"},
+                {"turns": 0},
+            )
+        )
+        lease = workflows.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id="active-worker",
+            ttl=30,
+        )
+        model = ScriptedModel([])
+        model.model = "cancel-fenced-model"
+        app = None
+        errors = []
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "SESSION_STORAGE_TYPE": "postgres",
+                    "DATABASE_AUTO_MIGRATE": "false",
+                    "CORE_AGENT_MEMORY": "disabled",
+                    "ARTIFACT_STORAGE_ENABLED": "false",
+                },
+                clear=True,
+            ):
+                app = create_app(model=model, database=database)
+
+            def cancel():
+                try:
+                    app.state.core_agent.cancel_task(record.task_id)
+                except Exception as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=cancel)
+            thread.start()
+            time.sleep(0.1)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(
+                workflows.lookup_task(record.task_id).state,
+                "RUNNING",
+            )
+            workflows.release_lease(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                worker_id="active-worker",
+                token=lease,
+            )
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(
+                workflows.lookup_task(record.task_id).state,
+                "CANCELLED",
+            )
+        finally:
+            if app is not None:
+                app.state.close()
+            else:
+                database.close()
+
+    def test_cancel_intent_atomically_blocks_a_later_completed_transition(self):
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        try:
+            record = workflows.create(
+                WorkflowRecord(
+                    "cancel-gate-run",
+                    "cancel-gate-task",
+                    "cancel-gate-context",
+                    "tenant-1",
+                    "owner-1",
+                    None,
+                    "RUNNING",
+                    1,
+                    {"prompt": "work"},
+                    {"turns": 0},
+                )
+            )
+            record = workflows.request_cancel(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+            )
+            lease = workflows.acquire_lease(
+                record.run_id,
+                tenant_id=record.tenant_id,
+                owner_id=record.owner_id,
+                worker_id="completion-worker",
+                ttl=30,
+            )
+            with self.assertRaises(CoreError) as caught:
+                workflows.transition(
+                    record.run_id,
+                    tenant_id=record.tenant_id,
+                    owner_id=record.owner_id,
+                    expected_version=record.version,
+                    state="COMPLETED",
+                    snapshot=record.snapshot,
+                    event_kind="task.completed",
+                    result={
+                        "message": "too late",
+                        "usage": {"model_turns": 0, "tool_calls": 0},
+                    },
+                    lease_token=lease,
+                )
+            self.assertEqual(caught.exception.code, "CANCEL_REQUESTED")
+            self.assertEqual(workflows.lookup_task(record.task_id).state, "RUNNING")
+        finally:
+            database.close()
 
     def test_workflow_lease_acquire_and_recovery_use_database_clock(self):
         database = self._database()
@@ -1391,9 +2166,7 @@ class PostgresRestartTests(unittest.TestCase):
                     (task_id, scheduler._worker_id, f"{task_id}-token", now, now),
                 )
         try:
-            scheduler._renew_claim(
-                "skewed-renew", "tenant-1", "skewed-renew-token"
-            )
+            scheduler._renew_claim("skewed-renew", "tenant-1", "skewed-renew-token")
             self.assertTrue(
                 scheduler._finish(
                     "skewed-finish",
@@ -1425,9 +2198,7 @@ class PostgresRestartTests(unittest.TestCase):
                            'submitted', true, true, '{}'::jsonb, false, %s, %s)""",
                 (now, now),
             )
-        token, _ = scheduler._claim(
-            "blocked-renew", "tenant-1", allow_working=False
-        )
+        token, _ = scheduler._claim("blocked-renew", "tenant-1", allow_working=False)
         outcome = []
 
         def renew():
@@ -1481,9 +2252,7 @@ class PostgresRestartTests(unittest.TestCase):
                            'submitted', true, true, '{}'::jsonb, false, %s, %s)""",
                 (now, now),
             )
-        token, _ = scheduler._claim(
-            "blocked-finish", "tenant-1", allow_working=False
-        )
+        token, _ = scheduler._claim("blocked-finish", "tenant-1", allow_working=False)
         outcome = []
 
         def finish():
@@ -1548,12 +2317,8 @@ class PostgresRestartTests(unittest.TestCase):
             def _claim(self, task_id, tenant_id, *, allow_working):
                 if task_id == "cancel-race" and not self.cancel_injected:
                     self.cancel_injected = True
-                    canceler.cancel(
-                        task_id, owner_id="parent-run", tenant_id=tenant_id
-                    )
-                return super()._claim(
-                    task_id, tenant_id, allow_working=allow_working
-                )
+                    canceler.cancel(task_id, owner_id="parent-run", tenant_id=tenant_id)
+                return super()._claim(task_id, tenant_id, allow_working=allow_working)
 
         scheduler = CancelBeforeClaimScheduler(database)
         reconciled = []
@@ -1622,9 +2387,7 @@ class PostgresRestartTests(unittest.TestCase):
                 timeout=2,
             )
             self.assertEqual(terminal.state, "failed")
-            self.assertEqual(
-                terminal.error.code, "RECOVERY_REQUIRES_RECONCILIATION"
-            )
+            self.assertEqual(terminal.error.code, "RECOVERY_REQUIRES_RECONCILIATION")
         finally:
             scheduler.close()
             canceler.close()
@@ -1655,9 +2418,7 @@ class PostgresRestartTests(unittest.TestCase):
                                'submitted', true, true, '{}'::jsonb, %s, %s)""",
                     (task_id, now, now),
                 )
-        renew_token, _ = first._claim(
-            "expired-renew", "tenant-1", allow_working=False
-        )
+        renew_token, _ = first._claim("expired-renew", "tenant-1", allow_working=False)
         finish_token, _ = first._claim(
             "expired-finish", "tenant-1", allow_working=False
         )
@@ -1758,9 +2519,7 @@ class PostgresRestartTests(unittest.TestCase):
                 mutating=False,
             )
             self.assertTrue(started.wait(1))
-            second.cancel(
-                task.id, owner_id="parent-run", tenant_id="tenant-1"
-            )
+            second.cancel(task.id, owner_id="parent-run", tenant_id="tenant-1")
             self.assertTrue(cancel_seen.wait(1))
             observer = PostgresTaskScheduler(database)
             self.assertEqual(

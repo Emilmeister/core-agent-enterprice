@@ -4,6 +4,8 @@ import copy
 import time
 import unittest
 import threading
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -26,7 +28,7 @@ from core_agent.model import (
     ToolRequest,
 )
 from core_agent.observability import FailingExporter, RecordingExporter, Telemetry
-from core_agent.runtime import CoreAgent
+from core_agent.runtime import CoreAgent, _DurableCancelEvent
 from core_agent.tasks import TaskScheduler
 from core_agent.tools import (
     ToolDefinition,
@@ -140,6 +142,7 @@ def agent_config(memory="optional", *, max_turns=10, max_tools=10, mcp=True):
 DOCS_MCP = {
     "name": "docs",
     "required": False,
+    "read_only_tools": ["search", "read"],
     "transport": {"type": "streamable_http", "url": "https://docs.test/mcp"},
 }
 
@@ -230,6 +233,1003 @@ def make_agent(
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_durable_cancel_poll_survives_a_transient_store_failure(self):
+        class FlakyStore:
+            atomic = True
+
+            def __init__(self):
+                self.calls = 0
+
+            def is_cancelled(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("database connection dropped")
+                return True
+
+        store = FlakyStore()
+        record = type(
+            "Record",
+            (),
+            {"run_id": "run", "tenant_id": "tenant", "owner_id": "owner"},
+        )()
+        cancel = _DurableCancelEvent(None, store, record)
+        try:
+            self.assertTrue(cancel.wait(1))
+        finally:
+            cancel.close()
+        self.assertGreaterEqual(store.calls, 2)
+
+    def test_mcp_cold_start_is_durable_accepts_followup_and_can_be_cancelled(self):
+        attempted = threading.Event()
+
+        class StartingConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                attempted.set()
+                cancel_event.wait(1)
+                raise CoreError("TASK_CANCELLED")
+
+        connector = StartingConnector()
+        agent = make_agent(
+            ScriptedModel([ModelResponse(message="must not run")]),
+            memory="disabled",
+            connector=connector,
+        )
+        errors = []
+
+        def run():
+            try:
+                agent.run(run_request(memory=False), task_id="cold-start-cancel")
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(attempted.wait(1))
+        starting = agent.workflow_store.lookup_task("cold-start-cancel")
+        self.assertTrue(starting.snapshot["initializing"])
+        message = agent.enqueue_message(
+            RunRequest.from_dict({"prompt": "More context"}),
+            task_id="cold-start-cancel",
+            message_id="followup-during-cold-start",
+            identity="anonymous",
+            session_id=starting.context_id,
+            tenant_id="default",
+        )
+        self.assertEqual(message["message_id"], "followup-during-cold-start")
+        agent.cancel_task("cold-start-cancel")
+        thread.join(1)
+
+        try:
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], CoreError)
+            self.assertEqual(errors[0].code, "TASK_CANCELLED")
+            self.assertEqual(len(agent.model.calls), 0)
+            self.assertEqual(
+                agent.workflow_store.lookup_task("cold-start-cancel").state,
+                "CANCELLED",
+            )
+            terminal = agent.workflow_store.lookup_task("cold-start-cancel")
+            self.assertEqual(agent.workflow_store.pending_inbound(terminal), ())
+            self.assertIn(
+                "unprocessed_due_to_cancel",
+                [item["kind"] for item in terminal.snapshot["context"]["transcript"]],
+            )
+        finally:
+            agent.close()
+
+    def test_all_mcp_servers_share_one_run_cold_start_deadline(self):
+        class DeadlineConnector(InMemoryMcpConnector):
+            cold_start_timeout = 5.0
+
+            def __init__(self):
+                super().__init__()
+                self.attempts = []
+
+            def connect(
+                self,
+                declaration,
+                *,
+                cancel_event=None,
+                deadline=None,
+            ):
+                self.attempts.append((declaration["name"], deadline))
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED",
+                    "still starting",
+                    retryable=True,
+                    data={"reason": "cold_start_timeout"},
+                )
+
+        other = {
+            "name": "other",
+            "required": False,
+            "transport": {"type": "streamable_http", "url": "https://other.test/mcp"},
+        }
+        connector = DeadlineConnector()
+        agent = make_agent(
+            ScriptedModel([ModelResponse(message="continued")]),
+            memory="disabled",
+            connector=connector,
+            platform_mcp=(DOCS_MCP, other),
+        )
+        agent.platform_config.allowed_mcp_servers.add("other")
+        try:
+            result = agent.run(run_request(memory=False), task_id="shared-deadline")
+        finally:
+            agent.close()
+
+        self.assertEqual(result.message, "continued")
+        self.assertEqual([item[0] for item in connector.attempts], ["docs", "other"])
+        self.assertIsNotNone(connector.attempts[0][1])
+        self.assertEqual(connector.attempts[0][1], connector.attempts[1][1])
+
+    def test_mcp_cold_start_deadline_is_not_reset_by_recovery(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        first = make_agent(
+            ScriptedModel([]),
+            memory="disabled",
+            connector=StreamableHttpMcpConnector(timeout=30, cold_start_timeout=300),
+        )
+        record, _raw, _discovered, _effective = first._new_workflow(
+            run_request(memory=False),
+            task_id="expired-cold-start",
+            identity="anonymous",
+            session_id="expired-context",
+            tenant_id="default",
+            defer_initialization=True,
+        )
+        snapshot = copy.deepcopy(record.snapshot)
+        snapshot["mcp_cold_start_expires_at"] = time.time() - 1
+        record = first._record_transition(
+            record,
+            state="RUNNING",
+            snapshot=snapshot,
+            event_kind="test.process.stopped",
+        )
+        store = first.workflow_store
+        first.close()
+
+        second = make_agent(
+            ScriptedModel([ModelResponse(message="continued after recovery")]),
+            memory="disabled",
+            connector=StreamableHttpMcpConnector(timeout=30, cold_start_timeout=300),
+            workflow_store=store,
+        )
+        try:
+            with patch("core_agent.mcp.httpx.AsyncClient") as client:
+                result = second.resume_task(record.task_id)
+        finally:
+            second.close()
+
+        client.assert_not_called()
+        self.assertEqual(result.message, "continued after recovery")
+        self.assertEqual((result.usage.model_turns, result.usage.tool_calls), (1, 0))
+
+    def test_mcp_zero_cold_start_timeout_is_not_replaced_during_recovery(self):
+        class ZeroTimeoutConnector(InMemoryMcpConnector):
+            cold_start_timeout = 0.0
+
+        first = make_agent(
+            ScriptedModel([]),
+            memory="disabled",
+            connector=ZeroTimeoutConnector(),
+        )
+        record, _raw, _discovered, _effective = first._new_workflow(
+            run_request(memory=False),
+            task_id="zero-timeout-recovery",
+            identity="anonymous",
+            session_id="zero-timeout-context",
+            tenant_id="default",
+            defer_initialization=True,
+        )
+        self.assertIsNone(record.snapshot["mcp_cold_start_expires_at"])
+        store = first.workflow_store
+        first.close()
+
+        class CapturingConnector(InMemoryMcpConnector):
+            cold_start_timeout = 300.0
+
+            def __init__(self):
+                super().__init__()
+                self.deadlines = []
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                self.deadlines.append(deadline)
+                return super().connect(
+                    declaration, cancel_event=cancel_event, deadline=deadline
+                )
+
+        connector = CapturingConnector()
+        second = make_agent(
+            ScriptedModel([ModelResponse(message="continued without retries")]),
+            memory="disabled",
+            connector=connector,
+            workflow_store=store,
+        )
+        try:
+            result = second.resume_task(record.task_id)
+        finally:
+            second.close()
+
+        self.assertEqual(result.message, "continued without retries")
+        self.assertEqual(connector.deadlines, [0.0])
+
+    def test_workflow_recovery_rescans_after_an_old_lease_expires(self):
+        from core_agent.workflow import InMemoryWorkflowStore
+
+        now = [0.0]
+        store = InMemoryWorkflowStore(clock=lambda: now[0])
+        first = make_agent(ScriptedModel([]), memory="disabled", workflow_store=store)
+        record, _raw, _discovered, _effective = first._new_workflow(
+            run_request(memory=False),
+            task_id="lease-expiry-recovery",
+            identity="anonymous",
+            session_id="lease-expiry-context",
+            tenant_id="default",
+            defer_initialization=True,
+        )
+        store.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id="stopped-worker",
+            ttl=1,
+        )
+        first.close()
+
+        model = ScriptedModel([ModelResponse(message="recovered after lease")])
+        second = make_agent(model, memory="disabled", workflow_store=store)
+        try:
+            second.recover_workflows(poll_seconds=0.01)
+            self.assertEqual(store.lookup_task(record.task_id).state, "RUNNING")
+            now[0] = 2.0
+            deadline = time.monotonic() + 1
+            while store.lookup_task(record.task_id).state != "COMPLETED":
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            persisted = store.lookup_task(record.task_id)
+        finally:
+            second.close()
+
+        self.assertEqual(persisted.state, "COMPLETED")
+        self.assertEqual(persisted.result["message"], "recovered after lease")
+
+    def test_resume_stops_after_one_lost_lease_claim(self):
+        from core_agent.workflow import InMemoryWorkflowStore
+
+        class CountingStore(InMemoryWorkflowStore):
+            def __init__(self):
+                super().__init__()
+                self.acquire_calls = 0
+
+            def acquire_lease(self, *args, **kwargs):
+                self.acquire_calls += 1
+                return super().acquire_lease(*args, **kwargs)
+
+        store = CountingStore()
+        owner = make_agent(ScriptedModel([]), memory="disabled", workflow_store=store)
+        record, _raw, _discovered, _effective = owner._new_workflow(
+            run_request(memory=False),
+            task_id="single-lost-lease-attempt",
+            identity=None,
+            session_id=None,
+            tenant_id=None,
+            defer_initialization=True,
+        )
+        store.acquire_lease(
+            record.run_id,
+            tenant_id=record.tenant_id,
+            owner_id=record.owner_id,
+            worker_id="lease-owner",
+            ttl=30,
+        )
+        contender = make_agent(
+            ScriptedModel([]), memory="disabled", workflow_store=store
+        )
+        baseline = store.acquire_calls
+        outcome = []
+
+        def resume():
+            try:
+                contender.resume_task(record.task_id)
+            except CoreError as error:
+                outcome.append(error.code)
+
+        thread = threading.Thread(target=resume)
+        thread.start()
+        thread.join(0.15)
+        if thread.is_alive():
+            contender.close()
+            thread.join(1)
+        else:
+            contender.close()
+        owner.close()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcome, ["LEASE_LOST"])
+        self.assertEqual(store.acquire_calls - baseline, 1)
+
+    def test_root_recovery_is_not_starved_by_the_child_workflow_limit(self):
+        from core_agent.workflow import InMemoryWorkflowStore, WorkflowRecord
+
+        store = InMemoryWorkflowStore()
+        store.create(
+            WorkflowRecord(
+                "finished-parent",
+                "finished-parent-task",
+                "finished-parent-context",
+                "default",
+                "anonymous",
+                None,
+                "COMPLETED",
+                1,
+                {"prompt": "done"},
+                {},
+            )
+        )
+        for index in range(100):
+            store.create(
+                WorkflowRecord(
+                    f"child-{index}",
+                    f"child-task-{index}",
+                    f"child-context-{index}",
+                    "default",
+                    "anonymous",
+                    "finished-parent",
+                    "RUNNING",
+                    1,
+                    {"prompt": "child"},
+                    {},
+                )
+            )
+
+        model = ScriptedModel([ModelResponse(message="root recovered")])
+        agent = make_agent(model, memory="disabled", workflow_store=store)
+        root, _raw, _discovered, _effective = agent._new_workflow(
+            run_request(memory=False),
+            task_id="root-after-many-children",
+            identity=None,
+            session_id=None,
+            tenant_id=None,
+            defer_initialization=True,
+        )
+        try:
+            agent.recover_workflows(poll_seconds=0.01)
+            deadline = time.monotonic() + 0.2
+            while store.lookup_task(root.task_id).state != "COMPLETED":
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            persisted = store.lookup_task(root.task_id)
+        finally:
+            agent.close()
+
+        self.assertEqual(persisted.state, "COMPLETED")
+        self.assertEqual(persisted.result["message"], "root recovered")
+
+    def test_root_admission_lease_prevents_recovery_from_stealing_a_new_run(self):
+        from core_agent.workflow import InMemoryWorkflowStore
+
+        store = InMemoryWorkflowStore()
+        owner_model = ScriptedModel([ModelResponse(message="owner completed")])
+        owner = make_agent(owner_model, memory="disabled", workflow_store=store)
+        recovery_model = ScriptedModel([ModelResponse(message="recovery must not run")])
+        recovery = make_agent(recovery_model, memory="disabled", workflow_store=store)
+        admitted = threading.Event()
+        release = threading.Event()
+        original_continue = owner._continue_workflow
+
+        def delayed_continue(record, **kwargs):
+            admitted.set()
+            release.wait(1)
+            return original_continue(record, **kwargs)
+
+        owner._continue_workflow = delayed_continue
+        results = []
+        errors = []
+
+        def run():
+            try:
+                results.append(
+                    owner.run(
+                        run_request(memory=False), task_id="atomic-root-admission"
+                    )
+                )
+            except Exception as error:
+                errors.append(error)
+
+        recovery.recover_workflows(poll_seconds=0.01)
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            self.assertTrue(admitted.wait(1))
+            time.sleep(0.05)
+            self.assertEqual(recovery_model.calls, ())
+        finally:
+            release.set()
+            thread.join(2)
+            owner.close()
+            recovery.close()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results[0].message, "owner completed")
+        self.assertEqual(recovery_model.calls, ())
+
+    def test_worker_shutdown_preserves_the_run_for_recovery(self):
+        started = threading.Event()
+
+        class BlockingConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                self.calls += 1
+                if self.calls > 1:
+                    return {}
+                started.set()
+                cancel_event.wait(2)
+                raise CoreError(cancel_event.error_code)
+
+        connector = BlockingConnector()
+        first = make_agent(
+            ScriptedModel([]),
+            memory="disabled",
+            connector=connector,
+        )
+        failures = []
+
+        def run():
+            try:
+                first.run(run_request(memory=False), task_id="shutdown-recoverable-run")
+            except Exception as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(started.wait(1))
+
+        def resume():
+            try:
+                first.resume_task("shutdown-recoverable-run")
+            except Exception as error:
+                failures.append(error)
+
+        waiter = threading.Thread(target=resume)
+        waiter.start()
+        time.sleep(0.05)
+        store = first.workflow_store
+        first.close()
+        thread.join(2)
+        waiter.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(
+            sorted(error.code for error in failures),
+            ["WORKER_STOPPED", "WORKER_STOPPED"],
+        )
+        self.assertEqual(connector.calls, 1)
+        self.assertEqual(
+            store.lookup_task("shutdown-recoverable-run").state,
+            "RUNNING",
+        )
+
+        model = ScriptedModel([ModelResponse(message="recovered after shutdown")])
+        second = make_agent(model, memory="disabled", workflow_store=store)
+        try:
+            second.recover_workflows(poll_seconds=0.01)
+            deadline = time.monotonic() + 1
+            while store.lookup_task("shutdown-recoverable-run").state != "COMPLETED":
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            persisted = store.lookup_task("shutdown-recoverable-run")
+        finally:
+            second.close()
+
+        self.assertEqual(persisted.state, "COMPLETED")
+        self.assertEqual(persisted.result["message"], "recovered after shutdown")
+
+    def test_mcp_cold_start_recovery_cannot_expand_admitted_platform_capabilities(self):
+        connector = InMemoryMcpConnector(
+            catalogs={"docs": {"search": {"type": "object"}}}
+        )
+        model = ScriptedModel([ModelResponse(message="no MCP")])
+        agent = make_agent(model, memory="disabled", connector=connector)
+        agent.platform_config.allowed_mcp_servers.clear()
+        record, _raw, _discovered, _effective = agent._new_workflow(
+            run_request(memory=False),
+            task_id="frozen-admission",
+            identity="anonymous",
+            session_id="frozen-context",
+            tenant_id="default",
+            defer_initialization=True,
+        )
+        agent.platform_config.allowed_mcp_servers.add("docs")
+        try:
+            result = agent.resume_task(record.task_id)
+        finally:
+            agent.close()
+
+        self.assertEqual(result.message, "no MCP")
+        self.assertEqual(connector.connections, ())
+        self.assertNotIn("docs_search", model.calls[0].tools)
+
+    def test_initialized_workflow_recovers_with_its_persisted_mcp_catalog(self):
+        class UnavailableConnector(InMemoryMcpConnector):
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED",
+                    "server scaled to zero",
+                    retryable=True,
+                    data={"reason": "cold_start_timeout"},
+                )
+
+        first = make_agent(
+            ScriptedModel([]),
+            memory="disabled",
+            connector=InMemoryMcpConnector(
+                catalogs={
+                    "docs": {
+                        "search": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                        }
+                    }
+                }
+            ),
+        )
+        record, _raw, _discovered, _effective = first._new_workflow(
+            run_request(memory=False),
+            task_id="initialized-recovery",
+            identity="anonymous",
+            session_id="initialized-context",
+            tenant_id="default",
+        )
+        store = first.workflow_store
+        first.close()
+
+        class CatalogModel(ScriptedModel):
+            def generate(self, *, context, tools, instructions, messages=None):
+                self.catalog = copy.deepcopy(tools)
+                return super().generate(
+                    context=context,
+                    tools=tools,
+                    instructions=instructions,
+                    messages=messages,
+                )
+
+        model = CatalogModel([ModelResponse(message="continued with snapshot")])
+        second = make_agent(
+            model,
+            memory="disabled",
+            connector=UnavailableConnector(),
+            workflow_store=store,
+        )
+        try:
+            result = second.resume_task(record.task_id)
+        finally:
+            second.close()
+
+        self.assertEqual(result.message, "continued with snapshot")
+        self.assertIn("docs_search", model.calls[0].tools)
+        self.assertEqual(
+            model.catalog["docs_search"]["input_schema"]["properties"],
+            {"query": {"type": "string"}},
+        )
+
+    def test_recovery_applies_a_new_platform_deny_without_invalidating_checkpoint(self):
+        catalog = {"docs": {"search": {"type": "object"}}}
+        first = make_agent(
+            ScriptedModel([]),
+            memory="disabled",
+            connector=InMemoryMcpConnector(catalogs=catalog),
+        )
+        record, _raw, _discovered, _effective = first._new_workflow(
+            run_request(memory=False),
+            task_id="recovery-platform-deny",
+            identity="anonymous",
+            session_id="recovery-platform-deny-context",
+            tenant_id="default",
+        )
+        store = first.workflow_store
+        first.close()
+
+        model = ScriptedModel([ModelResponse(message="continued without denied tool")])
+        second = make_agent(
+            model,
+            memory="disabled",
+            connector=InMemoryMcpConnector(catalogs=catalog),
+            workflow_store=store,
+        )
+        second.platform_config.denied_mcp_tools["docs"] = {"search"}
+        try:
+            result = second.resume_task(record.task_id)
+        finally:
+            second.close()
+
+        self.assertEqual(result.message, "continued without denied tool")
+        self.assertNotIn("docs_search", model.calls[0].tools)
+
+    def test_recovery_removes_newly_denied_skill_instructions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "recovery-skill"
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\n"
+                "name: recovery-skill\n"
+                "description: Recovery test skill.\n"
+                "---\n"
+                "DENIED_SKILL_MARKER\n",
+                encoding="utf-8",
+            )
+            declaration = {"name": "recovery-skill", "source": path.as_uri()}
+            first = make_agent(
+                ScriptedModel([]),
+                memory="disabled",
+                declared_skills=(declaration,),
+            )
+            raw = first.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["recovery-skill"]
+            first.agent_config = AgentConfig.from_dict(raw)
+            first.platform_config.allowed_skills.add("recovery-skill")
+            first.platform_config.supported_features.add("skills")
+            record, _raw, _discovered, effective = first._new_workflow(
+                {"prompt": "Use recovery-skill"},
+                task_id="recovery-denied-skill",
+                identity="anonymous",
+                session_id="recovery-denied-skill-context",
+                tenant_id="default",
+            )
+            self.assertIn("recovery-skill", effective.skills)
+            self.assertIn(
+                "DENIED_SKILL_MARKER", record.snapshot["compiled_instructions"]
+            )
+            store = first.workflow_store
+            first.close()
+
+            model = ScriptedModel([ModelResponse(message="continued safely")])
+            second = make_agent(
+                model,
+                memory="disabled",
+                workflow_store=store,
+            )
+            try:
+                result = second.resume_task(record.task_id)
+            finally:
+                second.close()
+
+        self.assertEqual(result.message, "continued safely")
+        self.assertNotIn("DENIED_SKILL_MARKER", model.calls[0].instructions)
+
+    def test_recovery_reconnects_only_servers_in_the_persisted_catalog(self):
+        ghost = {
+            "name": "ghost",
+            "required": False,
+            "transport": {"type": "streamable_http", "url": "https://ghost.test/mcp"},
+        }
+        docs = {**DOCS_MCP, "required": True}
+        first = make_agent(
+            ScriptedModel([]),
+            memory="disabled",
+            connector=InMemoryMcpConnector(
+                catalogs={"docs": {"search": {"type": "object"}}},
+                fail_connections={"ghost"},
+            ),
+            platform_mcp=(ghost, docs),
+        )
+        first.platform_config.allowed_mcp_servers.add("ghost")
+        record, _raw, _discovered, _effective = first._new_workflow(
+            run_request(memory=False),
+            task_id="reconnect-persisted-servers",
+            identity="anonymous",
+            session_id="reconnect-persisted-servers-context",
+            tenant_id="default",
+        )
+        store = first.workflow_store
+        first.close()
+
+        class RecordingConnector(InMemoryMcpConnector):
+            def __init__(self):
+                super().__init__(catalogs={"docs": {"search": {"type": "object"}}})
+                self.attempts = []
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                self.attempts.append(declaration["name"])
+                return super().connect(
+                    declaration, cancel_event=cancel_event, deadline=deadline
+                )
+
+        connector = RecordingConnector()
+        second = make_agent(
+            ScriptedModel([ModelResponse(message="recovered")]),
+            memory="disabled",
+            connector=connector,
+            workflow_store=store,
+            platform_mcp=(ghost, docs),
+        )
+        second.platform_config.allowed_mcp_servers.add("ghost")
+        try:
+            result = second.resume_task(record.task_id)
+        finally:
+            second.close()
+
+        self.assertEqual(result.message, "recovered")
+        self.assertEqual(connector.attempts, ["docs"])
+
+    def test_cancel_does_not_close_mcp_connector_before_discovery_exits(self):
+        started = threading.Event()
+        allow_exit = threading.Event()
+
+        class RunConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def __init__(self):
+                super().__init__()
+                self.exited = False
+                self.closed_before_exit = False
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                started.set()
+                self.assert_cancel_event = cancel_event
+                cancel_event.wait(1)
+                allow_exit.wait(1)
+                self.exited = True
+                raise CoreError("TASK_CANCELLED")
+
+            def close(self):
+                self.closed_before_exit = not self.exited
+
+        clone = RunConnector()
+
+        class Template(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def for_run(self):
+                return clone
+
+        agent = make_agent(
+            ScriptedModel([ModelResponse(message="must not run")]),
+            memory="disabled",
+            connector=Template(),
+        )
+        failures = []
+
+        def run():
+            try:
+                agent.run(run_request(memory=False), task_id="cancel-close-race")
+            except Exception as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(started.wait(1))
+        agent.cancel_task("cancel-close-race")
+        self.assertFalse(clone.closed_before_exit)
+        allow_exit.set()
+        thread.join(1)
+        try:
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([error.code for error in failures], ["TASK_CANCELLED"])
+            self.assertFalse(clone.closed_before_exit)
+        finally:
+            agent.close()
+
+    def test_cancel_is_successful_if_the_signaled_worker_commits_cancel_first(self):
+        started = threading.Event()
+
+        class CancelConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                started.set()
+                cancel_event.wait(1)
+                raise CoreError("TASK_CANCELLED")
+
+        agent = make_agent(
+            ScriptedModel([ModelResponse(message="must not run")]),
+            memory="disabled",
+            connector=CancelConnector(),
+        )
+        failures = []
+
+        def run():
+            try:
+                agent.run(run_request(memory=False), task_id="cancel-wins-race")
+            except Exception as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(started.wait(1))
+        original_lookup = agent.workflow_store.lookup_task
+
+        def lookup_after_worker(task_id):
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                record = original_lookup(task_id)
+                if record.state == "CANCELLED":
+                    return record
+                time.sleep(0.001)
+            return original_lookup(task_id)
+
+        with patch.object(agent.workflow_store, "lookup_task", lookup_after_worker):
+            agent.cancel_task("cancel-wins-race")
+        thread.join(1)
+        try:
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([error.code for error in failures], ["TASK_CANCELLED"])
+            self.assertEqual(original_lookup("cancel-wins-race").state, "CANCELLED")
+        finally:
+            agent.close()
+
+    def test_accepted_cancel_wins_over_a_later_mcp_start_failure(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class FailingConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                started.set()
+                release.wait(1)
+                raise CoreError("MCP_PROTOCOL_ERROR")
+
+        agent = make_agent(
+            ScriptedModel([ModelResponse(message="must not run")]),
+            memory="disabled",
+            connector=FailingConnector(),
+            platform_mcp=({**DOCS_MCP, "required": True},),
+        )
+        run_failures = []
+        cancel_failures = []
+
+        def run():
+            try:
+                agent.run(
+                    run_request(memory=False), task_id="cancel-before-start-failure"
+                )
+            except Exception as error:
+                run_failures.append(error)
+
+        def cancel():
+            try:
+                agent.cancel_task("cancel-before-start-failure")
+            except Exception as error:
+                cancel_failures.append(error)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(started.wait(1))
+        cancellation = threading.Thread(target=cancel)
+        cancellation.start()
+        deadline = time.monotonic() + 1
+        while not agent.workflow_store.lookup_task(
+            "cancel-before-start-failure"
+        ).cancel_requested:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.001)
+        release.set()
+        worker.join(1)
+        cancellation.join(1)
+        try:
+            persisted = agent.workflow_store.lookup_task("cancel-before-start-failure")
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(cancellation.is_alive())
+            self.assertEqual(cancel_failures, [])
+            self.assertEqual([error.code for error in run_failures], ["TASK_CANCELLED"])
+            self.assertEqual(persisted.state, "CANCELLED")
+        finally:
+            agent.close()
+
+    def test_required_mcp_start_failure_does_not_strand_an_accepted_followup(self):
+        from core_agent.workflow import InMemoryWorkflowStore
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class TrackingStore(InMemoryWorkflowStore):
+            def __init__(self):
+                super().__init__()
+                self.consume_states = []
+                self.consume_attempts = 0
+                self.injected = False
+
+            def consume_inbound(self, *args, **kwargs):
+                self.consume_attempts += 1
+                record = args[0]
+                if not self.injected:
+                    self.injected = True
+                    self.append_inbound(
+                        record.task_id,
+                        tenant_id=record.tenant_id,
+                        owner_id=record.owner_id,
+                        message_id="accepted-during-terminal-disposition",
+                        context_id=record.context_id,
+                        content="racing correction",
+                        provenance={},
+                    )
+                updated = super().consume_inbound(*args, **kwargs)
+                self.consume_states.append(updated.state)
+                return updated
+
+        class BrokenConnector(InMemoryMcpConnector):
+            cold_start_timeout = 30.0
+
+            def connect(self, declaration, *, cancel_event=None, deadline=None):
+                started.set()
+                release.wait(1)
+                raise CoreError("MCP_PROTOCOL_ERROR", "invalid initialize response")
+
+        store = TrackingStore()
+        agent = make_agent(
+            ScriptedModel([]),
+            memory="disabled",
+            connector=BrokenConnector(),
+            platform_mcp=({**DOCS_MCP, "required": True},),
+            workflow_store=store,
+        )
+        failures = []
+
+        def run():
+            try:
+                agent.run(run_request(memory=False), task_id="failed-start-followup")
+            except Exception as error:
+                failures.append(error)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(started.wait(1))
+        record = agent.workflow_store.lookup_task("failed-start-followup")
+        agent.enqueue_message(
+            RunRequest.from_dict({"prompt": "accepted correction"}),
+            task_id=record.task_id,
+            message_id="accepted-before-failure",
+            identity=record.owner_id,
+            session_id=record.context_id,
+            tenant_id=record.tenant_id,
+        )
+        release.set()
+        thread.join(1)
+        try:
+            terminal = agent.workflow_store.lookup_task(record.task_id)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([error.code for error in failures], ["MCP_PROTOCOL_ERROR"])
+            self.assertEqual(terminal.state, "FAILED")
+            self.assertEqual(agent.workflow_store.pending_inbound(terminal), ())
+            self.assertIn(
+                "accepted correction",
+                [
+                    item["content"]
+                    for item in terminal.snapshot["context"]["transcript"]
+                ],
+            )
+            self.assertIn(
+                "racing correction",
+                [
+                    item["content"]
+                    for item in terminal.snapshot["context"]["transcript"]
+                ],
+            )
+            self.assertIn(
+                "unprocessed_due_to_failure",
+                [item["kind"] for item in terminal.snapshot["context"]["transcript"]],
+            )
+            self.assertEqual(store.consume_attempts, 2)
+            self.assertEqual(store.consume_states, ["FAILED"])
+        finally:
+            agent.close()
+
     def _mark_executing_mutation(self, agent, task_id, *, parent_run_id=None):
         record, _raw, _discovered, _effective = agent._new_workflow(
             run_request(memory=False),
@@ -248,9 +1248,7 @@ class RuntimeTests(unittest.TestCase):
         snapshot["pending_response"] = CoreAgent._response_dict(
             ModelResponse(
                 tool_requests=(
-                    ToolRequest(
-                        pending["id"], pending["name"], pending["arguments"]
-                    ),
+                    ToolRequest(pending["id"], pending["name"], pending["arguments"]),
                 )
             )
         )
@@ -616,9 +1614,7 @@ class RuntimeTests(unittest.TestCase):
         agent.tool_runtime.handlers["core_terminal_exec"] = lose_outcome
         try:
             with self.assertRaises((CoreError, RuntimeError)):
-                agent.run(
-                    run_request(memory=False), task_id="mutating-tool-exception"
-                )
+                agent.run(run_request(memory=False), task_id="mutating-tool-exception")
             record = agent.workflow_store.lookup_task("mutating-tool-exception")
         finally:
             agent.close()
@@ -632,8 +1628,8 @@ class RuntimeTests(unittest.TestCase):
             terminal_mutating=True,
         )
         dispatches = []
-        agent.tool_runtime.handlers["core_terminal_exec"] = (
-            lambda _arguments, _run_id: dispatches.append("dispatched")
+        agent.tool_runtime.handlers["core_terminal_exec"] = lambda _arguments, _run_id: (
+            dispatches.append("dispatched")
         )
         self._mark_executing_mutation(agent, "resume-executing-mutation")
         try:
@@ -679,10 +1675,12 @@ class RuntimeTests(unittest.TestCase):
         )
         self._mark_executing_mutation(agent, "cancel-executing-mutation")
         try:
-            agent.cancel_task("cancel-executing-mutation")
+            with self.assertRaises(CoreError) as caught:
+                agent.cancel_task("cancel-executing-mutation")
             record = agent.workflow_store.lookup_task("cancel-executing-mutation")
         finally:
             agent.close()
+        self.assertEqual(caught.exception.code, "SIDE_EFFECT_UNKNOWN")
         self.assertEqual(record.state, "ABORTED")
         self.assertEqual(record.error_code, "SIDE_EFFECT_UNKNOWN")
 
@@ -1185,7 +2183,10 @@ class RuntimeTests(unittest.TestCase):
 
             def transition(self, *args, **kwargs):
                 record = super().transition(*args, **kwargs)
-                if kwargs.get("event_kind") == "model.attempt.started" and not self.crashed:
+                if (
+                    kwargs.get("event_kind") == "model.attempt.started"
+                    and not self.crashed
+                ):
                     self.crashed = True
                     raise KeyboardInterrupt("simulated process crash")
                 return record
@@ -1205,9 +2206,7 @@ class RuntimeTests(unittest.TestCase):
                 agent.run(run_request(memory=False), task_id="crash-normal-attempt")
             persisted = store.lookup_task("crash-normal-attempt")
             self.assertEqual(persisted.snapshot["turns"], 1)
-            self.assertEqual(
-                store._budgets[persisted.snapshot["budget_root_id"]][2], 2
-            )
+            self.assertEqual(store._budgets[persisted.snapshot["budget_root_id"]][2], 2)
 
             result = agent.resume_task("crash-normal-attempt")
         finally:
@@ -2151,6 +3150,295 @@ class RuntimeTests(unittest.TestCase):
             if '"tool.completed"' in record.getMessage()
         ]
         self.assertEqual(completed[0]["output"], {"results": [{"text": "leaderboard"}]})
+
+    def test_mcp_cold_start_retries_do_not_charge_or_duplicate_the_tool_call(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        methods = []
+
+        class WakingDocsHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                method = request.get("method")
+                methods.append(method)
+                if len(methods) == 1:
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if method == "initialize":
+                    result = {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "docs", "version": "1"},
+                    }
+                elif method == "tools/list":
+                    result = {"tools": [{"name": "search", "inputSchema": {}}]}
+                elif method == "tools/call":
+                    result = {"content": [{"type": "text", "text": "found"}]}
+                else:
+                    result = {}
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), WakingDocsHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        declaration = {
+            **DOCS_MCP,
+            "transport": {
+                "type": "streamable_http",
+                "url": f"http://127.0.0.1:{server.server_port}/mcp",
+            },
+        }
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(
+                        ToolRequest("call-1", "docs_search", {"query": "x"}),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(message="done", finish_reason="stop"),
+            ]
+        )
+        agent = make_agent(
+            model,
+            connector=StreamableHttpMcpConnector(timeout=5, cold_start_timeout=5),
+            platform_mcp=(declaration,),
+        )
+        try:
+            with patch("core_agent.mcp.time.sleep", return_value=None):
+                result = agent.run(run_request())
+        finally:
+            agent.close()
+
+        self.assertEqual((result.usage.model_turns, result.usage.tool_calls), (2, 1))
+        self.assertEqual(methods.count("initialize"), 2)
+        self.assertEqual(methods.count("tools/call"), 1)
+
+    def test_mcp_tool_call_uses_the_connector_owned_by_its_run(self):
+        class ScopedConnector(InMemoryMcpConnector):
+            def __init__(self, clones, *, template=False):
+                super().__init__(
+                    catalogs={"docs": {"search": {"type": "object"}}},
+                    results={"docs.search": {"content": [{"text": "found"}]}},
+                )
+                self.clones = clones
+                self.template = template
+                self.tool_calls = 0
+
+            def for_run(self):
+                clone = type(self)(self.clones)
+                self.clones.append(clone)
+                return clone
+
+            def call(self, server, tool, arguments):
+                self.tool_calls += 1
+                return super().call(server, tool, arguments)
+
+        clones = []
+        template = ScopedConnector(clones, template=True)
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(ToolRequest("search-1", "docs_search", {}),),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(message="done", finish_reason="stop"),
+            ]
+        )
+        agent = make_agent(model, connector=template)
+        try:
+            result = agent.run(run_request(), task_id="scoped-mcp-session")
+        finally:
+            agent.close()
+
+        self.assertEqual(result.message, "done")
+        self.assertEqual(len(clones), 1)
+        self.assertEqual(template.tool_calls, 0)
+        self.assertEqual(clones[0].tool_calls, 1)
+
+    def test_optional_mcp_cold_start_timeout_does_not_fail_the_task(self):
+        class TimedOutConnector(InMemoryMcpConnector):
+            def connect(
+                self,
+                declaration,
+                *,
+                cancel_event=None,
+                deadline=None,
+            ):
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED",
+                    "docs did not become ready",
+                    retryable=True,
+                    data={"reason": "cold_start_timeout"},
+                )
+
+        model = ScriptedModel([ModelResponse(message="continued without MCP")])
+        agent = make_agent(model, connector=TimedOutConnector())
+        try:
+            with self.assertLogs("core_agent.runtime", level="WARNING") as captured:
+                result = agent.run(run_request())
+        finally:
+            agent.close()
+
+        self.assertEqual(result.message, "continued without MCP")
+        self.assertEqual((result.usage.model_turns, result.usage.tool_calls), (1, 0))
+        self.assertIn("MCP_CONNECTION_FAILED", "\n".join(captured.output))
+        self.assertNotIn("docs_search", model.calls[0].tools)
+
+    def test_optional_mcp_failure_is_reported_for_each_run(self):
+        class TimedOutConnector(InMemoryMcpConnector):
+            cold_start_timeout = 0.0
+
+            def connect(
+                self,
+                declaration,
+                *,
+                cancel_event=None,
+                deadline=None,
+            ):
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED",
+                    "docs did not become ready",
+                    retryable=True,
+                    data={"reason": "cold_start_timeout"},
+                )
+
+        agent = make_agent(
+            ScriptedModel(
+                [ModelResponse(message="first"), ModelResponse(message="second")]
+            ),
+            memory="disabled",
+            connector=TimedOutConnector(),
+        )
+        try:
+            with self.assertLogs("core_agent.runtime", level="WARNING") as captured:
+                agent.run(run_request(memory=False), task_id="optional-one")
+                agent.run(run_request(memory=False), task_id="optional-two")
+        finally:
+            agent.close()
+
+        unavailable = [
+            line for line in captured.output if "MCP_CONNECTION_FAILED" in line
+        ]
+        self.assertEqual(len(unavailable), 2)
+
+    def test_mutating_mcp_transport_failure_is_not_redispatched(self):
+        class BreakingConnector(InMemoryMcpConnector):
+            def __init__(self):
+                super().__init__(catalogs={"docs": {"update": {"type": "object"}}})
+                self.tool_calls = 0
+
+            def call(self, server, tool, arguments):
+                self.tool_calls += 1
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED", "connection lost", retryable=True
+                )
+
+        connector = BreakingConnector()
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(ToolRequest("write-1", "docs_update", {}),),
+                    finish_reason="tool_calls",
+                )
+            ]
+        )
+        agent = make_agent(model, connector=connector)
+        try:
+            with self.assertRaises(CoreError) as caught:
+                agent.run(run_request(), task_id="mcp-write-unknown")
+            record = agent.workflow_store.lookup_task("mcp-write-unknown")
+        finally:
+            agent.close()
+
+        self.assertEqual(caught.exception.code, "SIDE_EFFECT_UNKNOWN")
+        self.assertEqual(record.state, "ABORTED")
+        self.assertEqual(record.error_code, "SIDE_EFFECT_UNKNOWN")
+        self.assertEqual(connector.tool_calls, 1)
+
+    def test_mcp_tool_name_cannot_classify_an_unknown_outcome_as_read_only(self):
+        class BreakingConnector(InMemoryMcpConnector):
+            def __init__(self):
+                super().__init__(catalogs={"docs": {"search": {"type": "object"}}})
+                self.tool_calls = 0
+
+            def call(self, server, tool, arguments):
+                self.tool_calls += 1
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED", "connection lost", retryable=True
+                )
+
+        connector = BreakingConnector()
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(ToolRequest("named-read-1", "docs_search", {}),),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(message="must not recover", finish_reason="stop"),
+            ]
+        )
+        declaration = {
+            key: value for key, value in DOCS_MCP.items() if key != "read_only_tools"
+        }
+        agent = make_agent(model, connector=connector, platform_mcp=(declaration,))
+        try:
+            with self.assertRaises(CoreError) as caught:
+                agent.run(run_request(), task_id="mcp-name-is-not-policy")
+            record = agent.workflow_store.lookup_task("mcp-name-is-not-policy")
+        finally:
+            agent.close()
+
+        self.assertEqual(caught.exception.code, "SIDE_EFFECT_UNKNOWN")
+        self.assertEqual(record.state, "ABORTED")
+        self.assertEqual(connector.tool_calls, 1)
+
+    def test_read_only_mcp_transport_failure_is_returned_to_the_model(self):
+        class BreakingConnector(InMemoryMcpConnector):
+            def __init__(self):
+                super().__init__(catalogs={"docs": {"search": {"type": "object"}}})
+                self.tool_calls = 0
+
+            def call(self, server, tool, arguments):
+                self.tool_calls += 1
+                raise CoreError(
+                    "MCP_CONNECTION_FAILED", "connection lost", retryable=True
+                )
+
+        connector = BreakingConnector()
+        model = ScriptedModel(
+            [
+                ModelResponse(
+                    tool_requests=(ToolRequest("read-1", "docs_search", {}),),
+                    finish_reason="tool_calls",
+                ),
+                ModelResponse(message="MCP is unavailable", finish_reason="stop"),
+            ]
+        )
+        agent = make_agent(model, connector=connector)
+        try:
+            result = agent.run(run_request(), task_id="mcp-read-failed")
+        finally:
+            agent.close()
+
+        self.assertEqual(result.message, "MCP is unavailable")
+        self.assertEqual(connector.tool_calls, 1)
+        self.assertIn("MCP_CONNECTION_FAILED", model.calls[1].messages[-1]["content"])
 
     def test_a_tool_reporting_its_own_failure_is_not_a_successful_result(self):
         """MCP answers a failed tool with 200 and isError, not with a transport error."""

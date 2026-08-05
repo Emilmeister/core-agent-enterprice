@@ -31,7 +31,13 @@ A2A является основным внешним контрактом: Agent
 
 ### Config compiler
 
-До Task собирает immutable EffectiveConfig как пересечение PlatformConfig, tenant policy, AgentConfig и Task capabilities. Он удаляет disabled tools/MCP/skills до model discovery и генерирует соответствующую Agent Card.
+До сетевого discovery собирает и сохраняет immutable admission ceiling как
+пересечение PlatformConfig, tenant policy, AgentConfig, Task capabilities и MCP
+declarations. После discovery фиксирует EffectiveConfig и полный проверенный MCP
+catalog. Новая platform deny может только сузить принятый ceiling; изменение
+deployment configuration не расширяет capabilities уже созданной Task. Compiler
+удаляет disabled tools/MCP/skills до model discovery и генерирует соответствующую
+Agent Card.
 
 ### Model router
 

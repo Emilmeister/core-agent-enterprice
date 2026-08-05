@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import logging
@@ -135,9 +136,7 @@ class StreamedReasoningTests(unittest.TestCase):
             b"data: [DONE]\n\n",
         ]
         response = model._stream_openai(iter(frames), lambda *args: None)
-        self.assertEqual(
-            model._parse_openai(response, {}).reasoning, "Думаю."
-        )
+        self.assertEqual(model._parse_openai(response, {}).reasoning, "Думаю.")
 
 
 class ModelTransportFailureTests(unittest.TestCase):
@@ -246,9 +245,7 @@ class ArtifactServiceTests(unittest.TestCase):
             def find(self, query, projection=None):
                 pattern = re.compile(query["_id"]["$regex"])
                 return [
-                    {"_id": key}
-                    for key in sorted(self.documents)
-                    if pattern.match(key)
+                    {"_id": key} for key in sorted(self.documents) if pattern.match(key)
                 ]
 
         service = ArtifactService(MongoDbArtifactBackend(collection=Collection()))
@@ -402,12 +399,15 @@ class RemoteAgentConnectionTests(unittest.TestCase):
                 forwarded_headers={"X-PROJECT-ID": "p1"},
             )
         )
-        self.assertEqual([event.text for event in events], ["looking it up", "24 degrees"])
+        self.assertEqual(
+            [event.text for event in events], ["looking it up", "24 degrees"]
+        )
         self.assertEqual([event.final for event in events], [False, True])
         body, headers = RemoteAgentHandler.seen
         self.assertEqual(body["method"], "message/stream")
         self.assertEqual(
-            body["params"]["message"]["parts"], [{"kind": "text", "text": "What is the weather?"}]
+            body["params"]["message"]["parts"],
+            [{"kind": "text", "text": "What is the weather?"}],
         )
         self.assertEqual(body["params"]["message"]["contextId"], "c1")
         lowered = {key.lower(): value for key, value in headers.items()}
@@ -462,7 +462,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                     "role": "user",
                     "messageId": str(uuid.uuid4()),
                     "parts": [{"kind": "text", "text": prompt}],
-                                                        }
+                }
             },
         }
         frames = []
@@ -476,7 +476,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                 "/",
                 json=payload,
                 headers={
-                                        "A2A-Version": "0.3",
+                    "A2A-Version": "0.3",
                     "Accept": "text/event-stream",
                     "Authorization": "Bearer caller-token",
                     "Cookie": "session=secret",
@@ -507,9 +507,9 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         partials = [
             frame
             for frame in frames
-            if (((frame.get("status") or {}).get("message") or {}).get("metadata") or {}).get(
-                "partial"
-            )
+            if (
+                ((frame.get("status") or {}).get("message") or {}).get("metadata") or {}
+            ).get("partial")
         ]
         self.assertGreater(len(partials), 1)
         snapshots = [
@@ -579,7 +579,8 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             part["text"]
             for frame in frames
             for part in self._parts(frame)
-            if part.get("kind") == "text" and not (part.get("metadata") or {}).get("adk_thought")
+            if part.get("kind") == "text"
+            and not (part.get("metadata") or {}).get("adk_thought")
         ]
         self.assertIn("looking it up", relayed)
         response = next(
@@ -597,7 +598,9 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_message_is_absent_when_no_remote_agent_is_configured(self):
         app = self._app()
-        advertised = {skill.id for skill in app.state.a2a_request_handler._agent_card.skills}
+        advertised = {
+            skill.id for skill in app.state.a2a_request_handler._agent_card.skills
+        }
         self.assertNotIn("core_agent_send_message", advertised)
         self.assertNotIn(
             "core_agent_send_message",
@@ -607,11 +610,15 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
     async def test_streaming_can_be_disabled_without_losing_the_result(self):
         frames = await self._frames(self._app(A2A_STREAMING_ENABLED="false"), "hello")
         self.assertEqual(
-            [], [frame for frame in frames if self._parts(frame) and not frame.get("final")]
+            [],
+            [
+                frame
+                for frame in frames
+                if self._parts(frame) and not frame.get("final")
+            ],
         )
         terminal = [frame for frame in frames if frame.get("final")]
         self.assertEqual(terminal[0]["status"]["state"], "completed")
-
 
     async def test_unknown_jsonrpc_envelope_fields_are_dropped_not_interpreted(self):
         """A client hedging with a duplicated field must not be rejected outright."""
@@ -629,7 +636,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                 "role": "user",
                 "messageId": str(uuid.uuid4()),
                 "parts": [{"kind": "text", "text": "hi"}],
-                                            }
+            }
             if context_id:
                 message["contextId"] = context_id
             return {
@@ -700,9 +707,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                     "/.well-known/agent.json",
                 ):
                     card = (await client.get(path, headers=headers)).json()
-                    found[path] = {
-                        item["url"] for item in card["supportedInterfaces"]
-                    }
+                    found[path] = {item["url"] for item in card["supportedInterfaces"]}
             return found
 
         # Hosting platforms publish the public address under either spelling;
@@ -729,9 +734,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         app = build(AGENT_URL="https://configured.example")
         try:
             found = await urls(app, {"Host": "attacker.example"})
-            self.assertEqual(
-                list(found.values()), [{"https://configured.example"}] * 2
-            )
+            self.assertEqual(list(found.values()), [{"https://configured.example"}] * 2)
         finally:
             app.state.close()
 
@@ -789,9 +792,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                     (item["protocolBinding"], item["protocolVersion"])
                     for item in card["supportedInterfaces"]
                 }
-                self.assertEqual(
-                    advertised, {("HTTP+JSON", "1.0"), ("JSONRPC", "0.3")}
-                )
+                self.assertEqual(advertised, {("HTTP+JSON", "1.0"), ("JSONRPC", "0.3")})
                 for binding, version in sorted(advertised):
                     with self.subTest(binding=binding, version=version):
                         headers = {"A2A-Version": version}
@@ -933,9 +934,7 @@ class ConfigurationTransferTests(unittest.TestCase):
                     os.environ, {**BASE_ENVIRONMENT, **environment}, clear=True
                 ):
                     with self.assertRaises(CoreError) as caught:
-                        create_app(
-                            model=None if "LLM_MODEL" in environment else model
-                        )
+                        create_app(model=None if "LLM_MODEL" in environment else model)
                 self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
     def test_startup_separates_configured_remote_agents_from_connected(self):
@@ -1169,7 +1168,9 @@ class ConfigurationTransferTests(unittest.TestCase):
                 }
             ]
         }
-        parsed = openai._parse_openai(response, {"core_terminal_exec": "core_terminal_exec"})
+        parsed = openai._parse_openai(
+            response, {"core_terminal_exec": "core_terminal_exec"}
+        )
         self.assertEqual(parsed.tool_requests[0].arguments, {"argv": ["ls"]})
 
     def test_startup_reports_otlp_endpoints_and_never_the_key(self):
@@ -1534,22 +1535,750 @@ class ConfigurationTransferTests(unittest.TestCase):
         )
         self.assertEqual(sorted(catalog), ["get_forecast"])
 
+    def test_mcp_session_id_is_isolated_between_runs(self):
+        """A second run must not replace the first run's server session."""
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        calls = []
+        sessions = iter(("session-one", "session-two"))
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                method = request.get("method")
+                session = self.headers.get("Mcp-Session-Id")
+                calls.append((method, session))
+                if method == "initialize":
+                    assigned = next(sessions)
+                    result = {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "scoped", "version": "1"},
+                    }
+                elif method == "tools/list":
+                    assigned = None
+                    result = {"tools": [{"name": "search", "inputSchema": {}}]}
+                else:
+                    assigned = None
+                    result = {"session": session}
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                if assigned:
+                    self.send_header("Mcp-Session-Id", assigned)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connector = StreamableHttpMcpConnector(timeout=5)
+        first_connector = connector.for_run()
+        second_connector = connector.for_run()
+        declaration = {
+            "name": "mcp",
+            "transport": {
+                "type": "streamable_http",
+                "url": f"http://127.0.0.1:{server.server_port}/mcp",
+            },
+        }
+
+        first_connector.connect(declaration)
+        second_connector.connect(declaration)
+        first = first_connector.call("mcp", "search", {})
+        second = second_connector.call("mcp", "search", {})
+
+        self.assertEqual(first["session"], "session-one")
+        self.assertEqual(second["session"], "session-two")
+        self.assertEqual(
+            calls[-2:],
+            [
+                ("tools/call", "session-one"),
+                ("tools/call", "session-two"),
+            ],
+        )
+
+    def test_mcp_malformed_catalog_is_a_permanent_protocol_error(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                result = (
+                    {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "bad", "version": "1"},
+                    }
+                    if request.get("method") == "initialize"
+                    else {"tools": [{"inputSchema": {}}]}
+                )
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connector = StreamableHttpMcpConnector(timeout=5, cold_start_timeout=5)
+        with self.assertRaises(CoreError) as caught:
+            connector.connect(
+                {
+                    "name": "mcp",
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": f"http://127.0.0.1:{server.server_port}/mcp",
+                    },
+                }
+            )
+
+        self.assertEqual(caught.exception.code, "MCP_PROTOCOL_ERROR")
+        self.assertFalse(caught.exception.retryable)
+
     def test_mcp_connection_failure_names_the_actual_cause(self):
         """One generic code cannot separate a wrong URL from TLS or a dead host."""
         from core_agent.mcp import StreamableHttpMcpConnector
 
-        connector = StreamableHttpMcpConnector(timeout=5)
+        connector = StreamableHttpMcpConnector(timeout=5, cold_start_timeout=0)
 
         def connect(url):
             with self.assertRaises(CoreError) as caught:
                 connector.connect(
-                    {"name": "mcp", "transport": {"type": "streamable_http", "url": url}}
+                    {
+                        "name": "mcp",
+                        "transport": {"type": "streamable_http", "url": url},
+                    }
                 )
             self.assertEqual(caught.exception.code, "MCP_CONNECTION_FAILED")
             return str(caught.exception)
 
         self.assertIn("scheme is not allowed", connect("http://mcp.example.test/mcp"))
         self.assertIn("Connection refused", connect("http://127.0.0.1:1/mcp"))
+
+    def test_mcp_cold_start_retries_discovery_and_drops_the_stale_session(self):
+        """A replacement instance cannot know the session owned by the scaled-down one."""
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        calls = []
+
+        class WakingMcpHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                method = request.get("method")
+                calls.append((method, self.headers.get("Mcp-Session-Id")))
+                if len(calls) == 1:
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if method == "initialize":
+                    result = {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "waking", "version": "1"},
+                    }
+                elif method == "tools/list":
+                    result = {"tools": [{"name": "search", "inputSchema": {}}]}
+                else:
+                    result = {}
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                if method == "initialize":
+                    self.send_header("Mcp-Session-Id", "fresh-session")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), WakingMcpHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connector = StreamableHttpMcpConnector(timeout=5, cold_start_timeout=5)
+        connector._sessions["mcp"] = "stale-session"
+        declaration = {
+            "name": "mcp",
+            "transport": {
+                "type": "streamable_http",
+                "url": f"http://127.0.0.1:{server.server_port}/mcp",
+            },
+        }
+
+        with patch("core_agent.mcp.time.sleep", return_value=None):
+            catalog = connector.connect(declaration)
+
+        self.assertEqual(catalog, {"search": {}})
+        self.assertEqual([method for method, _session in calls[:2]], ["initialize"] * 2)
+        self.assertEqual([session for _method, session in calls[:2]], [None, None])
+        self.assertEqual(
+            calls[2:],
+            [
+                ("notifications/initialized", "fresh-session"),
+                ("tools/list", "fresh-session"),
+            ],
+        )
+
+    def test_mcp_cold_start_does_not_retry_permanent_http_failure(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        attempts = []
+        real_client = httpx.AsyncClient
+
+        def denied(request):
+            return httpx.Response(401, request=request)
+
+        def client(**kwargs):
+            attempts.append(kwargs["timeout"].connect)
+            return real_client(transport=httpx.MockTransport(denied), **kwargs)
+
+        connector = StreamableHttpMcpConnector(timeout=30, cold_start_timeout=300)
+        with (
+            patch("core_agent.mcp.httpx.AsyncClient", side_effect=client),
+            patch("core_agent.mcp.time.sleep") as sleep,
+            self.assertRaises(CoreError) as caught,
+        ):
+            connector.connect(
+                {
+                    "name": "mcp",
+                    "transport": {"type": "streamable_http", "url": "https://mcp.test"},
+                }
+            )
+
+        self.assertEqual(caught.exception.code, "MCP_CONNECTION_FAILED")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(attempts, [30])
+        sleep.assert_not_called()
+
+    def test_mcp_explicit_zero_deadline_runs_one_attempt_without_retry(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        attempts = []
+        real_client = httpx.AsyncClient
+
+        def unavailable(request):
+            attempts.append(request)
+            return httpx.Response(503, request=request)
+
+        def client(**kwargs):
+            return real_client(transport=httpx.MockTransport(unavailable), **kwargs)
+
+        connector = StreamableHttpMcpConnector(timeout=30, cold_start_timeout=300)
+        with (
+            patch("core_agent.mcp.httpx.AsyncClient", side_effect=client),
+            patch("core_agent.mcp.time.sleep") as sleep,
+            self.assertRaises(CoreError) as caught,
+        ):
+            connector.connect(
+                {
+                    "name": "mcp",
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": "https://mcp.test/mcp",
+                    },
+                },
+                deadline=0.0,
+            )
+
+        self.assertEqual(caught.exception.code, "MCP_CONNECTION_FAILED")
+        self.assertEqual(len(attempts), 1)
+        sleep.assert_not_called()
+
+    def test_mcp_cold_start_does_not_retry_invalid_json(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        attempts = []
+        real_client = httpx.AsyncClient
+
+        def invalid(request):
+            attempts.append("initialize")
+            return httpx.Response(
+                200,
+                content=b"not-json",
+                headers={"Content-Type": "application/json"},
+                request=request,
+            )
+
+        def client(**kwargs):
+            return real_client(transport=httpx.MockTransport(invalid), **kwargs)
+
+        connector = StreamableHttpMcpConnector(timeout=30, cold_start_timeout=300)
+        with (
+            patch("core_agent.mcp.httpx.AsyncClient", side_effect=client),
+            patch("core_agent.mcp.time.sleep") as sleep,
+            self.assertRaises(CoreError) as caught,
+        ):
+            connector.connect(
+                {
+                    "name": "mcp",
+                    "transport": {"type": "streamable_http", "url": "https://mcp.test"},
+                }
+            )
+
+        self.assertEqual(caught.exception.code, "MCP_PROTOCOL_ERROR")
+        self.assertEqual(attempts, ["initialize"])
+        sleep.assert_not_called()
+
+    def test_mcp_cold_start_retries_a_remote_protocol_disconnect(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        attempts = []
+        real_client = httpx.AsyncClient
+
+        def handler(request):
+            method = json.loads(request.content)["method"]
+            attempts.append(method)
+            if len(attempts) == 1:
+                raise httpx.RemoteProtocolError("peer closed early", request=request)
+            result = (
+                {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "mcp", "version": "1"},
+                }
+                if method == "initialize"
+                else {"tools": [{"name": "search", "inputSchema": {}}]}
+                if method == "tools/list"
+                else {}
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": json.loads(request.content).get("id"),
+                    "result": result,
+                },
+                request=request,
+            )
+
+        def client(**kwargs):
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        connector = StreamableHttpMcpConnector(timeout=5, cold_start_timeout=5)
+        with (
+            patch("core_agent.mcp.httpx.AsyncClient", side_effect=client),
+            patch("core_agent.mcp.time.sleep", return_value=None),
+        ):
+            catalog = connector.connect(
+                {
+                    "name": "mcp",
+                    "transport": {"type": "streamable_http", "url": "https://mcp.test"},
+                }
+            )
+
+        self.assertEqual(catalog, {"search": {}})
+        self.assertEqual(attempts[:2], ["initialize", "initialize"])
+
+    def test_sync_mcp_connector_can_be_called_from_an_active_event_loop(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        real_client = httpx.AsyncClient
+
+        def handler(request):
+            payload = json.loads(request.content)
+            result = (
+                {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "mcp", "version": "1"},
+                }
+                if payload["method"] == "initialize"
+                else {"tools": [{"name": "search", "inputSchema": {}}]}
+                if payload["method"] == "tools/list"
+                else {}
+            )
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload.get("id"), "result": result},
+                request=request,
+            )
+
+        def client(**kwargs):
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        async def connect():
+            return StreamableHttpMcpConnector(timeout=5, cold_start_timeout=0).connect(
+                {
+                    "name": "mcp",
+                    "transport": {"type": "streamable_http", "url": "https://mcp.test"},
+                }
+            )
+
+        with patch("core_agent.mcp.httpx.AsyncClient", side_effect=client):
+            catalog = asyncio.run(connect())
+        self.assertEqual(catalog, {"search": {}})
+
+    def test_mcp_connector_close_does_not_invalidate_active_discovery(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                payload = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                method = payload["method"]
+                if method == "initialize":
+                    started.set()
+                    release.wait(1)
+                    result = {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "mcp", "version": "1"},
+                    }
+                elif method == "tools/list":
+                    result = {"tools": [{"name": "search", "inputSchema": {}}]}
+                else:
+                    result = {}
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "id": payload.get("id"), "result": result}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connector = StreamableHttpMcpConnector(timeout=5, cold_start_timeout=0)
+        results = []
+
+        def connect():
+            try:
+                results.append(
+                    connector.connect(
+                        {
+                            "name": "mcp",
+                            "transport": {
+                                "type": "streamable_http",
+                                "url": f"http://127.0.0.1:{server.server_port}/mcp",
+                            },
+                        }
+                    )
+                )
+            except Exception as error:
+                results.append(error)
+
+        thread = threading.Thread(target=connect)
+        thread.start()
+        self.assertTrue(started.wait(1))
+        connector.close()
+        release.set()
+        thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [{"search": {}}])
+
+    def test_mcp_cold_start_deadline_caps_the_network_attempt(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        timeouts = []
+        real_client = httpx.AsyncClient
+
+        def unavailable(request):
+            raise httpx.ConnectError("still starting", request=request)
+
+        def client(**kwargs):
+            timeouts.append(kwargs["timeout"].connect)
+            return real_client(transport=httpx.MockTransport(unavailable), **kwargs)
+
+        connector = StreamableHttpMcpConnector(timeout=30, cold_start_timeout=0.05)
+        with (
+            patch("core_agent.mcp.httpx.AsyncClient", side_effect=client),
+            self.assertRaises(CoreError) as caught,
+        ):
+            connector.connect(
+                {
+                    "name": "mcp",
+                    "transport": {"type": "streamable_http", "url": "https://mcp.test"},
+                }
+            )
+
+        self.assertEqual(len(timeouts), 1)
+        self.assertGreater(timeouts[0], 0)
+        self.assertLessEqual(timeouts[0], 0.05)
+        self.assertEqual(caught.exception.code, "MCP_CONNECTION_FAILED")
+        self.assertEqual(caught.exception.data["reason"], "cold_start_timeout")
+
+    def test_mcp_cold_start_does_not_turn_cancel_polling_into_a_one_second_timeout(
+        self,
+    ):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        class SlowHealthyHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                if request.get("method") == "initialize":
+                    time.sleep(1.05)
+                    result = {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "slow", "version": "1"},
+                    }
+                elif request.get("method") == "tools/list":
+                    result = {"tools": [{"name": "search", "inputSchema": {}}]}
+                else:
+                    result = {}
+                body = json.dumps(
+                    {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except BrokenPipeError:
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHealthyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connector = StreamableHttpMcpConnector(timeout=5, cold_start_timeout=3)
+
+        catalog = connector.connect(
+            {
+                "name": "mcp",
+                "transport": {
+                    "type": "streamable_http",
+                    "url": f"http://127.0.0.1:{server.server_port}/mcp",
+                },
+            },
+            cancel_event=threading.Event(),
+        )
+
+        self.assertEqual(catalog, {"search": {}})
+
+    def test_mcp_cancel_interrupts_a_trickled_response_body(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        first_byte = threading.Event()
+
+        class TricklingHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                body = json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "result": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {"tools": {}},
+                        },
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for byte in body:
+                        self.wfile.write(bytes((byte,)))
+                        self.wfile.flush()
+                        first_byte.set()
+                        time.sleep(0.02)
+                except BrokenPipeError:
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TricklingHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connector = StreamableHttpMcpConnector(timeout=5, cold_start_timeout=5)
+        cancel = threading.Event()
+        errors = []
+
+        def connect():
+            try:
+                connector.connect(
+                    {
+                        "name": "mcp",
+                        "transport": {
+                            "type": "streamable_http",
+                            "url": f"http://127.0.0.1:{server.server_port}/mcp",
+                        },
+                    },
+                    cancel_event=cancel,
+                )
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=connect)
+        thread.start()
+        self.assertTrue(first_byte.wait(1))
+        started = time.monotonic()
+        cancel.set()
+        thread.join(0.75)
+
+        self.assertFalse(thread.is_alive())
+        self.assertLess(time.monotonic() - started, 0.75)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], CoreError)
+        self.assertEqual(errors[0].code, "TASK_CANCELLED")
+
+    def test_mcp_cold_start_deadline_interrupts_a_trickled_response_body(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        class TricklingHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                body = json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "result": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {"tools": {}},
+                        },
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for byte in body:
+                        self.wfile.write(bytes((byte,)))
+                        self.wfile.flush()
+                        time.sleep(0.02)
+                except BrokenPipeError:
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TricklingHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connector = StreamableHttpMcpConnector(timeout=5, cold_start_timeout=0.2)
+        started = time.monotonic()
+
+        with self.assertRaises(CoreError) as caught:
+            connector.connect(
+                {
+                    "name": "mcp",
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": f"http://127.0.0.1:{server.server_port}/mcp",
+                    },
+                }
+            )
+
+        self.assertLess(time.monotonic() - started, 0.75)
+        self.assertEqual(caught.exception.code, "MCP_CONNECTION_FAILED")
+        self.assertEqual(caught.exception.data["reason"], "cold_start_timeout")
+
+    def test_mcp_cold_start_timeout_comes_from_the_environment(self):
+        from core_agent.model import ModelResponse, ScriptedModel
+
+        for configured, expected in ((None, 300.0), ("17.5", 17.5), ("0", 0.0)):
+            environment = dict(BASE_ENVIRONMENT)
+            if configured is not None:
+                environment["MCP_COLD_START_TIMEOUT_SECONDS"] = configured
+            model = ScriptedModel([ModelResponse(message="ok")])
+            model.model = "cold-start-config"
+            with self.subTest(configured=configured):
+                with patch.dict(os.environ, environment, clear=True):
+                    app = create_app(model=model)
+                try:
+                    self.assertEqual(
+                        app.state.core_agent.mcp_connector.cold_start_timeout,
+                        expected,
+                    )
+                finally:
+                    app.state.close()
+
+    def test_mcp_cold_start_timeout_rejects_non_finite_or_negative_values(self):
+        from core_agent.model import ModelResponse, ScriptedModel
+
+        for value in ("-1", "nan", "inf", "not-a-number"):
+            model = ScriptedModel([ModelResponse(message="unused")])
+            model.model = "cold-start-config"
+            with (
+                self.subTest(value=value),
+                patch.dict(
+                    os.environ,
+                    {**BASE_ENVIRONMENT, "MCP_COLD_START_TIMEOUT_SECONDS": value},
+                    clear=True,
+                ),
+                self.assertRaises(CoreError) as caught,
+            ):
+                create_app(model=model)
+            self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+
+    def test_mcp_request_timeouts_must_be_finite_and_positive(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        for field in ("timeout", "sse_read_timeout"):
+            for value in (0, -1, float("nan"), float("inf"), "not-a-number"):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(CoreError) as caught:
+                        StreamableHttpMcpConnector(**{field: value})
+                    self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+
+    def test_mcp_custom_headers_cannot_override_transport_state(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+
+        for name in (
+            "content-type",
+            "ACCEPT",
+            "mcp-method",
+            "MCP-NAME",
+            "mcp-session-id",
+            "mcp-protocol-version",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(CoreError) as caught:
+                    StreamableHttpMcpConnector(headers={name: "attacker-controlled"})
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
 
     def test_startup_record_survives_late_logging_setup(self):
         """The ASGI server configures logging after the app is built."""
@@ -1599,6 +2328,7 @@ class ConfigurationTransferTests(unittest.TestCase):
                 "builtin_tools",
                 "mcp_servers",
                 "mcp_allowed_tools",
+                "mcp_read_only_tools",
                 "remote_agents_configured",
                 "remote_agents_connected",
                 "artifact_storage",
@@ -1631,7 +2361,10 @@ class ConfigurationTransferTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {**BASE_ENVIRONMENT, "MCP_ALLOWED_TOOLS": "get_current,weather.get_forecast"},
+            {
+                **BASE_ENVIRONMENT,
+                "MCP_ALLOWED_TOOLS": "get_current,weather.get_forecast",
+            },
             clear=True,
         ):
             grouped = _allowed_mcp_tools({"weather", "docs"})
@@ -1644,10 +2377,13 @@ class ConfigurationTransferTests(unittest.TestCase):
         # Without an allowlist no tool is allowed anywhere: nothing is allowed by
         # default, so a connected server must say so instead of looking healthy.
         with patch.dict(os.environ, BASE_ENVIRONMENT, clear=True):
-            self.assertEqual(_allowed_mcp_tools({"weather", "docs"}), {
-                "weather": [],
-                "docs": [],
-            })
+            self.assertEqual(
+                _allowed_mcp_tools({"weather", "docs"}),
+                {
+                    "weather": [],
+                    "docs": [],
+                },
+            )
 
         model = ScriptedModel([ModelResponse(message="ok")])
         model.model = "silent-mcp-model"
@@ -1666,13 +2402,52 @@ class ConfigurationTransferTests(unittest.TestCase):
                     type("R", (), {"prompt": "x"})()
                 )
             self.assertEqual(connector.connections, ("docs",))
-            silent = [line for line in logs.output if "no tool of it is allowed" in line]
+            silent = [
+                line for line in logs.output if "no tool of it is allowed" in line
+            ]
             self.assertEqual(len(silent), 1)
             # The warning must name the server and what could be allowed.
             self.assertIn("'docs'", silent[0])
             self.assertIn("search", silent[0])
         finally:
             app.state.close()
+
+    def test_mcp_read_only_policy_comes_from_deployment_configuration(self):
+        from core_agent.mcp import InMemoryMcpConnector
+        from core_agent.model import ModelResponse, ScriptedModel
+
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "read-only-policy"
+        with patch.dict(
+            os.environ,
+            {
+                **BASE_ENVIRONMENT,
+                "MCP_URL": "https://docs.test/docs",
+                "MCP_ALLOWED_TOOLS": "search",
+                "MCP_READ_ONLY_TOOLS": "search",
+            },
+            clear=True,
+        ):
+            app = create_app(model=model, mcp_connector=InMemoryMcpConnector())
+        try:
+            self.assertEqual(
+                app.state.core_agent.platform_mcp[0]["read_only_tools"], ["search"]
+            )
+        finally:
+            app.state.close()
+
+    def test_scoped_mcp_read_only_policy_does_not_leak_to_another_server(self):
+        from core_agent.app import _read_only_mcp_tools
+
+        with patch.dict(
+            os.environ,
+            {**BASE_ENVIRONMENT, "MCP_READ_ONLY_TOOLS": "docs.search"},
+            clear=True,
+        ):
+            grouped = _read_only_mcp_tools({"docs", "evil"})
+
+        self.assertEqual(grouped["docs"], ["search"])
+        self.assertEqual(grouped["evil"], [])
 
     def test_subagent_inherits_artifact_and_remote_agent_services(self):
         """A delegated tool whose service is missing answers CAPABILITY_DISABLED."""
@@ -1739,7 +2514,9 @@ class ConfigurationTransferTests(unittest.TestCase):
                 ],
             )
         )
-        self.assertEqual([part.kind for part in converted.parts], ["text", "file", "url"])
+        self.assertEqual(
+            [part.kind for part in converted.parts], ["text", "file", "url"]
+        )
         self.assertEqual(converted.parts[1].data["bytes"], b"\x89PNG")
 
         # A URL part is refused outright: fetching it would be SSRF.
@@ -1868,7 +2645,9 @@ class ConfigurationTransferTests(unittest.TestCase):
 
         # Cloud.ru requires exactly one colon with both halves present.
         self.assertEqual(
-            build(endpoint_url=CLOUD_RU_ENDPOINT, tenant_id="t", access_key_id="k").access_key_id,
+            build(
+                endpoint_url=CLOUD_RU_ENDPOINT, tenant_id="t", access_key_id="k"
+            ).access_key_id,
             "t:k",
         )
         for key in ("AKIAKEY", "a:b:c", ":k", "t:"):

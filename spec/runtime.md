@@ -11,15 +11,20 @@
 До первого вызова модели ядро MUST:
 
 1. провалидировать входящий A2A Message;
-2. вычислить immutable EffectiveConfig;
-3. создать `run_id`, event stream и начальный checkpoint;
-4. разрешить skills и MCP descriptors через effective policy;
-5. создать lock snapshot skills, MCP capabilities и отфильтрованных tools;
-6. построить system/kernel/capability instructions;
-7. загрузить session working state и, если разрешено, вызвать retrieval MCP и подсистему памяти;
-8. выбрать primary model route и проверить capabilities;
-9. вычислить доступный контекстный бюджет;
-10. перевести A2A Task в `working` и испустить внутреннее `task.started`.
+2. вычислить immutable admission ceiling из PlatformConfig, tenant policy,
+   AgentConfig, Task capabilities и MCP declarations; текущий deny впоследствии
+   может только сузить его;
+3. создать `run_id`, event stream и начальный checkpoint с admission ceiling и
+   сроком MCP discovery;
+4. разрешить MCP descriptors через admission policy и выполнить discovery;
+5. вычислить и зафиксировать immutable EffectiveConfig и полный проверенный MCP
+   catalog со schemas;
+6. разрешить skills и создать их lock snapshot;
+7. построить system/kernel/capability instructions;
+8. загрузить session working state и, если разрешено, вызвать retrieval MCP и подсистему памяти;
+9. выбрать primary model route и проверить capabilities;
+10. вычислить доступный контекстный бюджет;
+11. перевести A2A Task в `working` и испустить внутреннее `task.started`.
 
 Если шаг не выполнен, модель и инструменты MUST NOT вызываться.
 
@@ -58,7 +63,7 @@
 
 ## Live steering
 
-Новый A2A Message не является interrupt текущей операции. Adapter durable-фиксирует его в inbox существующего non-terminal run; orchestrator забирает committed Messages перед следующим model turn. Если Message приходит между последним model response и terminal commit, completion gate обязан либо включить его в следующий turn, либо проиграть race уже committed terminal state и отклонить SendMessage.
+Новый A2A Message не является interrupt текущей операции. Adapter durable-фиксирует его в inbox существующего non-terminal run; orchestrator забирает committed Messages перед следующим model turn. Если Message приходит между последним model response и terminal commit, completion gate обязан либо включить его в следующий turn, либо проиграть race уже committed terminal state и отклонить SendMessage. При `failed` или `canceled` принятый раньше Message не запускает новый model/tool call: runtime атомарно переносит его в transcript с явной пометкой `unprocessed_due_to_failure` или `unprocessed_due_to_cancel`, затем повторяет terminal commit.
 
 Каждый accepted Message сохраняет исходные `messageId`, task/context IDs, authenticated caller provenance и monotonic inbox sequence, но поступает модели как недоверенный user-role input. Несколько Messages не склеиваются в один prompt и не подменяют system/kernel instructions. Unconsumed Messages pinned при compaction и recovery. Follow-up не сбрасывает и не увеличивает hard budgets.
 
@@ -202,7 +207,7 @@ A2A protocol version. При чтении результата, записанн
 
 ## Повторные попытки
 
-- Read-only и идемпотентные provider/MCP операции MAY повторяться при временной ошибке с ограниченным exponential backoff.
+- Read-only и идемпотентные provider/MCP операции MAY повторяться при временной ошибке с ограниченным exponential backoff. MCP initialize/discovery при cold start начинается после durable создания workflow и immutable admission snapshot, ограничивается единым для всех MCP данного run `MCP_COLD_START_TIMEOUT_SECONDS`, прерывается отменой и не расходует model/tool budget. Срок ожидания сохраняется в checkpoint и не начинается заново после recovery; reconnect уже инициализированного workflow получает отдельный сохраняемый срок, но не меняет его EffectiveConfig.
 - Мутирующий tool call MUST NOT повторяться автоматически, если нет достоверного idempotency key или подтверждения, что действие не началось.
 - Каждая попытка сохраняется в аудите под одним логическим `tool_call_id` и отдельным `attempt`.
 
@@ -221,6 +226,33 @@ A2A protocol version. При чтении результата, записанн
   продлевают fencing window. Workflow transition повторно проверяет token и
   expiry на финальном `core_runs` write после всех budget/outbox/audit locks;
   ранняя проверка перед потенциальной блокировкой не является fencing.
+- Recovery coordinator MUST автоматически повторно сканировать durable workflow,
+  чтобы продолжить `RUNNING`/`MODEL_RESPONDED` после истечения старого lease без
+  resubscribe или иного запроса клиента. Пассивные `WAITING_*`, `PAUSED` и
+  `APPROVED_RESERVED` при таком сканировании не запускаются. Фильтр root workflow
+  применяется до batch limit: очередь child workflow не может вытеснить root из
+  каждого сканирования. Если claim или continuation получает `LEASE_LOST`, одна
+  попытка recovery завершается без локального busy polling: право следующей
+  попытки определяет очередной scan после истечения или освобождения lease.
+- Первичный root admission MUST атомарно сохранить workflow и lease запускающего
+  worker: recovery не может перехватить новую запись в зазоре между admission и
+  началом `_continue_workflow`. Child workflow принадлежит durable scheduler и не
+  запускается общим root recovery coordinator.
+- A2A cancel сначала durable-фиксирует `cancel_requested`, не объявляя отмену
+  завершённой. Только текущий владелец fenced lease либо recovery после истечения
+  lease переводит workflow в `CANCELLED`; `EXECUTING` с неизвестным outcome
+  остаётся reconciliation. Cancel, принятый до создания workflow row, не может
+  теряться из-за локального timeout и применяется сразу после durable admission.
+  Принятый intent имеет приоритет над более поздними `COMPLETED`, `FAILED` и
+  `REJECTED`; владелец lease завершает такой non-ambiguous workflow как
+  `CANCELLED`.
+- Graceful shutdown worker-а не является A2A cancel: он останавливает текущие и
+  ожидающие локальные continuation, не записывает terminal state и оставляет
+  workflow для следующего fenced recovery. `LEASE_LOST` также является fencing
+  signal, а не ошибкой продукта: stale worker прекращает публикацию и не переводит
+  durable workflow или внешнюю A2A Task в terminal state. Это правило действует
+  только после durable admission: остановка до создания workflow возвращает
+  безопасную terminal ошибку и не оставляет невосстановимую A2A Task в `working`.
 - Перед каждой физической provider attempt runtime MUST одной транзакцией
   списать общий model budget и сохранить local attempt counter/dispatch marker.
   Для заранее оплаченного finalizer та же транзакция снимает reserve marker без

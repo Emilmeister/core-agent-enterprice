@@ -141,15 +141,12 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/tasks.py` | Test scheduler, mailbox и delegation contracts |
 | `core_agent/postgres_tasks.py` | Durable PostgreSQL scheduler и mailbox |
 | `core_agent/workflow.py` | Workflow stores, transitions и durable outbox |
-| `core_agent/approvals.py` | Proposal/digest/reservation и development approve-all stub |
-| `core_agent/operator.py` | Private operator control plane и JWT authentication |
 | `core_agent/database.py` | PostgreSQL schema, migrations, pool и stores |
 | `core_agent/artifacts.py`, `core_agent/audit.py` | Tenant-scoped transport artifacts и append-only audit adapters |
 | `core_agent/artifact_service.py` | Named/scoped/versioned artifact model и in-memory, S3, MongoDB backends |
 | `core_agent/remote_agents.py` | Remote A2A agent registry и synchronous JSON-RPC/SSE client |
 | `core_agent/streaming.py` | Stream chunk merge, snapshot buffer и ADK metadata keys |
 | `core_agent/durability.py`, `core_agent/lifecycle.py` | Events, checkpoints, leases, recovery и retention |
-| `core_agent/postgres_approvals.py` | Durable PostgreSQL HITL state |
 | `core_agent/mcp.py` | MCP discovery/calls, canonical tool naming и Streamable HTTP connector |
 | `core_agent/security.py` | Redaction, safe paths, retry и tenant helpers |
 | `core_agent/skills.py` | Skill resolution и integrity metadata |
@@ -189,7 +186,8 @@ Target spec может описывать больше текущего runtime.
 
 ### Публичный контракт и инструкции
 
-- Run input содержит ровно `prompt`, `mcp`, `skills`.
+- Run input содержит ровно `prompt`; MCP-серверы и skills задаются
+  конфигурацией развёртывания и не добавляются в RunRequest.
 - Tenant, identity, auth, trace context, model route, policy и budgets приходят
   через authenticated transport/platform config, а не добавляются в RunRequest.
 - A2A является внешним lifecycle. Не создавать параллельную несовместимую task
@@ -200,6 +198,10 @@ Target spec может описывать больше текущего runtime.
 - Follow-up не прерывает текущий model/tool call, не меняет EffectiveConfig или
   budgets и дедуплицируется по `(task_id, message_id)`. После terminal state
   продолжение создаёт новую Task в том же context.
+- Перед `FAILED`, `CANCELLED`, `REJECTED` или `ABORTED` все уже принятые
+  follow-up атомарно переносятся в transcript как
+  `unprocessed_due_to_failure|cancel` вместе с terminal transition. Они не
+  остаются unread и не доставляются модели после recovery.
 - Terminal A2A Artifact различает полное и budget-exhausted завершение через
   `complete`, `completion_reason`, local `usage`, root `shared_budget` и при
   необходимости `exhausted_dimension`/`pending_tasks`; live и recovery path
@@ -207,6 +209,12 @@ Target spec может описывать больше текущего runtime.
 - Любая tool/side-effect/background/subagent работа принадлежит A2A Task.
   Закрытие stream не отменяет Task; critical wait/status сохраняется durable и
   восстанавливается через GetTask.
+- Fresh subscription пассивно публикует persisted Task и его durable изменения;
+  она не запускает workflow. Для active Task persisted snapshot идёт раньше live
+  events, а первое terminal event закрывает stream без последующих кадров.
+- `LEASE_LOST` и graceful shutdown после durable admission не terminalize-ят A2A
+  Task. Shutdown до admission публикует safe failure, потому что восстанавливать
+  ещё нечего. Late cancel сохраняет уже committed workflow outcome.
 - EffectiveConfig является immutable intersection PlatformConfig, tenant policy,
   AgentConfig и Task/delegation contract. Deny сильнее allow.
 - Disabled capability отсутствует в Agent Card/model catalog и повторно
@@ -258,14 +266,27 @@ Memory tools являются built-ins Core Agent, а не MCP tools отдел
 `index_status` и `entity_resolve` остаются внутренними методами. `MCP_ALLOWED_SERVERS`
 и `MCP_ALLOWED_TOOLS` пусты по умолчанию: MCP-сервер и его tools требуют явной
 platform configuration, а зарезервированного сервера `memory` не существует.
+`MCP_READ_ONLY_TOOLS` также пуст по умолчанию: неизвестный MCP-tool считается
+mutating независимо от имени и server annotations. Только доверенная запись
+голого имени или `server.tool` разрешает обработать неизвестный transport
+outcome как ошибку read-only операции; scoped-форма не действует на другие
+серверы.
+При каждом новом run Streamable HTTP discovery повторяет только временные
+ошибки до одного общего для всех MCP `MCP_COLD_START_TIMEOUT_SECONDS` (по
+умолчанию 300 секунд). Workflow и абсолютный срок сохраняются до сети, поэтому
+follow-up, cancel и recovery видят тот же Task и не начинают срок заново. Каждый
+run получает отдельные MCP session и negotiated version; перед initialize они
+очищаются. Ожидание не расходует model/tool budget. Permanent auth/protocol
+ошибки и неоднозначный mutating `tools/call` не повторяются; cancel прерывает
+ожидание.
 
 ### Runtime modes и execution
 
 - `with_terminal` может публиковать `core_terminal_exec` и `core_task_start`.
 - `without_terminal` удаляет эти два tool, сохраняя task lifecycle, delegation,
   MCP и memory.
-- `core_python_exec` доступен в обоих режимах только при
-  `LOCAL_APPROVAL_ENABLED=false`.
+- `core_python_exec` доступен в обоих режимах, если не удалён
+  `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`.
 - `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` только сужает выбранный mode ceiling.
 - `CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS` задаёт положительное bounded ожидание
   подтверждения cancel owned Tasks перед возвратом budget-partial результата.
@@ -291,31 +312,16 @@ platform configuration, а зарезервированного сервера `
   она могла исправиться или объяснить ошибку пользователю.
 - Неизвестный outcome возможного mutating side effect требует
   `SIDE_EFFECT_UNKNOWN`/reconciliation и никогда не получает blind retry.
-- Intent внешней мутации фиксируется до dispatch. Approval/reservation не даёт
+- Intent внешней мутации фиксируется до dispatch. Runtime не обещает
   exactly-once guarantee downstream.
 
 ### HITL
 
-- Remote A2A caller никогда не является approver. Текст «одобряю», request
-  metadata или caller JWT не дают approval.
-- Operator plane является private, имеет отдельные credentials/audience и не
-  публикуется как A2A tool.
-- Protected action dispatch-ится только после immutable proposal, exact digest,
-  committed approve-once decision и single-use reservation с повторной
-  проверкой task, proposal, tenant, caller principal, tool/version, environment,
-  target, semantic arguments, side-effect class, policy version и expiry.
-- Approval не заменяет повторную schema, tenant и tool-policy validation.
-- `WAITING_LOCAL_APPROVAL` проецируется в A2A как `working`; caller может
-  наблюдать, поставить follow-up в durable очередь или вызвать настоящий A2A
-  `CancelTask`. Queued text не является approve/deny/cancel и не доставляется
-  модели до снятия approval lock.
-- Первый committed approve/deny/cancel transition побеждает. Cancel, committed
-  до reservation, отменяет approval; после reservation Task не отменяется.
-- Expiry, deny или outage operator service оставляют side effect неисполненным;
-  outage сохраняет Task в durable `working`.
-- Approval mode `never` означает deny protected action, а не allow-all.
-- `ApproveAllControlPlane` допустим только в development; production обязан
-  fail closed без настоящего authenticated control plane.
+- Текущий v1 composition root не подключает operator approval plane:
+  policy deny окончателен, а полноценный HITL остаётся target capability.
+- Remote A2A caller не становится approver через текст, request metadata или
+  caller JWT. Не документировать модули approval/operator как включённый
+  runtime flow, пока они не подключены в `core_agent/app.py` и не имеют CI proof.
 
 ### Background и delegation
 
@@ -335,7 +341,7 @@ platform configuration, а зарезервированного сервера `
   policy-bypass и generic second-opinion работа остаётся у parent.
 - Внутри objective/scope child самостоятельно выбирает strategy, sequencing и
   delegated tools. Procedure задаётся только для safety, correctness,
-  reproducibility или policy; assumptions не подменяют tenant/approval/scope.
+  reproducibility или policy; assumptions не подменяют tenant/policy/scope.
 - Child не расширяет capabilities, tenant или parent budget.
 - Root и каждый child заранее занимают один finalization model turn в общем
   root ledger. Перед каждой физической provider attempt и каждым model-issued
@@ -380,13 +386,19 @@ platform configuration, а зарезервированного сервера `
 
 ### Persistence и storage
 
-- Production использует PostgreSQL и fail closed без `DATABASE_URL`, доступной
+- Production использует PostgreSQL и fail closed без настроенного DSN, доступной
   DB и совпадающей schema version. Нет SQLite/in-memory fallback.
-- Tasks, workflow events/checkpoints, inbound inbox, approvals/reservations,
-  outbox и audit tenant/owner-scoped и сохраняются в PostgreSQL согласованно.
+- Tasks, workflow events/checkpoints, inbound inbox, outbox и audit
+  tenant/owner-scoped и сохраняются в PostgreSQL согласованно.
 - После restart ambiguous dispatched side effect переходит в reconciliation, а
   не replay. Shared storage lock не заменяет lease: у stateful run один active
   owner.
+- Root recovery coordinator сканирует durable безопасные состояния автоматически;
+  root-фильтр применяется до batch limit. Проигравший claim завершается на первом
+  `LEASE_LOST` и ждёт следующего scan вместо локального polling. Graceful shutdown
+  оставляет admitted workflow для следующего владельца.
+- Recovery reconciliation одной транзакцией обновляет A2A Task и ставит push в
+  idempotent ledger; recovered failure содержит только stable safe error code.
 - Serving process не выполняет production auto-migration; migration job имеет
   отдельный `DATABASE_MIGRATION_URL`.
 - `DURABLE_STORAGE_ROOT` предназначен для immutable durable blobs, snapshots и
@@ -395,8 +407,8 @@ platform configuration, а зарезервированного сервера `
   процессов и не находится внутри durable mount.
 - Memory corpus живёт в backend из `MEMORY_STORAGE_TYPE` (процесс или общая БД
   агента) и не имеет собственного filesystem root; не смешивать storage domains.
-- Test/in-memory adapters и approve-all control plane разрешены только в явно
-  выбранном development/test profile.
+- Test/in-memory adapters разрешены только в явно выбранном
+  development/test profile.
 
 ### Память агента
 
@@ -568,7 +580,7 @@ docker compose logs -f agent
 2. Observable behavior соответствует разрешённой normative spec.
 3. Добавлен минимальный regression proof либо объяснено, почему он не нужен.
 4. Все применимые проверки выполнены; skipped/failed gates явно перечислены.
-5. Security, tenant, durability, approval и recovery invariants сохранены.
+5. Security, tenant, durability, policy и recovery invariants сохранены.
 6. `AGENTS.md` проверен и обновлён, если его факты изменились.
 7. Diff не содержит secrets, `.env`, `.idea/`, generated state или unrelated
    user changes.

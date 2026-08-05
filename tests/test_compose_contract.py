@@ -50,16 +50,12 @@ class ComposeContractTests(unittest.TestCase):
         environment = self.services["agent"]["environment"]
         self.assertIn("AGENT_NAME", environment)
         self.assertEqual(environment["AGENT_SYSTEM_PROMPT"], "${AGENT_SYSTEM_PROMPT:-}")
-        self.assertEqual(
-            environment["THINKING_LEVEL"], "${THINKING_LEVEL:-}"
-        )
+        self.assertEqual(environment["THINKING_LEVEL"], "${THINKING_LEVEL:-}")
         self.assertEqual(
             environment["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"],
             "${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-true}",
         )
-        self.assertEqual(
-            environment["LOG_LEVEL"], "${LOG_LEVEL:-INFO}"
-        )
+        self.assertEqual(environment["LOG_LEVEL"], "${LOG_LEVEL:-INFO}")
         self.assertEqual(
             environment["CORE_AGENT_LOG_CONTENT"],
             "${CORE_AGENT_LOG_CONTENT:-true}",
@@ -73,7 +69,9 @@ class ComposeContractTests(unittest.TestCase):
             "${CORE_AGENT_RUNTIME_MODE:-with_terminal}",
         )
         self.assertIn("CORE_AGENT_ALLOWED_BUILTIN_TOOLS", environment)
-        self.assertIn("core_python_exec", environment["CORE_AGENT_ALLOWED_BUILTIN_TOOLS"])
+        self.assertIn(
+            "core_python_exec", environment["CORE_AGENT_ALLOWED_BUILTIN_TOOLS"]
+        )
 
     def test_transfer_scheme_variables_are_wired_through_compose(self):
         environment = self.services["agent"]["environment"]
@@ -93,6 +91,16 @@ class ComposeContractTests(unittest.TestCase):
             ("EMBEDDING_API_BASE", "${EMBEDDING_API_BASE:-}"),
             ("EMBEDDING_API_KEY", "${EMBEDDING_API_KEY:-}"),
             ("EMBEDDING_DIMENSION", "${EMBEDDING_DIMENSION:-768}"),
+            ("MCP_ALLOWED_SERVERS", "${MCP_ALLOWED_SERVERS:-}"),
+            ("MCP_ALLOWED_TOOLS", "${MCP_ALLOWED_TOOLS:-}"),
+            ("MCP_READ_ONLY_TOOLS", "${MCP_READ_ONLY_TOOLS:-}"),
+            ("MCP_HEADERS_JSON", "${MCP_HEADERS_JSON:-}"),
+            ("MCP_TIMEOUT", "${MCP_TIMEOUT:-30.0}"),
+            ("MCP_SSE_READ_TIMEOUT", "${MCP_SSE_READ_TIMEOUT:-300.0}"),
+            (
+                "MCP_COLD_START_TIMEOUT_SECONDS",
+                "${MCP_COLD_START_TIMEOUT_SECONDS:-300.0}",
+            ),
         ):
             with self.subTest(name=name):
                 self.assertEqual(environment[name], expected)

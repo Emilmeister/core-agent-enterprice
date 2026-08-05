@@ -28,6 +28,7 @@ class WorkflowRecord:
     pending_approval_id: str | None = None
     result: dict | None = None
     error_code: str | None = None
+    cancel_requested: bool = False
 
 
 class InMemoryWorkflowStore:
@@ -42,6 +43,7 @@ class InMemoryWorkflowStore:
         self._lock = threading.RLock()
         self._budgets = {}
         self._inbound = {}
+        self._cancel_requested = set()
 
     def create(
         self,
@@ -49,9 +51,22 @@ class InMemoryWorkflowStore:
         *,
         budget_limits=(100, 200),
         reserve_model_turns=0,
+        lease_owner=None,
+        lease_token=None,
+        lease_ttl=None,
         **_metadata,
     ):
         with self._lock:
+            if any(
+                value is not None for value in (lease_owner, lease_token, lease_ttl)
+            ):
+                if (
+                    not lease_owner
+                    or not lease_token
+                    or not lease_ttl
+                    or lease_ttl <= 0
+                ):
+                    raise CoreError("INVALID_TASK_STATE")
             if record.run_id in self._records:
                 raise CoreError("SESSION_CONFLICT")
             if record.parent_run_id:
@@ -86,6 +101,12 @@ class InMemoryWorkflowStore:
             )
             self._records[record.run_id] = record
             self._inbound[record.run_id] = []
+            if lease_token is not None:
+                self._leases[record.run_id] = (
+                    lease_owner,
+                    lease_token,
+                    self.clock() + lease_ttl,
+                )
             return record
 
     def append_inbound(
@@ -145,6 +166,17 @@ class InMemoryWorkflowStore:
         snapshot,
         sequences,
         lease_token,
+        state="RUNNING",
+        event_kind="input.delivered",
+        inbound_event_kind=None,
+        event_data=None,
+        audit=(),
+        result=None,
+        error_code=None,
+        consume_model_turns=0,
+        consume_tool_calls=0,
+        release_model_turns=0,
+        include_shared_budget=False,
     ):
         with self._lock:
             current = self.get(
@@ -159,19 +191,31 @@ class InMemoryWorkflowStore:
             }
             if set(selected) != set(sequences):
                 raise CoreError("SESSION_CONFLICT")
-            updated = self.transition(
-                current.run_id,
-                tenant_id=current.tenant_id,
-                owner_id=current.owner_id,
-                expected_version=expected_version,
-                state="RUNNING",
-                snapshot=snapshot,
-                event_kind="input.delivered",
-                event_data={"sequences": list(sequences)},
-                lease_token=lease_token,
-            )
             for sequence in sequences:
                 selected[sequence]["consumed"] = True
+            try:
+                updated = self.transition(
+                    current.run_id,
+                    tenant_id=current.tenant_id,
+                    owner_id=current.owner_id,
+                    expected_version=expected_version,
+                    state=state,
+                    snapshot=snapshot,
+                    event_kind=event_kind,
+                    event_data=event_data or {"sequences": list(sequences)},
+                    audit=audit,
+                    result=result,
+                    error_code=error_code,
+                    lease_token=lease_token,
+                    consume_model_turns=consume_model_turns,
+                    consume_tool_calls=consume_tool_calls,
+                    release_model_turns=release_model_turns,
+                    include_shared_budget=include_shared_budget,
+                )
+            except Exception:
+                for sequence in sequences:
+                    selected[sequence]["consumed"] = False
+                raise
             return updated
 
     def consume_budget(self, record, *, model_turns=0, tool_calls=0):
@@ -226,6 +270,20 @@ class InMemoryWorkflowStore:
                 raise CoreError("TASK_NOT_FOUND")
             return record
 
+    def is_cancelled(self, run_id, *, tenant_id, owner_id):
+        record = self.get(run_id, tenant_id=tenant_id, owner_id=owner_id)
+        return record.state == "CANCELLED" or run_id in self._cancel_requested
+
+    def request_cancel(self, run_id, *, tenant_id, owner_id):
+        with self._lock:
+            record = self.get(run_id, tenant_id=tenant_id, owner_id=owner_id)
+            if record.state in TERMINAL_STATES:
+                raise CoreError("TASK_NOT_CANCELABLE")
+            self._cancel_requested.add(run_id)
+            updated = WorkflowRecord(**{**record.__dict__, "cancel_requested": True})
+            self._records[run_id] = updated
+            return updated
+
     def by_task(self, task_id, *, tenant_id, owner_id):
         with self._lock:
             for record in self._records.values():
@@ -271,7 +329,12 @@ class InMemoryWorkflowStore:
                 raise CoreError("SESSION_CONFLICT")
             if current.state in TERMINAL_STATES and state != current.state:
                 raise CoreError("INVALID_TASK_STATE")
-            if state == "COMPLETED" and any(
+            if (
+                state in {"COMPLETED", "FAILED", "REJECTED"}
+                and current.cancel_requested
+            ):
+                raise CoreError("CANCEL_REQUESTED")
+            if state in TERMINAL_STATES and any(
                 not item["consumed"] for item in self._inbound.get(run_id, ())
             ):
                 raise CoreError("INBOUND_MESSAGE_PENDING")
@@ -440,12 +503,17 @@ class InMemoryWorkflowStore:
                 raise CoreError("LEASE_LOST")
             del self._leases[run_id]
 
-    def recoverable(self, *, limit=100):
+    def recoverable(self, *, states=None, root_only=False, limit=100):
         with self._lock:
             return tuple(
                 record
                 for record in self._records.values()
-                if record.state not in TERMINAL_STATES
+                if (
+                    record.state in states
+                    if states is not None
+                    else record.state not in TERMINAL_STATES
+                )
+                and (not root_only or record.parent_run_id is None)
                 and (
                     record.run_id not in self._leases
                     or self._leases[record.run_id][2] <= self.clock()
@@ -542,6 +610,9 @@ class PostgresWorkflowStore:
         outbox_payload=None,
         budget_limits=(100, 200),
         reserve_model_turns=0,
+        lease_owner=None,
+        lease_token=None,
+        lease_ttl=None,
         connection=None,
     ):
         now = self.clock()
@@ -549,6 +620,9 @@ class PostgresWorkflowStore:
             raise CoreError("INVALID_TASK_STATE")
         if reserve_model_turns < 0:
             raise CoreError("INVALID_TASK_STATE")
+        if any(value is not None for value in (lease_owner, lease_token, lease_ttl)):
+            if not lease_owner or not lease_token or not lease_ttl or lease_ttl <= 0:
+                raise CoreError("INVALID_TASK_STATE")
 
         def create(db):
             nonlocal record
@@ -629,13 +703,21 @@ class PostgresWorkflowStore:
                     "snapshot": {**record.snapshot, "budget_root_id": root_run_id},
                 }
             )
+            lease_expires_at = None
+            if lease_token is not None:
+                lease_now = db.execute(
+                    """SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision
+                              AS now"""
+                ).fetchone()["now"]
+                lease_expires_at = lease_now + lease_ttl
             db.execute(
                 """INSERT INTO core_runs
                    (run_id, task_id, context_id, tenant_id, owner_id,
                     parent_run_id, state, version, request, snapshot,
-                    pending_approval_id, result, error_code, created_at, updated_at)
+                    pending_approval_id, result, error_code, lease_owner,
+                    lease_token, lease_expires_at, created_at, updated_at)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s, %s,
-                           %s, %s, %s, %s, %s)""",
+                           %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     record.run_id,
                     record.task_id,
@@ -649,6 +731,9 @@ class PostgresWorkflowStore:
                     record.pending_approval_id,
                     Jsonb(record.result) if record.result is not None else None,
                     record.error_code,
+                    lease_owner,
+                    lease_token,
+                    lease_expires_at,
                     now,
                     now,
                 ),
@@ -774,6 +859,37 @@ class PostgresWorkflowStore:
         with self.database.pool.connection() as db:
             return query(db)
 
+    def is_cancelled(self, run_id, *, tenant_id, owner_id):
+        with self.database.pool.connection() as connection:
+            row = connection.execute(
+                """SELECT state = 'CANCELLED' OR cancel_requested AS cancelled
+                   FROM core_runs
+                   WHERE run_id = %s AND tenant_id = %s AND owner_id = %s""",
+                (run_id, tenant_id, owner_id),
+            ).fetchone()
+        if row is None:
+            raise CoreError("TASK_NOT_FOUND")
+        return row["cancelled"]
+
+    def request_cancel(self, run_id, *, tenant_id, owner_id):
+        with self.database.transaction() as connection:
+            updated = connection.execute(
+                """UPDATE core_runs SET cancel_requested = true,
+                       updated_at = EXTRACT(EPOCH FROM clock_timestamp())
+                   WHERE run_id = %s AND tenant_id = %s AND owner_id = %s
+                     AND state NOT IN
+                         ('COMPLETED','FAILED','CANCELLED','REJECTED','ABORTED')""",
+                (run_id, tenant_id, owner_id),
+            )
+            if updated.rowcount != 1:
+                raise CoreError("TASK_NOT_CANCELABLE")
+            return self.get(
+                run_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                connection=connection,
+            )
+
     def by_task(self, task_id, *, tenant_id, owner_id):
         with self.database.pool.connection() as connection:
             row = connection.execute(
@@ -891,6 +1007,17 @@ class PostgresWorkflowStore:
         snapshot,
         sequences,
         lease_token,
+        state="RUNNING",
+        event_kind="input.delivered",
+        inbound_event_kind=None,
+        event_data=None,
+        audit=(),
+        result=None,
+        error_code=None,
+        consume_model_turns=0,
+        consume_tool_calls=0,
+        release_model_turns=0,
+        include_shared_budget=False,
     ):
         now = self.clock()
         with self.database.transaction() as connection:
@@ -910,21 +1037,36 @@ class PostgresWorkflowStore:
             ).fetchall()
             if {row["sequence"] for row in rows} != set(sequences):
                 raise CoreError("SESSION_CONFLICT")
-            updated = self._transition_locked(
-                connection,
-                current,
-                expected_version=expected_version,
-                state="RUNNING",
-                snapshot=snapshot,
-                event_kind="input.delivered",
-                event_data={"sequences": list(sequences)},
-                lease_token=lease_token,
-            )
+            if inbound_event_kind is not None:
+                self._event(
+                    connection,
+                    current,
+                    inbound_event_kind,
+                    {"sequences": list(sequences)},
+                    now,
+                )
             connection.execute(
                 """UPDATE core_inbound_messages SET consumed_at = %s
                    WHERE run_id = %s AND sequence = ANY(%s)
                      AND consumed_at IS NULL""",
                 (now, record.run_id, list(sequences)),
+            )
+            updated = self._transition_locked(
+                connection,
+                current,
+                expected_version=expected_version,
+                state=state,
+                snapshot=snapshot,
+                event_kind=event_kind,
+                event_data=event_data or {"sequences": list(sequences)},
+                audit=audit,
+                result=result,
+                error_code=error_code,
+                lease_token=lease_token,
+                consume_model_turns=consume_model_turns,
+                consume_tool_calls=consume_tool_calls,
+                release_model_turns=release_model_turns,
+                include_shared_budget=include_shared_budget,
             )
         return updated
 
@@ -963,7 +1105,9 @@ class PostgresWorkflowStore:
             raise CoreError("SESSION_CONFLICT")
         if current.state in TERMINAL_STATES and state != current.state:
             raise CoreError("INVALID_TASK_STATE")
-        if state == "COMPLETED":
+        if state in {"COMPLETED", "FAILED", "REJECTED"} and current.cancel_requested:
+            raise CoreError("CANCEL_REQUESTED")
+        if state in TERMINAL_STATES:
             pending = connection.execute(
                 """SELECT 1 FROM core_inbound_messages
                    WHERE run_id = %s AND consumed_at IS NULL LIMIT 1""",
@@ -981,11 +1125,7 @@ class PostgresWorkflowStore:
             ).fetchone()
             if lease is None:
                 raise CoreError("LEASE_LOST")
-        if (
-            consume_model_turns < 0
-            or consume_tool_calls < 0
-            or release_model_turns < 0
-        ):
+        if consume_model_turns < 0 or consume_tool_calls < 0 or release_model_turns < 0:
             raise CoreError("INVALID_TASK_STATE")
         if consume_model_turns:
             consumed = connection.execute(
@@ -1164,7 +1304,9 @@ class PostgresWorkflowStore:
             parameters,
         )
         if updated.rowcount != 1:
-            raise CoreError("LEASE_LOST" if lease_token is not None else "SESSION_CONFLICT")
+            raise CoreError(
+                "LEASE_LOST" if lease_token is not None else "SESSION_CONFLICT"
+            )
         return next_record
 
     def enter_approval(
@@ -1415,15 +1557,23 @@ class PostgresWorkflowStore:
             if updated.rowcount != 1:
                 raise CoreError("LEASE_LOST")
 
-    def recoverable(self, *, limit=100):
+    def recoverable(self, *, states=None, root_only=False, limit=100):
         with self.database.pool.connection() as connection:
+            state_filter = (
+                "state = ANY(%s)"
+                if states is not None
+                else "state NOT IN ('COMPLETED','FAILED','CANCELLED','REJECTED','ABORTED')"
+            )
+            values = [list(states)] if states is not None else []
+            root_filter = "AND parent_run_id IS NULL" if root_only else ""
             rows = connection.execute(
-                """SELECT * FROM core_runs
-                   WHERE state NOT IN ('COMPLETED','FAILED','CANCELLED','REJECTED','ABORTED')
-                     AND (lease_expires_at IS NULL OR lease_expires_at <=
-                          EXTRACT(EPOCH FROM clock_timestamp()))
-                   ORDER BY updated_at LIMIT %s""",
-                (limit,),
+                f"""SELECT * FROM core_runs
+                    WHERE {state_filter}
+                      {root_filter}
+                      AND (lease_expires_at IS NULL OR lease_expires_at <=
+                           EXTRACT(EPOCH FROM clock_timestamp()))
+                    ORDER BY updated_at LIMIT %s""",
+                (*values, limit),
             ).fetchall()
         return tuple(self._record(row) for row in rows)
 

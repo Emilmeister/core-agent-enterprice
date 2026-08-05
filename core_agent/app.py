@@ -148,14 +148,18 @@ def _log_environment(logger):
     # state either way — a name in the second group is exactly the case where
     # "the platform sent something we do not read" has to be readable.
     blocks = [
-        ("consulted", _chunked(
-            [f"{name}={_variable_state(name)}" for name in sorted(known)]
-        ))
+        (
+            "consulted",
+            _chunked([f"{name}={_variable_state(name)}" for name in sorted(known)]),
+        )
     ]
     if other:
-        blocks.append(("not-consulted", _chunked(
-            [f"{name}={_variable_state(name)}" for name in other]
-        )))
+        blocks.append(
+            (
+                "not-consulted",
+                _chunked([f"{name}={_variable_state(name)}" for name in other]),
+            )
+        )
     total = sum(len(lines) for _, lines in blocks)
     index = 0
     for label, lines in blocks:
@@ -181,19 +185,35 @@ def _json(name):
     return result
 
 
-def _allowed_mcp_tools(servers):
+def _grouped_mcp_tools(servers, variable):
     """Allow a tool by bare name on any server, or scope it with "server.tool".
 
     Both readings are kept because an MCP tool name may itself contain a dot;
     a name absent from a server's catalog is dropped when the two intersect.
     """
     grouped = {server: set() for server in servers}
-    for value in _csv("MCP_ALLOWED_TOOLS"):
+    for value in _csv(variable):
         server, separator, tool = value.partition(".")
         if separator and server in grouped:
             grouped[server].add(tool)
         for names in grouped.values():
             names.add(value)
+    return {server: sorted(names) for server, names in grouped.items()}
+
+
+def _allowed_mcp_tools(servers):
+    return _grouped_mcp_tools(servers, "MCP_ALLOWED_TOOLS")
+
+
+def _read_only_mcp_tools(servers):
+    grouped = {server: set() for server in servers}
+    for value in _csv("MCP_READ_ONLY_TOOLS"):
+        server, separator, tool = value.partition(".")
+        if separator and server in grouped:
+            grouped[server].add(tool)
+        else:
+            for names in grouped.values():
+                names.add(value)
     return {server: sorted(names) for server, names in grouped.items()}
 
 
@@ -385,9 +405,7 @@ def _artifact_service():
         s3_connect_timeout=float(_env("ARTIFACT_S3_CONNECT_TIMEOUT", "60")),
         s3_read_timeout=float(_env("ARTIFACT_S3_READ_TIMEOUT", "300")),
         s3_max_attempts=int(_env("ARTIFACT_S3_BOTO_MAX_ATTEMPTS", "1")),
-        s3_retry_initial_delay=float(
-            _env("ARTIFACT_S3_RETRY_INITIAL_DELAY", "1.0")
-        ),
+        s3_retry_initial_delay=float(_env("ARTIFACT_S3_RETRY_INITIAL_DELAY", "1.0")),
         s3_retry_max_delay=float(_env("ARTIFACT_S3_RETRY_MAX_DELAY", "60.0")),
         s3_retry_max_total_seconds=float(
             _env("ARTIFACT_S3_RETRY_MAX_TOTAL_SECONDS", "0.0")
@@ -610,27 +628,33 @@ def _declared_skills(allowed):
 
 def _mcp_name(url, index):
     parsed = urlparse(url)
-    return parsed.path.strip("/").split("/")[-1] or parsed.hostname or f"mcp_{index + 1}"
+    return (
+        parsed.path.strip("/").split("/")[-1] or parsed.hostname or f"mcp_{index + 1}"
+    )
 
 
 def _platform_mcp():
     """MCP_URL declares deployment-owned Streamable HTTP servers for every run."""
+    urls = _csv("MCP_URL")
+    names = tuple(_mcp_name(url, index) for index, url in enumerate(urls))
+    read_only = _read_only_mcp_tools(names)
     return tuple(
         {
-            "name": _mcp_name(url, index),
+            "name": names[index],
             "required": False,
+            "read_only_tools": read_only[names[index]],
             "transport": {"type": "streamable_http", "url": url},
         }
-        for index, url in enumerate(_csv("MCP_URL"))
+        for index, url in enumerate(urls)
     )
 
 
 def _agent(model, mcp_connector=None, *, state=None):
     platform_mcp = _platform_mcp()
-    servers = set(_csv("MCP_ALLOWED_SERVERS")) | {
-        item["name"] for item in platform_mcp
-    }
-    remote_connections, remote_agents_configured, remote_agent_failures = _remote_agents()
+    servers = set(_csv("MCP_ALLOWED_SERVERS")) | {item["name"] for item in platform_mcp}
+    remote_connections, remote_agents_configured, remote_agent_failures = (
+        _remote_agents()
+    )
     allowed_skills = set(_csv("CORE_AGENT_ALLOWED_SKILLS"))
     mcp_tools = _allowed_mcp_tools(servers)
     builtin_tools_without_terminal = {
@@ -668,7 +692,9 @@ def _agent(model, mcp_connector=None, *, state=None):
     memory_mode = _env("CORE_AGENT_MEMORY", "optional")
     if memory_mode == "disabled":
         for tools in builtin_tools_by_mode.values():
-            tools -= {name for name in all_builtin_tools if name.startswith("core_memory_")}
+            tools -= {
+                name for name in all_builtin_tools if name.startswith("core_memory_")
+            }
     if not _boolean("ARTIFACT_STORAGE_ENABLED", "true"):
         for tools in builtin_tools_by_mode.values():
             tools -= {
@@ -755,9 +781,7 @@ def _agent(model, mcp_connector=None, *, state=None):
                 "compact_to_working_ratio": 0.15,
                 "compaction_enabled": _boolean("EVENTS_COMPACTION_ENABLED", "true"),
                 "compaction_interval": int(_env("EVENTS_COMPACTION_INTERVAL", "0")),
-                "compaction_overlap": int(
-                    _env("EVENTS_COMPACTION_OVERLAP_SIZE", "0")
-                ),
+                "compaction_overlap": int(_env("EVENTS_COMPACTION_OVERLAP_SIZE", "0")),
             },
             "execution": {
                 "environment_profile": (
@@ -775,9 +799,7 @@ def _agent(model, mcp_connector=None, *, state=None):
             "budgets": {
                 "model_turns": platform.max_model_turns,
                 "tool_calls": platform.max_tool_calls,
-                "depth": int(
-                    _env("CORE_AGENT_MAX_DEPTH", str(MAX_SUBAGENT_DEPTH))
-                ),
+                "depth": int(_env("CORE_AGENT_MAX_DEPTH", str(MAX_SUBAGENT_DEPTH))),
                 "fan_out": int(_env("CORE_AGENT_MAX_FAN_OUT", "4")),
             },
         }
@@ -789,21 +811,16 @@ def _agent(model, mcp_connector=None, *, state=None):
         "yes",
     }
     try:
-        python_max_code_chars = int(
-            _env("CORE_AGENT_PYTHON_MAX_CODE_CHARS", "100000")
-        )
-        python_max_seconds = float(
-            _env("CORE_AGENT_PYTHON_MAX_SECONDS", "120")
-        )
+        python_max_code_chars = int(_env("CORE_AGENT_PYTHON_MAX_CODE_CHARS", "100000"))
+        python_max_seconds = float(_env("CORE_AGENT_PYTHON_MAX_SECONDS", "120"))
         python_max_output_bytes = int(
             _env("CORE_AGENT_PYTHON_MAX_OUTPUT_BYTES", "1000000")
         )
     except ValueError as error:
         raise CoreError("CONFIG_INVALID", "invalid Python execution limits") from error
-    if (
-        min(python_max_code_chars, python_max_seconds, python_max_output_bytes) <= 0
-        or not math.isfinite(python_max_seconds)
-    ):
+    if min(
+        python_max_code_chars, python_max_seconds, python_max_output_bytes
+    ) <= 0 or not math.isfinite(python_max_seconds):
         raise CoreError("CONFIG_INVALID", "Python execution limits must be positive")
     registry.register(
         ToolDefinition(
@@ -1186,9 +1203,7 @@ def _agent(model, mcp_connector=None, *, state=None):
                 risk_tags=frozenset(),
             )
         )
-    local_root = Path(
-        _env("LOCAL_WORKSPACE_ROOT", "/tmp/core-agent/runs")
-    ).resolve()
+    local_root = Path(_env("LOCAL_WORKSPACE_ROOT", "/tmp/core-agent/runs")).resolve()
     durable_value = _env("DURABLE_STORAGE_ROOT", "")
     if (
         _env("CORE_AGENT_ENVIRONMENT", "development") == "production"
@@ -1343,6 +1358,16 @@ def _agent(model, mcp_connector=None, *, state=None):
         },
     )
     token_counter = getattr(model, "count_tokens", None)
+    mcp_cold_start_timeout = _number("MCP_COLD_START_TIMEOUT_SECONDS", float)
+    if mcp_cold_start_timeout is None:
+        mcp_cold_start_timeout = 300.0
+    if not math.isfinite(mcp_cold_start_timeout) or mcp_cold_start_timeout < 0:
+        raise CoreError(
+            "CONFIG_INVALID",
+            "MCP_COLD_START_TIMEOUT_SECONDS must be finite and non-negative",
+        )
+    mcp_timeout = _number("MCP_TIMEOUT", float)
+    mcp_sse_read_timeout = _number("MCP_SSE_READ_TIMEOUT", float)
     agent = CoreAgent(
         platform_config=platform,
         agent_config=config,
@@ -1352,8 +1377,11 @@ def _agent(model, mcp_connector=None, *, state=None):
         or StreamableHttpMcpConnector(
             headers={**_entity_headers(), **_json("MCP_HEADERS_JSON")},
             telemetry=telemetry,
-            timeout=float(_env("MCP_TIMEOUT", "30.0")),
-            sse_read_timeout=float(_env("MCP_SSE_READ_TIMEOUT", "300.0")),
+            timeout=30.0 if mcp_timeout is None else mcp_timeout,
+            sse_read_timeout=(
+                300.0 if mcp_sse_read_timeout is None else mcp_sse_read_timeout
+            ),
+            cold_start_timeout=mcp_cold_start_timeout,
         ),
         task_scheduler=(
             state["scheduler"](state["database"], telemetry)
@@ -1369,9 +1397,7 @@ def _agent(model, mcp_connector=None, *, state=None):
         context_window=int(
             _env("LLM_CONTEXT_WINDOW", getattr(model, "context_window", 128_000))
         ),
-        output_reserve=int(
-            _env("LLM_MAX_TOKENS", getattr(model, "max_tokens", 4_096))
-        ),
+        output_reserve=int(_env("LLM_MAX_TOKENS", getattr(model, "max_tokens", 4_096))),
         token_counter=token_counter,
         artifact_store=artifact_store,
         retention_manager=retention_manager,
@@ -1390,7 +1416,6 @@ def _agent(model, mcp_connector=None, *, state=None):
             _env("CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS", "5")
         ),
     )
-    agent.recover_workflows()
     agent.recover_durable_tasks()
     agent._log(
         "startup.configuration",
@@ -1400,6 +1425,9 @@ def _agent(model, mcp_connector=None, *, state=None):
         mcp_allowed_tools={
             server: sorted(tools) for server, tools in sorted(mcp_tools.items())
         },
+        mcp_read_only_tools={
+            item["name"]: item["read_only_tools"] for item in platform_mcp
+        },
         skills=sorted(allowed_skills),
         remote_agents_configured=remote_agents_configured,
         remote_agents_connected=sorted(remote_connections),
@@ -1407,7 +1435,12 @@ def _agent(model, mcp_connector=None, *, state=None):
         telemetry=getattr(
             telemetry.exporter,
             "configuration",
-            {"traces": None, "metrics": None, "logs": None, "credentials_configured": False},
+            {
+                "traces": None,
+                "metrics": None,
+                "logs": None,
+                "credentials_configured": False,
+            },
         ),
         memory=memory_configuration,
         artifact_storage=_env("ARTIFACT_STORAGE_TYPE", "in-memory"),
@@ -1445,8 +1478,6 @@ def create_app(
         )
     try:
         agent, telemetry = _agent(model, mcp_connector, state=state)
-        if state["tasks"]:
-            state["tasks"].reconcile_from_workflows()
     except Exception:
         if state["database"]:
             state["database"].close()
@@ -1463,6 +1494,17 @@ def create_app(
             client=push_client,
             telemetry=telemetry,
         )
+
+    def reconcile_workflows(_task_id=None):
+        if state["tasks"]:
+            return state["tasks"].reconcile_from_workflows(
+                enqueue_notification=(
+                    push_sender.enqueue_notification if push_sender else None
+                )
+            )
+        return 0
+
+    reconcile_workflows()
 
     def traced_execution(context, function, request=None):
         headers = context.call_context.state.get("headers", {})
@@ -1648,7 +1690,13 @@ def create_app(
         return result_artifact(result, context)
 
     def cancel(context):
-        agent.cancel_task(context.task_id)
+        try:
+            return agent.cancel_task(context.task_id)
+        finally:
+            agent.clear_task_cancel_signal(context.task_id)
+
+    def signal_cancel(context):
+        agent.signal_task_cancel(context.task_id)
 
     host = _env("HOST", "0.0.0.0")
     port = int(_env("PORT", "8000"))
@@ -1669,9 +1717,7 @@ def create_app(
         },
         skills=tuple(sorted(agent.platform_config.allowed_builtin_tools)),
         optional_extensions=(),
-        description=_env(
-            "AGENT_DESCRIPTION", "Policy-enforced core agent runtime"
-        ),
+        description=_env("AGENT_DESCRIPTION", "Policy-enforced core agent runtime"),
         version=_env("AGENT_VERSION", "1.0.0"),
     )
     closed = False
@@ -1692,6 +1738,7 @@ def create_app(
         agent_card=card,
         handler=handle,
         cancel_handler=cancel,
+        cancel_signal=signal_cancel,
         base_url=base_url,
         derive_base_url=not configured_url,
         task_store=state["tasks"],
@@ -1728,6 +1775,9 @@ def create_app(
     atexit.register(close)
     app.state.close = close
     app.state.bind = (host, port)
+    agent.recover_workflows(
+        on_settled=reconcile_workflows,
+    )
     _log_environment(logging.getLogger("core_agent.runtime"))
     return app
 
