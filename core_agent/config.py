@@ -11,7 +11,7 @@ from .mcp import mcp_tool_index
 from .skills import SKILL_TOOLS
 
 # Advertised (binding, version) pairs; see core_agent/a2a.py for why they pair up.
-A2A_INTERFACES = (("HTTP+JSON", "1.0"), ("JSONRPC", "0.3"))
+A2A_INTERFACES = (("HTTP+JSON", "1.0"), ("JSONRPC", "1.0"))
 
 
 MAX_SUBAGENT_DEPTH = 2

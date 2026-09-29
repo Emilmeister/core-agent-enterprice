@@ -146,7 +146,7 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/database.py` | PostgreSQL schema, migrations, pool и stores |
 | `core_agent/artifacts.py`, `core_agent/audit.py` | Tenant-scoped transport artifacts и append-only audit adapters |
 | `core_agent/artifact_service.py` | Named/scoped/versioned artifact model и in-memory, S3, MongoDB backends |
-| `core_agent/remote_agents.py` | Remote A2A agent registry и synchronous JSON-RPC/SSE client |
+| `core_agent/remote_agents.py` | Remote A2A agent registry и synchronous A2A 1.0 JSON-RPC/SSE client |
 | `core_agent/streaming.py` | Stream chunk merge, snapshot buffer и ADK metadata keys |
 | `core_agent/durability.py`, `core_agent/lifecycle.py` | Events, checkpoints, leases, recovery и retention |
 | `core_agent/mcp.py` | MCP discovery/calls, canonical tool naming и Streamable HTTP connector |

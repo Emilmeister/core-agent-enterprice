@@ -238,9 +238,9 @@ Downstream MUST уходить только allowlist входящих заго�
 
 Tool принимает `agent_name` и `task`. Пустой `agent_name` допустим только когда сконфигурирован ровно один агент; в остальных случаях он обязателен. Неизвестное имя возвращает модели список доступных, а не ошибку Task.
 
-Runtime MUST отправить JSON-RPC `message/stream`, если карточка объявляет streaming, иначе `message/send`. Текст задачи передаётся без изменений одной user-частью. `taskId` равен id корневой Task, `contextId` — её session, что связывает подзадачу с корневой Task на стороне получателя.
+Runtime вызывает удалённого агента только по A2A 1.0: адрес берётся из интерфейса `supportedInterfaces` с `protocolBinding: "JSONRPC"` и `protocolVersion` 1.x, запрос несёт `A2A-Version: 1.0`. Карточка без такого интерфейса отклоняется как `REMOTE_AGENT_CARD_INVALID`. Runtime MUST отправить JSON-RPC `SendStreamingMessage`, если карточка объявляет streaming, иначе `SendMessage`. Текст задачи передаётся без изменений одной user-частью. `taskId` равен id корневой Task, `contextId` — её session, что связывает подзадачу с корневой Task на стороне получателя.
 
-Промежуточные части ответа удалённого агента ретранслируются в поток корневой Task как partial-кадры. Итоговым текстом считается текст кадра с `final: true`; при его отсутствии — последний непустой текст; если и его нет, выполняется обычный `message/send`. Оборвавшийся поток MUST так же переходить на `message/send`, а не терять результат.
+Промежуточные части ответа удалённого агента ретранслируются в поток корневой Task как partial-кадры. Итоговым текстом считается текст кадра `statusUpdate` с терминальным или прерывающим состоянием (`TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`, `TASK_STATE_REJECTED`, `TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_AUTH_REQUIRED`); при его отсутствии — последний непустой текст; если и его нет, выполняется обычный `SendMessage`. Оборвавшийся поток MUST так же переходить на `SendMessage`, а не терять результат.
 
 ### Результат
 

@@ -7,8 +7,8 @@ SPEC_ROOT = Path(__file__).resolve().parents[1] / "spec"
 
 EXPECTED_SHA256 = {
     "README.md": "d7742805d1e460e3cf72d963bdff04b41d2920bbb75272e01a7be6207dc7db99",
-    "a2a-protocol.md": "0354e42a1db2c34db7ff6422049aeb16a3fd6fa6aa5b46c6ae30657c54112202",
-    "acceptance.md": "9713aa56a3ef9f9d9a154aa689c801bf13ee4c6bceb0662fd687bb3d337ce184",
+    "a2a-protocol.md": "5d2b589f8c79f021d71abbdd6ef076cd0e39938235580ddcef8b0cfe32ec6221",
+    "acceptance.md": "79169854700d00eecec9af7495644419684b0a0382cfc14189142af7eda9bf5c",
     "agent-configuration.md": "ea98c015032bcc61b235a138593c248c9d90aa7d028bd1547e1d3c8b59e3cc2f",
     "architecture.md": "081f8ca7d0319b7e838618972d1023659bf2450e0ce12bdcb6570af9cef29c28",
     "artifacts.md": "ad7b39b54bb0c4194fb577d361499c7dc091f6a9022d499b507e7e0569fb909c",
@@ -25,7 +25,7 @@ EXPECTED_SHA256 = {
     "runtime.md": "09a1fc319ced97c82d8fc16dd5c43cdb5afbc143f68e5c2d05f810e6382224b6",
     "security-and-reliability.md": "51968f107e23a41da86293ec948817282915c490761097e2584b6a46773b62c4",
     "skills.md": "5a1a73c1ea3db1ddd4403534f49c04b2a83f1378b6199eb5be9c7b254b4202df",
-    "tasks-and-delegation.md": "9a0e83e914996a016e22e36f0fd34d720022b2eaac277c31d8bc8d795cc4dee9",
+    "tasks-and-delegation.md": "b75f5da566809c4596bc2d8526ece30343c5d308c4186322262889eb5d107178",
     "tools.md": "f9f552fc79b6212dc09516b4b68f6fba41b6ffd6ee85fde1a319ccc4f19b635d",
 }
 

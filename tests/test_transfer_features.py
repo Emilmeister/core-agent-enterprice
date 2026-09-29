@@ -328,7 +328,7 @@ class ForwardedHeaderTests(unittest.TestCase):
 
 
 class RemoteAgentHandler(BaseHTTPRequestHandler):
-    """Minimal A2A 0.3 JSON-RPC peer used to exercise send_message."""
+    """Minimal A2A 1.0 JSON-RPC peer used to exercise send_message."""
 
     def log_message(self, *args):
         pass
@@ -338,7 +338,13 @@ class RemoteAgentHandler(BaseHTTPRequestHandler):
             {
                 "name": "weather-agent",
                 "description": "weather",
-                "url": f"http://127.0.0.1:{self.server.server_port}/",
+                "supportedInterfaces": [
+                    {
+                        "url": f"http://127.0.0.1:{self.server.server_port}/",
+                        "protocolBinding": "JSONRPC",
+                        "protocolVersion": "1.0",
+                    }
+                ],
                 "capabilities": {"streaming": True},
                 "skills": [],
             }
@@ -350,24 +356,24 @@ class RemoteAgentHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
-        for frame in (
-            {
-                "kind": "status-update",
-                "final": False,
-                "status": {
-                    "state": "working",
-                    "message": {"parts": [{"kind": "text", "text": "looking it up"}]},
-                },
-            },
-            {
-                "kind": "status-update",
-                "final": True,
-                "status": {
-                    "state": "completed",
-                    "message": {"parts": [{"kind": "text", "text": "24 degrees"}]},
-                },
-            },
+        for state, text in (
+            ("TASK_STATE_WORKING", "looking it up"),
+            ("TASK_STATE_COMPLETED", "24 degrees"),
         ):
+            frame = {
+                "statusUpdate": {
+                    "taskId": "t1",
+                    "contextId": "c1",
+                    "status": {
+                        "state": state,
+                        "message": {
+                            "role": "ROLE_AGENT",
+                            "messageId": str(uuid.uuid4()),
+                            "parts": [{"text": text}],
+                        },
+                    },
+                }
+            }
             payload = json.dumps({"jsonrpc": "2.0", "id": "1", "result": frame})
             self.wfile.write(f"data: {payload}\n\n".encode())
             self.wfile.flush()
@@ -404,18 +410,27 @@ class RemoteAgentConnectionTests(unittest.TestCase):
         )
         self.assertEqual([event.final for event in events], [False, True])
         body, headers = RemoteAgentHandler.seen
-        self.assertEqual(body["method"], "message/stream")
+        self.assertEqual(body["method"], "SendStreamingMessage")
+        self.assertEqual(body["params"]["message"]["role"], "ROLE_USER")
         self.assertEqual(
-            body["params"]["message"]["parts"],
-            [{"kind": "text", "text": "What is the weather?"}],
+            body["params"]["message"]["parts"], [{"text": "What is the weather?"}]
         )
         self.assertEqual(body["params"]["message"]["contextId"], "c1")
         lowered = {key.lower(): value for key, value in headers.items()}
         self.assertEqual(lowered["x-project-id"], "p1")
+        self.assertEqual(lowered["a2a-version"], "1.0")
+
+    def test_peer_without_a_jsonrpc_1_0_interface_is_refused(self):
+        from core_agent.remote_agents import _interface_url
+
+        legacy = [{"url": "https://peer", "protocolBinding": "JSONRPC", "protocolVersion": "0.3"}]
+        with self.assertRaises(CoreError) as caught:
+            _interface_url(legacy)
+        self.assertEqual(caught.exception.code, "REMOTE_AGENT_CARD_INVALID")
 
 
 class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
-    """The A2A 0.3 JSON-RPC binding must carry ADK-shaped progress frames."""
+    """The A2A 1.0 JSON-RPC binding must carry ADK-typed progress frames."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -455,13 +470,12 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         payload = {
             "jsonrpc": "2.0",
             "id": "1",
-            "method": "message/stream",
+            "method": "SendStreamingMessage",
             "params": {
                 "message": {
-                    "kind": "message",
-                    "role": "user",
+                    "role": "ROLE_USER",
                     "messageId": str(uuid.uuid4()),
-                    "parts": [{"kind": "text", "text": prompt}],
+                    "parts": [{"text": prompt}],
                 }
             },
         }
@@ -476,7 +490,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                 "/",
                 json=payload,
                 headers={
-                    "A2A-Version": "0.3",
+                    "A2A-Version": "1.0",
                     "Accept": "text/event-stream",
                     "Authorization": "Bearer caller-token",
                     "Cookie": "session=secret",
@@ -491,8 +505,22 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         return frames
 
     @staticmethod
-    def _parts(frame):
-        return ((frame.get("status") or {}).get("message") or {}).get("parts", [])
+    def _status(frame):
+        return (frame.get("statusUpdate") or frame.get("task") or {}).get("status") or {}
+
+    @classmethod
+    def _parts(cls, frame):
+        return (cls._status(frame).get("message") or {}).get("parts", [])
+
+    @classmethod
+    def _terminal(cls, frames):
+        return [
+            frame
+            for frame in frames
+            if "statusUpdate" in frame
+            and cls._status(frame).get("state")
+            in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"}
+        ]
 
     async def test_reasoning_streams_as_thought_parts_before_the_terminal_frame(self):
         frames = await self._frames(self._app(), "hello")
@@ -508,7 +536,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             frame
             for frame in frames
             if (
-                ((frame.get("status") or {}).get("message") or {}).get("metadata") or {}
+                (self._status(frame).get("message") or {}).get("metadata") or {}
             ).get("partial")
         ]
         self.assertGreater(len(partials), 1)
@@ -521,9 +549,10 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshots, sorted(snapshots, key=len))
         self.assertTrue(snapshots[-1].startswith(snapshots[0]))
 
-        terminal = [frame for frame in frames if frame.get("final")]
+        terminal = self._terminal(frames)
         self.assertEqual(len(terminal), 1)
-        self.assertEqual(terminal[0]["status"]["state"], "completed")
+        self.assertIs(terminal[0], frames[-1])
+        self.assertEqual(self._status(terminal[0])["state"], "TASK_STATE_COMPLETED")
         self.assertNotIn(
             True,
             [
@@ -579,7 +608,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             part["text"]
             for frame in frames
             for part in self._parts(frame)
-            if part.get("kind") == "text"
+            if "text" in part
             and not (part.get("metadata") or {}).get("adk_thought")
         ]
         self.assertIn("looking it up", relayed)
@@ -614,11 +643,11 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             [
                 frame
                 for frame in frames
-                if self._parts(frame) and not frame.get("final")
+                if self._parts(frame) and frame not in self._terminal(frames)
             ],
         )
-        terminal = [frame for frame in frames if frame.get("final")]
-        self.assertEqual(terminal[0]["status"]["state"], "completed")
+        terminal = self._terminal(frames)
+        self.assertEqual(self._status(terminal[0])["state"], "TASK_STATE_COMPLETED")
 
     async def test_unknown_jsonrpc_envelope_fields_are_dropped_not_interpreted(self):
         """A client hedging with a duplicated field must not be rejected outright."""
@@ -632,17 +661,16 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
 
         def envelope(identifier, extra, context_id=None):
             message = {
-                "kind": "message",
-                "role": "user",
+                "role": "ROLE_USER",
                 "messageId": str(uuid.uuid4()),
-                "parts": [{"kind": "text", "text": "hi"}],
+                "parts": [{"text": "hi"}],
             }
             if context_id:
                 message["contextId"] = context_id
             return {
                 "jsonrpc": "2.0",
                 "id": identifier,
-                "method": "message/send",
+                "method": "SendMessage",
                 "params": {"message": message},
                 **extra,
             }
@@ -652,7 +680,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://agent.test"
             ) as client:
-                headers = {}
+                headers = {"A2A-Version": "1.0"}
 
                 async def send(body):
                     return (await client.post("/", json=body, headers=headers)).json()
@@ -663,23 +691,23 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                         envelope("1", {"contextId": "ctx-a"}, context_id="ctx-a")
                     )
                 self.assertNotIn("error", result)
-                self.assertEqual(result["result"]["contextId"], "ctx-a")
+                self.assertEqual(result["result"]["task"]["contextId"], "ctx-a")
                 self.assertIn("contextId", logs.output[0])
 
                 # Only outside: accepted, but never promoted to a session id.
                 result = await send(envelope("2", {"contextId": "ctx-b"}))
-                self.assertNotEqual(result["result"]["contextId"], "ctx-b")
+                self.assertNotEqual(result["result"]["task"]["contextId"], "ctx-b")
 
                 # Several unknown members are dropped together.
                 result = await send(
                     envelope("3", {"foo": 1, "bar": 2}, context_id="ctx-c")
                 )
-                self.assertEqual(result["result"]["contextId"], "ctx-c")
+                self.assertEqual(result["result"]["task"]["contextId"], "ctx-c")
 
                 # A clean envelope keeps working and logs nothing new.
                 before = set(_reported_extra_fields)
                 result = await send(envelope("4", {}, context_id="ctx-d"))
-                self.assertEqual(result["result"]["contextId"], "ctx-d")
+                self.assertEqual(result["result"]["task"]["contextId"], "ctx-d")
                 self.assertEqual(set(_reported_extra_fields), before)
         finally:
             _reported_extra_fields.clear()
@@ -792,7 +820,22 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                     (item["protocolBinding"], item["protocolVersion"])
                     for item in card["supportedInterfaces"]
                 }
-                self.assertEqual(advertised, {("HTTP+JSON", "1.0"), ("JSONRPC", "0.3")})
+                self.assertEqual(advertised, {("HTTP+JSON", "1.0"), ("JSONRPC", "1.0")})
+                # No v0.3 card fields beside the 1.0 interfaces.
+                for field in ("url", "preferredTransport", "protocolVersion"):
+                    self.assertNotIn(field, card)
+                legacy = await client.post(
+                    "/",
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": "1",
+                        "method": "tasks/get",
+                        "params": {"id": "missing"},
+                    },
+                    headers={"A2A-Version": "0.3"},
+                )
+                # The 0.3 method names are gone: JSON-RPC "method not found".
+                self.assertEqual(legacy.json()["error"]["code"], -32601)
                 for binding, version in sorted(advertised):
                     with self.subTest(binding=binding, version=version):
                         headers = {"A2A-Version": version}
@@ -802,7 +845,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                                 json={
                                     "jsonrpc": "2.0",
                                     "id": "1",
-                                    "method": "tasks/get",
+                                    "method": "GetTask",
                                     "params": {"id": "missing"},
                                 },
                                 headers=headers,

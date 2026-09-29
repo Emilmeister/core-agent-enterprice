@@ -176,9 +176,7 @@ class Task:
 @dataclass(frozen=True)
 class AgentCard:
     name: str
-    # (binding, version) pairs. A cross product would advertise pairs no endpoint
-    # serves: the JSON-RPC routes are mounted in 0.3 compatibility mode and reject
-    # 1.0, while the REST routes only accept 1.0.
+    # (binding, version) pairs, each exactly as its endpoint accepts it.
     interfaces: tuple[tuple[str, str], ...] = A2A_INTERFACES
     capabilities: dict = field(
         default_factory=lambda: {"streaming": True, "pushNotifications": True}

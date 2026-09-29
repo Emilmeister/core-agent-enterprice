@@ -14,7 +14,6 @@ from a2a.server.request_handlers.request_handler import (
     validate,
     validate_request_params,
 )
-from a2a.server.request_handlers.response_helpers import agent_card_to_dict
 from a2a.server.routes import (
     create_jsonrpc_routes,
     create_rest_routes,
@@ -72,6 +71,7 @@ A2A_TERMINAL_STATES = {
 }
 
 
+
 def resolve_owner_scope(context):
     name = context.user.user_name
     return name if context.user.is_authenticated and name else "anonymous"
@@ -119,7 +119,11 @@ def to_sdk_agent_card(card, *, base_url):
         default_output_modes=card.output_modes,
         skills=[
             SdkAgentSkill(
-                id=name, name=name, description=f"Enabled agent capability: {name}"
+                id=name,
+                name=name,
+                description=f"Enabled agent capability: {name}",
+                # REQUIRED in A2A 1.0; protobuf JSON drops an empty list entirely.
+                tags=[name.removeprefix("core_").split("_")[0]],
             )
             for name in card.skills
         ],
@@ -222,7 +226,7 @@ def _agent_card_routes(sdk_card, *, derive_base_url):
             card.CopyFrom(sdk_card)
             for interface in card.supported_interfaces:
                 interface.url = base_url
-        return JSONResponse(agent_card_to_dict(card))
+        return JSONResponse(json_format.MessageToDict(card))
 
     return [
         Route(path, endpoint, methods=["GET"])
@@ -344,10 +348,9 @@ class TaskStreamPublisher:
         """Forward already-shaped downstream parts into this task's stream."""
         published = []
         for part in parts:
-            kind = part.get("kind")
-            if kind == "text" and part.get("text"):
+            if isinstance(part.get("text"), str) and part["text"]:
                 item = SdkPart(text=part["text"], media_type="text/plain")
-            elif kind == "data" and part.get("data") is not None:
+            elif part.get("data") is not None:
                 item = SdkPart(
                     data=_struct_value(part["data"]), media_type="application/json"
                 )
@@ -751,7 +754,7 @@ def build_starlette_app(
     streaming_enabled=True,
     max_chunk_size=0,
 ):
-    """Build the official A2A 1.0 HTTP+JSON binding around the domain runtime."""
+    """Build the official A2A 1.0 JSON-RPC and HTTP+JSON bindings around the runtime."""
     sdk_card = to_sdk_agent_card(agent_card, base_url=base_url)
     request_handler = CoreRequestHandler(
         CoreAgentExecutor(
@@ -772,13 +775,8 @@ def build_starlette_app(
         followup_handler=followup_handler,
     )
     routes = _agent_card_routes(sdk_card, derive_base_url=derive_base_url)
-    # The JSON-RPC binding carries the v0.3 compatibility shape (`kind`, `final`,
-    # lowercase states, text/data parts) that ADK-style streaming clients expect.
     for route in create_jsonrpc_routes(
-        request_handler,
-        DEFAULT_RPC_URL,
-        context_builder=context_builder,
-        enable_v0_3_compat=True,
+        request_handler, DEFAULT_RPC_URL, context_builder=context_builder
     ):
         # A client that also repeats a field outside `params` must not be rejected.
         route.endpoint = _tolerant_envelope(route.endpoint)

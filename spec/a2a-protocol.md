@@ -27,14 +27,14 @@ A2A Agent Skill описывает внешнюю capability сервера и �
 
 | Binding | Путь | A2A version |
 |---|---|---|
-| `JSONRPC` | корневой RPC-путь | `0.3` |
+| `JSONRPC` | корневой RPC-путь | `1.0` |
 | `HTTP+JSON` | REST-пути | `1.0` |
 
-JSON-RPC работает в режиме совместимости `0.3` намеренно: только он даёт ADK-совместимую форму streaming-кадров, описанную ниже. Это осознанный компромисс — ADK-совместимый streaming для v1 важнее единой версии на обоих binding.
+Поддерживается только A2A `1.0`. Режим совместимости A2A `0.3` MUST NOT включаться ни на одном binding: методы JSON-RPC `0.3` (`message/send`, `message/stream`, `tasks/get` и др.) не принимаются, а карточка MUST NOT содержать полей карточки `0.3` (`url`, `preferredTransport`, `protocolVersion` верхнего уровня, `additionalInterfaces`).
 
 Проверка соответствия MUST быть автоматической: для каждой объявленной пары endpoint MUST принимать запрос именно с этой версией. Ручной сверки недостаточно, потому что версия binding задаётся при монтировании routes и расходится с картой незаметно.
 
-Клиент, не приславший `A2A-Version`, обрабатывается как `0.3`. Для REST это означает, что заголовок `A2A-Version: 1.0` обязателен; отсутствие заголовка на REST-пути завершается ошибкой версии, а не молчаливым downgrade.
+Заголовок `A2A-Version: 1.0` обязателен на обоих binding. Клиент, не приславший `A2A-Version`, получает ошибку версии, а не молчаливый downgrade.
 
 ### Лишние поля JSON-RPC конверта
 
@@ -90,14 +90,16 @@ Agent Card MAY объявлять optional informational extensions, не вли
 
 | Core state | A2A Task state | Дополнительная семантика |
 |---|---|---|
-| `CREATED`, `QUEUED` | `submitted` | задача принята, worker ещё не выполняет turn |
-| `RUNNING`, `WAITING_TASK`, `PAUSED`, `RECOVERING` | `working` | точная причина доступна в безопасном status metadata |
-| `WAITING_INPUT` | `input-required` | caller должен предоставить новые бизнес-данные |
-| `WAITING_AUTH` | `auth-required` | требуется credential/auth flow |
-| `COMPLETED` | `completed` | результаты представлены Artifacts; `completion_reason=budget_exhausted` и `complete=false` явно помечают честный неполный результат |
-| `FAILED`, `ABORTED` | `failed` | error metadata различает обычную ошибку и unsafe continuation |
-| `CANCELLED` | `canceled` | отмена подтверждена runtime |
-| `REJECTED` | `rejected` | policy отказала до выполнения |
+| `CREATED`, `QUEUED` | `TASK_STATE_SUBMITTED` | задача принята, worker ещё не выполняет turn |
+| `RUNNING`, `WAITING_TASK`, `PAUSED`, `RECOVERING` | `TASK_STATE_WORKING` | точная причина доступна в безопасном status metadata |
+| `WAITING_INPUT` | `TASK_STATE_INPUT_REQUIRED` | caller должен предоставить новые бизнес-данные |
+| `WAITING_AUTH` | `TASK_STATE_AUTH_REQUIRED` | требуется credential/auth flow |
+| `COMPLETED` | `TASK_STATE_COMPLETED` | результаты представлены Artifacts; `completion_reason=budget_exhausted` и `complete=false` явно помечают честный неполный результат |
+| `FAILED`, `ABORTED` | `TASK_STATE_FAILED` | error metadata различает обычную ошибку и unsafe continuation |
+| `CANCELLED` | `TASK_STATE_CANCELED` | отмена подтверждена runtime |
+| `REJECTED` | `TASK_STATE_REJECTED` | policy отказала до выполнения |
+
+Далее в тексте состояния для краткости называются без префикса: `working` означает `TASK_STATE_WORKING` и т. д.
 
 Internal state не добавляет новые A2A terminal states. Client, понимающий только стандартный A2A, остаётся корректным.
 
@@ -191,22 +193,22 @@ Streaming показывает вызывающей стороне ход вып
 
 ### Binding
 
-Сервер MUST монтировать оба binding: JSON-RPC на корневом RPC-пути и HTTP+JSON REST. ADK-совместимую форму кадров (`kind`, `final`, lowercase `state`, части `kind: "text"|"data"`) даёт JSON-RPC binding в режиме совместимости A2A 0.3; она и является нормативной для этого раздела. Agent Card объявляет оба binding.
+Сервер MUST монтировать оба binding A2A 1.0: JSON-RPC на корневом RPC-пути и HTTP+JSON REST. Оба отдают одинаковые кадры `StreamResponse` A2A 1.0; ADK-метки частей (`adk_thought`, `adk_type`) передаются в `metadata` частей. Agent Card объявляет оба binding.
 
 ### Последовательность кадров
 
-Один streaming-вызов MUST давать ровно такую последовательность:
+Один streaming-вызов MUST давать ровно такую последовательность `StreamResponse`:
 
-1. один кадр `kind: "task"` с начальным состоянием;
-2. ноль или больше кадров `kind: "status-update"` со `state: "working"` и `final: false`;
-3. ноль или больше кадров `kind: "artifact-update"` с чанками результата;
-4. ровно один терминальный кадр `kind: "status-update"` с терминальным `state` и `final: true`.
+1. один кадр `task` с начальным состоянием;
+2. ноль или больше кадров `statusUpdate` со `state: "TASK_STATE_WORKING"`;
+3. ноль или больше кадров `artifactUpdate` с чанками результата;
+4. ровно один терминальный кадр `statusUpdate` с терминальным `state`.
 
-Кадр с `final: true` MUST быть последним. Ни один промежуточный кадр MUST NOT иметь `final: true`.
+В A2A 1.0 нет поля `final`: признаком конца потока является терминальное состояние. Терминальный кадр MUST быть последним, ни один промежуточный кадр MUST NOT нести терминальное состояние.
 
 ### Типы промежуточных кадров
 
-Промежуточный `status-update` несёт agent-сообщение, части которого различаются по метаданным:
+Промежуточный `statusUpdate` несёт agent-сообщение, части которого различаются по метаданным (текстовая часть — поле `text`, структурная — поле `data`):
 
 | Часть | Метаданные части | Содержимое |
 |---|---|---|

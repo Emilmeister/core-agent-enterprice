@@ -14,6 +14,8 @@ from .errors import CoreError
 from .security import redact
 
 AGENT_CARD_WELL_KNOWN_PATH = "/.well-known/agent-card.json"
+A2A_PROTOCOL_VERSION = "1.0"
+A2A_BINDING = "JSONRPC"
 FORWARDED_CLIENT_HEADERS = ("Authorization", "X-PROJECT-ID", "X-A2A-Extensions")
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -23,8 +25,16 @@ STREAM_DONE_SENTINEL = "[DONE]"
 
 # 4xx are permanent except these two, which the peer itself marks as retryable.
 RETRYABLE_CLIENT_STATUS_CODES = (408, 429)
+# A 1.0 stream ends on a terminal or interrupted state; there is no `final` flag.
 TERMINAL_TASK_STATES = frozenset(
-    {"completed", "failed", "canceled", "rejected", "input-required", "auth-required"}
+    {
+        "TASK_STATE_COMPLETED",
+        "TASK_STATE_FAILED",
+        "TASK_STATE_CANCELED",
+        "TASK_STATE_REJECTED",
+        "TASK_STATE_INPUT_REQUIRED",
+        "TASK_STATE_AUTH_REQUIRED",
+    }
 )
 
 
@@ -147,14 +157,7 @@ def _parts(container):
 
 
 def _parts_text(parts):
-    # A2A 0.3 spells the discriminator "kind"; some peers still emit "type".
-    texts = [
-        part["text"]
-        for part in parts
-        if (part.get("kind") or part.get("type")) == "text"
-        and isinstance(part.get("text"), str)
-    ]
-    return "\n".join(texts)
+    return "\n".join(part["text"] for part in parts if isinstance(part.get("text"), str))
 
 
 def _task_parts(task):
@@ -174,39 +177,53 @@ def _task_parts(task):
 def _state(container):
     status = container.get("status")
     state = status.get("state") if isinstance(status, Mapping) else None
-    return state.lower() if isinstance(state, str) else None
+    return state if isinstance(state, str) else None
 
 
 def _normalize(result):
+    """Read one A2A 1.0 SendMessageResponse or StreamResponse payload."""
     if not isinstance(result, Mapping):
         raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR", "unexpected result payload")
-    kind = result.get("kind")
-    if kind == "status-update" or (
-        kind is None and "status" in result and "id" not in result
-    ):
-        status = result.get("status")
+    if isinstance(result.get("statusUpdate"), Mapping):
+        update = result["statusUpdate"]
+        status = update.get("status")
         parts = _parts(status.get("message")) if isinstance(status, Mapping) else ()
+        state = _state(update)
         return RemoteEvent(
-            "status",
-            _state(result),
-            _parts_text(parts),
-            bool(result.get("final")),
-            parts,
+            "status", state, _parts_text(parts), state in TERMINAL_TASK_STATES, parts
         )
-    if kind == "artifact-update" or (kind is None and "artifact" in result):
-        parts = _parts(result.get("artifact"))
-        # Only a status-update carries stream finality; lastChunk ends one artifact.
+    if isinstance(result.get("artifactUpdate"), Mapping):
+        parts = _parts(result["artifactUpdate"].get("artifact"))
+        # Only a status update carries stream finality; lastChunk ends one artifact.
         return RemoteEvent("artifact", None, _parts_text(parts), False, parts)
-    if kind == "task" or (kind is None and "status" in result):
-        parts = _task_parts(result)
-        state = _state(result)
+    if isinstance(result.get("task"), Mapping):
+        parts = _task_parts(result["task"])
+        state = _state(result["task"])
         return RemoteEvent(
             "task", state, _parts_text(parts), state in TERMINAL_TASK_STATES, parts
         )
-    if kind == "message" or (kind is None and "parts" in result):
-        parts = _parts(result)
+    if isinstance(result.get("message"), Mapping):
+        parts = _parts(result["message"])
         return RemoteEvent("message", None, _parts_text(parts), True, parts)
     raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR", "unrecognized event kind")
+
+
+def _interface_url(interfaces):
+    """Pick the JSON-RPC 1.x endpoint; a peer without one cannot be called."""
+    major = A2A_PROTOCOL_VERSION.split(".")[0]
+    for item in interfaces if isinstance(interfaces, list) else ():
+        if (
+            isinstance(item, Mapping)
+            and item.get("protocolBinding") == A2A_BINDING
+            and str(item.get("protocolVersion", "")).split(".")[0] == major
+            and isinstance(item.get("url"), str)
+            and item["url"].strip()
+        ):
+            return item["url"]
+    raise CoreError(
+        "REMOTE_AGENT_CARD_INVALID",
+        f"card declares no {A2A_BINDING} {A2A_PROTOCOL_VERSION} interface",
+    )
 
 
 def _is_sentinel(payload):
@@ -262,7 +279,7 @@ def _read_body(response):
 
 
 class RemoteAgentConnection:
-    """Synchronous A2A 0.3 JSON-RPC client for one downstream agent."""
+    """Synchronous A2A 1.0 JSON-RPC client for one downstream agent."""
 
     def __init__(self, card, *, timeout=600.0, api_key=None):
         if not isinstance(card, RemoteAgentCard):
@@ -301,10 +318,9 @@ class RemoteAgentConnection:
             context_id, "INVALID_REQUEST", "context_id must be non-empty text"
         )
         message = {
-            "kind": "message",
-            "role": "user",
+            "role": "ROLE_USER",
             "messageId": message_id,
-            "parts": [{"kind": "text", "text": task}],
+            "parts": [{"text": task}],
         }
         if task_id:
             message["taskId"] = task_id
@@ -316,7 +332,11 @@ class RemoteAgentConnection:
             "method": method,
             "params": {"message": message},
         }
-        headers = {"Content-Type": "application/json", "Accept": accept}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": accept,
+            "A2A-Version": A2A_PROTOCOL_VERSION,
+        }
         headers.update(
             build_forwarded_headers(forwarded_headers or {}, api_key=self.api_key)
         )
@@ -337,7 +357,7 @@ class RemoteAgentConnection:
         forwarded_headers=None,
     ) -> Iterator[RemoteEvent]:
         request = self._request(
-            "message/stream",
+            "SendStreamingMessage",
             accept="text/event-stream",
             task=task,
             message_id=message_id,
@@ -397,7 +417,7 @@ class RemoteAgentConnection:
         forwarded_headers=None,
     ) -> RemoteEvent:
         request = self._request(
-            "message/send",
+            "SendMessage",
             accept="application/json",
             task=task,
             message_id=message_id,
@@ -492,7 +512,6 @@ class RemoteAgentRegistry:
         payload = self._fetch_card(base_url)
         name = payload.get("name")
         description = payload.get("description")
-        url = payload.get("url")
         capabilities = payload.get("capabilities")
         skills = payload.get("skills")
         return RemoteAgentCard(
@@ -500,7 +519,7 @@ class RemoteAgentRegistry:
             if isinstance(name, str) and name.strip()
             else self._fallback_name(base_url, index),
             description=description if isinstance(description, str) else "",
-            url=url if isinstance(url, str) and url.strip() else base_url,
+            url=_interface_url(payload.get("supportedInterfaces")),
             streaming=bool(
                 capabilities.get("streaming")
                 if isinstance(capabilities, Mapping)

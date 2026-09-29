@@ -52,10 +52,11 @@ prompt -> сохраняемая задача A2A -> события выполн
 
 ### Жизненный цикл A2A
 
-Сервер построен на официальном SDK A2A, поддерживает HTTP+JSON 1.0 и совместим с
-JSON-RPC 0.3. Карточка агента доступна по
-`/.well-known/agent-card.json`. JSON-RPC 0.3 принимает запросы на `/`, а
-HTTP+JSON 1.0 использует стандартные маршруты A2A SDK.
+Сервер построен на официальном SDK A2A и поддерживает только A2A 1.0: JSON-RPC и
+HTTP+JSON. Карточка агента доступна по `/.well-known/agent-card.json`. JSON-RPC
+принимает запросы на `/`, а HTTP+JSON использует стандартные маршруты A2A SDK
+(`/message:send`, `/tasks/{id}` и т. д.). Каждый запрос MUST содержать заголовок
+`A2A-Version: 1.0`.
 
 Одна сохраняемая задача A2A используется для потоковой выдачи, опроса состояния,
 подписки, отмены и отправки уведомлений клиенту. Незавершённая задача принимает
@@ -290,25 +291,33 @@ Anthropic используйте `LLM_API_FORMAT=anthropic` и соответс�
 - проверка работоспособности: <http://localhost:8000/health/live>;
 - проверка готовности: <http://localhost:8000/health/ready>.
 
-Минимальный вызов через JSON-RPC 0.3:
+Минимальный вызов через JSON-RPC 1.0:
 
 ```bash
 curl -sS http://localhost:8000/ \
   -H 'Content-Type: application/json' \
-  -H 'A2A-Version: 0.3' \
+  -H 'A2A-Version: 1.0' \
   -d '{
     "jsonrpc": "2.0",
     "id": "1",
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
-        "kind": "message",
-        "role": "user",
+        "role": "ROLE_USER",
         "messageId": "00000000-0000-4000-8000-000000000001",
-        "parts": [{"kind": "text", "text": "Кратко опиши Core Agent"}]
+        "parts": [{"text": "Кратко опиши Core Agent"}]
       }
     }
   }'
+```
+
+Тот же вызов через HTTP+JSON 1.0:
+
+```bash
+curl -sS http://localhost:8000/message:send \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -d '{"message": {"role": "ROLE_USER", "messageId": "00000000-0000-4000-8000-000000000002", "parts": [{"text": "Кратко опиши Core Agent"}]}}'
 ```
 
 ### Docker Compose
