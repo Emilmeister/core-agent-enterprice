@@ -21,7 +21,7 @@ ISSUER = "https://identity.example.test/realms/company"
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 
-class AuthBoundaryTests(unittest.IsolatedAsyncioTestCase):
+class AuthAppTestCase(unittest.IsolatedAsyncioTestCase):
     """ENT-AC-01..05/67: exercise HTTP admission and real A2A task storage."""
 
     use_postgres = False
@@ -111,6 +111,8 @@ class AuthBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status_code, 200, result.text)
         return result.json()["task"]
 
+
+class AuthBoundaryTests(AuthAppTestCase):
     async def test_missing_bearer_and_legacy_route_never_reach_model(self):
         response = await self.http.get("/api/identity")
         self.assertEqual(response.status_code, 401)

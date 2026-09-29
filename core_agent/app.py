@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import asyncio
 import hashlib
 import json
 import logging
@@ -23,7 +24,8 @@ from .a2a import (
     Part,
     parse_run_request,
 )
-from .a2a_sdk import build_starlette_app
+from .a2a_sdk import CoreAgentExecutor, ScopedMemoryTaskStore, build_starlette_app
+from .admission import MemoryRootAdmission, PostgresRootAdmission
 from .artifact_service import validate_segment, create_artifact_service
 from .artifacts import InMemoryArtifactStore, PostgresArtifactStore
 from .audit import InMemoryAuditLog
@@ -1713,6 +1715,10 @@ def create_app(
                     session_id=context.context_id,
                     tenant_id=context.tenant or "default",
                     actor_id=actor.actor_id if actor else None,
+                    initial_lease_token=(
+                        context.call_context.state["initial_admission"].lease_token
+                        if "initial_admission" in context.call_context.state else None
+                    ),
                 ),
                 request=request,
             )
@@ -1798,6 +1804,39 @@ def create_app(
         for owned in state["owned_databases"]:
             owned.close()
 
+    task_store = state["tasks"] or ScopedMemoryTaskStore(
+        workflow_store=state["workflow"] if auth_settings else None
+    )
+    admission = None
+    if auth_settings:
+        if state["database"] and state["tasks"] is None:
+            raise CoreError("CONFIG_CONFLICT", "Enterprise PostgreSQL admission requires PostgreSQL tasks")
+        admission = (
+            PostgresRootAdmission(agent, task_store) if state["database"]
+            else MemoryRootAdmission(agent, task_store)
+        )
+
+    async def admit(message, call_context):
+        from a2a.utils.errors import InvalidParamsError
+
+        try:
+            request = parse_run_request(CoreAgentExecutor._from_sdk_message(message))
+        except CoreError as error:
+            raise InvalidParamsError(message=str(error)) from None
+        return await admission.admit(message, request, call_context)
+
+    async def release_admission(call_context):
+        accepted = call_context.state.pop("initial_admission")
+        try:
+            await asyncio.to_thread(
+                agent.workflow_store.release_lease, accepted.run_id,
+                tenant_id=call_context.tenant, worker_id=agent._worker_id,
+                token=accepted.lease_token,
+            )
+        except CoreError as error:
+            if error.code != "LEASE_LOST":
+                raise
+
     app = build_starlette_app(
         agent_card=card,
         handler=handle,
@@ -1805,9 +1844,11 @@ def create_app(
         cancel_signal=signal_cancel,
         base_url=base_url,
         derive_base_url=not configured_url,
-        task_store=state["tasks"],
+        task_store=task_store,
         resume_handler=resume,
         followup_handler=followup,
+        admission_handler=admit if admission else None,
+        admission_cleanup=release_admission if admission else None,
         context_builder=AuthContextBuilder() if auth_settings else None,
         push_config_store=push_config_store,
         push_sender=push_sender,

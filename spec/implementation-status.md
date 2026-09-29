@@ -75,8 +75,8 @@
 | ENT-AC-11 | [Общий inbound лимит](artifacts.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-12 | [Path safety](artifacts.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-13 | [Download scope](artifacts.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
-| ENT-AC-14 | [Atomic root admission](public-contract.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
-| ENT-AC-15 | [Busy во время ожидания](public-contract.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
+| ENT-AC-14 | [Atomic root admission](public-contract.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | `tests.test_admission`: конкурентные root и независимые PostgreSQL pools, persisted busy Task, rollback, shutdown/restart и disconnect recovery | implemented |
+| ENT-AC-15 | [Busy во время ожидания](public-contract.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | `tests.test_admission` подтверждает удержание слота canonical nonterminal state; реальные enterprise HITL/remote ожидания ещё не подключены | partial |
 | ENT-AC-16 | [Follow-up safe boundary](runtime.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-17 | [Follow-up dedup/race](runtime.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-17a | [Follow-up during HITL/remote wait](runtime.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
@@ -128,7 +128,7 @@
 | ENT-AC-63 | [Atomic attachment admission](artifacts.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-64 | [Outbound total limit](artifacts.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-65 | [Indefinite history](context.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
-| ENT-AC-66 | [Stable-caller creation dedup](public-contract.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
+| ENT-AC-66 | [Stable-caller creation dedup](public-contract.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | `tests.test_admission`: actor/messageId, canonical Message, конфликт, restart, смена токена, busy и completed duplicates; файловый admission пока отклонён | partial |
 | ENT-AC-67 | [HTTP request auth boundary](security-and-reliability.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | `tests.test_auth` stream завершается после expiry во время generation, следующий запрос отклонён; memory/PostgreSQL | implemented |
 | ENT-AC-68 | [Orphan upload cleanup](artifacts.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-69 | [Message wakes timer](tasks-and-delegation.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |

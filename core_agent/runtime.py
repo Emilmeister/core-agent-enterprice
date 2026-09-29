@@ -1247,20 +1247,21 @@ class CoreAgent:
                 self.event_store.revision(run_id),
                 {**snapshot, "state": "RUNNING"},
             )
-        self._run_scopes[run_id] = {
-            "identity": owner_id,
-            "session_id": context_id,
-            "task_id": task_id,
-            "tenant_id": tenant_id,
-        }
-        self._log(
-            "task.admitted",
-            run_id=run_id,
-            task_id=task_id,
-            context_id=context_id,
-            parent_run_id=parent_run_id,
-            **({"prompt": request.prompt} if self.log_content else {}),
-        )
+        if connection is None:
+            self._run_scopes[run_id] = {
+                "identity": owner_id,
+                "session_id": context_id,
+                "task_id": task_id,
+                "tenant_id": tenant_id,
+            }
+            self._log(
+                "task.admitted",
+                run_id=run_id,
+                task_id=task_id,
+                context_id=context_id,
+                parent_run_id=parent_run_id,
+                **({"prompt": request.prompt} if self.log_content else {}),
+            )
         if defer_initialization:
             return record, raw, {}, None
         return self._initialize_workflow(record, raw=raw, cancel_event=cancel_event)
@@ -4242,17 +4243,19 @@ class CoreAgent:
         parent_run_id=None,
         finalization_reserved=False,
         cancel_event=None,
+        initial_lease_token=None,
     ):
         startup_cancel = (
             cancel_event
             if isinstance(cancel_event, _TaskControlEvent)
             else _TaskControlEvent(cancel_event)
         )
+        workflow_admitted = initial_lease_token is not None
         registered = False
         if task_id is not None:
             with self._starting_tasks_lock:
                 if self._closed.is_set():
-                    raise CoreError("WORKER_STOPPED")
+                    raise CoreError("WORKER_STOPPED", data={"workflow_admitted": workflow_admitted})
                 if task_id in self._starting_tasks:
                     raise CoreError("INVALID_TASK_STATE")
                 self._starting_tasks[task_id] = startup_cancel
@@ -4260,8 +4263,7 @@ class CoreAgent:
                     startup_cancel.set()
                 registered = True
         elif self._closed.is_set():
-            raise CoreError("WORKER_STOPPED")
-        workflow_admitted = False
+            raise CoreError("WORKER_STOPPED", data={"workflow_admitted": workflow_admitted})
         try:
             if task_id is not None:
                 try:
@@ -4286,7 +4288,7 @@ class CoreAgent:
                         raise CoreError("INVALID_TASK_STATE")
                     workflow_admitted = True
                     return self._continue_workflow(
-                        existing, cancel_event=startup_cancel
+                        existing, cancel_event=startup_cancel, lease_token=initial_lease_token
                     )
             initial_lease_token = str(uuid.uuid4())
             record, _raw, _discovered, _effective = self._new_workflow(

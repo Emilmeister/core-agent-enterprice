@@ -260,6 +260,23 @@ Production требует полную Keycloak configuration и закрыва�
 и замену токена. Проверка повтора предшествует созданию новой failed Task
 из-за занятости чата; конкурентные повторы не создают несколько задач.
 
+В wire representation busy Task содержит
+`metadata.error = {"code": "CONTEXT_BUSY", "activeTaskId": "..."}` и
+пояснение в `status.message`. Changed-message конфликт передаётся стандартным
+A2A InvalidParamsError с `data.code = "MESSAGE_ID_CONFLICT"`; отдельная Task
+при конфликте не создаётся. Пустой messageId и исходный role, отличный от
+ROLE_USER, отклоняются до admission.
+
+Fingerprint version 1 — SHA-256 canonical JSON исходного A2A Message до
+назначения сервером отсутствующих IDs. Protobuf MessageToDict преобразуется
+через JSON с отсортированными ключами, ASCII escapes и разделителями `,`/`:`
+без пробелов, затем кодируется UTF-8. В сравнении участвует весь Message,
+включая parts, metadata, extensions, references и переданный context;
+HTTP credentials, trace headers и response configuration не участвуют.
+Отсутствие contextId отличается от явно переданного contextId: повтор первого
+запроса не должен подменять его серверным ID. Изменение алгоритма требует новой
+fingerprint version и чтения старого ledger по его сохранённой версии.
+
 ### TASK-03. Сообщение в активную задачу
 
 - Сообщение с `taskId` существующей нетерминальной задачи является follow-up.

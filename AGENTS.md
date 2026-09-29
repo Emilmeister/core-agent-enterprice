@@ -135,6 +135,7 @@ Package entrypoints из `pyproject.toml`:
 |---|---|
 | `core_agent/app.py` | Composition root: environment config, stores, tool registry, kernel, A2A app, health и Uvicorn |
 | `core_agent/auth.py` | Keycloak introspection, immutable authenticated scope, owner/external access и SDK context builder |
+| `core_agent/admission.py` | Atomic root admission, stable-caller deduplication и busy guard чата до SDK execution |
 | `core_agent/runtime.py` | Agent loop, workflow continuation, recovery, tool handlers и delegation |
 | `core_agent/config.py` | RunRequest, Platform/Agent/EffectiveConfig и capability intersection |
 | `core_agent/a2a.py` | Внутренние A2A contract types и Task representation |
@@ -206,6 +207,16 @@ Target spec может описывать больше текущего runtime.
   External role исключает owner authority. Owner-wide доступ к задаче сохраняет
   её исходного owner; actor identity отдельно записывается в admission audit и
   follow-up provenance. Cancel проверяет scoped Task до active SDK registry.
+- Авторизованные A2A endpoints принимают новый root через общий admission:
+  один нетерминальный root на чат, duplicate по `(tenant, actor, messageId)`
+  проверяется до busy guard. Изменённый Message даёт `MESSAGE_ID_CONFLICT`;
+  новая попытка в занятом чате сохраняется как отдельная failed Task с
+  `CONTEXT_BUSY`, без workflow или worker. Owner сохраняет исходный scope чата.
+- Initial Message, Task, chat mapping, request ledger и workflow записываются
+  одной PostgreSQL транзакцией до запуска SDK. Shutdown или потеря stream
+  после commit оставляет Task для recovery. Legacy context без явного mapping
+  не присваивается новому caller. Enterprise binary Parts пока отклоняются до
+  admission; atomic workspace attachments подключаются отдельным этапом.
 - Run input содержит ровно `prompt`; MCP-серверы и skills задаются
   конфигурацией развёртывания и не добавляются в RunRequest.
 - Tenant, identity, auth, trace context, model route, policy и budgets приходят
@@ -459,6 +470,13 @@ run получает отдельные MCP session и negotiated version; пе�
   DB и совпадающей schema version. Нет SQLite/in-memory fallback.
 - Tasks, workflow events/checkpoints, inbound inbox, outbox и audit
   tenant/owner-scoped и сохраняются в PostgreSQL согласованно.
+- `core_chats.latest_root_run_id` указывает на последний root; занятость
+  определяется его canonical workflow state. Terminal transition не очищает
+  указатель. `core_root_messages` хранит immutable creation dedup ledger без TTL.
+  Schema 13 добавляется отдельной migration job после остановки старых workers;
+  после новых записей откат image требует согласованного отката БД.
+  Legacy run-family retention отвечает `RETENTION_PROHIBITED` для enterprise
+  чатов до изменения данных; очистка workspace не удаляет историю или ledger.
 - После restart ambiguous dispatched side effect переходит в reconciliation, а
   не replay. Shared storage lock не заменяет lease: у stateful run один active
   owner.

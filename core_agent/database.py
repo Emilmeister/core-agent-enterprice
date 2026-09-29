@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from a2a.server.owner_resolver import resolve_user_scope
 from a2a.server.tasks import TaskStore
@@ -24,7 +24,7 @@ from .durability import Event
 from .errors import CoreError
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -399,6 +399,35 @@ CREATE INDEX core_background_recovery_idx
 ALTER TABLE core_runs
     ADD COLUMN cancel_requested boolean NOT NULL DEFAULT false;
 """,
+    13: """
+CREATE TABLE core_chats (
+    tenant_id text NOT NULL,
+    context_id text NOT NULL,
+    owner_id text NOT NULL,
+    latest_root_run_id text REFERENCES core_runs(run_id),
+    schema_version integer NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, context_id)
+);
+CREATE INDEX core_chats_owner_idx ON core_chats (tenant_id, owner_id, context_id);
+CREATE TABLE core_root_messages (
+    tenant_id text NOT NULL,
+    actor_id text NOT NULL,
+    message_id text NOT NULL,
+    request_digest text NOT NULL,
+    fingerprint_version integer NOT NULL DEFAULT 1 CHECK (fingerprint_version = 1),
+    owner_id text NOT NULL,
+    context_id text NOT NULL,
+    task_id text NOT NULL,
+    schema_version integer NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, actor_id, message_id),
+    FOREIGN KEY (tenant_id, context_id) REFERENCES core_chats (tenant_id, context_id),
+    FOREIGN KEY (task_id, owner_id, tenant_id) REFERENCES core_a2a_tasks (task_id, owner, tenant)
+);
+CREATE INDEX core_root_messages_task_idx ON core_root_messages (tenant_id, task_id);
+""",
+
 }
 
 
@@ -542,6 +571,8 @@ class PostgresDatabase:
             "core_audit_records": "SELECT, INSERT",
             "core_a2a_tasks": "SELECT, INSERT, UPDATE, DELETE",
             "core_runs": "SELECT, INSERT, UPDATE, DELETE",
+            "core_chats": "SELECT, INSERT, UPDATE",
+            "core_root_messages": "SELECT, INSERT",
             "core_background_tasks": "SELECT, INSERT, UPDATE, DELETE",
             "core_notifications": "SELECT, INSERT, UPDATE, DELETE",
             "core_outbox": "SELECT, INSERT, UPDATE, DELETE",
@@ -685,6 +716,86 @@ class PostgresAuditLog:
         raise CoreError("AUDIT_IMMUTABLE")
 
 
+def reconcile_workflow_task(task, *, run_id, state, result=None, error_code=None):
+    """Project a terminal canonical workflow into its persisted public Task."""
+    terminal = {
+        "COMPLETED": a2a_pb2.TASK_STATE_COMPLETED,
+        "FAILED": a2a_pb2.TASK_STATE_FAILED,
+        "ABORTED": a2a_pb2.TASK_STATE_FAILED,
+        "CANCELLED": a2a_pb2.TASK_STATE_CANCELED,
+        "REJECTED": a2a_pb2.TASK_STATE_REJECTED,
+    }
+    if state not in terminal or task.status.state in terminal.values():
+        return False
+    task.status.state = terminal[state]
+    task.status.timestamp.GetCurrentTime()
+    if state in {"FAILED", "ABORTED", "REJECTED"}:
+        reason = (
+            error_code
+            or {
+                "FAILED": "TASK_FAILED",
+                "ABORTED": "SIDE_EFFECT_UNKNOWN",
+                "REJECTED": "POLICY_DENIED",
+            }[state]
+        )
+        task.status.message.Clear()
+        task.status.message.message_id = (
+            f"{task.id}:{state.lower()}"
+        )
+        task.status.message.task_id = task.id
+        task.status.message.context_id = task.context_id
+        task.status.message.role = a2a_pb2.ROLE_AGENT
+        task.status.message.parts.add(
+            text=reason,
+            media_type="text/plain",
+        )
+    result = result or {}
+    message = result.get("message")
+    if state == "COMPLETED" and message:
+        encoded = message.encode()
+        digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+        artifact = next(
+            (item for item in task.artifacts if item.artifact_id == digest),
+            None,
+        )
+        if artifact is None:
+            artifact = task.artifacts.add()
+        else:
+            del artifact.parts[:]
+            artifact.metadata.Clear()
+        artifact.artifact_id = digest
+        part = artifact.parts.add()
+        part.text = message
+        part.media_type = "text/plain"
+        provenance = {
+            "run_id": run_id,
+            "task_id": task.id,
+            "complete": result.get("complete", True),
+            "completion_reason": result.get(
+                "completion_reason", "completed"
+            ),
+            "usage": result.get(
+                "usage", {"model_turns": 0, "tool_calls": 0}
+            ),
+        }
+        if result.get("exhausted_dimension"):
+            provenance["exhausted_dimension"] = result[
+                "exhausted_dimension"
+            ]
+        if result.get("shared_budget") is not None:
+            provenance["shared_budget"] = result["shared_budget"]
+        if result.get("pending_tasks"):
+            provenance["pending_tasks"] = result["pending_tasks"]
+        metadata = {
+            "digest": digest,
+            "size": len(encoded),
+            "recovered": True,
+            "provenance": provenance,
+        }
+        artifact.metadata.update(metadata)
+    return True
+
+
 class PostgresTaskStore(TaskStore):
     """Durable A2A task store scoped by authenticated owner and tenant."""
 
@@ -699,13 +810,6 @@ class PostgresTaskStore(TaskStore):
         ), context.tenant or "default"
 
     def reconcile_from_workflows(self, *, enqueue_notification=None):
-        terminal = {
-            "COMPLETED": a2a_pb2.TASK_STATE_COMPLETED,
-            "FAILED": a2a_pb2.TASK_STATE_FAILED,
-            "ABORTED": a2a_pb2.TASK_STATE_FAILED,
-            "CANCELLED": a2a_pb2.TASK_STATE_CANCELED,
-            "REJECTED": a2a_pb2.TASK_STATE_REJECTED,
-        }
         reconciled = 0
         with self.database.transaction() as connection:
             rows = connection.execute(
@@ -728,72 +832,10 @@ class PostgresTaskStore(TaskStore):
             ).fetchall()
             for row in rows:
                 task = a2a_pb2.Task.FromString(bytes(row["payload"]))
-                task.status.state = terminal[row["run_state"]]
-                task.status.timestamp.GetCurrentTime()
-                if row["run_state"] in {"FAILED", "ABORTED", "REJECTED"}:
-                    reason = (
-                        row["error_code"]
-                        or {
-                            "FAILED": "TASK_FAILED",
-                            "ABORTED": "SIDE_EFFECT_UNKNOWN",
-                            "REJECTED": "POLICY_DENIED",
-                        }[row["run_state"]]
-                    )
-                    task.status.message.Clear()
-                    task.status.message.message_id = (
-                        f"{task.id}:{row['run_state'].lower()}"
-                    )
-                    task.status.message.task_id = task.id
-                    task.status.message.context_id = task.context_id
-                    task.status.message.role = a2a_pb2.ROLE_AGENT
-                    task.status.message.parts.add(
-                        text=reason,
-                        media_type="text/plain",
-                    )
-                result = row["result"] or {}
-                message = result.get("message")
-                if row["run_state"] == "COMPLETED" and message:
-                    encoded = message.encode()
-                    digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
-                    artifact = next(
-                        (item for item in task.artifacts if item.artifact_id == digest),
-                        None,
-                    )
-                    if artifact is None:
-                        artifact = task.artifacts.add()
-                    else:
-                        del artifact.parts[:]
-                        artifact.metadata.Clear()
-                    artifact.artifact_id = digest
-                    part = artifact.parts.add()
-                    part.text = message
-                    part.media_type = "text/plain"
-                    provenance = {
-                        "run_id": row["run_id"],
-                        "task_id": row["task_id"],
-                        "complete": result.get("complete", True),
-                        "completion_reason": result.get(
-                            "completion_reason", "completed"
-                        ),
-                        "usage": result.get(
-                            "usage", {"model_turns": 0, "tool_calls": 0}
-                        ),
-                    }
-                    if result.get("exhausted_dimension"):
-                        provenance["exhausted_dimension"] = result[
-                            "exhausted_dimension"
-                        ]
-                    if result.get("shared_budget") is not None:
-                        provenance["shared_budget"] = result["shared_budget"]
-                    if result.get("pending_tasks"):
-                        provenance["pending_tasks"] = result["pending_tasks"]
-                    metadata = {
-                        "digest": digest,
-                        "size": len(encoded),
-                        "recovered": True,
-                        "provenance": provenance,
-                    }
-                    artifact.metadata.update(metadata)
+                reconcile_workflow_task(
+                    task, run_id=row["run_id"], state=row["run_state"],
+                    result=row["result"], error_code=row["error_code"],
+                )
                 connection.execute(
                     """UPDATE core_a2a_tasks SET state = %s,
                            status_timestamp = %s, payload = %s, updated_at = now()
@@ -818,12 +860,12 @@ class PostgresTaskStore(TaskStore):
                 reconciled += 1
         return reconciled
 
-    def _save(self, task, context):
+    def _save(self, task, context, *, connection=None):
         owner, tenant = self._scope(context)
         timestamp = None
         if task.HasField("status") and task.status.HasField("timestamp"):
             timestamp = task.status.timestamp.ToMilliseconds() / 1000
-        with self.database.transaction() as connection:
+        with (self.database.transaction() if connection is None else nullcontext(connection)) as connection:
             if is_company_owner(context):
                 existing = connection.execute(
                     "SELECT owner FROM core_a2a_tasks WHERE task_id = %s AND tenant = %s FOR UPDATE",

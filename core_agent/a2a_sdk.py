@@ -40,6 +40,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, request_response
 from a2a.utils.errors import (
     InvalidParamsError,
+    ContentTypeNotSupportedError,
     TaskNotFoundError,
     UnsupportedOperationError,
 )
@@ -52,6 +53,8 @@ from .a2a import (
     parse_run_request,
 )
 from .auth import OWNER_SCOPE, ScopeUser, is_company_owner
+from .database import reconcile_workflow_task
+from .errors import CoreError
 from .streaming import (
     ADK_THOUGHT_KEY,
     ADK_TYPE_KEY,
@@ -81,7 +84,8 @@ def resolve_owner_scope(context):
 class ScopedMemoryTaskStore(InMemoryTaskStore):
     """Development adapter: owner access with the same company boundary as SQL."""
 
-    def __init__(self):
+    def __init__(self, *, workflow_store=None):
+        self.workflow_store = workflow_store
         super().__init__(owner_resolver=lambda context: json.dumps([
             context.tenant, resolve_owner_scope(context),
         ]))
@@ -99,10 +103,36 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
             owner = self._owners.get(key, caller)
             if owner != caller and not is_company_owner(context):
                 raise InvalidParamsError("Task not found")
+            if self.workflow_store is not None:
+                current = await super().get(task.id, self._as_owner(context, owner))
+                if current is not None and current.status.state in A2A_TERMINAL_STATES:
+                    return
             self._owners[key] = owner
             await super().save(task, self._as_owner(context, owner))
             if owner != OWNER_SCOPE:
                 await super().save(task, self._as_owner(context, OWNER_SCOPE))
+
+    async def _get_reconciled(self, task_id, context, owner):
+        owner_context = self._as_owner(context, owner)
+        task = await super().get(task_id, owner_context)
+        if task is None or self.workflow_store is None or task.status.state in A2A_TERMINAL_STATES:
+            return task
+        try:
+            record = self.workflow_store.by_task(
+                task_id, tenant_id=context.tenant, owner_id=owner,
+            )
+        except CoreError as error:
+            if error.code != "TASK_NOT_FOUND":
+                raise
+            return task
+        if reconcile_workflow_task(
+            task, run_id=record.run_id, state=record.state,
+            result=record.result, error_code=record.error_code,
+        ):
+            await super().save(task, owner_context)
+            if owner != OWNER_SCOPE:
+                await super().save(task, self._as_owner(context, OWNER_SCOPE))
+        return task
 
     async def get(self, task_id, context):
         async with self._access_lock:
@@ -114,13 +144,27 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
                 context.user = ScopeUser(owner)
             elif owner != resolve_owner_scope(context):
                 return None
-            return await super().get(task_id, context)
+            return await self._get_reconciled(task_id, context, owner)
 
     async def list(self, params, context):
         async with self._access_lock:
-            if is_company_owner(context):
+            company_owner = is_company_owner(context)
+            if self.workflow_store is not None:
+                for (tenant, task_id), owner in self._owners.items():
+                    if tenant == context.tenant and (company_owner or owner == resolve_owner_scope(context)):
+                        await self._get_reconciled(task_id, context, owner)
+            if company_owner:
                 context = self._as_owner(context, OWNER_SCOPE)
             return await super().list(params, context)
+
+    async def has_context(self, context_id, context):
+        async with self._access_lock:
+            for (tenant, task_id), owner in self._owners.items():
+                if tenant == context.tenant:
+                    task = await super().get(task_id, self._as_owner(context, owner))
+                    if task and task.context_id == context_id:
+                        return True
+        return False
 
     async def delete(self, task_id, context):
         async with self._access_lock:
@@ -655,12 +699,16 @@ class TransientStatusTaskStore:
         self.inner = inner
 
     async def save(self, task, context=None):
-        kept = [
-            message
-            for message in task.history
-            if message.role != SdkRole.ROLE_AGENT
-            or not json_format.MessageToDict(message.metadata).get(PARTIAL_KEY)
-        ]
+        kept = []
+        user_ids = set()
+        for message in task.history:
+            if message.role == SdkRole.ROLE_AGENT and json_format.MessageToDict(message.metadata).get(PARTIAL_KEY):
+                continue
+            if message.role == SdkRole.ROLE_USER and message.message_id:
+                if message.message_id in user_ids:
+                    continue
+                user_ids.add(message.message_id)
+            kept.append(message)
         if len(kept) != len(task.history):
             del task.history[:]
             task.history.extend(kept)
@@ -677,9 +725,36 @@ class TransientStatusTaskStore:
 
 
 class CoreRequestHandler(DefaultRequestHandler):
-    def __init__(self, *args, followup_handler, **kwargs):
+    def __init__(self, *args, followup_handler, admission_handler=None, admission_cleanup=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.followup_handler = followup_handler
+        self.admission_handler = admission_handler
+        self.admission_cleanup = admission_cleanup
+
+    def _validate_enterprise_message(self, message):
+        if self.admission_handler is None:
+            return
+        if not message.message_id.strip() or message.role != SdkRole.ROLE_USER:
+            raise InvalidParamsError("A nonempty messageId and ROLE_USER are required")
+        if any(part.HasField("raw") or part.HasField("url") for part in message.parts):
+            raise ContentTypeNotSupportedError()
+
+    async def _admit_root(self, params, context):
+        validate_history_length(params.configuration)
+        admitted = await self.admission_handler(params.message, context)
+        if admitted.lease_token:
+            context.state["initial_admission"] = admitted
+            params.message.task_id = admitted.task.id
+            params.message.context_id = admitted.task.context_id
+        return admitted
+
+    async def _setup_active_task(self, params, call_context):
+        try:
+            return await super()._setup_active_task(params, call_context)
+        except BaseException:
+            if self.admission_cleanup and call_context.state.get("initial_admission"):
+                await self.admission_cleanup(call_context)
+            raise
 
     async def _accept_followup(self, params, context):
         validate_history_length(params.configuration)
@@ -695,6 +770,12 @@ class CoreRequestHandler(DefaultRequestHandler):
             raise InvalidParamsError(message="Follow-up role must be ROLE_USER")
         if params.message.context_id and params.message.context_id != task.context_id:
             raise InvalidParamsError(message="context_id does not match task")
+        if self.admission_handler and any(
+            item.role == SdkRole.ROLE_USER and item.message_id == params.message.message_id
+            for item in task.history
+        ):
+            # The initial turn is committed before the SDK starts the worker.
+            return apply_history_length(task, params.configuration)
         message = CoreAgentExecutor._from_sdk_message(
             params.message, context_id=task.context_id
         )
@@ -715,8 +796,13 @@ class CoreRequestHandler(DefaultRequestHandler):
 
     @validate_request_params
     async def on_message_send(self, params, context):
+        self._validate_enterprise_message(params.message)
         if params.message.task_id:
             return await self._accept_followup(params, context)
+        if self.admission_handler:
+            admitted = await self._admit_root(params, context)
+            if admitted.lease_token is None:
+                return apply_history_length(admitted.task, params.configuration)
         return await super().on_message_send(params, context)
 
     @validate_request_params
@@ -725,9 +811,15 @@ class CoreRequestHandler(DefaultRequestHandler):
         "Streaming is not supported by the agent",
     )
     async def on_message_send_stream(self, params, context):
+        self._validate_enterprise_message(params.message)
         if params.message.task_id:
             yield await self._accept_followup(params, context)
             return
+        if self.admission_handler:
+            admitted = await self._admit_root(params, context)
+            yield apply_history_length(admitted.task, params.configuration)
+            if admitted.lease_token is None:
+                return
         async for event in super().on_message_send_stream(params, context):
             yield event
 
@@ -814,6 +906,8 @@ def build_starlette_app(
     resume_handler,
     followup_handler,
     context_builder=None,
+    admission_handler=None,
+    admission_cleanup=None,
     task_store=None,
     push_config_store=None,
     push_sender=None,
@@ -841,6 +935,8 @@ def build_starlette_app(
         push_config_store=push_config_store,
         push_sender=push_sender,
         followup_handler=followup_handler,
+        admission_handler=admission_handler,
+        admission_cleanup=admission_cleanup,
     )
     routes = _agent_card_routes(sdk_card, derive_base_url=derive_base_url)
     for route in create_jsonrpc_routes(

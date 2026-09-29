@@ -156,6 +156,42 @@ Waits, решения, timer generation, remote handle↔IDs, final timeout, cro
 
 ## Совместимость, migration и rollback
 
+### Schema 13: admission корневой задачи
+
+`core_chats` хранит `(tenant_id, context_id)` как primary key, immutable
+`owner_id`, nullable `latest_root_run_id` со ссылкой на `core_runs`,
+`schema_version=1` и время создания. Последний root — историческая ссылка:
+занятость определяется его canonical workflow state, а не вторым lifecycle.
+Все нетерминальные states, включая ожидания, занимают чат. Terminal state
+освобождает слот без удаления истории и без изменения указателя старым worker.
+Следующий принятый root атомарно заменяет указатель.
+
+`core_root_messages` хранит primary key `(tenant_id, actor_id, message_id)`,
+`request_digest`, `fingerprint_version=1`, `owner_id`, `context_id`, `task_id`,
+`schema_version=1` и время создания. `actor_id` — verified caller, отдельно от
+общего execution owner владельцев. Ledger не удаляется автоматическим TTL.
+Прежний run-family retention не применяется к runs зарегистрированного
+enterprise чата: возвращается `RETENTION_PROHIBITED` до изменений. Очистка
+выбранных workspace файлов не удаляет Task, историю или creation ledger.
+Начальный Message сохраняется в A2A Task.history в той же транзакции, поэтому
+crash до первого SDK события не теряет запрос. Повторное добавление этого
+Message SDK не создаёт копию в истории.
+
+Admission берёт transaction-scoped lock по dedup key, проверяет повтор, затем
+создаёт/блокирует chat row и проверяет scope. Task, ledger и, при успешном старте,
+workflow/checkpoint/audit/outbox, initial lease и budget reservation коммитятся
+вместе. Busy-отказ сохраняет только свою failed Task и ledger, без workflow,
+worker или budget reservation. Model/MCP/tool execution допускается после commit.
+Чтение state последнего root под chat lock не требует встречного run lock;
+terminal transition сохраняет существующие fencing и atomicity.
+
+Migration 12→13 добавляет таблицы, indexes и application grants, сохраняя
+legacy rows и blobs. Старые context IDs без явного migration mapping не
+присваиваются новым caller-ам. До применения DDL останавливаются старые
+admission workers; отдельная migration job обновляет schema, затем стартует
+runtime schema 13. После новых chat/ledger writes старый image не может
+обслуживать базу без согласованного reverse migration/backup restore.
+
 Enterprise меняет authentication, caller ownership, file placement, tool availability и remote wait semantics, сохраняя A2A 1.0 и однополевой RunRequest. Это явная версия application/persistence contract; старые неаутентифицированные endpoints MUST NOT сохраняться как обход новых owner/external границ. Agent Card рекламирует только фактически подключённые bindings/capabilities. Rollout требует обновлённых клиентов/credentials и отдельного migration job с DDL role; serving процесс только проверяет schema version и fail closed при несовпадении.
 
 Migration заранее делает recoverable backup metadata и blobs, проверяет versions/integrity и задаёт явное сопоставление legacy tenant/user/context со стабильной authenticated identity. Нельзя угадывать caller по текущему токену, `anonymous`, имени файла, последнему запросу или общему tenant. Неоднозначные legacy rows/blobs сохраняются изолированно, недоступны внешним caller-ам до подтверждённого operator mapping. Owner-wide UI доступ не расширяет execution scope. Старые пользовательские blobs сохраняются при удалении artifact tools; mapping/move публикуется только после полного успешного переноса и сверки digest.
