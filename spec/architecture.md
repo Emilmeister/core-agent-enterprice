@@ -2,7 +2,7 @@
 
 ## Архитектурная цель
 
-Core Agent — stateful orchestration kernel с портами для моделей, local terminal sessions, MCP, skills, persistence, policy и событий. Целевой deployment работает в одном managed container без Kubernetes API; бизнес-логика agent loop не зависит от HTTP framework или model provider.
+Core Agent — stateful orchestration kernel с портами для моделей, local terminal sessions, MCP, skills, persistence, policy и событий. Целевой deployment работает в одном Kubernetes Pod, с постоянными папками чатов и обязательным Bubblewrap для команд; бизнес-логика agent loop не зависит от HTTP framework или model provider.
 
 ## Подсистемы
 
@@ -49,7 +49,7 @@ Agent Card.
 
 ### Tool runtime
 
-Регистрирует built-ins и MCP tools, валидирует calls и передаёт их policy engine. Terminal, skill scripts и stdio MCP запускаются через owned TerminalSession с отдельными PTY/process group/workspace; runtime нормализует outputs и фиксирует side effects.
+Регистрирует built-ins и MCP tools, валидирует calls и передаёт их policy engine. Terminal, skill scripts и stdio MCP запускаются через owned TerminalSession с отдельными PTY/process group в workspace своего чата либо optional isolated scratch-копии; runtime нормализует outputs и фиксирует side effects.
 
 ### Skill manager
 
@@ -57,11 +57,11 @@ Agent Card.
 
 ### Policy
 
-Policy engine принимает нормализованный proposed action и возвращает `AUTO_ALLOW` или `DENY`. Отдельного пути подтверждения человеком нет: этот runtime не содержит human-in-the-loop, и вердикт policy является окончательным. Граница возможностей задаётся tool allowlist, runtime mode и изоляцией контейнера.
+Policy engine проверяет immutable platform/tenant/mode ceiling и текущую owner policy `allow|require_hitl|deny`. HITL durable связывает точный call/arguments с решением владельца; schema, scope и current policy проверяются перед dispatch. Guardrails независимо допускает конкретную версию материала и не выдаёт capability. UI и owner endpoints находятся за Keycloak, внешний A2A имеет отдельную границу доступа.
 
 ### Durable state
 
-Event log является источником истины для состояния A2A Task/run. Inbound Messages durable сохраняются до model delivery и дедуплицируются по `(task_id, message_id)`; inbox append и terminal transition сериализуются без потери подтверждённого input. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript и artifacts имеют независимые retention policies. Память является подсистемой Core Agent и ведёт собственные revisions вне event log; Core сохраняет только использованные tool results/provenance согласно Task retention.
+Event log является источником истины для состояния A2A Task/run. Inbound Messages durable сохраняются до model delivery и дедуплицируются по `(task_id, message_id)`; inbox append и terminal transition сериализуются без потери подтверждённого input. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. История чата сохраняется без автоматического удаления по возрасту; служебные blobs/checkpoints имеют отдельные retention policies, не удаляющие историю. Память является подсистемой Core Agent и ведёт собственные revisions вне event log; Core сохраняет только использованные tool results/provenance согласно Task retention.
 
 Production adapter хранит A2A Tasks, event log, checkpoints, и append-only audit в PostgreSQL через один bounded pool. `DATABASE_URL` обязателен и берётся из deployment secret. Нет автоматического fallback на process memory/SQLite при database outage: startup/readiness fail closed, активные protected actions не исполняются. Test adapters не могут быть выбраны production configuration.
 
@@ -146,3 +146,22 @@ Primary agent создаёт сабагента как неблокирующу�
 ## Dependency direction
 
 Domain types и state machine не импортируют provider SDK, transport frameworks или platform shell code. Инфраструктурные adapters зависят от core ports, но не наоборот. Это правило MUST проверяться архитектурными tests или package boundaries.
+
+
+## Enterprise admission и долговечные состояния
+
+Одна компания имеет владельцев и внешних caller-ов со стабильным authenticated scope. Чат привязан к tenant и доказанному caller scope; owners видят все чаты компании, но выполняющаяся Task получает только scope своего чата. Admission атомарно проверяет один active root на чат, сохраняет `(tenant, stable caller, messageId)` и digest content/context/attachments, Task/inbox и files publication. Duplicate сначала возвращает прежнюю Task; changed content конфликтует. Неуспешный CONTEXT_BUSY является отдельной durable terminal Task, не занимает чат и не создаёт очередь.
+
+Waits, решения, timer generation, remote handle↔IDs, final timeout, cron revision/ticks, file staging/publication/quarantine и workspace revision имеют versioned structured records в существующей PostgreSQL workflow модели. Summary не является их источником истины. Lease/fencing и atomic transitions допускают одно продолжение; новые retries не воспроизводят неизвестный side effect. Ожидание освобождает execution worker, сохраняя занятость чата. Cleanup и новый root/cron admission сериализуются по тому же chat guard.
+
+## Совместимость, migration и rollback
+
+Enterprise меняет authentication, caller ownership, file placement, tool availability и remote wait semantics, сохраняя A2A 1.0 и однополевой RunRequest. Это явная версия application/persistence contract; старые неаутентифицированные endpoints MUST NOT сохраняться как обход новых owner/external границ. Agent Card рекламирует только фактически подключённые bindings/capabilities. Rollout требует обновлённых клиентов/credentials и отдельного migration job с DDL role; serving процесс только проверяет schema version и fail closed при несовпадении.
+
+Migration заранее делает recoverable backup metadata и blobs, проверяет versions/integrity и задаёт явное сопоставление legacy tenant/user/context со стабильной authenticated identity. Нельзя угадывать caller по текущему токену, `anonymous`, имени файла, последнему запросу или общему tenant. Неоднозначные legacy rows/blobs сохраняются изолированно, недоступны внешним caller-ам до подтверждённого operator mapping. Owner-wide UI доступ не расширяет execution scope. Старые пользовательские blobs сохраняются при удалении artifact tools; mapping/move публикуется только после полного успешного переноса и сверки digest.
+
+Wait, cron и file schemas/checkpoints версионируются; migration сохраняет абсолютные deadlines, admission IDs, closed outcomes, visibility и side-effect intent. Старый checkpoint с неизвестным исходом dispatched call переводится в reconciliation, а не переотправляется. Неизвестная schema version не исполняется. Legacy ephemeral workspace нельзя объявить постоянным без переноса на `CHAT_WORKSPACE_ROOT`; старые snapshots не восстанавливают удалённые файлы.
+
+Legacy `REMOTE_AGENTS` и dedicated auth settings импортируются однократно явным migration в owner registry с проверкой target, identity и защищённым хранением header values. Неоднозначный per-agent auth требует operator mapping; входящий credential автоматически не переносится и не проксируется. После cutover UI registry authoritative: рестарт и старое ENV не перезаписывают его, изменения аудируются. Старые values сохраняются защищённо только для согласованного rollback, не в model/transcript/logs.
+
+До первой enterprise mutation допускается rollback на проверенный pre-migration snapshot. После новых waits, owner decisions, cron admissions, file revisions или UI registry edits старый runtime не может обслуживать новые records: сначала drain/quiesce, затем проверенный reverse migration либо восстановление согласованного DB+blob backup с учётом новых данных. Нельзя молча потерять принятые сообщения/файлы, воскресить timer/approval или повторить возможный side effect. Rollback, который не сохраняет эти гарантии, блокируется; простой запуск старого image на новой schema запрещён.

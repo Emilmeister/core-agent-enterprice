@@ -92,7 +92,7 @@ Production deployment MUST задавать `DURABLE_STORAGE_ROOT` как пут
 - `skills`: boolean;
 - `human_input`: boolean;
 
-Этот runtime не содержит human-in-the-loop: отдельного пути подтверждения side effect человеком нет, а вердикт policy является окончательным. Граница возможностей задаётся исключительно tool allowlist, runtime mode и изоляцией контейнера.
+Enterprise v1 включает owner HITL поверх неизменного platform/tenant/mode ceiling. Новый инструмент по умолчанию требует подтверждения каждого вызова; deny окончателен для этого вызова. Owner UI изменяет текущую policy и guardrails exception по [Инструментам](tools.md), не расширяя ceiling.
 
 `disabled` memory означает:
 
@@ -111,9 +111,29 @@ Deployment передаёт конфигурацию переменными ок
 
 ### Identity и Agent Card
 
+Production enterprise authentication требует complete configuration ниже.
+Частичная configuration отклоняется; настроенная auth не переходит в legacy
+режим при ошибке Keycloak. Полностью отсутствующая configuration разрешает
+legacy routes только в явно выбранном development/test profile.
+
 | Переменная | По умолчанию | Семантика |
 |---|---|---|
-| `AGENT_NAME` | `core-agent` | Имя в Agent Card; оно же `app_name` в ключах артефактов |
+| `CORE_AGENT_ENVIRONMENT` | обязательна | Ровно `production`, `development` или `test`; отсутствие и неизвестное значение завершают startup с `CONFIG_INVALID` |
+| `CORE_AGENT_TENANT_ID` | обязательна в enterprise | Trusted company scope, не берётся из prompt/metadata |
+| `KEYCLOAK_ISSUER_URL` | обязательна | Realm issuer, HTTPS; loopback HTTP только development/test |
+| `KEYCLOAK_CLIENT_ID` | обязательна | Confidential introspection client |
+| `KEYCLOAK_CLIENT_SECRET` | обязательна | Secret introspection credential; не сохраняется в task/model/audit |
+| `KEYCLOAK_AUDIENCE` | обязательна | Expected audience и scope принимаемых client roles |
+| `KEYCLOAK_OWNER_ROLE` | `agent-owner` | Роль владельца |
+| `KEYCLOAK_EXTERNAL_ROLE` | `agent-external` | Роль внешнего caller; исключает owner/HITL authority |
+
+Новый HTTP-запрос проверяется introspection без auth cache; уже открытый ответ
+не переавторизуется. `/a2a/owner`, `/a2a/external` и `/api` используют эти
+границы; `/health/live` и `/health/ready` остаются public probes.
+
+| Переменная | По умолчанию | Семантика |
+|---|---|---|
+| `AGENT_NAME` | `core-agent` | Имя в Agent Card |
 | `AGENT_DESCRIPTION` | `Policy-enforced core agent runtime` | Описание в Agent Card |
 | `AGENT_VERSION` | `1.0.0` | Версия в Agent Card |
 | `AGENT_SYSTEM_PROMPT` | пусто | AgentProfilePrompt; не повторяет Task prompt и не выдаёт capability |
@@ -157,17 +177,9 @@ Deployment передаёт конфигурацию переменными ок
 
 ### Удалённые A2A-агенты
 
-| Переменная | По умолчанию | Семантика |
-|---|---|---|
-| `REMOTE_AGENTS` | пусто | Список базовых URL. Пустой список MUST удалять `core_agent_send_message` из карточки и каталога |
-| `REMOTE_AGENTS_TIMEOUT` | `15.0` | Таймаут загрузки карточки и вызова, секунды |
-| `REMOTE_AGENTS_MAX_RETRIES` | `3` | Повторы загрузки карточки при retryable-ошибке |
-| `REMOTE_AGENTS_RETRY_DELAY` | `1.0` | Базовая задержка повтора, секунды |
-| `REMOTE_AGENTS_RETRY_BACKOFF` | `2.0` | Множитель задержки; MUST быть не меньше `1` |
-| `REMOTE_AGENTS_RETRYABLE_STATUS_CODES` | `500,502,503,504` | Дополнительные retryable статусы поверх встроенных 408 и 429 |
-| `SEND_MESSAGE_API_KEY` | пусто | Непустое значение заменяет проксируемый `Authorization` на `Api-Key <значение>` |
+Реестр доверенных агентов и пары имя/значение исходящего auth header настраиваются владельцами в UI; default — `Authorization: Bearer …`. Значения хранятся защищённо и не выдаются модели/процессу/telemetry. Пустой effective registry скрывает `core_agent_send_message`. Runtime использует connection timeout и bounded read-only discovery retry; mutation не повторяется при неизвестном outcome.
 
-Полный контракт описан в разделе [Удалённые A2A-агенты](tasks-and-delegation.md#удалённые-a2a-агенты).
+`REMOTE_AGENTS`, прежние retry-настройки и `SEND_MESSAGE_API_KEY` являются legacy configuration для явного migration, а не конкурирующим live источником. Сохранённый owner registry становится authoritative после подтверждённого импорта; incoming credential forwarding удалён. Правила import/rollback определены в [Архитектуре](architecture.md).
 
 ### A2A и streaming
 
@@ -182,11 +194,10 @@ Deployment передаёт конфигурацию переменными ок
 | Переменная | По умолчанию | Семантика |
 |---|---|---|
 | `RUNTIME_MAX_LLM_CALLS` | `100` | Hard limit числа model turns |
-| `USER_ID` | `anonymous` | Identity, когда A2A-вызов не аутентифицирован |
-| `MAX_RESPONSE_SIZE` | `100000000` | Верхняя граница одного артефакта в байтах, одинаковая для `content` и `path` |
+| `USER_ID` | только explicit development/test | Не является identity fallback для enterprise endpoints; production identity получается только из проверенного Keycloak context |
+| `MAX_RESPONSE_SIZE` | `100000000` | Legacy предел transport output; не заменяет единый лимит вложений одного сообщения из owner settings |
 | `MAX_CHUNK_SIZE` | `0` | Символов в одном чанке A2A Artifact; `0` означает один чанк |
 | `ENTITY_ID` | пусто | Добавляется заголовком `X-Internal-Entity-ID` к исходящим provider и MCP вызовам |
-| `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` | `false` | `true` сохраняет входящие binary Parts как артефакты сессии и реферирует их в prompt; `false` отклоняет их `CONTENT_TYPE_NOT_SUPPORTED` |
 
 ### Плагины
 
@@ -216,8 +227,6 @@ Prompt caching является полем запроса только у Anthro
 | `SESSION_POSTGRES_DATABASE` | пусто | Имя базы собираемого URL |
 | `TASK_STORAGE_TYPE` | значение `SESSION_STORAGE_TYPE` | Допустимы ровно `in-memory` и `postgres`. `postgres` при не-postgres сессиях завершается `CONFIG_CONFLICT` |
 | `TASK_POSTGRES_URL` | пусто | Fallback URL перед `DATABASE_URL` |
-| `ARTIFACT_STORAGE_TYPE` | `in-memory` | `in-memory`, `s3` или `mongodb` |
-| `ARTIFACT_S3_*`, `ARTIFACT_MONGODB_URL` | см. [Артефакты](artifacts.md) | Параметры backend-интеграций |
 | `MEMORY_STORAGE_TYPE` | `in-memory` | Допустимы ровно `in-memory` и `postgres`. Production с включённой памятью MUST использовать `postgres` |
 | `MEMORY_POSTGRES_*` | см. [Память агента](memory-service.md) | Отдельный DSN памяти; непустой `MEMORY_POSTGRES_HOST` переопределяет общий пул агента целиком |
 | `EMBEDDING_MODEL`, `EMBEDDING_API_BASE`, `EMBEDDING_API_KEY` | пусто | Все три заданные включают слой эмбеддингов; иначе векторный канал поиска деградирует |
@@ -226,7 +235,7 @@ Prompt caching является полем запроса только у Anthro
 
 Порядок разрешения URL сессионной базы фиксирован: `SESSION_DATABASE_URL`, затем сборка из `SESSION_POSTGRES_*` при непустом host, затем `TASK_POSTGRES_URL`, затем `DATABASE_URL`.
 
-Artifact backends `s3` и `mongodb` являются интеграциями: они читают и пишут объекты, но не создают и не мигрируют схему хранилища. Naming, scope и versioning живут внутри агента и описаны в [Артефактах](artifacts.md).
+Dedicated artifact backends/config удаляются после migration входящих файлов. Transport results и snapshots сохраняются по [Файлам и transport artifacts](artifacts.md).
 
 ### Telemetry
 
@@ -247,7 +256,7 @@ Deployment MUST выбрать один из двух capability-профиле�
 
 Имя built-in tool в `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, записанное точками, MUST продолжать называть тот же tool: канонические имена лишились точек, а развёртывания написаны против прежнего написания, и молчаливая потеря capability здесь хуже, чем принятие обоих написаний. Неизвестное имя MUST отклонять startup с перечислением непонятых значений.
 
-`without_terminal` означает отсутствие model-visible terminal capability, а не OS security sandbox: Python-код всё ещё может использовать стандартные `os`, `subprocess` и filesystem APIs внутри доверенной single-container среды. Shell, stdio MCP и skill scripts не предоставляются как самостоятельные tools в этом профиле. `core_python_exec` управляется только built-in allowlist.
+`without_terminal` означает отсутствие model-visible terminal capability, а не OS security sandbox: Python-код всё ещё может использовать стандартные `os`, `subprocess` и filesystem APIs внутри обязательной Bubblewrap/egress границы своего чата. Shell, stdio MCP и skill scripts не предоставляются как самостоятельные tools в этом профиле. `core_python_exec` управляется только built-in allowlist.
 
 ## Tool filters
 
@@ -256,7 +265,7 @@ Built-in и MCP tools фильтруются после discovery, но до mod
 1. Platform/tenant deny policy;
 2. AgentConfig feature switch;
 3. AgentConfig server/tool allow/deny;
-4. Task-provided MCP/skills;
+4. deployment-declared MCP/skills и текущая owner tool policy;
 5. delegation allowlist для child.
 
 На каждом уровне deny имеет приоритет. Wildcard разрешён только в namespaced форме вроде `core_task_*` или `core_memory_*`; глобальный `*` SHOULD быть запрещён production policy.
@@ -299,7 +308,7 @@ MCP descriptor MAY иметь host-validated role, например `repository`
 
 ## Skills policy
 
-AgentConfig задаёт allowed sources, names, versions, permissions и default deny/allow. Task передаёт желаемые skills, но effective catalog содержит только пересечение Task request и AgentConfig/tenant policy.
+AgentConfig задаёт allowed sources, names, versions, permissions и default deny/allow. MCP и skills принадлежат deployment; RunRequest их не передаёт. Child получает только явно делегированный subset.
 
 Для local filesystem packages `SKILLS_ROOT` задаёт корень каталогов, а
 `CORE_AGENT_ALLOWED_SKILLS` — точный deployment allowlist имён. Пустой allowlist
@@ -319,7 +328,7 @@ Snapshot содержит versions/digests profile prompt, kernel policy packs, 
 
 - Unknown config fields MUST отклоняться.
 - Conflict MUST возвращать path и безопасную причину.
-- Hot reload применяется только к новой Task, кроме security revocation.
+- Infrastructure/model/budget snapshot меняется только для новой Task. Owner tool policy и guardrails exceptions применяются к последующим calls активных Tasks внутри immutable ceiling; они не прерывают уже dispatched call. Новое разрешение не восстанавливает закрытое ожидание и не автоматически одобряет ожидающий HITL.
 - Agent Card генерируется из Effective AgentConfig и не рекламирует disabled capability.
 - Audit/OTel записывают config version/digest без secret values.
 
@@ -358,3 +367,29 @@ Serving entrypoint MUST:
 Требование распространяется на все ошибки старта, включая production-gates `PRODUCTION_DATABASE_REQUIRED`, `PRODUCTION_AUTO_MIGRATE_FORBIDDEN`, `DURABLE_STORAGE_REQUIRED` и `PUSH_ENCRYPTION_KEY_REQUIRED`.
 
 Ошибка конфигурации, обнаруженная после успешного старта, остаётся обычной runtime-ошибкой и не завершает процесс.
+
+## Настройки владельцев
+
+### UI-02. Настройки
+
+В UI владельцы управляют политикой каждого инструмента, исключением инструмента
+из проверки guardrails, доверенными внешними агентами и расписаниями cron.
+Согласованные таймауты ожиданий, интервал опроса внешних задач и лимит вложений
+настраиваются в UI. Уже сохранённые абсолютные сроки ожиданий не сбрасываются
+при изменении настройки. Корень папок чатов задаётся через env;
+подключения к инфраструктуре относятся к конфигурации развёртывания.
+
+
+| Настройка UI | Default | Семантика |
+|---|---|---|
+| Tool policy | HITL для нового tool | `allow`, `require_hitl`, `deny` внутри platform ceiling |
+| Guardrails exception | выключена | Только owner; отдельно для arguments/results конкретного tool |
+| HITL timeout | 24 часа | Абсолютный срок конкретного запроса |
+| Owner-answer timeout | 24 часа | Отдельный срок вопроса владельцу |
+| Guardrails decision timeout | 24 часа | Отдельный срок решения по материалу |
+| Remote operation timeout | 24 часа | Окончательный срок операции, повторный wait не продлевает |
+| Remote polling interval | 5 минут | GetTask без model/tool budget polling |
+| Общий лимит вложений сообщения | 25 000 000 байт | Один предел inbound/outbound UI/A2A; 1 МБ = 1 000 000 байт |
+| Cron timezone | `Europe/Moscow` | Сохранённый IANA identifier на расписание |
+
+Изменение timeout не переписывает уже сохранённые deadlines. `CHAT_WORKSPACE_ROOT` задаётся deployment env и требует постоянный POSIX том; `LOCAL_WORKSPACE_ROOT` остаётся ephemeral. Keycloak, secret storage, model/guardrails model connections и sandbox/egress profile принадлежат trusted deployment. Guardrails модель настраивается отдельно, default использует подключённую модель агента в отдельном контексте без tools.

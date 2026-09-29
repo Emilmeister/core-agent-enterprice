@@ -1,6 +1,6 @@
 # Core Agent Specification
 
-Статус: Draft target specification
+Статус: нормативная target specification; enterprise v1 release candidate, реализация отслеживается отдельно
 
 Назначение: нормативная спецификация целевого продукта и профилей его поставки.
 
@@ -17,7 +17,8 @@ Core Agent превращает пользовательский `prompt` в з�
 - встроенную долговременную память с Markdown, графом, NER и hybrid retrieval;
 - сжатие рабочего контекста при достижении 90% до 10–15%;
 - фоновые задачи и неблокирующие сабагенты;
-- отдельные local PTY/process groups/workspaces main и сабагентов внутри одного managed container;
+- общий owner UI, Keycloak, caller scope, постоянные папки чатов и Bubblewrap/egress в одном Kubernetes Pod;
+- owner HITL, guardrails, cron и durable remote/time ожидания;
 - A2A-интерфейс и OpenTelemetry observability.
 
 ## Как читать спецификацию
@@ -36,14 +37,14 @@ Core Agent превращает пользовательский `prompt` в з�
 10. [Контекст и суммаризация](context.md) — расчёт 90%, compaction до 10–15% и гарантии.
 11. [Skills](skills.md) — формат, registry, выбор и progressive disclosure.
 12. [Инструменты](tools.md) — built-ins и MCP.
-13. [Артефакты](artifacts.md) — именование, scope, версии, integrity и backends файлового хранилища.
+13. [Файлы и transport artifacts](artifacts.md) — папки чатов, вложения, очистка, integrity и миграция прежних blobs.
 14. [Local terminal sessions](execution-environment.md) — отдельные PTY/process groups/workspaces main и сабагентов в одном container.
 15. [Безопасность и надёжность](security-and-reliability.md) — trust boundaries и ошибки.
 16. [Наблюдаемость](observability.md) — OpenTelemetry, события, метрики, трассировка и evals.
 17. [Критерии готовности продукта](acceptance.md) — сквозные свойства целевого ядра.
 18. [Трассируемость реализации](implementation-status.md) — release gate от требования к доказательству.
 19. [Spec-driven процесс](development-process.md) — как менять спецификацию и связывать её с реализацией.
-20. [Профиль поставки v1](releases/v1.md) — первый вертикальный срез целевой спецификации.
+20. [Профиль поставки v1](releases/v1.md) — текущий enterprise release candidate и его непроверенные обязательства.
 
 ## Нормативные слова
 
@@ -60,7 +61,7 @@ Core Agent превращает пользовательский `prompt` в з�
 
 - Каждый запуск принимает ровно одно поле: `prompt`. MCP и skills задаются конфигурацией развёртывания.
 - Модель, credentials, S3/local workspace profiles, terminal policy и лимиты принадлежат platform config и не являются входами запуска.
-- Session identity и control-команды передаются transport-ом вне тела запуска, поэтому не размывают однополевой контракт.
+- Session identity, вложения и control-команды передаются transport-ом вне тела запуска, поэтому не размывают однополевой контракт.
 - Ядро поддерживает stateless runs, долгоживущие sessions, durable recovery и управляемую долговременную память.
 - Инструменты исполняются последовательно, пока runtime не доказал независимость; разрешённый параллелизм остаётся внутренней оптимизацией.
 - Делегирование дочерним агентам является внутренней возможностью и не добавляет полей клиенту.
@@ -70,7 +71,7 @@ Core Agent превращает пользовательский `prompt` в з�
 - AgentConfig может отключить memory, built-in tools, отдельные MCP tools, skills, delegation и другие optional capabilities.
 - Main agent и сабагенты используют общую память только когда parent явно делегировал им `core_memory_*` tools.
 - Сабагент получает явный allowlist рабочих tools и skills; обязательные kernel tools нельзя убрать.
-- Команды main и сабагентов выполняются в разных owned TerminalSessions одного managed container; это lifecycle/workspace separation, а не отдельная OS security boundary.
+- Команды main и сабагентов имеют owned TerminalSessions; доступ к файлам/процессам/сети ограничен обязательным Bubblewrap в одном Kubernetes Pod, проверяемым на целевом кластере.
 - Kernel rules для включённых capabilities имеют приоритет над настраиваемым agent prompt; AgentConfig определяет, какие capabilities вообще существуют.
 - Ядро не раскрывает скрытую chain-of-thought; клиент получает ответы, статусы и краткие основания решений.
 - Полный транскрипт хранится вне активного контекста, поэтому compaction не уничтожает аудит.

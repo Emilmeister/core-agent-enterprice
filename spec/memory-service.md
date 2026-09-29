@@ -25,7 +25,7 @@ Markdown-документ является единственным канони
 
 ## Scope
 
-Каждый memory-документ принадлежит тройке `(app_name, user_id, memory_id)`, где `app_name` — имя агента из AgentConfig, `user_id` — identity текущего run (`anonymous`, если identity отсутствует). Тройка является первичным ключом во всех backends.
+Каждый memory-документ принадлежит тройке `(app_name, user_id, memory_id)`, где `app_name` — имя агента из AgentConfig, `user_id` — стабильная authenticated identity текущего run в trusted tenant; отсутствие identity в enterprise отклоняется. `anonymous` допустим только в explicit development/test legacy profile. Тройка является первичным ключом во всех backends.
 
 Внутри этой тройки документ дополнительно принадлежит namespace, который определяет видимость между сессиями:
 
@@ -36,7 +36,7 @@ Markdown-документ является единственным канони
 
 Namespace MUST выводиться runtime-ом из scope текущего run и MUST NOT приниматься от модели как произвольная строка. Модель выбирает только перечисление `user|session`; путь, `user_id` и `session_id` подставляет runtime. Это исключает чтение чужого namespace подбором аргумента.
 
-Run без `session_id` не может писать и читать `session` scope: такой вызов отклоняется как `TOOL_ARGUMENT_INVALID`. Фоновая задача, запущенная через `core_task_start`, выполняется без run scope, поэтому её память принадлежит `anonymous`; это ограничение, а не дефект, и оно совпадает с поведением artifact tools.
+Run без `session_id` не может писать и читать `session` scope: такой вызов отклоняется как `TOOL_ARGUMENT_INVALID`. Фоновая задача и child наследуют проверенный tenant/caller/chat scope parent-а; отсутствие scope не допускает fallback к общему `anonymous` corpus. Внешние callers разделены также в памяти, summary и retrieval.
 
 Main agent и сабагент имеют общую память только когда delegation contract явно передал memory tools: сабагент наследует ту же тройку scope, поэтому явно делегированный `core_memory_search` видит память родителя. Если parent не делегировал ни одного memory tool, child работает без памяти. Working scratchpad и Core transcript не являются общей памятью.
 
