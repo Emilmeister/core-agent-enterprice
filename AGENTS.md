@@ -112,6 +112,8 @@ criterion должны войти в тот же завершённый change. 
 - `core_agent/` — policy-enforced agent runtime, встроенная память и A2A
   transport.
 - `spec/` — target specification, acceptance и release profiles.
+- `docs/superpowers/specs/` — проектные черновики для согласования; не заменяют
+  нормативный `spec/` и не разрешают менять замороженные spec/tests.
 - `tests/` — frozen acceptance, unit, integration, PostgreSQL, A2A и E2E suite.
 - `.github/workflows/ci.yml` — канонический CI-порядок.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
