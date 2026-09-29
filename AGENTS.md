@@ -114,6 +114,8 @@ criterion должны войти в тот же завершённый change. 
 - `spec/` — target specification, acceptance и release profiles.
 - `docs/superpowers/specs/` — проектные черновики для согласования; не заменяют
   нормативный `spec/` и не разрешают менять замороженные spec/tests.
+- `docs/superpowers/plans/` — планы реализации; не снимают ограничения на
+  замороженные spec/tests и не подтверждают готовность runtime capabilities.
 - `tests/` — frozen acceptance, unit, integration, PostgreSQL, A2A и E2E suite.
 - `.github/workflows/ci.yml` — канонический CI-порядок.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
