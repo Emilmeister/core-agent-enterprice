@@ -58,15 +58,15 @@
 
 ## Enterprise traceability
 
-Каждый ENT-AC соответствует одному сценарию [acceptance](acceptance.md). Все новые контракты остаются pending до обычного CI proof; foundations выше не являются доказательством Keycloak/UI/HITL/sandbox/cron. `missing` ниже означает отсутствие полного production path и его доказательства, а не отсутствие каждого вспомогательного primitive.
+Каждый ENT-AC соответствует одному сценарию [acceptance](acceptance.md). Новый контракт получает `implemented` только после обычного CI proof; foundations выше не являются доказательством UI/HITL/sandbox/cron. `missing` ниже означает отсутствие полного production path и его доказательства, а не отсутствие каждого вспомогательного primitive.
 
 | ID | Требование / normative source | Доказательство | Статус |
 |---|---|---|---|
 | ENT-AC-01 | [Совместный owner UI](product.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-02 | [Owner-only решения](security-and-reliability.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-03 | [Caller isolation](security-and-reliability.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
-| ENT-AC-04 | [Introspection fail closed](security-and-reliability.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
-| ENT-AC-05 | [Стабильная identity](security-and-reliability.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
+| ENT-AC-04 | [Introspection fail closed](security-and-reliability.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | `tests.test_auth` invalid/expired/revoked claims, outage и startup; `tests.test_keycloak_integration` реальный Keycloak в CI | implemented |
+| ENT-AC-05 | [Стабильная identity](security-and-reliability.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | `tests.test_auth` replacement token и прежняя Task на memory/PostgreSQL; `tests.test_keycloak_integration` реальные service-account tokens | implemented |
 | ENT-AC-06 | [Live tool deny](tools.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-07 | [Default HITL](tools.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-08 | [Exact call approval](runtime.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
@@ -129,7 +129,7 @@
 | ENT-AC-64 | [Outbound total limit](artifacts.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-65 | [Indefinite history](context.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-66 | [Stable-caller creation dedup](public-contract.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
-| ENT-AC-67 | [HTTP request auth boundary](security-and-reliability.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
+| ENT-AC-67 | [HTTP request auth boundary](security-and-reliability.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | `tests.test_auth` stream завершается после expiry во время generation, следующий запрос отклонён; memory/PostgreSQL | implemented |
 | ENT-AC-68 | [Orphan upload cleanup](artifacts.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-69 | [Message wakes timer](tasks-and-delegation.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |
 | ENT-AC-70 | [Wait generation/dedup](tasks-and-delegation.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | enterprise CI proof отсутствует | missing |

@@ -1149,6 +1149,7 @@ class CoreAgent:
         identity,
         session_id,
         tenant_id,
+        actor_id=None,
         parent_run_id=None,
         finalization_reserved=False,
         connection=None,
@@ -1220,7 +1221,7 @@ class CoreAgent:
             request.to_dict(),
             snapshot,
         )
-        audit = (("task.admitted", {}),)
+        audit = (("task.admitted", {"actor_id": actor_id} if actor_id else {}),)
         record = self.workflow_store.create(
             record,
             audit=audit,
@@ -4237,6 +4238,7 @@ class CoreAgent:
         identity=None,
         session_id=None,
         tenant_id=None,
+        actor_id=None,
         parent_run_id=None,
         finalization_reserved=False,
         cancel_event=None,
@@ -4294,6 +4296,7 @@ class CoreAgent:
                 session_id=session_id,
                 tenant_id=tenant_id,
                 parent_run_id=parent_run_id,
+                actor_id=actor_id,
                 finalization_reserved=finalization_reserved,
                 cancel_event=startup_cancel,
                 defer_initialization=True,
@@ -4325,6 +4328,7 @@ class CoreAgent:
         identity=None,
         session_id=None,
         tenant_id=None,
+        actor_id=None,
     ):
         if isinstance(request, dict):
             request = RunRequest.from_dict(request)
@@ -4343,7 +4347,10 @@ class CoreAgent:
             message_id=message_id,
             context_id=context_id,
             content=request.prompt,
-            provenance={"owner_id": owner_id, "tenant_id": tenant_id},
+            provenance={
+                "owner_id": owner_id, "tenant_id": tenant_id,
+                **({"actor_id": actor_id} if actor_id else {}),
+            },
         )
         self._log(
             "input.accepted" if accepted else "input.duplicate",

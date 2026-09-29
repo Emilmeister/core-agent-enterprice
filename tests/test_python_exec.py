@@ -57,6 +57,7 @@ class InterpreterChoiceTests(unittest.TestCase):
 class PythonExecTests(unittest.TestCase):
     def _environment(self, workspace, **extra):
         return {
+            "CORE_AGENT_ENVIRONMENT": "development",
             "SESSION_STORAGE_TYPE": "in-memory",
             "CORE_AGENT_RUNTIME_MODE": "without_terminal",
             "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": ("core_python_exec,core_task_list"),

@@ -134,6 +134,7 @@ Package entrypoints из `pyproject.toml`:
 | Файл | Ответственность |
 |---|---|
 | `core_agent/app.py` | Composition root: environment config, stores, tool registry, kernel, A2A app, health и Uvicorn |
+| `core_agent/auth.py` | Keycloak introspection, immutable authenticated scope, owner/external access и SDK context builder |
 | `core_agent/runtime.py` | Agent loop, workflow continuation, recovery, tool handlers и delegation |
 | `core_agent/config.py` | RunRequest, Platform/Agent/EffectiveConfig и capability intersection |
 | `core_agent/a2a.py` | Внутренние A2A contract types и Task representation |
@@ -192,6 +193,19 @@ Target spec может описывать больше текущего runtime.
 
 ### Публичный контракт и инструкции
 
+- `CORE_AGENT_ENVIRONMENT` обязателен и принимает только `production`,
+  `development`, `test`. Production требует полный набор `KEYCLOAK_*` и
+  `CORE_AGENT_TENANT_ID`; legacy A2A без auth разрешён только при явно выбранном
+  development/test и полностью отсутствующей auth-конфигурации.
+- Настроенный Keycloak открывает `/a2a/owner/`, `/a2a/external/` и owner-only
+  `/api/identity`; старые корневые A2A routes закрыты. Probes остаются публичными.
+  Introspection выполняется один раз на HTTP request без кэша; уже открытый
+  ответ не проверяется заново. Incoming credentials не передаются remote agents.
+- Company scope задаётся deployment config и не меняется SDK tenant metadata.
+  Владельцы используют общий scope, внешний caller — стабильный issuer/sub.
+  External role исключает owner authority. Owner-wide доступ к задаче сохраняет
+  её исходного owner; actor identity отдельно записывается в admission audit и
+  follow-up provenance. Cancel проверяет scoped Task до active SDK registry.
 - Run input содержит ровно `prompt`; MCP-серверы и skills задаются
   конфигурацией развёртывания и не добавляются в RunRequest.
 - Tenant, identity, auth, trace context, model route, policy и budgets приходят
@@ -605,6 +619,10 @@ docker compose logs -f agent
 - Persistence, HITL, race или recovery: PostgreSQL suite с `TEST_DATABASE_URL`;
   отсутствие DB и skipped tests явно сообщить.
 - A2A change: protocol/config tests и соответствующий HTTP E2E.
+- Auth change: `tests.test_auth` на in-memory и PostgreSQL, а также
+  `tests.test_keycloak_integration` с настоящим локальным Keycloak. Последний
+  требует `TEST_KEYCLOAK_URL`, `TEST_KEYCLOAK_ADMIN` и
+  `TEST_KEYCLOAK_ADMIN_PASSWORD`, создаёт и удаляет только свой временный realm.
 - Memory change: `tests.test_memory_service` и PostgreSQL suite с
   `TEST_DATABASE_URL`, так как backend памяти является database concern.
 - Docker/Compose/startup/permissions: повторить релевантные image/Compose smoke

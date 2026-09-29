@@ -27,6 +27,9 @@ jobs:
     env:
       DATABASE_MIGRATION_URL: postgresql://postgres:test@127.0.0.1:5432/core_agent
       TEST_DATABASE_URL: postgresql://postgres:test@127.0.0.1:5432/core_agent
+      TEST_KEYCLOAK_URL: http://127.0.0.1:8080
+      TEST_KEYCLOAK_ADMIN: enterprise-admin
+      TEST_KEYCLOAK_ADMIN_PASSWORD: enterprise-test
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -39,7 +42,19 @@ jobs:
       - run: uv sync --frozen
       - run: uv run core-agent-db migrate
       - run: uv run ruff check core_agent tests
+      - name: Start isolated Keycloak for authentication integration
+        run: |
+          docker run -d --name core-agent-keycloak-test -p 127.0.0.1:8080:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME="$TEST_KEYCLOAK_ADMIN" \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD="$TEST_KEYCLOAK_ADMIN_PASSWORD" \
+            quay.io/keycloak/keycloak:26.1.4@sha256:044a457e04987e1fff756be3d2fa325a4ef420fa356b7034ecc9f1b693c32761 start-dev
+          curl --fail --silent --show-error --retry 30 --retry-delay 2 \
+            --retry-connrefused --retry-max-time 90 --max-time 5 \
+            "$TEST_KEYCLOAK_URL/realms/master/.well-known/openid-configuration" >/dev/null
       - run: uv run python -m unittest discover -s tests -v
+      - name: Remove isolated Keycloak
+        if: always()
+        run: docker rm -f core-agent-keycloak-test
       - run: uv build --no-sources
       - run: docker build -t core-agent:ci .
       - run: test "$(docker image inspect core-agent:ci --format '{{.Config.User}}')" = agent

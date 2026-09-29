@@ -32,6 +32,7 @@ from core_agent.streaming import StreamBuffer, integrate_stream_chunk
 BASE_ENVIRONMENT = {
     # patch.dict(clear=True) drops the ambient no_proxy, and urllib would then
     # send the loopback stub calls through the host's system proxy.
+    "CORE_AGENT_ENVIRONMENT": "development",
     "NO_PROXY": "*",
     "no_proxy": "*",
     "SESSION_STORAGE_TYPE": "in-memory",
@@ -448,6 +449,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             os.environ,
             {
                 **BASE_ENVIRONMENT,
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "LOCAL_WORKSPACE_ROOT": str(Path(self.temp.name) / "workspaces"),
                 "A2A_STREAMING_BUFFER_SIZE": "4",
                 **environment,

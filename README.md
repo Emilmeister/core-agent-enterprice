@@ -271,6 +271,7 @@ Phoenix. Запись содержимого в промышленном реж�
 ```bash
 uv sync --frozen
 
+CORE_AGENT_ENVIRONMENT=development \
 LLM_API_FORMAT=openai \
 LLM_API_BASE=http://localhost:11434/v1 \
 LLM_MODEL=model-name \
@@ -285,11 +286,57 @@ Anthropic используйте `LLM_API_FORMAT=anthropic` и соответс�
 запуске переменные должны быть переданы в окружение процесса. По умолчанию
 состояние в режиме разработки хранится в памяти процесса.
 
-После запуска:
+После запуска без настроенного Keycloak (только development/test):
 
 - карточка агента: <http://localhost:8000/.well-known/agent-card.json>;
 - проверка работоспособности: <http://localhost:8000/health/live>;
 - проверка готовности: <http://localhost:8000/health/ready>.
+
+### Авторизация Keycloak
+
+`CORE_AGENT_ENVIRONMENT` задаётся явно: `production`, `development` или `test`.
+В production обязательны все пять переменных: `KEYCLOAK_ISSUER_URL`,
+`KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`, `KEYCLOAK_AUDIENCE` и
+`CORE_AGENT_TENANT_ID`. Частичная конфигурация отклоняется при старте в любом
+режиме. Issuer — HTTPS URL realm; HTTP разрешён только для loopback в
+development/test. Секрет принадлежит confidential client для introspection.
+
+Настроенный Keycloak включает отдельные входы:
+
+| Вход | Доступ |
+| --- | --- |
+| `/a2a/owner/` | Владельцы с ролью `agent-owner` |
+| `/a2a/external/` | Внешние service accounts с ролью `agent-external` |
+| `/api/identity` | Проверенная identity владельца |
+| `/health/live`, `/health/ready` | Kubernetes probes без токена |
+
+Карточка агента находится под соответствующим A2A входом, например
+`/a2a/external/.well-known/agent-card.json`. Старые корневые A2A маршруты при
+настроенной авторизации закрыты. Для вызовов передавайте
+`Authorization: Bearer <access_token>` и `A2A-Version: 1.0`.
+
+В Keycloak назначьте владельцам owner role, а отдельной сервисной учётной записи
+каждого внешнего агента — external role. Имена ролей можно изменить через
+`KEYCLOAK_OWNER_ROLE` и `KEYCLOAK_EXTERNAL_ROLE`. Наличие external role исключает
+права владельца даже при одновременном назначении обеих ролей. Настройте audience
+mapper на `KEYCLOAK_AUDIENCE`; роли должны присутствовать в introspection как
+realm roles либо client roles этого audience. Компания берётся только из
+`CORE_AGENT_TENANT_ID`, внешний scope — из issuer и subject, поэтому смена токена
+не теряет доступ к своим задачам. Владельцы видят общие задачи компании; внешний
+агент не может читать, подписываться или отменять чужую задачу.
+
+Каждый HTTP-запрос проходит introspection; открытый поток повторно не проверяется.
+Недоступность Keycloak закрывает допуск. Выпуск, срок и отзыв credentials полностью
+управляются Keycloak. Для access token сервисной учётной записи сроком месяц–год
+согласуйте Access Token Lifespan с ограничивающими его SSO/Client Session Max:
+проверка с Keycloak 26.1.4 выдаёт годовой токен после настройки обоих лимитов.
+Это проверка выданного срока, а не годовое испытание. Пример настройки и отзыва
+в изолированном realm: `tests/test_keycloak_integration.py`.
+См. [руководство Keycloak](https://www.keycloak.org/docs/latest/server_admin/).
+
+UI и решения HITL реализуются следующими этапами; эти endpoints пока обеспечивают
+только авторизацию и A2A доступ. Последующие примеры корневого маршрута относятся
+к локальному development без Keycloak.
 
 Минимальный вызов через JSON-RPC 1.0:
 

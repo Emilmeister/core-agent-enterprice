@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import quote, urlparse
 
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 
 from .a2a import (
     AgentCard,
@@ -27,6 +27,7 @@ from .a2a_sdk import build_starlette_app
 from .artifact_service import validate_segment, create_artifact_service
 from .artifacts import InMemoryArtifactStore, PostgresArtifactStore
 from .audit import InMemoryAuditLog
+from .auth import AuthContextBuilder, AuthenticationMiddleware, AuthSettings, KeycloakAuthenticator
 from .config import MAX_SUBAGENT_DEPTH, AgentConfig, PlatformConfig
 from .durability import CheckpointStore, InMemoryEventStore
 from .database import (
@@ -1515,9 +1516,16 @@ def create_app(
     base_url=None,
     database=None,
     push_client=None,
+    auth_transport=None,
 ):
     _configure_logging()
-    environment = _env("CORE_AGENT_ENVIRONMENT", "development")
+    environment = _env("CORE_AGENT_ENVIRONMENT", "")
+    if environment not in {"production", "development", "test"}:
+        raise CoreError("CONFIG_INVALID", "Explicit CORE_AGENT_ENVIRONMENT=production|development|test is required")
+    auth_settings = AuthSettings.from_environment(
+        _env, production=environment == "production",
+        allow_legacy=environment in {"development", "test"},
+    )
     model = model or _model()
     push_key = _env("PUSH_NOTIFICATION_ENCRYPTION_KEY", "")
     state = _state(database)
@@ -1691,6 +1699,7 @@ def create_app(
 
     def handle(request, context, stream=None):
         user = context.call_context.user
+        actor = context.call_context.state.get("principal")
         identity = user.user_name if user.is_authenticated else default_user
         request = store_attachments(request, identity, context.context_id)
         agent.attach_stream(context.task_id, stream, _caller_headers(context))
@@ -1703,6 +1712,7 @@ def create_app(
                     identity=identity,
                     session_id=context.context_id,
                     tenant_id=context.tenant or "default",
+                    actor_id=actor.actor_id if actor else None,
                 ),
                 request=request,
             )
@@ -1713,6 +1723,7 @@ def create_app(
     def followup(message, task, call_context):
         request = parse_run_request(message)
         user = call_context.user
+        actor = call_context.state.get("principal")
         identity = user.user_name if user.is_authenticated else default_user
         request = store_attachments(request, identity, task.context_id)
         deadline = time.monotonic() + 2
@@ -1725,6 +1736,7 @@ def create_app(
                     identity=identity,
                     session_id=task.context_id,
                     tenant_id=call_context.tenant or "default",
+                    actor_id=actor.actor_id if actor else None,
                 )
             except CoreError as error:
                 if error.code != "TASK_NOT_FOUND" or time.monotonic() >= deadline:
@@ -1796,6 +1808,7 @@ def create_app(
         task_store=state["tasks"],
         resume_handler=resume,
         followup_handler=followup,
+        context_builder=AuthContextBuilder() if auth_settings else None,
         push_config_store=push_config_store,
         push_sender=push_sender,
         shutdown_handler=close,
@@ -1804,6 +1817,27 @@ def create_app(
         streaming_enabled=_boolean("A2A_STREAMING_ENABLED", "true")
         and "streaming" in advertised,
     )
+
+    if auth_settings:
+        authenticator = KeycloakAuthenticator(auth_settings, transport=auth_transport)
+        # Both entrances share the handler, stores, queues and application lifespan.
+        # The SDK's caller-selected /{tenant} alias is not part of this deployment.
+        routes = [route for route in app.routes if getattr(route, "path", None) != "/{tenant}"]
+
+        async def identity(request):
+            actor = request.scope["principal"]
+            return JSONResponse(
+                {"actor_id": actor.actor_id, "role": "owner", "tenant": actor.tenant},
+                headers={"Cache-Control": "no-store"},
+            )
+
+        app.routes[:] = [
+            Mount("/a2a/owner", routes=routes),
+            Mount("/a2a/external", routes=routes),
+            Route("/api/identity", identity),
+        ]
+        app.add_middleware(AuthenticationMiddleware, authenticator=authenticator)
+        app.state.authenticator = authenticator
 
     async def live(_request):
         return JSONResponse({"status": "ok"})

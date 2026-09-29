@@ -34,6 +34,7 @@ MEMORY_TOOLS = (
 NAMESPACE = "subject/user-42"
 
 BASE_ENVIRONMENT = {
+    "CORE_AGENT_ENVIRONMENT": "development",
     "NO_PROXY": "*",
     "no_proxy": "*",
     "SESSION_STORAGE_TYPE": "in-memory",

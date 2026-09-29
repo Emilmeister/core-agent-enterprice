@@ -19,6 +19,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from .audit import AuditRecord
+from .auth import ScopeUser, is_company_owner
 from .durability import Event
 from .errors import CoreError
 
@@ -823,6 +824,15 @@ class PostgresTaskStore(TaskStore):
         if task.HasField("status") and task.status.HasField("timestamp"):
             timestamp = task.status.timestamp.ToMilliseconds() / 1000
         with self.database.transaction() as connection:
+            if is_company_owner(context):
+                existing = connection.execute(
+                    "SELECT owner FROM core_a2a_tasks WHERE task_id = %s AND tenant = %s FOR UPDATE",
+                    (task.id, tenant),
+                ).fetchall()
+                if len(existing) > 1:
+                    raise InvalidParamsError("Task not found")
+                if existing:
+                    owner = existing[0]["owner"]
             connection.execute(
                 """INSERT INTO core_a2a_tasks
                    (task_id, owner, tenant, context_id, state, status_timestamp, payload)
@@ -852,16 +862,19 @@ class PostgresTaskStore(TaskStore):
     def _get(self, task_id, context):
         owner, tenant = self._scope(context)
         with self.database.pool.connection() as connection:
-            row = connection.execute(
-                "SELECT payload FROM core_a2a_tasks WHERE task_id = %s AND owner = %s AND tenant = %s",
-                (task_id, owner, tenant),
-            ).fetchone()
+            rows = connection.execute(
+                "SELECT owner, payload FROM core_a2a_tasks WHERE task_id = %s AND (owner = %s OR %s) AND tenant = %s",
+                (task_id, owner, is_company_owner(context), tenant),
+            ).fetchall()
+        row = rows[0] if len(rows) == 1 else None
+        if row and is_company_owner(context):
+            context.user = ScopeUser(row["owner"])
         return a2a_pb2.Task.FromString(bytes(row["payload"])) if row else None
 
     def _list(self, params, context):
         owner, tenant = self._scope(context)
-        sql = "SELECT payload FROM core_a2a_tasks WHERE owner = %s AND tenant = %s"
-        values = [owner, tenant]
+        sql = "SELECT payload FROM core_a2a_tasks WHERE (owner = %s OR %s) AND tenant = %s"
+        values = [owner, is_company_owner(context), tenant]
         if params.context_id:
             sql += " AND context_id = %s"
             values.append(params.context_id)
@@ -901,8 +914,8 @@ class PostgresTaskStore(TaskStore):
         owner, tenant = self._scope(context)
         with self.database.transaction() as connection:
             connection.execute(
-                "DELETE FROM core_a2a_tasks WHERE task_id = %s AND owner = %s AND tenant = %s",
-                (task_id, owner, tenant),
+                "DELETE FROM core_a2a_tasks WHERE task_id = %s AND (owner = %s OR %s) AND tenant = %s",
+                (task_id, owner, is_company_owner(context), tenant),
             )
 
     async def save(self, task, context):

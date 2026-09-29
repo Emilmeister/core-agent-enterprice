@@ -51,6 +51,7 @@ from .a2a import (
     Part,
     parse_run_request,
 )
+from .auth import OWNER_SCOPE, ScopeUser, is_company_owner
 from .streaming import (
     ADK_THOUGHT_KEY,
     ADK_TYPE_KEY,
@@ -75,6 +76,62 @@ A2A_TERMINAL_STATES = {
 def resolve_owner_scope(context):
     name = context.user.user_name
     return name if context.user.is_authenticated and name else "anonymous"
+
+
+class ScopedMemoryTaskStore(InMemoryTaskStore):
+    """Development adapter: owner access with the same company boundary as SQL."""
+
+    def __init__(self):
+        super().__init__(owner_resolver=lambda context: json.dumps([
+            context.tenant, resolve_owner_scope(context),
+        ]))
+        self._owners = {}
+        self._access_lock = asyncio.Lock()
+
+    @staticmethod
+    def _as_owner(context, owner):
+        return context.model_copy(update={"user": ScopeUser(owner)})
+
+    async def save(self, task, context):
+        async with self._access_lock:
+            key = (context.tenant, task.id)
+            caller = resolve_owner_scope(context)
+            owner = self._owners.get(key, caller)
+            if owner != caller and not is_company_owner(context):
+                raise InvalidParamsError("Task not found")
+            self._owners[key] = owner
+            await super().save(task, self._as_owner(context, owner))
+            if owner != OWNER_SCOPE:
+                await super().save(task, self._as_owner(context, OWNER_SCOPE))
+
+    async def get(self, task_id, context):
+        async with self._access_lock:
+            owner = self._owners.get((context.tenant, task_id))
+            if owner is None:
+                return None
+            if is_company_owner(context):
+                # Follow-up/cancel keep the task's original execution identity.
+                context.user = ScopeUser(owner)
+            elif owner != resolve_owner_scope(context):
+                return None
+            return await super().get(task_id, context)
+
+    async def list(self, params, context):
+        async with self._access_lock:
+            if is_company_owner(context):
+                context = self._as_owner(context, OWNER_SCOPE)
+            return await super().list(params, context)
+
+    async def delete(self, task_id, context):
+        async with self._access_lock:
+            key = (context.tenant, task_id)
+            owner = self._owners.get(key)
+            if owner is None or (owner != resolve_owner_scope(context) and not is_company_owner(context)):
+                return
+            await super().delete(task_id, self._as_owner(context, owner))
+            if owner != OWNER_SCOPE:
+                await super().delete(task_id, self._as_owner(context, OWNER_SCOPE))
+            del self._owners[key]
 
 
 def to_sdk_agent_card(card, *, base_url):
@@ -221,11 +278,17 @@ def _agent_card_routes(sdk_card, *, derive_base_url):
     async def endpoint(request):
         card = sdk_card
         base_url = public_base_url(request) if derive_base_url else None
-        if base_url:
+        prefix = request.scope.get("root_path", "")
+        authenticated = "principal" in request.scope
+        if base_url or prefix or authenticated:
             card = SdkAgentCard()
             card.CopyFrom(sdk_card)
             for interface in card.supported_interfaces:
-                interface.url = base_url
+                interface.url = (base_url or interface.url).rstrip("/") + prefix
+            if authenticated:
+                scheme = card.security_schemes["keycloak"]
+                scheme.http_auth_security_scheme.scheme = "bearer"
+                card.security_requirements.add().schemes["keycloak"].SetInParent()
         return JSONResponse(json_format.MessageToDict(card))
 
     return [
@@ -669,6 +732,11 @@ class CoreRequestHandler(DefaultRequestHandler):
             yield event
 
     async def on_cancel_task(self, params, context):
+        # The SDK registry can return an active cached task without consulting
+        # its scoped store. Authorize before any cancellation or cached response.
+        task = await self.task_store.get(params.id, context)
+        if task is None:
+            raise TaskNotFoundError(message="Task not found")
         return await super().on_cancel_task(params, context)
 
     @validate_request_params
@@ -767,7 +835,7 @@ def build_starlette_app(
             max_chunk_size=max_chunk_size,
         ),
         TransientStatusTaskStore(
-            task_store or InMemoryTaskStore(owner_resolver=resolve_owner_scope)
+            task_store or ScopedMemoryTaskStore()
         ),
         sdk_card,
         push_config_store=push_config_store,

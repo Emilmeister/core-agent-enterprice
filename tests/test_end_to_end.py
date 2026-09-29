@@ -396,6 +396,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         cls.environment = patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "LOCAL_WORKSPACE_ROOT": str(root / "workspaces"),
                 "RUNTIME_MAX_LLM_CALLS": "10",
                 "CORE_AGENT_MAX_TOOL_CALLS": "10",

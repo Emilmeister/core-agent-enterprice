@@ -48,6 +48,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
             },
             clear=True,
@@ -72,6 +73,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_task_list",
             },
@@ -92,6 +94,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_artifact_get",
             },
@@ -107,6 +110,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
             },
             clear=True,
@@ -208,6 +212,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": "without_terminal",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
@@ -244,6 +249,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": "maybe",
             },
@@ -259,6 +265,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": runtime_mode,
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_python_exec",
@@ -1609,6 +1616,7 @@ class PostgresRestartTests(unittest.TestCase):
             with patch.dict(
                 os.environ,
                 {
+                    "CORE_AGENT_ENVIRONMENT": "development",
                     "SESSION_STORAGE_TYPE": "postgres",
                     "DATABASE_AUTO_MIGRATE": "false",
                     "CORE_AGENT_MEMORY": "disabled",
@@ -1663,6 +1671,7 @@ class PostgresRestartTests(unittest.TestCase):
             with patch.dict(
                 os.environ,
                 {
+                    "CORE_AGENT_ENVIRONMENT": "development",
                     "SESSION_STORAGE_TYPE": "postgres",
                     "DATABASE_AUTO_MIGRATE": "false",
                     "CORE_AGENT_MEMORY": "disabled",
