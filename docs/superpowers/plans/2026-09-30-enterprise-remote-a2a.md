@@ -266,3 +266,64 @@ implementation change может стать registry storage/API, но synchrono
 send не объявляется готовым и не должен выдавать новое неблокирующее поведение
 до подключения operation state/recovery. Требования исходного enterprise плана
 сохраняются полностью.
+
+## Файловый срез: уточнение по подключённому коду 1 октября 2026
+
+Это порядок следующей реализации, а не заявление о готовности remote files.
+Нормативные изменения в `spec/` и frozen lock входят в тот же разрешённый срез.
+
+- [ ] В `spec/tasks-and-delegation.md`, `spec/artifacts.md`, public contract и
+  acceptance закрепить optional `files` с относительными paths, pinned batch
+  ceiling, versioned job compatibility и импорт полного terminal результата.
+  Модель явно выбирает список для каждого `core_agent_send_message`; отсутствие
+  `files` или `[]` означает отправку без файлов. Содержимое workspace, недавно
+  созданные файлы и выбор `core_response_files` автоматически не добавляются.
+  `input-required`/`auth-required` сохраняют working и те же remote IDs;
+  промежуточные файлы не публикуются. Failed/cancelled/expired операции не
+  публикуют refs. Progressive import не добавляется без отдельного контракта.
+- [ ] В `runtime.py:_pin_remote_call` подготовить полный outbound snapshot до
+  HITL, используя `ResponseFileService.prepare`. Не менять final selection
+  `core_response_files`. Закрепить ordered public receipts и selection digest
+  в approval subject; private refs остаются в persisted remote contract.
+- [ ] В `tasks.py`, `postgres_tasks.py`, `remote_operations.py` добавить job v2:
+  существующие peer/message/settings, trusted `caller_scope` с owner/context/
+  public task/run, `attachment_limit_bytes`, frozen `outgoing_files`.
+  Scheduler `owner_id` остаётся owning run ID. v1 читается по прежнему text-only
+  протоколу, без реконструкции refs. До `send_started` загрузить и проверить
+  весь outbound набор; неизвестный исход Send не повторять.
+- [ ] В `remote_agents.py` общий `_task_request` обеих bindings передаёт text
+  и standard raw Parts с pinned Message ID. Finite encoded ceiling должен
+  вмещать 25 000 000 decoded bytes с base64/JSON (нынешние 16 MiB недостаточны).
+  Перед protobuf проверять полный bounded body, UTF-8/JSON, duplicate keys,
+  depth и canonical base64; до relay проверять decoded aggregate. Terminal
+  Task собирает весь ordered Artifact file set даже при status Message с text.
+- [ ] В `remote_operations.py`, scheduler stores и `chat_files.py` атомарно
+  фиксировать fenced terminal result и accepted quarantine batch, используя
+  одну PostgreSQL connection. Late cancel/deadline/lost claim не принимают
+  batch; собственный проигравший stage очищается после выхода из transaction.
+  Remote IDs являются provenance, не authority для локального binding.
+- [ ] Сохранить FK на canonical public A2A Task и core_run. Root send использует
+  существующий bind. Delegated child не имеет публичной A2A admission row:
+  проверить canonical root/child ancestry для batch binding, сохранив child
+  continuation/lease и root liveness. Не создавать shadow Tasks и не ослаблять FK.
+- [ ] В `runtime.py:_guard_file_batch` поддержать существующие tool-result/
+  Python nested continuation и authorized batch binding. До model/catalog/
+  history receipt проверить весь remote text/file batch и пройти существующий
+  publication barrier. `_task_snapshot` исключает private batch refs. Owner
+  sealed review/download проверяет ту же root/child ancestry. Отказ/timeout
+  исключает материал и продолжает задачу без него; quarantine переживает restart.
+- [ ] Регрессии: zero Send при ошибке всего набора, frozen bytes до/после HITL,
+  обе bindings и empty file, malformed/oversized последний Part без partial
+  relay, v1 recovery, foreign human wait и same-ID final, pool1 atomic bind,
+  child isolation, guard allow/reject/timeout/restart, identical-byte foreign
+  scope, cancel/deadline race и отсутствие post-failure refs. Использовать
+  existing HTTP server fixtures и реальный PostgreSQL для network proof.
+
+Порядок владения: root — `runtime.py`, `app.py`, owner review integration и
+norm/lock; transport — `remote_agents.py`/bounded decoder; scheduler —
+`tasks.py`, `postgres_tasks.py`, `remote_operations.py`; files — `chat_files.py`
+и shared manifest helpers. Два разработчика не меняют один файл одновременно.
+Проверки каждого среза используют существующий `unittest` engine; итоговый
+`uv run python -m unittest discover -s tests -v` запускается с PostgreSQL и
+Keycloak. Файловая возможность не объявляется поддержанной до прохождения
+полного admission/guard/publication flow.
