@@ -964,7 +964,7 @@ run получает отдельные MCP session и negotiated version; пе�
 - Сохранять unrelated user changes; не выполнять destructive Git commands.
 - При использовании development subagents давать им узкую независимую задачу.
   Избегать overlapping writes: один владелец файла, main интегрирует и проверяет.
-- Не коммитить `.env`, credentials, tokens, generated state, `.idea/` и другие
+- Не коммитить `.env`, `kubeconfig`, credentials, tokens, generated state, `.idea/` и другие
   локальные IDE-файлы.
 
 ## Канонические команды

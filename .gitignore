@@ -1,4 +1,5 @@
 .venv/
+.enterprise-work/
 .cache/
 .local-evidence/
 dist/
@@ -8,3 +9,4 @@ __pycache__/
 .env
 .env.*
 !.env.example
+/kubeconfig

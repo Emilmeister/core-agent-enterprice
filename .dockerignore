@@ -4,6 +4,7 @@
 .local-evidence
 .env
 .env.*
+kubeconfig
 __pycache__
 *.py[cod]
 dist
