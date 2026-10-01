@@ -92,6 +92,40 @@ jobs:
           kubectl --kubeconfig "$KUBECONFIG" wait pod/core-agent-sandbox-tests \
             --for=jsonpath='{.status.phase}'=Succeeded --timeout=800s
           kubectl --kubeconfig "$KUBECONFIG" logs core-agent-sandbox-tests
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: matrix.arch == 'amd64'
+        with:
+          node-version: "24"
+      - name: Start isolated browser integration services
+        if: matrix.arch == 'amd64'
+        run: |
+          command -v google-chrome
+          uv sync --frozen
+          docker run -d --name core-owner-browser-postgres --network kind \
+            -p 127.0.0.1:49738:5432 -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=test \
+            pgvector/pgvector:pg17@sha256:7ae6051efd0e60444282c27c7e141af07f322ce033300e727a49c3dd11075e38
+          docker run -d --name core-owner-browser-keycloak --network kind \
+            -p 127.0.0.1:49737:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=enterprise-admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=enterprise-test \
+            quay.io/keycloak/keycloak:26.1.4@sha256:044a457e04987e1fff756be3d2fa325a4ef420fa356b7034ecc9f1b693c32761 start-dev
+          curl --fail --silent --show-error --retry 30 --retry-delay 2 \
+            --retry-connrefused --retry-max-time 90 --max-time 5 \
+            http://127.0.0.1:49737/realms/master/.well-known/openid-configuration >/dev/null
+          docker exec core-owner-browser-postgres pg_isready -U postgres
+      - name: Verify actual owner browser file flow
+        if: matrix.arch == 'amd64'
+        env:
+          CORE_AGENT_REQUIRE_BROWSER_TESTS: "1"
+          OWNER_UI_BROWSER_IMAGE: core-agent:sandbox
+          OWNER_UI_BROWSER_PG_ADMIN_URL: postgresql://postgres:test@127.0.0.1:49738/postgres
+          TEST_KEYCLOAK_URL: http://127.0.0.1:49737
+          TEST_KEYCLOAK_ADMIN: enterprise-admin
+          TEST_KEYCLOAK_ADMIN_PASSWORD: enterprise-test
+        run: |
+          export OWNER_UI_BROWSER_CHROMIUM=$(command -v google-chrome)
+          export BROWSER_KEYCLOAK_TARGET="$(docker inspect core-owner-browser-keycloak --format '{{.NetworkSettings.Networks.kind.IPAddress}}'):8080"
+          export BROWSER_POSTGRES_TARGET="$(docker inspect core-owner-browser-postgres --format '{{.NetworkSettings.Networks.kind.IPAddress}}'):5432"
+          uv run python -m unittest tests.test_owner_ui_files_browser -v
       - name: Collect diagnostics and remove only the disposable cluster
         if: always()
         run: |
@@ -101,6 +135,7 @@ jobs:
           fi
           docker logs core-sandbox-network-fixture || true
           docker rm -f core-sandbox-network-fixture || true
+          docker rm -f core-owner-browser-postgres core-owner-browser-keycloak || true
           if command -v kind >/dev/null; then
             kind delete cluster --name "$SANDBOX_CLUSTER" --kubeconfig "$KUBECONFIG"
           fi

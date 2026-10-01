@@ -183,18 +183,18 @@ docker build -t core-agent:local .
 Подключены owner UI/history, политики/HITL/вопросы/guardrails, durable waits,
 text-only remote A2A, cron, workspace preview/download и ручная очистка.
 Private file batches и атомарный внутренний admission проверены отдельно;
-публичный binary intake пока закрыт. PostgreSQL Task записывается до file bind
+публичный raw FilePart intake и owner UI composer подключены. PostgreSQL Task записывается до file bind
 в одной транзакции; исходные имена и metadata сохраняются без потери bytes.
 
 Свежая проверка 1 октября 2026 года на schema22 с настоящими PostgreSQL и
-Keycloak: `uv run python -m unittest discover -s tests -v` — 1351 tests,
+Keycloak: `uv run python -m unittest discover -s tests -v` — 1376 tests,
 exit0, два skips. Ruff, spec quality/lock и diff-check также проходят.
 UI typecheck и production build проходят; Vite assets включены в wheel/sdist
 и проверенный ARM64 Docker image, который работает от `agent` без Node/npm.
 Исправлены ошибки восстановленного sandbox resource, legacy Task projection,
 file admission FK/JSONB и гонки synthetic PostgreSQL test fixtures.
 
-Полный release gate остаётся открытым: приём/отправка файлов через UI/A2A,
+Полный release gate остаётся открытым: отправка результирующих файлов через UI/A2A,
 миграция старых файлов и удаление named artifact service ещё не завершены.
 На native ARM64 Linux в отдельном disposable kind-кластере полный обязательный
 sandbox gate прошёл: 12 tests, 104.268 секунды, exit0, без skips. Реальный Pod
@@ -202,9 +202,16 @@ sandbox gate прошёл: 12 tests, 104.268 секунды, exit0, без skips
 разделение workspaces и контролируемую IPv4/IPv6 сеть. Node readback подтвердил
 aggregate Pod pids.max512. Исправлены lookup nft, user namespace helper,
 IPv6 readiness и потерянные libseccomp TTY deny rules; последняя проверка
-использует совместно два sealed filters. Native AMD64, целевой deployment/CSI
-и сквозная проверка browser+Keycloak+backend ещё не подтверждены; macOS unit
-suite их не заменяет.
+использует совместно два sealed filters. Сквозная проверка actual Chromium +
+Keycloak + PostgreSQL + application Pod прошла на native ARM64: files-only
+composer, atomic retry после потерянного acknowledgement и изменения лимита,
+owner HITL, sandbox read-only publication, persisted history, authenticated
+download и отсутствие observed credentials/raw files в browser storage обеих
+вкладок. Required browser module — 1 test, 47.793 секунды, exit0, без skips,
+20 browser checks. Ошибка видимости служебного manifest для UUIDhex исправлена
+в общем path guard. CI включает этот dedicated browser gate на amd64 после
+обязательного native sandbox gate; actual CI amd64, целевой deployment/CSI
+ещё не подтверждены, ARM64 browser proof их не заменяет.
 
 - Нет новой анонимной production-границы и bypass через list/stream/download,
   Python broker, child task, memory, summary или восстановление.

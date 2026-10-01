@@ -142,6 +142,10 @@ criterion должны войти в тот же завершённый change. 
   513 попытками независимо от большего container-visible cgroup limit.
   `CORE_AGENT_REQUIRE_SANDBOX_TESTS=1` запрещает скрыть недоступный sandbox skip-ом;
   local unit tests не заменяют этот gate и проверку целевого CSI/кластера.
+  Dedicated browser gate `tests/test_owner_ui_files_browser.py` использует
+  disposable Pod и реальные Keycloak/PostgreSQL. Он обязателен на amd64 с
+  `CORE_AGENT_REQUIRE_BROWSER_TESTS=1`: отсутствие Chromium, Node, конфигурации
+  или native fixtures завершает проверку ошибкой, без skip.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
 - `third_party/skills/` — закреплённые пакеты навыков, происхождение, лицензии и
   контрольные суммы для образа.
