@@ -138,6 +138,8 @@ criterion должны войти в тот же завершённый change. 
 - CI job `sandbox-linux` запускает обязательные Linux sandbox tests в отдельных
   native amd64/arm64 kind-кластерах. Его fixtures из `deploy/kubernetes/`
   назначают контрольные адреса только внутри одноразового node network namespace.
+  Node readback проверяет aggregate Pod `pids.max=512`; fork probe ограничен
+  513 попытками независимо от большего container-visible cgroup limit.
   `CORE_AGENT_REQUIRE_SANDBOX_TESTS=1` запрещает скрыть недоступный sandbox skip-ом;
   local unit tests не заменяют этот gate и проверку целевого CSI/кластера.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
@@ -459,6 +461,10 @@ run получает отдельные MCP session и negotiated version; пе�
   Ошибка teardown блокирует snapshot/delete; unhealthy launcher закрывает readiness.
   `SANDBOX_DNS_SERVERS` и `SANDBOX_DENIED_CIDRS` обязательны и дополняют закреплённую
   `core_agent/sandbox-policy.json`, которая входит в wheel и root-owned image.
+  Slirp входит только в owned user namespace, сохраняя Pod netns для egress;
+  target gate ждёт IPv6 address/default route до исходного startup deadline.
+  Base default-deny и TTY injection deny — отдельные sealed seccomp filters,
+  которые bwrap загружает совместно через `--add-seccomp-fd`.
   Наличие кода не подтверждает native/target-cluster gate.
 - Process ownership привязано к `(run_id, worker_id, execution_generation)`.
   Закрытая generation не открывается после follow-up; старая попытка не удаляет

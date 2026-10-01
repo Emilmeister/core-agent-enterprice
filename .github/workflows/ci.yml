@@ -82,6 +82,14 @@ jobs:
         run: |
           kubectl --kubeconfig "$KUBECONFIG" apply -f deploy/kubernetes/sandbox-pod.yaml
           kubectl --kubeconfig "$KUBECONFIG" wait pod/core-agent-sandbox-tests \
+            --for=condition=Ready --timeout=120s
+          sandbox_pod_uid=$(kubectl --kubeconfig "$KUBECONFIG" get pod core-agent-sandbox-tests \
+            -o jsonpath='{.metadata.uid}')
+          sandbox_pod_cgroup_uid=${sandbox_pod_uid//-/_}
+          sandbox_pod_pid_limit=$(docker exec "$SANDBOX_CLUSTER-control-plane" cat \
+            "/sys/fs/cgroup/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/kubelet-kubepods-burstable-pod$sandbox_pod_cgroup_uid.slice/pids.max")
+          test "$sandbox_pod_pid_limit" = 512
+          kubectl --kubeconfig "$KUBECONFIG" wait pod/core-agent-sandbox-tests \
             --for=jsonpath='{.status.phase}'=Succeeded --timeout=800s
           kubectl --kubeconfig "$KUBECONFIG" logs core-agent-sandbox-tests
       - name: Collect diagnostics and remove only the disposable cluster

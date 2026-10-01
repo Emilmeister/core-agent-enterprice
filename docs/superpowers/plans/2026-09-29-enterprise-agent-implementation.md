@@ -196,13 +196,15 @@ file admission FK/JSONB и гонки synthetic PostgreSQL test fixtures.
 
 Полный release gate остаётся открытым: приём/отправка файлов через UI/A2A,
 миграция старых файлов и удаление named artifact service ещё не завершены.
-Linux/Kubernetes sandbox и browser acceptance требуют самостоятельного proof;
-macOS unit suite не доказывает process isolation. Для native sandbox создан
-собственный disposable kind-кластер с отдельным kubeconfig. Missing `nft`
-исправлен добавлением `/usr/sbin:/sbin` в trusted helper PATH; 21 профильный
-test проходит, повторный native image/Pod находит executable. Следующий
-preflight завершается `Sandbox did not start`; причина исследуется, полный
-mandatory native gate пока не пройден.
+На native ARM64 Linux в отдельном disposable kind-кластере полный обязательный
+sandbox gate прошёл: 12 tests, 104.268 секунды, exit0, без skips. Реальный Pod
+подтвердил mount/PID/seccomp/rlimits, bootstrap/teardown, Python broker/HITL,
+разделение workspaces и контролируемую IPv4/IPv6 сеть. Node readback подтвердил
+aggregate Pod pids.max512. Исправлены lookup nft, user namespace helper,
+IPv6 readiness и потерянные libseccomp TTY deny rules; последняя проверка
+использует совместно два sealed filters. Native AMD64, целевой deployment/CSI
+и сквозная проверка browser+Keycloak+backend ещё не подтверждены; macOS unit
+suite их не заменяет.
 
 - Нет новой анонимной production-границы и bypass через list/stream/download,
   Python broker, child task, memory, summary или восстановление.

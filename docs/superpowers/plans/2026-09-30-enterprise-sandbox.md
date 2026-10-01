@@ -296,6 +296,16 @@ Ruff прошёл. Общий прогон: 677 tests, 7 failures, 35 errors, 14
 
 ## Состояние подключения — 30 сентября 2026
 
+Проверка 1 октября на native ARM64 Linux в disposable kind: все 12 обязательных
+tests прошли за 104.268 секунды, Pod Succeeded/container exit0, без skips.
+Проверен настоящий composition root, положительные и запрещённые IPv4/IPv6
+TCP/UDP receivers, DNS/redirect/rebinding/HTTPS, TTY syscall high bits,
+process limits, files, broker, HITL и fault cleanup. Aggregate Pod PID ceiling
+512 прочитан на node; bounded fork не зависит от container cgroup namespace.
+Slirp user namespace, готовность SLAAC/IPv6 route до release и отдельный sealed
+TTY deny filter исправляют реальные сбои native проверки. Это доказательство
+ARM64 fixture; native AMD64 и целевой deployment/CSI ещё требуют своего gate.
+
 `create_app` подключает обязательный preflight и один launcher к terminal,
 Python и background target. Hook `on_start(session, handle)` и trusted
 `broker_socket` не являются model arguments. Process reaper работает независимо

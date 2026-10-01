@@ -174,7 +174,7 @@ def _check_native():
         raise _unavailable('Sandbox requires native Linux amd64 or arm64')
     if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
         raise _unavailable('Linux pidfds are required')
-    for executable in ('bwrap', 'slirp4netns', 'nft', 'nsenter'):
+    for executable in ('bwrap', 'slirp4netns', 'nft', 'nsenter', 'ip'):
         if not shutil.which(executable, path=_HELPER_ENV['PATH']):
             raise _unavailable('Sandbox native executable is missing')
     if not ctypes.util.find_library('seccomp'):
@@ -195,8 +195,8 @@ def _check_native():
         raise _unavailable('Finite cgroup CPU, memory and PID limits are required') from error
     result = subprocess.run(['bwrap', '--help'], env=_HELPER_ENV, capture_output=True,
                             timeout=2, check=True)
-    if b'--ro-bind-fd' not in result.stdout:
-        raise _unavailable('Bubblewrap with directory FD binding is required')
+    if any(option not in result.stdout for option in (b'--ro-bind-fd', b'--add-seccomp-fd')):
+        raise _unavailable('Bubblewrap with FD binding and stacked seccomp is required')
 
 
 class _ArgCompare(ctypes.Structure):
@@ -204,7 +204,7 @@ class _ArgCompare(ctypes.Structure):
                 ('a', ctypes.c_uint64), ('b', ctypes.c_uint64)]
 
 
-def _seccomp_fd():
+def _seccomp_fd(*, deny_tty=False):
     library = ctypes.CDLL(ctypes.util.find_library('seccomp'), use_errno=True)
     library.seccomp_init.argtypes = [ctypes.c_uint32]
     library.seccomp_init.restype = ctypes.c_void_p
@@ -215,7 +215,7 @@ def _seccomp_fd():
                                               ctypes.POINTER(_ArgCompare)]
     library.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
     allow = 0x7fff0000
-    context = library.seccomp_init(0x00050000 | errno.EPERM)
+    context = library.seccomp_init(allow if deny_tty else 0x00050000 | errno.EPERM)
     if not context:
         raise _unavailable('Cannot create seccomp policy')
     descriptor = -1
@@ -228,23 +228,25 @@ def _seccomp_fd():
             if library.seccomp_rule_add_array(context, action, number, len(args), args) < 0:
                 raise _unavailable('Cannot compile seccomp rule')
 
-        _, resource = _policy_resource()
-        for name in resource['syscalls']:
-            rule(name)
-        # Includes CLONE_NEWTIME; clone3's pointer cannot be inspected by BPF.
-        rule('clone', [(0, 7, 0x7e020080, 0)])
-        rule('clone3', action=0x00050000 | errno.ENOSYS)
-        for family in (socket.AF_UNIX, socket.AF_INET, socket.AF_INET6):
-            types = (1, 2, 5) if family == socket.AF_UNIX else (1, 2)
-            for kind in types:
-                rule('socket', [(0, 4, family, 0), (1, 7, 0xf, kind)])
-        for kind in (1, 2, 5):
-            rule('socketpair', [(0, 4, socket.AF_UNIX, 0), (1, 7, 0xf, kind)])
-        # libseccomp cannot compare the same argument twice in one rule.
-        # ERRNO has precedence over ALLOW; EACCES differs from default EPERM.
-        rule('ioctl')
-        for request in (0x5412, 0x541c):
-            rule('ioctl', [(1, 7, 0xffffffff, request)], action=0x00050000 | errno.EACCES)
+        if deny_tty:
+            # A broad ioctl ALLOW in this context would erase these exceptions.
+            # The kernel intersects this filter with the separate default-deny one.
+            for request in (0x5412, 0x541c):
+                rule('ioctl', [(1, 7, 0xffffffff, request)], action=0x00050000 | errno.EACCES)
+        else:
+            _, resource = _policy_resource()
+            for name in resource['syscalls']:
+                rule(name)
+            # Includes CLONE_NEWTIME; clone3's pointer cannot be inspected by BPF.
+            rule('clone', [(0, 7, 0x7e020080, 0)])
+            rule('clone3', action=0x00050000 | errno.ENOSYS)
+            for family in (socket.AF_UNIX, socket.AF_INET, socket.AF_INET6):
+                types = (1, 2, 5) if family == socket.AF_UNIX else (1, 2)
+                for kind in types:
+                    rule('socket', [(0, 4, family, 0), (1, 7, 0xf, kind)])
+            for kind in (1, 2, 5):
+                rule('socketpair', [(0, 4, socket.AF_UNIX, 0), (1, 7, 0xf, kind)])
+            rule('ioctl')
         descriptor = os.memfd_create('core-agent-seccomp', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         if library.seccomp_export_bpf(context, descriptor) < 0:
             raise _unavailable('Cannot export seccomp policy')
@@ -615,6 +617,7 @@ def _supervise(channel):
                              dir_fd=workspace))
         trampoline = own(os.open(Path(__file__).with_name('sandbox_exec.py'), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC))
         seccomp = own(_seccomp_fd())
+        tty_seccomp = own(_seccomp_fd(deny_tty=True))
         resolver = own(os.memfd_create('sandbox-resolver', os.MFD_CLOEXEC))
         os.write(resolver, ''.join(f'nameserver {ip}\n' for ip in policy.dns_servers).encode())
         os.lseek(resolver, 0, os.SEEK_SET)
@@ -650,7 +653,8 @@ def _supervise(channel):
                    '--ro-bind-fd', str(trampoline), '/run/core-agent/sandbox_exec.py',
                    '--chdir', _workspace_cwd(launch['cwd']),
                    '--info-fd', str(info_w), '--block-fd', str(bootstrap_r),
-                   '--seccomp', str(seccomp)]
+                   '--add-seccomp-fd', str(tty_seccomp),
+                   '--add-seccomp-fd', str(seccomp)]
         if Path('/usr/lib64').exists():
             command.extend(['--symlink', 'usr/lib64', '/lib64'])
         if launch['broker']:
@@ -696,7 +700,11 @@ def _supervise(channel):
         rules = [item['rule'] for item in state if 'rule' in item]
         if len(rules) < 8:
             raise _unavailable('Firewall readback is incomplete')
-        slirp = subprocess.Popen(['slirp4netns', '--configure', '--disable-host-loopback',
+        # Path mode does not enter the user namespace in slirp's sandbox parent.
+        # Enter only the pinned user namespace; egress must remain in the Pod netns.
+        slirp = subprocess.Popen(['nsenter', '--preserve-credentials',
+                                  f'--user=/proc/self/fd/{userns}',
+                                  'slirp4netns', '--configure', '--disable-host-loopback',
                                   '--disable-dns', '--enable-ipv6', '--enable-sandbox', '--enable-seccomp',
                                   '--netns-type=path', f'--userns-path=/proc/self/fd/{userns}',
                                   '--exit-fd', str(exit_r), '--ready-fd', str(slirp_w),
@@ -712,6 +720,21 @@ def _supervise(channel):
         close(slirp_w)
         if _read_deadline(slirp_r, 1, deadline) != b'1' or slirp.poll() is not None:
             raise _unavailable('Sandbox network setup failed')
+        # Slirp's ready byte precedes kernel SLAAC/DAD and its IPv6 default route.
+        # Keep the target gated until both are ready in the pinned guest netns.
+        network_probe = [*nsenter[:-1], 'ip', '-j', '-6']
+        while True:
+            addresses = json.loads(run_helper([*network_probe, 'addr', 'show', 'dev', 'tap0'],
+                pass_fds=(userns, netns)).stdout)
+            routes = json.loads(run_helper([*network_probe, 'route', 'show', 'default'],
+                pass_fds=(userns, netns)).stdout)
+            if (any(info.get('scope') == 'global' and not info.get('tentative') and not info.get('dadfailed')
+                    for interface in addresses for info in interface.get('addr_info', []))
+                    and any(route.get('dst') == 'default' and route.get('dev') == 'tap0' for route in routes)):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or select.select([initfd, slirpfd], [], [], min(.05, remaining))[0]:
+                raise _unavailable('Sandbox IPv6 setup failed')
         # Releasing this barrier only starts the trusted isolated trampoline.
         if os.write(bootstrap_w, b'1') != 1:
             raise _unavailable('Incomplete bootstrap release')

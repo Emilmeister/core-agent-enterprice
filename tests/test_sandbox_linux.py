@@ -327,7 +327,7 @@ class SandboxLinuxTests(unittest.TestCase):
         self.run_code('''
             import ctypes,ctypes.util,errno,fcntl,os,pathlib,socket,subprocess,threading
             libc=ctypes.CDLL(None,use_errno=True)
-            seccomp=ctypes.CDLL(ctypes.util.find_library('seccomp'))
+            seccomp=ctypes.CDLL('libseccomp.so.2')
             seccomp.seccomp_syscall_resolve_name.argtypes=[ctypes.c_char_p]
             # Invalid arguments still MUST receive the filter's EPERM, before
             # the kernel can report EBADF/EFAULT/EINVAL for these calls.
@@ -460,7 +460,7 @@ class SandboxLinuxTests(unittest.TestCase):
             "sandbox.subprocess.run=failed\n",
             "original=sandbox.subprocess.Popen\n"
             "def failed(argv,**kwargs):\n"
-            "    if argv[0]=='slirp4netns': raise RuntimeError('slirp failure')\n"
+            "    if 'slirp4netns' in argv: raise RuntimeError('slirp failure')\n"
             "    return original(argv,**kwargs)\n"
             "sandbox.subprocess.Popen=failed\n",
             "original=sandbox._read_deadline\n"
@@ -475,6 +475,7 @@ class SandboxLinuxTests(unittest.TestCase):
             "sandbox._send=failed\n",
         )
         for index, hook in enumerate(hooks):
+            (self.workspace / 'forbidden').unlink(missing_ok=True)
             with self.subTest(stage=index), self.supervisor_hook(hook):
                 with self.assertRaises(CoreError) as caught:
                     self.start("from pathlib import Path; Path('forbidden').touch()")
@@ -596,15 +597,16 @@ class SandboxLinuxTests(unittest.TestCase):
     def test_pod_pid_limit_with_bounded_fork(self):
         self.assertEqual(os.environ.get('SANDBOX_TEST_DEDICATED_POD'), '1',
                          'PID ceiling check requires an explicitly dedicated disposable Pod')
-        ceiling = int(Path('/sys/fs/cgroup/pids.max').read_text().strip())
-        self.assertGreater(ceiling, 0)
-        self.assertLessEqual(ceiling, 512, 'Refuse an unbounded process stress test')
-        self.run_code(f'''
+        # Container cgroup namespaces hide the tighter aggregate Pod parent.
+        # Never scale this probe to a possibly much larger visible limit.
+        visible_ceiling = int(Path('/sys/fs/cgroup/pids.max').read_text().strip())
+        self.assertGreater(visible_ceiling, 0)
+        self.run_code('''
             import errno,os,signal
             children=[]
             limited=False
             try:
-                for _ in range({ceiling + 1}):
+                for _ in range(513):
                     try: child=os.fork()
                     except OSError as error:
                         assert error.errno==errno.EAGAIN
