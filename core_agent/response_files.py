@@ -14,6 +14,25 @@ from .errors import CoreError
 from .workspace import ChatWorkspaces, WorkspaceBinding
 
 
+# A slim image ships no /etc/mime.types, so `mimetypes` falls back to its
+# built-in table — which has no OOXML. Without these, every .pptx the agent
+# produces is labelled text/plain, and a client that believes the label decodes
+# a ZIP container as text.
+for _extension, _media_type in {
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".epub": "application/epub+zip",
+    ".rtf": "application/rtf",
+    ".7z": "application/x-7z-compressed",
+    ".webp": "image/webp",
+}.items():
+    mimetypes.add_type(_media_type, _extension)
+
+
 _PUBLIC_KEYS = ("file_id", "name", "media_type", "size_bytes", "sha256")
 _SCOPE_KEYS = ("tenant_id", "owner_id", "context_id", "task_id", "run_id")
 _REF_KEYS = frozenset(("schema_version", "limit_bytes", "blob_id", *_SCOPE_KEYS, *_PUBLIC_KEYS))

@@ -73,13 +73,16 @@ HTTP+JSON. Карточка агента доступна по `/.well-known/age
 | Выполнение | `core_terminal_exec`, `core_python_exec` |
 | Фоновые задачи | `core_task_start`, `core_task_get`, `core_task_list`, `core_task_wait`, `core_task_cancel` |
 | Делегирование | `core_delegate` |
-| Артефакты | `core_artifact_save`, `core_artifact_load`, `core_artifact_list` |
+| Файлы ответа | `core_response_files` |
+| Ожидание, вопросы владельцу и расписание | `core_wait_until`, `core_ask_owner`, `core_cron_create` |
 | Память | `core_memory_search`, `core_memory_read`, `core_memory_create`, `core_memory_update`, `core_memory_split`, `core_memory_delete` |
 | Удалённые агенты | `core_agent_send_message` |
 | Пакеты навыков (условно) | `core_skill_activate`, `core_skill_read_resource` |
 
 `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` может только сузить обычные встроенные
-инструменты.
+инструменты. Пустое значение использует ceiling выбранного runtime mode;
+условные tools по-прежнему требуют настроенных backend и разрешённой policy.
+Явный список через запятую оставляет только указанный набор.
 `with_terminal` разрешает публикацию `core_terminal_exec` и
 `core_task_start`; `without_terminal` удаляет их, но сохраняет управление
 задачами, делегирование, MCP, память и Python, если они разрешены конфигурацией.
@@ -94,6 +97,35 @@ Python остаётся локальным процессом с доступо�
 `core_skill_activate` появляется только при наличии навыков в
 `EffectiveConfig`, а `core_skill_read_resource` — только после подключения
 навыка с объявленными ресурсами.
+
+### Файлы чата и ответа
+
+При настроенной Keycloak-аутентификации владелец работает с файлами через UI
+`/ui/`, а внешний caller — через стандартные A2A raw FileParts. Входящие файлы
+проходят проверку всего набора и публикуются в постоянную папку своего чата;
+они не сохраняются через отдельный named artifact service. Владелец может
+просматривать и скачивать файлы чата через UI и owner API.
+
+`core_response_files` принимает `{paths: ["relative/path"]}` и выбирает весь
+набор файлов следующего финального ответа из chat workspace. `[]` очищает
+выбор. Сохранённый immutable набор передаётся как standard raw FileParts
+результирующего A2A Artifact и доступен владельцу для скачивания; изменение
+исходного workspace-файла не меняет уже выбранные bytes. Tool доступен только
+при настроенных trusted workspace и transport storage.
+
+Прежние `core_artifact_save`, `core_artifact_load`, `core_artifact_list` и их
+алиасы через точки больше не поддерживаются. При обновлении удалите их из
+allowlist, а также старые `ARTIFACT_STORAGE_*`, `ARTIFACT_S3_*`,
+`ARTIFACT_MONGODB_*` и `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` из окружения.
+Startup-диагностика перечисляет неподдерживаемые имена без значений настроек.
+Перед обновлением дождитесь завершения активных Tasks в прежнем image.
+Незавершённые frozen snapshots с прежними named artifact capabilities
+отклоняются с `CHECKPOINT_INVALID`. Если outcome уже начатого mutating вызова
+неизвестен, его intent сохраняется с `SIDE_EFFECT_UNKNOWN`; автоматического
+повтора нет. Ожидания и recovery задач с текущим config работают как прежде.
+Транспортные A2A Artifacts, результат/offload storage и workspace snapshots
+сохраняются. Согласованное обновление не требует переноса прежних named данных
+и не удаляет внешние S3 buckets, MongoDB databases или ресурсы Kubernetes.
 
 ### Пакеты навыков
 
@@ -444,8 +476,8 @@ Core Agent и Phoenix. Агент доступен на <http://localhost:8000>,
 | Возможности | `CORE_AGENT_RUNTIME_MODE`, `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, `CORE_AGENT_MAX_DEPTH`, `CORE_AGENT_MAX_FAN_OUT` |
 | Лимиты | `RUNTIME_MAX_LLM_CALLS`, `CORE_AGENT_MAX_TOOL_CALLS`, `CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS` |
 | MCP, пакеты навыков и удалённые агенты | `MCP_URL`, `MCP_ALLOWED_SERVERS`, `MCP_ALLOWED_TOOLS`, `MCP_READ_ONLY_TOOLS`, `MCP_COLD_START_TIMEOUT_SECONDS`, `SKILLS_ROOT`, `CORE_AGENT_ALLOWED_SKILLS`, `REMOTE_AGENTS` |
-| Сохраняемое состояние | `SESSION_STORAGE_TYPE`, `TASK_STORAGE_TYPE`, `DATABASE_URL`, `DURABLE_STORAGE_ROOT`, `LOCAL_WORKSPACE_ROOT` |
-| Память и артефакты | `CORE_AGENT_MEMORY`, `MEMORY_STORAGE_TYPE`, `ARTIFACT_STORAGE_TYPE`, `EMBEDDING_API_BASE`, `EMBEDDING_MODEL`, `EMBEDDING_API_KEY`, `EMBEDDING_DIMENSION` |
+| Сохраняемое состояние и файлы чата | `SESSION_STORAGE_TYPE`, `TASK_STORAGE_TYPE`, `DATABASE_URL`, `DURABLE_STORAGE_ROOT`, `LOCAL_WORKSPACE_ROOT`, `CHAT_WORKSPACE_ROOT` |
+| Память | `CORE_AGENT_MEMORY`, `MEMORY_STORAGE_TYPE`, `EMBEDDING_API_BASE`, `EMBEDDING_MODEL`, `EMBEDDING_API_KEY`, `EMBEDDING_DIMENSION` |
 | Наблюдаемость | `ENABLE_OTEL`, `OTEL_EXPORTER_OTLP_*_ENDPOINT`, `CORE_AGENT_LOG_CONTENT` |
 
 `AGENT_SYSTEM_PROMPT` — необязательный слой инструкций роли или профиля. Он не

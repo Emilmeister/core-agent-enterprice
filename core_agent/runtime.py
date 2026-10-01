@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import binascii
 import fnmatch
 import copy
 import hashlib
@@ -18,7 +16,6 @@ from datetime import datetime, timezone
 import json
 import re
 
-from .artifact_service import guess_media_type
 from .config import (
     MAX_SUBAGENT_DEPTH,
     AgentConfig,
@@ -319,7 +316,6 @@ class CoreAgent:
         logger=None,
         log_content=False,
         log_max_chars=12_000,
-        artifact_service=None,
         memory_registry=None,
         remote_agents=None,
         remote_registry=None,
@@ -396,7 +392,6 @@ class CoreAgent:
         self._task_streams = {}
         self._task_headers = {}
         self._model_streams_deltas = self._accepts_deltas(self.model)
-        self.artifact_service = artifact_service
         self.memory_registry = memory_registry
         self.platform_mcp = tuple(platform_mcp)
         self.declared_skills = tuple(declared_skills)
@@ -425,9 +420,6 @@ class CoreAgent:
                 "core_task_cancel": self._task_cancel,
                 "core_python_exec": self._python_exec,
                 "core_delegate": self._delegate,
-                "core_artifact_save": self._artifact_save,
-                "core_artifact_load": self._artifact_load,
-                "core_artifact_list": self._artifact_list,
                 "core_agent_send_message": self._send_message,
                 "core_cron_create": self._cron_create,
                 "core_response_files": self._response_files,
@@ -2706,11 +2698,6 @@ class CoreAgent:
         if isinstance(output, dict):
             if output.get("artifact") and output.get("truncated") is True:
                 references["artifact"] = output["artifact"]
-            if call.name == "core_artifact_save" and output.get("success") is True:
-                references["artifact"] = {key: output[key] for key in
-                    ("artifact_name", "version", "size", "media_type") if key in output}
-                if call.arguments.get("path"):
-                    references["path"] = call.arguments["path"]
             if call.name == "core_terminal_exec":
                 references.update({key: output[key] for key in ("artifacts", "side_effects") if output.get(key)})
         pinned = ()
@@ -5936,87 +5923,9 @@ class CoreAgent:
             "repository_revision": result.repository_revision,
         }
 
-    def _artifact_scope(self, run_id):
-        if self.artifact_service is None:
-            raise CoreError("CAPABILITY_DISABLED")
-        scope = self._run_scopes.get(run_id, {})
-        return {
-            "app_name": self.agent_config.agent["name"],
-            "user_id": scope.get("identity") or "anonymous",
-            "session_id": scope.get("session_id") or "",
-        }
 
-    def _artifact_save(self, arguments, run_id):
-        content = arguments.get("content")
-        path = arguments.get("path")
-        if (content is None) == (path is None):
-            raise CoreError(
-                "TOOL_ARGUMENT_INVALID", "pass exactly one of content and path"
-            )
-        media_type = arguments.get("mime_type")
-        if path is not None:
-            # The runtime reads the file itself: a finished file has no reason to
-            # become a string, and base64 would put every byte through the IPC
-            # frame on the way here.
-            resolved = self.tool_runtime.environment_manager.workspace_file(
-                run_id, path
-            )
-            blob = resolved.read_bytes()
-            media_type = media_type or guess_media_type(resolved.name)
-        elif arguments.get("encoding", "text") == "base64":
-            try:
-                blob = base64.b64decode(content, validate=True)
-            except (binascii.Error, ValueError) as error:
-                raise CoreError(
-                    "TOOL_ARGUMENT_INVALID", "content is not valid base64"
-                ) from error
-        else:
-            blob = content.encode("utf-8")
-        stored = self.artifact_service.save(
-            **self._artifact_scope(run_id),
-            filename=arguments["filename"],
-            content=blob,
-            media_type=media_type,
-            metadata=arguments.get("metadata"),
-        )
-        return {
-            "success": True,
-            "artifact_name": arguments["filename"],
-            "version": stored.version,
-            "size": stored.size,
-            "media_type": stored.media_type,
-        }
 
-    def _artifact_load(self, arguments, run_id):
-        stored, content = self.artifact_service.load(
-            **self._artifact_scope(run_id),
-            filename=arguments["filename"],
-            version=arguments.get("version"),
-        )
-        try:
-            text = content.decode("utf-8")
-            encoding = "text"
-        except UnicodeDecodeError:
-            text = base64.b64encode(content).decode("ascii")
-            encoding = "base64"
-        return {
-            "artifact_name": arguments["filename"],
-            "version": stored.version,
-            "media_type": stored.media_type,
-            "encoding": encoding,
-            "content": text,
-            "metadata": stored.metadata,
-        }
 
-    def _artifact_list(self, arguments, run_id):
-        session_artifacts, user_artifacts = self.artifact_service.list_keys(
-            **self._artifact_scope(run_id)
-        )
-        return {
-            "session_artifacts": session_artifacts,
-            "user_artifacts": user_artifacts,
-            "total": len(session_artifacts) + len(user_artifacts),
-        }
 
     def _send_message(self, arguments, run_id, *, wait_context=None):
         if self.remote_registry is not None:
@@ -6350,7 +6259,6 @@ class CoreAgent:
             # CAPABILITY_DISABLED on the first call.
             platform_mcp=self.platform_mcp,
             declared_skills=self.declared_skills,
-            artifact_service=self.artifact_service,
             memory_registry=self.memory_registry,
             remote_agents=self.remote_agents,
             remote_registry=self.remote_registry,

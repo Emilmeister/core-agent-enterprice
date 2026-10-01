@@ -15,9 +15,8 @@ import threading
 from .errors import CoreError, ExecutionNotStarted
 
 
-# Sized so the largest artifact the storage accepts still fits in one frame
-# as base64: a smaller limit makes core_artifact_save fail from here for a
-# file it accepts from anywhere else.
+# Bound the complete JSON IPC frame, including large tool results.
+# This is independent of file selection and transport attachment limits.
 MAX_RPC_BYTES = 140_000_000
 
 RUNNER = r'''

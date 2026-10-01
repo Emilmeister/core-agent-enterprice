@@ -1,12 +1,96 @@
 import os
+import asyncio
+import hashlib
+import json
 import tempfile
 import unittest
+import uuid
 from unittest.mock import patch
 
 from tests.app_support import create_app
-from core_agent.errors import CoreError
 from core_agent.mcp import InMemoryMcpConnector
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
+from tests.test_auth import AuthAppTestCase, TEST_DATABASE_URL
+
+
+class PythonResponseFileTests(AuthAppTestCase):
+    durable_blobs = True
+
+    async def execute(self, code):
+        self.model._responses = [ModelResponse(tool_requests=(ToolRequest("python-files", "core_python_exec", {"code": code}),)),
+                                 ModelResponse(message="Files ready")]
+        task = await self.submit("owner-a", uuid.uuid4().hex, "python-files-chat")
+        agent = self.app.state.core_agent
+        async with asyncio.timeout(5):
+            while True:
+                record = agent.workflow_store.lookup_task(task["id"])
+                if record.state in {"COMPLETED", "FAILED", "CANCELLED", "ABORTED"}:
+                    break
+                await asyncio.sleep(0.01)
+        self.assertEqual(record.state, "COMPLETED", record.error_code)
+        return agent._terminal_result(record), record
+
+    async def test_binary_workspace_selection_through_python_broker_is_frozen_without_base64(self):
+        code = """
+payload = bytes(range(256)) * 8
+open("deck.pptx", "wb").write(payload)
+selected = tools.call("core_response_files", {"paths": ["deck.pptx"]})
+print(selected["files"][0]["size_bytes"], selected["files"][0]["media_type"])
+open("deck.pptx", "wb").write(b"changed after selection")
+"""
+        result, record = await self.execute(code)
+        ref, = result.outgoing_files
+        expected = bytes(range(256)) * 8
+        self.assertEqual(ref["size_bytes"], 2048)
+        self.assertEqual(ref["media_type"], "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        self.assertEqual(ref["sha256"], hashlib.sha256(expected).hexdigest())
+        context = self.model.calls[-1].context
+        self.assertIn("2048", context)
+        self.assertIn("presentationml", context)
+        self.assertNotIn('"raw"', context)
+        self.assertNotIn('"base64"', context)
+        downloaded = await self.http.get(f"/api/chats/python-files-chat/tasks/{record.task_id}/files/{ref['file_id']}",
+                                         headers=self.headers("owner-a"))
+        self.assertEqual(downloaded.status_code, 200, downloaded.text)
+        self.assertEqual(downloaded.content, expected)
+        self.assertFalse(hasattr(self.app.state.core_agent, "artifact_service"))
+
+    async def test_invalid_last_path_is_atomic_and_retired_python_tool_cannot_dispatch(self):
+        code = """
+open("empty.bin", "wb").write(b"")
+tools.call("core_response_files", {"paths": ["empty.bin"]})
+for name, arguments in (
+    ("core_response_files", {"paths": ["empty.bin", "../../etc/passwd"]}),
+    ("core_response_files", {"paths": ["empty.bin"], "content": "forbidden"}),
+    ("core_artifact_save", {"filename": "old.bin", "content": "forbidden"}),
+):
+    try:
+        tools.call(name, arguments)
+        print("unexpected acceptance")
+    except ToolCallError as error:
+        print(error.code)
+"""
+        result, record = await self.execute(code)
+        ref, = result.outgoing_files
+        self.assertEqual((ref["name"], ref["size_bytes"], ref["sha256"]),
+                         ("empty.bin", 0, hashlib.sha256(b"").hexdigest()))
+        context = self.model.calls[-1].context
+        self.assertIn("INVALID_FILE_PATH", context)
+        self.assertIn("TOOL_ARGUMENT_INVALID", context)
+        outer = self.app.state.core_agent._context_from_dict(record.snapshot["context"]).transcript
+        output = next(json.loads(item.content)["output"] for item in outer if item.kind == "tool_result")
+        self.assertEqual(output["stdout"].splitlines(),
+                         ["INVALID_FILE_PATH", "TOOL_ARGUMENT_INVALID", "CAPABILITY_DISABLED"])
+        self.assertNotIn('"artifact_name"', json.dumps(output))
+        downloaded = await self.http.get(f"/api/chats/python-files-chat/tasks/{record.task_id}/files/{ref['file_id']}",
+                                         headers=self.headers("owner-b"))
+        self.assertEqual(downloaded.status_code, 200, downloaded.text)
+        self.assertEqual(downloaded.content, b"")
+
+
+@unittest.skipUnless(TEST_DATABASE_URL, "TEST_DATABASE_URL is required")
+class PostgresPythonResponseFileTests(PythonResponseFileTests):
+    use_postgres = True
 
 
 class InterpreterChoiceTests(unittest.TestCase):
@@ -70,103 +154,7 @@ class PythonExecTests(unittest.TestCase):
             **extra,
         }
 
-    def test_a_workspace_file_is_saved_by_path_without_becoming_a_string(self):
-        """Binary a run produced has no reason to travel as base64 to be kept."""
-        code = """
-payload = bytes(range(256)) * 8
-open("deck.pptx", "wb").write(payload)
-saved = tools.call("core_artifact_save", {"filename": "deck.pptx", "path": "deck.pptx"})
-print(saved["size"], saved["media_type"])
-"""
-        model = ScriptedModel(
-            [
-                ModelResponse(
-                    tool_requests=(
-                        ToolRequest("python-1", "core_python_exec", {"code": code}),
-                    )
-                ),
-                ModelResponse(message="saved"),
-            ]
-        )
-        model.model = "python-test"
-        workspace = tempfile.TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        environment = self._environment(
-            workspace.name,
-            CORE_AGENT_ALLOWED_BUILTIN_TOOLS="core_python_exec,core_artifact_save",
-        )
-        with patch.dict(os.environ, environment, clear=True):
-            app = create_app(model=model)
-        try:
-            result = app.state.core_agent.run({"prompt": "keep the deck"})
-            self.assertEqual(result.message, "saved")
-            self.assertIn("2048", model.calls[1].context)
-            # The image has no /etc/mime.types, so this must not depend on one.
-            self.assertIn("presentationml", model.calls[1].context)
 
-            stored, content = app.state.core_agent.artifact_service.load(
-                app_name=app.state.core_agent.agent_config.agent["name"],
-                user_id="anonymous",
-                session_id=result.run_id,
-                filename="deck.pptx",
-            )
-            self.assertEqual(content, bytes(range(256)) * 8)
-            self.assertEqual(stored.size, 2048)
-            # The image ships no /etc/mime.types: this must not depend on one.
-            self.assertEqual(
-                stored.media_type,
-                "application/vnd.openxmlformats-officedocument"
-                ".presentationml.presentation",
-            )
-        finally:
-            app.state.close()
-
-    def test_a_path_outside_the_workspace_or_both_inputs_are_refused(self):
-        code = """
-for arguments in (
-    {"filename": "a", "path": "../../etc/passwd"},
-    {"filename": "a", "path": "deck.pptx", "content": "text"},
-    {"filename": "a"},
-):
-    try:
-        tools.call("core_artifact_save", arguments)
-        print("accepted", arguments)
-    except ToolCallError as error:
-        print(error.code)
-"""
-        model = ScriptedModel(
-            [
-                ModelResponse(
-                    tool_requests=(
-                        ToolRequest("python-1", "core_python_exec", {"code": code}),
-                    )
-                ),
-                ModelResponse(message="refused"),
-            ]
-        )
-        model.model = "python-test"
-        workspace = tempfile.TemporaryDirectory()
-        self.addCleanup(workspace.cleanup)
-        environment = self._environment(
-            workspace.name,
-            CORE_AGENT_ALLOWED_BUILTIN_TOOLS="core_python_exec,core_artifact_save",
-        )
-        with patch.dict(os.environ, environment, clear=True):
-            app = create_app(model=model)
-        try:
-            run_id = app.state.core_agent.run({"prompt": "try to escape"}).run_id
-            printed = model.calls[1].context
-            service = app.state.core_agent.artifact_service
-            name = app.state.core_agent.agent_config.agent["name"]
-        finally:
-            app.state.close()
-        # Each of the three refusals printed its code, and nothing was stored.
-        self.assertEqual(printed.count("TOOL_ARGUMENT_INVALID"), 3)
-        with self.assertRaises(CoreError) as caught:
-            service.load(
-                app_name=name, user_id="anonymous", session_id=run_id, filename="a"
-            )
-        self.assertEqual(caught.exception.code, "NOT_FOUND")
 
     def test_python_calls_builtin_and_mcp_through_the_parent_broker(self):
         code = """

@@ -88,7 +88,6 @@ services:
       A2A_STREAMING_ENABLED: ${A2A_STREAMING_ENABLED:-true}
       A2A_STREAMING_BUFFER_SIZE: ${A2A_STREAMING_BUFFER_SIZE:-10}
       A2A_MAX_REQUEST_BYTES: ${A2A_MAX_REQUEST_BYTES:-40000000}
-      ARTIFACT_STORAGE_TYPE: ${ARTIFACT_STORAGE_TYPE:-in-memory}
       CORE_AGENT_MEMORY: ${CORE_AGENT_MEMORY:-optional}
       MEMORY_STORAGE_TYPE: ${MEMORY_STORAGE_TYPE:-in-memory}
       MEMORY_SEARCH_LIMIT: ${MEMORY_SEARCH_LIMIT:-10}
@@ -110,7 +109,7 @@ services:
       PORT: 8000
       CORE_AGENT_MAX_DEPTH: ${CORE_AGENT_MAX_DEPTH:-2}
       CORE_AGENT_RUNTIME_MODE: ${CORE_AGENT_RUNTIME_MODE:-with_terminal}
-      CORE_AGENT_ALLOWED_BUILTIN_TOOLS: ${CORE_AGENT_ALLOWED_BUILTIN_TOOLS:-core_terminal_exec,core_python_exec,core_task_start,core_task_get,core_task_list,core_task_wait,core_task_cancel,core_delegate}
+      CORE_AGENT_ALLOWED_BUILTIN_TOOLS: ${CORE_AGENT_ALLOWED_BUILTIN_TOOLS:-}
       SKILLS_ROOT: ${SKILLS_ROOT:-/opt/core-agent/skills}
       CORE_AGENT_ALLOWED_SKILLS: ${CORE_AGENT_ALLOWED_SKILLS-systematic-debugging,verification-before-completion,knowledge-synthesis,explore-data,validate-data,statistical-analysis,sql-queries}
       CORE_AGENT_PYTHON_MAX_CODE_CHARS: ${CORE_AGENT_PYTHON_MAX_CODE_CHARS:-100000}

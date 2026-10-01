@@ -5074,22 +5074,20 @@ class SemanticRuntimeTests(unittest.TestCase):
         self.assertIn('confirmed result', json.dumps(record.snapshot['context']['transcript']))
         self.assertEqual(result.usage.tool_calls, 1)
 
-    def test_compaction_keeps_exact_runtime_artifact_reference_outside_summary(self):
+    def test_compaction_keeps_exact_runtime_offload_reference_outside_summary(self):
         from core_agent.context import ContextState
         from core_agent.tools import ToolCall
         agent, _, _ = self.semantic_agent(lambda call: self.semantic_answer(call))
         record = agent._new_workflow(run_request(), task_id='artifact-pins', identity='owner', session_id='chat', tenant_id='company')[0]
         snapshot = copy.deepcopy(record.snapshot)
         snapshot['context'] = agent._context_to_dict(ContextState((), (), (1, 0)))
-        call = ToolCall('saved', 'core_artifact_save', {'filename': 'exact-report.csv', 'path': 'reports/exact.csv'})
-        text = agent._result_text('saved', {'success': True, 'artifact_name': 'exact-report.csv', 'version': 7, 'size': 42}, call.name)
+        call = ToolCall('saved', 'core_task_list', {})
+        text = agent._result_text('saved', {'truncated': True, 'artifact': {'id': 'exact-blob-id', 'digest': 'sha256:exact-digest'}}, call.name)
         agent._append_result(record, snapshot, call, text)
         context = agent._context_from_dict(snapshot['context'])
         pins = [item for item in context.active if item.pinned]
         self.assertEqual(len(pins), 1)
-        self.assertIn('exact-report.csv', pins[0].content)
-        self.assertIn('reports/exact.csv', pins[0].content)
-        self.assertEqual(json.loads(pins[0].content)['artifact']['version'], 7)
+        self.assertEqual(json.loads(pins[0].content)['artifact'], {'id': 'exact-blob-id', 'digest': 'sha256:exact-digest'})
         self.assertEqual(len(context.transcript), 1)
 
     def test_two_unknown_attempts_do_not_reset_on_a_third_worker(self):

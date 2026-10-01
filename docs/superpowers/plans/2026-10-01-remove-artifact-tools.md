@@ -39,3 +39,21 @@ Targeted existing tests first; then fresh PostgreSQL/Keycloak canonical
 `uv run python -m unittest discover -s tests -v`, `uv run ruff check core_agent tests`,
 UI typecheck/build and `uv build --no-sources` as applicable. Independent review
 before root saves the logical removal stage; no merge/push/deployment.
+
+## Verified removal slice
+
+- [x] Removed the three model tools, named service, exclusive configuration and
+  MongoDB dependency; independent transport/offload/snapshot paths remain.
+- [x] Targeted runtime gate: 409 tests, 90.556 seconds, no skips; config gate:
+  seven tests, no skips. Independent review found no blocking issue.
+- [x] Canonical Python3.12/schema23 PostgreSQL/Keycloak gate: 1599 tests,
+  220.519 seconds, exit0, three dedicated skips; frozen sync, migration and Ruff
+  also exit0. Evidence: `.local-evidence/artifact-removal-ci-final-*`.
+- [x] Wheel/sdist and ARM64 image built; ordinary CI image import, preinstalled
+  skills, CLI and Python library smoke passed. Removed named module/dependency
+  absent from wheel/image, UI and independent transport modules present.
+- [x] Upgrade guidance drains old active Tasks, rejects obsolete frozen
+  capabilities and preserves unknown already-dispatched intent without replay.
+
+This closes CLEAN-01, not the full enterprise release. Combined acceptance and
+final native/target Kubernetes gates remain tracked by the main plan.

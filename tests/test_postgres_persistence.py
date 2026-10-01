@@ -1622,7 +1622,6 @@ class PostgresRestartTests(unittest.TestCase):
                     "SESSION_STORAGE_TYPE": "postgres",
                     "DATABASE_AUTO_MIGRATE": "false",
                     "CORE_AGENT_MEMORY": "disabled",
-                    "ARTIFACT_STORAGE_ENABLED": "false",
                 },
                 clear=True,
             ):
@@ -1677,7 +1676,6 @@ class PostgresRestartTests(unittest.TestCase):
                     "SESSION_STORAGE_TYPE": "postgres",
                     "DATABASE_AUTO_MIGRATE": "false",
                     "CORE_AGENT_MEMORY": "disabled",
-                    "ARTIFACT_STORAGE_ENABLED": "false",
                 },
                 clear=True,
             ):

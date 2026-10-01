@@ -126,7 +126,8 @@ implementation scope и явное владение файлами; основн
 [owner UI](2026-09-30-enterprise-owner-ui.md),
 [semantic context/history](2026-09-30-enterprise-context.md),
 [trusted remote A2A](2026-09-30-enterprise-remote-a2a.md),
-[cron](2026-09-30-enterprise-cron.md).
+[cron](2026-09-30-enterprise-cron.md),
+[удаление artifact tools](2026-10-01-remove-artifact-tools.md).
 
 | Этап | Основные существующие точки изменений | Проверяемый результат и зависимость |
 | --- | --- | --- |
@@ -195,9 +196,12 @@ UI typecheck и production build проходят; Vite assets включены 
 Исправлены ошибки восстановленного sandbox resource, legacy Task projection,
 file admission FK/JSONB и гонки synthetic PostgreSQL test fixtures.
 
-Полный release gate остаётся открытым: приём файлов из завершённых задач
-вызванных внешних агентов, миграция старых файлов и удаление named artifact
-service ещё не завершены.
+Полный release gate остаётся открытым: нужны проверки combined cron/HITL,
+restart/compaction и всех private owner projection paths, итоговая traceability,
+actual amd64/целевой Kubernetes и реальный provider/embedding stack.
+Приём файлов завершённых remote Tasks и удаление named artifact service
+подключены. Пользователь подтвердил отсутствие прежних named файлов:
+export/import и перенос таких данных исключены из scope.
 Итоговые вложения подключены через явный `core_response_files`: immutable snapshots,
 canonical A2A results/recovery, owner history/download и source UI. Последний full
 PostgreSQL/Keycloak suite —1465 tests, 208.608 секунды, exit0, три ожидаемых skips;
@@ -222,6 +226,18 @@ download и отсутствие observed credentials/raw files в browser stora
 в общем path guard. CI включает этот dedicated browser gate на amd64 после
 обязательного native sandbox gate; actual CI amd64, целевой deployment/CSI
 ещё не подтверждены, ARM64 browser proof их не заменяет.
+
+После удаления трёх named artifact tools, exclusive S3/Mongo adapters,
+dependency и settings полный обычный CI suite на Python3.12/schema23 с
+настоящими PostgreSQL/Keycloak прошёл: 1599 tests, 220.519 секунды, exit0,
+три dedicated skips. `uv sync --frozen`, migrations, Ruff, wheel/sdist build,
+ARM64 image build и CI image/skills/CLI/Python smoke также прошли.
+Новый image: `sha256:952af8c422de6f81ced356bacee8e67d94087c3a2248c973352ef3d05c44a516`.
+Evidence — `.local-evidence/artifact-removal-ci-final-*`,
+`.local-evidence/artifact-removal-image*` и
+`.local-evidence/artifact-removal-smoke-*`.
+Saved native/browser proofs выше относятся к своим прежним image snapshots;
+новый image smoke сам по себе не подтверждает target CSI/amd64/sandbox gates.
 
 Исходящие remote attachments подключены отдельным срезом: optional per-call
 `files`, frozen snapshots до HITL, безопасные approval receipts, source-scoped

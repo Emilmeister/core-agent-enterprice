@@ -230,6 +230,13 @@ Migration заранее делает recoverable backup metadata и blobs, пр
 
 Wait, cron и file schemas/checkpoints версионируются; migration сохраняет абсолютные deadlines, admission IDs, closed outcomes, visibility и side-effect intent. Старый checkpoint с неизвестным исходом dispatched call переводится в reconciliation, а не переотправляется. Неизвестная schema version не исполняется. Legacy ephemeral workspace нельзя объявить постоянным без переноса на `CHAT_WORKSPACE_ROOT`; старые snapshots не восстанавливают удалённые файлы.
 
+CLEAN-01 не меняет PostgreSQL schema. Перед cutover завершаются active Tasks со
+старым frozen capability set. Snapshot, digest которого включает снятые named
+artifact capabilities, отклоняется как `CHECKPOINT_INVALID`, а не пересобирается
+молча с другим набором tools. Сохранённый intent возможного side effect не
+удаляется и не даёт права повторить вызов. Checkpoints нового capability set,
+включая HITL/remote waits, восстанавливаются по обычному контракту.
+
 Legacy `REMOTE_AGENTS` и dedicated auth settings импортируются однократно явным migration в owner registry с проверкой target, identity и защищённым хранением header values. Неоднозначный per-agent auth требует operator mapping; входящий credential автоматически не переносится и не проксируется. После cutover UI registry authoritative: рестарт и старое ENV не перезаписывают его, изменения аудируются. Старые values сохраняются защищённо только для согласованного rollback, не в model/transcript/logs.
 
 Registry storage version1 хранит company-scoped current peer pointer и append-only

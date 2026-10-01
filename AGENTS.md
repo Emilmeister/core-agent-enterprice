@@ -194,7 +194,6 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/workflow.py` | Workflow stores, transitions и durable outbox |
 | `core_agent/database.py` | PostgreSQL schema, migrations, pool и stores |
 | `core_agent/artifacts.py`, `core_agent/audit.py` | Tenant-scoped transport artifacts и append-only audit adapters |
-| `core_agent/artifact_service.py` | Named/scoped/versioned artifact model и in-memory, S3, MongoDB backends |
 | `core_agent/remote_agents.py` | Legacy ENV registry/SSE, bounded pinned peer discovery и A2A1.0 JSONRPC/HTTP+JSON Send/Get/Cancel adapter |
 | `core_agent/remote_operations.py` | Один bounded Send/Get/Cancel step под scheduler claim, pinned credentials, deadline и reconciliation |
 | `core_agent/streaming.py` | Stream chunk merge, snapshot buffer и ADK metadata keys |
@@ -337,7 +336,6 @@ Target spec может описывать больше текущего runtime.
   будит текущий таймер, повтор сообщения не будит следующую generation;
 - `core_ask_owner` — private вопрос владельцам при подключённом owner plane;
 - `core_delegate`;
-- `core_artifact_save`, `core_artifact_load`, `core_artifact_list`;
 - `core_response_files` при подключённом enterprise owner plane;
 - `core_memory_search`, `core_memory_read`, `core_memory_create`,
   `core_memory_update`, `core_memory_split`, `core_memory_delete`;
@@ -354,11 +352,16 @@ Target spec может описывать больше текущего runtime.
 Оба имени зарезервированы runtime: совпадающее каноническое имя MCP-tool
 отклоняется с `TOOL_NAME_COLLISION` при построении `EffectiveConfig`.
 
-Artifact tools версионируют именованные файлы внутри агента; `user:`-префикс
-даёт cross-session scope, а `ARTIFACT_STORAGE_TYPE` выбирает in-memory, S3 или
-MongoDB backend без управления схемой внешнего хранилища. Хранилище не является
-файловой системой run-а: `core_artifact_save` принимает либо `content`, либо
-`path` файла в workspace, который runtime читает сам. `core_agent_send_message`
+Три named artifact tools и исключительно их S3/MongoDB adapters удалены.
+Входящие enterprise файлы проходят atomic ChatFileService admission/guardrails,
+а `core_response_files` выбирает frozen набор файлов для итогового ответа.
+Legacy/test transport без ChatFileService явно отклоняет вложения. Transport
+A2A Artifacts, offload и workspace snapshots используют прежние независимые
+stores. Retired artifact tool/env settings отклоняются с names-only upgrade
+diagnostic; новые примеры оставляют builtin allowlist пустым для mode ceiling.
+Отдельный export/import или перенос данных снятого service не поставляется.
+Удаление касается application code/config, не внешних storage resources.
+`core_agent_send_message`
 в authenticated deployment создаёт durable local handle для доверенного peer
 из company registry. `core_task_wait` ждёт его сохранённый outcome без нового
 timeout. Legacy direct/test runtime без registry сохраняет ENV adapter отдельно.

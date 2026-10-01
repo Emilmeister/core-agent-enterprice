@@ -17,6 +17,7 @@ A2A_INTERFACES = (("HTTP+JSON", "1.0"), ("JSONRPC", "1.0"))
 MAX_SUBAGENT_DEPTH = 2
 RUNTIME_MODES = frozenset({"with_terminal", "without_terminal"})
 TERMINAL_MODE_TOOLS = frozenset({"core_terminal_exec", "core_task_start"})
+RETIRED_ARTIFACT_TOOLS = frozenset({"core_artifact_save", "core_artifact_load", "core_artifact_list"})
 
 
 @dataclass(frozen=True)
@@ -191,7 +192,7 @@ def compile_effective_config(
     denied = _expand(builtins.get("deny", []), choices) | set(
         platform.denied_builtin_tools
     )
-    allowed -= denied
+    allowed -= denied | RETIRED_ARTIFACT_TOOLS
     runtime_mode = raw["execution"].get("runtime_mode", "with_terminal")
     if runtime_mode == "without_terminal":
         allowed -= TERMINAL_MODE_TOOLS
@@ -203,7 +204,6 @@ def compile_effective_config(
         "core_task_": "background_tasks",
         "core_delegate": "delegation",
         "core_ask_owner": "human_input",
-        "core_artifact_": "artifacts",
         "core_agent_": "remote_agents",
         "core_memory_": "memory",
     }
@@ -260,8 +260,7 @@ def compile_effective_config(
         policies.discard("memory")
     if "core_python_exec" not in allowed:
         policies.discard("python")
-    if not any(tool.startswith("core_artifact_") for tool in allowed):
-        policies.discard("artifacts")
+    policies.discard("artifacts")
     if "core_response_files" in allowed:
         policies.add("response_files")
     if "core_agent_send_message" not in allowed:
