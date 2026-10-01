@@ -45,8 +45,12 @@ def _remote_text(value):
 def _remote_contract(contract, tenant_id, owner_id):
     required = {"version", "tenant_id", "owner_id", "peer_id", "peer_revision", "peer_name", "url", "binding",
                 "message_id", "task", "timeout_seconds", "poll_interval_seconds"}
-    if (not isinstance(contract, dict) or not required <= contract.keys() <= required | {"_trace_parent"}
-            or type(contract["version"]) is not int or contract["version"] != 1
+    if (not isinstance(contract, dict) or type(contract.get("version")) is not int
+            or contract["version"] not in {1, 2}):
+        raise CoreError("CHECKPOINT_INVALID")
+    if contract["version"] == 2:
+        required |= {"caller_scope", "attachment_limit_bytes", "outgoing_files"}
+    if (not required <= contract.keys() <= required | {"_trace_parent"}
             or contract["tenant_id"] != tenant_id or contract["owner_id"] != owner_id):
         raise CoreError("CHECKPOINT_INVALID")
     for key in ("tenant_id", "owner_id", "peer_id", "peer_name", "url", "message_id", "task"):
@@ -57,6 +61,26 @@ def _remote_contract(contract, tenant_id, owner_id):
             raise CoreError("CHECKPOINT_INVALID")
     if not isinstance(contract["binding"], str) or contract["binding"] not in {"JSONRPC", "HTTP+JSON"}:
         raise CoreError("CHECKPOINT_INVALID")
+    if contract["version"] == 2:
+        from .response_files import ResponseFileService
+        from .workspace import WorkspaceBinding
+
+        scope, limit, refs = contract["caller_scope"], contract["attachment_limit_bytes"], contract["outgoing_files"]
+        if (not isinstance(scope, dict) or scope.keys() != {"owner_id", "context_id", "task_id", "run_id"}
+                or scope["run_id"] != owner_id or type(limit) is not int or not 1 <= limit <= 2147483647
+                or not isinstance(refs, list)):
+            raise CoreError("CHECKPOINT_INVALID")
+        for value in scope.values():
+            _remote_text(value)
+        try:
+            validated = ResponseFileService.validate_refs(
+                WorkspaceBinding(tenant_id, scope["owner_id"], scope["context_id"]), refs,
+                task_id=scope["task_id"], run_id=scope["run_id"], limit_bytes=limit,
+            )
+            if any(ref["limit_bytes"] != limit for ref in validated):
+                raise CoreError("CHECKPOINT_INVALID")
+        except CoreError:
+            raise CoreError("CHECKPOINT_INVALID") from None
     if "_trace_parent" in contract:
         trace = contract["_trace_parent"]
         if not isinstance(trace, dict) or trace.keys() != {"trace_id", "span_id", "trace_flags"}:

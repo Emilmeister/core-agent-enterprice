@@ -1,15 +1,17 @@
 """One bounded network step for a claimed, persisted remote A2A operation."""
 
-from .errors import CoreError
+from .errors import CoreError, ExecutionNotStarted
 from .remote_agents import RemoteAgentCard, RemoteAgentConnection, _trusted_headers
 from .security import redact
-from .tasks import REMOTE_TASK_PENDING
+from .tasks import REMOTE_PROGRESS_STATES, REMOTE_TASK_PENDING
+from .workspace import WorkspaceBinding
 
 
 class RemoteA2AExecutor:
-    def __init__(self, scheduler, registry):
+    def __init__(self, scheduler, registry, response_files_service=None):
         self.scheduler = scheduler
         self.registry = registry
+        self.response_files_service = response_files_service
 
     def __call__(self, claim, cancel_event):
         # Only persisted caller intent authorizes cancellation; shutdown events do not.
@@ -66,6 +68,20 @@ class RemoteA2AExecutor:
             # Identifiers cannot be redacted or rewritten: reject before durable storage or URL construction.
             raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR")
 
+    def _outgoing_files(self, contract):
+        if contract["version"] != 2 or not contract["outgoing_files"]:
+            return ()
+        if self.response_files_service is None:
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        scope = contract["caller_scope"]
+        loaded = self.response_files_service.load(
+            WorkspaceBinding(contract["tenant_id"], scope["owner_id"], scope["context_id"]),
+            contract["outgoing_files"], task_id=scope["task_id"], run_id=scope["run_id"],
+            limit_bytes=contract["attachment_limit_bytes"],
+        )
+        return tuple({"name": ref["name"], "media_type": ref["media_type"], "raw": content}
+                     for ref, content in loaded)
+
     def _step(self, claim):
         current = self.scheduler.read_remote_claim(claim)
         checkpoint = current["checkpoint"]
@@ -85,6 +101,7 @@ class RemoteA2AExecutor:
             if current["cancel_requested"]:
                 self._finish(claim, current, "canceled", {"reason": "not_dispatched"})
                 return
+            files = self._outgoing_files(current["contract"])
             self._commit(claim, current, {**checkpoint, "send_started": True})
             current = self.scheduler.read_remote_claim(claim)
             if current["cancel_requested"]:
@@ -92,6 +109,8 @@ class RemoteA2AExecutor:
                 return
             method = "send_task"
             arguments = {"task": current["contract"]["task"], "message_id": current["contract"]["message_id"]}
+            if current["contract"]["version"] == 2:
+                arguments["files"] = files
         else:
             method = "get_task"
             arguments = {"task_id": checkpoint["remote_task_id"]}
@@ -100,13 +119,18 @@ class RemoteA2AExecutor:
                 current = self.scheduler.read_remote_claim(claim)
                 method = "cancel_task"
 
+        if current["contract"]["version"] == 2:
+            arguments["attachment_limit_bytes"] = current["contract"]["attachment_limit_bytes"]
+
         timeout = min(30.0, current["checkpoint"]["deadline"] - current["now"])
         try:
             event = getattr(connection, method)(**arguments, headers=headers, timeout=timeout)
         except Exception as error:
             # No exception text can cross the trust boundary or include private headers.
             current = self.scheduler.read_remote_claim(claim)
-            if method != "get_task":
+            if isinstance(error, ExecutionNotStarted):
+                self._finish(claim, current, "failed", {"reason": error.code.lower()}, error.code)
+            elif method != "get_task":
                 self._unknown(claim, current)
             elif isinstance(error, CoreError) and error.retryable:
                 self._poll_later(claim, current)
@@ -125,12 +149,14 @@ class RemoteA2AExecutor:
                                  "REMOTE_AGENT_PROTOCOL_ERROR")
                     return
                 checkpoint[key] = value
-        if event.has_files:
+        early_files = (current["contract"]["version"] == 2 and event.kind == "task"
+                       and not event.final and event.state in REMOTE_PROGRESS_STATES)
+        if event.has_files and not early_files:
             self._commit(claim, current, checkpoint, ("failed", {
                 "agent_name": current["contract"]["peer_name"], "reason": "files_unsupported",
             }, "REMOTE_FILES_UNSUPPORTED"))
             return
-        if any("text" not in part for part in event.parts):
+        if any("text" not in part and not (early_files and "raw" in part) for part in event.parts):
             self._commit(claim, current, checkpoint, ("failed", {
                 "agent_name": current["contract"]["peer_name"], "reason": "parts_unsupported",
             }, "REMOTE_PARTS_UNSUPPORTED"))

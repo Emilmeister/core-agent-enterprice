@@ -181,7 +181,8 @@ docker build -t core-agent:local .
 
 Восстановленный enterprise candidate находится в постоянной рабочей копии.
 Подключены owner UI/history, политики/HITL/вопросы/guardrails, durable waits,
-text-only remote A2A, cron, workspace preview/download и ручная очистка.
+durable remote A2A с явным выбором исходящих файлов, cron, workspace
+preview/download и ручная очистка.
 Private file batches и атомарный внутренний admission проверены отдельно;
 публичный raw FilePart intake и owner UI composer подключены. PostgreSQL Task записывается до file bind
 в одной транзакции; исходные имена и metadata сохраняются без потери bytes.
@@ -194,8 +195,9 @@ UI typecheck и production build проходят; Vite assets включены 
 Исправлены ошибки восстановленного sandbox resource, legacy Task projection,
 file admission FK/JSONB и гонки synthetic PostgreSQL test fixtures.
 
-Полный release gate остаётся открытым: файловый обмен при создании задач внешним
-агентам, миграция старых файлов и удаление named artifact service ещё не завершены.
+Полный release gate остаётся открытым: приём файлов из завершённых задач
+вызванных внешних агентов, миграция старых файлов и удаление named artifact
+service ещё не завершены.
 Итоговые вложения подключены через явный `core_response_files`: immutable snapshots,
 canonical A2A results/recovery, owner history/download и source UI. Последний full
 PostgreSQL/Keycloak suite —1465 tests, 208.608 секунды, exit0, три ожидаемых skips;
@@ -220,6 +222,25 @@ download и отсутствие observed credentials/raw files в browser stora
 в общем path guard. CI включает этот dedicated browser gate на amd64 после
 обязательного native sandbox gate; actual CI amd64, целевой deployment/CSI
 ещё не подтверждены, ARM64 browser proof их не заменяет.
+
+Исходящие remote attachments подключены отдельным срезом: optional per-call
+`files`, frozen snapshots до HITL, безопасные approval receipts, source-scoped
+job v2 и обе A2A1.0 bindings. Direct/Python runtime tests проверены на памяти и
+реальном PostgreSQL, в том числе отсутствие автоматического наследования final
+set, atomic failure без handle, восстановление snapshot и изменённые arguments.
+Loopback HTTP проверяет binary/empty raw Parts, strict JSON/base64, aggregate
+bounds и unknown Send после malformed redirect. Ранние remote file previews
+не завершают ожидание и не публикуются. Native executor/scheduler gate —68 tests,
+exit0, без skips; transport gate —45 tests, exit0, без skips; root/Python
+runtime gate —14 tests, exit0, без skips. Child metadata proof использует реальные
+PostgreSQL jobs/blobs с in-memory workflow и не доказывает весь delegated-child
+PostgreSQL pipeline. Terminal remote file import остаётся закрыт до atomic
+quarantine/guardrail следующего среза.
+После последних transport/executor исправлений полный прогон на новой БД и
+реальном Keycloak прошёл: `uv run python -m unittest discover -s tests -v` —
+1501 tests, 196.434 секунды, exit0, три ожидаемых skips (dedicated browser,
+native Linux sandbox, отдельный memory loop ownership case). Ruff и diff-check
+прошли. Evidence — `.local-evidence/remote-outbound-final.log` и `.exit`.
 
 - Нет новой анонимной production-границы и bypass через list/stream/download,
   Python broker, child task, memory, summary или восстановление.

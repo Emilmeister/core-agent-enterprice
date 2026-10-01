@@ -1,12 +1,15 @@
 import asyncio
+import base64
+import hashlib
 import io
 import json
 import threading
 import unittest
 from urllib.error import HTTPError, URLError
 from unittest.mock import patch
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from core_agent.errors import CoreError
+from core_agent.errors import CoreError, ExecutionNotStarted
 from core_agent.remote_agents import RemoteAgentCard, RemoteAgentConnection, connect_peer
 from tests.test_auth import AuthAppTestCase
 
@@ -124,7 +127,7 @@ class RemoteTransportTests(unittest.TestCase):
                     self.connection().send_task(task="Task", message_id="m")
                 self.assertEqual(caught.exception.code, "REMOTE_AGENT_PROTOCOL_ERROR")
                 self.assertNotIn("SECRET", str(caught.exception))
-        with patch("core_agent.remote_agents._OPENER.open", return_value=io.BytesIO(b"x" * 33)), patch("core_agent.remote_agents.MAX_RESPONSE_BYTES", 32):
+        with patch("core_agent.remote_agents._OPENER.open", return_value=io.BytesIO(b"x" * 257)), patch("core_agent.remote_agents.MAX_RESPONSE_BYTES", 256):
             with self.assertRaises(CoreError) as caught:
                 self.connection().send_task(task="Task", message_id="m")
             self.assertEqual(caught.exception.code, "REMOTE_AGENT_RESPONSE_TOO_LARGE")
@@ -190,6 +193,220 @@ class RemoteTransportTests(unittest.TestCase):
                 with self.subTest(timeout=timeout), self.assertRaises(CoreError):
                     self.connection().send_task(task="Task", message_id="m", timeout=timeout)
             opened.assert_not_called()
+
+    def test_explicit_ordered_files_include_empty_bytes_in_both_bindings(self):
+        files = [{"name": "report.txt", "media_type": "text/plain", "raw": b"a"},
+                 {"name": "empty.txt", "media_type": "text/plain", "raw": b""}]
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            with self.subTest(binding=binding), patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply({"task": task_payload()})) as opened:
+                self.connection(binding).send_task(task="Do one task", message_id="m", files=files, attachment_limit_bytes=1)
+                body = json.loads(opened.call_args.args[0].data)
+                body = body["params"] if binding == "JSONRPC" else body
+                self.assertEqual(body, {"message": {"role": "ROLE_USER", "messageId": "m", "parts": [
+                    {"text": "Do one task"}, {"filename": "report.txt", "mediaType": "text/plain", "raw": "YQ=="},
+                    {"filename": "empty.txt", "mediaType": "text/plain", "raw": ""}]},
+                    "configuration": {"returnImmediately": True}})
+                self.assertEqual(opened.call_count, 1)
+
+    def test_entire_outbound_batch_and_limit_are_validated_before_io(self):
+        valid = {"name": "a.txt", "media_type": "text/plain", "raw": b"a"}
+        invalid = [{**valid, "raw": bytearray(b"PRIVATE")}, {**valid, "raw": "PRIVATE"},
+                   {**valid, "name": "../PRIVATE"}, {**valid, "name": ""},
+                   {**valid, "name": "PRIVATE\\file"}, {**valid, "media_type": "PRIVATE\n"},
+                   {**valid, "media_type": 1}, {**valid, "private_ref": "PRIVATE"}, None]
+        with patch("core_agent.remote_agents._OPENER.open") as opened:
+            for file in invalid:
+                with self.subTest(file=repr(file)), self.assertRaises(ExecutionNotStarted) as caught:
+                    self.connection().send_task(task="Task", message_id="m", files=[valid, file], attachment_limit_bytes=10)
+                self.assertEqual(caught.exception.code, "INVALID_FILE_INPUT")
+                self.assertNotIn("PRIVATE", str(caught.exception))
+            for limit in (None, True, False, 0, -1, 2147483648, "10", float("inf")):
+                with self.subTest(limit=limit), self.assertRaises(ExecutionNotStarted):
+                    self.connection().send_task(task="Task", message_id="m", files=[valid], attachment_limit_bytes=limit)
+            with self.assertRaises(ExecutionNotStarted) as caught:
+                self.connection().send_task(task="Task", message_id="m", files=[valid, valid], attachment_limit_bytes=1)
+            self.assertEqual(caught.exception.code, "ATTACHMENTS_TOO_LARGE")
+            self.assertEqual(caught.exception.data, {"allowed_bytes": 1, "actual_bytes": 2})
+            for files in ({}, iter([valid]), "PRIVATE"):
+                with self.subTest(files=repr(files)), self.assertRaises(ExecutionNotStarted):
+                    self.connection().send_task(task="Task", message_id="m", files=files, attachment_limit_bytes=10)
+            opened.assert_not_called()
+
+    def test_local_send_validation_is_known_not_started_and_encoded_request_is_bounded(self):
+        for arguments in ({"task": ""}, {"message_id": "\ud800"}, {"headers": {"Host": "PRIVATE"}}, {"timeout": 0}):
+            with self.subTest(arguments=arguments), patch("core_agent.remote_agents._OPENER.open") as opened:
+                with self.assertRaises(ExecutionNotStarted):
+                    self.connection().send_task(**({"task": "Task", "message_id": "m"} | arguments))
+                opened.assert_not_called()
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            with self.subTest(binding=binding), patch("core_agent.remote_agents.MAX_FILE_RESPONSE_BYTES", 128), patch("core_agent.remote_agents._OPENER.open") as opened:
+                with self.assertRaises(ExecutionNotStarted) as caught:
+                    self.connection(binding).send_task(task="x" * 200, message_id="m", attachment_limit_bytes=2147483647)
+                self.assertEqual(caught.exception.code, "REMOTE_AGENT_REQUEST_TOO_LARGE")
+                opened.assert_not_called()
+
+    def test_response_status_artifacts_and_empty_parts_survive_both_bindings_and_polling(self):
+        payload = task_payload("TASK_STATE_INPUT_REQUIRED", status={"state": "TASK_STATE_INPUT_REQUIRED", "message": {
+            "messageId": "status", "role": "ROLE_AGENT", "parts": [{"text": "Waiting"}, {"raw": "YQ==", "filename": "a.txt"}]}},
+            artifacts=[{"artifactId": "empty", "parts": [{"raw": "", "filename": "empty.txt", "mediaType": "text/plain", "metadata": {"source": "peer"}}]}])
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            for method, arguments in (("send_task", {"task": "Task", "message_id": "m"}),
+                    ("get_task", {"task_id": "remote-task"}), ("cancel_task", {"task_id": "remote-task"})):
+                reply = {"task": payload} if method == "send_task" else payload
+                with self.subTest(binding=binding, method=method), patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(reply)):
+                    event = getattr(self.connection(binding), method)(**arguments, attachment_limit_bytes=1)
+                self.assertFalse(event.final)
+                self.assertEqual(event.text, "Waiting")
+                self.assertEqual(event.parts, tuple(payload["status"]["message"]["parts"] + payload["artifacts"][0]["parts"]))
+
+    def test_response_file_batch_is_validated_before_protobuf_and_no_url_is_fetched(self):
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            for part, expected in (({"raw": "YR=="}, "REMOTE_AGENT_PROTOCOL_ERROR"),
+                    ({"raw": "YQ"}, "REMOTE_AGENT_PROTOCOL_ERROR"), ({"raw": "YQ==\n"}, "REMOTE_AGENT_PROTOCOL_ERROR"),
+                    ({"raw": "-_=="}, "REMOTE_AGENT_PROTOCOL_ERROR"), ({"raw": 7}, "REMOTE_AGENT_PROTOCOL_ERROR"),
+                    ({"raw": "Yg=="}, "ATTACHMENTS_TOO_LARGE"),
+                    ({"url": "https://PRIVATE.test/file"}, "REMOTE_AGENT_PROTOCOL_ERROR")):
+                payload = {"message": {"role": "ROLE_AGENT", "messageId": "answer", "parts": [{"raw": "YQ=="}, part]}}
+                with self.subTest(binding=binding, part=part), patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)) as opened, patch("core_agent.remote_agents.ParseDict") as parsed:
+                    with self.assertRaises(CoreError) as caught:
+                        self.connection(binding).send_task(task="Task", message_id="m", attachment_limit_bytes=1)
+                    self.assertEqual(caught.exception.code, expected)
+                    self.assertNotIn("PRIVATE", str(caught.exception))
+                    self.assertEqual(opened.call_count, 1)
+                    parsed.assert_not_called()
+
+    def test_response_json_is_strict_before_protobuf(self):
+        valid = '{"task":{"id":"task","contextId":"context","status":{"state":"TASK_STATE_COMPLETED"}}}'
+        payloads = [valid.replace('"id":"task"', '"id":"PRIVATE","id":"task"').encode(),
+                    valid.encode("utf-16"),
+                    valid[:-2].encode() + b',"metadata":{"number":NaN}}}',
+                    valid[:-2].encode() + b',"metadata":{"number":1e999}}}',
+                    valid[:-2].encode() + b',"metadata":{"nested":' + b'[' * 101 + b'0' + b']' * 101 + b'}}}']
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            for payload in payloads:
+                if binding == "JSONRPC":
+                    payload = b'{"jsonrpc":"2.0","id":"m","result":' + payload + b'}'
+                with self.subTest(binding=binding, payload=payload[:50]), patch("core_agent.remote_agents._OPENER.open", return_value=io.BytesIO(payload)), patch("core_agent.remote_agents.ParseDict") as parsed:
+                    with self.assertRaises(CoreError) as caught:
+                        self.connection(binding).send_task(task="Task", message_id="m", attachment_limit_bytes=10)
+                    self.assertEqual(caught.exception.code, "REMOTE_AGENT_PROTOCOL_ERROR")
+                    self.assertNotIn("PRIVATE", str(caught.exception))
+                    parsed.assert_not_called()
+
+    def test_history_is_validated_but_company_limit_counts_only_current_batch(self):
+        payload = {"task": task_payload("TASK_STATE_COMPLETED",
+            metadata={"raw": "arbitrary metadata, not a FilePart"},
+            history=[{"role": "ROLE_USER", "messageId": "old", "parts": [{"raw": "Yg==", "filename": "old.txt"}]}],
+            artifacts=[{"artifactId": "current", "parts": [{"raw": "YQ==", "filename": "current.txt"}]}])}
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            with self.subTest(binding=binding), patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)):
+                event = self.connection(binding).send_task(task="Task", message_id="m", attachment_limit_bytes=1)
+                self.assertEqual(event.parts, ({"raw": "YQ==", "filename": "current.txt"},))
+                self.assertTrue(event.final)
+            for old_parts in ([{"raw": "YR=="}], ["PRIVATE"], [{"file": "PRIVATE"}],
+                              [{"raw": "Yg==", "text": "PRIVATE"}], [{"raw": "Yg==", "filename": "\ud800"}]):
+                payload["task"]["history"][0]["parts"] = old_parts
+                with self.subTest(binding=binding, old_parts=repr(old_parts)), patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)), patch("core_agent.remote_agents.ParseDict") as parsed:
+                    with self.assertRaises(CoreError) as caught:
+                        self.connection(binding).send_task(task="Task", message_id="m", attachment_limit_bytes=1)
+                    self.assertEqual(caught.exception.code, "REMOTE_AGENT_PROTOCOL_ERROR")
+                    self.assertNotIn("PRIVATE", str(caught.exception))
+                    parsed.assert_not_called()
+            payload["task"]["history"][0]["parts"] = [{"raw": "Yg==", "filename": "old.txt"}]
+
+    def test_file_response_encoded_ceiling_is_independent_of_decoded_limit(self):
+        payload = {"task": task_payload(metadata={"padding": "x" * 512})}
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            with self.subTest(binding=binding), patch("core_agent.remote_agents.MAX_RESPONSE_BYTES", 256), patch("core_agent.remote_agents.MAX_FILE_RESPONSE_BYTES", 1024), patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)):
+                self.assertFalse(self.connection(binding).send_task(task="Task", message_id="m", attachment_limit_bytes=1).final)
+                with self.assertRaises(CoreError) as caught:
+                    self.connection(binding).send_task(task="Task", message_id="m")
+                self.assertEqual(caught.exception.code, "REMOTE_AGENT_RESPONSE_TOO_LARGE")
+            with self.subTest(binding=binding), patch("core_agent.remote_agents.MAX_FILE_RESPONSE_BYTES", 256), patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)):
+                with self.assertRaises(CoreError) as caught:
+                    self.connection(binding).send_task(task="Task", message_id="m", attachment_limit_bytes=2147483647)
+                self.assertEqual(caught.exception.code, "REMOTE_AGENT_RESPONSE_TOO_LARGE")
+
+    def test_malformed_redirect_after_received_send_is_not_known_not_started(self):
+        class Peer(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                self.server.received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(302)
+                self.send_header("Location", "http://[invalid")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Peer)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            server.received = []
+            connection = RemoteAgentConnection(RemoteAgentCard("peer", "Peer", f"http://127.0.0.1:{server.server_port}/", False, (), binding))
+            with self.subTest(binding=binding), self.assertRaises(CoreError) as caught:
+                connection.send_task(task="Mutating task", message_id="m", files=[
+                    {"name": "selected.txt", "media_type": "text/plain", "raw": b"x"}], attachment_limit_bytes=1)
+            self.assertEqual(len(server.received), 1)
+            body = server.received[0]
+            body = body["params"] if binding == "JSONRPC" else body
+            self.assertEqual(body["message"]["parts"][-1]["raw"], "eA==")
+            self.assertEqual(caught.exception.code, "REMOTE_AGENT_DENIED")
+            self.assertNotIsInstance(caught.exception, ExecutionNotStarted)
+            self.assertFalse(caught.exception.retryable)
+
+    def test_explicit_file_send_get_and_cancel_over_real_loopback_http(self):
+        class Peer(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def respond(self, payload):
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def task(self, state="TASK_STATE_COMPLETED"):
+                return task_payload(state, status={"state": state, "message": {
+                    "role": "ROLE_AGENT", "messageId": "status", "parts": [{"text": "done"}]}},
+                    artifacts=[{"artifactId": "result", "parts": self.server.parts}])
+
+            def do_GET(self):
+                self.respond(self.task())
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                rpc = "jsonrpc" in body
+                params = body["params"] if rpc else body
+                method = body["method"] if rpc else ("SendMessage" if self.path.endswith("/message:send") else "CancelTask")
+                if method == "SendMessage":
+                    self.server.parts = params["message"]["parts"][1:]
+                    result = {"task": self.task()}
+                else:
+                    result = self.task("TASK_STATE_CANCELED" if method == "CancelTask" else "TASK_STATE_COMPLETED")
+                self.respond({"jsonrpc": "2.0", "id": body["id"], "result": result} if rpc else result)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Peer)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        files = [{"name": "binary.bin", "media_type": "application/octet-stream", "raw": b"\x00\xff"},
+                 {"name": "empty.txt", "media_type": "text/plain", "raw": b""}]
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            connection = RemoteAgentConnection(RemoteAgentCard("peer", "Peer", f"http://127.0.0.1:{server.server_port}/", False, (), binding))
+            with self.subTest(binding=binding):
+                sent = connection.send_task(task="Read explicit files", message_id="m", files=files, attachment_limit_bytes=2)
+                fetched = connection.get_task(task_id=sent.task_id, attachment_limit_bytes=2)
+                cancelled = connection.cancel_task(task_id=sent.task_id, attachment_limit_bytes=2)
+                self.assertEqual([sent.state, fetched.state, cancelled.state], ["TASK_STATE_COMPLETED", "TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"])
+                for event in (sent, fetched, cancelled):
+                    self.assertTrue(event.final)
+                    self.assertEqual(event.text, "done")
+                    self.assertEqual([base64.b64decode(part["raw"]) for part in event.parts[1:]], [b"\x00\xff", b""])
 
 
 class PeerDiscoveryTests(unittest.TestCase):
@@ -291,6 +508,34 @@ class PeerDiscoveryTests(unittest.TestCase):
 
 
 class AuthenticatedPeerTransportTests(AuthAppTestCase):
+    async def test_both_bindings_admit_only_explicit_files_and_empty_bytes_with_real_sdk(self):
+        loop = asyncio.get_running_loop()
+        replies = []
+
+        async def request_remote(request):
+            response = await self.http.request(request.method, request.full_url,
+                content=request.data, headers=dict(request.header_items()))
+            self.assertEqual(response.status_code, 200)
+            replies.append(response.json())
+            return io.BytesIO(response.content)
+
+        def open_remote(request, timeout):
+            return asyncio.run_coroutine_threadsafe(request_remote(request), loop).result(timeout=timeout)
+
+        files = [{"name": "report.txt", "media_type": "text/plain", "raw": b"a"},
+                 {"name": "report.txt", "media_type": "text/plain", "raw": b""}]
+        with patch("core_agent.remote_agents._OPENER.open", side_effect=open_remote):
+            for binding in ("JSONRPC", "HTTP+JSON"):
+                connection = RemoteAgentConnection(RemoteAgentCard("peer", "Peer", "https://agent.example.test/a2a/external/", False, (), binding))
+                event = await asyncio.to_thread(connection.send_task, task="Read files", message_id="files-" + binding,
+                    files=files, attachment_limit_bytes=1, headers={"Authorization": "Bearer external-a"})
+                payload = replies[-1]["result"] if binding == "JSONRPC" else replies[-1]
+                self.assertEqual(event.task_id, payload["task"]["id"])
+                receipt = payload["task"]["metadata"]["file_receipt"]
+                self.assertEqual([entry["size_bytes"] for entry in receipt["entries"]], [1, 0])
+                self.assertEqual(len({entry["actual_name"] for entry in receipt["entries"]}), 2)
+                self.assertEqual([entry["sha256"] for entry in receipt["entries"]], [hashlib.sha256(file["raw"]).hexdigest() for file in files])
+
     async def test_real_http_json_card_nonblocking_send_get_cancel(self):
         loop = asyncio.get_running_loop()
         seen = []

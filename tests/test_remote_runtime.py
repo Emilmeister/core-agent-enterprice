@@ -65,7 +65,9 @@ class RemoteRuntimeTests(AuthAppTestCase):
         self.assertEqual(handles[0].result["text"], "delivered")
         self.assertEqual(self.sent.call_count, 1)
         wire = self.sent.call_args.kwargs
-        self.assertEqual(set(wire), {"task", "message_id", "headers", "timeout"})
+        self.assertEqual(set(wire), {"task", "message_id", "headers", "timeout", "files", "attachment_limit_bytes"})
+        self.assertEqual(wire["files"], ())
+        self.assertEqual(wire["attachment_limit_bytes"], 25_000_000)
         self.assertEqual(wire["headers"], {})
         self.assertNotEqual(wire["message_id"], "message-one")
         self.assertNotIn("external-a", json.dumps(record.snapshot))

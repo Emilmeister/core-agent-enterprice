@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, is_dataclass, replace
 from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
+import re
 
 from .artifact_service import guess_media_type
 from .config import (
@@ -46,6 +47,7 @@ from .model import CompatibleHttpModel, ModelResponse
 from .remote_agents import build_forwarded_headers
 from . import remote_agents as remote_transport
 from .remote_operations import RemoteA2AExecutor
+from .response_files import ResponseFileService
 from .security import redact
 from .streaming import NullStreamPublisher
 from .tasks import DelegationContract, _remote_contract
@@ -444,7 +446,8 @@ class CoreAgent:
             )
             self.task_scheduler.register("subagent", self._recover_subagent)
             if self.remote_registry is not None:
-                self.task_scheduler.register("remote_a2a", RemoteA2AExecutor(self.task_scheduler, self.remote_registry))
+                self.task_scheduler.register("remote_a2a", RemoteA2AExecutor(
+                    self.task_scheduler, self.remote_registry, response_files_service=self.response_files_service))
 
     @staticmethod
     def _accepts_deltas(model):
@@ -1159,7 +1162,11 @@ class CoreAgent:
             else:
                 catalog["core_agent_send_message"]["description"] = (
                     "Send one focused task to a trusted remote agent; returns a durable local task handle. "
-                    "Use core_task_wait without timeout for its result. Available agents: "
+                    "Use core_task_wait without timeout for its result. "
+                    + ("Choose attachments explicitly with files: relative workspace paths. "
+                       "Omit files or use [] to send none; workspace and final-response files are never added automatically. "
+                       if "files" in catalog["core_agent_send_message"]["input_schema"].get("properties", {}) else "")
+                    + "Available agents: "
                     + "; ".join(peer["name"] + ": " + peer["description"] for peer in peers.values()))
         return catalog
 
@@ -1190,6 +1197,26 @@ class CoreAgent:
             cursor = page[-1]["id"]
 
     @staticmethod
+    def _remote_arguments_digest(call):
+        return hashlib.sha256(json.dumps(call.arguments, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+
+    @staticmethod
+    def _remote_entry_contract(entry):
+        if (not isinstance(entry, dict) or not isinstance(entry.get("contract"), dict)
+                or type(entry.get("version")) is not int or entry["version"] != 1):
+            raise CoreError("CHECKPOINT_INVALID")
+        contract = entry["contract"]
+        keys = {"version", "contract"} | ({"arguments_digest"} if contract.get("version") == 2 else set())
+        if entry.keys() != keys:
+            raise CoreError("CHECKPOINT_INVALID")
+        if "arguments_digest" in keys:
+            digest = entry["arguments_digest"]
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise CoreError("CHECKPOINT_INVALID")
+        return contract
+
+    @staticmethod
     def _remote_binding(snapshot, call, *, attempt=None):
         attempt = snapshot["tool_calls"] if attempt is None else attempt
         calls = snapshot.get("remote_calls", {})
@@ -1198,10 +1225,10 @@ class CoreAgent:
         entry = calls.get(f"{attempt}:{call.id}")
         if entry is None:
             return None
-        if not isinstance(entry, dict) or entry.keys() != {"version", "contract"} or type(entry["version"]) is not int or entry["version"] != 1:
-            raise CoreError("CHECKPOINT_INVALID")
-        contract = entry["contract"]
+        contract = CoreAgent._remote_entry_contract(entry)
         if not isinstance(contract, dict) or contract.get("task") != call.arguments.get("task") or contract.get("peer_name") != call.arguments.get("agent_name"):
+            raise CoreError("CHECKPOINT_INVALID")
+        if contract.get("version") == 2 and entry["arguments_digest"] != CoreAgent._remote_arguments_digest(call):
             raise CoreError("CHECKPOINT_INVALID")
         return copy.deepcopy(contract)
 
@@ -1212,11 +1239,14 @@ class CoreAgent:
             raise CoreError("CHECKPOINT_INVALID")
         for key, entry in calls.items():
             if (not isinstance(key, str) or ":" not in key or not key.split(":", 1)[0].isdigit()
-                    or int(key.split(":", 1)[0]) < 1 or not key.split(":", 1)[1]
-                    or not isinstance(entry, dict) or entry.keys() != {"version", "contract"}
-                    or type(entry["version"]) is not int or entry["version"] != 1):
+                    or int(key.split(":", 1)[0]) < 1 or not key.split(":", 1)[1]):
                 raise CoreError("CHECKPOINT_INVALID")
-            _remote_contract(entry["contract"], record.tenant_id, record.run_id)
+            contract = CoreAgent._remote_entry_contract(entry)
+            _remote_contract(contract, record.tenant_id, record.run_id)
+            if contract["version"] == 2 and contract["caller_scope"] != {
+                key: getattr(record, key) for key in ("owner_id", "context_id", "task_id", "run_id")
+            }:
+                raise CoreError("CHECKPOINT_INVALID")
         previous = record.snapshot.get("remote_admission")
         if previous is not None and (
                 not isinstance(previous, dict) or previous.keys() != {"version", "source_id", "attempt", "task_id"}
@@ -1231,6 +1261,10 @@ class CoreAgent:
         contract = self._remote_binding(snapshot, call, attempt=attempt)
         if contract is not None:
             _remote_contract(contract, record.tenant_id, record.run_id)
+            if contract["version"] == 2 and contract["caller_scope"] != {
+                key: getattr(record, key) for key in ("owner_id", "context_id", "task_id", "run_id")
+            }:
+                raise CoreError("CHECKPOINT_INVALID")
             return record, snapshot
         if self.interaction_store.get_policy(record.tenant_id, call.name, tool_origin(call.name)).mode == "deny":
             raise CoreError("POLICY_DENIED")
@@ -1243,8 +1277,22 @@ class CoreAgent:
             "url": peer["url"], "binding": peer["binding"], "task": call.arguments["task"],
             "message_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"remote-message:{record.run_id}:{attempt}:{call.id}")),
             "timeout_seconds": settings.remote_timeout_seconds, "poll_interval_seconds": settings.remote_poll_interval_seconds}
+        if self.response_files_service is not None:
+            try:
+                files = self.response_files_service.prepare(
+                    WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id), call.arguments.get("files", []),
+                    task_id=record.task_id, run_id=record.run_id, limit_bytes=settings.attachment_limit_bytes,
+                )
+            except CoreError as error:
+                raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+            contract.update(version=2, caller_scope={key: getattr(record, key) for key in (
+                "owner_id", "context_id", "task_id", "run_id")},
+                attachment_limit_bytes=settings.attachment_limit_bytes, outgoing_files=list(files))
         _remote_contract(contract, record.tenant_id, record.run_id)
-        snapshot.setdefault("remote_calls", {})[f"{attempt}:{call.id}"] = {"version": 1, "contract": contract}
+        entry = {"version": 1, "contract": contract}
+        if contract["version"] == 2:
+            entry["arguments_digest"] = self._remote_arguments_digest(call)
+        snapshot.setdefault("remote_calls", {})[f"{attempt}:{call.id}"] = entry
         record = self._record_transition(record, state=record.state, snapshot=snapshot,
             event_kind="remote.pinned", event_data={"tool_call_id": call.id, "peer_id": peer["id"], "peer_revision": peer["revision"]}, lease_token=lease_token)
         return record, copy.deepcopy(record.snapshot)
@@ -3363,6 +3411,12 @@ class CoreAgent:
         if call.name == "core_agent_send_message" and snapshot is not None:
             binding = CoreAgent._remote_binding(snapshot, call)
             if binding is not None:
+                if binding["version"] == 2:
+                    receipts = ResponseFileService.receipts(binding.pop("outgoing_files"))
+                    binding.pop("caller_scope")
+                    binding["files"] = list(receipts)
+                    binding["selection_digest"] = hashlib.sha256(json.dumps(receipts,
+                        sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
                 subject["remote_binding"] = binding
         return subject
 
@@ -3485,7 +3539,7 @@ class CoreAgent:
             try:
                 record, snapshot = self._pin_remote_call(record, snapshot, call, lease_token=lease_token)
             except CoreError as error:
-                if error.code not in {"TOOL_UNAVAILABLE", "POLICY_DENIED"}:
+                if not isinstance(error, ExecutionNotStarted) and error.code not in {"TOOL_UNAVAILABLE", "POLICY_DENIED"}:
                     raise
                 return self._record_tool_outcome(record, snapshot, call, self._failed_tool_outcome(call, error),
                     lease_token=lease_token, active_result_token_limit=active_result_token_limit)
@@ -5439,7 +5493,7 @@ class CoreAgent:
                 current, pinned = self._pin_remote_call(context["record"], copy.deepcopy(context["snapshot"]), call,
                     lease_token=context["lease_token"], attempt=context["snapshot"]["tool_calls"] + 1)
             except CoreError as error:
-                if error.code in {"TOOL_UNAVAILABLE", "POLICY_DENIED"}:
+                if isinstance(error, ExecutionNotStarted) or error.code in {"TOOL_UNAVAILABLE", "POLICY_DENIED"}:
                     self._nested_dispatch_intent(record, call, definition, effective, failure=error, request_id=request_id)
                 raise
             context.update(record=current, snapshot=pinned)

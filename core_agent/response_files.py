@@ -11,7 +11,7 @@ from contextlib import ExitStack
 from urllib.parse import urlsplit
 
 from .errors import CoreError
-from .workspace import WorkspaceBinding
+from .workspace import ChatWorkspaces, WorkspaceBinding
 
 
 _PUBLIC_KEYS = ("file_id", "name", "media_type", "size_bytes", "sha256")
@@ -114,8 +114,9 @@ class ResponseFileService:
     def receipts(refs):
         return tuple({key: ref[key] for key in _PUBLIC_KEYS} for ref in refs)
 
-    def validate_refs(self, binding, refs, *, task_id, run_id, limit_bytes):
-        scope = self._scope(binding, task_id, run_id, limit_bytes)
+    @staticmethod
+    def validate_refs(binding, refs, *, task_id, run_id, limit_bytes):
+        scope = ResponseFileService._scope(binding, task_id, run_id, limit_bytes)
         if not isinstance(refs, (tuple, list)):
             raise CoreError("ARTIFACT_INTEGRITY_FAILED")
         validated = []
@@ -137,14 +138,14 @@ class ResponseFileService:
                         or not isinstance(ref["blob_id"], str) or not ref["blob_id"] or "\0" in ref["blob_id"]
                         or not isinstance(ref["media_type"], str) or not ref["media_type"]
                         or not isinstance(ref["file_id"], str) or uuid.UUID(ref["file_id"]).hex != ref["file_id"]
-                        or ref["file_id"] in seen or len(self.workspaces.path_parts(ref["name"])) != 1):
+                        or ref["file_id"] in seen or len(ChatWorkspaces.path_parts(ref["name"])) != 1):
                     raise ValueError()
             except (CoreError, ValueError, AttributeError):
                 raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
             validated.append(ref)
             seen.add(ref["file_id"])
             pinned_limit = ref["limit_bytes"]
-        self._check_limit(sum(ref["size_bytes"] for ref in validated), limit_bytes)
+        ResponseFileService._check_limit(sum(ref["size_bytes"] for ref in validated), limit_bytes)
         return tuple(validated)
 
     def load(self, binding, refs, *, task_id, run_id, limit_bytes, connection=None):

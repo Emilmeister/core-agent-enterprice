@@ -602,8 +602,17 @@ run получает отдельные MCP session и negotiated version; пе�
   проверку в пределах deadline; Send/Cancel имеют одну attempt.
   Per-peer headers передаются на один request без хранения в connection;
   caller/root identifiers и legacy auth не наследуются. Parts и remote IDs
-  сохраняются executor-ом для durable operation. Файловый transport остаётся
-  незавершённым; неподдерживаемые Parts отклоняются явно.
+  сохраняются executor-ом для durable operation. Enterprise Send принимает
+  optional `files` — уникальные относительные workspace paths на каждый вызов;
+  отсутствие поля или `[]` отправляет только текст. Выбор финальных вложений
+  `core_response_files` не используется автоматически. Весь набор snapshot-ится
+  до HITL; ошибка сохраняет прежний final set и не создаёт remote handle.
+  Approval получает только safe receipts и digest выбора, без private refs.
+  Перед Send весь frozen manifest проверяется повторно, затем передаются только
+  стандартные raw Parts с именем/media type, включая пустые файлы.
+  Responses проходят bounded strict JSON/canonical base64 до SDK; decoded
+  aggregate относится к текущему ответу, а не к прежним файлам в Task history.
+  Legacy ENV/text-only schema не получает новый аргумент `files`.
 - Owner settings GET/PUT включают `remote_timeout_seconds` (86400 по умолчанию)
   и `remote_poll_interval_seconds` (300). PUT со старым набором трёх timeout
   сохраняет эти настройки и attachment limit; все поля делят settings revision.
@@ -665,9 +674,16 @@ run получает отдельные MCP session и negotiated version; пе�
 
 ### Background и delegation
 
-- Remote kind `remote_a2a` использует existing scheduler/ownership/mailbox,
-  version1 immutable contract и mutable checkpoint LONG-02. Local rows имеют
-  null checkpoint. Миграции выполняет database entrypoint, а не serving process.
+- Remote kind `remote_a2a` использует existing scheduler/ownership/mailbox
+  и mutable checkpoint LONG-02. Прежний immutable contract v1 читается без
+  изменений. Enterprise contract v2 закрепляет source `caller_scope` ровно
+  `{owner_id, context_id, task_id, run_id}`, aggregate limit и frozen file refs;
+  scheduler owner совпадает с source run ID. Child сохраняет свои task/run IDs.
+  Parent snapshot wrapper остаётся v1, entry v2 дополнительно закрепляет digest
+  исходных аргументов: recovery не читает изменённые workspace paths заново.
+  Unknown versions/fields/scope и изменённые arguments отклоняются.
+  Local rows имеют null checkpoint. Миграции выполняет database entrypoint,
+  а не serving process.
 - Send/Cancel marker сохраняется до network; один worker выполняет один bounded
   request и освобождает claim. Unknown Send без remote ID и уже сохранённый
   Cancel marker требуют reconciliation; они не повторяются после recovery.
@@ -676,8 +692,12 @@ run получает отдельные MCP session и negotiated version; пе�
   атомарно и выигрывает у позднего ответа.
 - Executor читает credentials только из закреплённой registry revision.
   Отражённые секреты в peer IDs отклоняются до checkpoint/URL, текст очищается
-  existing redactor. Неподдерживаемые file/data Parts дают явную ошибку; наличие
-  executor не подтверждает готовность файлового A2A transport или live PG gates.
+  existing redactor. v2 `working`/`input-required`/`auth-required` не импортируют
+  ранние raw previews и сохраняют polling с прежними IDs/deadline. Terminal
+  remote files пока дают `REMOTE_FILES_UNSUPPORTED`: quarantine/guardrail import
+  ещё не подключён. Data Parts отклоняются. Ошибка network/parser после возможного
+  Send/Cancel сохраняет unknown outcome; только доказанная локальная ошибка
+  до dispatch возвращается как известный отказ без blind retry.
 - TaskStore проецирует `core_agent_remote_progress` из scoped working operations
   как local ID, stable displayed revision, peer name и nonterminal enum. Read-only
   `remote_progress` не вызывает model-visible task tools. Get/List/Subscribe/push

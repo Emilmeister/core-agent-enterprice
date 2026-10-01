@@ -326,7 +326,8 @@ native Linux application Pod прошли required module без skips: 20 brows
 - [x] Добавить outgoing_files в RunResult и все result reconstruction branches. Budget-partial result с выбранными файлами сохраняет прежние complete/completion_reason/shared_budget; attachment bytes не попадают в telemetry.
 - [x] Обновить result_artifact/_publish_artifact, чтобы raw FileParts сохраняли media type/name/bytes и весь batch проверялся до первого final frame. GetTask/live/SSE/recovery одинаковы по IDs, digests и ordered files; stream disconnect не дублирует результат.
 - [ ] Добавить same-tenant different-chat blob isolation test, включая одинаковые file bytes: известный digest/file_id без доступной Task manifest не даёт download. In-memory и PostgreSQL проходят один observable contract.
-- [ ] Remote outbound files и inbound complete batch проходят общий limit/scope/guardrail service; inbound headers не становятся downstream Authorization. Стуб HTTP проверяет отсутствие первого request при oversized batch и отсутствие relay частичного превышающего лимит remote message.
+- [x] Remote outbound: optional per-call `files`, общий snapshot/limit/scope service до HITL, безопасные approval receipts и повторная whole-manifest validation до Send. Отсутствие `files`/`[]` не наследует workspace или final selection; oversized/invalid batch не создаёт handle и первый HTTP request. Incoming headers не становятся downstream Authorization.
+- [ ] Remote inbound completed batch проходит atomic quarantine/claim/source-root binding и guardrails до workspace/model publication; transport whole-response bounds исключают relay частичного превышающего лимит материала.
 - [x] Выполнить `uv run python -m unittest tests.test_transfer_features tests.test_python_exec tests.test_end_to_end tests.test_runtime_observability -v`.
 
 Backend итоговых вложений и source UI подключены: immutable snapshots, whole manifest
@@ -345,11 +346,29 @@ snapshots, включая empty file, после изменения/удален
 abort при смене чата и отсутствие stale download; incoming checks сохранены.
 Image ID: `sha256:d785ee4fa13f38dbd7d3bb43d0a88d9ff93418e550c213d5a99c761c3eb20a8d`.
 Evidence — `.local-evidence/owner-browser-outgoing/`; source hashes включают
-последний binary AgentCard output mode. Remote files, migration/cutover и полный
+последний binary AgentCard output mode. Remote inbound files, migration/cutover и полный
 release этим не закрыты; actual CI AMD64 и целевой CSI остаются отдельными gates.
 Финальный набор выбирает модель через `core_response_files`; остальные файлы
 workspace не прикрепляются автоматически. Вложения при создании задачи внешнему
-агенту остаются отдельным следующим срезом с явным `files` на каждый вызов.
+агенту теперь выбираются отдельным `files` на каждый вызов. Schema доступна
+только enterprise file runtime; legacy catalog остаётся text-only. Job v2 хранит
+source scope, pinned aggregate limit и immutable refs; прежний v1 читается без
+изменений. Snapshot/arguments digest переживают HITL и runtime restoration,
+изменение originals или settings не меняет approved bytes. Memory и PostgreSQL
+root/Python runtime gate —14 tests, exit0, без skips; executor/scheduler gate —
+68 tests, exit0, без skips; actual wire transport gate —45 tests, exit0, без skips.
+Проверены обе bindings, empty binary files, pre-dispatch aggregate refusal,
+strict pre-SDK validation и отсутствие повторного Send после malformed redirect.
+Remote working/input-required/auth-required raw previews сохраняют IDs/deadline
+и polling без relay/import. Child scope tests использовали PostgreSQL jobs/blobs
+и in-memory workflow: настоящий delegated-child PostgreSQL file pipeline ещё
+требует отдельного proof. Completed remote files пока явно unsupported, до
+atomic inbound quarantine/guardrail среза. Evidence —
+`.local-evidence/remote-outbound/`, `.local-evidence/remote-transport/` и
+`.local-evidence/remote-files-runtime-final.log`.
+Финальный полный прогон после redirect/preview исправлений на свежей PostgreSQL
+БД и настоящем Keycloak: 1501 tests, 196.434 секунды, exit0, три ожидаемых skips;
+Ruff и diff-check прошли. Logs/exit — `.local-evidence/remote-outbound-final.*`.
 
 ### 6. Подключить owner file API и безопасную очистку
 

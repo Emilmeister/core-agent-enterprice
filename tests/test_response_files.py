@@ -143,15 +143,17 @@ class ResponseFileContract:
             get.assert_not_called()
 
     def test_manifest_validation_never_reads_source_or_blobs_and_returns_copies(self):
+        from core_agent.response_files import ResponseFileService
+
         self.write("file", b"frozen")
         refs = self.prepare(["file"])
         with patch.object(self.store, "get", side_effect=AssertionError("manifest validation reads no blobs")), \
                 patch.object(self.workspaces, "open_file", side_effect=AssertionError("manifest validation opens no source")):
-            validated = self.service.validate_refs(self.binding, refs, **self.options)
+            validated = ResponseFileService.validate_refs(self.binding, refs, **self.options)
             self.assertIsInstance(validated, tuple)
             self.assertEqual(validated, refs)
             self.assertIsNot(validated[0], refs[0])
-            self.assert_code("FILE_NOT_FOUND", lambda: self.service.validate_refs(self.binding,
+            self.assert_code("FILE_NOT_FOUND", lambda: ResponseFileService.validate_refs(self.binding,
                 (refs[0], {**refs[0], "task_id": "foreign"}), **self.options))
         validated[0]["name"] = "changed"
         self.assertEqual(refs[0]["name"], "file")

@@ -117,21 +117,26 @@ def _check_depth(payload):
             pending.append(iter(children))
 
 
+def _decode_raw(raw):
+    """Decode only canonical standard base64, including an empty file."""
+    if not isinstance(raw, str) or len(raw) % 4 or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", raw):
+        raise ValueError("noncanonical file encoding")
+    decoded = base64.b64decode(raw, validate=True)
+    if base64.b64encode(decoded).decode("ascii") != raw:
+        raise ValueError("noncanonical file encoding")
+    return decoded
+
+
 def _validate_files(message):
     if not isinstance(message, dict) or not isinstance(message.get("parts"), list):
         return  # The SDK retains responsibility for the public message schema.
     for part in message["parts"]:
         if not isinstance(part, dict) or "raw" not in part:
             continue
-        raw = part["raw"]
-        if not isinstance(raw, str) or len(raw) % 4 or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", raw):
-            raise InvalidParamsError("File bytes require canonical standard base64", data={"code": "INVALID_FILE_ENCODING"})
         try:
-            decoded = base64.b64decode(raw, validate=True)
+            _decode_raw(part["raw"])
         except (ValueError, binascii.Error):
             raise InvalidParamsError("File bytes require canonical standard base64", data={"code": "INVALID_FILE_ENCODING"}) from None
-        if base64.b64encode(decoded).decode("ascii") != raw:
-            raise InvalidParamsError("File bytes require canonical standard base64", data={"code": "INVALID_FILE_ENCODING"})
 
 
 async def read_input(request, limit, *, rpc):
