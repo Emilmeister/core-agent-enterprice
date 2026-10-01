@@ -1,12 +1,26 @@
 import type { Session } from "./auth";
+import { byteCount } from "./types";
+
+function count(value: unknown): number | undefined {
+  const number = typeof value === "number" ? value
+    : typeof value === "string" && /^\d+$/.test(value) ? Number(value) : NaN;
+  return Number.isSafeInteger(number) && number >= 0 ? number : undefined;
+}
 
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
+    readonly data: { allowed_bytes?: number; actual_bytes?: number } = {},
   ) {
     super(
-      status === 409
+      code === "ATTACHMENTS_TOO_LARGE"
+        && data.allowed_bytes !== undefined && data.allowed_bytes > 0 && data.actual_bytes !== undefined
+        ? `Размер вложений — ${byteCount(data.actual_bytes)}; допустимо ${byteCount(data.allowed_bytes)}. Уберите файлы и повторите отправку.`
+        : (code === "REQUEST_TOO_LARGE" || status === 413)
+          && data.allowed_bytes !== undefined && data.allowed_bytes > 0 && data.actual_bytes !== undefined
+          ? `Размер сообщения — ${byteCount(data.actual_bytes)}; допустимо ${byteCount(data.allowed_bytes)}. Уменьшите сообщение и повторите отправку.`
+        : status === 409
         ? "Данные уже изменились. Показано актуальное состояние; проверьте его перед повторным действием."
         : status === 403
           ? "Нет доступа к этому действию."
@@ -49,11 +63,17 @@ export class Api {
     if (response.status === 401) this.session.expire();
     if (!response.ok) {
       const body = await response.json().catch(() => null);
+      const error = body?.error ?? body;
+      const details = error?.details ?? error?.data;
+      const info = Array.isArray(details)
+        ? details.find((detail: { "@type"?: unknown }) => detail?.["@type"] === "type.googleapis.com/google.rpc.ErrorInfo") : undefined;
+      const data = info?.metadata ?? error?.data ?? error;
       throw new ApiError(
         response.status,
-        typeof body?.error?.code === "string"
-          ? body.error.code
-          : "REQUEST_FAILED",
+        typeof info?.metadata?.code === "string" ? info.metadata.code
+          : typeof error?.code === "string" ? error.code
+          : typeof info?.reason === "string" ? info.reason : "REQUEST_FAILED",
+        { allowed_bytes: count(data?.allowed_bytes), actual_bytes: count(data?.actual_bytes) },
       );
     }
     return response;

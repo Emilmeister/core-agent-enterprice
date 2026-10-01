@@ -417,7 +417,7 @@ capture, поскольку rename меняет ctime и один stat недо�
 раз при завершении операции с verified deletion; stale preview требует обновления.
 
 History item содержит ровно `id`, `task_id`, `kind`, `text`, `status` и при
-необходимости `review`/`outcome`. `id` — стабильная server-owned identity,
+необходимости `review`/`outcome`/`attachments`. `id` — стабильная server-owned identity,
 `task_id` — root Task, `kind` — `user_message|agent_message|tool_call|tool_result|
 result|placeholder`. `status` — `available|queued|pending_guardrail|rejected|
 timed_out|unprocessed_due_to_failure|unprocessed_due_to_cancel`. `review` содержит
@@ -427,6 +427,31 @@ timed_out|unprocessed_due_to_failure|unprocessed_due_to_cancel`. `review` сод
 Error — safe code, без exception/provider text. Tool calls/results проецируются
 явно, без provider replay, hidden reasoning, auth/trace/private snapshot fields.
 Текст отображается как данные и не разрешает использование материала моделью.
+
+После публикации входящего file batch доступная запись сообщения MAY включать
+`attachments`: ordered array объектов ровно с `index`, `actual_name`,
+`relative_path`, `size_bytes`, `sha256` из сохранённого server-owned receipt.
+History заново проверяет связь batch с company, chat owner, context, Task, run
+и input sequence. Исходные имена, media metadata и bytes не возвращаются этим
+полем. Для queued, pending, excluded или rejected материала имена не раскрываются
+через history; просмотр карантина остаётся отдельным owner review API.
+
+Task metadata исходного принятого сообщения с файлами содержит `file_batch_id`
+и `file_receipt` с ровно `schema_version`, `batch_id`, `created_at`, `source`,
+`total_bytes`, `entries`.
+Успешный ACK follow-up MAY дополнительно включать `accepted_message_id` и
+`accepted_file_receipt` в response copy Task. ID должен совпадать с отправленным
+messageId; receipt берётся из canonical inbox provenance, включая dedup. Этот
+response не заменяет immutable root receipt или persisted Task history.
+
+Отказ file admission использует safe SDK ErrorInfo: `metadata.code` и при
+превышении `allowed_bytes`/`actual_bytes` как decimal strings, без file bytes,
+исходных имён или metadata. HTTP+JSON возвращает INVALID_ARGUMENT400,
+JSON-RPC — -32602 с массивом ErrorInfo в `error.data`. До SDK malformed JSON,
+повторные keys, invalid UTF-8/nesting дают REQUEST_INVALID400/-32700; compressed
+body — CONTENT_TYPE_NOT_SUPPORTED400/-32005. Независимый encoded body ceiling
+даёт REQUEST_TOO_LARGE413/RESOURCE_EXHAUSTED (JSON-RPC -32602); корректный
+base64 проверяется до SDK, company decoded aggregate — при canonical admission.
 
 История читается из полного local transcript, retained inbound rows и canonical
 previous-root chain; active summary и импортированные сообщения не копируются

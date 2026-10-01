@@ -428,6 +428,18 @@ def _project(admission, root, entry, connection, chat):
         result["kind"], result["text"] = _text(item or {})
         if kind in {"unprocessed_due_to_failure", "unprocessed_due_to_cancel"}:
             result.update(kind="placeholder", status=kind, text="[Accepted message was not processed]")
+    if result["status"] == "available" and batches:
+        service = admission.agent.chat_file_service
+        for batch_id in batches:
+            batch = service.store.get(batch_id, root["tenant_id"], connection=connection)
+            if (batch["owner_id"], batch["context_id"], batch["task_id"], batch["run_id"], batch["sequence"]) != (
+                    root["owner_id"], root["context_id"], root["task_id"], root["run_id"],
+                    message["sequence"] if message else None):
+                raise CoreError("CHECKPOINT_INVALID")
+            if batch["state"] == "published":
+                result.setdefault("attachments", []).extend({key: entry[key] for key in (
+                    "index", "actual_name", "relative_path", "size_bytes", "sha256")}
+                    for entry in batch["manifest"]["entries"])
     return result
 
 

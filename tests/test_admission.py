@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -187,11 +188,130 @@ class AuthAdmissionTests(AuthAppTestCase):
         next_record = workflow.lookup_task(next_task["id"])
         self.assertEqual(next_record.snapshot.get("previous_root_run_id"), first_record.run_id)
 
-    async def test_invalid_role_id_and_binary_parts_have_no_admission_effect(self):
-        for fields in ({"role": "ROLE_AGENT"}, {"messageId": " "}, {"parts": [{"raw": "aGVsbG8="}]}, {"parts": [{"url": "https://example.test/a"}]}):
+    async def test_invalid_role_id_and_url_have_no_effect_but_raw_is_protected_input(self):
+        for fields in ({"role": "ROLE_AGENT"}, {"messageId": " "}, {"parts": [{"url": "https://example.test/a"}]}):
             message = {"messageId": "invalid", "contextId": "invalid-chat", "role": "ROLE_USER", "parts": [{"text": "Answer"}], **fields}
             response = await self.http.post("/a2a/external/message:send", headers=self.headers("external-a"), json={"message": message})
             self.assertIn(response.status_code, (400, 415), response.text)
+        listing = await self.http.get("/a2a/external/tasks", headers=self.headers("external-a"))
+        self.assertEqual(listing.json().get("tasks", []), [])
+        self.assertEqual(len(self.model.calls), 0)
+        response = await self.send("valid-file", "invalid-chat", parts=[
+            {"raw": "aGVsbG8=", "filename": "incoming.txt", "mediaType": "text/plain"}])
+        self.assertEqual(response.status_code, 200, response.text)
+        task = response.json()["task"]
+        receipt = task["metadata"]["file_receipt"]
+        self.assertEqual(receipt["entries"][0]["actual_name"], "incoming.txt")
+        batch = self.app.state.core_agent.chat_file_service.store.get(receipt["batch_id"], self.context().tenant)
+        self.assertEqual(batch["state"], "published")
+        self.assertEqual(batch["owner_id"], self.context().user.user_name)
+        self.assertEqual(len(self.model.calls), 1)
+
+    async def file_transport(self, binding, message, *, token="external-a"):
+        kind = "owner" if token.startswith("owner") else "external"
+        params = {"message": message}
+        rpc = not binding.startswith("/")
+        body = {"jsonrpc": "2.0", "id": "files-rpc", "method": binding, "params": params} if rpc else params
+        response = await self.http.post(f"/a2a/{kind}{'/' if rpc else binding}", headers=self.headers(token), json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        if "stream" in binding.lower():
+            frames = [json.loads(line[5:]) for line in response.text.splitlines() if line.startswith("data:")]
+            frame = frames[0]["result"] if rpc else frames[0]
+            return frame["task"]
+        return (response.json()["result"] if rpc else response.json())["task"]
+
+    async def test_file_roots_all_bindings_keep_receipts_after_limit_change_and_rotation(self):
+        agent, context = self.app.state.core_agent, self.context()
+        store = agent.interaction_store
+        settings_values = {"hitl_timeout_seconds": 86400, "owner_answer_timeout_seconds": 86400,
+                           "guardrails_timeout_seconds": 86400, "attachment_limit_bytes": 25000000}
+        for index, binding in enumerate(("/message:send", "/message:stream", "SendMessage", "SendStreamingMessage")):
+            store.update_settings(context.tenant, settings_values, store.get_settings(context.tenant).revision)
+            parts = [{"raw": base64.b64encode(raw).decode(), "filename": "report.txt", "mediaType": "text/plain"}
+                     for raw in (b"first report", b"second report")]
+            if index % 2:
+                parts.insert(0, {"text": "Read both files"})
+            message = {"messageId": f"file-root-{index}", "contextId": f"file-chat-{index}", "role": "ROLE_USER", "parts": parts}
+            first = await self.file_transport(binding, message)
+            receipt = first["metadata"]["file_receipt"]
+            self.assertEqual([entry["actual_name"] for entry in receipt["entries"]], ["report.txt", "report_2.txt"])
+            batch = agent.chat_file_service.store.get(receipt["batch_id"], context.tenant)
+            self.assertEqual((batch["owner_id"], batch["context_id"], batch["state"]),
+                             (context.user.user_name, message["contextId"], "published"))
+            model_calls = len(self.model.calls)
+            store.update_settings(context.tenant, {**settings_values, "attachment_limit_bytes": 1}, store.get_settings(context.tenant).revision)
+            repeated = await self.file_transport(binding, message, token="external-a-replaced")
+            self.assertEqual(repeated["id"], first["id"])
+            self.assertEqual(repeated["metadata"]["file_receipt"], receipt)
+            self.assertEqual(len(self.model.calls), model_calls)
+            denied = await self.http.get(f"/a2a/external/tasks/{first['id']}", headers=self.headers("external-b"))
+            self.assertEqual(denied.status_code, 404)
+            owner = await self.http.get(f"/a2a/owner/tasks/{first['id']}", headers=self.headers("owner-b"))
+            self.assertEqual(owner.json()["metadata"]["file_receipt"], receipt)
+        store.update_settings(context.tenant, settings_values, store.get_settings(context.tenant).revision)
+        owner_message = {"messageId": "owner-files", "contextId": "file-chat-0", "role": "ROLE_USER",
+                         "parts": [{"raw": "bmV3", "filename": "report.txt", "mediaType": "text/plain"}]}
+        owner_task = await self.file_transport("/message:send", owner_message, token="owner-a")
+        owner_receipt = owner_task["metadata"]["file_receipt"]
+        owner_batch = agent.chat_file_service.store.get(owner_receipt["batch_id"], context.tenant)
+        self.assertEqual(owner_batch["owner_id"], context.user.user_name)
+        self.assertEqual(owner_receipt["entries"][0]["actual_name"], "report_3.txt")
+
+    async def test_file_followups_all_bindings_ack_original_receipts_while_model_is_blocked(self):
+        started, release = self.block_model()
+        agent, context = self.app.state.core_agent, self.context()
+        values = {"hitl_timeout_seconds": 86400, "owner_answer_timeout_seconds": 86400,
+                  "guardrails_timeout_seconds": 86400, "attachment_limit_bytes": 25000000}
+        for index, binding in enumerate(("/message:send", "/message:stream", "SendMessage", "SendStreamingMessage")):
+            started.clear()
+            release.clear()
+            agent.interaction_store.update_settings(context.tenant, values, agent.interaction_store.get_settings(context.tenant).revision)
+            root = (await self.send(f"file-active-{index}", f"file-active-chat-{index}", immediate=True)).json()["task"]
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            parts = [{"raw": "YWJj", "filename": "follow.txt", "mediaType": "text/plain"}]
+            if index % 2:
+                parts.insert(0, {"text": "Use this additional file"})
+            message = {"messageId": f"file-follow-{index}", "taskId": root["id"], "contextId": root["contextId"],
+                       "role": "ROLE_USER", "parts": parts}
+            accepted = await self.file_transport(binding, message)
+            metadata = accepted["metadata"]
+            self.assertEqual(metadata["accepted_message_id"], message["messageId"])
+            receipt = metadata["accepted_file_receipt"]
+            batch = agent.chat_file_service.store.get(receipt["batch_id"], context.tenant)
+            self.assertEqual(batch["state"], "accepted_quarantine")
+            before = len(self.model.calls)
+            agent.interaction_store.update_settings(context.tenant, {**values, "attachment_limit_bytes": 1}, agent.interaction_store.get_settings(context.tenant).revision)
+            again = await self.file_transport(binding, message, token="external-a-replaced")
+            self.assertEqual(again["metadata"]["accepted_file_receipt"], receipt)
+            self.assertEqual(len(self.model.calls), before)
+            stored = await self.http.get(f"/a2a/external/tasks/{root['id']}", headers=self.headers("external-a"))
+            self.assertNotIn("accepted_file_receipt", stored.json().get("metadata", {}))
+            await self.finish_workers()
+            batch = agent.chat_file_service.store.get(receipt["batch_id"], context.tenant)
+            self.assertEqual(batch["state"], "published")
+
+    async def test_invalid_second_file_and_aggregate_oversize_have_no_admission_effect(self):
+        context = self.context()
+        agent = self.app.state.core_agent
+        settings = agent.interaction_store.get_settings(context.tenant)
+        agent.interaction_store.update_settings(context.tenant, {"hitl_timeout_seconds": 86400,
+            "owner_answer_timeout_seconds": 86400, "guardrails_timeout_seconds": 86400,
+            "attachment_limit_bytes": 7}, settings.revision)
+        for binding in ("/message:send", "/message:stream", "SendMessage", "SendStreamingMessage"):
+            for index, raw in enumerate(("YR==", "MTIzNDU=")):
+                message = {"messageId": f"bad-files-{binding}-{index}", "contextId": "reject-files", "role": "ROLE_USER",
+                           "parts": [{"text": "Do not deliver"}, {"raw": "MTIzNA==", "filename": "first.txt", "mediaType": "text/plain"},
+                                     {"raw": raw, "filename": "second.txt", "mediaType": "text/plain"}]}
+                rpc = not binding.startswith("/")
+                payload = {"message": message}
+                body = {"jsonrpc": "2.0", "id": "bad", "method": binding, "params": payload} if rpc else payload
+                response = await self.http.post(f"/a2a/external{'/' if rpc else binding}", headers=self.headers("external-a"), json=body)
+                self.assertEqual(response.status_code, 200 if rpc else 400, response.text)
+                error = response.json()["error"]
+                info = (error["data"] if rpc else error["details"])[0]["metadata"]
+                self.assertEqual(info["code"], "INVALID_FILE_ENCODING" if index == 0 else "ATTACHMENTS_TOO_LARGE")
+                if index:
+                    self.assertEqual((info["allowed_bytes"], info["actual_bytes"]), ("7", "9"))
         listing = await self.http.get("/a2a/external/tasks", headers=self.headers("external-a"))
         self.assertEqual(listing.json().get("tasks", []), [])
         self.assertEqual(len(self.model.calls), 0)

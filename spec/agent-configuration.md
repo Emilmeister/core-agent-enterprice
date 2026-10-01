@@ -214,6 +214,7 @@ storage/dispatch без persistent key запрещён, даже в development
 | `A2A_CAPABILITIES` | `streaming,push_notifications,tool_calling,multi_turn` | MAY только сужать реально реализованное. Неизвестное значение завершает startup с `CONFIG_INVALID`. На Agent Card влияют только `streaming` и `push_notifications`; остальные два принимаются для совместимости схемы |
 | `A2A_STREAMING_ENABLED` | `true` | Выключение убирает промежуточные кадры и отключает streaming-режим запроса к модели |
 | `A2A_STREAMING_BUFFER_SIZE` | `10` | Символов роста до следующего кумулятивного снимка |
+| `A2A_MAX_REQUEST_BYTES` | `40000000` | Deployment ceiling encoded HTTP body перед SDK/protobuf; integer 524288–2147483647. Учитывает JSON/base64 целиком, не является decoded company attachment limit; неверное значение — `CONFIG_INVALID` |
 
 ### Runtime и лимиты ответа
 

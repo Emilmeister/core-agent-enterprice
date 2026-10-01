@@ -2,8 +2,8 @@ import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
 import { scheduleTime } from "./Schedules";
 import { InteractionCard } from "./Interactions";
-import { mergeHistoryPage } from "./types";
-import type { HistoryItem, HistoryPage, Interaction } from "./types";
+import { byteCount, mergeHistoryPage } from "./types";
+import type { AttachmentEntry, HistoryItem, HistoryPage, Interaction } from "./types";
 
 const empty: HistoryPage = { items: [], next_cursor: null };
 const statusLabels: Record<HistoryItem["status"], string> = {
@@ -163,6 +163,16 @@ export function useChatHistory(api: Api, contextId?: string) {
   return { page, waits, loading, error, load };
 }
 
+export function Attachments({ entries }: { entries: AttachmentEntry[] }) {
+  return <ul className="message-attachments" aria-label="Принятые вложения">
+    {entries.map((entry) => <li key={entry.index}>
+      <strong>{entry.actual_name}</strong>
+      <span className="muted">{entry.relative_path}</span>
+      <span className="muted">{byteCount(entry.size_bytes)}</span>
+    </li>)}
+  </ul>;
+}
+
 function Entry({ item }: { item: HistoryItem }) {
   if (item.kind === "schedule_notice") {
     const reasons: Record<string, string> = {
@@ -209,6 +219,7 @@ function Entry({ item }: { item: HistoryItem }) {
       {statusLabels[item.status] && (
         <p className="muted history-status">{statusLabels[item.status]}</p>
       )}
+      {item.status === "available" && item.attachments?.length ? <Attachments entries={item.attachments} /> : null}
       {item.outcome && (
         <p className="muted history-status">
           {outcomes[item.outcome.state] ?? "Задача завершена"}

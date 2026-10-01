@@ -8,6 +8,36 @@ export interface ChatRow {
   latest_task_id: string | null;
   active: boolean;
 }
+export interface AttachmentEntry {
+  index: number;
+  actual_name: string;
+  relative_path: string;
+  size_bytes: number;
+  sha256: string;
+}
+export interface FileReceipt {
+  schema_version: 1;
+  batch_id: string;
+  created_at: number;
+  source: string;
+  total_bytes: number;
+  entries: AttachmentEntry[];
+}
+export const byteCount = (bytes: number) => `${new Intl.NumberFormat("ru-RU").format(bytes)} байт`;
+export function fileReceipt(value: unknown): FileReceipt | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const receipt = value as FileReceipt;
+  if (receipt.schema_version !== 1 || typeof receipt.batch_id !== "string" || !receipt.batch_id
+    || !Number.isFinite(receipt.created_at) || typeof receipt.source !== "string"
+    || !Number.isSafeInteger(receipt.total_bytes) || receipt.total_bytes < 0
+    || !Array.isArray(receipt.entries) || !receipt.entries.length
+    || receipt.entries.some((entry) => !entry || typeof entry !== "object"
+      || !Number.isSafeInteger(entry.index) || entry.index < 0
+      || typeof entry.actual_name !== "string" || typeof entry.relative_path !== "string"
+      || !Number.isSafeInteger(entry.size_bytes) || entry.size_bytes < 0
+      || typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(entry.sha256))) return undefined;
+  return receipt;
+}
 export interface HistoryItem {
   id: string;
   task_id: string | null;
@@ -36,6 +66,7 @@ export interface HistoryItem {
   through?: string | null;
   created_at?: string;
   review?: { wait_id: string };
+  attachments?: AttachmentEntry[];
   outcome?: {
     state: string;
     complete?: boolean;
@@ -76,6 +107,8 @@ export interface Part {
   metadata?: Record<string, unknown>;
   raw?: string;
   url?: string;
+  filename?: string;
+  mediaType?: string;
 }
 export interface Message {
   messageId: string;
@@ -83,6 +116,7 @@ export interface Message {
   parts: Part[];
   taskId?: string;
   contextId?: string;
+  metadata?: Record<string, unknown>;
 }
 export interface Task {
   id: string;

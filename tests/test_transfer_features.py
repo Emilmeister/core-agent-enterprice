@@ -690,7 +690,8 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertNotIn("error", result)
                 self.assertEqual(result["result"]["task"]["contextId"], "ctx-a")
-                self.assertIn("contextId", logs.output[0])
+                self.assertIn("unknown JSON-RPC fields", logs.output[0])
+                self.assertNotIn("contextId", logs.output[0])
 
                 # Only outside: accepted, but never promoted to a session id.
                 result = await send(envelope("2", {"contextId": "ctx-b"}))

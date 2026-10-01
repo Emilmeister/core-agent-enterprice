@@ -170,7 +170,7 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/remote_registry.py` | Company-scoped immutable peer revisions, CAS, encrypted credentials и безопасные metadata для owner API |
 | `core_agent/guardrails.py` | Ограниченный classifier без tools, отдельный context и deployment-configured model adapter |
 | `core_agent/material_reviews.py` | Private material decisions, detector budget и атомарная связь с guardrail waits |
-| `core_agent/chat_files.py` | Private file batches, scoped extraction/download, runtime publication barrier и bounded orphan sweep; binary admission пока закрыт |
+| `core_agent/chat_files.py` | Private file batches, scoped extraction/download, runtime publication barrier, bounded orphan sweep и atomic raw FilePart admission |
 | `core_agent/runtime.py` | Agent loop, workflow continuation, recovery, tool handlers и delegation |
 | `core_agent/config.py` | RunRequest, Platform/Agent/EffectiveConfig и capability intersection |
 | `core_agent/a2a.py` | Внутренние A2A contract types и Task representation |
@@ -257,8 +257,8 @@ Target spec может описывать больше текущего runtime.
 - Initial Message, Task, chat mapping, request ledger и workflow записываются
   одной PostgreSQL транзакцией до запуска SDK. Shutdown или потеря stream
   после commit оставляет Task для recovery. Legacy context без явного mapping
-  не присваивается новому caller. Enterprise binary Parts пока отклоняются до
-  admission, пока не пройден native sandbox gate.
+  не присваивается новому caller. Enterprise raw FileParts проходят bounded
+  pre-SDK validation и atomic file admission; URL Parts отклоняются.
 - Внутренний file admission выполняет preflight под canonical locks, освобождает
   соединение до settings/staging и повторяет проверки при commit. Bind batch
   входит в root/inbox transaction; нет вложенного захвата PostgreSQL pool.
@@ -604,6 +604,14 @@ run получает отдельные MCP session и negotiated version; пе�
 - `attachment_limit_bytes` в company settings задаёт общий decoded aggregate
   лимит вложений (default 25 000 000). Timeout-only PUT сохраняет прежний лимит;
   принятые manifests не пересматриваются при его изменении.
+- `A2A_MAX_REQUEST_BYTES` отдельно ограничивает encoded HTTP body до SDK
+  (default 40 000 000 bytes). Для большего company limit deployment ceiling
+  увеличивается с учётом JSON/base64 overhead; старый принятый dedup не зависит
+  от нового company limit. Raw FileParts доступны на owner/external routes;
+  файлы публикуются только после полного batch guardrail решения.
+- Доступные owner history messages после file publication содержат только
+  actual name/path/size/digest из scoped batch. Quarantine/excluded names не
+  раскрываются через history; bytes и исходная metadata остаются в private store.
 - File guardrail download `/api/guardrails/{wait_id}/file` получает точный
   sealed reference из сохранённого review, возвращает только owner-scoped
   проверенные bytes как attachment и остаётся доступен для owner history.
@@ -612,7 +620,7 @@ run получает отдельные MCP session и negotiated version; пе�
   `GUARDRAILS_LLM_*` overrides требуют полного набора и не наследуют credentials
   основной модели. Detector имеет отдельные time/token/call limits; его tools
   всегда пусты. File quarantine подключён к внутреннему canonical admission;
-  public binary transport остаётся закрыт до native sandbox proof.
+  public raw FileParts принимаются через scoped admission после native sandbox proof.
 - Initial/follow-up input, owner answers, tool args/results, background и nested
   Python проходят runtime material gates. Известный результат сохраняется до
   review; возобновление раскрывает его без повторного dispatch. Pending nested

@@ -6,16 +6,40 @@ import {
   useState,
 } from "react";
 import { Api, ApiError, errorText } from "./api";
-import { History, useChatHistory } from "./History";
+import { Attachments, History, useChatHistory } from "./History";
 import { WorkspaceFiles } from "./WorkspaceFiles";
 import {
   remoteProgress,
+  byteCount,
+  fileReceipt,
   remoteStates,
   states,
   terminal,
   textParts,
 } from "./types";
-import type { ChatRow, Message, Task } from "./types";
+import type { ChatRow, FileReceipt, Message, Part, Settings, Task } from "./types";
+
+function settingsLimit(settings: Settings): number {
+  const value = settings.attachment_limit_bytes;
+  if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error("Invalid attachment limit");
+  return value;
+}
+
+function readFile(file: File, reader: FileReader): Promise<Part> {
+  return new Promise((resolve, reject) => {
+    reader.onerror = reader.onabort = () => reject(new Error("File read failed"));
+    reader.onload = () => {
+      const result = reader.result;
+      const comma = typeof result === "string" ? result.indexOf(",") : -1;
+      if (typeof result !== "string" || comma < 0 || !result.slice(0, comma).endsWith(";base64")) {
+        reject(new Error("Invalid file encoding"));
+        return;
+      }
+      resolve({ raw: result.slice(comma + 1), filename: file.name, mediaType: file.type || "application/octet-stream" });
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 export function Chat({
   api,
@@ -30,6 +54,10 @@ export function Chat({
 }) {
   const [task, setTask] = useState<Task>();
   const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState<File[]>([]);
+  const [attachmentLimit, setAttachmentLimit] = useState(25_000_000);
+  const [limitConfirmed, setLimitConfirmed] = useState(false);
+  const [acceptedFiles, setAcceptedFiles] = useState<FileReceipt>();
   const [pending, setPending] = useState<{
     message: Message;
     configuration: { returnImmediately: true };
@@ -53,6 +81,8 @@ export function Chat({
     filesButton.current?.focus();
   };
   const filesButton = useRef<HTMLButtonElement>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const fileReader = useRef<FileReader>(null);
   const mounted = useRef(true);
   const observedRoot = useRef(row?.latest_task_id);
   const view = useRef({
@@ -76,6 +106,7 @@ export function Chat({
           terminal: false,
         };
         setTask(undefined);
+        setAcceptedFiles(undefined);
         setCancelConfirm(false);
       }
     }
@@ -90,6 +121,7 @@ export function Chat({
     if (view.current.taskId !== next.id) {
       view.current.revision++;
       setCancelConfirm(false);
+      setAcceptedFiles(undefined);
     }
     view.current.taskId = next.id;
     view.current.terminal = terminal(next);
@@ -103,10 +135,21 @@ export function Chat({
     mounted.current = true;
     return () => {
       mounted.current = false;
+      fileReader.current?.abort();
     };
   }, []);
   useEffect(() => {
-    const dirty = !!draft || !!pending || busy || filesDirty;
+    const abort = new AbortController();
+    void api.json<Settings>("/api/settings", "GET", undefined, abort.signal).then((settings) => {
+      if (!abort.signal.aborted) {
+        setAttachmentLimit(settingsLimit(settings));
+        setLimitConfirmed(true);
+      }
+    }).catch(() => {});
+    return () => abort.abort();
+  }, [api]);
+  useEffect(() => {
+    const dirty = !!draft || attachments.length > 0 || !!pending || busy || filesDirty;
     onDirty(dirty);
     const warn = (event: BeforeUnloadEvent) => {
       event.preventDefault();
@@ -117,7 +160,9 @@ export function Chat({
       window.removeEventListener("beforeunload", warn);
       onDirty(false);
     };
-  }, [draft, pending, busy, filesDirty, onDirty]);
+  }, [draft, attachments, pending, busy, filesDirty, onDirty]);
+  const attachmentBytes = attachments.reduce((sum, file) => sum + file.size, 0);
+  const acceptedReceipt = acceptedFiles ?? fileReceipt(task?.metadata?.file_receipt);
   const taskId = task?.id ?? row?.latest_task_id;
   const refresh = useCallback(
     async (signal?: AbortSignal, reloadHistory = false) => {
@@ -200,24 +245,56 @@ export function Chat({
   }, []);
 
   async function send() {
-    if (busy || (!draft.trim() && !pending) || (!pending && row?.latest_task_id && !task))
+    if (busy || (!draft.trim() && !attachments.length && !pending) || (!pending && row?.latest_task_id && !task))
       return;
-    const body = pending ?? {
-      message: {
-        role: "ROLE_USER",
-        messageId: crypto.randomUUID(),
-        parts: [{ text: draft }],
-        ...(row?.context_id ? { contextId: row.context_id } : {}),
-        ...(task && !terminal(task) ? { taskId: task.id } : {}),
-      },
-      configuration: { returnImmediately: true as const },
-    };
-    if (!pending) pendingRevision.current = view.current.revision;
-    const revision = pendingRevision.current;
-    setPending(body);
+    const revision = pending ? pendingRevision.current : view.current.revision;
+    const previousBatch = fileReceipt(task?.metadata?.file_receipt)?.batch_id;
     setBusy(true);
     setError("");
     try {
+      let body = pending;
+      if (!body) {
+        const parts: Part[] = draft.trim() ? [{ text: draft }] : [];
+        if (attachments.length) {
+          let limit: number;
+          try {
+            limit = settingsLimit(await api.json<Settings>("/api/settings"));
+            if (!mounted.current) return;
+            setAttachmentLimit(limit);
+            setLimitConfirmed(true);
+          } catch {
+            if (mounted.current) setError("Не удалось проверить лимит вложений. Сообщение и файлы сохранены. Повторите отправку.");
+            return;
+          }
+          if (attachmentBytes > limit) {
+            setError(errorText(new ApiError(413, "ATTACHMENTS_TOO_LARGE", { allowed_bytes: limit, actual_bytes: attachmentBytes })));
+            return;
+          }
+          try {
+            for (const file of attachments) {
+              const reader = new FileReader();
+              fileReader.current = reader;
+              parts.push(await readFile(file, reader));
+              if (!mounted.current) return;
+            }
+          } catch {
+            if (mounted.current) setError("Не удалось прочитать вложения. Сообщение и выбранные файлы сохранены; отправка не началась.");
+            return;
+          } finally {
+            fileReader.current = null;
+          }
+        }
+        body = {
+          message: {
+            role: "ROLE_USER", messageId: crypto.randomUUID(), parts,
+            ...(row?.context_id ? { contextId: row.context_id } : {}),
+            ...(task && !terminal(task) ? { taskId: task.id } : {}),
+          },
+          configuration: { returnImmediately: true },
+        };
+        pendingRevision.current = revision;
+        setPending(body);
+      }
       const result = await api.json<{ task?: Task; message?: Message }>(
         "/a2a/owner/message:send",
         "POST",
@@ -226,6 +303,7 @@ export function Chat({
       if (!mounted.current) return;
       if (!result.task && !result.message) throw new Error("Missing result");
       setDraft("");
+      setAttachments([]);
       setPending(undefined);
       stickToBottom.current = true;
       if (revision !== view.current.revision) {
@@ -238,6 +316,10 @@ export function Chat({
         if (result.task.id === taskId) await refresh();
       } else if (result.message)
         setDirectAnswer(textParts(result.message.parts));
+      const metadata = result.task?.metadata ?? result.message?.metadata;
+      const receipt = fileReceipt(metadata?.accepted_message_id === body.message.messageId
+        ? metadata.accepted_file_receipt : metadata?.file_receipt);
+      if (receipt && receipt.batch_id !== previousBatch) setAcceptedFiles(receipt);
     } catch (failure) {
       if (!mounted.current) return;
       if (
@@ -358,6 +440,10 @@ export function Chat({
             <p className="prose">{directAnswer}</p>
           </article>
         )}
+        {acceptedReceipt && <div className="accepted-attachments" role="status">
+          <p className="muted">Вложения приняты · папка attachments/{acceptedReceipt.batch_id}</p>
+          <Attachments entries={acceptedReceipt.entries} />
+        </div>}
         {error && (
           <p className="error" role="alert">
             {error}
@@ -372,6 +458,29 @@ export function Chat({
             void send();
           }}
         >
+          <input ref={fileInput} type="file" multiple className="sr-only" tabIndex={-1}
+            aria-label="Выбрать вложения" disabled={busy || !!pending}
+            onChange={(event) => {
+              if (!busy && !pending) {
+                const chosen = Array.from(event.target.files ?? []);
+                setAttachments((current) => [...current, ...chosen]);
+                setError("");
+              }
+              event.target.value = "";
+            }} />
+          {attachments.length > 0 && <ul className="composer-attachments" aria-label="Выбранные вложения">
+            {attachments.map((file, index) => <li key={index}>
+              <span className="attachment-name" title={file.name}>{file.name}</span>
+              <span className="muted">{byteCount(file.size)}</span>
+              <button type="button" className="text-button" disabled={busy || !!pending}
+                aria-label={`Удалить ${file.name} из вложений`}
+                onClick={() => { setAttachments((current) => current.filter((_, position) => position !== index)); setError(""); }}>×</button>
+            </li>)}
+          </ul>}
+          <p className={`attachment-summary muted ${attachmentBytes > attachmentLimit ? "attachment-limit" : ""}`} id="attachment-summary" aria-live="polite">
+            {attachments.length > 0 && `Файлов: ${attachments.length} · ${byteCount(attachmentBytes)} · `}
+            Лимит {byteCount(attachmentLimit)}{!limitConfirmed && " по умолчанию"}
+          </p>
           <label className="sr-only" htmlFor="message">
             Сообщение агенту
           </label>
@@ -398,10 +507,14 @@ export function Chat({
             rows={2}
           />
           <div className="composer-actions">
-            <span className="muted">Shift+Enter — новая строка</span>
+            <div className="composer-tools">
+              <button type="button" className="secondary attach-button" aria-describedby="attachment-summary"
+                disabled={busy || !!pending} onClick={() => fileInput.current?.click()}>Прикрепить файлы</button>
+              <span className="muted">Shift+Enter — новая строка</span>
+            </div>
             <button
               disabled={
-                busy || (!pending && (!draft.trim() || (!!row?.latest_task_id && !task)))
+                busy || (!pending && ((!draft.trim() && !attachments.length) || (!!row?.latest_task_id && !task)))
               }
             >
               {busy

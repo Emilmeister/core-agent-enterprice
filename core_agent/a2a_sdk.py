@@ -62,6 +62,7 @@ from .a2a import (
     parse_run_request,
 )
 from .auth import OWNER_SCOPE, ScopeUser, is_company_owner
+from .a2a_input import input_error_response, protect_sdk_logs, read_input, request_limit
 from .database import REMOTE_PROGRESS_KEY, reconcile_remote_progress, reconcile_workflow_task
 from .errors import CoreError
 from .workflow import SuspendedRun
@@ -403,23 +404,23 @@ def _strip_envelope(payload):
     extra = frozenset(payload) - frozenset(JSONRPC_ENVELOPE_FIELDS)
     if not extra:
         return payload
-    if extra not in _reported_extra_fields and len(_reported_extra_fields) < 32:
-        _reported_extra_fields.add(extra)
+    marker = hash(extra)
+    if marker not in _reported_extra_fields and len(_reported_extra_fields) < 32:
+        _reported_extra_fields.add(marker)
         logging.getLogger("core_agent.runtime").warning(
-            "ignoring unknown JSON-RPC fields %s; they are not interpreted",
-            ",".join(sorted(extra)),
+            "ignoring %s unknown JSON-RPC fields; they are not interpreted",
+            len(extra),
         )
     return {name: payload[name] for name in payload if name not in extra}
 
 
-def _tolerant_envelope(endpoint):
+def _input_guard(endpoint, limit, *, rpc):
     async def wrapper(request):
-        body = await request.body()
         try:
-            payload = json.loads(body)
-        except ValueError:
-            return await endpoint(request)
-        cleaned = _strip_envelope(payload)
+            body, payload = await read_input(request, limit, rpc=rpc)
+        except A2AError as error:
+            return input_error_response(error, rpc=rpc, request_id=getattr(error, "request_id", None))
+        cleaned = _strip_envelope(payload) if rpc else payload
         if cleaned == payload:
             return await endpoint(Request(request.scope, _replay(body)))
         return await endpoint(
@@ -427,6 +428,18 @@ def _tolerant_envelope(endpoint):
         )
 
     return wrapper
+
+
+def _file_input_error(error):
+    data = {"code": error.code}
+    for name in ("allowed_bytes", "actual_bytes"):
+        value = error.data.get(name)
+        if type(value) is int and 0 <= value < 2**63:
+            data[name] = str(value)
+    return InvalidParamsError("File input was rejected", data=data)
+
+
+FILE_INPUT_ERRORS = frozenset({"INVALID_FILE_INPUT", "INVALID_FILE_ENCODING", "FILE_METADATA_TOO_LARGE", "ATTACHMENTS_TOO_LARGE"})
 
 
 def _replay(body):
@@ -868,7 +881,7 @@ class CoreRequestHandler(DefaultRequestHandler):
             return
         if not message.message_id.strip() or message.role != SdkRole.ROLE_USER:
             raise InvalidParamsError("A nonempty messageId and ROLE_USER are required")
-        if any(part.HasField("raw") or part.HasField("url") for part in message.parts):
+        if any(part.HasField("url") for part in message.parts):
             raise ContentTypeNotSupportedError()
 
     async def _admit_root(self, params, context):
@@ -876,6 +889,8 @@ class CoreRequestHandler(DefaultRequestHandler):
         try:
             admitted = await self.admission_handler(params.message, context)
         except CoreError as error:
+            if error.code in FILE_INPUT_ERRORS:
+                raise _file_input_error(error) from None
             if error.code == "WORKSPACE_CLEANUP_PENDING":
                 raise WorkspaceCleanupPendingError(data={"code": error.code, "retryable": "true"}) from None
             raise
@@ -924,10 +939,12 @@ class CoreRequestHandler(DefaultRequestHandler):
             params.message, context_id=task.context_id
         )
         try:
-            await asyncio.to_thread(self.followup_handler, message, task, context,
+            receipt = await asyncio.to_thread(self.followup_handler, message, task, context,
                 **({"original_message": params.message} if self.admission_handler else {}))
         except Exception as error:
             code = getattr(error, "code", None)
+            if isinstance(error, CoreError) and code in FILE_INPUT_ERRORS:
+                raise _file_input_error(error) from None
             if code == "TASK_NOT_FOUND":
                 raise TaskNotFoundError(message=f"Task {task_id} not found") from None
             if code in {"TASK_TERMINAL", "INVALID_TASK_STATE"}:
@@ -937,6 +954,14 @@ class CoreRequestHandler(DefaultRequestHandler):
             if code in {"INVALID_REQUEST", "MESSAGE_ID_CONFLICT"}:
                 raise InvalidParamsError(message=str(error), data={"code": code}) from None
             raise
+        if self.admission_handler and isinstance(receipt, dict):
+            file_receipt = receipt.get("provenance", {}).get("file_receipt")
+            if file_receipt is not None:
+                response = type(task)()
+                response.CopyFrom(task)
+                response.metadata.update({"accepted_message_id": params.message.message_id,
+                                          "accepted_file_receipt": file_receipt})
+                task = response
         return apply_history_length(task, params.configuration)
 
     @validate_request_params
@@ -1086,6 +1111,8 @@ def build_starlette_app(
     max_chunk_size=0,
 ):
     """Build the official A2A 1.0 JSON-RPC and HTTP+JSON bindings around the runtime."""
+    limit = request_limit()
+    protect_sdk_logs()
     sdk_card = to_sdk_agent_card(agent_card, base_url=base_url)
     request_handler = CoreRequestHandler(
         CoreAgentExecutor(
@@ -1112,10 +1139,14 @@ def build_starlette_app(
         request_handler, DEFAULT_RPC_URL, context_builder=context_builder
     ):
         # A client that also repeats a field outside `params` must not be rejected.
-        route.endpoint = _tolerant_envelope(route.endpoint)
+        route.endpoint = _input_guard(route.endpoint, limit, rpc=True)
         route.app = request_response(route.endpoint)
         routes.append(route)
-    routes.extend(create_rest_routes(request_handler, context_builder=context_builder))
+    for route in create_rest_routes(request_handler, context_builder=context_builder):
+        if route.path in {"/message:send", "/message:stream"}:
+            route.endpoint = _input_guard(route.endpoint, limit, rpc=False)
+            route.app = request_response(route.endpoint)
+        routes.append(route)
     lifespan = None
     if push_sender or shutdown_handler:
 

@@ -303,6 +303,18 @@ nonterminal input принимается до terminal commit, публикац�
 - [ ] Проверить root text+files, files-only и follow-up text+files через обе authenticated A2A routes; внешнему B неизвестны files/chat A, owner сохраняет external execution owner. URL input по-прежнему отказан без trusted resolver.
 - [ ] Выполнить `uv run python -m unittest tests.test_admission tests.test_auth tests.test_end_to_end tests.test_postgres_persistence -v`. Только после прохода real decision и hostile sandbox gates убрать temporary enterprise binary rejection.
 
+Проверенный срез 1 октября 2026: mandatory native ARM64 Kubernetes sandbox
+прошёл все 12 тестов без skips; после этого открыт приём inline raw Parts на
+owner/external HTTP+JSON и JSON-RPC Send/SendStreaming routes. URL Parts остаются
+отклонёнными. Pre-SDK guard проверяет encoded body, JSON и canonical base64 до
+admission. Targeted ingress/admission/auth/file/guardrail/transfer suite прошёл
+308 тестов с реальным PostgreSQL без skips. Owner history показывает только
+опубликованные безопасные attachment receipts; 38 history tests прошли на
+PostgreSQL. UI multiple-file picker и immutable retry проверены 11 сценариями
+в Chromium с контролируемым API. Полный browser + Keycloak + Linux backend
+сценарий ещё не подтверждён; native AMD64 и целевой CSI остаются отдельными gates.
+Эти результаты не закрывают исходящие files и migration/cutover следующего шага.
+
 ### 5. Реализовать final-file selection и полный A2A/remote transport
 
 **Files:** `core_agent/app.py`, `core_agent/runtime.py`, `core_agent/config.py`, `core_agent/kernel.py`, `core_agent/a2a.py`, `core_agent/a2a_sdk.py`, `core_agent/artifacts.py`, `core_agent/remote_agents.py`, `core_agent/chat_files.py`; tests `test_transfer_features.py`, `test_python_exec.py`, `test_end_to_end.py`, `test_runtime_observability.py`.

@@ -1,5 +1,6 @@
 """Owner history projects canonical roots and retained input without executing them."""
 import base64
+import asyncio
 import copy
 import hashlib
 import json
@@ -11,8 +12,12 @@ from unittest.mock import patch
 from urllib.parse import quote
 
 from psycopg.types.json import Jsonb
+from a2a.types import Message, Role
+from google.protobuf.json_format import MessageToDict
 
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
+from core_agent.a2a_sdk import CoreAgentExecutor
+from core_agent.workflow import SuspendedRun
 from tests import test_admission as admission_tests
 from tests.test_auth import AuthAppTestCase, TEST_DATABASE_URL
 
@@ -374,6 +379,73 @@ class OwnerHistoryTests(AuthAppTestCase):
             expected = {"state": state, **({"complete": False, "completion_reason": "budget_exhausted"} if result else {"error_code": error})}
             self.assertEqual(finals[0]["outcome"], expected)
             self.assertNotIn("PRIVATE_RESULT", response.text)
+
+    async def test_published_input_files_persist_in_owner_history_without_private_metadata(self):
+        agent = self.app.state.core_agent
+        context = admission_tests.AuthAdmissionTests.context(self, "external-a")
+        message = Message(message_id="history-files", context_id="history", role=Role.ROLE_USER,
+            parts=[{"text": "Read attached reports"},
+                {"raw": b"report", "filename": "report.txt", "media_type": "text/plain"},
+                {"raw": b"second report", "filename": "report.txt", "media_type": "text/plain"}])
+        message.parts[1].metadata.update({"private_name": "PRIVATE_TRANSPORT_METADATA"})
+        admitted = await self.app.state.a2a_request_handler.admission_handler(message, context)
+        followup = Message(message_id="history-followup-files", context_id="history",
+            task_id=admitted.task.id, role=Role.ROLE_USER,
+            parts=[{"text": "Read this too"}, {"raw": b"followup", "filename": "followup.txt"}])
+        inbound = await asyncio.to_thread(self.app.state.a2a_request_handler.followup_handler,
+            CoreAgentExecutor._from_sdk_message(followup, context_id="history"), admitted.task,
+            context, original_message=followup)
+        before = await self.history()
+        self.assertEqual(before.status_code, 200, before.text)
+        self.assertTrue(before.json()["items"])
+        self.assertTrue(all("attachments" not in item for item in before.json()["items"]))
+        await asyncio.to_thread(agent.workflow_store.release_lease, admitted.run_id,
+            tenant_id=context.tenant, worker_id=agent._worker_id, token=admitted.lease_token)
+        for _ in range(8):
+            outcome = await asyncio.to_thread(agent.resume_task, admitted.task.id)
+            if not isinstance(outcome, SuspendedRun):
+                break
+            agent.workflow_store.resolve_wait(outcome.wait_id, tenant_id=context.tenant,
+                outcome={"reason": "allowed"}, actor_id="test-owner")
+        else:
+            self.fail("File review did not settle")
+        self.assertEqual(outcome.terminal_state, "completed")
+        expected = MessageToDict(admitted.task.metadata)["file_receipt"]["entries"]
+        with patch.object(self.model, "generate", side_effect=AssertionError("history is passive")):
+            response = await self.history()
+            refreshed = await self.history()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(refreshed.json(), response.json())
+        messages = [item for item in response.json()["items"] if item["kind"] == "user_message"]
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0].get("attachments"), inbound["provenance"]["file_receipt"]["entries"])
+        self.assertEqual(messages[1].get("attachments"), expected)
+        self.assertEqual([item["actual_name"] for item in expected], ["report.txt", "report_2.txt"])
+        self.assertNotIn("PRIVATE_TRANSPORT_METADATA", response.text)
+        self.assertNotIn("original_name", response.text)
+        self.assertEqual((await self.history(token="external-a")).status_code, 403)
+
+    async def test_rejected_file_batch_names_stay_out_of_owner_history(self):
+        agent = self.app.state.core_agent
+        context = admission_tests.AuthAdmissionTests.context(self, "external-a")
+        message = Message(message_id="rejected-history-file", context_id="history", role=Role.ROLE_USER,
+            parts=[{"text": "Process the file"}, {"raw": b"", "filename": "PRIVATE_FILE_NAME.bin"}])
+        admitted = await self.app.state.a2a_request_handler.admission_handler(message, context)
+        await asyncio.to_thread(agent.workflow_store.release_lease, admitted.run_id,
+            tenant_id=context.tenant, worker_id=agent._worker_id, token=admitted.lease_token)
+        suspended = await asyncio.to_thread(agent.resume_task, admitted.task.id)
+        self.assertIsInstance(suspended, SuspendedRun)
+        pending = await self.history()
+        self.assertNotIn("PRIVATE_FILE_NAME", pending.text)
+        self.assertTrue(all("attachments" not in item for item in pending.json()["items"]))
+        agent.workflow_store.resolve_wait(suspended.wait_id, tenant_id=context.tenant,
+            outcome={"reason": "rejected"}, actor_id="test-owner")
+        outcome = await asyncio.to_thread(agent.resume_task, admitted.task.id)
+        self.assertEqual(outcome.terminal_state, "completed")
+        rejected = await self.history()
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        self.assertNotIn("PRIVATE_FILE_NAME", rejected.text)
+        self.assertTrue(all("attachments" not in item for item in rejected.json()["items"]))
 
     async def test_file_digest_namespace_does_not_reject_json_and_pending_alias_is_not_negative(self):
         task = await self.submit("owner-a", "first", "history")

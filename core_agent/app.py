@@ -26,6 +26,7 @@ from .a2a import (
     parse_run_request,
 )
 from .a2a_sdk import CoreAgentExecutor, ScopedMemoryTaskStore, build_starlette_app
+from .a2a_input import request_limit
 from .admission import MemoryRootAdmission, PostgresRootAdmission
 from .artifact_service import validate_segment, create_artifact_service
 from .artifacts import InMemoryArtifactStore, PostgresArtifactStore
@@ -1599,6 +1600,8 @@ def create_app(
     environment = _env("CORE_AGENT_ENVIRONMENT", "")
     if environment not in {"production", "development", "test"}:
         raise CoreError("CONFIG_INVALID", "Explicit CORE_AGENT_ENVIRONMENT=production|development|test is required")
+    _env("A2A_MAX_REQUEST_BYTES", "40000000")
+    request_limit()
     def auth_env(name, default=""):
         value = _env(name, default)
         # Record the lookup, but validate the browser ID before whitespace cleanup.
@@ -1910,6 +1913,8 @@ def create_app(
         },
         skills=tuple(sorted(agent.platform_config.allowed_builtin_tools)),
         optional_extensions=(),
+        input_modes=("text/plain", "application/json", "application/octet-stream")
+        if auth_settings is not None else ("text/plain", "application/json"),
         description=_env("AGENT_DESCRIPTION", "Policy-enforced core agent runtime"),
         version=_env("AGENT_VERSION", "1.0.0"),
     )

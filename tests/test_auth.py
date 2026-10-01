@@ -155,6 +155,7 @@ class AuthBoundaryTests(AuthAppTestCase):
             )
             self.assertEqual(card.status_code, 200, card.text)
             self.assertTrue(card.json()["securitySchemes"])
+            self.assertIn("application/octet-stream", card.json()["defaultInputModes"])
             self.assertTrue(all(
                 item["url"] == f"https://agent.example.test/a2a/{kind}"
                 for item in card.json()["supportedInterfaces"]
