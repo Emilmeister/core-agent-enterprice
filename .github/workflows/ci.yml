@@ -46,6 +46,26 @@ jobs:
           echo "$RUNNER_TEMP/core-sandbox/bin" >> "$GITHUB_PATH"
       - name: Build native application image
         run: docker build -t core-agent:sandbox .
+      - name: Verify required sandbox through Docker Compose
+        env:
+          COMPOSE_PROJECT_NAME: core-sandbox-compose-${{ matrix.arch }}
+          POSTGRES_DB: core_agent
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test
+          LLM_API_BASE: https://example.invalid/v1
+          LLM_MODEL: native-sandbox-test
+          LLM_API_KEY: fixture
+          SANDBOX_OCI_ARCH: ${{ matrix.arch }}
+          SANDBOX_DNS_SERVERS: 1.1.1.1,2606:4700:4700::1111
+          SANDBOX_DENIED_CIDRS: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+        run: |
+          trap 'docker compose --env-file /dev/null down --volumes --remove-orphans' EXIT
+          docker compose --env-file /dev/null config --quiet
+          docker compose --env-file /dev/null run --rm --no-deps --build -T \
+            --volume "$PWD/tests/test_sandbox_linux.py:/sandbox-tests/test_sandbox_linux.py:ro" \
+            --env CORE_AGENT_REQUIRE_SANDBOX_TESTS=1 --env PYTHONPATH=/sandbox-tests \
+            agent uv run --no-sync python -m unittest -v \
+            test_sandbox_linux.SandboxLinuxTests.test_real_app_terminal_python_and_background_share_required_launcher
       - name: Create disposable dual-stack Kubernetes cluster
         run: |
           kind create cluster --name "$SANDBOX_CLUSTER" --kubeconfig "$KUBECONFIG" \

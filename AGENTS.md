@@ -148,6 +148,11 @@ criterion должны войти в тот же завершённый change. 
   `CORE_AGENT_REQUIRE_BROWSER_TESTS=1`: отсутствие Chromium, Node, конфигурации
   или native fixtures завершает проверку ошибкой, без skip.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
+  Agent использует native OCI seccomp profile (`SANDBOX_OCI_ARCH=amd64|arm64`),
+  `systempaths=unconfined` для nested proc mount, `/dev/net/tun`, read-only root,
+  dropped capabilities и конечные CPU/memory/PID limits. Native CI запускает
+  реальный composition-root terminal/Python/background test через Compose;
+  профиль inner commands остаётся отдельным и обязательным.
 - `third_party/skills/` — закреплённые пакеты навыков, происхождение, лицензии и
   контрольные суммы для образа.
 - `.env.example` — поддерживаемый шаблон локальной конфигурации; `.env` никогда

@@ -451,6 +451,8 @@ curl -sS http://localhost:8000/message:send \
 ```bash
 cp .env.example .env
 # Заполните POSTGRES_PASSWORD и LLM_API_FORMAT/LLM_API_BASE/LLM_MODEL/LLM_API_KEY.
+# Задайте SANDBOX_DENIED_CIDRS для своих внутренних сетей и защищённых адресов.
+# На Apple Silicon/native ARM задайте SANDBOX_OCI_ARCH=arm64; default — amd64.
 docker compose up --build
 ```
 
@@ -464,6 +466,17 @@ Docker Compose запускает PostgreSQL/pgvector, одноразовое о
 Core Agent и Phoenix. Агент доступен на <http://localhost:8000>, Phoenix — на
 <http://localhost:6006>. Эта конфигурация использует
 `CORE_AGENT_ENVIRONMENT=development` и предназначена только для разработки.
+Compose подключает native seccomp profile из `deploy/security/`, `/dev/net/tun`
+и отдельный временный `/tmp`; контейнер остаётся non-root, с read-only root,
+без capabilities, с лимитами 2 CPU, 4 GiB памяти и 512 процессов. Параметр
+`systempaths=unconfined` позволяет Bubblewrap создать собственный proc mount;
+внешний seccomp и отдельный строгий фильтр команд продолжают действовать.
+Обязательный sandbox preflight проверяется при запуске сервиса. Native CI
+дополнительно запускает реальные terminal/Python/background операции через
+этот Compose с контролируемой моделью. Отсутствие совместимых Linux namespaces
+или устройств завершает запуск ошибкой.
+Для хранения секретов подключений внешних агентов задайте
+`PUSH_NOTIFICATION_ENCRYPTION_KEY` из `.env.example`; в production он обязателен.
 
 ## Конфигурация
 

@@ -55,6 +55,19 @@ services:
 
   agent:
     build: .
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./deploy/security/oci-${SANDBOX_OCI_ARCH:-amd64}.json
+      - systempaths=unconfined
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    tmpfs:
+      - /tmp:rw,exec,size=1g
+    pids_limit: 512
+    cpus: 2
+    mem_limit: 4g
     environment:
       CORE_AGENT_ENVIRONMENT: ${CORE_AGENT_ENVIRONMENT:-development}
       KEYCLOAK_ISSUER_URL: ${KEYCLOAK_ISSUER_URL:-}
@@ -65,6 +78,7 @@ services:
       KEYCLOAK_OWNER_ROLE: ${KEYCLOAK_OWNER_ROLE:-agent-owner}
       KEYCLOAK_EXTERNAL_ROLE: ${KEYCLOAK_EXTERNAL_ROLE:-agent-external}
       CORE_AGENT_TENANT_ID: ${CORE_AGENT_TENANT_ID:-}
+      PUSH_NOTIFICATION_ENCRYPTION_KEY: ${PUSH_NOTIFICATION_ENCRYPTION_KEY:-}
       AGENT_NAME: ${AGENT_NAME:-core-agent}
       AGENT_SYSTEM_PROMPT: ${AGENT_SYSTEM_PROMPT:-}
       SESSION_STORAGE_TYPE: postgres
@@ -128,6 +142,8 @@ services:
       SANDBOX_ADDRESS_SPACE_BYTES: ${SANDBOX_ADDRESS_SPACE_BYTES:-2147483648}
       SANDBOX_MAX_OPEN_FILES: ${SANDBOX_MAX_OPEN_FILES:-256}
       SANDBOX_MAX_FILE_BYTES: ${SANDBOX_MAX_FILE_BYTES:-104857600}
+      PYTHONDONTWRITEBYTECODE: "1"
+      UV_CACHE_DIR: /tmp/uv-cache
       DURABLE_STORAGE_ROOT: /data/durable
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://phoenix:6006/v1/traces}
       OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-true}

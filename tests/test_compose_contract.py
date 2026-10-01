@@ -15,6 +15,26 @@ class ComposeContractTests(unittest.TestCase):
             (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         )["services"]
 
+    def test_agent_supplies_required_sandbox_host_controls(self):
+        agent = self.services["agent"]
+        self.assertGreater(agent.get("pids_limit", 0), 0)
+        self.assertGreater(float(agent.get("cpus", 0)), 0)
+        self.assertTrue(agent.get("mem_limit"))
+        self.assertTrue(agent.get("read_only"))
+        self.assertFalse(agent.get("privileged", False))
+        self.assertIn("ALL", agent.get("cap_drop", []))
+        self.assertFalse(agent.get("cap_add"))
+        options = agent.get("security_opt", [])
+        self.assertIn("no-new-privileges:true", options)
+        self.assertIn("systempaths=unconfined", options)
+        self.assertIn("seccomp=./deploy/security/oci-${SANDBOX_OCI_ARCH:-amd64}.json", options)
+        self.assertNotIn("seccomp=unconfined", options)
+        self.assertIn("/dev/net/tun:/dev/net/tun", agent.get("devices", []))
+        self.assertTrue(any(mount.startswith("/tmp:") for mount in agent.get("tmpfs", [])))
+        self.assertTrue(agent["environment"].get("UV_CACHE_DIR", "").startswith("/tmp/"))
+        self.assertEqual(agent["environment"].get("PUSH_NOTIFICATION_ENCRYPTION_KEY"),
+                         "${PUSH_NOTIFICATION_ENCRYPTION_KEY:-}")
+
     def test_phoenix_is_version_pinned_and_uses_postgres(self):
         phoenix = self.services["phoenix"]
         self.assertEqual(
