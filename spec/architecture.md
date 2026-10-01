@@ -239,6 +239,18 @@ artifact capabilities, отклоняется как `CHECKPOINT_INVALID`, а н
 
 Legacy `REMOTE_AGENTS` и dedicated auth settings импортируются однократно явным migration в owner registry с проверкой target, identity и защищённым хранением header values. Неоднозначный per-agent auth требует operator mapping; входящий credential автоматически не переносится и не проксируется. После cutover UI registry authoritative: рестарт и старое ENV не перезаписывают его, изменения аудируются. Старые values сохраняются защищённо только для согласованного rollback, не в model/transcript/logs.
 
+Migration 23→24 добавляет явный `tenant_id` в memory documents, versions и
+repository revisions, их primary keys и namespace index. Неоднозначные прежние
+memory rows сохраняют пустой legacy tenant и остаются недоступны новым
+authenticated corpus; их tenant не угадывается по имени агента, общему owner ID
+или первому запросу. Новые direct development/test corpus используют tenant
+`default`, отдельно от legacy пустого scope. Public memory tool schemas и opaque
+IDs не меняются; known ID другого namespace возвращает not-found до read/mutation.
+Старые serving workers останавливаются до migration job, затем запускается
+image schema24; image schema23 не обслуживает новую schema. После новых
+tenant-scoped writes rollback требует согласованного совместимого backup/restore,
+а не удаления tenant column поверх действующей базы.
+
 Registry storage version1 хранит company-scoped current peer pointer и append-only
 peer revisions; каждая revision содержит безопасную конфигурацию, encrypted
 credential, actor и timestamp. Name уникален в company и immutable. DELETE —новая

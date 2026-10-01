@@ -799,7 +799,9 @@ run получает отдельные MCP session и negotiated version; пе�
 - Child failure возвращается parent как structured result и сам по себе не
   обязан завершать parent Task.
 - Shared memory существует только при явной делегации memory tools: child
-  наследует ту же тройку scope, а без делегированного tool работает без памяти.
+  наследует trusted tenant/app/user и session scope, а без делегированного tool
+  работает без памяти. Нормативный ключ corpus и migration boundary заданы в
+  `spec/memory-service.md` и `spec/architecture.md`.
   Scratchpad/context не является общей памятью.
 
 ### Cron

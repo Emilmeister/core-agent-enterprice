@@ -351,6 +351,7 @@
 
 ## Enterprise migration и transport trust boundary
 
+- [ ] Корпусы памяти с одинаковыми agent/owner ID разных trusted tenants изолированы в memory и PostgreSQL после restart; child получает только делегированный исходный scope. Known session-A ID недоступен read/update/split/delete из session-B или user namespace; отказ не меняет ни contents, ни revision. Migration23→24 сохраняет legacy rows под пустым tenant без автоматического присвоения; новые corpus не читают их, old image fail closed на новой schema.
 - [ ] SDK/path/JSON-RPC tenant не перезаписывает trusted deployment company: mismatch отклоняется, пустое SDK значение сохраняет verified tenant.
 - [ ] Legacy identity явно сопоставляется issuer/sub; неизвестный owner остаётся изолированным, исходные rows/blobs и digests сохраняются при migration.
 - [ ] Versioned wait/cron/file migration сохраняет deadlines, closed outcomes и visibility; unknown dispatched side effects не replay-ятся.
