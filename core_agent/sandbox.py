@@ -33,7 +33,7 @@ import time
 from .errors import CoreError, ExecutionNotStarted
 
 _POLICY_SHA256 = '8ef9479132f923e4c2f485ae4c06c98ddce9ad9448ce48232cc199663beefe2e'
-_HELPER_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8'}
+_HELPER_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'C.UTF-8'}
 _MAX_CONFIG = 65536
 _CLEANUP_SECONDS = 3.0
 

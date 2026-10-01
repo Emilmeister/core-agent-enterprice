@@ -198,8 +198,11 @@ file admission FK/JSONB и гонки synthetic PostgreSQL test fixtures.
 миграция старых файлов и удаление named artifact service ещё не завершены.
 Linux/Kubernetes sandbox и browser acceptance требуют самостоятельного proof;
 macOS unit suite не доказывает process isolation. Для native sandbox создан
-собственный disposable kind-кластер с отдельным kubeconfig; первый image probe
-обнаружил missing `nft` в trusted helper PATH, исправление ещё требуется.
+собственный disposable kind-кластер с отдельным kubeconfig. Missing `nft`
+исправлен добавлением `/usr/sbin:/sbin` в trusted helper PATH; 21 профильный
+test проходит, повторный native image/Pod находит executable. Следующий
+preflight завершается `Sandbox did not start`; причина исследуется, полный
+mandatory native gate пока не пройден.
 
 - Нет новой анонимной production-границы и bypass через list/stream/download,
   Python broker, child task, memory, summary или восстановление.
