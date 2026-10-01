@@ -269,10 +269,11 @@ send не объявляется готовым и не должен выдав�
 
 ## Файловый срез: уточнение по подключённому коду 1 октября 2026
 
-Это порядок следующей реализации, а не заявление о готовности remote files.
+Исходящий срез сохранён в `a3098f2`; terminal inbound import остаётся следующим
+этапом. Частичные gates не означают готовность полного remote file flow.
 Нормативные изменения в `spec/` и frozen lock входят в тот же разрешённый срез.
 
-- [ ] В `spec/tasks-and-delegation.md`, `spec/artifacts.md`, public contract и
+- [x] В `spec/tasks-and-delegation.md`, `spec/artifacts.md`, public contract и
   acceptance закрепить optional `files` с относительными paths, pinned batch
   ceiling, versioned job compatibility и импорт полного terminal результата.
   Модель явно выбирает список для каждого `core_agent_send_message`; отсутствие
@@ -281,28 +282,28 @@ send не объявляется готовым и не должен выдав�
   `input-required`/`auth-required` сохраняют working и те же remote IDs;
   промежуточные файлы не публикуются. Failed/cancelled/expired операции не
   публикуют refs. Progressive import не добавляется без отдельного контракта.
-- [ ] В `runtime.py:_pin_remote_call` подготовить полный outbound snapshot до
+- [x] В `runtime.py:_pin_remote_call` подготовить полный outbound snapshot до
   HITL, используя `ResponseFileService.prepare`. Не менять final selection
   `core_response_files`. Закрепить ordered public receipts и selection digest
   в approval subject; private refs остаются в persisted remote contract.
-- [ ] В `tasks.py`, `postgres_tasks.py`, `remote_operations.py` добавить job v2:
+- [x] В `tasks.py`, `postgres_tasks.py`, `remote_operations.py` добавить job v2:
   существующие peer/message/settings, trusted `caller_scope` с owner/context/
-  public task/run, `attachment_limit_bytes`, frozen `outgoing_files`.
+  source task/run, `attachment_limit_bytes`, frozen `outgoing_files`.
   Scheduler `owner_id` остаётся owning run ID. v1 читается по прежнему text-only
   протоколу, без реконструкции refs. До `send_started` загрузить и проверить
   весь outbound набор; неизвестный исход Send не повторять.
-- [ ] В `remote_agents.py` общий `_task_request` обеих bindings передаёт text
+- [x] В `remote_agents.py` общий `_task_request` обеих bindings передаёт text
   и standard raw Parts с pinned Message ID. Finite encoded ceiling должен
   вмещать 25 000 000 decoded bytes с base64/JSON (нынешние 16 MiB недостаточны).
   Перед protobuf проверять полный bounded body, UTF-8/JSON, duplicate keys,
   depth и canonical base64; до relay проверять decoded aggregate. Terminal
   Task собирает весь ordered Artifact file set даже при status Message с text.
-- [ ] В `remote_operations.py`, scheduler stores и `chat_files.py` атомарно
+- [x] В `remote_operations.py`, scheduler stores и `chat_files.py` атомарно
   фиксировать fenced terminal result и accepted quarantine batch, используя
   одну PostgreSQL connection. Late cancel/deadline/lost claim не принимают
   batch; собственный проигравший stage очищается после выхода из transaction.
   Remote IDs являются provenance, не authority для локального binding.
-- [ ] Сохранить FK на canonical public A2A Task и core_run. Root send использует
+- [x] Сохранить FK на canonical public A2A Task и core_run. Root send использует
   существующий bind. Delegated child не имеет публичной A2A admission row:
   проверить canonical root/child ancestry для batch binding, сохранив child
   continuation/lease и root liveness. Не создавать shadow Tasks и не ослаблять FK.
@@ -327,3 +328,46 @@ norm/lock; transport — `remote_agents.py`/bounded decoder; scheduler —
 `uv run python -m unittest discover -s tests -v` запускается с PostgreSQL и
 Keycloak. Файловая возможность не объявляется поддержанной до прохождения
 полного admission/guard/publication flow.
+
+Для inbound bind сохраняется существующая схема: `batch.run_id` — source child
+или root run, `batch.task_id` — derived public root Task. Shared
+`ChatFileService.caller_scope(binding, task_id, run_id, connection=None,
+lease_token=None, accept_input=False)` возвращает source/root/connection под
+locks chat → root → intermediate → source. Mutations проверяют всю canonical
+ancestry и liveness; optional token fence относится только к source, а historical
+sealed read допускает завершённые workflows. Root IDs из request/job metadata
+не создают authority. Два parent links — maximum; другой чат/owner/tenant,
+cycle, отменённый ancestor и stale source lease закрывают mutation.
+
+Remote `commit_remote_claim` получает optional local `prepared_file_batch`
+ровно `{batch_id, lease_token, actor_id, message_id, request_digest}`. Source
+берётся из persisted job v2; service не сериализуется в contract. PostgreSQL
+держит одну connection и после canonical locks берёт remote job, затем batch;
+после slow bind повторно проверяет fresh server time/claim/revision/cancel и
+source. Terminal result, accepted quarantine и notification/outbox commit-ятся
+вместе. Memory соблюдает workflow → scheduler → batch и откатывает эти изменения
+при ошибке. Проигравший stage очищается после rollback, а не внутри transaction.
+Private result содержит только `file_batch_id`; marker исключается из
+mailbox/outbox и `_task_snapshot`. Runtime refetch-ит scoped authoritative
+scheduler Task и проверяет text/files до публикации и передачи модели.
+
+После outbound redirect/early-preview исправлений полный fresh PostgreSQL /
+Keycloak suite прошёл: 1501 tests, 196.434 секунды, exit0, три ожидаемых skips;
+Ruff/diff-check прошли. Детальные evidence и ограничения actual child proof
+сохранены в основном enterprise/file plan. Эти проверки не закрывают inbound
+atomic bind/guardrail пункты выше.
+
+Atomic quarantine/source foundation проверен отдельно до composition wiring:
+native scheduler/executor gate —96 tests, 5.064 секунды, exit0, без skips;
+canonical files/owner review gate —68 tests, 4.508 секунды, exit0, без skips.
+Реальные PostgreSQL workflows child/grandchild используют только одну public
+root Task row и pool1. Проверены cancel/ancestor/claim/deadline races после slow
+bind, notification rollback, late duplicate stage cleanup, restart без Send,
+marker-free mailbox/outbox и owner-only sealed read из root chat, включая
+historical terminal sources. Independent review выявил Latin-1 reflected header
+bytes: новый memory/PG regression подтверждает отказ до stage для actual wire
+и UTF-8 representations без изменения bytes/digest. Ruff и diff-check прошли.
+Evidence — `.local-evidence/remote-inbound/final-targeted.*`, `red-latin1.*` и
+`.local-evidence/chat-files-children/owner-final.*`. Этот foundation не включает
+runtime text/file guard, publication receipt и app wiring следующего среза;
+полный FILE-03 остаётся open.

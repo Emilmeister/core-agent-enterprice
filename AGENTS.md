@@ -693,9 +693,21 @@ run получает отдельные MCP session и negotiated version; пе�
 - Executor читает credentials только из закреплённой registry revision.
   Отражённые секреты в peer IDs отклоняются до checkpoint/URL, текст очищается
   existing redactor. v2 `working`/`input-required`/`auth-required` не импортируют
-  ранние raw previews и сохраняют polling с прежними IDs/deadline. Terminal
-  remote files пока дают `REMOTE_FILES_UNSUPPORTED`: quarantine/guardrail import
-  ещё не подключён. Data Parts отклоняются. Ошибка network/parser после возможного
+  ранние raw previews и сохраняют polling с прежними IDs/deadline. Terminal v2
+  files принимаются в quarantine только при подключении одного ChatFileService
+  к executor/scheduler; отсутствие service явно закрывает import. Этот optional
+  backend flow ещё не подключён к composition root до runtime guard/publication.
+  v1 file response остаётся `REMOTE_FILES_UNSUPPORTED`. Accepted batch хранит
+  source run и derived public root Task; child public rows не создаются.
+  Shared `caller_scope` держит chat → root → intermediate → source locks,
+  использует actual parent links максимум двух уровней и fence только source
+  writer lease; historical sealed reads допускают terminal ancestors.
+  Quarantine bind, terminal result и notification/outbox commit-ятся атомарно
+  под claim/deadline/revision/cancel fences на одной borrowed connection.
+  Private `file_batch_id` исключается из remote mailbox/outbox projections.
+  Reflected credentials в metadata/raw files отклоняются до stage, проверяя
+  UTF-8 и фактические Latin-1 header bytes; содержимое файлов не переписывается.
+  Data Parts отклоняются. Ошибка network/parser после возможного
   Send/Cancel сохраняет unknown outcome; только доказанная локальная ошибка
   до dispatch возвращается как известный отказ без blind retry.
 - TaskStore проецирует `core_agent_remote_progress` из scoped working operations

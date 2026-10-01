@@ -71,6 +71,47 @@ def _live(record, binding, task_id, *, accept_input=False):
         raise CoreError("FILE_BATCH_TASK_CLOSED")
 
 
+def _caller_records(workflow, binding, run_id, task_id=None, *, connection=None,
+                    lock=False, live=False, accept_input=False):
+    """Read actual parent links; budget/checkpoint hints never grant file access."""
+    records, visited = [], set()
+    for _ in range(3):
+        if not isinstance(run_id, str) or not run_id or run_id in visited:
+            raise CoreError("FILE_BATCH_NOT_FOUND")
+        visited.add(run_id)
+        try:
+            record = workflow.get(run_id, tenant_id=binding.tenant_id,
+                                  owner_id=binding.owner_id, connection=connection)
+        except CoreError as error:
+            if error.code != "TASK_NOT_FOUND":
+                raise
+            raise CoreError("FILE_BATCH_NOT_FOUND") from None
+        if ((record.run_id, record.tenant_id, record.owner_id, record.context_id) !=
+                (run_id, binding.tenant_id, binding.owner_id, binding.context_id)
+                or not isinstance(record.task_id, str) or not record.task_id
+                or (not records and task_id is not None and record.task_id != task_id)):
+            raise CoreError("FILE_BATCH_NOT_FOUND")
+        records.append(copy.deepcopy(record))
+        if record.parent_run_id is None:
+            break
+        run_id = record.parent_run_id
+    else:
+        raise CoreError("FILE_BATCH_NOT_FOUND")
+    records.reverse()
+    if lock:
+        for index, expected in enumerate(records):
+            current = workflow.get(expected.run_id, tenant_id=binding.tenant_id,
+                owner_id=binding.owner_id, connection=connection, lock=True)
+            if (current.task_id, current.parent_run_id, current.context_id) != (
+                    expected.task_id, expected.parent_run_id, expected.context_id):
+                raise CoreError("FILE_BATCH_NOT_FOUND")
+            records[index] = copy.deepcopy(current)
+    if live:
+        for record in records:
+            _live(record, binding, record.task_id, accept_input=accept_input and len(records) == 1)
+    return tuple(records)
+
+
 class MemoryChatFileStore:
     def __init__(self, workflow_store, validate_scope):
         self.workflow = workflow_store
@@ -105,10 +146,14 @@ class MemoryChatFileStore:
         # Match workflow -> batch ordering used by admission and terminalization.
         with self.workflow._lock:
             self.validate_scope(binding)
-            record = self.workflow.get(run_id, tenant_id=binding.tenant_id, owner_id=binding.owner_id)
-            _live(record, binding, task_id, accept_input=accept_input)
-            with self.workflow._execution_lock(record, lease_token):
-                yield None
+            records = _caller_records(self.workflow, binding, run_id, task_id,
+                                      live=True, accept_input=accept_input)
+            self.check_lease(records[-1], lease_token)
+            yield None
+
+    def check_lease(self, record, lease_token, *, connection=None):
+        with self.workflow._execution_lock(record, lease_token):
+            pass
 
     def reserved(self, binding, *, connection=None):
         with self.lock:
@@ -211,15 +256,17 @@ class PostgresChatFileStore:
             ).fetchone()
             if row is None or row["owner_id"] != binding.owner_id:
                 raise CoreError("FILE_BATCH_NOT_FOUND")
-            record = self.workflow.get(run_id, tenant_id=binding.tenant_id,
-                                       owner_id=binding.owner_id, connection=conn, lock=True)
-            _live(record, binding, task_id, accept_input=accept_input)
-            if lease_token is not None and (not lease_token or conn.execute(
-                "SELECT 1 FROM core_runs WHERE run_id=%s AND lease_token=%s AND lease_expires_at>EXTRACT(EPOCH FROM clock_timestamp())",
-                (run_id, lease_token),
-            ).fetchone() is None):
-                raise CoreError("LEASE_LOST")
+            records = _caller_records(self.workflow, binding, run_id, task_id, connection=conn,
+                                      lock=True, live=True, accept_input=accept_input)
+            self.check_lease(records[-1], lease_token, connection=conn)
             yield conn
+
+    def check_lease(self, record, lease_token, *, connection):
+        if lease_token is not None and (not lease_token or connection.execute(
+                "SELECT 1 FROM core_runs WHERE run_id=%s AND lease_token=%s AND lease_expires_at>EXTRACT(EPOCH FROM clock_timestamp())",
+                (record.run_id, lease_token),
+            ).fetchone() is None):
+            raise CoreError("LEASE_LOST")
 
     def reserved(self, binding, *, connection):
         rows = connection.execute(
@@ -386,6 +433,25 @@ class ChatFileService:
         self._descriptors.close()
 
     @contextmanager
+    def caller_scope(self, binding, *, task_id, run_id, connection=None,
+                     lease_token=None, accept_input=False):
+        """Hold chat/root-to-source mutation locks; borrow an admission connection."""
+        if not isinstance(task_id, str) or not task_id:
+            raise CoreError("FILE_BATCH_NOT_FOUND")
+        with self.store.chat(binding, run_id, task_id, connection=connection,
+                lease_token=lease_token, accept_input=accept_input) as conn:
+            records = _caller_records(self.store.workflow, binding, run_id, task_id, connection=conn)
+            yield records[-1], records[0], conn
+
+    def _recheck_caller(self, source, root, binding, connection, *, lease_token=None, accept_input=False):
+        records = _caller_records(self.store.workflow, binding, source.run_id, source.task_id,
+            connection=connection, live=True, accept_input=accept_input)
+        if (records[-1].parent_run_id, records[0].run_id, records[0].task_id) != (
+                source.parent_run_id, root.run_id, root.task_id):
+            raise CoreError("FILE_BATCH_NOT_FOUND")
+        self.store.check_lease(records[-1], lease_token, connection=connection)
+
+    @contextmanager
     def _attachments(self, binding):
         path = self.workspaces.workspace(binding)
         descriptor = os.dup(self.root)
@@ -549,7 +615,8 @@ class ChatFileService:
             raise CoreError("FILE_ADMISSION_TRANSACTION_REQUIRED")
         if sequence is not None and (type(sequence) is not int or sequence < 1):
             raise CoreError("INVALID_FILE_INPUT")
-        with self.store.chat(binding, run_id, task_id, connection=connection, accept_input=sequence is not None) as conn:
+        with self.caller_scope(binding, run_id=run_id, task_id=task_id,
+                connection=connection, accept_input=sequence is not None) as (source, root, conn):
             occupied = self.store.reserved(binding, connection=conn)
             with self._attachments(binding) as attachments:
                 occupied.update(os.listdir(attachments))
@@ -578,15 +645,19 @@ class ChatFileService:
                     if isinstance(error, CoreError):
                         raise
                     raise CoreError("FILE_WRITE_FAILED") from error
+                self._recheck_caller(source, root, binding, conn, accept_input=sequence is not None)
                 row.update(state="accepted_quarantine", context_id=binding.context_id,
-                           owner_id=binding.owner_id, task_id=task_id, run_id=run_id, sequence=sequence)
+                           owner_id=binding.owner_id, task_id=root.task_id, run_id=run_id, sequence=sequence)
         return copy.deepcopy(row)
 
     @contextmanager
     def _accepted_files(self, batch_id, binding, *, run_id, task_id):
+        if not isinstance(task_id, str) or not task_id:
+            raise CoreError("FILE_BATCH_NOT_FOUND")
         row = self.store.get(batch_id, binding.tenant_id)
         self._scope(row, binding)
-        if row["state"] not in _ACCEPTED or (row["run_id"], row["task_id"]) != (run_id, task_id):
+        records = _caller_records(self.store.workflow, binding, run_id, task_id)
+        if row["state"] not in _ACCEPTED or (row["run_id"], row["task_id"]) != (run_id, records[0].task_id):
             raise CoreError("FILE_BATCH_NOT_FOUND")
         try:
             with ExitStack() as stack:
@@ -671,8 +742,12 @@ class ChatFileService:
             raise CoreError("FILE_BATCH_DECISION_REQUIRED")
         batch = self.store.get(batch_id, binding.tenant_id, connection=connection)
         self._scope(batch, binding)
-        with self.store.chat(binding, batch["run_id"], batch["task_id"], connection=connection, lease_token=lease_token) as conn:
+        source = _caller_records(self.store.workflow, binding, batch["run_id"], connection=connection)[-1]
+        with self.caller_scope(binding, run_id=source.run_id, task_id=source.task_id,
+                connection=connection, lease_token=lease_token) as (source, root, conn):
             with self.store.locked(batch_id, binding.tenant_id, connection=conn) as (row, _):
+                if row["task_id"] != root.task_id:
+                    raise CoreError("FILE_BATCH_NOT_FOUND")
                 if row["state"] != "accepted_quarantine":
                     raise CoreError("FILE_BATCH_CONFLICT")
                 with self._private(batch_id) as (parent, directory):
@@ -681,6 +756,7 @@ class ChatFileService:
                         _rename(parent, batch_id, self.quarantine, batch_id)
                         os.fsync(parent)
                         os.fsync(self.quarantine)
+                self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
                 row.update(state="accepted_ready" if allow else "excluded", decision_ref=decision_ref)
 
     @staticmethod
@@ -695,9 +771,13 @@ class ChatFileService:
         self._scope(batch, binding)
         if batch["state"] not in {"accepted_ready", "published"}:
             raise CoreError("FILE_BATCH_NOT_READY")
+        source = _caller_records(self.store.workflow, binding, batch["run_id"])[-1]
         try:
-            with self.store.chat(binding, batch["run_id"], batch["task_id"], lease_token=lease_token) as conn:
+            with self.caller_scope(binding, run_id=source.run_id, task_id=source.task_id,
+                    lease_token=lease_token) as (source, root, conn):
                 with self.store.locked(batch_id, binding.tenant_id, connection=conn) as (row, _):
+                    if row["task_id"] != root.task_id:
+                        raise CoreError("FILE_BATCH_NOT_FOUND")
                     if row["state"] not in {"accepted_ready", "published"}:
                         raise CoreError("FILE_BATCH_NOT_READY")
                     with self._attachments(binding) as attachments:
@@ -706,6 +786,7 @@ class ChatFileService:
                         except FileNotFoundError:
                             with self._private(batch_id) as (parent, directory):
                                 _verify(directory, row["manifest"])
+                                self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
                                 _rename(parent, batch_id, attachments, batch_id)
                                 os.fsync(parent)
                             target = os.open(batch_id, _DIRECTORY, dir_fd=attachments)
@@ -722,6 +803,7 @@ class ChatFileService:
                         finally:
                             os.close(target)
                         os.fsync(attachments)
+                    self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
                     row.update(state="published", published_at=row["published_at"] or self.clock(), error_code=None)
             return copy.deepcopy(row["manifest"])
         except (OSError, CoreError) as error:

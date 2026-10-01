@@ -14,7 +14,7 @@ from .observability import TraceContext
 from .tasks import (
     BackgroundTask, Notification, RemoteTaskClaim, REMOTE_KIND, _remote_progress,
     _remote_contract, _remote_checkpoint, _initial_remote_checkpoint, _advance_remote_checkpoint,
-    _remote_expired, _remote_due, _remote_text, remote_timeout_result,
+    _remote_expired, _remote_due, _remote_text, remote_timeout_result, _remote_file_binding, remote_result_projection,
 )
 from .workflow import SuspendedRun
 
@@ -192,7 +192,12 @@ class PostgresTaskScheduler:
             raise CoreError("LEASE_LOST")
         return result
 
-    def commit_remote_claim(self, claim, *, expected_revision, checkpoint, outcome=None, progress=None):
+    def commit_remote_claim(self, claim, *, expected_revision, checkpoint, outcome=None, progress=None,
+                            prepared_file_batch=None):
+        if prepared_file_batch is not None:
+            return self._commit_remote_files(claim, expected_revision, checkpoint, outcome, progress, prepared_file_batch)
+        if isinstance(outcome, tuple) and len(outcome) > 1 and isinstance(outcome[1], dict) and "file_batch_id" in outcome[1]:
+            raise CoreError("CHECKPOINT_INVALID")
         with self.database.transaction() as connection:
             row, now = self._remote_claim_locked(connection, claim, terminal=True)
             if row["state"] in TERMINAL:
@@ -214,6 +219,54 @@ class PostgresTaskScheduler:
                                           now, claim.task_id, claim.tenant_id)).fetchone()
         if outcome is not None:
             self._notify_remote(claim.task_id)
+        return self._task(row)
+
+    def _commit_remote_files(self, claim, expected_revision, checkpoint, outcome, progress, batch):
+        service = getattr(self, "chat_file_service", None)
+        if service is None or getattr(service.store, "database", None) is not self.database:
+            raise CoreError("FILE_ADMISSION_TRANSACTION_REQUIRED")
+        if not isinstance(claim, RemoteTaskClaim):
+            raise CoreError("LEASE_LOST")
+        with self.database.transaction() as connection:
+            initial = connection.execute("""SELECT contract FROM core_background_tasks
+                WHERE id=%s AND tenant_id=%s AND owner_run_id=%s AND kind=%s""",
+                (claim.task_id, claim.tenant_id, claim.owner_id, REMOTE_KIND)).fetchone()
+            if initial is None:
+                raise CoreError("TASK_NOT_FOUND")
+            contract = initial["contract"]
+            _remote_contract(contract, claim.tenant_id, claim.owner_id)
+            binding = _remote_file_binding(contract, batch, outcome, claim.task_id)
+            scope = contract["caller_scope"]
+            with service.caller_scope(binding, task_id=scope["task_id"], run_id=scope["run_id"], connection=connection):
+                row, now = self._remote_claim_locked(connection, claim, terminal=True)
+                if row["state"] in TERMINAL:
+                    return self._task(row)
+                if row["contract"] != contract or type(expected_revision) is not int or row["revision"] != expected_revision:
+                    raise CoreError("SESSION_CONFLICT")
+                if _remote_expired(row["checkpoint"], now):
+                    row = self._remote_finish_locked(connection, row, row["checkpoint"],
+                        ("failed", remote_timeout_result(contract), "REMOTE_OPERATION_TIMEOUT"), now)
+                else:
+                    if row["cancel_requested"] or row["checkpoint"]["cancel_started"]:
+                        raise CoreError("CANCEL_REQUESTED")
+                    updated = _advance_remote_checkpoint(row["checkpoint"], checkpoint, contract, now, False, outcome)
+                    _remote_progress(progress, contract, updated, outcome)
+                    if not updated["send_started"]:
+                        raise CoreError("CHECKPOINT_INVALID")
+                    service.bind(batch["batch_id"], binding, task_id=scope["task_id"], run_id=scope["run_id"],
+                        actor_id=batch["actor_id"], message_id=batch["message_id"], request_digest=batch["request_digest"],
+                        lease_token=batch["lease_token"], connection=connection)
+                    with service.caller_scope(binding, task_id=scope["task_id"], run_id=scope["run_id"], connection=connection):
+                        fresh, now = self._remote_claim_locked(connection, claim)
+                        if fresh["contract"] != contract or fresh["revision"] != expected_revision:
+                            raise CoreError("SESSION_CONFLICT")
+                        if _remote_expired(updated, now):
+                            raise CoreError("LEASE_LOST")
+                        if fresh["cancel_requested"]:
+                            raise CoreError("CANCEL_REQUESTED")
+                        row = self._remote_finish_locked(connection, fresh, updated,
+                            ("completed", {**outcome[1], "file_batch_id": batch["batch_id"]}, None), now)
+        self._notify_remote(claim.task_id)
         return self._task(row)
 
     def expire_remote(self, limit=100):
@@ -655,7 +708,8 @@ class PostgresTaskScheduler:
     def _finish_locked(self, connection, row, state, result, error_code, now):
         task_id, tenant_id = row["id"], row["tenant_id"]
         revision = row["revision"] + 1
-        payload = {"result": _value(result), "error_code": error_code}
+        public_result = remote_result_projection(result) if row["kind"] == REMOTE_KIND else result
+        payload = {"result": _value(public_result), "error_code": error_code}
         connection.execute(
             """UPDATE core_background_tasks SET state = %s, result = %s,
                    error_code = %s, revision = %s, updated_at = %s,

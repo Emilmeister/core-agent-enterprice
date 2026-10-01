@@ -183,7 +183,7 @@ class RemoteOperationTests(unittest.TestCase):
         self.assertFalse(self.scheduler._remote[missing.id]["checkpoint"]["send_started"])
         self.assertEqual(self.calls, [])
 
-    def test_v2_cancel_uses_pinned_limit_and_received_files_still_fail_explicitly(self):
+    def test_v2_cancel_uses_pinned_limit_and_missing_ingress_service_fails_explicitly(self):
         self.outbound_files()
         self.responses.extend([self.event(), self.event("CANCELED"), self.event("COMPLETED", files=True)])
         task = self.start()
@@ -192,7 +192,7 @@ class RemoteOperationTests(unittest.TestCase):
         self.assertEqual(task.state, "canceled")
         self.assertEqual(self.calls[1][2]["attachment_limit_bytes"], 3)
         rejected = self.start()
-        self.assertEqual((rejected.state, rejected.error.code), ("failed", "REMOTE_FILES_UNSUPPORTED"))
+        self.assertEqual((rejected.state, rejected.error.code), ("failed", "FILE_ADMISSION_TRANSACTION_REQUIRED"))
 
     def test_v2_early_files_preserve_working_and_human_waits_without_import_or_relay(self):
         self.outbound_files()

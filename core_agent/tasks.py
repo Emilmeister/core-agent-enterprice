@@ -167,6 +167,33 @@ def _remote_progress(progress, contract, checkpoint, outcome):
     return copy.deepcopy(progress)
 
 
+def remote_result_projection(result):
+    """The accepted batch is an internal publication capability, never mailbox data."""
+    if isinstance(result, dict):
+        return {key: copy.deepcopy(value) for key, value in result.items() if key != "file_batch_id"}
+    return copy.deepcopy(result)
+
+
+def _remote_file_binding(contract, batch, outcome, task_id):
+    from .workspace import WorkspaceBinding
+
+    if (not isinstance(batch, dict) or batch.keys() != {
+            "batch_id", "lease_token", "actor_id", "message_id", "request_digest"}
+            or contract["version"] != 2 or not isinstance(outcome, tuple) or len(outcome) != 3
+            or outcome[0] != "completed" or outcome[2] is not None
+            or not isinstance(outcome[1], dict) or outcome[1].keys() != {"agent_name", "remote_state", "text"}
+            or outcome[1]["agent_name"] != contract["peer_name"]
+            or outcome[1]["remote_state"] not in {None, "TASK_STATE_COMPLETED"}
+            or not isinstance(outcome[1]["text"], str)):
+        raise CoreError("CHECKPOINT_INVALID")
+    for value in batch.values():
+        _remote_text(value)
+    scope = contract["caller_scope"]
+    if batch["actor_id"] != scope["owner_id"] or batch["message_id"] != task_id:
+        raise CoreError("FILE_BATCH_NOT_FOUND")
+    return WorkspaceBinding(contract["tenant_id"], scope["owner_id"], scope["context_id"])
+
+
 @dataclass(frozen=True)
 class Notification:
     id: str
@@ -182,7 +209,7 @@ class DurableMailbox:
         self.owner_id = owner_id
         self._events = {}
         self._acked = set()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def deliver(self, event):
         key = (event.task_id, event.kind, event.revision)
@@ -311,7 +338,7 @@ class TaskScheduler:
         self._recovery.pop(task.id, None)
         self.mailbox(task.owner_id, row["contract"]["tenant_id"], remote=True).deliver(Notification(
             str(uuid.uuid4()), task.owner_id, task.id, "task." + state, task.revision,
-            {"result": copy.deepcopy(result), "error_code": error_code},
+            {"result": remote_result_projection(result), "error_code": error_code},
         ))
         with task.condition:
             task.condition.notify_all()
@@ -326,7 +353,12 @@ class TaskScheduler:
             return {"contract": copy.deepcopy(row["contract"]), "checkpoint": copy.deepcopy(row["checkpoint"]),
                     "cancel_requested": row["cancel_requested"], "now": now, "revision": task.revision}
 
-    def commit_remote_claim(self, claim, *, expected_revision, checkpoint, outcome=None, progress=None):
+    def commit_remote_claim(self, claim, *, expected_revision, checkpoint, outcome=None, progress=None,
+                            prepared_file_batch=None):
+        if prepared_file_batch is not None:
+            return self._commit_remote_files(claim, expected_revision, checkpoint, outcome, progress, prepared_file_batch)
+        if isinstance(outcome, tuple) and len(outcome) > 1 and isinstance(outcome[1], dict) and "file_batch_id" in outcome[1]:
+            raise CoreError("CHECKPOINT_INVALID")
         with self._lock:
             row, task = self._remote_claim(claim, terminal=True)
             if task.state in _REMOTE_TERMINAL:
@@ -347,6 +379,66 @@ class TaskScheduler:
             else:
                 self._finish_remote_locked(row, task, outcome)
             return task
+
+    def _commit_remote_files(self, claim, expected_revision, checkpoint, outcome, progress, batch):
+        service = getattr(self, "chat_file_service", None)
+        if service is None:
+            raise CoreError("FILE_ADMISSION_TRANSACTION_REQUIRED")
+        with self._lock:
+            row, _ = self._remote_claim(claim, terminal=True)
+            contract = copy.deepcopy(row["contract"])
+        binding = _remote_file_binding(contract, batch, outcome, claim.task_id)
+        scope = contract["caller_scope"]
+        with service.caller_scope(binding, task_id=scope["task_id"], run_id=scope["run_id"]):
+            with self._lock, service.store.lock:
+                row, task = self._remote_claim(claim, terminal=True)
+                if task.state in _REMOTE_TERMINAL:
+                    return task
+                if row["contract"] != contract or type(expected_revision) is not int or task.revision != expected_revision:
+                    raise CoreError("SESSION_CONFLICT")
+                if _remote_expired(row["checkpoint"], self.clock()):
+                    self._finish_remote_locked(row, task, ("failed", remote_timeout_result(contract), "REMOTE_OPERATION_TIMEOUT"))
+                    return task
+                if row["cancel_requested"] or row["checkpoint"]["cancel_started"]:
+                    raise CoreError("CANCEL_REQUESTED")
+                updated = _advance_remote_checkpoint(row["checkpoint"], checkpoint, contract, self.clock(), False, outcome)
+                _remote_progress(progress, contract, updated, outcome)
+                if not updated["send_started"]:
+                    raise CoreError("CHECKPOINT_INVALID")
+                mailbox = self.mailbox(task.owner_id, claim.tenant_id, remote=True)
+                with mailbox._lock, task.condition:
+                    before_batch = service.store.get(batch["batch_id"], claim.tenant_id)
+                    before_row = copy.deepcopy(row)
+                    before_task = (task.state, copy.deepcopy(task.result), task.error, task.revision)
+                    before_events = dict(mailbox._events)
+                    suspended, recovery = task.id in self._suspended, self._recovery.get(task.id)
+                    try:
+                        service.bind(batch["batch_id"], binding, task_id=scope["task_id"], run_id=scope["run_id"],
+                            actor_id=batch["actor_id"], message_id=batch["message_id"],
+                            request_digest=batch["request_digest"], lease_token=batch["lease_token"])
+                        with service.caller_scope(binding, task_id=scope["task_id"], run_id=scope["run_id"]):
+                            self._remote_claim(claim)
+                            if task.revision != expected_revision or row["contract"] != contract:
+                                raise CoreError("SESSION_CONFLICT")
+                            if _remote_expired(updated, self.clock()):
+                                raise CoreError("LEASE_LOST")
+                            if row["cancel_requested"]:
+                                raise CoreError("CANCEL_REQUESTED")
+                            row["checkpoint"] = updated
+                            self._finish_remote_locked(row, task, ("completed", {
+                                **outcome[1], "file_batch_id": batch["batch_id"]}, None))
+                    except BaseException:
+                        service.store.rows[batch["batch_id"]] = before_batch
+                        row.clear()
+                        row.update(before_row)
+                        task.state, task.result, task.error, task.revision = before_task
+                        mailbox._events = before_events
+                        if suspended:
+                            self._suspended.add(task.id)
+                        if recovery is not None:
+                            self._recovery[task.id] = recovery
+                        raise
+                return task
 
     def expire_remote(self, limit=100):
         if type(limit) is not int or not 1 <= limit <= 1000:
