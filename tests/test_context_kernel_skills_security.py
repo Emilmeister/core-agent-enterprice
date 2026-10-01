@@ -106,6 +106,29 @@ class CompactionTests(unittest.TestCase):
             tokens,
         )
 
+    def test_failed_interval_compaction_preserves_context_below_pressure_threshold(self):
+        items = (ContextItem("history", "latest corrected decision", 400),)
+        state = ContextState(items, items, (1, 1))
+        compactor = Compactor(self.budget, lambda items, limit: None, interval=2)
+        self.assertIs(compactor.maybe_compact(state, turns=2), state)
+
+        full = ContextState(items * 3, items * 3, (1, 3))
+        with self.assertRaises(CoreError) as caught:
+            compactor.maybe_compact(full, turns=2)
+        self.assertEqual(caught.exception.code, "CONTEXT_UNRECOVERABLE")
+        self.assertEqual(full.active, items * 3)
+
+    def test_interval_compaction_does_not_swallow_lease_loss(self):
+        items = (ContextItem("history", "old history", 400),)
+        state = ContextState(items, items, (1, 1))
+
+        def summarize(items, limit):
+            raise CoreError("LEASE_LOST")
+
+        with self.assertRaises(CoreError) as caught:
+            Compactor(self.budget, summarize, interval=2).maybe_compact(state, turns=2)
+        self.assertEqual(caught.exception.code, "LEASE_LOST")
+
     def test_pinned_above_the_target_still_compacts_while_it_fits_the_window(self):
         """The target is a goal; the window is the condition for surviving."""
         pinned = (ContextItem("prompt", "must stay", 160, pinned=True),)
@@ -136,6 +159,47 @@ class CompactionTests(unittest.TestCase):
             ).compact(state)
         self.assertEqual(caught.exception.code, "CONTEXT_UNRECOVERABLE")
         self.assertEqual(state.active[0].content, "must stay")
+
+    def test_pinned_window_check_includes_system_and_tools_even_without_candidates(self):
+        pinned = ContextItem("prompt", "must stay", 1_010, pinned=True)
+        for history in ((), (ContextItem("history", "old", 20),)):
+            with self.subTest(history=bool(history)):
+                items = (pinned, *history)
+                state = ContextState(items, items, (1, len(items)))
+                with self.assertRaises(CoreError) as caught:
+                    Compactor(self.budget, lambda items, limit: self._summary(1)).compact(state)
+                self.assertEqual(caught.exception.code, "CONTEXT_UNRECOVERABLE")
+                self.assertEqual(state.active, items)
+
+    def test_pinned_above_target_leaves_real_summary_space_within_working_window(self):
+        pinned = ContextItem("prompt", "must stay", 160, pinned=True)
+        history = ContextItem("history", "important old outcome", 800)
+        state = ContextState((pinned, history), (pinned, history), (1, 2))
+
+        def summarize(items, limit):
+            self.assertGreaterEqual(limit, 50)
+            return self._summary(50)
+
+        result = Compactor(self.budget, summarize).compact(state)
+        self.assertEqual(result.working_tokens, 210)
+        self.assertEqual(result.transcript, state.transcript)
+
+    def test_overlap_filling_target_is_released_to_leave_summary_room(self):
+        items = (ContextItem("prompt", "must stay", 50, pinned=True),
+                 ContextItem("history", "old", 800),
+                 ContextItem("history", "recent", 100))
+        state = ContextState(items, items, (1, 3))
+        result = Compactor(self.budget, lambda items, limit: self._summary(50), overlap=1).compact(state)
+        self.assertLessEqual(result.working_tokens, 150)
+        self.assertEqual(result.transcript, state.transcript)
+
+    def test_oversized_overlap_containing_all_history_is_still_compacted(self):
+        items = (ContextItem("prompt", "must stay", 50, pinned=True),
+                 ContextItem("tool_result", "only large result", 1_100))
+        state = ContextState(items, items, (1, 2))
+        result = Compactor(self.budget, lambda items, limit: self._summary(50), overlap=1).compact(state)
+        self.assertEqual(result.working_tokens, 100)
+        self.assertEqual(result.transcript, state.transcript)
 
     def test_an_oversized_overlap_is_released_rather_than_ending_the_run(self):
         """Overlap is unpinned: a big tool result in the tail is not fatal."""
@@ -179,9 +243,12 @@ class CompactionTests(unittest.TestCase):
             20,
             provider_replay={"signature": "opaque-provider-replay"},
         )
-        summary = StructuredSummarizer(lambda text: max(1, len(text) // 4))(
-            (item,), 1_000
-        )
+        import json
+        from core_agent.model import ModelResponse
+        summary = StructuredSummarizer(lambda text: max(1, len(text) // 4),
+            lambda **kw: ModelResponse(message=json.dumps({key: [] for key in
+                ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")}),
+                finish_reason="stop"))((item,), 1_000)
         self.assertNotIn("opaque-provider-replay", summary.content)
 
 
@@ -439,3 +506,49 @@ class SecurityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SemanticSummaryTests(unittest.TestCase):
+    def test_complete_sources_corrections_and_strict_output(self):
+        import json
+        from core_agent.model import ModelResponse
+        calls = []
+        source = {"version": 1, "sources": {"run:2": {"run_id": "run", "sequence": 2}}}
+        item = ContextItem("history", "Use A. Correction: use B. Plan to publish; not yet done.", 30,
+                           provenance=source, provider_replay={"signature": "SECRET"})
+        payload = {key: [] for key in ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")}
+        payload["Decisions"] = [{"text": "Use B", "basis": "fact", "sources": ["run:2"]}]
+        payload["Pending"] = [{"text": "Publish", "basis": "fact", "sources": ["run:2"]}]
+        def generate(**call):
+            calls.append(call)
+            return ModelResponse(message=json.dumps(payload), finish_reason="stop")
+        summary = StructuredSummarizer(len, generate)((item,), 2000)
+        self.assertEqual(json.loads(summary.content), payload)
+        self.assertEqual(summary.tokens, len(summary.content))
+        self.assertEqual(summary.provenance["sources"], source["sources"])
+        self.assertIn(item.content, calls[0]["context"])
+        self.assertNotIn("SECRET", calls[0]["context"])
+        self.assertEqual(calls[0]["tools"], {})
+        for response in [ModelResponse(message=json.dumps(payload), finish_reason="length"),
+                         ModelResponse(message=json.dumps(payload)),
+                         ModelResponse(message='{ "Goal": [], "Goal": [] }', finish_reason="stop"),
+                         ModelResponse(message=json.dumps(payload).replace("run:2", "unknown"), finish_reason="stop")]:
+            with self.subTest(response=response), self.assertRaises(CoreError):
+                StructuredSummarizer(len, lambda **kw: response)((item,), 2000)
+        with self.assertRaises(CoreError):
+            StructuredSummarizer(len, generate)((item,), 10)
+
+    def test_unknown_provenance_version_is_not_legacy(self):
+        with self.assertRaises(CoreError) as caught:
+            ContextItem("history", "x", 1, provenance={"version": 99, "sources": {}})
+        self.assertEqual(caught.exception.code, "CHECKPOINT_INVALID")
+
+    def test_overlap_keeps_entire_tool_batch(self):
+        import json
+        calls = ContextItem("assistant_tool_calls", json.dumps([{"id": "a"}, {"id": "b"}]), 10)
+        results = tuple(ContextItem("tool_result", json.dumps({"tool_call_id": name}), 10) for name in ("a", "b"))
+        history = ContextItem("history", "old", 900)
+        items = (history, calls, *results)
+        state = ContextState(items, items, (1, 4))
+        summary = CompactionTests()._summary(70)
+        compacted = Compactor(ContextBudget(1200, 100, 50, 50), lambda *args: summary, overlap=1).compact(state)
+        self.assertEqual(compacted.active[-3:], (calls, *results))

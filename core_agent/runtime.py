@@ -7,10 +7,13 @@ import copy
 import hashlib
 import inspect
 import logging
+import math
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, is_dataclass
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, is_dataclass, replace
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
 
@@ -28,7 +31,8 @@ from .context import (
     ContextState,
     StructuredSummarizer,
 )
-from .errors import CoreError
+from .errors import CoreError, ExecutionNotStarted
+from .interactions import tool_origin
 from .skills import (
     SKILL_ACTIVATE_TOOL,
     SKILL_RESOURCE_TOOL,
@@ -36,21 +40,24 @@ from .skills import (
     SkillResolver,
 )
 from .kernel import KernelCompiler
-from .python_exec import execute_python
+from .python_exec import PythonContinuationStopped, execute_python
 from .mcp import mcp_tool_index
-from .model import ModelResponse
+from .model import CompatibleHttpModel, ModelResponse
 from .remote_agents import build_forwarded_headers
+from . import remote_agents as remote_transport
+from .remote_operations import RemoteA2AExecutor
 from .security import redact
 from .streaming import NullStreamPublisher
-from .tasks import DelegationContract
-from .tools import ToolCall, ToolDefinition, ToolResult
-from .workflow import InMemoryWorkflowStore, WorkflowRecord
+from .tasks import DelegationContract, _remote_contract
+from .tools import CRON_CREATE_TOOL, ToolCall, ToolDefinition, ToolResult
+from .workflow import InMemoryWorkflowStore, SuspendedRun, WorkflowRecord, TERMINAL_STATES
+from .workspace import WorkspaceBinding
 
 NULL_STREAM = NullStreamPublisher()
 WORKFLOW_LEASE_TTL = 600
 WORKFLOW_LEASE_HEARTBEAT_INTERVAL = WORKFLOW_LEASE_TTL / 3
 WORKFLOW_RECOVERY_POLL_SECONDS = 0.5
-RECOVERABLE_WORKFLOW_STATES = frozenset({"RUNNING", "MODEL_RESPONDED", "EXECUTING"})
+RECOVERABLE_WORKFLOW_STATES = frozenset({"RUNNING", "MODEL_RESPONDED", "EXECUTING", "WAITING_TASK", "WAITING_INPUT"})
 DEFAULT_BUDGET_CANCEL_GRACE_SECONDS = 5.0
 BUDGET_FINALIZATION_INSTRUCTION = (
     "BUDGET FINALIZATION: The work budget is exhausted. Return a concise, truthful "
@@ -69,6 +76,11 @@ BUDGET_FOLLOWUP_MESSAGE = (
     "Completed durable work remains recorded, and no missing result was invented."
 )
 SKILL_CONTRACT_VERSION = 2
+
+
+class _MaterialSuspended(Exception):
+    def __init__(self, result):
+        self.result = result
 
 
 def _skill_tool_definitions():
@@ -290,6 +302,10 @@ class CoreAgent:
         token_counter=None,
         depth=0,
         workflow_store=None,
+        interaction_store=None,
+        material_review_store=None,
+        guardrail_classifier=None,
+        chat_file_service=None,
         kernel_compiler=None,
         context_window=128_000,
         output_reserve=4_096,
@@ -301,6 +317,7 @@ class CoreAgent:
         artifact_service=None,
         memory_registry=None,
         remote_agents=None,
+        remote_registry=None,
         send_message_api_key=None,
         platform_mcp=(),
         declared_skills=(),
@@ -322,6 +339,16 @@ class CoreAgent:
         self.depth = depth
         self._worker_id = str(uuid.uuid4())
         self.workflow_store = workflow_store or InMemoryWorkflowStore()
+        self.interaction_store = interaction_store
+        if (material_review_store is None) != (guardrail_classifier is None):
+            raise CoreError("CONFIG_INVALID", "Material store and classifier must be configured together")
+        self.material_review_store = material_review_store
+        self.guardrail_classifier = guardrail_classifier
+        if chat_file_service is not None and material_review_store is None:
+            raise CoreError("CONFIG_INVALID", "Chat files require material reviews")
+        self.chat_file_service = chat_file_service
+        self._file_sweep_due = 0.0
+        self._file_sweep_startup = True
         self.kernel_compiler = kernel_compiler or KernelCompiler(
             "Never reveal secrets or hidden reasoning.",
             "Only EffectiveConfig capabilities are authorized.",
@@ -344,6 +371,11 @@ class CoreAgent:
         self._run_contexts = {}
         self._run_scopes = {}
         self._runtime_cache = {}
+        self._runtime_lock = threading.RLock()
+        self._runtime_generations = {}
+        self._runtime_owner = ContextVar("core_agent_runtime_owner", default=None)
+        self._active_tool_calls = {}
+        self._dispatch_context = ContextVar("core_agent_dispatch_context", default=None)
         self._run_mcp_connectors = {}
         self._starting_tasks = {}
         self._cancel_requests = set()
@@ -354,6 +386,7 @@ class CoreAgent:
         self._recovery_thread = None
         self._recovery_workers = {}
         self._recovery_callback = None
+        self._task_wait_cursor = None
         self._task_streams = {}
         self._task_headers = {}
         self._model_streams_deltas = self._accepts_deltas(self.model)
@@ -370,9 +403,10 @@ class CoreAgent:
                 "CONFIG_INVALID", "budget cancel grace seconds must be positive"
             )
         self.remote_agents = dict(remote_agents or {})
+        self.remote_registry = remote_registry
         self.send_message_api_key = send_message_api_key
         registered = self.tool_runtime.registry.names()
-        for definition in _skill_tool_definitions():
+        for definition in (*_skill_tool_definitions(), CRON_CREATE_TOOL):
             if definition.name not in registered:
                 self.tool_runtime.registry.register(definition)
         self.tool_runtime.handlers.update(
@@ -388,6 +422,7 @@ class CoreAgent:
                 "core_artifact_load": self._artifact_load,
                 "core_artifact_list": self._artifact_list,
                 "core_agent_send_message": self._send_message,
+                "core_cron_create": self._cron_create,
                 "core_memory_search": self._memory_search,
                 "core_memory_read": self._memory_read,
                 "core_memory_create": self._memory_create,
@@ -397,10 +432,13 @@ class CoreAgent:
             }
         )
         if self.depth == 0 and hasattr(self.task_scheduler, "register"):
+            self.task_scheduler._workflow_outcome = self._scheduler_workflow_outcome
             self.task_scheduler.register(
                 "background_tool", self._recover_background_tool
             )
             self.task_scheduler.register("subagent", self._recover_subagent)
+            if self.remote_registry is not None:
+                self.task_scheduler.register("remote_a2a", RemoteA2AExecutor(self.task_scheduler, self.remote_registry))
 
     @staticmethod
     def _accepts_deltas(model):
@@ -497,6 +535,278 @@ class CoreAgent:
             tuple(ContextItem(**item) for item in value["transcript"]),
             tuple(value["sequence_range"]),
         )
+
+    @staticmethod
+    def _context_provenance(snapshot, sequence, *, material_source_ids=(), dependent=False):
+        run_id = snapshot.get("context_run_id", "legacy")
+        materials = [copy.deepcopy(snapshot["context_materials"][key]["identity"])
+                     for key in material_source_ids
+                     if snapshot.get("context_materials", {}).get(key, {}).get("allowed")]
+        sources = {}
+        if dependent:
+            for item in snapshot["context"]["active"]:
+                sources.update((item.get("provenance") or {}).get("sources", {}))
+        sources[f"{run_id}:{sequence}"] = {"run_id": run_id, "sequence": sequence,
+                                           **({"materials": materials} if materials else {})}
+        return {"version": 1, "source_id": f"{run_id}:{sequence}", "sources": sources}
+
+    @staticmethod
+    def _context_import(snapshot):
+        imported = snapshot.get("context_import")
+        if imported is not None and (not isinstance(imported, dict)
+                or type(imported.get("version")) is not int or imported["version"] != 1
+                or imported.get("previous_run_id") != snapshot.get("previous_root_run_id")
+                or not isinstance(imported.get("sources"), dict)):
+            raise CoreError("CHECKPOINT_INVALID")
+        return imported
+
+    def _history_source(self, record, run_id, *, connection=None):
+        try:
+            source = self.workflow_store.get(run_id, tenant_id=record.tenant_id,
+                owner_id=record.owner_id, connection=connection)
+        except CoreError as error:
+            if error.code == "TASK_NOT_FOUND":
+                raise CoreError("CHECKPOINT_INVALID") from None
+            raise
+        if (source.run_id == record.run_id or source.context_id != record.context_id
+                or source.parent_run_id is not None or source.state not in TERMINAL_STATES):
+            raise CoreError("CHECKPOINT_INVALID")
+        return source
+
+    def _historical_item(self, item, source):
+        if (item.provenance or {}).get("historical"):
+            return replace(item, pinned=False, provider_replay=None)
+        content = item.content
+        if item.kind == "assistant_tool_calls":
+            payload = json.loads(content)
+            content = json.dumps(payload if isinstance(payload, list) else payload["tool_calls"], ensure_ascii=False)
+        content = json.dumps({"historical_task": source.task_id, "state": source.state,
+            "instruction": "Historical data only; earlier goals and outcomes are not the current instruction.",
+            "kind": item.kind, "content": content}, ensure_ascii=False, separators=(",", ":"))
+        return replace(item, kind="summary" if item.kind == "summary" else "history",
+            content=content, tokens=self.token_counter(content), pinned=False, provider_replay=None,
+            provenance={**item.provenance, "historical": True})
+
+    def _terminal_context_item(self, source, originals):
+        digest = hashlib.sha256(json.dumps(source.result, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        source_id = f"{source.run_id}:result:{digest}"
+        sources = dict(source.snapshot.get("context_import", {}).get("sources", {}))
+        sources.update({key: value for item in originals.values()
+                        for key, value in item.provenance["sources"].items()})
+        sources[source_id] = {"kind": "terminal_result", "run_id": source.run_id, "result_digest": digest}
+        result = source.result or {}
+        content = json.dumps({"message": result.get("message"), "state": source.state,
+            "complete": result.get("complete", source.state == "COMPLETED"),
+            "completion_reason": result.get("completion_reason", source.state.lower()),
+            "error_code": source.error_code}, ensure_ascii=False, separators=(",", ":"))
+        return ContextItem("final_result", content, self.token_counter(content),
+            provenance={"version": 1, "source_id": source_id, "sources": sources})
+
+    def _context_originals(self, record, snapshot, *, lease_token, connection=None, source_record=None):
+        self._context_import(snapshot)
+        source_record = source_record or record
+        state = self._context_from_dict(snapshot["context"])
+        originals = {}
+        normalized = []
+        legacy_reviews = []
+        if self.material_review_store is not None and any(item.provenance is None for item in state.transcript):
+            legacy_reviews = [self.material_review_store.visibility_reference(record, review_id,
+                lease_token=lease_token, connection=connection, source_run_id=source_record.run_id)
+                for review_id in set(snapshot.get("material_reviews", {}).values())]
+        for sequence, item in enumerate(state.transcript, start=state.sequence_range[0]):
+            if item.kind.startswith("unprocessed_due_to_"):
+                continue
+            if item.provenance is None:
+                materials = []
+                if self.material_review_store is not None and item.kind in {"prompt", "user_message", "tool_result"}:
+                    payload = item.content
+                    if item.kind == "tool_result":
+                        result = json.loads(payload)
+                        payload = result.get("output")
+                        if result.get("tool_name") == "core_ask_owner" and isinstance(payload, dict):
+                            payload = payload.get("answer", payload)
+                        elif result.get("tool_name") in {"core_task_get", "core_task_wait", "core_delegate"} and isinstance(payload, dict):
+                            payload = payload.get("result", payload)
+                    materials = [{"material_digest": hashlib.sha256(json.dumps(payload, ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()}]
+                source_id = ("initial" if item.kind == "prompt" else
+                    "result:" + json.loads(item.content)["tool_call_id"] if item.kind == "tool_result" else None)
+                for review in legacy_reviews:
+                    if (review["source_id"] == source_id
+                            or (item.kind == "user_message" and review["source_kind"] == "follow_up")
+                            or (item.kind in {"prompt", "user_message"} and review["source_kind"] == "file_attachment")):
+                        reference = review["completed_result_ref"] or {}
+                        if reference.get("material_digest"):
+                            materials.append({**reference, "review_id": review["review_id"]})
+                source = {"run_id": source_record.run_id, "sequence": sequence, **({"materials": materials} if materials else {})}
+                sources = {}
+                if item.kind in {"assistant_tool_calls", "assistant", "model_response"}:
+                    sources.update({key: value for prior in normalized
+                                    for key, value in prior.provenance["sources"].items()})
+                sources[f"{source_record.run_id}:{sequence}"] = source
+                item = replace(item, provenance={"version": 1, "source_id": f"{source_record.run_id}:{sequence}", "sources": sources})
+            normalized.append(item)
+            originals[f"{source_record.run_id}:{sequence}"] = item
+        return originals
+
+    def _visible_context(self, record, snapshot, *, lease_token, connection=None, source_record=None, fenced=False):
+        """Project immutable originals through today's negative material decisions."""
+        if not fenced and connection is None:
+            with self.workflow_store._execution_lock(record, lease_token) as (current, conn):
+                return self._visible_context(current, snapshot, lease_token=lease_token,
+                    connection=conn, source_record=source_record, fenced=True)
+        state = self._context_from_dict(snapshot["context"])
+        source_record = source_record or record
+        if source_record.run_id == record.run_id:
+            snapshot["context_run_id"] = record.run_id
+        originals = self._context_originals(record, snapshot, lease_token=lease_token,
+            connection=connection, source_record=source_record)
+        normalized = list(originals.values())
+        loaded = {source_record.run_id}
+        source_records = {source_record.run_id: source_record}
+        if source_record.run_id != record.run_id:
+            terminal = self._terminal_context_item(source_record, originals)
+            originals[terminal.provenance["source_id"]] = terminal
+        # Read foreign immutable originals through the caller's fenced connection;
+        # historical rows never acquire a writer lease or execution lock.
+        foreign_sources = {key: value for item in state.active if not item.kind.startswith("unprocessed_due_to_") for key, value in
+                           (item.provenance or {}).get("sources", {}).items()
+                           if value.get("run_id") != record.run_id}
+        for source_id, source in foreign_sources.items():
+            run_id = source.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise CoreError("CHECKPOINT_INVALID")
+            if run_id not in loaded:
+                historical = self._history_source(record, run_id, connection=connection)
+                source_records[run_id] = historical
+                prior = self._context_originals(record, historical.snapshot, lease_token=lease_token,
+                    connection=connection, source_record=historical)
+                terminal = self._terminal_context_item(historical, prior)
+                prior[terminal.provenance["source_id"]] = terminal
+                originals.update({key: self._historical_item(item, historical) for key, item in prior.items()})
+                loaded.add(run_id)
+            original = originals.get(source_id)
+            if original is None or original.provenance["sources"].get(source_id) != source:
+                raise CoreError("CHECKPOINT_INVALID")
+        decisions = {}
+        def allowed(item):
+            for source in (item.provenance or {}).get("sources", {}).values():
+                materials = list(source.get("materials", ()))
+                if source.get("kind") == "terminal_result":
+                    result = source_records[source["run_id"]].result or {}
+                    if result.get("message") is not None:
+                        materials.append({"material_digest": hashlib.sha256(json.dumps(result["message"],
+                            ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()})
+                for material in materials:
+                    key = json.dumps(material, sort_keys=True)
+                    if key not in decisions:
+                        decisions[key] = (self.material_review_store.negative_decision(record,
+                            material["material_digest"], material_kind=material.get("material_kind", "json"),
+                            text_digest=material.get("text_digest"), lease_token=lease_token, connection=connection)
+                            if self.material_review_store is not None else None)
+                    if decisions[key] is not None:
+                        return False
+                    if material.get("review_id"):
+                        revision_key = "review:" + material["review_id"]
+                        if revision_key not in decisions:
+                            reference = self.material_review_store.visibility_reference(record, material["review_id"],
+                                lease_token=lease_token, connection=connection, source_run_id=source["run_id"])
+                            decisions[revision_key] = {"state": reference["state"], "revision": reference["revision"]}
+                        if decisions[revision_key]["state"] not in {"clear", "allowed"}:
+                            return False
+            return True
+        active, emitted = [], set()
+        for item in state.active:
+            if item.kind.startswith("unprocessed_due_to_"):
+                continue
+            if item.provenance is None and item.kind != "summary":
+                matches = [original for original in normalized if original.kind == item.kind and original.content == item.content]
+                if not matches and item.kind == "tool_result":
+                    call_id = json.loads(item.content).get("tool_call_id")
+                    matches = [original for original in normalized if original.kind == "tool_result"
+                               and json.loads(original.content).get("tool_call_id") == call_id]
+                # Ambiguous legacy records conservatively depend on every matching original.
+                sources = {key: value for match in (matches or normalized)
+                           for key, value in (match.provenance or {}).get("sources", {}).items()}
+                item = replace(item, provenance={"version": 1, "sources": sources})
+            semantic = item.kind == "summary" and (item.provenance or {}).get("summary_version") == 1
+            if item.kind == "summary" and (not semantic or not allowed(item)):
+                dependencies = (item.provenance or {}).get("sources", originals)
+                for source_id in dependencies:
+                    original = originals.get(source_id)
+                    if original is not None and source_id not in emitted:
+                        if allowed(original):
+                            active.append(original)
+                        elif original.kind == "tool_result":
+                            result = json.loads(original.content)
+                            content = json.dumps({"tool_call_id": result["tool_call_id"], "status": "failed",
+                                "error_code": "MATERIAL_REJECTED", "output": {"instruction": "Material is no longer available."}})
+                            active.append(replace(original, content=content, tokens=self.token_counter(content),
+                                provider_replay=None, provenance={"version": 1, "sources": {}}))
+                        emitted.add(source_id)
+                continue
+            if not allowed(item):
+                # Remove derived prose too; preserve only a content-free provider result.
+                if item.kind == "tool_result":
+                    result = json.loads(item.content)
+                    content = json.dumps({"tool_call_id": result["tool_call_id"], "status": "failed",
+                        "error_code": "MATERIAL_REJECTED", "output": {"instruction": "Material is no longer available."}})
+                    item = replace(item, content=content, tokens=self.token_counter(content), provider_replay=None,
+                                   provenance={"version": 1, "sources": {}})
+                else:
+                    continue
+            source_ids = set((item.provenance or {}).get("sources", {}))
+            # Only suppress duplicate restored originals, not summaries with the same dependency set.
+            if item.kind not in {"summary", "runtime_references"} and source_ids and source_ids <= emitted:
+                continue
+            active.append(item)
+            if item.kind not in {"summary", "runtime_references"}:
+                emitted.update(source_ids)
+        # A rejected assistant batch must not leave provider orphan results.
+        calls = set()
+        for item in active:
+            if item.kind == "assistant_tool_calls":
+                payload = json.loads(item.content)
+                calls.update(call["id"] for call in (payload if isinstance(payload, list) else payload["tool_calls"]))
+        active = tuple(replace(item, kind="historical_tool_result", provider_replay=None)
+                       if item.kind == "tool_result" and json.loads(item.content)["tool_call_id"] not in calls else item
+                       for item in active)
+        return ContextState(active, state.transcript, state.sequence_range), decisions
+
+    def _import_previous_context(self, record, *, lease_token):
+        previous = record.snapshot.get("previous_root_run_id")
+        imported = self._context_import(record.snapshot)
+        if imported is not None:
+            return record
+        if previous is None:
+            return record
+        if not isinstance(previous, str) or not previous or record.parent_run_id is not None:
+            raise CoreError("CHECKPOINT_INVALID")
+        with self.workflow_store._execution_lock(record, lease_token) as (current, connection):
+            source = self._history_source(current, previous, connection=connection)
+            old = copy.deepcopy(source.snapshot)
+            originals = self._context_originals(current, old, lease_token=lease_token,
+                connection=connection, source_record=source)
+            terminal = self._terminal_context_item(source, originals)
+            old["context"]["active"].append(asdict(terminal))
+            visible, _ = self._visible_context(current, old, lease_token=lease_token,
+                connection=connection, source_record=source)
+            history = tuple(self._historical_item(item, source) for item in visible.active)
+            snapshot = copy.deepcopy(current.snapshot)
+            context = self._context_from_dict(snapshot["context"])
+            snapshot["context"] = self._context_to_dict(replace(context, active=history + context.active))
+            snapshot["context_import"] = {"version": 1, "previous_run_id": previous,
+                "sources": {key: value for item in history for key, value in item.provenance["sources"].items()}}
+            return self._record_transition(current, state=current.state, snapshot=snapshot,
+                event_kind="context.imported", event_data={"source_run_id": previous},
+                lease_token=lease_token, connection=connection)
+
+    @staticmethod
+    def _context_fingerprint(context, decisions):
+        return hashlib.sha256(json.dumps({"active": [asdict(item) for item in context.active],
+            "boundary": context.sequence_range, "visibility": decisions}, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
     @staticmethod
     def _platform_snapshot(platform):
@@ -759,12 +1069,14 @@ class CoreAgent:
             schema["properties"]["skills"]["maxItems"] = 0
         return schema
 
-    def _tool_catalog(self, effective, discovered, snapshot=None):
+    def _tool_catalog(self, effective, discovered, snapshot=None, *, tenant_id=None):
         catalog = {}
         index = mcp_tool_index(effective.mcp_tools)
         for name in effective.model_tool_catalog:
             if name in index:
                 server, remote_tool = index[name]
+                if remote_tool not in discovered.get(server, {}):
+                    continue
                 catalog[name] = {
                     "description": name,
                     "input_schema": discovered.get(server, {}).get(remote_tool, {}),
@@ -817,7 +1129,119 @@ class CoreAgent:
                 "description": definition.description,
                 "input_schema": schema,
             }
+        if getattr(self, "cron_store", None) is None:
+            catalog.pop("core_cron_create", None)
+        if self.interaction_store is not None:
+            if tenant_id is None:
+                raise CoreError("AUTH_CONTEXT_REQUIRED")
+            catalog = {
+                name: definition for name, definition in catalog.items()
+                if self.interaction_store.get_policy(
+                    tenant_id, name, tool_origin(name, index.get(name))
+                ).mode != "deny"
+            }
+            if catalog.get("core_delegate", {}).get("input_schema"):
+                schema = copy.deepcopy(catalog["core_delegate"]["input_schema"])
+                schema["properties"]["tools"]["items"] = {
+                    "enum": sorted(set(catalog) - SKILL_TOOLS)
+                }
+                catalog["core_delegate"]["input_schema"] = schema
+        if self.remote_registry is not None and "core_agent_send_message" in catalog:
+            peers = self._remote_peers(tenant_id)
+            if not peers:
+                catalog.pop("core_agent_send_message")
+            else:
+                catalog["core_agent_send_message"]["description"] = (
+                    "Send one focused task to a trusted remote agent; returns a durable local task handle. "
+                    "Use core_task_wait without timeout for its result. Available agents: "
+                    + "; ".join(peer["name"] + ": " + peer["description"] for peer in peers.values()))
         return catalog
+
+    def _remote_peers(self, tenant_id):
+        if self.remote_registry is None or not tenant_id:
+            return {}
+        if self.interaction_store is not None and self.interaction_store.get_policy(
+                tenant_id, "core_agent_send_message", tool_origin("core_agent_send_message")).mode == "deny":
+            return {}
+        peers, cursor = {}, None
+        while True:
+            page = self.remote_registry.list(tenant_id, limit=100, after_id=cursor)
+            for peer in page:
+                if not peer["enabled"]:
+                    continue
+                try:
+                    connection = remote_transport.connect_peer(peer, headers=self.remote_registry.resolve_headers(
+                        tenant_id, peer["id"], peer["revision"]))
+                except CoreError as error:
+                    if error.code not in {"REMOTE_AGENT_DENIED", "REMOTE_AGENT_UNAVAILABLE", "REMOTE_AGENT_PROTOCOL_ERROR",
+                                           "REMOTE_AGENT_CARD_INVALID", "REMOTE_AGENT_RESPONSE_TOO_LARGE", "REMOTE_AGENT_CREDENTIAL_UNAVAILABLE"}:
+                        raise
+                    self._log("remote.discovery.failed", peer_id=peer["id"], error_code=error.code)
+                    continue
+                peers[peer["name"]] = {**peer, "binding": connection.card.binding}
+            if len(page) < 100:
+                return peers
+            cursor = page[-1]["id"]
+
+    @staticmethod
+    def _remote_binding(snapshot, call, *, attempt=None):
+        attempt = snapshot["tool_calls"] if attempt is None else attempt
+        calls = snapshot.get("remote_calls", {})
+        if not isinstance(calls, dict):
+            raise CoreError("CHECKPOINT_INVALID")
+        entry = calls.get(f"{attempt}:{call.id}")
+        if entry is None:
+            return None
+        if not isinstance(entry, dict) or entry.keys() != {"version", "contract"} or type(entry["version"]) is not int or entry["version"] != 1:
+            raise CoreError("CHECKPOINT_INVALID")
+        contract = entry["contract"]
+        if not isinstance(contract, dict) or contract.get("task") != call.arguments.get("task") or contract.get("peer_name") != call.arguments.get("agent_name"):
+            raise CoreError("CHECKPOINT_INVALID")
+        return copy.deepcopy(contract)
+
+    @staticmethod
+    def _validate_remote_snapshot(record):
+        calls = record.snapshot.get("remote_calls", {})
+        if not isinstance(calls, dict):
+            raise CoreError("CHECKPOINT_INVALID")
+        for key, entry in calls.items():
+            if (not isinstance(key, str) or ":" not in key or not key.split(":", 1)[0].isdigit()
+                    or int(key.split(":", 1)[0]) < 1 or not key.split(":", 1)[1]
+                    or not isinstance(entry, dict) or entry.keys() != {"version", "contract"}
+                    or type(entry["version"]) is not int or entry["version"] != 1):
+                raise CoreError("CHECKPOINT_INVALID")
+            _remote_contract(entry["contract"], record.tenant_id, record.run_id)
+        previous = record.snapshot.get("remote_admission")
+        if previous is not None and (
+                not isinstance(previous, dict) or previous.keys() != {"version", "source_id", "attempt", "task_id"}
+                or type(previous["version"]) is not int or previous["version"] != 1
+                or type(previous["attempt"]) is not int or previous["attempt"] < 1
+                or not isinstance(previous["source_id"], str) or not previous["source_id"]
+                or not isinstance(previous["task_id"], str) or not previous["task_id"]):
+            raise CoreError("CHECKPOINT_INVALID")
+
+    def _pin_remote_call(self, record, snapshot, call, *, lease_token, attempt=None):
+        attempt = snapshot["tool_calls"] if attempt is None else attempt
+        contract = self._remote_binding(snapshot, call, attempt=attempt)
+        if contract is not None:
+            _remote_contract(contract, record.tenant_id, record.run_id)
+            return record, snapshot
+        if self.interaction_store.get_policy(record.tenant_id, call.name, tool_origin(call.name)).mode == "deny":
+            raise CoreError("POLICY_DENIED")
+        peer = self._remote_peers(record.tenant_id).get(call.arguments["agent_name"])
+        if peer is None:
+            raise CoreError("TOOL_UNAVAILABLE", "Registered remote agent is unavailable")
+        settings = self.interaction_store.get_settings(record.tenant_id)
+        contract = {"version": 1, "tenant_id": record.tenant_id, "owner_id": record.run_id,
+            "peer_id": peer["id"], "peer_revision": peer["revision"], "peer_name": peer["name"],
+            "url": peer["url"], "binding": peer["binding"], "task": call.arguments["task"],
+            "message_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"remote-message:{record.run_id}:{attempt}:{call.id}")),
+            "timeout_seconds": settings.remote_timeout_seconds, "poll_interval_seconds": settings.remote_poll_interval_seconds}
+        _remote_contract(contract, record.tenant_id, record.run_id)
+        snapshot.setdefault("remote_calls", {})[f"{attempt}:{call.id}"] = {"version": 1, "contract": contract}
+        record = self._record_transition(record, state=record.state, snapshot=snapshot,
+            event_kind="remote.pinned", event_data={"tool_call_id": call.id, "peer_id": peer["id"], "peer_revision": peer["revision"]}, lease_token=lease_token)
+        return record, copy.deepcopy(record.snapshot)
 
     def _safe_telemetry(self, value):
         return redact(value, (getattr(self.model, "api_key", None),))
@@ -952,7 +1376,7 @@ class CoreAgent:
         return attributes
 
     def _instrument_tool(self, span, call, definition):
-        arguments = self._json(call.arguments)
+        arguments = self._json(call.arguments) if self.material_review_store is None else "[private tool arguments]"
         schema = self._json(definition.input_schema)
         span.set_attributes(
             {
@@ -1019,6 +1443,151 @@ class CoreAgent:
             messages.append({"role": "user", "content": item.content})
         return messages
 
+    def _finish_terminal(self, record, *, lease_token):
+        intent = record.snapshot["terminal_intent"]
+        family = self.workflow_store.execution_family(record)
+        if any(self._unproven_local_execution(item) for item in family):
+            raise CoreError("EXECUTION_CLEANUP_PENDING", "Legacy execution has no durable cleanup receipt")
+        manager = self.tool_runtime.environment_manager
+        owners = [(item, item.snapshot.get("execution_owner")) for item in family]
+        local = [(item, owner) for item, owner in owners if owner and not owner["cleanup_confirmed"]
+                 and owner["instance_id"] == getattr(manager, "instance_id", None)]
+        proven_idle = [(item, owner) for item, owner in owners if owner and not owner["cleanup_confirmed"]
+                       and owner.get("local_execution_pending") is False
+                       and owner["instance_id"] != getattr(manager, "instance_id", None)]
+        close = getattr(manager, "close_execution_tree", None)
+        try:
+            if close is not None:
+                close(record.run_id, intent["id"], run_ids=tuple(item.run_id for item in family),
+                      execution_owners=tuple((item.run_id, owner["worker_id"], owner["generation"]) for item, owner in local))
+            for item, owner in (*local, *proven_idle):
+                self.workflow_store.confirm_execution(item, owner)
+        except Exception as error:
+            if isinstance(error, CoreError) and error.code == "LEASE_LOST":
+                raise
+            raise CoreError("EXECUTION_CLEANUP_PENDING", "Execution cleanup is not confirmed") from error
+        if any(owner and not owner["cleanup_confirmed"] and owner.get("local_execution_pending") is not False
+               and owner["instance_id"] != getattr(manager, "instance_id", None)
+               for _, owner in owners):
+            raise CoreError("EXECUTION_CLEANUP_PENDING", "Previous server execution requires reconciliation")
+        record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+        try:
+            updated = self._record_transition(record, **{key: value for key, value in intent.items() if key != "id"},
+                                              lease_token=lease_token, _terminal_committing=True)
+        except CoreError as error:
+            if error.code not in {"INBOUND_MESSAGE_PENDING", "CANCEL_REQUESTED"}:
+                raise
+            snapshot = copy.deepcopy(record.snapshot)
+            if not snapshot.get("finalizing_response"):
+                snapshot["pending_response"] = None
+            snapshot["tool_queue"] = []
+            self.workflow_store.clear_terminal(record, intent["id"], lease_token=lease_token, snapshot=snapshot)
+            if close is not None:
+                manager.reopen_execution_tree(record.run_id, intent["id"])
+            # Cleanup retired this lease's execution capability. A fresh attempt
+            # delivers the accepted input/cancel without reviving old callbacks.
+            raise CoreError("EXECUTION_REOPENED") from error
+        release = getattr(manager, "release_run_workspaces", None)
+        if release is not None:
+            release(tuple(item.run_id for item in family))
+        for child in family:
+            if child.run_id == record.run_id or child.state in TERMINAL_STATES:
+                continue
+            try:
+                self.workflow_store.request_cancel(child.run_id, tenant_id=child.tenant_id, owner_id=child.owner_id)
+            except CoreError as error:
+                if error.code != "TASK_NOT_CANCELABLE":
+                    raise
+        return updated
+
+    @staticmethod
+    def _unproven_local_execution(record):
+        return (record.state == "EXECUTING" and not record.snapshot.get("execution_owner")
+                and (record.snapshot.get("pending_call") or {}).get("name") in {"core_terminal_exec", "core_python_exec"})
+
+    @staticmethod
+    def _terminal_result(record):
+        if record.state != "COMPLETED":
+            raise CoreError(record.error_code or ("TASK_CANCELLED" if record.state == "CANCELLED" else "INVALID_TASK_STATE"))
+        result = record.result
+        if record.snapshot.get("background_tool"):
+            return result["output"]
+        return RunResult(record.run_id, result["message"], "completed", Usage(**result["usage"]),
+                         result.get("complete", True), result.get("completion_reason", "completed"),
+                         result.get("exhausted_dimension"), result.get("shared_budget"), tuple(result.get("pending_tasks", ())))
+
+    def _run_execution_attempt(self, record, callback, *, lease_token=None):
+        token = lease_token or self.workflow_store.acquire_lease(record.run_id, tenant_id=record.tenant_id,
+                    owner_id=record.owner_id, worker_id=self._worker_id, ttl=WORKFLOW_LEASE_TTL)
+        try:
+            return self._execute_generation(record, callback, token)
+        except CoreError as error:
+            if error.code not in {"EXECUTION_CLEANUP_PENDING", "EXECUTION_CLOSING"}:
+                raise
+            current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            return SuspendedRun(current.run_id, current.task_id, current.snapshot.get("wait_id", ""), current.version)
+        finally:
+            try:
+                self.workflow_store.release_lease(record.run_id, tenant_id=record.tenant_id,
+                                                 worker_id=self._worker_id, token=token)
+            except CoreError:
+                pass
+
+    def _execute_generation(self, record, callback, token):
+        manager = self.tool_runtime.environment_manager
+        scope = None
+        owner = None
+        runtime_token = None
+        try:
+            record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            if record.snapshot.get("terminal_intent"):
+                return self._terminal_result(self._finish_terminal(record, lease_token=token))
+            if self._unproven_local_execution(record):
+                raise CoreError("EXECUTION_CLEANUP_PENDING", "Legacy execution has no durable cleanup receipt")
+            ancestors = self.workflow_store.execution_ancestors(record)
+            closed_parent = any(self.workflow_store.get(run_id, tenant_id=record.tenant_id,
+                                owner_id=record.owner_id).state in TERMINAL_STATES for run_id in ancestors)
+            if record.cancel_requested or closed_parent:
+                if record.state == "EXECUTING":
+                    settled = self._abort_ambiguous_execution(record, lease_token=token)
+                else:
+                    settled = self._record_transition(record, state="CANCELLED", snapshot=copy.deepcopy(record.snapshot),
+                                                      event_kind="task.canceled", lease_token=token)
+                return self._terminal_result(settled)
+            if hasattr(manager, "execution_scope"):
+                previous = record.snapshot.get("execution_owner")
+                if previous and not previous["cleanup_confirmed"]:
+                    if previous["instance_id"] != manager.instance_id:
+                        if previous.get("local_execution_pending") is not False:
+                            raise CoreError("EXECUTION_CLEANUP_PENDING")
+                    else:
+                        manager.destroy_execution(record.run_id, previous["worker_id"], previous["generation"])
+                    record = self.workflow_store.confirm_execution(record, previous)
+                record = self.workflow_store.register_execution(record, instance_id=manager.instance_id,
+                            worker_id=self._worker_id, generation=token, lease_token=token)
+                owner = record.snapshot["execution_owner"]
+                next_scope = manager.execution_scope(record.run_id, self._worker_id, token, parent_run_id=record.parent_run_id,
+                            ancestor_run_ids=ancestors)
+                next_scope.__enter__()
+                scope = next_scope
+            with self._runtime_lock:
+                current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+                if owner is not None and current.snapshot.get("execution_owner", {}).get("generation") != token:
+                    raise CoreError("LEASE_LOST")
+                self._runtime_generations[record.run_id] = token
+                runtime_token = self._runtime_owner.set((record.run_id, token))
+            return callback(record, token)
+        finally:
+            try:
+                if scope is not None:
+                    scope.__exit__(None, None, None)
+                    self.workflow_store.confirm_execution(record, owner)
+            except Exception as error:
+                raise CoreError("EXECUTION_CLEANUP_PENDING", "Execution generation cleanup is not confirmed") from error
+            finally:
+                if runtime_token is not None:
+                    self._runtime_owner.reset(runtime_token)
+
     def _record_transition(
         self,
         record,
@@ -1035,7 +1604,20 @@ class CoreAgent:
         consume_tool_calls=0,
         release_model_turns=0,
         include_shared_budget=False,
+        connection=None,
+        _terminal_committing=False,
     ):
+        if state in TERMINAL_STATES and not _terminal_committing:
+            if connection is not None:
+                raise CoreError("INVALID_TASK_STATE", "Terminal cleanup cannot run inside a database transaction")
+            intent = dict(id=str(uuid.uuid4()), state=state, snapshot=copy.deepcopy(snapshot), event_kind=event_kind,
+                          event_data=event_data, audit=list(audit), result=result, error_code=error_code,
+                          consume_model_turns=consume_model_turns, consume_tool_calls=consume_tool_calls,
+                          release_model_turns=release_model_turns, include_shared_budget=include_shared_budget)
+            record = self.workflow_store.begin_terminal(record, intent, lease_token=lease_token)
+            if record.state in TERMINAL_STATES:
+                return record
+            return self._finish_terminal(record, lease_token=lease_token)
         exceptional_terminal = state in {
             "FAILED",
             "CANCELLED",
@@ -1107,6 +1689,7 @@ class CoreAgent:
                         consume_tool_calls=consume_tool_calls,
                         release_model_turns=transition_release,
                         include_shared_budget=include_shared_budget,
+                        connection=connection,
                     )
                 snapshot = transition_snapshot
                 break
@@ -1122,7 +1705,7 @@ class CoreAgent:
             self.checkpoint_store.save(
                 record.run_id,
                 self.event_store.revision(record.run_id),
-                {**snapshot, "state": state},
+                {**updated.snapshot, "state": state},
             )
         transition_data = dict(event_data or {})
         if not self.log_content:
@@ -1157,11 +1740,20 @@ class CoreAgent:
         defer_initialization=False,
         initial_lease_owner=None,
         initial_lease_token=None,
+        file_batch_id=None,
+        previous_root_run_id=None,
+        cron_origin=None,
     ):
         if isinstance(request, dict):
             request = RunRequest.from_dict(request)
         if not isinstance(request, RunRequest):
             raise CoreError("INVALID_REQUEST")
+        if cron_origin is not None:
+            from .cron import validate_origin
+
+            if parent_run_id is not None:
+                raise CoreError("CRON_INVALID")
+            cron_origin = validate_origin(cron_origin, prompt=request.prompt)
         raw = self.agent_config.to_dict()
         budgets = raw.get("budgets", {})
         max_model_turns = min(
@@ -1179,10 +1771,13 @@ class CoreAgent:
         task_id = task_id or run_id
         context_id = session_id or run_id
         prompt = ContextItem(
-            "prompt", request.prompt, self.token_counter(request.prompt), pinned=True
+            "prompt", request.prompt, self.token_counter(request.prompt), pinned=True,
+            provenance={"version": 1, "sources": {f"{run_id}:1": {"run_id": run_id, "sequence": 1}}},
         )
         snapshot = {
             "initializing": True,
+            "context_run_id": run_id,
+            "previous_root_run_id": previous_root_run_id,
             "skill_contract_version": SKILL_CONTRACT_VERSION,
             "admission": {
                 "agent_config": copy.deepcopy(raw),
@@ -1198,7 +1793,8 @@ class CoreAgent:
             "turns": 0,
             "tool_calls": 0,
             "context": self._context_to_dict(
-                ContextState((prompt,), (prompt,), (1, 1))
+                ContextState((), (), (1, 0)) if self.material_review_store is not None
+                else ContextState((prompt,), (prompt,), (1, 1))
             ),
             "skills": [],
             "pending_response": None,
@@ -1209,6 +1805,10 @@ class CoreAgent:
             "finalization_turn_reserved": True,
             "budget_exhausted": None,
         }
+        if file_batch_id is not None:
+            snapshot["file_batch_id"] = file_batch_id
+        if cron_origin is not None:
+            snapshot["cron_origin"] = copy.deepcopy(cron_origin)
         record = WorkflowRecord(
             run_id,
             task_id,
@@ -1260,19 +1860,35 @@ class CoreAgent:
                 task_id=task_id,
                 context_id=context_id,
                 parent_run_id=parent_run_id,
-                **({"prompt": request.prompt} if self.log_content else {}),
+                **({"prompt": request.prompt} if self.log_content and self.material_review_store is None else {}),
             )
         if defer_initialization:
             return record, raw, {}, None
+        if self.material_review_store is not None:
+            token = initial_lease_token or self.workflow_store.acquire_lease(record.run_id,
+                tenant_id=record.tenant_id, owner_id=record.owner_id, worker_id=self._worker_id, ttl=WORKFLOW_LEASE_TTL)
+            try:
+                record = self._guard_initial_input(record, lease_token=token)
+                return self._initialize_workflow(record, raw=raw, cancel_event=cancel_event, lease_token=token)
+            finally:
+                if initial_lease_token is None:
+                    self.workflow_store.release_lease(record.run_id, tenant_id=record.tenant_id, worker_id=self._worker_id, token=token)
         return self._initialize_workflow(record, raw=raw, cancel_event=cancel_event)
 
     def _fork_mcp_connector(self):
         fork = getattr(self.mcp_connector, "for_run", None)
         return fork() if fork is not None else self.mcp_connector
 
+    def _bind_workspace(self, run_id, tenant_id, owner_id, context_id):
+        self.tool_runtime.environment_manager.bind_run(
+            run_id, WorkspaceBinding(tenant_id, owner_id, context_id)
+        )
+
     def _initialize_workflow(
         self, record, *, raw=None, cancel_event=None, lease_token=None
     ):
+        if record.snapshot.get("file_batch_id") and not record.snapshot.get("initial_material_checked"):
+            raise CoreError("MATERIAL_REVIEW_REQUIRED")
         request = RunRequest.from_dict(record.request)
         (
             raw,
@@ -1294,6 +1910,7 @@ class CoreAgent:
                 else time.monotonic() + max(0.0, expires_at - time.time())
             )
         try:
+            self._bind_workspace(record.run_id, record.tenant_id, record.owner_id, record.context_id)
             raw, discovered, effective = self._resolve_capabilities(
                 request,
                 cancel_event=cancel_event,
@@ -1383,7 +2000,7 @@ class CoreAgent:
         return record, raw, discovered, effective
 
     def _raise_start_failure(self, record, error, *, lease_token=None):
-        if error.code in {"LEASE_LOST", "WORKER_STOPPED"}:
+        if error.code in {"LEASE_LOST", "WORKER_STOPPED", "EXECUTION_CLEANUP_PENDING", "EXECUTION_REOPENED", "EXECUTION_CLOSING"}:
             raise error
         current = self.workflow_store.get(
             record.run_id,
@@ -1428,6 +2045,8 @@ class CoreAgent:
         raise error
 
     def _load_workflow_runtime(self, record, *, cancel_event=None, lease_token=None):
+        self._validate_remote_snapshot(record)
+        self._bind_workspace(record.run_id, record.tenant_id, record.owner_id, record.context_id)
         request = RunRequest.from_dict(record.request)
         cached = self._runtime_cache.get(record.run_id)
         if cached is not None:
@@ -1526,6 +2145,15 @@ class CoreAgent:
                 event_kind="mcp.reconnect.completed",
                 lease_token=lease_token,
             )
+            # Recovery verifies the admission digest using its frozen identities,
+            # while dispatch validates actual schemas returned by this reconnect.
+            # New live tools cannot expand the immutable admission ceiling.
+            discovered = {
+                server: {name: schema for name, schema in catalog.items()
+                         if name in effective.mcp_tools.get(server, ())}
+                for server, catalog in live_discovered.items()
+                if server in effective.mcp_tools
+            }
         if effective.digest != record.snapshot["effective_config_digest"]:
             raise CoreError("CHECKPOINT_INVALID")
         self._run_contexts[record.run_id] = (request, effective)
@@ -1585,12 +2213,12 @@ class CoreAgent:
         except KeyError:
             raise CoreError("CHECKPOINT_INVALID") from None
 
-    def _context_compactor(self, raw, effective, discovered, snapshot):
+    def _context_compactor(self, raw, effective, discovered, snapshot, *, tenant_id=None):
         if self.compactor:
             return self.compactor
         instructions = self._instructions(snapshot)
         catalog = json.dumps(
-            self._tool_catalog(effective, discovered, snapshot),
+            self._tool_catalog(effective, discovered, snapshot, tenant_id=tenant_id),
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -1605,11 +2233,150 @@ class CoreAgent:
         )
         return Compactor(
             budget,
-            StructuredSummarizer(self.token_counter),
+            None,  # The runtime supplies a durably charged semantic callback.
             enabled=context.get("compaction_enabled", True),
             interval=context.get("compaction_interval", 0),
             overlap=context.get("compaction_overlap", 0),
         )
+
+    def _compact_context(self, record, snapshot, compactor, *, max_turns, cancel_event, lease_token):
+        operation = snapshot.get("compaction_operation")
+        if operation is not None and (not isinstance(operation, dict)
+                or type(operation.get("version")) is not int or operation["version"] != 1
+                or type(operation.get("attempts")) is not int or not 0 <= operation["attempts"] <= 2
+                or not isinstance(operation.get("fingerprint"), str)):
+            raise CoreError("CHECKPOINT_INVALID")
+        if operation is not None and operation.get("outcome") == "in_flight":
+            operation = {**operation, "outcome": "unknown"}
+            snapshot["compaction_operation"] = operation
+            record = self._record_transition(record, state=record.state, snapshot=snapshot,
+                event_kind="model.attempt.unknown", event_data={"purpose": "compaction", "attempt": operation["attempts"]},
+                lease_token=lease_token)
+        context, decisions = self._visible_context(record, snapshot, lease_token=lease_token)
+        if self._context_to_dict(context) != snapshot["context"]:
+            snapshot["context"] = self._context_to_dict(context)
+            record = self._record_transition(record, state=record.state, snapshot=snapshot,
+                event_kind="context.visibility.checked", lease_token=lease_token)
+        pressure = compactor.budget.should_compact(context.working_tokens)
+        interval_due = compactor.due(snapshot["turns"]) and not (
+            operation and operation.get("finished_turn") == snapshot["turns"]
+            and operation.get("outcome") in {"committed", "failed"})
+        if (snapshot.get("pending_response") is not None or not compactor.enabled
+                or (not pressure and not interval_due)):
+            return record, snapshot, context
+        if snapshot.get("budget_exhausted"):
+            return record, snapshot, context
+        fingerprint = self._context_fingerprint(context, decisions)
+        if operation is not None and operation.get("outcome") == "committed" and operation.get("committed_fingerprint") == fingerprint:
+            return record, snapshot, context
+        if operation is None or operation["fingerprint"] != fingerprint:
+            operation = {"version": 1, "fingerprint": fingerprint, "attempts": 0, "outcome": "selected"}
+        if operation.get("outcome") == "committed":
+            return record, snapshot, context
+        last_error = None
+        while operation["attempts"] < 2:
+            attempts_before = operation["attempts"]
+            def generate_summary(items, target):
+                nonlocal record, snapshot, operation
+                self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
+                if snapshot["turns"] >= max_turns - 1:
+                    raise self._budget_error("model_turns", max_turns, max_turns)
+                model = self.model
+                if isinstance(model, CompatibleHttpModel):
+                    model = copy.copy(model)
+                    model.stream = False
+                    model.max_tokens = min(model.max_tokens, target)
+                    limit_key = ("max_completion_tokens" if model.api_format == "openai"
+                                 and "max_completion_tokens" in model.extra_body else "max_tokens")
+                    # The HTTP body is authoritative: extra provider options must
+                    # not restore streaming or override this summary's output cap.
+                    model.extra_body = {key: value for key, value in model.extra_body.items()
+                        if key not in {"stream", "stream_options", "max_tokens", "max_completion_tokens"}}
+                    model.extra_body.update({"stream": False, limit_key: model.max_tokens})
+                def bounded_generate(**call):
+                    nonlocal record, snapshot, operation
+                    if self.token_counter(call["context"]) + self.token_counter(call["instructions"]) + target > self.context_window:
+                        raise CoreError("CONTEXT_UNRECOVERABLE")
+                    with self.workflow_store._execution_lock(record, lease_token) as (current, connection):
+                        checked, visibility = self._visible_context(current, snapshot, lease_token=lease_token, connection=connection)
+                        if self._context_fingerprint(checked, visibility) != fingerprint:
+                            raise CoreError("CONTEXT_SOURCE_CHANGED")
+                        attempt = copy.deepcopy(snapshot)
+                        attempt["turns"] += 1
+                        operation = {**operation, "attempts": operation["attempts"] + 1,
+                            "target": target, "outcome": "in_flight", "purpose": "compaction",
+                            "sources": [list((item.provenance or {}).get("sources", {})) for item in items]}
+                        attempt["compaction_operation"] = operation
+                        record = self._record_transition(current, state="RUNNING", snapshot=attempt,
+                            event_kind="model.attempt.started", event_data={"turn": attempt["turns"],
+                                "purpose": "compaction", "attempt": operation["attempts"]},
+                            consume_model_turns=1, lease_token=lease_token, connection=connection)
+                        snapshot = copy.deepcopy(record.snapshot)
+                    self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
+                    return model.generate(**call)
+                summarizer = StructuredSummarizer(self.token_counter, bounded_generate,
+                    pinned=tuple(item for item in context.active if item.pinned))
+                try:
+                    summary = summarizer(items, target)
+                except CoreError as error:
+                    if error.code in {"MODEL_UNAVAILABLE", "MODEL_RESPONSE_INVALID", "MODEL_INVALID_RESPONSE"}:
+                        raise CoreError("CONTEXT_UNRECOVERABLE") from error
+                    raise
+                self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
+                return summary
+            if self.compactor is None:
+                # The second attempt tightens output only; selection remains unchanged.
+                compactor.summarizer = lambda items, target: generate_summary(items,
+                    max(1, int(target * (0.8 if operation["attempts"] else 1))))
+            try:
+                compacted = compactor.compact(context, forced=compactor.due(snapshot["turns"]) or not pressure)
+                if compacted is context:
+                    return record, snapshot, context
+                self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
+                with self.workflow_store._execution_lock(record, lease_token) as (current, connection):
+                    checked, visibility = self._visible_context(current, snapshot, lease_token=lease_token, connection=connection)
+                    if self._context_fingerprint(checked, visibility) != fingerprint:
+                        raise CoreError("CONTEXT_SOURCE_CHANGED")
+                    snapshot["context"] = self._context_to_dict(compacted)
+                    if self.compactor is None:
+                        snapshot["compaction_operation"] = {**operation, "outcome": "committed",
+                            "finished_turn": snapshot["turns"], "committed_fingerprint": self._context_fingerprint(compacted, visibility)}
+                    record = self._record_transition(current, state="RUNNING", snapshot=snapshot,
+                        event_kind="context.compacted", event_data={"before": compacted.event.before_working_tokens,
+                            "after": compacted.event.after_working_tokens,
+                            "working_capacity": compactor.budget.working_capacity,
+                            "replaced_sequence_range": list(compacted.event.replaced_sequence_range)},
+                        audit=(("context.compacted", {"content": False}),), lease_token=lease_token, connection=connection)
+                return record, copy.deepcopy(record.snapshot), compacted
+            except CoreError as error:
+                if error.code == "CONTEXT_SOURCE_CHANGED":
+                    # A new selection is made at the next safe boundary; stale prose never commits.
+                    visible, _ = self._visible_context(record, snapshot, lease_token=lease_token)
+                    snapshot["context"] = self._context_to_dict(visible)
+                    snapshot["compaction_operation"] = {**operation, "outcome": "invalidated"}
+                    record = self._record_transition(record, state="RUNNING", snapshot=snapshot,
+                        event_kind="context.compaction.invalidated", lease_token=lease_token)
+                    return self._compact_context(record, snapshot, compactor, max_turns=max_turns,
+                        cancel_event=cancel_event, lease_token=lease_token)
+                if error.code == "BUDGET_EXCEEDED":
+                    self._mark_budget_exhausted(snapshot, error, dimension="model_turns", used=max_turns, limit=max_turns)
+                    record = self._record_transition(record, state="RUNNING", snapshot=snapshot,
+                        event_kind="budget.exhausted", event_data={"dimension": "model_turns"}, lease_token=lease_token)
+                    return record, snapshot, context
+                if error.code != "CONTEXT_UNRECOVERABLE":
+                    raise
+                last_error = error
+                # A selection/fit failure before provider admission made no
+                # progress. In particular, recovery must not spin on a paid
+                # unknown attempt whose count cannot advance in this window.
+                if self.compactor is not None or operation["attempts"] == attempts_before:
+                    break
+                snapshot["compaction_operation"] = {**operation, "outcome": "failed", "finished_turn": snapshot["turns"]}
+                record = self._record_transition(record, state="RUNNING", snapshot=snapshot,
+                    event_kind="context.compaction.failed", event_data={"attempt": operation["attempts"]}, lease_token=lease_token)
+        if pressure:
+            raise last_error or CoreError("CONTEXT_UNRECOVERABLE")
+        return record, snapshot, context
 
     @staticmethod
     def _mcp_target(name, effective):
@@ -1620,6 +2387,8 @@ class CoreAgent:
         target = self._mcp_target(call.name, effective)
         if target:
             server, remote_tool = target
+            if remote_tool not in discovered.get(server, {}):
+                raise CoreError("TOOL_UNAVAILABLE", "The admitted MCP tool is absent from the current server catalog")
             declaration = next(
                 (
                     item
@@ -1785,6 +2554,7 @@ class CoreAgent:
             content,
             tokens,
             provider_replay=provider_replay,
+            provenance=self._context_provenance(snapshot, context.sequence_range[1] + 1, dependent=True),
         )
         context = ContextState(
             context.active + (item,),
@@ -1795,7 +2565,8 @@ class CoreAgent:
 
     def _append_context_item(self, snapshot, kind, text):
         context = self._context_from_dict(snapshot["context"])
-        item = ContextItem(kind, text, self.token_counter(text))
+        item = ContextItem(kind, text, self.token_counter(text),
+                           provenance=self._context_provenance(snapshot, context.sequence_range[1] + 1))
         context = ContextState(
             context.active + (item,),
             context.transcript + (item,),
@@ -1861,16 +2632,35 @@ class CoreAgent:
     def _append_result(self, record, snapshot, call, text, *, token_limit=None):
         active_text = self._active_tool_result(record, call, text, token_limit)
         context = self._context_from_dict(snapshot["context"])
-        transcript_item = ContextItem("tool_result", text, self.token_counter(text))
+        provenance = self._context_provenance(snapshot, context.sequence_range[1] + 1,
+                                              material_source_ids=("result:" + call.id,))
+        transcript_item = ContextItem("tool_result", text, self.token_counter(text), provenance=provenance)
         active_item = (
             transcript_item
             if active_text == text
             else ContextItem(
-                "tool_result", active_text, self.token_counter(active_text)
+                "tool_result", active_text, self.token_counter(active_text), provenance=provenance
             )
         )
+        output = json.loads(active_text).get("output")
+        references = {}
+        if isinstance(output, dict):
+            if output.get("artifact") and output.get("truncated") is True:
+                references["artifact"] = output["artifact"]
+            if call.name == "core_artifact_save" and output.get("success") is True:
+                references["artifact"] = {key: output[key] for key in
+                    ("artifact_name", "version", "size", "media_type") if key in output}
+                if call.arguments.get("path"):
+                    references["path"] = call.arguments["path"]
+            if call.name == "core_terminal_exec":
+                references.update({key: output[key] for key in ("artifacts", "side_effects") if output.get(key)})
+        pinned = ()
+        if references:
+            rendered = json.dumps(references, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            pinned = (ContextItem("runtime_references", rendered, self.token_counter(rendered),
+                                  pinned=True, provenance=provenance),)
         context = ContextState(
-            context.active + (active_item,),
+            context.active + (active_item,) + pinned,
             context.transcript + (transcript_item,),
             (context.sequence_range[0], context.sequence_range[1] + 1),
         )
@@ -1908,7 +2698,7 @@ class CoreAgent:
                             "task_id": notification.task_id,
                             "kind": notification.kind,
                             "revision": notification.revision,
-                            "payload": self._value(notification.payload),
+                            **({"payload": self._value(notification.payload)} if self.material_review_store is None else {}),
                         }
                     },
                     sort_keys=True,
@@ -1970,10 +2760,28 @@ class CoreAgent:
         transcript = list(context.transcript)
         sequence_end = context.sequence_range[1]
         for message in messages:
+            content = message["content"]
+            if state not in TERMINAL_STATES:
+                decision = self._guard_material(
+                    record, snapshot, source_id="input:" + message["message_id"], source_kind="follow_up",
+                    payload=content, continuation={"version": 1, "phase": "input", "sequence": message["sequence"]},
+                    lease_token=lease_token,
+                )
+                if decision is not None:
+                    content = self._material_refusal(decision, "follow_up")
+                batch_id = message.get("provenance", {}).get("file_batch_id")
+                if batch_id:
+                    content += "\n" + self._guard_file_batch(record, snapshot, batch_id,
+                        sequence=message["sequence"], lease_token=lease_token)
             item = ContextItem(
                 item_kind,
-                message["content"],
-                self.token_counter(message["content"]),
+                content,
+                self.token_counter(content),
+                provenance={**self._context_provenance(snapshot, sequence_end + 1,
+                    material_source_ids=("input:" + message["message_id"],) + tuple(
+                        key for key in snapshot.get("context_materials", {})
+                        if key.startswith("file:" + str(message.get("provenance", {}).get("file_batch_id")) + ":"))),
+                    "inbound_sequence": message["sequence"], "message_id": message["message_id"]},
             )
             active.append(item)
             transcript.append(item)
@@ -2029,10 +2837,11 @@ class CoreAgent:
     @staticmethod
     def _recoverable_tool_error(call, error):
         return isinstance(error, CoreError) and (
-            error.code in {"TOOL_ARGUMENT_INVALID", "TOOL_START_FAILED"}
+            isinstance(error, ExecutionNotStarted)
+            or error.code in {"TOOL_ARGUMENT_INVALID", "TOOL_START_FAILED"}
             or (
                 call.name in {"core_delegate", "core_task_start"}
-                and error.code == "CAPABILITY_DISABLED"
+                and error.code in {"CAPABILITY_DISABLED", "POLICY_DENIED", "OWNER_APPROVAL_REQUIRED"}
             )
             or (call.name == "core_delegate" and error.code == "BUDGET_EXCEEDED")
             or (
@@ -2076,6 +2885,211 @@ class CoreAgent:
             payload["details"] = error.data
         return ToolResult(call.id, "failed", {"error": payload}, error.code)
 
+    @staticmethod
+    def _material_refusal(state, source_kind):
+        return json.dumps({"code": "MATERIAL_TIMEOUT" if state == "timed_out" else "MATERIAL_REJECTED",
+                           "source_kind": source_kind,
+                           "instruction": "This material is unavailable. Continue without it or ask for missing information."})
+
+    def _guard_initial_input(self, record, *, lease_token):
+        snapshot = copy.deepcopy(record.snapshot)
+        decision = self._guard_material(record, snapshot, source_id="initial", source_kind="initial_input",
+            payload=record.request["prompt"], continuation={"version": 1, "phase": "input", "sequence": 0}, lease_token=lease_token)
+        content = record.request["prompt"] if decision is None else self._material_refusal(decision, "initial_input")
+        if snapshot.get("file_batch_id"):
+            content += "\n" + self._guard_file_batch(record, snapshot, snapshot["file_batch_id"],
+                sequence=None, lease_token=lease_token)
+        item = ContextItem("prompt", content, self.token_counter(content), pinned=True,
+            provenance=self._context_provenance(snapshot, 1, material_source_ids=("initial",) + tuple(
+                key for key in snapshot.get("context_materials", {}) if key.startswith("file:"))))
+        snapshot["context"] = self._context_to_dict(ContextState((item,), (item,), (1, 1)))
+        snapshot["initial_material_checked"] = True
+        return self._record_transition(record, state="RUNNING", snapshot=snapshot,
+            event_kind="input.initial.checked", lease_token=lease_token)
+
+    def _material_exempt(self, record, call):
+        if self.interaction_store is None:
+            return False
+        cached = self._runtime_cache.get(record.run_id)
+        target = self._mcp_target(call.name, cached[2]) if cached else None
+        return self.interaction_store.get_policy(record.tenant_id, call.name, tool_origin(call.name, target)).guardrails_exempt
+
+    def _guard_material(self, record, snapshot, *, source_id, source_kind, payload,
+                        continuation, lease_token, exempt=False, before_pending=None,
+                        sealed_ref=None, documents=None, complete=True, material_digest=None,
+                        material_kind="json", text_digest=None):
+        if self.material_review_store is None:
+            return None
+        material = payload
+        if source_kind in {"tool_result", "owner_answer"}:
+            material = payload["output"]
+            if source_kind == "owner_answer":
+                material = material["answer"]
+            elif (payload.get("tool_name") in {"core_task_get", "core_task_wait", "core_delegate"}
+                  and isinstance(material, dict) and material.get("result") is not None):
+                material = material["result"]
+        material_digest = material_digest or hashlib.sha256(json.dumps(material, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        identity = {"material_digest": material_digest, "material_kind": material_kind,
+                    **({"text_digest": text_digest} if text_digest is not None else {})}
+        tracked = snapshot.setdefault("context_materials", {})[source_id] = {"identity": identity, "allowed": False}
+        def negative_state():
+            decision = self.material_review_store.negative_decision(record, material_digest,
+                lease_token=lease_token, material_kind=material_kind, text_digest=text_digest)
+            if decision is not None:
+                snapshot.setdefault("material_denials", {})[source_id] = decision["review_id"]
+                return decision["state"]
+            return None
+
+        denied = negative_state()
+        if denied is not None:
+            return denied
+        reviews = snapshot.setdefault("material_reviews", {})
+        material_key = source_id + ":" + hashlib.sha256(json.dumps(payload, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        review_id = reviews.get(material_key)
+        # An exemption applies to subsequent sources, never to an existing decision.
+        if review_id is None:
+            if exempt:
+                tracked["allowed"] = True
+                return None
+            classifier = self.guardrail_classifier
+            review = self.material_review_store.create(
+                record, source_id=source_id, source_kind=source_kind,
+                payload=payload if sealed_ref is None else None, sealed_ref=sealed_ref,
+                content_digest=material_key[len(source_id) + 1:] if sealed_ref is not None else None,
+                deadline=self.workflow_store.current_time() + classifier.timeout_seconds,
+                max_calls=classifier.max_calls, max_input_tokens=classifier.max_input_tokens,
+                completed_result_ref={"material_digest": material_digest,
+                    **({"material_kind": material_kind, "text_digest": text_digest} if material_kind != "json" else {})},
+                lease_token=lease_token,
+            )
+            review_id = reviews[material_key] = review["review_id"]
+        else:
+            review = self.material_review_store.get(record, review_id)
+        if review["state"] == "checking":
+            timeout = (self.interaction_store.get_settings(record.tenant_id).guardrails_timeout_seconds
+                       if self.interaction_store is not None else 86400)
+            review = self.material_review_store.classify(
+                record, review_id, self.guardrail_classifier, lease_token=lease_token,
+                continuation=continuation, snapshot=snapshot, owner_timeout_seconds=timeout,
+                before_pending=before_pending, documents=documents, complete=complete,
+            )
+        if review["state"] == "pending":
+            wait = self.workflow_store.get_wait(review["wait_id"], tenant_id=record.tenant_id, owner_id=record.owner_id)
+            raise _MaterialSuspended(self._finish_wait_entry(record, wait))
+        if review["state"] in {"clear", "allowed"}:
+            denied = negative_state()
+            if denied is not None:
+                return denied
+            try:
+                self.material_review_store.read_payload(record, review_id, lease_token=lease_token)
+            except CoreError as error:
+                if error.code != "MATERIAL_REVIEW_REQUIRED":
+                    raise
+                denied = negative_state()
+                if denied is None:
+                    raise
+                return denied
+            tracked["allowed"] = True
+            tracked["identity"]["review_id"] = review_id
+            return None
+        return review["state"]
+
+    def _guard_file_batch(self, record, snapshot, batch_id, *, sequence, lease_token):
+        if self.chat_file_service is None or self.material_review_store is None:
+            raise CoreError("MATERIAL_REVIEW_REQUIRED")
+        binding = WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id)
+        service = self.chat_file_service
+        batch = service.store.get(batch_id, record.tenant_id)
+        if (batch["run_id"], batch["task_id"], batch["sequence"]) != (record.run_id, record.task_id, sequence):
+            raise CoreError("FILE_BATCH_NOT_FOUND")
+        material = service.review_material(batch_id, binding, run_id=record.run_id, task_id=record.task_id)
+        manifest = material["manifest"]
+        decision = None
+        review_refs = []
+        for entry, document in zip(manifest["entries"], material["documents"], strict=True):
+            source_id = f"file:{batch_id}:{entry['index']}"
+            payload = {"manifest": manifest, "index": entry["index"]}
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            digest = hashlib.sha256(encoded.encode()).hexdigest()
+            decision = self._guard_material(record, snapshot, source_id=source_id, source_kind="file_attachment",
+                payload=payload, sealed_ref={"batch_id": batch_id, "index": entry["index"]},
+                material_digest=entry["sha256"], material_kind="file_sha256", text_digest=document["text_digest"],
+                documents=[encoded, document["text"]], complete=document["complete"],
+                continuation={"version": 1, "phase": "input", "sequence": sequence or 0}, lease_token=lease_token)
+            review_refs.append(snapshot.get("material_denials", {}).get(source_id)
+                or snapshot["material_reviews"][source_id + ":" + digest])
+            if decision is not None:
+                break
+        # Every classification/owner resolution is already committed. Persist a
+        # single batch decision before publication; recovery reuses these reviews.
+        decision_ref = review_refs[-1]
+        try:
+            if material["state"] == "accepted_quarantine":
+                service.record_decision(batch_id, binding, decision_ref=decision_ref, allow=decision is None, lease_token=lease_token)
+            elif (material["state"] == "excluded") != (decision is not None):
+                raise CoreError("MATERIAL_REVIEW_CONFLICT")
+            if decision is not None:
+                return json.dumps({"code": "MATERIAL_TIMEOUT" if decision == "timed_out" else "MATERIAL_REJECTED",
+                    "source_kind": "file_attachment", "affected_scope": "file_batch", "batch_id": batch_id,
+                    "decision_ref": decision_ref, "instruction": "All files from this message are unavailable. Continue without them."})
+            service.publish(batch_id, binding, lease_token=lease_token)
+        except (CoreError, OSError) as error:
+            code = getattr(error, "code", "FILE_PUBLICATION_PENDING")
+            if code not in {"FILE_PUBLICATION_PENDING", "FILE_PUBLICATION_CONFLICT"}:
+                raise
+            # Acceptance is already durable. A temporary storage outage leaves
+            # the original input unread and recoverable, never an HTTP rejection
+            # followed by a later surprise publication.
+            current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            pending = copy.deepcopy(current.snapshot)
+            pending["file_delivery_pending"] = {"batch_id": batch_id, "error_code": code}
+            current = self._record_transition(current, state=current.state, snapshot=pending,
+                event_kind="file.delivery.pending", event_data=pending["file_delivery_pending"], lease_token=lease_token)
+            raise _MaterialSuspended(SuspendedRun(current.run_id, current.task_id, "", current.version)) from error
+        snapshot.pop("file_delivery_pending", None)
+        return "Attached files: " + json.dumps([entry["actual_name"] for entry in manifest["entries"]], ensure_ascii=False) + "; folder: /workspace/attachments/" + batch_id
+
+    def _apply_material_wait(self, record, *, lease_token):
+        snapshot = copy.deepcopy(record.snapshot)
+        wait = self.workflow_store.get_wait(snapshot["wait_id"], tenant_id=record.tenant_id, owner_id=record.owner_id)
+        if wait.kind != "guardrail" or wait.outcome is None:
+            raise CoreError("CHECKPOINT_INVALID")
+        review = self.material_review_store.get(record, wait.source_id)
+        if review["state"] == "pending" or review["wait_id"] != wait.wait_id:
+            raise CoreError("CHECKPOINT_INVALID")
+        snapshot.pop("wait_id", None)
+        snapshot.pop("wait_ready", None)
+        return self._record_transition(record, state="MODEL_RESPONDED" if snapshot.get("pending_call") else "RUNNING",
+                                       snapshot=snapshot, event_kind="material.decision.applied",
+                                       event_data={"review_id": review["review_id"], "state": review["state"]}, lease_token=lease_token)
+
+    def _resume_completed_material(self, record, snapshot, *, lease_token, active_result_token_limit=None):
+        completed = snapshot["pending_completed_result"]
+        original = completed["call"]
+        call = ToolCall(original["id"], original["name"], original["arguments"])
+        outcome = completed["outcome"]
+        return self._record_tool_outcome(record, snapshot, call,
+            ToolResult(call.id, outcome["status"], outcome["output"], outcome.get("error_code")),
+            lease_token=lease_token, active_result_token_limit=active_result_token_limit)
+
+    def _recover_completed_python(self, record, *, lease_token):
+        if record.state != "EXECUTING" or not record.snapshot.get("pending_completed_result"):
+            return record
+        snapshot = copy.deepcopy(record.snapshot)
+        frame = snapshot.get("python_execution")
+        if not frame:
+            return record
+        # The execution-generation barrier has already confirmed prior process
+        # cleanup. The saved nested outcome is known; never replay Python's prefix.
+        frame.update(phase="stopped", stdout="", stderr="", truncated=True, output_capture_incomplete=True)
+        snapshot["pending_call"] = copy.deepcopy(frame["nested_call"])
+        snapshot["pending_mutating"] = None
+        snapshot.pop("approved_tool_call", None)
+        return self._record_transition(record, state="MODEL_RESPONDED", snapshot=snapshot,
+            event_kind="python.completed_result.recovered", lease_token=lease_token)
+
     def _record_tool_outcome(
         self,
         record,
@@ -2087,6 +3101,51 @@ class CoreAgent:
         span=None,
         active_result_token_limit=None,
     ):
+        if self.material_review_store is not None:
+            completed = snapshot.get("pending_completed_result")
+            if completed is None:
+                completed = {"call": {"id": call.id, "name": call.name, "arguments": call.arguments},
+                             "outcome": json.loads(self._result_text(call.id, outcome, call.name))}
+                snapshot["pending_completed_result"] = completed
+                # A known completed side effect is durable before any detector I/O.
+                # Removing a prior wait here also atomically applies it before another wait.
+                record = self._record_transition(record, state="MODEL_RESPONDED", snapshot=snapshot,
+                    event_kind="tool.result.saved", event_data={"tool_call_id": call.id}, lease_token=lease_token)
+            source_kind = "owner_answer" if call.name == "core_ask_owner" and completed["outcome"]["status"] == "succeeded" else "tool_result"
+            # Locally generated rejection/error metadata contains no tool material.
+            must_review = (completed["outcome"]["status"] == "succeeded" or record.snapshot.get("pending_mutating") is not None
+                           or call.name == "core_python_exec")
+            decision = self._guard_material(record, snapshot, source_id="result:" + call.id, source_kind=source_kind,
+                payload=completed["outcome"], continuation=self._tool_wait_continuation(snapshot, call, "tool_result"),
+                lease_token=lease_token, exempt=not must_review or (source_kind != "owner_answer" and self._material_exempt(record, call)))
+            if decision is not None:
+                outcome = ToolResult(call.id, "failed", json.loads(self._material_refusal(decision, source_kind)),
+                                     "MATERIAL_TIMEOUT" if decision == "timed_out" else "MATERIAL_REJECTED")
+            snapshot.pop("pending_completed_result", None)
+        notification_call = call
+        notification_output = outcome.output if isinstance(outcome, ToolResult) else outcome
+        frame = snapshot.get("python_execution")
+        if frame and frame["phase"] == "stopped" and call.id == frame["nested_call"]["id"]:
+            nested = json.loads(self._result_text(call.id, outcome, call.name))
+            original = frame["outer_call"]
+            call = ToolCall(original["id"], original["name"], original["arguments"])
+            outcome = ToolResult(call.id, "failed", {
+                "code": "PYTHON_CONTINUATION_INTERRUPTED",
+                "instruction": "Python was stopped. Continue from these known outcomes; do not replay its prefix or remainder automatically. Prior side effects are not rolled back.",
+                "stdout": frame.get("stdout", ""), "stderr": frame.get("stderr", ""),
+                "truncated": frame.get("truncated", False),
+                "output_capture_incomplete": frame.get("output_capture_incomplete", False),
+                "completed_calls": frame.get("completed", []),
+                "omitted_completed_calls": frame.get("omitted_completed_calls", 0),
+                "nested_result": self._bounded_python_outcome(nested),
+                "remainder_executed": False,
+            }, "PYTHON_CONTINUATION_INTERRUPTED")
+            if self.material_review_store is not None:
+                snapshot.pop("python_execution", None)
+                return self._record_tool_outcome(record, snapshot, call, outcome,
+                    lease_token=lease_token, span=span, active_result_token_limit=active_result_token_limit)
+        snapshot.pop("python_execution", None)
+        snapshot.pop("approved_tool_call", None)
         result_text = self._result_text(call.id, outcome, call.name)
         # A handler may return a ToolResult or the bare output; MCP tools return
         # the latter. Unwrapped once here because every reader below needs the
@@ -2104,6 +3163,11 @@ class CoreAgent:
             )
             if span and span.status_code != "ERROR":
                 span.record_error(CoreError(error_code))
+        if snapshot.get("background_tool"):
+            snapshot["background_tool_result"] = {
+                "status": status, "output": self._value(output),
+                "error_code": error_code or ("POLICY_DENIED" if denied else None),
+            }
         if span:
             span.set_attributes(
                 {
@@ -2120,7 +3184,7 @@ class CoreAgent:
             token_limit=active_result_token_limit,
         )
         active_result = json.loads(active_result_text)
-        self._stream(record).tool_result(
+        (self._stream(record) if self.material_review_store is None else NULL_STREAM).tool_result(
             call.id,
             call.name,
             {
@@ -2187,9 +3251,9 @@ class CoreAgent:
             ),
             lease_token=lease_token,
         )
-        output = outcome.output if isinstance(outcome, ToolResult) else outcome
+        output = notification_output
         if (
-            call.name in {"core_delegate", "core_task_get", "core_task_wait"}
+            notification_call.name in {"core_delegate", "core_task_get", "core_task_wait"}
             and isinstance(output, dict)
             and output.get("state") in {"completed", "failed", "canceled"}
             and isinstance(output.get("task_id"), str)
@@ -2198,6 +3262,187 @@ class CoreAgent:
                 record.run_id, record.tenant_id, output["task_id"]
             )
         return updated
+
+    @staticmethod
+    def _utc_timestamp(value):
+        return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _suspended(self, record, wait):
+        self._drop_run_runtime(record.run_id)
+        return SuspendedRun(record.run_id, record.task_id, wait.wait_id, record.version)
+
+    def _enter_tool_wait(self, record, snapshot, call, *, kind, subject, deadline, lease_token, connection=None):
+        wait = self.workflow_store.enter_wait(
+            record, kind=kind, source_id=call.id, subject=subject,
+            continuation=self._tool_wait_continuation(snapshot, call, "tool_wait"),
+            deadline=deadline, snapshot=snapshot, lease_token=lease_token,
+            connection=connection,
+        )
+        return self._finish_wait_entry(record, wait)
+
+    def _finish_wait_entry(self, record, wait):
+        updated = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+        if not self.workflow_store.atomic:
+            data = {"wait_id": wait.wait_id, "kind": wait.kind}
+            self.audit_log.append(record.run_id, "wait.entered", data)
+            self.event_store.append(record.run_id, "wait.entered", data)
+            self.checkpoint_store.save(record.run_id, self.event_store.revision(record.run_id), {**updated.snapshot, "state": updated.state})
+        return self._suspended(updated, wait)
+
+    @staticmethod
+    def _tool_wait_continuation(snapshot, call, phase):
+        frame = snapshot.get("python_execution")
+        if frame and frame["phase"] == "stopped":
+            return {"version": 1, "phase": "python_nested", "stage": phase,
+                    "call_id": call.id, "outer_call_id": frame["outer_call"]["id"]}
+        return {"version": 1, "phase": phase, "call_id": call.id}
+
+    def _prepare_tool_wait(self, record, snapshot, call, *, lease_token, prepare_only=False):
+        now = self.workflow_store.current_time()
+        if call.name == "core_ask_owner":
+            if self.interaction_store is None:
+                raise CoreError("CAPABILITY_DISABLED")
+            timeout = self.interaction_store.get_settings(record.tenant_id).owner_answer_timeout_seconds
+            subject = {"question": call.arguments["question"]}
+            if prepare_only:
+                return "owner_question", subject, now + timeout
+            return self._enter_tool_wait(
+                record, snapshot, call, kind="owner_question", subject=subject,
+                deadline=now + timeout, lease_token=lease_token,
+            )
+        if call.name == "core_wait_until":
+            try:
+                until = datetime.fromisoformat(call.arguments["until"])
+                if until.utcoffset() is None:
+                    raise ValueError("timezone required")
+                deadline = until.timestamp()
+                if not math.isfinite(deadline):
+                    raise ValueError("finite time required")
+            except (ValueError, TypeError, OverflowError):
+                raise CoreError("TOOL_ARGUMENT_INVALID", "until must be an ISO-8601 datetime with an explicit UTC offset") from None
+            subject = {"until": self._utc_timestamp(deadline)}
+            if deadline <= now:
+                return {**subject, "woke_at": self._utc_timestamp(now), "reason": "time"}
+            kind = "timer"
+        else:
+            task = self.task_scheduler.get(call.arguments["task_id"], owner_id=record.run_id, tenant_id=record.tenant_id)
+            self._remote_wait_arguments(call.arguments, record.run_id, record.tenant_id)
+            timeout = call.arguments.get("timeout")
+            if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout < 0):
+                raise CoreError("TOOL_ARGUMENT_INVALID", "timeout must be a finite nonnegative number")
+            if task.state in {"completed", "failed", "canceled"} or timeout == 0:
+                return self._task_snapshot(task)
+            kind, subject = "task", {"task_id": task.id}
+            deadline = now + timeout if timeout is not None else None
+        if prepare_only:
+            return kind, subject, deadline
+        return self._enter_tool_wait(record, snapshot, call, kind=kind, subject=subject, deadline=deadline, lease_token=lease_token)
+
+    @staticmethod
+    def _approval_subject(call, definition, effective, snapshot=None):
+        subject = {
+            "tool_name": call.name,
+            "origin": tool_origin(call.name, mcp_tool_index(effective.mcp_tools).get(call.name)),
+            "arguments": copy.deepcopy(call.arguments),
+            "schema_digest": hashlib.sha256(json.dumps(
+                definition.input_schema, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+        }
+        if call.name == "core_cron_create":
+            subject["resolved_parameters"] = {"timezone": call.arguments.get("timezone", "Europe/Moscow")}
+        if call.name == "core_agent_send_message" and snapshot is not None:
+            binding = CoreAgent._remote_binding(snapshot, call)
+            if binding is not None:
+                subject["remote_binding"] = binding
+        return subject
+
+    def _apply_tool_wait(self, record, snapshot, wait, *, lease_token, active_result_token_limit):
+        pending = snapshot.get("pending_call")
+        phase = "tool_gate" if wait.kind == "tool_approval" else "tool_wait"
+        expected = self._tool_wait_continuation(snapshot, ToolCall(pending["id"], pending["name"], pending["arguments"]), phase) if pending else None
+        if (wait.continuation != expected
+                or not pending or wait.continuation.get("call_id") != pending["id"]
+                or wait.source_id != pending["id"]):
+            raise CoreError("CHECKPOINT_INVALID")
+        call = ToolCall(pending["id"], pending["name"], dict(pending["arguments"]))
+        snapshot.pop("wait_id", None)
+        snapshot.pop("wait_ready", None)
+        reason = wait.outcome["reason"]
+        if wait.kind == "tool_approval":
+            if reason == "allowed":
+                snapshot["approved_tool_call"] = {"call_id": call.id, **wait.subject}
+                return self._record_transition(
+                    record, state="MODEL_RESPONDED", snapshot=snapshot,
+                    event_kind="tool.approval.applied", event_data={"tool_call_id": call.id},
+                    lease_token=lease_token,
+                )
+            code, message = {
+                "rejected": ("OWNER_APPROVAL_REJECTED", "Owner rejected this tool call"),
+                "timeout": ("OWNER_APPROVAL_TIMEOUT", "Confirmation was not received in time"),
+                "policy_denied": ("POLICY_DENIED", "Tool is disabled by owner policy"),
+            }.get(reason, ("CHECKPOINT_INVALID", "Unexpected approval outcome"))
+            output = self._failed_tool_outcome(call, CoreError(code, message))
+        elif wait.kind == "owner_question":
+            if reason == "answer":
+                output = {"answer": wait.outcome["answer"]}
+            elif reason == "timeout":
+                output = self._failed_tool_outcome(call, CoreError("OWNER_ANSWER_TIMEOUT", "Owner answer was not received in time"))
+            else:
+                raise CoreError("CHECKPOINT_INVALID")
+        elif wait.kind == "timer":
+            output = {**wait.subject, **wait.outcome}
+            output["woke_at"] = self._utc_timestamp(output["woke_at"])
+        elif wait.kind == "task":
+            output = wait.outcome.get("result") or self._task_snapshot(self.task_scheduler.get(wait.subject["task_id"], owner_id=record.run_id, tenant_id=record.tenant_id))
+            if call.name == "core_delegate":
+                output = {**output, "mode": "joined"}
+        else:
+            raise CoreError("CHECKPOINT_INVALID")
+        return self._record_tool_outcome(record, snapshot, call, output, lease_token=lease_token, active_result_token_limit=active_result_token_limit)
+
+    def _tool_dispatch_intent(self, record, snapshot, call, definition, effective, *, lease_token, durable_wait, check_only=False):
+        subject = self._approval_subject(call, definition, effective, snapshot)
+        scope = (
+            self.interaction_store.policy_scope(record.tenant_id, call.name, subject["origin"])
+            if self.interaction_store is not None else nullcontext((None, None))
+        )
+        deadline = None
+        if self.interaction_store is not None:
+            timeout = self.interaction_store.get_settings(record.tenant_id).hitl_timeout_seconds
+            deadline = self.workflow_store.current_time() + timeout
+        wait = error = None
+        with scope as (policy, connection):
+            approved = snapshot.get("approved_tool_call")
+            if policy is not None and policy.mode == "deny":
+                error = CoreError("POLICY_DENIED", "Tool is disabled by owner policy")
+            elif approved is not None and approved != {"call_id": call.id, **subject}:
+                error = CoreError("TOOL_APPROVAL_STALE", "Approved arguments or tool schema changed; a new call is required")
+            elif approved is None and (
+                (policy is not None and policy.mode == "require_hitl")
+                or snapshot.get("python_execution", {}).get("approval_required", False)
+            ):
+                frame = snapshot.get("python_execution", {})
+                if frame.get("approval_required"):
+                    subject = frame["subject"]
+                    deadline = frame["approval_deadline"]
+                wait = self.workflow_store.enter_wait(
+                    record, kind="tool_approval", source_id=call.id, subject=subject,
+                    continuation=self._tool_wait_continuation(snapshot, call, "tool_gate"),
+                    deadline=deadline,
+                    snapshot=snapshot, lease_token=lease_token, connection=connection,
+                )
+            elif not check_only:
+                snapshot["pending_mutating"] = definition.mutating
+                # Wait creation is atomic and replayable until it commits. In particular,
+                # joined child admission must run after releasing the policy transaction.
+                record = self._record_transition(
+                    record, state="MODEL_RESPONDED" if durable_wait else "EXECUTING",
+                    snapshot=snapshot, event_kind="tool.intent",
+                    event_data={"tool_call_id": call.id, "mutating": definition.mutating},
+                    audit=(("tool.execution.started", {"tool_call_id": call.id}),),
+                    lease_token=lease_token, connection=connection,
+                )
+        return record, wait, error
 
     def _execute_pending(
         self,
@@ -2226,16 +3471,72 @@ class CoreAgent:
             **({"arguments": call.arguments} if self.log_content else {}),
         )
         self.tool_runtime.validate(call, definition)
-        snapshot["pending_mutating"] = definition.mutating
-        record = self._record_transition(
-            record,
-            state="EXECUTING",
-            snapshot=snapshot,
-            event_kind="tool.intent",
-            event_data={"tool_call_id": call.id, "mutating": definition.mutating},
-            audit=(("tool.execution.started", {"tool_call_id": call.id}),),
-            lease_token=lease_token,
+        if call.name == "core_agent_send_message" and self.remote_registry is not None:
+            try:
+                record, snapshot = self._pin_remote_call(record, snapshot, call, lease_token=lease_token)
+            except CoreError as error:
+                if error.code not in {"TOOL_UNAVAILABLE", "POLICY_DENIED"}:
+                    raise
+                return self._record_tool_outcome(record, snapshot, call, self._failed_tool_outcome(call, error),
+                    lease_token=lease_token, active_result_token_limit=active_result_token_limit)
+        durable_wait = (call.name in {"core_wait_until", "core_task_wait", "core_ask_owner"}
+                        or (call.name == "core_delegate" and not call.arguments.get("background", False))
+                        or call.name == "core_task_start"
+                        or (call.name == "core_agent_send_message" and self.remote_registry is not None))
+        record, wait, error = self._tool_dispatch_intent(
+            record, snapshot, call, definition, effective,
+            lease_token=lease_token, durable_wait=durable_wait, check_only=True,
         )
+        if wait is not None:
+            return self._finish_wait_entry(record, wait)
+        if error is not None:
+            return self._record_tool_outcome(
+                record, snapshot, call, self._failed_tool_outcome(call, error),
+                lease_token=lease_token, span=span, active_result_token_limit=active_result_token_limit,
+            )
+        decision = self._guard_material(record, snapshot, source_id="arguments:" + call.id,
+            source_kind="tool_arguments", payload=call.arguments,
+            continuation=self._tool_wait_continuation(snapshot, call, "tool_gate"), lease_token=lease_token,
+            exempt=self._material_exempt(record, call))
+        if decision is not None:
+            return self._record_tool_outcome(record, snapshot, call,
+                ToolResult(call.id, "failed", json.loads(self._material_refusal(decision, "tool_arguments")),
+                           "MATERIAL_TIMEOUT" if decision == "timed_out" else "MATERIAL_REJECTED"),
+                lease_token=lease_token, active_result_token_limit=active_result_token_limit)
+        # Detector network I/O never holds the policy lock; re-read it at physical intent.
+        record, wait, error = self._tool_dispatch_intent(record, snapshot, call, definition, effective,
+            lease_token=lease_token, durable_wait=durable_wait)
+        if wait is not None:
+            return self._finish_wait_entry(record, wait)
+        if error is not None:
+            return self._record_tool_outcome(record, snapshot, call, self._failed_tool_outcome(call, error),
+                lease_token=lease_token, active_result_token_limit=active_result_token_limit)
+        if durable_wait:
+            try:
+                if call.name == "core_delegate":
+                    outcome = self._delegate(call.arguments, record.run_id, wait_context=(record, snapshot, call, lease_token))
+                elif call.name in {"core_task_start", "core_agent_send_message"}:
+                    handler = self._task_start if call.name == "core_task_start" else self._send_message
+                    outcome = handler(call.arguments, record.run_id, wait_context=(record, snapshot, call, lease_token))
+                    record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+                    snapshot = copy.deepcopy(record.snapshot)
+                else:
+                    outcome = self._prepare_tool_wait(record, snapshot, call, lease_token=lease_token)
+            except CoreError as error:
+                if error.code not in {"TOOL_ARGUMENT_INVALID", "TASK_NOT_FOUND", "POLICY_DENIED"} and not self._recoverable_tool_error(call, error):
+                    raise
+                if error.code == "BUDGET_EXCEEDED" and error.data.get("dimension") in {"model_turns", "tool_calls"}:
+                    error.data = self._mark_budget_exhausted(
+                        snapshot, error, dimension=error.data["dimension"],
+                        used=error.data.get("used", 0), limit=error.data.get("limit", 0),
+                    )
+                outcome = self._failed_tool_outcome(call, error)
+            if isinstance(outcome, SuspendedRun):
+                return outcome
+            return self._record_tool_outcome(record, snapshot, call, outcome, lease_token=lease_token, span=span, active_result_token_limit=active_result_token_limit)
+        dispatch_context = {"record": record, "snapshot": snapshot, "lease_token": lease_token}
+        self._active_tool_calls[record.run_id] = dispatch_context
+        dispatch_token = self._dispatch_context.set(dispatch_context)
         try:
             if call.name == SKILL_ACTIVATE_TOOL:
                 outcome = self._activate_skill_call(
@@ -2265,6 +3566,9 @@ class CoreAgent:
                     policy_version=effective.digest,
                 )
         except Exception as error:
+            record, snapshot = dispatch_context["record"], dispatch_context["snapshot"]
+            if dispatch_context.get("error") is not None:
+                raise dispatch_context["error"] from error
             if self._recoverable_tool_error(call, error) or (
                 is_mcp and not definition.mutating and isinstance(error, CoreError)
             ):
@@ -2329,6 +3633,20 @@ class CoreAgent:
                     lease_token=lease_token,
                 )
                 raise
+        finally:
+            self._dispatch_context.reset(dispatch_token)
+            if self._active_tool_calls.get(record.run_id) is dispatch_context:
+                self._active_tool_calls.pop(record.run_id, None)
+        record, snapshot = dispatch_context["record"], dispatch_context["snapshot"]
+        if dispatch_context.get("error") is not None:
+            raise dispatch_context["error"]
+        if call.name == "core_python_exec" and snapshot.get("python_execution", {}).get("phase") == "stopped":
+            # The loop now owns the charged frozen nested call. The outer Python
+            # queue entry remains until that call has a durable known outcome.
+            if snapshot.get("wait_id"):
+                wait = self.workflow_store.get_wait(snapshot["wait_id"], tenant_id=record.tenant_id, owner_id=record.owner_id)
+                return self._suspended(record, wait)
+            return record
         return self._record_tool_outcome(
             record,
             snapshot,
@@ -2340,7 +3658,12 @@ class CoreAgent:
         )
 
     def _stream(self, record):
-        return self._task_streams.get(record.task_id) or NULL_STREAM
+        return self._scoped_stream(record.task_id, record.owner_id)
+
+    def _scoped_stream(self, task_id, owner_id):
+        if owner_id and owner_id.startswith("external-"):
+            return NULL_STREAM
+        return self._task_streams.get(task_id) or NULL_STREAM
 
     def _generate(self, *, before_retry=None, **call):
         """Retry a retryable provider failure REFLECT_AND_RETRY_MAX_RETRIES times."""
@@ -2407,10 +3730,16 @@ class CoreAgent:
         return record
 
     def _drop_run_runtime(self, run_id):
-        self._run_contexts.pop(run_id, None)
-        self._run_scopes.pop(run_id, None)
-        self._runtime_cache.pop(run_id, None)
-        connector = self._run_mcp_connectors.pop(run_id, None)
+        with self._runtime_lock:
+            owner = self._runtime_owner.get()
+            if owner is not None and owner[0] == run_id and self._runtime_generations.get(run_id) != owner[1]:
+                return
+            self.tool_runtime.environment_manager.unbind_run(run_id)
+            self._run_contexts.pop(run_id, None)
+            self._run_scopes.pop(run_id, None)
+            self._runtime_cache.pop(run_id, None)
+            self._runtime_generations.pop(run_id, None)
+            connector = self._run_mcp_connectors.pop(run_id, None)
         if connector is not None and connector is not self.mcp_connector:
             close = getattr(connector, "close", None)
             if close is not None:
@@ -2445,11 +3774,6 @@ class CoreAgent:
                 audit=(("task.canceled", {"content": False}),),
                 lease_token=lease_token,
             )
-        destroy_run = getattr(
-            self.tool_runtime.environment_manager, "destroy_run", None
-        )
-        if destroy_run:
-            destroy_run(record.run_id)
         self._drop_run_runtime(record.run_id)
         raise CoreError("TASK_CANCELLED")
 
@@ -2558,9 +3882,22 @@ class CoreAgent:
                 pending.append(current.id)
         return len(tasks), tuple(pending)
 
-    def _continue_workflow(
+    def _continue_workflow(self, record, *, decision=None, cancel_event=None, lease_token=None):
+        while True:
+            try:
+                return self._run_execution_attempt(record, lambda current, token: self._continue_workflow_body(
+                    current, decision=decision, cancel_event=cancel_event, lease_token=token), lease_token=lease_token)
+            except CoreError as error:
+                if error.code != "EXECUTION_REOPENED":
+                    raise
+                lease_token = None
+                record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+
+    def _continue_workflow_body(
         self, record, *, decision=None, cancel_event=None, lease_token=None
     ):
+        if record.snapshot.get("background_tool"):
+            raise CoreError("INVALID_TASK_STATE", "Background tools resume through their scheduler")
         if lease_token is None:
             lease_token = self.workflow_store.acquire_lease(
                 record.run_id,
@@ -2583,6 +3920,7 @@ class CoreAgent:
                 cancel_event, self.workflow_store, record
             )
             cancel_event = durable_cancel_event
+            record = self._recover_completed_python(record, lease_token=lease_token)
             if record.state == "EXECUTING":
                 record = self._abort_ambiguous_execution(
                     record, lease_token=lease_token
@@ -2594,6 +3932,16 @@ class CoreAgent:
                 cancel_event,
                 lease_token=lease_token,
             )
+            wait = None
+            if record.snapshot.get("wait_id"):
+                wait = self.workflow_store.get_wait(record.snapshot["wait_id"], tenant_id=record.tenant_id, owner_id=record.owner_id)
+                if wait.outcome is None:
+                    return self._suspended(record, wait)
+                if wait.kind == "guardrail":
+                    record = self._apply_material_wait(record, lease_token=lease_token)
+                    wait = None
+            if record.snapshot.get("initializing") and self.material_review_store is not None and not record.snapshot.get("initial_material_checked"):
+                record = self._guard_initial_input(record, lease_token=lease_token)
             if record.snapshot.get("initializing"):
                 record, raw, discovered, effective = self._initialize_workflow(
                     record,
@@ -2616,6 +3964,7 @@ class CoreAgent:
                     )
                 except CoreError as error:
                     self._raise_start_failure(record, error, lease_token=lease_token)
+            record = self._import_previous_context(record, lease_token=lease_token)
             snapshot = copy.deepcopy(record.snapshot)
             budgets = raw.get("budgets", {})
             budget_platform = self._admitted_platform(record.snapshot)
@@ -2629,7 +3978,7 @@ class CoreAgent:
             )
             while True:
                 compactor = self._context_compactor(
-                    raw, effective, discovered, snapshot
+                    raw, effective, discovered, snapshot, tenant_id=record.tenant_id
                 )
                 active_result_token_limit = min(
                     compactor.budget.output_reserve,
@@ -2640,14 +3989,22 @@ class CoreAgent:
                 self._cancel_at_boundary(
                     record, snapshot, cancel_event, lease_token=lease_token
                 )
+                if wait is not None:
+                    record = self._apply_tool_wait(record, snapshot, wait, lease_token=lease_token, active_result_token_limit=active_result_token_limit)
+                    snapshot = copy.deepcopy(record.snapshot)
+                    wait = None
+                if snapshot.get("pending_completed_result"):
+                    record = self._resume_completed_material(record, snapshot, lease_token=lease_token,
+                                                             active_result_token_limit=active_result_token_limit)
+                    snapshot = copy.deepcopy(record.snapshot)
                 record, snapshot = self._consume_task_notifications(
                     record, snapshot, lease_token=lease_token
                 )
-                record, snapshot, delivered_at_boundary = (
-                    self._consume_inbound_messages(
+                delivered_at_boundary = 0
+                if snapshot.get("python_execution", {}).get("phase") != "stopped":
+                    record, snapshot, delivered_at_boundary = self._consume_inbound_messages(
                         record, snapshot, lease_token=lease_token
                     )
-                )
                 if delivered_at_boundary and snapshot.get("finalizing_response"):
                     snapshot["pending_response"]["message"] = BUDGET_FOLLOWUP_MESSAGE
                     snapshot["budget_followup_unprocessed"] = True
@@ -2707,27 +4064,21 @@ class CoreAgent:
                     record, snapshot = self._consume_task_notifications(
                         record, snapshot, lease_token=lease_token
                     )
-                context = self._context_from_dict(snapshot["context"])
-                compacted = compactor.maybe_compact(context, turns=snapshot["turns"])
-                if compacted is not context:
-                    snapshot["context"] = self._context_to_dict(compacted)
-                    record = self._record_transition(
-                        record,
-                        state="RUNNING",
-                        snapshot=snapshot,
-                        event_kind="context.compacted",
-                        event_data={
-                            "before": compacted.event.before_working_tokens,
-                            "after": compacted.event.after_working_tokens,
-                            "working_capacity": compactor.budget.working_capacity,
-                            "replaced_sequence_range": list(
-                                compacted.event.replaced_sequence_range
-                            ),
-                        },
-                        audit=(("context.compacted", {"content": False}),),
-                        lease_token=lease_token,
-                    )
-                    context = compacted
+                record, snapshot, context = self._compact_context(record, snapshot, compactor,
+                    max_turns=max_turns, cancel_event=cancel_event, lease_token=lease_token)
+                if snapshot["pending_response"] is None:
+                    # Compaction performs provider I/O. Inputs accepted while it
+                    # ran belong to this next model turn, through the usual guards.
+                    record, snapshot, delivered_after_compaction = self._consume_inbound_messages(
+                        record, snapshot, lease_token=lease_token)
+                    if delivered_after_compaction:
+                        continue  # Recompute visibility, budgets and pressure first.
+                if exhausted is None and snapshot["turns"] >= max_turns - 1:
+                    self._mark_budget_exhausted(snapshot, self._budget_error("model_turns", max_turns, max_turns),
+                        dimension="model_turns", used=max_turns, limit=max_turns)
+                if exhausted is None and snapshot.get("budget_exhausted"):
+                    # Re-enter the ordinary finalization path, including owned-child settlement.
+                    continue
                 if snapshot["pending_response"] is None:
                     finalizing = exhausted is not None
                     call_finalizer_model = True
@@ -2801,6 +4152,14 @@ class CoreAgent:
                         # whether the provider received the reserved call. Do not
                         # spend another turn; the deterministic fallback is honest.
                         call_finalizer_model = False
+                    # A material decision may have arrived during accounting or compaction.
+                    context, _ = self._visible_context(record, snapshot, lease_token=lease_token)
+                    if self._context_to_dict(context) != snapshot["context"] and not finalizing:
+                        snapshot["context"] = self._context_to_dict(context)
+                        snapshot["model_attempt_in_flight"] = None
+                        record = self._record_transition(record, state="RUNNING", snapshot=snapshot,
+                            event_kind="context.visibility.checked", lease_token=lease_token)
+                        continue
                     with self.telemetry.span("core_agent.context.assemble"):
                         model_context = "\n".join(
                             item.content for item in context.active
@@ -2809,13 +4168,17 @@ class CoreAgent:
                         model_tools = (
                             {}
                             if finalizing
-                            else self._tool_catalog(effective, discovered, snapshot)
+                            else self._tool_catalog(effective, discovered, snapshot, tenant_id=record.tenant_id)
                         )
                         model_instructions = self._instructions(snapshot)
                     if finalizing:
                         model_instructions = (
                             f"{model_instructions}\n\n{BUDGET_FINALIZATION_INSTRUCTION}"
                         )
+                        if (self.token_counter(model_instructions)
+                                + self.token_counter(json.dumps(model_messages, ensure_ascii=False, separators=(",", ":")))
+                                + self.output_reserve > self.context_window):
+                            call_finalizer_model = False
                     retry_limit = max_turns if finalizing else max_turns - 1
                     stream = self._stream(record)
                     buffered_delta = (
@@ -2830,6 +4193,8 @@ class CoreAgent:
                     )
 
                     def publish_or_buffer_delta(response_text, reasoning_text):
+                        if self.material_review_store is not None:
+                            reasoning_text = None
                         if buffered_delta is None:
                             stream.text(response_text, reasoning_text)
                         else:
@@ -3024,7 +4389,8 @@ class CoreAgent:
                     )
                     for item in response.tool_requests:
                         if not finalizing:
-                            stream.tool_call(item.id, item.name, item.arguments)
+                            if self.material_review_store is None:
+                                stream.tool_call(item.id, item.name, item.arguments)
                     snapshot["model_attempt_in_flight"] = None
                     snapshot["pending_response"] = response_data
                     snapshot["finalizing_response"] = finalizing
@@ -3131,14 +4497,23 @@ class CoreAgent:
                         )
                         continue
                     self._require_tool(pending["name"], effective)
-                    definition, _is_mcp = self._definition(
-                        call, effective, discovered, record
-                    )
+                    definition = None
                     try:
+                        definition, _is_mcp = self._definition(
+                            call, effective, discovered, record
+                        )
+                        approved = snapshot.get("approved_tool_call")
+                        frame = snapshot.get("python_execution")
+                        if frame and frame["phase"] == "stopped" and frame["subject"] != self._approval_subject(call, definition, effective, snapshot):
+                            raise CoreError("TOOL_APPROVAL_STALE", "Frozen nested tool identity or schema changed")
+                        if approved is not None and approved != {"call_id": call.id, **self._approval_subject(call, definition, effective, snapshot)}:
+                            raise CoreError("TOOL_APPROVAL_STALE", "Approved arguments or tool schema changed; a new call is required")
                         self.tool_runtime.validate(call, definition)
                     except CoreError as error:
-                        if error.code != "TOOL_ARGUMENT_INVALID":
+                        if error.code not in {"TOOL_ARGUMENT_INVALID", "TOOL_APPROVAL_STALE", "TOOL_UNAVAILABLE"}:
                             raise
+                        if error.code == "TOOL_UNAVAILABLE" and snapshot.get("approved_tool_call"):
+                            error = CoreError("TOOL_APPROVAL_STALE", "Approved tool is no longer available; a new call is required")
                         self._log(
                             "tool.requested",
                             run_id=record.run_id,
@@ -3159,7 +4534,8 @@ class CoreAgent:
                                 )[0]
                             },
                         ) as tool_span:
-                            self._instrument_tool(tool_span, call, definition)
+                            if definition is not None:
+                                self._instrument_tool(tool_span, call, definition)
                             tool_span.record_error(error)
                             record = self._record_tool_outcome(
                                 record,
@@ -3179,7 +4555,7 @@ class CoreAgent:
                             ]
                         },
                     ) as tool_span:
-                        record = self._execute_pending(
+                        executed = self._execute_pending(
                             record,
                             snapshot,
                             raw,
@@ -3189,9 +4565,13 @@ class CoreAgent:
                             span=tool_span,
                             active_result_token_limit=active_result_token_limit,
                         )
+                    if isinstance(executed, SuspendedRun):
+                        return executed
+                    record = executed
+                    snapshot = copy.deepcopy(record.snapshot)
                     continue
                 response = snapshot["pending_response"]
-                if response["message"] is not None:
+                if response["message"] is not None and not response["tool_requests"]:
                     if snapshot.get("budget_exhausted") and not snapshot.get(
                         "finalizing_response"
                     ):
@@ -3311,6 +4691,8 @@ class CoreAgent:
                     event_data={"turn": snapshot["turns"]},
                     lease_token=lease_token,
                 )
+        except _MaterialSuspended as suspended:
+            return suspended.result
         except CoreError as error:
             if error.code != "CANCEL_REQUESTED":
                 raise
@@ -3332,15 +4714,6 @@ class CoreAgent:
                 durable_cancel_event.close()
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1)
-            try:
-                self.workflow_store.release_lease(
-                    record.run_id,
-                    tenant_id=record.tenant_id,
-                    worker_id=self._worker_id,
-                    token=lease_token,
-                )
-            except CoreError:
-                pass
             try:
                 current = self.workflow_store.get(
                     record.run_id,
@@ -3401,55 +4774,255 @@ class CoreAgent:
             "revision": task.revision,
         }
 
-    def _task_start(self, arguments, run_id):
+    def _require_automatic_tool(self, name, tenant_id, *, mcp_target=None):
+        if self.interaction_store is None:
+            return
+        with self.interaction_store.policy_scope(tenant_id, name, tool_origin(name, mcp_target)) as (policy, _):
+            if policy.mode == "deny":
+                raise CoreError("POLICY_DENIED", "Tool is disabled by owner policy")
+            if policy.mode != "allow":
+                # Until these paths lift their exact continuation, they must never
+                # treat approval of the outer Python/start call as target approval.
+                raise CoreError("OWNER_APPROVAL_REQUIRED", "Invoke this tool directly so its exact call can receive owner approval")
+
+    def _task_start(self, arguments, run_id, *, wait_context=None):
         target = arguments["tool"]
         if (
             target not in self._enabled_builtins()
             or target.startswith("core_task_")
             or target
-            in {"core_delegate", "core_python_exec", "core_agent_send_message"}
+            in {"core_delegate", "core_python_exec", "core_agent_send_message", "core_wait_until", "core_ask_owner"}
         ):
             raise CoreError("CAPABILITY_DISABLED")
-        task_run_id = f"{run_id}-background-{uuid.uuid4()}"
-        scope = self._run_scopes.get(run_id, {})
+        self._run_contexts[run_id][1].require_tool(target)
         definition = self.tool_runtime.registry.get(target)
+        self.tool_runtime.validate(ToolCall("background", target, arguments.get("arguments", {})), definition)
+        context = None
+        if wait_context is None:
+            context = self._current_dispatch(run_id)
+            if context is None:
+                self._require_automatic_tool(target, self._run_scopes.get(run_id, {}).get("tenant_id", "default"))
+                raise CoreError("CAPABILITY_DISABLED", "Background admission requires a workflow continuation")
+            pending = context["snapshot"]["pending_call"]
+            wait_context = (context["record"], context["snapshot"],
+                            ToolCall(pending["id"], pending["name"], pending["arguments"]), context["lease_token"])
+        outcome = self._start_background_workflow(arguments, wait_context)
+        if context is not None:
+            parent = context["record"]
+            current = self.workflow_store.get(parent.run_id, tenant_id=parent.tenant_id, owner_id=parent.owner_id)
+            context.update(record=current, snapshot=copy.deepcopy(current.snapshot))
+        return outcome
 
-        def execute(cancel_event):
-            if cancel_event.is_set():
-                return None
-            outcome = self.tool_runtime.execute(
-                ToolCall(str(uuid.uuid4()), target, arguments.get("arguments", {})),
-                run_id=task_run_id,
-                identity=scope.get("identity"),
-                session_id=scope.get("session_id"),
-                tenant_id=scope.get("tenant_id"),
-            )
-            return self._value(outcome.output)
+    def _start_background_workflow(self, arguments, wait_context):
+        parent, parent_snapshot, outer_call, lease_token = wait_context
+        attempt = parent_snapshot["tool_calls"]
+        previous = parent_snapshot.get("background_admission")
+        if previous and previous["source_id"] == outer_call.id and previous["attempt"] == attempt:
+            return self._task_snapshot(self.task_scheduler.get(previous["task_id"], owner_id=parent.run_id, tenant_id=parent.tenant_id))
+        identifier = str(uuid.uuid5(uuid.NAMESPACE_URL, f"background:{parent.run_id}:{attempt}:{outer_call.id}"))
+        child_run_id = f"{parent.run_id}-background-{identifier}"
+        call = {"id": identifier, "name": arguments["tool"], "arguments": copy.deepcopy(arguments.get("arguments", {}))}
+        raw = copy.deepcopy(parent_snapshot["admission"]["agent_config"])
+        raw["tools"]["builtins"] = {"default": "deny", "allow": [call["name"]], "deny": []}
+        raw["tools"]["mcp"] = {"default": "deny", "allow_servers": [], "allow_tools": {}}
+        raw["skills"] = {"default": "deny", "allow": []}
+        raw["features"].update(mcp=False, skills=False, delegation=False, background_tasks=False,
+                                terminal=call["name"] == "core_terminal_exec")
+        if not call["name"].startswith("core_memory_"):
+            raw["features"]["memory"] = "disabled"
+        platform = self._admitted_platform(parent_snapshot, narrow=False)
+        effective = compile_effective_config(platform, AgentConfig.from_dict(raw), (), {})
+        snapshot = {
+            "admission": {"agent_config": raw, "platform_config": self._platform_snapshot(platform),
+                          "mcp": [], "declared_skills": []},
+            "initializing": False, "skill_contract_version": SKILL_CONTRACT_VERSION,
+            "skill_catalog": [], "skills": [], "mcp_catalogs": {},
+            "effective_config_digest": effective.digest,
+            "effective_platform_config": self._platform_snapshot(platform),
+            "background_tool": True, "background_charged": False, "turns": 0, "tool_calls": 0,
+            "pending_call": call, "pending_mutating": None, "tool_queue": [call],
+            "pending_response": {"message": None, "tool_requests": [call]},
+            "finalization_turn_reserved": False, "budget_exhausted": None,
+            "context": self._context_to_dict(ContextState((), (), (0, 0))),
+        }
+        compiled = self._compile_instructions(raw, effective, snapshot)
+        snapshot.update(compiled_instructions=compiled.text, protected_kernel_digest=compiled.protected_digest)
+        child = WorkflowRecord(child_run_id, identifier, parent.context_id, parent.tenant_id,
+                               parent.owner_id, parent.run_id, "MODEL_RESPONDED", 1, {"prompt": "Background tool"}, snapshot)
+        contract = {"workflow_version": 1, "run_id": child_run_id, "task_id": identifier,
+                    "tenant_id": parent.tenant_id, "identity": parent.owner_id}
+        admitted = False
 
-        task = self.task_scheduler.start(
-            execute,
-            owner_id=run_id,
-            required=bool(arguments.get("required")),
-            accepts_cancel_event=True,
-            kind="background_tool",
-            contract={
-                "tool": target,
-                "arguments": arguments.get("arguments", {}),
-                "run_id": task_run_id,
-                "identity": scope.get("identity"),
-                "session_id": scope.get("session_id"),
-                "tenant_id": scope.get("tenant_id", "default"),
-            },
-            recoverable=not definition.mutating,
-            tenant_id=scope.get("tenant_id", "default"),
-            mutating=definition.mutating,
-            on_cancel=(
-                lambda: self.tool_runtime.environment_manager.destroy_run(task_run_id)
+        def admit(connection):
+            nonlocal admitted
+            current = self.workflow_store.get(parent.run_id, tenant_id=parent.tenant_id, owner_id=parent.owner_id,
+                                              connection=connection, lock=True)
+            if current.version != parent.version or current.cancel_requested:
+                raise CoreError("CANCEL_REQUESTED" if current.cancel_requested else "LEASE_LOST")
+            self.workflow_store.create(child, reserve_model_turns=0, connection=connection)
+            updated_snapshot = copy.deepcopy(parent_snapshot)
+            updated_snapshot["background_admission"] = {"source_id": outer_call.id, "attempt": attempt,
+                                                         "task_id": identifier, "run_id": child_run_id}
+            self._record_transition(parent, state="MODEL_RESPONDED", snapshot=updated_snapshot,
+                                    event_kind="background.admitted", event_data={"task_id": identifier},
+                                    lease_token=lease_token, connection=connection)
+            admitted = True
+
+        def cancel_child():
+            self.cancel_task(identifier)
+
+        try:
+            task = self.task_scheduler.start(
+                lambda cancel_event: self._recover_background_tool(contract, cancel_event),
+                owner_id=parent.run_id, task_id=identifier, required=bool(arguments.get("required")),
+                accepts_cancel_event=True, kind="background_tool", contract=contract, recoverable=True,
+                tenant_id=parent.tenant_id, admission=admit, on_cancel=cancel_child,
+                mutating=self.tool_runtime.registry.get(call["name"]).mutating,
             )
-            if target == "core_terminal_exec"
-            else None,
-        )
+        except Exception:
+            if not admitted:
+                raise
+            # Only a committed canonical admission may survive a local launch failure.
+            current = self.workflow_store.get(parent.run_id, tenant_id=parent.tenant_id, owner_id=parent.owner_id)
+            if current.snapshot.get("background_admission", {}).get("task_id") != identifier:
+                raise
+            task = self.task_scheduler.get(identifier, owner_id=parent.run_id, tenant_id=parent.tenant_id)
         return self._task_snapshot(task)
+
+    def _resume_background_workflow(self, contract, cancel_event):
+        record = self.workflow_store.get(contract["run_id"], tenant_id=contract["tenant_id"], owner_id=contract["identity"])
+        if record.state in TERMINAL_STATES:
+            return self._terminal_result(record)
+        try:
+            return self._run_execution_attempt(record, lambda current, token: self._resume_background_workflow_body(
+                contract, cancel_event, token))
+        except CoreError as error:
+            if error.code != "LEASE_LOST":
+                raise
+            return SuspendedRun(record.run_id, record.task_id, record.snapshot.get("wait_id", ""), record.version)
+
+    def _resume_background_workflow_body(self, contract, cancel_event, token):
+        record = self.workflow_store.get(contract["run_id"], tenant_id=contract["tenant_id"], owner_id=contract["identity"])
+        if record.task_id != contract["task_id"] or not record.snapshot.get("background_tool"):
+            raise CoreError("CHECKPOINT_INVALID")
+        if record.state in TERMINAL_STATES:
+            if record.state == "COMPLETED":
+                return record.result["output"]
+            raise CoreError(record.error_code or ("TASK_CANCELLED" if record.state == "CANCELLED" else "TOOL_EXECUTION_FAILED"))
+        stop, heartbeat, failures = self._start_lease_heartbeat(record, token)
+        durable_cancel = _DurableCancelEvent(cancel_event, self.workflow_store, record)
+        try:
+            record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            if record.state == "EXECUTING":
+                self._abort_ambiguous_execution(record, lease_token=token)
+                raise CoreError("SIDE_EFFECT_UNKNOWN")
+            self._cancel_at_boundary(record, copy.deepcopy(record.snapshot), durable_cancel, lease_token=token)
+            wait = None
+            if record.snapshot.get("wait_id"):
+                wait = self.workflow_store.get_wait(record.snapshot["wait_id"], tenant_id=record.tenant_id, owner_id=record.owner_id)
+                if wait.outcome is None:
+                    return self._suspended(record, wait)
+                if wait.kind == "guardrail":
+                    record = self._apply_material_wait(record, lease_token=token)
+                    wait = None
+            record, _, raw, discovered, effective = self._load_workflow_runtime(record, cancel_event=durable_cancel, lease_token=token)
+            snapshot = copy.deepcopy(record.snapshot)
+            if snapshot.get("pending_call") and not snapshot["background_charged"]:
+                snapshot.update(background_charged=True, tool_calls=1)
+                try:
+                    record = self._record_transition(record, state="MODEL_RESPONDED", snapshot=snapshot,
+                                                    event_kind="tool.attempt.started", consume_tool_calls=1, lease_token=token)
+                except CoreError as error:
+                    if error.code != "BUDGET_EXCEEDED":
+                        raise
+                    snapshot = copy.deepcopy(record.snapshot)
+                    pending = snapshot["pending_call"]
+                    call = ToolCall(pending["id"], pending["name"], pending["arguments"])
+                    record = self._record_tool_outcome(record, snapshot, call, self._failed_tool_outcome(call, error), lease_token=token)
+                    snapshot = copy.deepcopy(record.snapshot)
+            if wait is not None:
+                record = self._apply_tool_wait(record, snapshot, wait, lease_token=token, active_result_token_limit=None)
+                snapshot = copy.deepcopy(record.snapshot)
+            if snapshot.get("pending_completed_result"):
+                record = self._resume_completed_material(record, snapshot, lease_token=token)
+                snapshot = copy.deepcopy(record.snapshot)
+            if snapshot.get("pending_call"):
+                pending = snapshot["pending_call"]
+                call = ToolCall(pending["id"], pending["name"], pending["arguments"])
+                try:
+                    effective.require_tool(call.name)
+                    definition, _ = self._definition(call, effective, discovered, record)
+                    approved = snapshot.get("approved_tool_call")
+                    if approved is not None and approved != {"call_id": call.id, **self._approval_subject(call, definition, effective, snapshot)}:
+                        raise CoreError("TOOL_APPROVAL_STALE", "Approved arguments or tool schema changed; a new call is required")
+                    self.tool_runtime.validate(call, definition)
+                except CoreError as error:
+                    if error.code not in {"CAPABILITY_DISABLED", "TOOL_ARGUMENT_INVALID", "TOOL_UNAVAILABLE", "TOOL_APPROVAL_STALE"}:
+                        raise
+                    record = self._record_tool_outcome(record, snapshot, call, self._failed_tool_outcome(call, error), lease_token=token)
+                else:
+                    record = self._execute_pending(record, snapshot, raw, discovered, effective, lease_token=token)
+                    if isinstance(record, SuspendedRun):
+                        return record
+                snapshot = copy.deepcopy(record.snapshot)
+            if failures:
+                raise failures[0]
+            self._cancel_at_boundary(record, snapshot, durable_cancel, lease_token=token)
+            outcome = snapshot["background_tool_result"]
+            succeeded = outcome["status"] == "succeeded"
+            code = None if succeeded else outcome["error_code"] or "TOOL_EXECUTION_FAILED"
+            record = self._record_transition(
+                record, state="COMPLETED" if succeeded else "FAILED", snapshot=snapshot,
+                event_kind="task.completed" if succeeded else "task.failed",
+                result={"output": outcome["output"]} if succeeded else None,
+                error_code=code, lease_token=token,
+            )
+            if not succeeded:
+                raise CoreError(code)
+            return record.result["output"]
+        except _MaterialSuspended as suspended:
+            return suspended.result
+        except CoreError as error:
+            current = self.workflow_store.get(contract["run_id"], tenant_id=contract["tenant_id"], owner_id=contract["identity"])
+            if error.code in {"LEASE_LOST", "WORKER_STOPPED", "EXECUTION_CLEANUP_PENDING", "EXECUTION_REOPENED", "EXECUTION_CLOSING"}:
+                return SuspendedRun(current.run_id, current.task_id, current.snapshot.get("wait_id", ""), current.version)
+            if error.code == "CANCEL_REQUESTED":
+                forced = _TaskControlEvent()
+                forced.set()
+                self._cancel_at_boundary(current, copy.deepcopy(current.snapshot), forced, lease_token=token)
+            if current.state not in TERMINAL_STATES:
+                if current.state == "EXECUTING":
+                    self._abort_ambiguous_execution(current, lease_token=token)
+                    raise CoreError("SIDE_EFFECT_UNKNOWN") from error
+                self._record_transition(current, state="FAILED", snapshot=copy.deepcopy(current.snapshot),
+                                        event_kind="task.failed", error_code=error.code, lease_token=token)
+            raise
+        finally:
+            durable_cancel.close()
+            stop.set()
+            heartbeat.join(timeout=1)
+            self._drop_run_runtime(contract["run_id"])
+
+    def _current_dispatch(self, run_id):
+        context = self._dispatch_context.get()
+        return context if context is not None and context["record"].run_id == run_id else None
+
+    def _cron_create(self, arguments, run_id):
+        context = self._current_dispatch(run_id)
+        store = getattr(self, "cron_store", None)
+        if store is None or context is None:
+            raise ExecutionNotStarted("CAPABILITY_DISABLED")
+        snapshot = context["snapshot"]
+        nested = snapshot.get("nested_dispatch", {})
+        call_id = (nested["call_id"] if nested.get("state") == "executing"
+                   and nested.get("subject", {}).get("tool_name") == "core_cron_create"
+                   else snapshot["pending_call"]["id"])
+        try:
+            return store.create_from_tool(context["record"], context["lease_token"], call_id, arguments)
+        except CoreError as error:
+            if error.code in {"CRON_INVALID", "CRON_CONFLICT", "CRON_NOT_FOUND", "TASK_NOT_FOUND", "TASK_CANCELLED"}:
+                raise ExecutionNotStarted(error.code) from None
+            raise
 
     def _python_exec(self, arguments, run_id):
         cached = self._runtime_cache.get(run_id)
@@ -3462,28 +5035,282 @@ class CoreAgent:
         ]
         parent_context = self.telemetry.current_context()
         tool_names = set(effective.model_tool_catalog) - {"core_python_exec"}
-        return execute_python(
-            self.tool_runtime.environment_manager,
-            run_id=run_id,
-            code=arguments["code"],
-            tool_names=tool_names,
-            dispatch=lambda name, values: self._python_tool_call(
-                name,
-                values,
-                run_id=run_id,
-                discovered=discovered,
-                effective=effective,
-                parent_context=parent_context,
-            ),
-            cwd=arguments.get("cwd"),
-            timeout=arguments.get(
-                "timeout", min(30, schema["timeout"].get("maximum", 30))
-            ),
-            max_output_bytes=arguments.get(
-                "max_output_bytes",
-                min(100_000, schema["max_output_bytes"].get("maximum", 100_000)),
-            ),
-        )
+        if getattr(self, "cron_store", None) is None:
+            tool_names.discard("core_cron_create")
+        if self.interaction_store is not None:
+            tenant_id = self._run_scopes[run_id]["tenant_id"]
+            tool_names = {
+                name for name in tool_names
+                if self.interaction_store.get_policy(
+                    tenant_id, name, tool_origin(name, self._mcp_target(name, effective)),
+                ).mode != "deny"
+            }
+        context = self._current_dispatch(run_id)
+        control = {"ready": threading.Event(), "finished": threading.Event()}
+        context["python_control"] = control
+
+        def started(session, handle):
+            control.update(session=session, handle=handle)
+            control["ready"].set()
+
+        try:
+            return execute_python(
+                self.tool_runtime.environment_manager, run_id=run_id,
+                code=arguments["code"], tool_names=tool_names,
+                dispatch=lambda name, values, request_id=None: self._python_tool_call(
+                    name, values, run_id=run_id, discovered=discovered,
+                    effective=effective, parent_context=parent_context,
+                    request_id=request_id,
+                ),
+                cwd=arguments.get("cwd"),
+                timeout=arguments.get("timeout", min(30, schema["timeout"].get("maximum", 30))),
+                max_output_bytes=arguments.get("max_output_bytes", min(100_000, schema["max_output_bytes"].get("maximum", 100_000))),
+                on_start=started,
+            )
+        finally:
+            # Wake an early broker request even when process registration failed.
+            control["ready"].set()
+            if context.get("material_stopping") or context["snapshot"].get("python_execution", {}).get("phase") == "stopping":
+                if not control["finished"].wait(10) or context["snapshot"].get("python_execution", {}).get("phase") == "stopping":
+                    context["error"] = CoreError("SIDE_EFFECT_UNKNOWN", "Python stop was not confirmed")
+
+    @staticmethod
+    def _bounded_python_outcome(value):
+        encoded = json.dumps(value, ensure_ascii=False, default=str)
+        if len(encoded.encode()) <= 8192:
+            return value
+        return {"truncated": True, "preview": encoded.encode()[:8000].decode("utf-8", "ignore")}
+
+    def _complete_python_nested(self, context, call, outcome):
+        if context is None or context.get("error") is not None:
+            return
+        snapshot = copy.deepcopy(context["snapshot"])
+        frame = snapshot.get("python_execution")
+        if frame is None:
+            return
+        frame["completed"].append(self._bounded_python_outcome(
+            json.loads(self._result_text(call.id, outcome, call.name))))
+        while len(json.dumps(frame["completed"]).encode()) > 65536:
+            frame["completed"].pop(0)
+            frame["omitted_completed_calls"] = frame.get("omitted_completed_calls", 0) + 1
+        snapshot["nested_dispatch"]["state"] = "completed"
+        try:
+            updated = self._record_transition(
+                context["record"], state="EXECUTING", snapshot=snapshot,
+                event_kind="tool.nested.completed", event_data={"tool_call_id": call.id},
+                lease_token=context["lease_token"],
+            )
+        except Exception as error:
+            # Once dispatch has happened, a failed journal commit must poison
+            # the outer call even if user Python catches the broker exception.
+            context["error"] = error if isinstance(error, CoreError) and error.code == "LEASE_LOST" else CoreError(
+                "SIDE_EFFECT_UNKNOWN", "Nested outcome could not be persisted")
+            raise context["error"] from error
+        context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+
+    def _guard_python_material(self, context, call, payload, *, stage):
+        try:
+            return self._review_python_material(context, call, payload, stage=stage)
+        except Exception as error:
+            if isinstance(error, CoreError) and error.code in {"MATERIAL_REJECTED", "MATERIAL_TIMEOUT"}:
+                raise
+            # Failed persistence is a host failure, never a catchable broker RPC.
+            context["error"] = error if isinstance(error, CoreError) else CoreError("MATERIAL_REVIEW_UNAVAILABLE")
+            control = context.get("python_control")
+            if control is None:
+                raise context["error"] from error
+            cleanup_failed = False
+            try:
+                if not control["ready"].wait(10) or "session" not in control:
+                    raise CoreError("SIDE_EFFECT_UNKNOWN")
+                control["session"].cancel(control["handle"].id)
+                stopped = control["session"].wait(control["handle"].id)
+                if stopped.cleanup not in {"sandbox_terminated", "process_group_terminated"}:
+                    raise CoreError("SIDE_EFFECT_UNKNOWN")
+            except BaseException:
+                cleanup_failed = True
+                context["error"] = CoreError("SIDE_EFFECT_UNKNOWN", "Python cleanup after guard failure was not confirmed")
+            finally:
+                control["finished"].set()
+            raise PythonContinuationStopped(cleanup_failed=cleanup_failed) from error
+
+    def _review_python_material(self, context, call, payload, *, stage):
+        if self.material_review_store is None or context is None:
+            return None
+        snapshot = copy.deepcopy(context["snapshot"])
+        frame = snapshot["python_execution"]
+        frame.update(nested_call={"id": call.id, "name": call.name, "arguments": copy.deepcopy(call.arguments)},
+                     approval_required=False, subject=snapshot["nested_dispatch"]["subject"])
+        if stage == "tool_result":
+            snapshot["pending_completed_result"] = {"call": frame["nested_call"], "outcome": payload}
+            snapshot["nested_dispatch"]["state"] = "result_saved"
+            updated = self._record_transition(context["record"], state="EXECUTING", snapshot=snapshot,
+                event_kind="tool.nested.result.saved", event_data={"tool_call_id": call.id}, lease_token=context["lease_token"])
+            context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+
+        def stop_before_wait():
+            context["material_stopping"] = True
+            frame["phase"] = "stopping"
+            updated = self._record_transition(context["record"], state="EXECUTING", snapshot=snapshot,
+                event_kind="python.stopping", event_data={"tool_call_id": call.id}, lease_token=context["lease_token"])
+            context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+            try:
+                self._stop_python_for_wait(context, finish=False)
+            except PythonContinuationStopped as stopped:
+                if stopped.cleanup_failed:
+                    raise
+            snapshot.clear()
+            snapshot.update(copy.deepcopy(context["snapshot"]))
+            return snapshot, self._tool_wait_continuation(snapshot, call, stage)
+
+        try:
+            decision = self._guard_material(context["record"], snapshot,
+                source_id=("result:" if stage == "tool_result" else "arguments:") + call.id,
+                source_kind="tool_result" if stage == "tool_result" else "tool_arguments", payload=payload,
+                continuation={"version": 1, "phase": "python_nested", "stage": stage,
+                              "call_id": call.id, "outer_call_id": frame["outer_call"]["id"]},
+                lease_token=context["lease_token"], exempt=self._material_exempt(context["record"], call),
+                before_pending=stop_before_wait)
+        except _MaterialSuspended:
+            current = self.workflow_store.get(context["record"].run_id,
+                tenant_id=context["record"].tenant_id, owner_id=context["record"].owner_id)
+            context.update(record=current, snapshot=copy.deepcopy(current.snapshot))
+            raise PythonContinuationStopped()
+        finally:
+            if context.get("material_stopping"):
+                context["python_control"]["finished"].set()
+                context.pop("material_stopping", None)
+        snapshot.pop("pending_completed_result", None)
+        context["snapshot"] = snapshot
+        if decision is not None:
+            raise CoreError("MATERIAL_TIMEOUT" if decision == "timed_out" else "MATERIAL_REJECTED")
+        return payload
+
+    def _stop_python_for_wait(self, context, *, finish=True):
+        control = context.get("python_control")
+        try:
+            if control is None or not control["ready"].wait(10) or "session" not in control:
+                raise CoreError("SIDE_EFFECT_UNKNOWN", "Python process registration was not confirmed")
+            control["session"].cancel(control["handle"].id)
+            result = control["session"].wait(control["handle"].id)
+            if result.cleanup not in {"sandbox_terminated", "process_group_terminated"}:
+                raise CoreError("SIDE_EFFECT_UNKNOWN", "Python tree teardown was not confirmed")
+            snapshot = copy.deepcopy(context["snapshot"])
+            frame = snapshot["python_execution"]
+            frame.update(phase="stopped", stdout=result.stdout, stderr=result.stderr,
+                         truncated=result.truncated)
+            snapshot["pending_call"] = copy.deepcopy(frame["nested_call"])
+            snapshot["pending_mutating"] = None
+            snapshot.pop("approved_tool_call", None)
+            updated = self._record_transition(
+                context["record"], state="MODEL_RESPONDED", snapshot=snapshot,
+                event_kind="python.stopped", event_data={"tool_call_id": frame["outer_call"]["id"]},
+                lease_token=context["lease_token"],
+            )
+            context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+        except BaseException as error:
+            unknown = CoreError("SIDE_EFFECT_UNKNOWN", "Python stop requires reconciliation")
+            context["error"] = unknown
+            # Never tell a still-live interpreter that the call failed. Keep
+            # the broker reply pending until cleanup is confirmed or the owner
+            # execution path closes the broker after its own bounded teardown.
+            if control is not None:
+                control["stop_error"] = error
+            try:
+                updated = self._record_transition(
+                    context["record"], state="ABORTED", snapshot=context["snapshot"],
+                    event_kind="execution.side_effect_unknown",
+                    event_data={"tool_call_id": context["snapshot"]["python_execution"]["outer_call"]["id"]},
+                    error_code=unknown.code, lease_token=context["lease_token"],
+                )
+                context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+            finally:
+                raise PythonContinuationStopped(cleanup_failed=True) from error
+        finally:
+            if control is not None and finish:
+                control["finished"].set()
+        raise PythonContinuationStopped()
+
+    def _nested_dispatch_intent(self, record, call, definition, effective, *, failure=None, request_id=None, wait_needed=False):
+        try:
+            return self._admit_nested_dispatch(record, call, definition, effective, failure=failure, request_id=request_id, wait_needed=wait_needed)
+        except CoreError as error:
+            if error.code != "BUDGET_EXCEEDED":
+                raise
+            context = self._current_dispatch(record.run_id)
+            snapshot = copy.deepcopy(context["snapshot"])
+            self._mark_budget_exhausted(
+                snapshot, error, dimension=error.data.get("dimension", "tool_calls"),
+                used=error.data.get("used", snapshot["tool_calls"]),
+                limit=error.data.get("limit", self.platform_config.max_tool_calls),
+            )
+            # This decision belongs to the run even if Python catches the RPC error.
+            # A failed checkpoint must also prevent the outer result from committing.
+            context["error"] = error
+            updated = self._record_transition(
+                context["record"], state="EXECUTING", snapshot=snapshot,
+                event_kind="budget.exhausted", event_data=snapshot["budget_exhausted"],
+                lease_token=context["lease_token"],
+            )
+            context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+            context.pop("error")
+            raise
+
+    def _admit_nested_dispatch(self, record, call, definition, effective, *, failure=None, request_id=None, wait_needed=False):
+        context = self._current_dispatch(record.run_id)
+        subject_snapshot = ({**context["snapshot"], "tool_calls": context["snapshot"]["tool_calls"] + 1} if context else None)
+        subject = self._approval_subject(call, definition, effective, subject_snapshot)
+        scope = (self.interaction_store.policy_scope(record.tenant_id, call.name, subject["origin"])
+                 if self.interaction_store is not None else nullcontext((None, None)))
+        with scope as (policy, connection):
+            mode = policy.mode if policy is not None else "allow"
+            error = failure
+            if error is None and (mode == "deny" or (context is None and mode == "require_hitl")):
+                error = CoreError("POLICY_DENIED" if mode == "deny" else "OWNER_APPROVAL_REQUIRED")
+            if context is None:
+                raise error or CoreError("CAPABILITY_DISABLED", "Nested dispatch requires an active owned outer call")
+            current = context["record"]
+            if current.state != "EXECUTING" or current.snapshot.get("pending_call", {}).get("name") != "core_python_exec":
+                raise CoreError("INVALID_TASK_STATE")
+            snapshot = copy.deepcopy(context["snapshot"])
+            raw = self._runtime_cache[record.run_id][0]
+            limit = min(raw["budgets"].get("tool_calls", self.platform_config.max_tool_calls), self.platform_config.max_tool_calls)
+            if snapshot["tool_calls"] >= limit:
+                raise self._budget_error("tool_calls", snapshot["tool_calls"], limit)
+            snapshot["tool_calls"] += 1
+            frame = snapshot.setdefault("python_execution", {
+                "version": 1, "phase": "running", "outer_call": copy.deepcopy(snapshot["pending_call"]),
+                "completed": [],
+            })
+            suspend = error is None and (mode == "require_hitl" or wait_needed)
+            if suspend:
+                frame.update(
+                    phase="stopping", nested_call={"id": call.id, "name": call.name, "arguments": copy.deepcopy(call.arguments)},
+                    request_id=request_id, subject=subject,
+                    approval_required=mode == "require_hitl",
+                    approval_deadline=(self.workflow_store.current_time() + self.interaction_store.get_settings(record.tenant_id).hitl_timeout_seconds) if mode == "require_hitl" else None,
+                )
+            snapshot["nested_dispatch"] = {
+                "call_id": call.id, "request_id": request_id, "subject": subject,
+                "state": "failed" if error is not None else ("stopping" if suspend else ("checking" if self.material_review_store is not None else "executing")),
+                "error_code": error.code if error is not None else None,
+            }
+            updated = self._record_transition(
+                current, state="EXECUTING", snapshot=snapshot,
+                event_kind="tool.nested.rejected" if error is not None else "tool.nested.intent",
+                event_data={"tool_call_id": call.id, "tool_name": call.name},
+                audit=() if self.material_review_store is not None and error is None else (("tool.execution.failed" if error is not None else "tool.execution.started", {
+                    "tool_call_id": call.id, "tool_name": call.name, "source": "core_python_exec",
+                    **({"error_code": error.code} if error is not None else {}),
+                }),),
+                consume_tool_calls=1, lease_token=context["lease_token"], connection=connection,
+            )
+        context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+        if error is not None:
+            self._complete_python_nested(context, call, self._failed_tool_outcome(call, error))
+            raise error
+        if suspend:
+            self._stop_python_for_wait(context)
 
     def _python_tool_call(
         self,
@@ -3494,11 +5321,19 @@ class CoreAgent:
         discovered,
         effective,
         parent_context,
+        request_id=None,
     ):
+        context = self._current_dispatch(run_id)
+        if context is not None and context.get("error") is not None:
+            raise context["error"]
+        if context is not None and context["snapshot"].get("python_execution", {}).get("phase") in {"stopping", "stopped"}:
+            raise PythonContinuationStopped()
         if name == "core_python_exec":
             raise CoreError("CAPABILITY_DISABLED")
         effective.require_tool(name)
-        call = ToolCall(str(uuid.uuid4()), name, arguments)
+        call_id = (str(uuid.uuid5(uuid.NAMESPACE_URL, run_id + ":" + context["snapshot"]["pending_call"]["id"] + ":" + request_id))
+                   if context is not None and request_id is not None else str(uuid.uuid4()))
+        call = ToolCall(call_id, name, arguments)
         scope = self._run_scopes.get(run_id, {})
         tenant_id = scope.get("tenant_id", "default")
         record = self.workflow_store.get(
@@ -3507,7 +5342,6 @@ class CoreAgent:
             owner_id=scope.get("identity"),
         )
         definition, is_mcp = self._definition(call, effective, discovered, record)
-        self.workflow_store.consume_budget(record, tool_calls=1)
         audit_data = {
             "tool_call_id": call.id,
             "tool_name": name,
@@ -3525,6 +5359,7 @@ class CoreAgent:
         try:
             self.tool_runtime.validate(call, definition)
         except CoreError as error:
+            self._nested_dispatch_intent(record, call, definition, effective, failure=error, request_id=request_id)
             with self.telemetry.span(
                 "core_agent.tool.execute", parent=parent_context
             ) as span:
@@ -3546,19 +5381,72 @@ class CoreAgent:
                 error_code=error.code,
             )
             raise
-        self.audit_log.append(
-            run_id, "tool.execution.started", audit_data, tenant_id=tenant_id
-        )
+        wait_value = None
+        if name == "core_agent_send_message" and self.remote_registry is not None:
+            if context is None:
+                raise CoreError("CAPABILITY_DISABLED")
+            try:
+                current, pinned = self._pin_remote_call(context["record"], copy.deepcopy(context["snapshot"]), call,
+                    lease_token=context["lease_token"], attempt=context["snapshot"]["tool_calls"] + 1)
+            except CoreError as error:
+                if error.code in {"TOOL_UNAVAILABLE", "POLICY_DENIED"}:
+                    self._nested_dispatch_intent(record, call, definition, effective, failure=error, request_id=request_id)
+                raise
+            context.update(record=current, snapshot=pinned)
+            record = current
+        if name in {"core_wait_until", "core_task_wait", "core_ask_owner"}:
+            try:
+                wait_value = self._prepare_tool_wait(record, {}, call, lease_token=None, prepare_only=True)
+            except CoreError as error:
+                self._nested_dispatch_intent(record, call, definition, effective, failure=error, request_id=request_id)
+                raise
+        wait_needed = (isinstance(wait_value, tuple) or (name == "core_delegate" and not arguments.get("background", False))
+                       or (name == "core_agent_send_message" and self.remote_registry is not None))
+        self._nested_dispatch_intent(record, call, definition, effective, request_id=request_id, wait_needed=wait_needed)
+        self._guard_python_material(context, call, call.arguments, stage="tool_gate")
+        if self.material_review_store is not None:
+            subject = self._approval_subject(call, definition, effective, context["snapshot"])
+            policy_scope = (self.interaction_store.policy_scope(record.tenant_id, call.name, subject["origin"])
+                     if self.interaction_store is not None else nullcontext((None, None)))
+            with policy_scope as (policy, connection):
+                if policy is not None and policy.mode == "deny":
+                    raise CoreError("POLICY_DENIED")
+                needs_approval = policy is not None and policy.mode == "require_hitl"
+                if not needs_approval:
+                    context["snapshot"]["nested_dispatch"]["state"] = "executing"
+                    updated = self._record_transition(context["record"], state="EXECUTING", snapshot=context["snapshot"],
+                        event_kind="tool.nested.dispatch", event_data={"tool_call_id": call.id},
+                        audit=(("tool.execution.started", {"tool_call_id": call.id, "tool_name": call.name, "source": "core_python_exec"}),),
+                        lease_token=context["lease_token"], connection=connection)
+                    context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+            if needs_approval:
+                snapshot = copy.deepcopy(context["snapshot"])
+                snapshot["python_execution"].update(phase="stopping", nested_call={"id": call.id, "name": call.name, "arguments": call.arguments},
+                    subject=subject, approval_required=True,
+                    approval_deadline=self.workflow_store.current_time() + self.interaction_store.get_settings(record.tenant_id).hitl_timeout_seconds)
+                updated = self._record_transition(context["record"], state="EXECUTING", snapshot=snapshot,
+                    event_kind="python.stopping", lease_token=context["lease_token"])
+                context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+                self._stop_python_for_wait(context)
+        known_outcome = False
+        reviewed_outcome = False
         try:
             with self.telemetry.span(
                 "core_agent.tool.execute", parent=parent_context
             ) as span:
                 self._instrument_tool(span, call, definition)
-                if is_mcp:
+                if wait_value is not None and not isinstance(wait_value, tuple):
+                    output = wait_value
+                    known_outcome = True
+                elif is_mcp:
                     server, remote_tool = self._mcp_target(name, effective)
                     output = self._run_mcp_connectors.get(
                         run_id, self.mcp_connector
                     ).call(server, remote_tool, arguments)
+                    known_outcome = True
+                    self._guard_python_material(context, call, json.loads(self._result_text(
+                        call.id, self._mcp_outcome(call, output), call.name)), stage="tool_result")
+                    reviewed_outcome = True
                     # The same rule as a failed built-in outcome below: inside
                     # tools.call a failure has to raise, not return a body.
                     if isinstance(output, dict) and output.get("isError"):
@@ -3576,6 +5464,10 @@ class CoreAgent:
                         environment="local-pty",
                         policy_version=effective.digest,
                     )
+                    known_outcome = outcome.error_code != "SIDE_EFFECT_UNKNOWN"
+                    if known_outcome:
+                        self._guard_python_material(context, call, json.loads(self._result_text(call.id, outcome, call.name)), stage="tool_result")
+                        reviewed_outcome = True
                     if outcome.status != "succeeded":
                         raise CoreError(
                             outcome.error_code
@@ -3587,6 +5479,8 @@ class CoreAgent:
                         )
                     output = outcome.output
                 value = self._value(output)
+                if wait_value is not None and not isinstance(wait_value, tuple):
+                    self._guard_python_material(context, call, json.loads(self._result_text(call.id, value, call.name)), stage="tool_result")
                 span.set_attributes(
                     {
                         "core_agent.tool.outcome": "succeeded",
@@ -3595,6 +5489,28 @@ class CoreAgent:
                     }
                 )
         except Exception as error:
+            if definition.mutating and not known_outcome and not self._recoverable_tool_error(call, error):
+                unknown = CoreError("SIDE_EFFECT_UNKNOWN", "Nested mutating tool requires reconciliation")
+                if context is None:
+                    raise unknown from error
+                context["error"] = unknown
+                snapshot = copy.deepcopy(context["snapshot"])
+                if snapshot.get("nested_dispatch"):
+                    snapshot["nested_dispatch"].update(state="unknown", error_code=unknown.code)
+                updated = self._record_transition(
+                    context["record"], state="ABORTED", snapshot=snapshot,
+                    event_kind="execution.side_effect_unknown",
+                    event_data={"tool_call_id": call.id, "source": "core_python_exec"},
+                    audit=(("execution.reconciliation_required", audit_data),),
+                    error_code=unknown.code, lease_token=context["lease_token"],
+                )
+                context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+                raise unknown from error
+            known_error = error if isinstance(error, CoreError) else CoreError("TOOL_EXECUTION_FAILED", type(error).__name__)
+            if not reviewed_outcome and known_error.code not in {"MATERIAL_REJECTED", "MATERIAL_TIMEOUT"}:
+                self._guard_python_material(context, call, json.loads(self._result_text(
+                    call.id, self._failed_tool_outcome(call, known_error), call.name)), stage="tool_result")
+            self._complete_python_nested(context, call, self._failed_tool_outcome(call, known_error))
             self.audit_log.append(
                 run_id,
                 "tool.execution.failed",
@@ -3614,6 +5530,7 @@ class CoreAgent:
                 error_code=getattr(error, "code", type(error).__name__),
             )
             raise
+        self._complete_python_nested(context, call, value)
         self.audit_log.append(
             run_id, "tool.execution.succeeded", audit_data, tenant_id=tenant_id
         )
@@ -3629,16 +5546,9 @@ class CoreAgent:
         return value
 
     def _recover_background_tool(self, contract, cancel_event):
-        if cancel_event.is_set():
-            return None
-        outcome = self.tool_runtime.execute(
-            ToolCall(str(uuid.uuid4()), contract["tool"], dict(contract["arguments"])),
-            run_id=contract["run_id"],
-            identity=contract.get("identity"),
-            session_id=contract.get("session_id"),
-            tenant_id=contract.get("tenant_id", "default"),
-        )
-        return self._value(outcome.output)
+        if contract.get("workflow_version") == 1:
+            return self._resume_background_workflow(contract, cancel_event)
+        raise CoreError("RECOVERY_REQUIRES_RECONCILIATION", "Legacy background tool has no durable dispatch contract")
 
     def _task_get(self, arguments, run_id):
         tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
@@ -3657,6 +5567,7 @@ class CoreAgent:
 
     def _task_wait(self, arguments, run_id):
         tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
+        self._remote_wait_arguments(arguments, run_id, tenant_id)
         try:
             task = self.task_scheduler.wait(
                 arguments["task_id"],
@@ -3669,6 +5580,10 @@ class CoreAgent:
                 arguments["task_id"], owner_id=run_id, tenant_id=tenant_id
             )
         return self._task_snapshot(task)
+
+    def _remote_wait_arguments(self, arguments, run_id, tenant_id):
+        if "timeout" in arguments and self.task_scheduler.is_remote(arguments["task_id"], owner_id=run_id, tenant_id=tenant_id):
+            raise CoreError("TOOL_ARGUMENT_INVALID", "Remote operations have a fixed deadline; omit timeout")
 
     def _task_cancel(self, arguments, run_id):
         tenant_id = self._run_scopes.get(run_id, {}).get("tenant_id", "default")
@@ -3892,7 +5807,11 @@ class CoreAgent:
             "total": len(session_artifacts) + len(user_artifacts),
         }
 
-    def _send_message(self, arguments, run_id):
+    def _send_message(self, arguments, run_id, *, wait_context=None):
+        if self.remote_registry is not None:
+            if wait_context is None:
+                raise CoreError("CAPABILITY_DISABLED", "Remote admission requires a workflow continuation")
+            return self._start_remote_operation(wait_context)
         if not self.remote_agents:
             raise CoreError("CAPABILITY_DISABLED")
         name = (arguments.get("agent_name") or "").strip()
@@ -3910,7 +5829,7 @@ class CoreAgent:
                 ),
             }
         scope = self._run_scopes.get(run_id, {})
-        stream = self._task_streams.get(scope.get("task_id")) or NULL_STREAM
+        stream = self._scoped_stream(scope.get("task_id"), scope.get("identity"))
         headers = build_forwarded_headers(
             self._task_headers.get(scope.get("task_id")) or {},
             api_key=self.send_message_api_key,
@@ -3945,13 +5864,52 @@ class CoreAgent:
             ),
         }
 
+    def _start_remote_operation(self, wait_context):
+        parent, snapshot, call, lease_token = wait_context
+        attempt = snapshot["tool_calls"]
+        identifier = str(uuid.uuid5(uuid.NAMESPACE_URL, f"remote:{parent.run_id}:{attempt}:{call.id}"))
+        previous = snapshot.get("remote_admission")
+        if previous is not None:
+            if (not isinstance(previous, dict) or previous.keys() != {"version", "source_id", "attempt", "task_id"}
+                    or type(previous["version"]) is not int or previous["version"] != 1):
+                raise CoreError("CHECKPOINT_INVALID")
+            if previous["source_id"] == call.id and previous["attempt"] == attempt:
+                if previous["task_id"] != identifier:
+                    raise CoreError("CHECKPOINT_INVALID")
+                return self._task_snapshot(self.task_scheduler.get(identifier, owner_id=parent.run_id, tenant_id=parent.tenant_id))
+        contract = self._remote_binding(snapshot, call)
+        _remote_contract(contract, parent.tenant_id, parent.run_id)
+        admitted = False
+        def admit(connection):
+            nonlocal admitted
+            current = self.workflow_store.get(parent.run_id, tenant_id=parent.tenant_id, owner_id=parent.owner_id,
+                connection=connection, lock=True)
+            if current.version != parent.version or current.cancel_requested:
+                raise CoreError("CANCEL_REQUESTED" if current.cancel_requested else "LEASE_LOST")
+            updated = copy.deepcopy(snapshot)
+            updated["remote_admission"] = {"version": 1, "source_id": call.id, "attempt": attempt, "task_id": identifier}
+            self._record_transition(parent, state="MODEL_RESPONDED", snapshot=updated, event_kind="remote.admitted",
+                event_data={"task_id": identifier}, lease_token=lease_token, connection=connection)
+            admitted = True
+        try:
+            task = self.task_scheduler.start_remote(contract, owner_id=parent.run_id, tenant_id=parent.tenant_id,
+                task_id=identifier, required=True, admission=admit)
+        except Exception:
+            if not admitted:
+                raise
+            current = self.workflow_store.get(parent.run_id, tenant_id=parent.tenant_id, owner_id=parent.owner_id)
+            if current.snapshot.get("remote_admission", {}).get("task_id") != identifier:
+                raise
+            task = self.task_scheduler.get(identifier, owner_id=parent.run_id, tenant_id=parent.tenant_id)
+        return self._task_snapshot(task)
+
     def _relay_remote_stream(self, connection, call, stream):
         """Republish the child's progress into this task and keep its final text."""
         final_text = ""
         last_text = ""
         try:
             for event in connection.stream_message(**call):
-                if event.parts:
+                if event.parts and self.material_review_store is None:
                     stream.relay(event.parts)
                 if not event.text:
                     continue
@@ -3963,7 +5921,7 @@ class CoreAgent:
             return connection.send_message(**call).text
         return final_text or last_text or connection.send_message(**call).text
 
-    def _delegate(self, arguments, run_id):
+    def _delegate(self, arguments, run_id, *, wait_context=None):
         contract = DelegationContract.from_dict(arguments)
         raw = self.agent_config.to_dict()
         request, effective = self._run_contexts[run_id]
@@ -4062,8 +6020,21 @@ class CoreAgent:
             "parent_run_id": run_id,
         }
         child = self._child_agent(child_raw, child_tools)
+        parent_wait = None
 
         def admit(connection):
+            nonlocal parent_wait
+            if wait_context is not None:
+                parent_record, parent_snapshot, call, lease_token = wait_context
+                # Parent run precedes the shared budget lock taken by child admission.
+                current = self.workflow_store.get(
+                    run_id, tenant_id=parent_record.tenant_id, owner_id=parent_record.owner_id,
+                    connection=connection, lock=True,
+                )
+                if current.version != parent_record.version or current.snapshot.get("wait_id"):
+                    raise CoreError("LEASE_LOST")
+                if current.cancel_requested:
+                    raise CoreError("CANCEL_REQUESTED")
             child._new_workflow(
                 child_request,
                 task_id=child_task_id,
@@ -4074,28 +6045,49 @@ class CoreAgent:
                 connection=connection,
                 defer_initialization=True,
             )
+            if wait_context is not None:
+                parent_wait = self.workflow_store.enter_wait(
+                    parent_record, kind="task", source_id=call.id,
+                    subject={"task_id": child_task_id},
+                    continuation=self._tool_wait_continuation(parent_snapshot, call, "tool_wait"),
+                    deadline=None, snapshot=parent_snapshot, lease_token=lease_token,
+                    connection=connection,
+                )
 
-        task = self.task_scheduler.start(
-            lambda cancel_event: child.run(
-                child_request, cancel_event=cancel_event, **child_scope
-            ),
-            owner_id=run_id,
-            task_id=child_task_id,
-            required=True,
-            accepts_cancel_event=True,
-            kind="subagent",
-            contract={
-                "request": child_request,
-                "agent_config": child_raw,
-                "tools": list(child_tools),
-                "scope": child_scope,
-            },
-            recoverable=True,
-            tenant_id=scope.get("tenant_id", "default"),
-            continue_trace=True,
-            admission=admit,
-            mutating=False,
-        )
+        try:
+            task = self.task_scheduler.start(
+                lambda cancel_event: child.run(
+                    child_request, cancel_event=cancel_event, **child_scope
+                ),
+                owner_id=run_id,
+                task_id=child_task_id,
+                required=True,
+                accepts_cancel_event=True,
+                kind="subagent",
+                contract={
+                    "request": child_request,
+                    "agent_config": child_raw,
+                    "tools": list(child_tools),
+                    "scope": child_scope,
+                },
+                recoverable=True,
+                tenant_id=scope.get("tenant_id", "default"),
+                continue_trace=True,
+                admission=admit,
+                mutating=False,
+            )
+        except Exception:
+            if parent_wait is None:
+                raise
+            # The admission callback can succeed before local worker launch fails.
+            # A separate store read proves commit; rolled-back admissions still fail.
+            committed = self.workflow_store.get_wait(
+                parent_wait.wait_id, tenant_id=wait_context[0].tenant_id,
+                owner_id=wait_context[0].owner_id,
+            )
+            return self._finish_wait_entry(wait_context[0], committed)
+        if parent_wait is not None:
+            return self._finish_wait_entry(wait_context[0], parent_wait)
         if not contract.background:
             task = self.task_scheduler.wait(
                 task.id,
@@ -4150,8 +6142,13 @@ class CoreAgent:
             artifact_service=self.artifact_service,
             memory_registry=self.memory_registry,
             remote_agents=self.remote_agents,
+            remote_registry=self.remote_registry,
             send_message_api_key=self.send_message_api_key,
             workflow_store=self.workflow_store,
+            interaction_store=self.interaction_store,
+            material_review_store=self.material_review_store,
+            guardrail_classifier=self.guardrail_classifier,
+            chat_file_service=self.chat_file_service,
             kernel_compiler=self.kernel_compiler,
             context_window=self.context_window,
             output_reserve=self.output_reserve,
@@ -4162,7 +6159,49 @@ class CoreAgent:
             log_max_chars=self.log_max_chars,
             budget_cancel_grace_seconds=self.budget_cancel_grace_seconds,
         )
+        child.cron_store = getattr(self, "cron_store", None)
         return child
+
+    def _scheduler_workflow_outcome(self, task_id, tenant_id, kind, contract):
+        if kind == "subagent":
+            scope = contract.get("scope", {})
+        elif kind == "background_tool" and contract.get("workflow_version") == 1:
+            scope = contract
+        else:
+            return None
+        if scope.get("task_id") != task_id or scope.get("tenant_id", "default") != tenant_id:
+            return None
+        try:
+            record = self.workflow_store.by_task(
+                task_id, tenant_id=tenant_id, owner_id=scope.get("identity", "anonymous"),
+            )
+        except CoreError as error:
+            if error.code != "TASK_NOT_FOUND":
+                raise
+            return None
+        if record.state not in TERMINAL_STATES:
+            return SuspendedRun(record.run_id, task_id, record.snapshot.get("wait_id", ""), record.version)
+        if record.state == "COMPLETED":
+            result = record.result["output"] if kind == "background_tool" else self._completed_subagent_result(record)
+            return "completed", result, None
+        if record.state == "CANCELLED":
+            return "canceled", None, record.error_code
+        return "failed", None, record.error_code or "INVALID_TASK_STATE"
+
+    @staticmethod
+    def _completed_subagent_result(record):
+        result = record.result
+        return RunResult(
+            record.run_id,
+            result["message"],
+            "completed",
+            Usage(**result["usage"]),
+            result.get("complete", True),
+            result.get("completion_reason", "completed"),
+            result.get("exhausted_dimension"),
+            result.get("shared_budget"),
+            tuple(result.get("pending_tasks", ())),
+        )
 
     def _recover_subagent(self, contract, cancel_event):
         scope = dict(contract["scope"])
@@ -4198,18 +6237,7 @@ class CoreAgent:
                 owner_id=scope.get("identity", "anonymous"),
             )
         if record.state == "COMPLETED":
-            result = record.result
-            return RunResult(
-                record.run_id,
-                result["message"],
-                "completed",
-                Usage(**result["usage"]),
-                result.get("complete", True),
-                result.get("completion_reason", "completed"),
-                result.get("exhausted_dimension"),
-                result.get("shared_budget"),
-                tuple(result.get("pending_tasks", ())),
-            )
+            return self._completed_subagent_result(record)
         if record.state in {"FAILED", "REJECTED", "ABORTED"}:
             raise CoreError(record.error_code or "INVALID_TASK_STATE")
         if record.state == "CANCELLED":
@@ -4399,6 +6427,8 @@ class CoreAgent:
                 continue
             try:
                 record = self.workflow_store.lookup_task(task_id)
+                if record.snapshot.get("background_tool"):
+                    raise CoreError("INVALID_TASK_STATE", "Background tools resume through their scheduler")
                 if record.state == "COMPLETED":
                     result = record.result
                     return RunResult(
@@ -4458,6 +6488,16 @@ class CoreAgent:
             tenant_id=record.tenant_id,
             owner_id=record.owner_id,
         )
+        owner = record.snapshot.get("execution_owner")
+        manager = self.tool_runtime.environment_manager
+        if owner and not owner["cleanup_confirmed"] and owner["instance_id"] == getattr(manager, "instance_id", None):
+            # Durable cancel prevents new dispatch; capture the exact current
+            # generation so an old callback cannot destroy a later lease.
+            try:
+                manager.destroy_execution(record.run_id, owner["worker_id"], owner["generation"])
+                self.workflow_store.confirm_execution(record, owner)
+            except Exception as error:
+                raise CoreError("EXECUTION_CLEANUP_PENDING") from error
         if record.parent_run_id:
             try:
                 self.task_scheduler.cancel(
@@ -4583,8 +6623,19 @@ class CoreAgent:
 
     def recover_durable_tasks(self):
         if hasattr(self.task_scheduler, "recover"):
-            return self.task_scheduler.recover()
+            return self.task_scheduler.recover(ready=self._task_ready_to_resume)
         return 0
+
+    def _task_ready_to_resume(self, task_id, tenant_id):
+        try:
+            record = self.workflow_store.lookup_task(task_id)
+        except CoreError as error:
+            if error.code == "TASK_NOT_FOUND":
+                return True
+            raise
+        if record.tenant_id != tenant_id:
+            return False
+        return record.cancel_requested or bool(record.snapshot.get("terminal_intent")) or not record.snapshot.get("wait_id") or bool(record.snapshot.get("wait_ready"))
 
     def _recovery_settled(self, task_id):
         callback = self._recovery_callback
@@ -4647,12 +6698,38 @@ class CoreAgent:
 
     def _recover_workflows_once(self):
         """A run interrupted mid-dispatch cannot prove the side effect did not happen."""
+        cron = getattr(self, "cron_coordinator", None)
+        if cron is not None:
+            cron.tick()
+        cleanup = getattr(self, "workspace_cleanup", None)
+        if cleanup is not None:
+            try:
+                cleanup.recover(limit=100)
+            except Exception as error:
+                # Keep unresolved chat barriers while other workflow recovery proceeds.
+                self._log("workspace.cleanup.scan_failed", error_code=getattr(error, "code", type(error).__name__))
+        if self.chat_file_service is not None and time.monotonic() >= self._file_sweep_due:
+            while not self._recovery_stop.is_set():
+                result = self.chat_file_service.sweep(startup=self._file_sweep_startup)
+                if not result["has_more"]:
+                    self._file_sweep_startup = False
+                    self._file_sweep_due = time.monotonic() + 3600
+                    break
+        self.workflow_store.expire_waits()
+        self.task_scheduler.expire_remote(limit=100)
+        self.recover_durable_tasks()
+        waits = self.workflow_store.pending_waits(kind="task", after=self._task_wait_cursor)
+        self._task_wait_cursor = (waits[-1].created_at, waits[-1].wait_id) if len(waits) == 100 else None
+        for wait in waits:
+            task = self.task_scheduler.get(wait.subject["task_id"], owner_id=wait.run_id, tenant_id=wait.tenant_id)
+            if task.state in {"completed", "failed", "canceled"}:
+                self.workflow_store.resolve_wait(wait.wait_id, tenant_id=wait.tenant_id, outcome={"reason": "task", "result": self._task_snapshot(task)})
         recovered = []
         for candidate in self.workflow_store.recoverable(
             states=RECOVERABLE_WORKFLOW_STATES,
             root_only=True,
         ):
-            if candidate.state != "EXECUTING":
+            if candidate.state != "EXECUTING" or candidate.snapshot.get("terminal_intent"):
                 if self._launch_recovery(candidate):
                     recovered.append(candidate)
                 continue
@@ -4677,6 +6754,9 @@ class CoreAgent:
                 if record.state == "EXECUTING":
                     self._abort_ambiguous_execution(record, lease_token=lease_token)
                     self._recovery_settled(record.task_id)
+            except CoreError as error:
+                if error.code not in {"EXECUTION_CLEANUP_PENDING", "LEASE_LOST"}:
+                    raise
             finally:
                 try:
                     self.workflow_store.release_lease(

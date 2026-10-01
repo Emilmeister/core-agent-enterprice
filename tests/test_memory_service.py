@@ -6,7 +6,7 @@ import unittest
 from urllib.error import HTTPError
 from unittest.mock import patch
 
-from core_agent.app import create_app
+from tests.app_support import create_app
 from core_agent.audit import InMemoryAuditLog
 from core_agent.config import AgentConfig, PlatformConfig, RunRequest
 from core_agent.durability import CheckpointStore, InMemoryEventStore

@@ -1,7 +1,11 @@
 .git
 .venv
+.cache
+.local-evidence
 .env
 .env.*
 __pycache__
 *.py[cod]
 dist
+node_modules
+core_agent/ui_dist

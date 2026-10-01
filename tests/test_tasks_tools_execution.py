@@ -24,6 +24,7 @@ from core_agent.tools import (
     ToolResult,
     ToolRuntime,
 )
+from core_agent.workflow import SuspendedRun
 
 
 class RecordingBackend:
@@ -68,6 +69,105 @@ class MissingTerminalBackend:
 
 
 class BackgroundTaskTests(unittest.TestCase):
+    def suspended_scheduler(self, *, on_cancel=None):
+        scheduler = TaskScheduler()
+        self.addCleanup(scheduler.close)
+        task = scheduler.start(lambda: SuspendedRun("run", "child", "wait", 1),
+            task_id="child", owner_id="parent", tenant_id="tenant", kind="subagent",
+            contract={"instruction": "resume"}, recoverable=True, on_cancel=on_cancel)
+        with scheduler._lock:
+            workers = tuple(scheduler._threads)
+        for worker in workers:
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+        return scheduler, task
+
+    def test_recovery_readiness_does_not_hold_lock_and_competing_resume_claims_once(self):
+        scheduler, task = self.suspended_scheduler()
+        entered, release = threading.Event(), threading.Event()
+        dispatched, recovered = [], []
+        scheduler.register("subagent", lambda _contract, _cancel: dispatched.append(task.id) or "done")
+
+        def readiness(task_id, tenant_id):
+            self.assertEqual((task_id, tenant_id), (task.id, "tenant"))
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return True
+
+        worker = threading.Thread(target=lambda: recovered.append(scheduler.recover(ready=readiness)), daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            available = scheduler._lock.acquire(timeout=0.2)
+            if available:
+                scheduler._lock.release()
+                self.assertEqual(scheduler.recover(ready=lambda *_: True), 1)
+                self.assertEqual(scheduler.wait(task.id, timeout=1).state, "completed")
+            self.assertTrue(available, "workflow readiness callback held the scheduler lock")
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(recovered, [0])
+        self.assertEqual(dispatched, [task.id])
+        self.assertEqual(len(scheduler.mailbox("parent").poll()), 1)
+
+    def test_recovery_rechecks_cancellation_after_readiness_returns_false(self):
+        cancelled = []
+        scheduler, task = self.suspended_scheduler(on_cancel=lambda: cancelled.append("requested"))
+        entered, release = threading.Event(), threading.Event()
+        dispatched, recovered = [], []
+        scheduler.register("subagent", lambda _contract, cancel: dispatched.append(cancel.is_set()) or "canceled")
+
+        def readiness(*_):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return False
+
+        worker = threading.Thread(target=lambda: recovered.append(scheduler.recover(ready=readiness)), daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            scheduler.cancel(task.id, owner_id="parent", tenant_id="tenant")
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(recovered, [0])
+        self.assertEqual(scheduler.wait(task.id, timeout=1).state, "canceled")
+        self.assertEqual(dispatched, [True])
+        self.assertEqual(cancelled, ["requested"])
+
+    def test_recovery_does_not_apply_old_readiness_to_a_new_suspension(self):
+        scheduler, task = self.suspended_scheduler()
+        entered, release = threading.Event(), threading.Event()
+        dispatched, recovered = [], []
+        scheduler.register("subagent", lambda _contract, _cancel:
+            dispatched.append(task.id) or SuspendedRun("run", task.id, "next-wait", 2))
+
+        def readiness(*_):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return True
+
+        worker = threading.Thread(target=lambda: recovered.append(scheduler.recover(ready=readiness)), daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(scheduler.recover(ready=lambda *_: True), 1)
+            with scheduler._lock:
+                workers = tuple(scheduler._threads)
+            for resumed in workers:
+                resumed.join(2)
+                self.assertFalse(resumed.is_alive())
+            self.assertIn(task.id, scheduler._suspended)
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(recovered, [0])
+        self.assertEqual(dispatched, [task.id])
+
     def test_thread_start_failure_does_not_admit_or_register_task(self):
         scheduler = TaskScheduler()
         admissions = []
@@ -419,6 +519,8 @@ class ToolRuntimeTests(unittest.TestCase):
         self.events = []
         self.backend = RecordingBackend()
         self.environment_manager = ExecutionEnvironmentManager(self.backend)
+        from core_agent.workspace import WorkspaceBinding
+        self.environment_manager.bind_run("run-1", WorkspaceBinding("default", "anonymous", "chat"))
         self.registry = ToolRegistry()
         self.registry.register(
             ToolDefinition(

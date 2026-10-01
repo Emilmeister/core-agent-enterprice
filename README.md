@@ -310,6 +310,12 @@ development/test. Секрет принадлежит confidential client для
 | `/api/identity` | Проверенная identity владельца |
 | `/health/live`, `/health/ready` | Kubernetes probes без токена |
 
+Для браузерного входа задайте `KEYCLOAK_UI_CLIENT_ID` отдельного public client.
+Тогда `GET /ui/config` без токена возвращает только issuer и этот client ID;
+секрет introspection туда не попадает. Пустое значение отключает маршрут.
+Настройка не включает готовый UI: SPA и проверка реального browser login ещё
+находятся в реализации.
+
 Карточка агента находится под соответствующим A2A входом, например
 `/a2a/external/.well-known/agent-card.json`. Старые корневые A2A маршруты при
 настроенной авторизации закрыты. Для вызовов передавайте
@@ -334,7 +340,25 @@ realm roles либо client roles этого audience. Компания берё
 в изолированном realm: `tests/test_keycloak_integration.py`.
 См. [руководство Keycloak](https://www.keycloak.org/docs/latest/server_admin/).
 
-UI и решения HITL реализуются следующими этапами. Последующие примеры корневого
+Owner API предоставляет `/api/settings`, `/api/tool-policies` и запросы решения
+внутри задачи через `/api/interactions?task_id=...`. Новый инструмент требует
+HITL; владелец может разрешить автоматическое выполнение, оставить подтверждение
+или запретить инструмент. Запрет скрывает инструмент от модели. Решения по
+`/api/hitl/{wait_id}/decision` принимают только `allow` или `reject` вместе с
+полученным `subject_digest`; аргументы ожидающего вызова менять нельзя.
+
+Guardrails использует отдельный контекст без tools. По умолчанию подключение
+модели совпадает с агентом; для отдельного детектора задайте все четыре
+`GUARDRAILS_LLM_PROVIDER`, `GUARDRAILS_LLM_MODEL`, `GUARDRAILS_LLM_BASE_URL` и
+`GUARDRAILS_LLM_API_KEY`. Частичный набор останавливает запуск. Лимиты детектора:
+`GUARDRAILS_TIMEOUT_SECONDS=60`, `GUARDRAILS_MAX_INPUT_TOKENS=100000` и
+`GUARDRAILS_MAX_CALLS=32`. Подозрительный материал, ошибка и неполная проверка
+создают ожидание владельца; они не означают автоматическое разрешение.
+Владелец читает материал через `/api/guardrails/{wait_id}/material` и отправляет
+решение через `/api/guardrails/{wait_id}/decision`. Внешний агент к этим API
+доступа не имеет. Настраиваемый срок решения по умолчанию — 24 часа.
+
+UI и файловый quarantine flow ещё реализуются. Последующие примеры корневого
 маршрута относятся к локальному development без Keycloak.
 
 На авторизованных A2A входах в одном чате выполняется одна корневая задача.

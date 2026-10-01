@@ -7,17 +7,29 @@ import threading
 import unittest
 from unittest.mock import AsyncMock, patch
 from functools import wraps
+from types import SimpleNamespace
 
 import httpx
 from a2a.types import Message, Role, SendMessageRequest, Task, TaskState, TaskStatus
 from a2a.utils.errors import InvalidParamsError
 
-from core_agent.app import create_app
+from tests.app_support import create_app
 from core_agent.auth import AuthenticatedCallContext, Principal, ScopeUser
+from core_agent.admission import PostgresRootAdmission
+from core_agent.config import RunRequest
 from core_agent.database import PostgresDatabase
 from core_agent.errors import CoreError
 
 from tests.test_auth import AuthAppTestCase, ISSUER, TEST_DATABASE_URL
+
+
+class BorrowedAdmissionValidationTests(unittest.TestCase):
+    def test_invalid_message_is_rejected_before_borrowed_connection_access(self):
+        admission = PostgresRootAdmission(None, SimpleNamespace(database=None))
+        for message in (Message(message_id=" ", role=Role.ROLE_USER),
+                        Message(message_id="invalid", role=Role.ROLE_AGENT)):
+            with self.subTest(message=message), self.assertRaises(InvalidParamsError):
+                admission._admit_transaction(message, None, None, connection=object())
 
 
 class AuthAdmissionTests(AuthAppTestCase):
@@ -95,13 +107,18 @@ class AuthAdmissionTests(AuthAppTestCase):
         self.assertEqual(len(self.model.calls), 1)
 
     async def test_other_chat_runs_while_first_chat_is_blocked(self):
-        self.block_model()
-        responses = await asyncio.gather(self.send("a", "one", immediate=True), self.send("b", "two", immediate=True))
+        started, _release = self.block_model()
+        first = await self.send("a", "one", immediate=True)
+        self.assertEqual(first.status_code, 200, first.text)
+        # The shared detector's first review has finished once the model blocks.
+        self.assertTrue(await asyncio.to_thread(started.wait, 2))
+        responses = [first, await self.send("b", "two", immediate=True)]
         self.assertTrue(all(response.status_code == 200 for response in responses))
         self.assertTrue(all(response.json()["task"]["status"]["state"] != "TASK_STATE_FAILED" for response in responses))
         async with asyncio.timeout(2):
             while self.model_entries < 2:
                 await asyncio.sleep(0.01)
+        self.assertEqual(len(self.model.calls), 0)
         await self.finish_workers()
         self.assertEqual(len(self.model.calls), 2)
 
@@ -133,6 +150,42 @@ class AuthAdmissionTests(AuthAppTestCase):
         self.assertNotIn(next_task["id"], (first["id"], busy["id"]))
         self.assertEqual(next_task["status"]["state"], "TASK_STATE_COMPLETED")
         self.assertEqual(len(self.model.calls), 2)
+
+    async def test_previous_root_is_pinned_by_admission_and_not_request_metadata(self):
+        workflow = self.app.state.core_agent.workflow_store
+        first = (await self.send("first-history", "history-chat")).json()["task"]
+        first_record = workflow.lookup_task(first["id"])
+        self.assertIn("previous_root_run_id", first_record.snapshot)
+        self.assertIsNone(first_record.snapshot["previous_root_run_id"])
+        other = (await self.send("other-history", "other-chat")).json()["task"]
+        other_record = workflow.lookup_task(other["id"])
+        second = (await self.send("second-history", "history-chat", token="owner-b",
+            metadata={"previous_root_run_id": other_record.run_id})).json()["task"]
+        second_record = workflow.lookup_task(second["id"])
+        self.assertEqual(second_record.snapshot["previous_root_run_id"], first_record.run_id)
+        self.assertEqual(second_record.owner_id, first_record.owner_id)
+        self.assertIsNone(other_record.snapshot["previous_root_run_id"])
+        duplicate = await self.send("first-history", "history-chat")
+        self.assertEqual(duplicate.json()["task"]["id"], first["id"])
+        third = (await self.send("third-history", "history-chat", token="owner-a")).json()["task"]
+        third_record = workflow.lookup_task(third["id"])
+        self.assertEqual(third_record.snapshot["previous_root_run_id"], second_record.run_id)
+        self.assertEqual(workflow.get(second_record.run_id, tenant_id=second_record.tenant_id,
+                                     owner_id=second_record.owner_id).snapshot["previous_root_run_id"],
+                         first_record.run_id)
+
+    async def test_busy_task_does_not_become_previous_root(self):
+        started, _release = self.block_model()
+        first = (await self.send("active-history", "history-chat", immediate=True)).json()["task"]
+        self.assertTrue(await asyncio.to_thread(started.wait, 2))
+        busy = (await self.send("busy-history", "history-chat")).json()["task"]
+        self.assertEqual(busy["status"]["state"], "TASK_STATE_FAILED")
+        await self.finish_workers()
+        next_task = (await self.send("next-history", "history-chat")).json()["task"]
+        workflow = self.app.state.core_agent.workflow_store
+        first_record = workflow.lookup_task(first["id"])
+        next_record = workflow.lookup_task(next_task["id"])
+        self.assertEqual(next_record.snapshot.get("previous_root_run_id"), first_record.run_id)
 
     async def test_invalid_role_id_and_binary_parts_have_no_admission_effect(self):
         for fields in ({"role": "ROLE_AGENT"}, {"messageId": " "}, {"parts": [{"raw": "aGVsbG8="}]}, {"parts": [{"url": "https://example.test/a"}]}):
@@ -402,9 +455,139 @@ class AuthAdmissionTests(AuthAppTestCase):
         self.assertEqual(len(self.model.calls), 1)
 
 
+class MemoryAtomicAdmissionTests(AuthAppTestCase):
+    context = AuthAdmissionTests.context
+    sdk_message = staticmethod(AuthAdmissionTests.sdk_message)
+
+    @property
+    def admission(self):
+        return self.app.state.core_agent.tool_runtime.environment_manager.validate_workspace_scope.__self__
+
+    async def test_callback_admissions_and_empty_chat_roll_back_as_one_unit(self):
+        agent, admission = self.app.state.core_agent, self.admission
+        task_store = admission.task_store
+        def failed(admit):
+            binding = admission.ensure_chat(self.context("owner-a"))
+            self.assertIsNone(admission.chats[(binding.tenant_id, binding.context_id)]["latest_root_run_id"])
+            for index in range(2):
+                result = admit(self.sdk_message(str(index), "transaction-" + str(index)), RunRequest(prompt="transaction"), self.context())
+                self.assertIsNotNone(result.run_id)
+                self.assertIn(result.run_id, agent.workflow_store._records)
+            raise CoreError("TEST_CALLBACK_FAILED")
+        with self.assertRaisesRegex(CoreError, "TEST_CALLBACK_FAILED"):
+            await admission.transaction(self.context(), failed)
+        for values in (admission.chats, admission.messages, task_store._owners, task_store._impl.tasks,
+                       agent.workflow_store._records, agent.workflow_store._leases, agent.workflow_store._budgets,
+                       agent._run_scopes, agent.event_store._events, agent.checkpoint_store._values, agent.audit_log._records):
+            self.assertFalse(values)
+        self.assertFalse(self.model.calls)
+        await self.submit("external-a", "after", "after")
+
+    async def test_all_async_locks_acquired_before_workflow_guard_and_callback_is_sync(self):
+        admission, entered = self.admission, threading.Event()
+        workflow = self.app.state.core_agent.workflow_store
+        def callback(admit):
+            self.assertTrue(admission.lock.locked())
+            self.assertTrue(admission.task_store._access_lock.locked())
+            self.assertTrue(admission.task_store._impl.lock.locked())
+            self.assertTrue(workflow._lock._is_owned())
+            entered.set()
+            return admit(self.sdk_message("locked", "locked"), RunRequest(prompt="locked"), self.context())
+        await admission.task_store._impl.lock.acquire()
+        task = asyncio.create_task(admission.transaction(self.context(), callback))
+        try:
+            await asyncio.sleep(0)
+            self.assertFalse(entered.is_set())
+            self.assertFalse(workflow._records)
+            def thread_can_lock():
+                acquired = workflow._lock.acquire(timeout=1)
+                if acquired:
+                    workflow._lock.release()
+                return acquired
+            self.assertTrue(await asyncio.to_thread(thread_can_lock))
+        finally:
+            admission.task_store._impl.lock.release()
+        self.assertIsNotNone((await task).run_id)
+
+    async def test_transaction_duplicate_busy_and_original_owner_use_common_core(self):
+        admission = self.admission
+        first = await admission.transaction(self.context(), lambda admit:
+            admit(self.sdk_message("first", "shared"), RunRequest(prompt="first"), self.context()))
+        def callback(admit):
+            duplicate = admit(self.sdk_message("first", "shared"), RunRequest(prompt="first"), self.context())
+            busy = admit(self.sdk_message("busy", "shared"), RunRequest(prompt="busy"), self.context("owner-a"))
+            return duplicate, busy
+        duplicate, busy = await admission.transaction(self.context("owner-a"), callback)
+        self.assertEqual(duplicate.task.id, first.task.id)
+        self.assertEqual(busy.task.status.state, TaskState.TASK_STATE_FAILED)
+        self.assertEqual(dict(busy.task.metadata)["error"]["activeTaskId"], first.task.id)
+        self.assertEqual(admission.chats[(self.context().tenant, "shared")]["owner_id"], self.context().user.user_name)
+
+
 @unittest.skipUnless(TEST_DATABASE_URL, "TEST_DATABASE_URL is required")
 class PostgresAuthAdmissionTests(AuthAdmissionTests):
     use_postgres = True
+
+    async def test_borrowed_connection_keeps_root_dedup_busy_and_history_in_outer_transaction(self):
+        previous_task = (await self.send("previous", "borrowed-chat")).json()["task"]
+        agent = self.app.state.core_agent
+        previous = agent.workflow_store.lookup_task(previous_task["id"])
+        admission = agent.workspace_cleanup.admission
+        database = self.app.state.database
+        context = self.context("owner-a")
+        request = RunRequest.from_dict({"prompt": "Answer briefly"})
+        message = self.sdk_message("borrowed", "borrowed-chat")
+        with database.transaction() as connection:
+            accepted = admission._admit_transaction(message, request, context, connection=connection)
+            repeated = admission._admit_transaction(message, request, context, connection=connection)
+            busy = admission._admit_transaction(self.sdk_message("borrowed-busy", "borrowed-chat"),
+                request, context, connection=connection)
+            self.assertEqual(repeated.task.id, accepted.task.id)
+            self.assertIsNone(repeated.run_id)
+            self.assertEqual(busy.task.status.state, TaskState.TASK_STATE_FAILED)
+            self.assertIsNone(busy.run_id)
+            self.assertEqual(dict(busy.task.metadata)["error"]["activeTaskId"], accepted.task.id)
+            row = connection.execute("SELECT * FROM core_runs WHERE run_id=%s", (accepted.run_id,)).fetchone()
+            self.assertEqual(row["owner_id"], previous.owner_id)
+            self.assertEqual(row["snapshot"]["previous_root_run_id"], previous.run_id)
+            self.assertEqual(row["lease_token"], accepted.lease_token)
+            self.assertEqual(len(accepted.task.history), 1)
+            self.assertEqual(accepted.task.history[0].task_id, accepted.task.id)
+            self.assertEqual(connection.execute("SELECT used_model_turns FROM core_budget_ledgers WHERE root_run_id=%s",
+                (accepted.run_id,)).fetchone()["used_model_turns"], 1)
+            with database.pool.connection() as observer:
+                self.assertIsNone(observer.execute("SELECT 1 FROM core_runs WHERE run_id=%s", (accepted.run_id,)).fetchone())
+                self.assertIsNone(observer.execute("SELECT 1 FROM core_a2a_tasks WHERE task_id=%s", (busy.task.id,)).fetchone())
+        repeated = await admission.admit(message, request, self.context("owner-a"))
+        self.assertEqual(repeated.task.id, accepted.task.id)
+        self.assertEqual(len(self.model.calls), 1)
+        record = agent.workflow_store.lookup_task(accepted.task.id)
+        agent.workflow_store.transition(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id,
+            expected_version=record.version, state="FAILED", snapshot=record.snapshot,
+            event_kind="test.finished", error_code="TEST_FINISHED", lease_token=accepted.lease_token)
+
+    async def test_outer_rollback_removes_borrowed_admission_and_caller_writes(self):
+        agent = self.app.state.core_agent
+        admission = agent.workspace_cleanup.admission
+        database = self.app.state.database
+        context = self.context()
+        with self.assertRaisesRegex(CoreError, "TEST_OUTER_ROLLBACK"):
+            with database.transaction() as connection:
+                accepted = admission._admit_transaction(self.sdk_message("rollback-borrowed", "rollback-chat"),
+                    RunRequest.from_dict({"prompt": "Answer briefly"}), context, connection=connection)
+                # A caller write after admission belongs to this same commit boundary.
+                connection.execute("UPDATE core_chats SET workspace_revision=workspace_revision+1 WHERE tenant_id=%s AND context_id=%s",
+                    (context.tenant, accepted.task.context_id))
+                self.assertIsNotNone(connection.execute("SELECT 1 FROM core_root_messages WHERE task_id=%s", (accepted.task.id,)).fetchone())
+                raise CoreError("TEST_OUTER_ROLLBACK")
+        with database.pool.connection() as connection:
+            for table, field in (("core_chats", "tenant_id"), ("core_root_messages", "tenant_id"),
+                    ("core_a2a_tasks", "tenant"), ("core_runs", "tenant_id"), ("core_budget_ledgers", "tenant_id"),
+                    ("core_events", "tenant_id"), ("core_checkpoints", "tenant_id"), ("core_audit_records", "tenant_id"), ("core_outbox", "tenant_id")):
+                self.assertEqual(connection.execute(f"SELECT count(*) AS n FROM {table} WHERE {field}=%s",
+                    (context.tenant,)).fetchone()["n"], 0, table)
+        self.assertEqual(agent._run_scopes, {})
+        self.assertEqual(len(self.model.calls), 0)
 
     async def test_enterprise_history_and_creation_ledger_are_not_retention_targets(self):
         agent = self.app.state.core_agent

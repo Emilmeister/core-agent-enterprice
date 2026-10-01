@@ -32,16 +32,30 @@
 
 После joined `core_delegate` parent MUST использовать возвращённый child result и MUST NOT повторять ту же делегацию или выполнять делегированную работу самостоятельно. После `background: true` parent MAY продолжить только независимую работу; если result нужен для ответа, parent вызывает `core_task_wait` с возвращённым task ID либо получает terminal notification на следующей safe boundary.
 
+Joined delegation сохраняет child ID вместе с admission и continuation; ожидание
+освобождает parent worker. При suspension child его scheduler Task остаётся working,
+execution claim освобождается, а recovery запускает этот же child только после
+разрешения wait. Suspension не публикует terminal notification или final Artifact.
+Повторный recovery не создаёт второго child и не начисляет исходный tool call вновь.
+
+Для локальной scheduler Task optional `core_task_wait.timeout` ограничивает одну
+попытку ожидания и при истечении возвращает актуальный Task snapshot без отмены.
+Это не deadline remote operation: внешний handle имеет окончательный срок по LONG-02,
+который повторный wait не продлевает. Timeout хранится абсолютным после admission.
+
 Scheduler handle, `taskId` child workflow, ID в `core_delegate`/`core_task_*`,
 mailbox notifications, logs и traces MUST быть одним и тем же стабильным ID.
 Runtime не создаёт второй внутренний child ID, который caller не может связать
 с возвращённым handle.
 
-Child, исчерпавший execution budget, завершает свой run как `COMPLETED` с
+Child с собственным model loop, исчерпавший execution budget, завершает свой run как `COMPLETED` с
 `completion_reason: "budget_exhausted"` и `complete: false`, а не как `FAILED`.
 Joined `core_delegate`, `core_task_get`, `core_task_wait` и terminal notification
 MUST вернуть один и тот же persisted result, usage и exhausted dimension.
-Parent воспринимает его как недоверенный неполный input: передаёт пользователю
+Фоновый target tool без model loop не резервирует финальный model turn. Если
+начисление его вызова отклонено общим budget, target не исполняется, local usage
+не увеличивается, а Task возвращает pre-dispatch `FAILED/BUDGET_EXCEEDED`.
+Parent воспринимает model-child result как недоверенный неполный input: передаёт пользователю
 проверенный промежуточный результат и перечисляет незавершённую часть, не
 повторяет уже выполненную работу и не выдумывает отсутствующий outcome. Parent
 MAY продолжить только ещё не выполненный scope и только в пределах оставшегося
@@ -225,6 +239,13 @@ Runtime использует A2A 1.0 `SendMessage`/`SendStreamingMessage`, об�
 
 Вызов отправляет одну сфокусированную задачу и возвращает локальный durable handle. При создании remote Task root task/context IDs не подставляются как remote IDs; полученные remote IDs сохраняются с handle. Вложения проходят общий лимит/transport rules. Сбой до dispatch возвращается structured tool result; неизвестный outcome возможной remote мутации требует reconciliation, а не повторного `SendMessage`. Обрыв SSE требует проверки существующего remote task через GetTask, не повторной отправки задания.
 
+Text schema `core_agent_send_message` содержит ровно обязательные непустые
+`agent_name` и `task`; результат —обычный локальный task snapshot с `task_id`.
+Accepted operation закрепляет peer revision до owner approval/dispatch, чтобы
+registry update не подменил согласуемого адресата. Имена/credentials/remote IDs
+выводятся из trusted binding; prompt не задаёт URL или header. Immediate terminal
+Message завершает локальный handle без GetTask, если remote task ID не выдан.
+
 Прогресс разрешённой операции показывается в текущем чате и соответствующей публичной проекции; окончательный result доставляется через существующий task lifecycle. Remote `input-required`/`auth-required` не считаются финальным ответом: чужое HITL разрешает владелец удалённого агента. Детали LONG-01–04 ниже.
 
 ## TerminalSession сабагента
@@ -284,6 +305,18 @@ Polling через GetTask выполняется по умолчанию каж
 операций. Имена закреплены; схемы аргументов и результатов определяются
 при технической проработке API-контракта.
 
+Исходящий adapter поддерживает объявленный Card binding JSONRPC либо HTTP+JSON
+версии1.0. Send использует `returnImmediately: true`; Get/Cancel обращаются к
+remote task ID, закодированному одним URL segment. Root task/context IDs и
+входящий credential не передаются. Credential разрешается только из закреплённой
+registry revision. URL интерфейса Card совпадает с зарегистрированными scheme,
+authority и полным path, включая semicolon parameters; различие только завершающего
+slash допустимо. Card не может переназначить authenticated request на другой target.
+Discovery ограниченно повторяет temporary408/429/500/502/503/504; Send/Cancel
+не повторяются adapter-ом. Parser сохраняет Task state, remote IDs и все Parts,
+включая raw/URL files; malformed responses/IDs дают безопасную protocol error
+без публикации содержимого ответа или parser diagnostics.
+
 ### LONG-02. Окончательный timeout операции
 
 - Для ожидания задаётся предельный срок; его истечение окончательно закрывает
@@ -311,6 +344,56 @@ Polling через GetTask выполняется по умолчанию каж
 Пример результата: «Мы уже ожидали эту задачу, срок истёк. Повторное ожидание
 недоступно; можно создать новую задачу. Исход предыдущей неизвестен».
 Default — 24 часа с настройкой; это отдельный параметр от HITL.
+
+Абсолютный remote deadline фиксируется до первого разрешённого dispatch Send;
+ожидание локального HITL до этого не расходует remote timeout. Его настройки
+и poll interval закрепляются для операции, последующие settings updates их
+не меняют. Для remote handle `core_task_wait.timeout` отклоняется structured
+`TOOL_ARGUMENT_INVALID` с пояснением использовать сохранённый deadline; optional
+bounded timeout локальных task waits сохраняет прежнюю семантику.
+
+Explicit cancel и owned-task cancellation фиксируют intent до внешнего вызова.
+Если remote ID известен и операция не закрыта deadline, допустим один CancelTask;
+неизвестный mutating outcome требует reconciliation, а не повторения. После
+committed remote timeout даже последующий cancel не открывает network заново.
+
+Remote operation использует существующий background task kind `remote_a2a` и
+public snapshot `{task_id, state, result, error, revision}`. Timeout сохраняет
+terminal `state: failed`, error code `REMOTE_OPERATION_TIMEOUT` и result ровно:
+`{agent_name, reason: "timeout", message, remote_outcome: "unknown",
+can_create_new_task: true}`. Message сообщает, что срок уже истёк, повторное
+ожидание недоступно и можно создать отдельную новую задачу; он не утверждает
+неизвестный remote outcome. Повторный wait/get/cancel возвращает тот же сохранённый
+outcome без отправки запросов. Local task snapshots сохраняют прежнюю семантику.
+
+Immutable contract version1 содержит ровно `version`, `tenant_id`, `owner_id`
+(parent run ID), `peer_id`, `peer_revision`, `peer_name`, `url`, `binding`,
+`message_id`, `task`, `timeout_seconds`, `poll_interval_seconds`; internal trace
+parent MAY добавляться существующим scheduler. Mutable checkpoint version1
+содержит ровно `version`, `send_started`, `deadline`, `remote_task_id`,
+`remote_context_id`, `next_poll_at`, `cancel_started`. Начальный checkpoint имеет
+оба marker=false и остальные nullable fields=null. Первый committed send marker
+назначает deadline от server/DB clock плюс timeout contract; caller не задаёт
+новый срок. Сохранённый deadline не меняется. Известные remote IDs не заменяются.
+Секретный header отсутствует в contract/checkpoint/result.
+
+Checkpoint updates используют existing task revision для compare-and-set и
+текущую compute claim. Они увеличивают revision; terminal notification создаётся
+только один раз вместе с terminal state/result/error и outbox. Между network
+steps claim освобождается, Task остаётся working. Due/expiry проверяются повторно
+под тем же scope/row lock; deadline выигрывает у позднего результата даже при
+ещё действительной claim. Terminal result никогда не восстанавливает polling.
+Generic cancel не подменяет неизвестный mutating outcome обычным canceled.
+Shutdown/lease loss сохраняют recoverable operation, не изображают caller cancel.
+
+После non-terminal ответа Task working snapshot сохраняет только безопасный
+progress result `{agent_name, remote_state}`. `remote_state` принадлежит ровно
+`TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, `TASK_STATE_INPUT_REQUIRED` или
+`TASK_STATE_AUTH_REQUIRED`. Это metadata, а не peer text или окончательный ответ.
+Progress и checkpoint коммитятся одной fenced/CAS transaction; progress не
+создаёт terminal notification, не разрешает wait и не расходует model/tool budget.
+Terminal timeout/outcome заменяет working progress и выигрывает у позднего update.
+Foreign human-wait остаётся working: согласование выполняет remote owner.
 
 ### LONG-03. Ожидание времени
 
@@ -401,6 +484,12 @@ restart не превращает её в пропущенный cron tick. Ес
 pod или браузера владельца не меняют моменты запусков. UI явно показывает
 выбранный пояс и время ближайшего запуска в нём.
 
+При переводе часов несуществующий local wall time пропускается. Повторяющийся
+wall time выполняется один раз, в его более раннем occurrence. Следующий
+момент всегда строго позже переданного UTC instant; второй occurrence того же
+wall time не компенсирует уже прошедший первый. Календарный расчёт не зависит от
+локального timezone процесса и возвращает timezone-aware UTC instant.
+
 ### CRON-06. Ручной запуск
 
 В UI владельцу доступна кнопка «Запустить сейчас». Она создаёт новую задачу
@@ -429,3 +518,85 @@ cron tick, автоматический запуск пропускается п
 получает целиком одну версию параметров, без смешивания старых и новых полей.
 Правила изменения политики инструментов из TOOL-01 и HITL-03/04 сохраняются:
 снимок расписания не закрепляет устаревшие разрешения.
+
+### CRON-08. Диалект выражений version1
+
+Выражение содержит ровно пять полей: minute, hour, day of month, month,
+day of week. Поддерживаются обычные числовые значения, `*`, списки через запятую,
+неубывающие диапазоны и положительные целочисленные шаги. Для month/weekday
+допустимы стандартные трёхбуквенные английские имена без учёта регистра;
+Sunday обозначается 0 либо 7; имя `sun` нормализуется к 0, поэтому
+`mon-sun` является обратным диапазоном (для понедельника–воскресенья используется
+`mon-7`). Ограниченным считается поле, отличное от отдельного `*`, включая
+явные полные диапазоны, шаги и списки. Day-of-month и day-of-week при одновременном
+ограничении связаны OR; невозможный day-of-month сам по себе не отменяет
+допустимые совпадения day-of-week.
+
+Seconds/year fields, macros `@...`, `H/R/L/W/#/?`, обратные диапазоны,
+некорректные поля и выражения без возможного следующего момента отклоняются
+как `CRON_INVALID`, без файловых/DB effects и без текста исключения парсера.
+Expression ограничен 256 UTF-8 байтами. Поиск следующего календарного совпадения
+ограничен восемью годами; все public create/update paths проверяют следующий
+момент до сохранения. Пробельное разделение нормализуется к одному пробелу.
+Синтаксис и итерация используют закреплённый mature cron parser; собственный
+minute-by-minute parser или цикл по всем пропущенным годам не вводятся.
+
+
+### CRON-09. Admission, идемпотентность и доступ
+
+Owner create может привязать расписание к существующему canonical чату компании
+либо создать новый пустой owner chat без Task, вызова модели или workspace
+mutation. Несколько расписаний могут использовать один чат; занятость определяет
+последний canonical root этого чата, а не только предыдущая задача расписания.
+Пустой чат имеет `latest_task_id: null`, пустую историю и тот же `context_id`
+после первого запуска. Удаление расписания сохраняет такой чат.
+
+Автоматический запуск использует сохранённую company/chat/owner binding через
+внутренний server-owned origin, без loopback HTTP, JWT или owner authority.
+Внешний агент и модель не могут сформировать такой origin или стать approver.
+Ручной запуск сохраняет authenticated actor владельца отдельно от execution
+owner чата. Любой root получает immutable `cron_origin` version1: schedule ID,
+revision, source `automatic|manual`, due instant для automatic и согласованный
+prompt/expression/timezone. Это provenance, а не источник новых разрешений.
+
+Admission root, его creation receipt, event запуска и продвижение `next_due_at`
+автоматического расписания сохраняются атомарно. Ручной запуск не продвигает
+`next_due_at`. Автоматический busy tick фиксирует только пропуск. Pending cleanup
+блокирует автоматический запуск с пропуском `workspace_cleanup_pending`; ручной
+запрос получает обычную pre-admission retryable ошибку без receipt.
+
+Create и run-now требуют client `request_id`: 1–256 UTF-8 bytes без NUL и
+некорректного Unicode. Company-scoped receipt связывает ID с нормализованным
+телом запроса; тот же запрос возвращает прежний результат, иное тело — conflict.
+Retry ранее принятого run-now возвращает ту же Task даже после изменения,
+отключения или удаления расписания. Новый run-now выключенного расписания
+отклоняется до admission. Edit/delete/run-now используют `expected_revision`,
+целое >=1 без boolean; stale revision даёт conflict. Tool create закрепляет
+receipt за исходным run/call и fenced lease: late completion после потери lease
+или cancel не создаёт расписание. Запрет tool не ограничивает owner CRUD.
+
+### CRON-10. Coordinator и записи пропусков
+
+Для здорового coordinator допускается lateness до 60 секунд включительно по
+DB clock. Более поздний непринятый tick пропускается с reason `late`. При startup,
+смене leader или перерыве более 60 секунд между завершёнными passes фиксируется
+recovery cutoff; все ещё не принятые due instants <=cutoff пропускаются независимо
+от grace с reason `service_unavailable`, следующий due строго позже cutoff.
+Уже принятые roots восстанавливаются обычным workflow coordinator.
+
+Для компании работает один coordinator, включая rolling update. PostgreSQL
+session advisory leader lock и automatic occurrence transaction используют одну
+connection; потеря session не позволяет другой connection коммитить под прежним
+leadership. Unknown commit outcome разрешается durable receipt/event dedup,
+без optimistic продвижения или blind retry. Один pass обрабатывает не более
+100 candidates, с продолжением обычного recovery между passes. Ошибка отдельной
+записи не должна навсегда блокировать обработку остальных расписаний.
+
+Пропуск сохраняется append-only событием с reason `context_busy|late|
+service_unavailable|workspace_cleanup_pending`, schedule revision, timezone и
+моментом либо интервалом `{first_due_at, through}`. Интервал не обещает exact
+count пропущенных ticks и не требует перебора всех минут downtime. UI показывает
+событие в исходном чате, включая до первой Task. Оно имеет immutable history
+anchor и stable cursor, не меняет terminal transcript, не становится user turn
+для модели и не открывается внешнему агенту. Ordinary history entry IDs и
+ранее выданные cursors остаются совместимыми.

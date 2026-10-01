@@ -299,3 +299,268 @@ HITL и не продлевает deadline. Это правило согласо
 прерывает ожидание и сразу возобновляет агента для обработки сообщения.
 Порядок при пакете нескольких tool calls должен сохранять корректные пары
 вызов/результат для model API; adapter MUST сохранить эту гарантию.
+
+
+## Owner API: настройки и решения
+
+`GET /ui/config` — отдельный публичный bootstrap для браузерного входа, доступный
+только при настроенном `KEYCLOAK_UI_CLIENT_ID`. Ответ содержит ровно `{issuer,
+client_id}` из deployment configuration. Confidential introspection client и его
+secret, audience, company, токены и пользовательские сведения не выдаются.
+Query parameters не допускаются (`400 REQUEST_INVALID`); client/issuer нельзя
+переопределить запросом. При выключенном bootstrap маршрут даёт 404.
+Ответы имеют `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer` и CSP `default-src 'none'`. Public bootstrap не
+ослабляет авторизацию `/api/`, `/a2a/` и любых file/material routes и не делает
+произвольный `/ui/` path публичным.
+
+При настроенном browser client и наличии собранного UI сервис публично отдаёт
+только `GET/HEAD /ui/`, `/ui/index.html` и перечисленные build assets в
+`/ui/assets/`; `/ui` перенаправляет на `/ui/`. Unknown asset/path даёт404,
+произвольные файлы приложения и symlinks не выдаются. Отсутствующий build или
+выключенный browser client не включает эти routes. SPA shell не перехватывает
+`/api/`, `/a2a/` и их ошибки авторизации/404. OAuth callback параметры shell
+не выбирают issuer/client/scope и не влияют на отдаваемый build.
+Shell имеет no-store, assets — immutable cache только при build filename;
+все ответы имеют nosniff и no-referrer. CSP запрещает чужие scripts/styles,
+embedding, object и base overrides; connect-src включает только self и origin
+настроенного Keycloak issuer. Browser bundle не содержит secrets или
+build-time credentials. Public assets не снимают server auth с private API.
+
+Каждый маршрут ниже требует verified owner Principal той же company. Внешний
+caller получает 403 до поиска идентификатора; owner другой company — 404.
+Владелец принимает решение по external-owned Task без изменения её owner_id.
+Tenant, owner, actor и права не принимаются из JSON. Неизвестные поля JSON
+отклоняются; ответы содержат `Cache-Control: no-store`.
+
+| Method/path | Контракт |
+| --- | --- |
+| `GET /api/chats` | Общий список canonical чатов company: `context_id`, `latest_task_id` и `active` из последнего root workflow. Только владельцы; без prompt, caller credentials и private material. Limit 1–100 (default 50), стабильный порядок по context_id, непрозрачный cursor, привязанный к company; ответ `{chats, next_cursor}`. Чтение не создаёт чат и не запускает/возобновляет задачу |
+| `GET /api/chats/{context_id}/history` | Owner-only полная история canonical чата, включая предыдущие root Tasks и принятые уточнения во время ожидания. Limit 1–100 (default 50), newest-first, versioned cursor, привязанный к company/chat и сохранённой позиции; ответ `{items, next_cursor}`. Missing/foreign chat —404; неверные query/cursor —400; чтение не запускает runtime |
+| `GET /api/chats/{context_id}/files` | Owner-only preview обычных файлов постоянного workspace. Optional `directory` — относительный каталог (default корень), `older_than_days` — неотрицательное конечное десятичное число до 100000, `limit` 1–100 (default 50), `cursor`; неизвестные/повторные query запрещены. Ответ `{files, next_cursor, listed_at, active, cleanup_block_reason, workspace_revision}`; элемент содержит ровно `name`, `path`, `size`, `mtime_ns`, `identity_token`. Порядок lexicographic по относительному пути, cursor связан с company/chat/каталогом/фильтром, revision и server timestamp; чтение не создаёт папку и не запускает runtime |
+| `GET /api/chats/{context_id}/files/content?path=...` | Owner-only скачивание существующего обычного файла выбранного workspace; ровно один непустой относительный POSIX path. Свежая проверка company/chat и безопасное открытие по directory fds; symlinks, hardlinks и special files не выдаются. Attachment, `application/octet-stream`, no-store, nosniff и sandbox CSP. Missing/foreign file —404, malformed path/query —400; descriptor закрывается и при disconnect |
+| `POST /api/chats/{context_id}/files/delete` | Owner-only удаление явно выбранного набора: ровно `{request_id, files:[{path, identity_token}]}`. Не более 1000 уникальных относительных paths; request_id — непустая UTF-8 строка до 256 байт без NUL. Тот же company/chat/request_id и неизменное упорядоченное тело возвращают прежнюю операцию; другое тело —409 `CLEANUP_REQUEST_CONFLICT`. Empty selection не меняет файлы. Active Task —409 `CONTEXT_BUSY`, без создания/очереди операции. Completed receipt —200, pending/reconciliation —202 |
+| `GET /api/chats/{context_id}/files/delete` | Owner-only read-only receipt: optional единственный `request_id`, без него —последняя сохранённая операция чата. Все владельцы company могут прочитать receipt и явно повторить прежнее подтверждённое тело. Missing/foreign receipt —404 `FILE_CLEANUP_NOT_FOUND`. GET не запускает очистку и не возобновляет операцию |
+| `GET /api/interactions?task_id=...&status=pending` | Запросы указанной Task и её root family в том же чате; status `pending` или `all`, limit 1–100 (default 50), непрозрачный cursor, привязанный к task_id и status; immutable subject, digest, generation, deadline и сохранённый outcome доступны владельцам. Timer и local-task waits в этот список не входят |
+| `POST /api/hitl/{wait_id}/decision` | Ровно `decision: allow|reject` и `subject_digest`; аргументы вызова изменить нельзя |
+| `POST /api/questions/{wait_id}/answer` | Ровно непустой `answer` до 64 KiB UTF-8 и `subject_digest` |
+| `POST /api/guardrails/{wait_id}/decision` | Ровно `decision: allow|reject` и `subject_digest`; kind ожидания обязан быть guardrail |
+| `GET /api/guardrails/{wait_id}/material` | Owner-only чтение сохранённого материала указанного guardrail wait: public interaction metadata и private payload либо sealed file reference. Tenant берётся из principal, run/owner — из сохранённого ожидания; query/body не меняют scope. Чужой или неподходящий wait имеет not-found semantics; ответ `Cache-Control: no-store` |
+| `GET /api/guardrails/{wait_id}/file` | Owner-only скачивание конкретного файла по сохранённому sealed reference проверки; batch/index/run/owner не принимаются от клиента. Scope и bytes/digest проверяются также после завершения Task. Ответ: attachment, `application/octet-stream`, no-store, nosniff и sandbox CSP; неподходящий/чужой review — 404, повреждённые bytes не выдаются |
+| `GET /api/tool-policies` | Известный catalog внутри deployment ceiling с origin, mode, guardrails_exempt и revision |
+| `PUT /api/tool-policies/{canonical_name}` | Ровно `mode: allow|require_hitl|deny`, boolean `guardrails_exempt`, integer `expected_revision`, string `expected_origin` из прочитанного catalog |
+
+Workspace preview использует original immutable chat owner из canonical mapping,
+а не actor ID просматривающего владельца. `listed_at` — Unix seconds server clock;
+cursor сохраняет исходное время списка с точностью nanoseconds. Возраст файла
+сравнивается строго с N суток по 86400 секунд, поэтому точная граница исключена.
+`active` выводится из актуального canonical root, включая все durable waits;
+`cleanup_block_reason` равен `CONTEXT_BUSY`, `WORKSPACE_CLEANUP_PENDING` либо null.
+`workspace_revision` — неотрицательная durable revision чата. Preview доступен при active
+Task и не удаляет файлы. Известный чат без созданной папки даёт пустой список;
+неизвестный/чужой чат или отсутствующий явно выбранный каталог имеет 404.
+
+Preview cursor version 2 подписан process-local key и связан с company/chat owner,
+directory, фильтром, revision, временем и последним путём. Подмена, устаревшая
+revision, прежний cursor v1 либо restart дают 400;
+владелец обновляет preview. Cursor не является bearer authority; каждый запрос
+повторно проверяет роль и scope. Пагинация не обещает snapshot изменяющейся файловой
+системы. Identity token version 2 учитывает scope/path, durable workspace revision
+и device/inode/ctime/mtime/size. Старый token v1 либо изменившийся token считается
+stale selection и пропускается; сервер не заменяет его свежим token автоматически.
+
+Traversal использует nofollow directory fds; обычные файлы с единственной ссылкой
+перечисляются, symlinks/hardlinks/devices/FIFO и control manifests опубликованных
+attachments не выдаются. Private staging/quarantine находятся вне workspace.
+Один preview ограничен 10000 просмотренных entries и глубиной 64; превышение
+возвращает `WORKSPACE_SCAN_LIMIT`/409 вместо неполного успешного списка. Владелец
+может выбрать более узкий directory. Ошибка доступа/гонка безопасного открытия
+возвращает `WORKSPACE_UNAVAILABLE`/409, не открывая соседний путь. File download
+держит проверенный descriptor до окончания ответа, читает bounded chunks не
+дальше размера на момент открытия и не обещает immutable snapshot live-файла.
+
+Cleanup receipt содержит ровно `request_id`, `operation_id`, `state`,
+`workspace_revision`, `files`, `results`, `totals`. `files` — исходные подтверждённые
+`{path,identity_token}` без filesystem/private proofs. `state` —
+`pending|completed|reconciliation`; для каждого submitted path `results` содержит
+`path`, `status: pending|deleted|skipped|error`, optional `reason`/`size`.
+Reasons — `missing|identity_changed|unsafe_file|protected_file|filesystem_error|
+reconciliation_required`. `totals` содержит `deleted`, `skipped`, `errors`,
+`deleted_bytes`; pending не считается удалённым или ошибкой. UI показывает
+частичные результаты, а не общий успех. Повтор uncertain network сохраняет
+request_id и точное тело; автоматического POST retry либо новой selection нет.
+
+Очистка и admission используют один canonical chat lock. Immutable intent с
+original owner, selection, stat/parent proofs, content digest и base revision
+коммитится до filesystem mutation; затем исполняется или восстанавливается под
+тем же lock. Пока принятый intent не завершён, новый root получает retryable
+`WORKSPACE_CLEANUP_PENDING` до admission, без Task/модели/файловых effects;
+существующий duplicate Task receipt остаётся прежним. Это не очередь попыток
+очистки при busy Task. Неверный persisted protocol даёт
+`WORKSPACE_CLEANUP_INVALID`/409 и сохраняет barrier, неизвестная версия не исполняется.
+HTTP+JSON send/stream возвращает 503 `UNAVAILABLE` до открытия stream;
+JSON-RPC возвращает server error -32000 с исходным request ID. Typed
+`google.rpc.ErrorInfo` содержит reason `WORKSPACE_CLEANUP_PENDING` и только safe
+metadata `{code:"WORKSPACE_CLEANUP_PENDING", retryable:"true"}`.
+
+Файл перед unlink атомарно захватывается без замены в private staging вне
+workspace; исходный descriptor/stat/digest и parent-chain proofs проверяются.
+Content digest снимается при intent с pre/post stat, затем проверяется после
+capture, поскольку rename меняет ctime и один stat недостаточен для обнаружения
+изменённых bytes с прежними size/mtime. Journal и оба каталога fsync-ятся до
+терминального receipt; private deletion proof позволяет восстановить исход
+после unlink и DB rollback. Отсутствие исходного пути само по себе не доказывает
+удаление. Подменённый captured object восстанавливается без перезаписи; конфликт
+сохраняет bytes и reconciliation/barrier. Recovery не делает blind unlink по
+исходному имени. Допускается только продолжение прежнего подтверждённого intent;
+все владельцы могут явно проверить/повторить его. Revision увеличивается один
+раз при завершении операции с verified deletion; stale preview требует обновления.
+
+History item содержит ровно `id`, `task_id`, `kind`, `text`, `status` и при
+необходимости `review`/`outcome`. `id` — стабильная server-owned identity,
+`task_id` — root Task, `kind` — `user_message|agent_message|tool_call|tool_result|
+result|placeholder`. `status` — `available|queued|pending_guardrail|rejected|
+timed_out|unprocessed_due_to_failure|unprocessed_due_to_cancel`. `review` содержит
+ровно `wait_id` для существующего owner review API; ссылки и sealed refs из
+непроверенного материала не используются. `outcome` у final result содержит
+`state` и при наличии сохранённые `complete`, `completion_reason`, `error_code`.
+Error — safe code, без exception/provider text. Tool calls/results проецируются
+явно, без provider replay, hidden reasoning, auth/trace/private snapshot fields.
+Текст отображается как данные и не разрешает использование материала моделью.
+
+История читается из полного local transcript, retained inbound rows и canonical
+previous-root chain; active summary и импортированные сообщения не копируются
+повторно. Каждый final result публикуется один раз, включая partial/failed.
+Принятое unread уточнение немедленно имеет собственную entry со статусом queued;
+доставка/отказ сохраняют её identity вместо второго сообщения. Пока материал не
+проверен или отклонён, inline payload заменяется понятным placeholder; при наличии
+review владелец открывает полный материал через отдельный authorized API.
+Внутренние вопросы/ответы доступны владельцам, external/dual-role не получает
+history route даже для своей Task. Owner чужой company не получает её данные.
+
+Cursor закрепляет последнюю выданную root/позицию; новые roots, append и compaction
+не меняют уже прочитанные позиции. Для новых сообщений UI перечитывает первую
+страницу и объединяет entries по стабильному ID. Cursor не содержит произвольного
+snapshot и не открывает чужой/child/legacy-unmapped run. В каждом запросе читается
+ограниченная страница под canonical company/chat scope, без writer lease,
+classifier/model/tool dispatch и изменения wait/deadline/budget. Private responses
+имеют no-store. Старые snapshots без history provenance читаются по совместимому
+детерминированному порядку из CONTEXT-03, без восстановления неизвестного времени.
+| `GET /api/settings` | Три исходных timeout, `attachment_limit_bytes`, remote timeout/poll interval и текущая revision |
+| `PUT /api/settings` | Все три исходных timeout и integer `expected_revision`; optional integer `attachment_limit_bytes`, `remote_timeout_seconds`, `remote_poll_interval_seconds` |
+| `GET /api/remote-agents` | Company registry metadata, без header values/ciphertext. Limit1–100 (default50), стабильный порядок по server ID, company-bound cursor; ответ `{agents, next_cursor}`. Чтение не вызывает discovery или модель |
+| `POST /api/remote-agents` | Создаёт адресата с immutable company-unique `name`; обязательны `name`, `url`, `description`, `enabled`, `header_name`; optional `header_value` (строка либо null). Server назначает `id`, revision1. Повтор name —409 `REMOTE_AGENT_CONFLICT` |
+| `PUT /api/remote-agents/{id}` | Полная замена `url`, `description`, `enabled`, `header_name` при integer `expected_revision`; optional `header_value`: omission сохраняет секрет, null очищает. Name/id не меняются. CAS создаёт новую immutable revision; несовпадение —409 |
+| `DELETE /api/remote-agents/{id}` | Ровно integer `expected_revision`; создаёт новую disabled revision и сохраняет старые revisions/credentials для принятых операций. Ответ —metadata новой revision; повтор со stale revision даёт409 |
+
+Timeout keys: `hitl_timeout_seconds`, `owner_answer_timeout_seconds`,
+`guardrails_timeout_seconds`. Default каждого — 86 400 секунд; допустимы целые
+1–2 147 483 647, boolean числом не считается. Изменение влияет только на новые
+ожидания. Revision начинается с 0; конфликт compare-and-set возвращает 409
+`SETTINGS_CONFLICT`. Неизвестный инструмент не создаётся owner request-ом.
+
+`attachment_limit_bytes` по умолчанию равен 25 000 000; допустимы целые
+1–2 147 483 647, boolean не допускается. Это одна company setting для суммы
+декодированных входящих/исходящих вложений сообщения. Её чтение и изменение
+подчиняются той же owner role и revision. Для совместимости PUT без нового поля
+изменяет только таймауты, сохраняя текущий лимит. Изменение не пересматривает
+уже принятые manifest и не запрещает владельцу читать сохранённые файлы.
+
+Remote settings принадлежат той же settings revision: `remote_timeout_seconds`
+по умолчанию86 400, `remote_poll_interval_seconds` —300. Допустимы целые
+1–2 147 483 647, boolean запрещён. Старый PUT без этих полей сохраняет их
+значения. Изменения задают параметры новых операций, не меняя принятый deadline
+или poll interval. GET settings включает оба поля.
+
+Registry metadata содержит ровно `id`, `name`, `url`, `description`, `enabled`,
+`header_name`, `has_header_value`, `revision`. Все registry routes требуют owner
+и no-store; external/dual-role403 до lookup, чужой company ID —404
+`REMOTE_AGENT_NOT_FOUND`. Секретные значения не возвращаются после записи,
+включая errors, cursor, audit, модель и process environment.
+POST/PUT/DELETE registry routes не принимают query parameters. Неверный JSON или
+набор полей запроса возвращает400 `REQUEST_INVALID` до записи.
+Decoded peer ID с NUL или некорректным Unicode отклоняется до lookup с400
+`REMOTE_AGENT_INVALID`; неизвестный корректный ID сохраняет404 semantics.
+
+Name —1–128 ASCII `[A-Za-z0-9_-]`; URL —до4096 UTF-8 bytes, description —до4096
+UTF-8 bytes (может быть пустой; NUL запрещён), header name —HTTP token до128 ASCII characters.
+URL использует HTTPS; HTTP разрешён только для loopback trusted targets.
+Userinfo, query, fragment, whitespace/control characters и некорректный port
+запрещены. Header name не может переопределить Host, Content-Type,
+Content-Length, Connection, Transfer-Encoding, Upgrade, Trailer, TE,
+Proxy-Authorization, Accept или A2A-Version. Header value —непустая строка
+до16 384 bytes с безопасной HTTP encoding и без control characters; null или
+omission при создании означают отсутствие credential. UI использует
+`Authorization` как исходное имя и полное значение `Bearer …`; приложение
+не добавляет credential prefix автоматически. Неверные значения fields дают400
+`REMOTE_AGENT_INVALID`. Credential data шифруются с binding company/peer/
+revision/header name; без подходящего encryption key операции с секретами
+завершаются `REMOTE_AGENT_CREDENTIAL_UNAVAILABLE`, без plaintext fallback.
+
+Digest связывает решение с immutable kind, wait ID/generation, source ID и
+subject (включая schema/origin/исходные аргументы для tool approval). Для
+`core_cron_create` он также связывает `resolved_parameters.timezone`; owner UI
+показывает его вместе с exact raw arguments, не принимает его как изменение call. Несовпадение
+даёт 409 `INTERACTION_VERSION_CONFLICT`; неверный kind или schema — 400.
+Повтор того же принятого решения возвращает сохранённое состояние; иное либо
+опоздавшее решение — 409 `INTERACTION_CLOSED`. Если deadline уже наступил,
+сначала сохраняется timeout. Decision не выдаёт execution lease и не вызывает
+инструмент: продолжает задачу обычный recovery coordinator.
+
+Для policy update `expected_origin` является precondition, а не выбранной
+клиентом identity. Сервер сам определяет текущий origin; несовпадение даёт 409
+`TOOL_IDENTITY_CONFLICT` без изменения policy. Это предотвращает разрешение
+другого MCP tool из устаревшей UI-вкладки при повторном использовании alias,
+даже если оба origin имеют revision=0. Поле `origin` в запросе запрещено.
+
+### Безопасный прогресс внешних операций
+
+Root A2A Task MAY содержать metadata `core_agent_remote_progress`: упорядоченный
+по local task ID список объектов ровно `{task_id, revision, agent_name,
+remote_state}`. `task_id` — локальный handle операции, `revision` — scheduler
+revision зафиксированного наблюдения, впервые показавшего текущий status;
+одинаковый последующий enum не обновляет её. Значение `remote_state` ограничено
+четырьмя non-terminal A2A enum из LONG-02. До первого проверенного Task snapshot
+entry отсутствует; при terminal operation/root оно удаляется.
+Metadata показывает владельцу и authorized caller прогресс только их root Task.
+Remote task/context ID, текст/Parts/история peer, credentials, внутренние HITL
+и вопросы владельцам туда не входят. Canonical status root не меняется; ожидание
+только remote Task остаётся working. Get/List/Subscribe/push используют одинаковую
+safe projection. Повторное чтение не запускает работу и не продлевает deadline.
+
+
+### Owner schedules API version1
+
+Все routes требуют owner role компании, новую авторизацию каждого HTTP request
+и `Cache-Control: no-store`; внешняя и dual-role identity получает403 до lookup.
+Tenant, execution owner и origin выводит сервер. Foreign/deleted schedule ID
+даёт404 `CRON_NOT_FOUND`; неправильный JSON, неизвестные поля/query, expression,
+timezone или request ID —400 `CRON_INVALID`; stale revision или изменённое тело
+retry —409 `CRON_CONFLICT`; новый запуск выключенного расписания —409
+`CRON_DISABLED`. Delete является tombstone и не отменяет принятую Task.
+
+- `GET /api/schedules`: bounded pagination по `limit`/`cursor`, company-scoped cursor.
+- `POST /api/schedules`: `{prompt, expression, timezone?, context_id?, request_id}`;
+  default timezone `Europe/Moscow`; отсутствие context создаёт пустой owner chat.
+- `GET /api/schedules/{id}`: текущие metadata.
+- `PUT /api/schedules/{id}`: `{prompt, expression, timezone, enabled, expected_revision}`;
+  enabled —boolean. Edit/re-enable вычисляют next due строго после текущего clock.
+- `DELETE /api/schedules/{id}`: `{expected_revision}`; повтор уже применённого
+  delete с той же precondition возвращает прежний receipt.
+- `POST /api/schedules/{id}/run-now`: `{expected_revision, request_id}`;
+  ответ200 `{task}` содержит обычную A2A Task, включая failed/CONTEXT_BUSY.
+
+Metadata содержит `{id, revision, context_id, prompt, expression, timezone,
+enabled, next_due_at, active_task_id}`. Даты —ISO-8601 с UTC offset; active task
+ID —null, если чат свободен. Disabled schedule имеет next_due_at null. Prompt
+проходит действующую root-input validation до любых effects. Все operation
+receipts сохраняются company-scoped; retry create возвращает прежний snapshot,
+не пересоздавая удалённое расписание/чат. List не раскрывает tombstones.
+
+Chat list включает пустые canonical chats с `latest_task_id: null, active: false`.
+Новый chat cursor кодирует context ID; для прежнего длинного context ID,
+который не помещается в действующий предел4096 bytes cursor, сервер сохраняет
+выдачу legacy task-ID cursor. Старый task-ID cursor читается через
+scoped canonical root mapping. История пустого чата доступна без фиктивной Task;
+cron skip notices добавляются отдельной owner-only immutable проекцией и
+собственным version2 cursor. Version1 transcript cursors продолжают работать.

@@ -66,6 +66,22 @@ Runtime MUST обеспечить проверенную mount/PID/IPC/network i
 
 Shared storage lock не заменяет PostgreSQL lease; у каждого stateful run один fenced owner.
 
+Runtime связывает owned run с `(tenant_id, owner_id, context_id)` из сохранённого
+workflow, включая recovery, child и background tool. В авторизованном deployment
+эта тройка MUST совпадать с immutable owner записи `core_chats`; отсутствие mapping
+у legacy workflow не разрешает создавать папку от имени нового caller. Владелец
+компании, работающий в чате внешнего агента, сохраняет исходную привязку. Model/tool
+arguments не задают эти идентификаторы. Непривязанный execution отклоняется до
+процесса с `WORKSPACE_SCOPE_REQUIRED`, смена chat binding существующего run — с
+`WORKSPACE_SCOPE_CONFLICT`. Хешированные имена каталогов не заменяют проверку доступа;
+при открытии дочерних каталогов symlinks не допускаются.
+
+Явный anonymous development/test без Keycloak MAY не задавать
+`CHAT_WORKSPACE_ROOT`; тогда прежние ephemeral области сохраняют свою семантику.
+Это не даёт enterprise isolation guarantees и не разрешает fallback из обязательного
+Bubblewrap. `LOCAL_BASE_SNAPSHOT` применяется только к ephemeral/scratch областям;
+restart и новый run не восстанавливают snapshot поверх живого чата.
+
 ## Secrets
 
 - Container-wide environment не должен содержать секреты, доступные всем локальным processes.
@@ -149,6 +165,72 @@ TerminalSession принадлежит ровно одному main/child agent,
 
 После timeout, failed cleanup или terminal agent state session закрывается и не переиспользуется другим agent.
 
+### Terminal transition и владение попыткой выполнения
+
+До terminal commit runtime MUST сохранять durable intent завершения с исходным
+результатом и закрывать допуск новых локальных команд во всём canonical subtree
+Task. Child admission и dispatch проверяют барьер атомарно с общим root ledger;
+родство определяется сохранёнными parent links, а не префиксом run ID.
+Остановка процессов выполняется вне транзакции БД. Пока остановка не подтверждена,
+workflow остаётся nonterminal и чат занят, в том числе при budget-partial результате.
+Нельзя освободить чат через `ABORTED`, если его процессы всё ещё могут писать файлы.
+
+До разрешения локального запуска сохраняется operational receipt с server
+instance, worker и уникальной execution generation. Receipt нельзя заменить или
+удалить устаревшим snapshot. Потерявший lease worker останавливает и подтверждает
+только собственную generation. Пустой список handles другого server instance или
+истечение lease не доказывают завершение прежних процессов: без подтверждения
+очистки сохраняется nonterminal reconciliation, без повторного запуска команды.
+При этом логическое владение задачей не означает запуск процесса: receipt хранит
+явный признак незавершённого local dispatch. Он устанавливается атомарно с intent
+terminal/Python и снимается только при известном завершении либо подтверждённой
+остановке. Сохранённый явный признак отсутствия такого dispatch позволяет новой
+fenced попытке восстановить model-only run или safe wait после сбоя сервера;
+отсутствующий признак не считается этим доказательством.
+Это правило распространяется на legacy checkpoint, указывающий на возможное
+незавершённое локальное выполнение без достаточных сведений для проверки.
+
+Recovery сначала продолжает сохранённый terminal intent. Принятый до commit
+follow-up сохраняет обычную обработку inbox; если он отменяет завершение, следующая
+команда использует новую execution generation. Закрытая generation никогда не
+открывается повторно. Nonterminal suspension сохраняет файлы workspace run-а,
+включая development без постоянного chat root. Повторная или конкурентная очистка
+одной session не публикует новый snapshot из уже удалённой папки.
+
 ## Observability без утечки
 
 Spans отражают session ID, owner kind, process state, duration, exit status, timeout/cancel и bounded byte counts. Raw command, stdin/stdout/stderr, file content, environment и S3 paths выключены по умолчанию. Background terminal process получает новый execution trace со Span Link на task submission.
+
+
+## Python при durable ожидании вложенного инструмента
+
+Произвольные terminal и Python команды считаются потенциально mutating независимо
+от owner allow или guardrails exemption. Прежняя `CORE_AGENT_TRUST_TERMINAL` не
+изменяет эту классификацию. Неизвестный исход после
+старта требует `SIDE_EFFECT_UNKNOWN`/reconciliation, включая legacy checkpoint
+с `pending_mutating=false`. Известный exit/timeout возвращается как structured
+result с частичным output; это не обещает отсутствия предыдущих side effects.
+
+Неизвестный outcome вложенной мутации требует `SIDE_EFFECT_UNKNOWN` и после
+подтверждённой очистки фиксируется как `ABORTED`. При неподтверждённой очистке
+сохраняется описанный выше nonterminal барьер. До возврата broker response
+исход фиксируется durable; Python `try/except` не может скрыть его и разрешить
+следующий вызов или успешное завершение outer run. Исчерпание общего либо локального
+budget также сохраняется до ответа broker независимо от перехвата исключения:
+дальше допускается только предусмотренная runtime финализация без tools.
+
+Произвольный CPython процесс не сериализуется. Если `tools.call(...)` требует
+HITL, вопроса владельцу, проверки материала либо timer/task wait, broker
+сохраняет конкретный frozen nested call, stable request ID, исходный outer call,
+уже начисленный budget и результаты завершённых broker calls. Он прекращает
+принимать следующие вызовы и не возвращает catchable ошибку, позволяющую Python
+продолжить выполнение.
+
+Перед сохранением safe wait runtime подтверждает остановку всего process group
+или sandbox namespace. После решения исполняется только сохранённый nested call
+с повторной проверкой текущей policy; уже завершённый call не повторяется ради
+раскрытия его результата. Модель получает interrupted outer Python result с
+частичными stdout/stderr и известными broker outcomes и сама выбирает следующий
+шаг. Prefix и остаток Python-кода автоматически не запускаются повторно.
+Неподтверждённая остановка или неизвестный outcome возможной мутации требуют
+reconciliation и не допускают повторного dispatch.

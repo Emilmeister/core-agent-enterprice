@@ -589,7 +589,7 @@ class RuntimeTests(unittest.TestCase):
                 "default",
                 "anonymous",
                 None,
-                "COMPLETED",
+                "RUNNING",
                 1,
                 {"prompt": "done"},
                 {},
@@ -610,6 +610,11 @@ class RuntimeTests(unittest.TestCase):
                     {},
                 )
             )
+
+        parent = store.lookup_task("finished-parent-task")
+        store.transition(parent.run_id, tenant_id=parent.tenant_id, owner_id=parent.owner_id,
+                         expected_version=parent.version, state="COMPLETED",
+                         snapshot=parent.snapshot, event_kind="fixture.completed")
 
         model = ScriptedModel([ModelResponse(message="root recovered")])
         agent = make_agent(model, memory="disabled", workflow_store=store)
@@ -786,7 +791,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(connector.connections, ())
         self.assertNotIn("docs_search", model.calls[0].tools)
 
-    def test_initialized_workflow_recovers_with_its_persisted_mcp_catalog(self):
+    def test_recovery_hides_unavailable_mcp_without_changing_admitted_catalog(self):
         class UnavailableConnector(InMemoryMcpConnector):
             def connect(self, declaration, *, cancel_event=None, deadline=None):
                 raise CoreError(
@@ -843,10 +848,14 @@ class RuntimeTests(unittest.TestCase):
             second.close()
 
         self.assertEqual(result.message, "continued with snapshot")
-        self.assertIn("docs_search", model.calls[0].tools)
+        self.assertNotIn("docs_search", model.calls[0].tools)
+        recovered = store.lookup_task(record.task_id)
         self.assertEqual(
-            model.catalog["docs_search"]["input_schema"]["properties"],
-            {"query": {"type": "string"}},
+            recovered.snapshot["mcp_catalogs"], record.snapshot["mcp_catalogs"]
+        )
+        self.assertEqual(
+            recovered.snapshot["effective_config_digest"],
+            record.snapshot["effective_config_digest"],
         )
 
     def test_recovery_applies_a_new_platform_deny_without_invalidating_checkpoint(self):
@@ -1896,6 +1905,17 @@ class RuntimeTests(unittest.TestCase):
                 self.consume_attempts = 0
                 self.injected = False
 
+            def begin_terminal(self, record, intent, *, lease_token):
+                updated = super().begin_terminal(record, intent, lease_token=lease_token)
+                # Execution closes at intent; input remains admissible until
+                # actual terminal commit, including while cleanup is pending.
+                self.append_inbound(
+                    record.task_id, tenant_id=record.tenant_id, owner_id=record.owner_id,
+                    message_id="accepted-during-cleanup", context_id=record.context_id,
+                    content="cleanup correction", provenance={},
+                )
+                return updated
+
             def consume_inbound(self, *args, **kwargs):
                 self.consume_attempts += 1
                 record = args[0]
@@ -1976,6 +1996,14 @@ class RuntimeTests(unittest.TestCase):
                 "unprocessed_due_to_failure",
                 [item["kind"] for item in terminal.snapshot["context"]["transcript"]],
             )
+            self.assertIn("cleanup correction", [
+                item["content"] for item in terminal.snapshot["context"]["transcript"]
+            ])
+            with self.assertRaises(CoreError) as caught:
+                store.append_inbound(record.task_id, tenant_id=record.tenant_id, owner_id=record.owner_id,
+                    message_id="after-terminal", context_id=record.context_id,
+                    content="late unaccepted input", provenance={})
+            self.assertEqual(caught.exception.code, "TASK_TERMINAL")
             self.assertEqual(store.consume_attempts, 2)
             self.assertEqual(store.consume_states, ["FAILED"])
         finally:
@@ -1990,6 +2018,15 @@ class RuntimeTests(unittest.TestCase):
             tenant_id="default",
             parent_run_id=parent_run_id,
         )
+        # The mutation outcome is unknown, but this fixture's process is
+        # already stopped. Missing/foreign cleanup receipts have separate tests.
+        store = agent.workflow_store
+        worker = "stopped-fixture"
+        token = store.acquire_lease(record.run_id, tenant_id=record.tenant_id,
+                                    owner_id=record.owner_id, worker_id=worker, ttl=60)
+        record = store.register_execution(record,
+            instance_id=agent.tool_runtime.environment_manager.instance_id,
+            worker_id=worker, generation=token, lease_token=token)
         pending = {
             "id": "mutation-call",
             "name": "core_terminal_exec",
@@ -2007,13 +2044,17 @@ class RuntimeTests(unittest.TestCase):
         snapshot["pending_call"] = pending
         snapshot["tool_calls"] = 1
         agent.workflow_store.consume_budget(record, tool_calls=1)
-        return agent._record_transition(
+        record = agent._record_transition(
             record,
             state="EXECUTING",
             snapshot=snapshot,
             event_kind="tool.intent",
             event_data={"tool_call_id": pending["id"], "mutating": True},
+            lease_token=token,
         )
+        record = store.confirm_execution(record, record.snapshot["execution_owner"])
+        store.release_lease(record.run_id, tenant_id=record.tenant_id, worker_id=worker, token=token)
+        return record
 
     def _executing_subagent(self, agent, task_id):
         parent, _raw, _discovered, _effective = agent._new_workflow(
@@ -3170,6 +3211,11 @@ class RuntimeTests(unittest.TestCase):
             )
             parent = agent.workflow_store.lookup_task("shared-budget-parent")
             child_task = agent.task_scheduler.list(owner_id=parent.run_id)[0]
+            agent.task_scheduler.wait(child_task.id, timeout=5, owner_id=parent.run_id)
+            with patch.object(agent, "_launch_recovery", return_value=False):
+                agent._recover_workflows_once()
+            result = agent.resume_task(parent.task_id)
+            parent = agent.workflow_store.lookup_task(parent.task_id)
             child = agent.workflow_store.lookup_task(child_task.id)
             resumed = agent.resume_task(child_task.id)
         finally:
@@ -4336,9 +4382,17 @@ class RuntimeTests(unittest.TestCase):
     def test_runtime_compacts_twice_and_keeps_prompt_and_full_transcript(self):
         connector = InMemoryMcpConnector(
             catalogs={"docs": {"search": {"type": "object"}}},
-            results={"docs.search": {"blob": "x" * 3_000}},
+            results={"docs.search": {"blob": "x" * 4_600}},
         )
-        model = ScriptedModel(
+        class SemanticModel(ScriptedModel):
+            def generate(self, **call):
+                if call["instructions"].startswith("SEMANTIC CONTEXT SUMMARY"):
+                    records = json.loads(call["context"])["records"]
+                    payload = {key: [] for key in ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")}
+                    payload["Completed"] = [{"text": "The docs search completed successfully and returned a blob of source data. Its full output remains in the immutable transcript. This is a completed retrieval only: no publication, file modification or external mutation has been performed by the search call. Continue the user's request using the returned data without repeating the completed search merely because the active history was compressed. The latest result supersedes any earlier search result for this step.", "basis": "fact", "sources": [records[-1]["sources"][-1]]}]
+                    return ModelResponse(message=json.dumps(payload), finish_reason="stop")
+                return super().generate(**call)
+        model = SemanticModel(
             [
                 ModelResponse(
                     tool_requests=(ToolRequest(f"call-{index}", "docs_search", {}),)
@@ -4350,8 +4404,9 @@ class RuntimeTests(unittest.TestCase):
         agent = make_agent(
             model,
             connector=connector,
-            context_window=1_000,
+            context_window=2_000,
             output_reserve=100,
+            kernel_compiler=KernelCompiler("Safety policy. " * 170, "Host policy.", "Kernel policy."),
         )
         result = agent.run(run_request(memory=True), task_id="compact-task")
         record = agent.workflow_store.lookup_task("compact-task")
@@ -4790,3 +4845,419 @@ class ObservabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SemanticRuntimeTests(unittest.TestCase):
+    def test_real_semantic_calls_keep_latest_corrections_and_charge_budget(self):
+        from core_agent.config import AgentConfig
+        class CorrectingModel(ScriptedModel):
+            def generate(self, **call):
+                if call['instructions'].startswith('SEMANTIC CONTEXT SUMMARY'):
+                    self._calls.append(__import__('core_agent.model', fromlist=['ModelCall']).ModelCall(
+                        call['context'], frozenset(call['tools']), call['instructions'], tuple(call.get('messages', ()))))
+                    records = json.loads(call['context'])['records']
+                    latest = 'C' if any('Correction: C' in item['content'] for item in records) else 'B'
+                    sources = list(dict.fromkeys(source for item in records for source in item['sources']))
+                    result = {key: [] for key in ('Goal', 'Constraints', 'Decisions', 'Completed', 'Artifacts', 'Pending', 'Failures')}
+                    result['Decisions'] = [{'text': 'Use ' + latest, 'basis': 'fact', 'sources': sources}]
+                    result['Pending'] = [{'text': 'Publish is planned only', 'basis': 'fact', 'sources': sources}]
+                    return ModelResponse(message=json.dumps(result), finish_reason='stop')
+                return super().generate(**call)
+        model = CorrectingModel([ModelResponse(tool_requests=(ToolRequest('b', 'docs_search', {}),)),
+                                 ModelResponse(tool_requests=(ToolRequest('c', 'docs_search', {}),)),
+                                 ModelResponse(message='done')])
+        connector = InMemoryMcpConnector(catalogs={'docs': {'search': {'type': 'object'}}},
+                                        results={'docs.search': 'Correction: B. Plan to publish.'})
+        original_call = connector.call
+        def call(*args, **kwargs):
+            value = original_call(*args, **kwargs)
+            connector.results['docs.search'] = 'Correction: C. Plan still not executed.'
+            return value
+        connector.call = call
+        agent = make_agent(model, connector=connector)
+        raw = agent.agent_config.to_dict()
+        raw['context']['compaction_interval'] = 1
+        agent.agent_config = AgentConfig.from_dict(raw)
+        try:
+            result = agent.run({'prompt': 'Use A; preserve latest corrections.'}, task_id='semantic')
+            summaries = [call for call in model.calls if call.instructions.startswith('SEMANTIC CONTEXT SUMMARY')]
+            self.assertEqual(len(summaries), 2)
+            self.assertIn('Use B', summaries[1].context)
+            self.assertIn('Use C', model.calls[-1].context)
+            self.assertIn('Publish is planned only', model.calls[-1].context)
+            self.assertEqual(result.usage.model_turns, 5)
+            self.assertEqual(result.shared_budget["used"]["model_turns"], 5)
+            record = agent.workflow_store.lookup_task('semantic')
+            self.assertEqual(record.snapshot['compaction_operation']['outcome'], 'committed')
+            self.assertEqual(len(record.snapshot['context']['transcript']), 5)
+            persisted_summary = next(item for item in record.snapshot['context']['active'] if item['kind'] == 'summary')
+            self.assertEqual(set(persisted_summary['provenance']['sources']),
+                             {f'{record.run_id}:{sequence}' for sequence in range(1, 6)})
+            self.assertTrue(all(not call.tools for call in summaries))
+        finally:
+            agent.close()
+
+    @staticmethod
+    def semantic_answer(call, text="Verified pending work"):
+        records = json.loads(call["context"])["records"]
+        sources = list(dict.fromkeys(source for item in records for source in item["sources"]))
+        payload = {key: [] for key in ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")}
+        payload["Pending"] = [{"text": text, "basis": "fact", "sources": sources}]
+        return ModelResponse(message=json.dumps(payload), finish_reason="stop")
+
+    def semantic_agent(self, callback, *, max_turns=10, context_window=128000):
+        class Model(ScriptedModel):
+            def generate(inner, **call):
+                if call["instructions"].startswith("SEMANTIC CONTEXT SUMMARY"):
+                    return callback(call)
+                return super().generate(**call)
+        model = Model([ModelResponse(tool_requests=(ToolRequest("once", "docs_search", {}),)),
+                       ModelResponse(message="verified partial")])
+        connector = InMemoryMcpConnector(catalogs={"docs": {"search": {"type": "object"}}},
+                                        results={"docs.search": "confirmed result"})
+        agent = make_agent(model, connector=connector, max_turns=max_turns, context_window=context_window)
+        raw = agent.agent_config.to_dict()
+        raw["context"]["compaction_interval"] = 1
+        agent.agent_config = AgentConfig.from_dict(raw)
+        self.addCleanup(agent.close)
+        return agent, model, connector
+
+    def test_summary_never_spends_local_finalizer_reservation(self):
+        calls = []
+        def summary(call):
+            calls.append(call)
+            return self.semantic_answer(call)
+        agent, model, _ = self.semantic_agent(summary, max_turns=3)
+        result = agent.run(run_request(), task_id="budget-summary")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.usage.model_turns, 3)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.completion_reason, "budget_exhausted")
+        self.assertIn("BUDGET FINALIZATION", model.calls[-1].instructions)
+
+    def test_unknown_summary_attempt_is_charged_across_restart(self):
+        class Crash(BaseException):
+            pass
+        calls = []
+        def summary(call):
+            calls.append(call)
+            if len(calls) == 1:
+                raise Crash()
+            return self.semantic_answer(call)
+        agent, model, connector = self.semantic_agent(summary)
+        with self.assertRaises(Crash):
+            agent.run(run_request(), task_id="crash-summary")
+        first = agent.workflow_store.lookup_task("crash-summary")
+        self.assertEqual(first.snapshot["turns"], 2)
+        self.assertEqual(first.snapshot["compaction_operation"]["attempts"], 1)
+        agent._runtime_cache.clear()
+        result = agent.resume_task("crash-summary")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result.usage.model_turns, 4)
+        self.assertEqual(result.usage.tool_calls, 1)
+
+    def test_committed_summary_is_reused_after_restart(self):
+        class Crash(BaseException):
+            pass
+        calls = []
+        def summary(call):
+            calls.append(call)
+            return self.semantic_answer(call)
+        agent, _, _ = self.semantic_agent(summary)
+        transition = agent._record_transition
+        def crash_after_commit(*args, **kwargs):
+            record = transition(*args, **kwargs)
+            if kwargs["event_kind"] == "context.compacted":
+                raise Crash()
+            return record
+        with patch.object(agent, "_record_transition", side_effect=crash_after_commit):
+            with self.assertRaises(Crash):
+                agent.run(run_request(), task_id="commit-summary")
+        result = agent.resume_task("commit-summary")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.usage.model_turns, 3)
+        self.assertEqual(result.usage.tool_calls, 1)
+
+    def test_two_failed_summaries_below_pressure_leave_original_context(self):
+        calls = []
+        def summary(call):
+            calls.append(call)
+            return ModelResponse(message="invalid", finish_reason="stop")
+        agent, model, _ = self.semantic_agent(summary)
+        result = agent.run(run_request(), task_id="failed-summary")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("confirmed result", model.calls[-1].context)
+        self.assertEqual(result.usage.model_turns, 4)
+        self.assertEqual(result.usage.tool_calls, 1)
+
+    def test_visibility_discards_dependent_summary_and_legacy_derived_text(self):
+        from core_agent.context import ContextItem, ContextState
+        from types import SimpleNamespace
+        agent, _, _ = self.semantic_agent(lambda call: self.semantic_answer(call))
+        record = agent._new_workflow(run_request(), task_id='visibility', identity='owner', session_id='chat', tenant_id='tenant')[0]
+        token = agent.workflow_store.acquire_lease(record.run_id, tenant_id='tenant', owner_id='owner', worker_id='test', ttl=100)
+        secret = 'REVOKED SOURCE'
+        digest = hashlib.sha256(json.dumps(secret, separators=(',', ':')).encode()).hexdigest()
+        agent.material_review_store = SimpleNamespace(negative_decision=lambda current, value, **kw:
+            {'state': 'rejected', 'review_id': 'denied'} if value == digest else None)
+        original = ContextItem('user_message', secret, 10)
+        call = ContextItem('assistant_tool_calls', json.dumps([{'id': 'x', 'function': {'name': 'write', 'arguments': {'content': secret}}}]), 10)
+        outcome = ContextItem('tool_result', json.dumps({'tool_call_id': 'x', 'output': 'done'}), 10)
+        private = ContextItem('unprocessed_due_to_failure', 'UNDELIVERED PRIVATE', 10)
+        snapshot = copy.deepcopy(record.snapshot)
+        for active in [(original, call, outcome), (ContextItem('summary', 'legacy truncated text', 5),)]:
+            snapshot['context'] = agent._context_to_dict(ContextState(active, (original, call, outcome, private), (1, 4)))
+            projected, _ = agent._visible_context(record, snapshot, lease_token=token)
+            rendered = '\n'.join(item.content for item in projected.active)
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn('UNDELIVERED PRIVATE', rendered)
+            self.assertEqual(projected.transcript[-1], private)
+
+    def test_changed_negative_decision_invalidates_summary_prose_and_restores_allowed_originals(self):
+        from core_agent.context import ContextItem, ContextState
+        from types import SimpleNamespace
+        agent, _, _ = self.semantic_agent(lambda call: self.semantic_answer(call))
+        record = agent._new_workflow(run_request(), task_id='visibility-summary', identity='owner', session_id='chat', tenant_id='tenant')[0]
+        token = agent.workflow_store.acquire_lease(record.run_id, tenant_id='tenant', owner_id='owner', worker_id='test', ttl=100)
+        denied = {'version': 1, 'sources': {f'{record.run_id}:1': {'run_id': record.run_id, 'sequence': 1,
+                  'materials': [{'material_digest': 'a' * 64, 'material_kind': 'file_sha256', 'text_digest': 'b' * 64}]}}}
+        allowed = {'version': 1, 'sources': {f'{record.run_id}:2': {'run_id': record.run_id, 'sequence': 2}}}
+        originals = (ContextItem('user_message', 'PRIVATE FILE', 10, provenance=denied),
+                     ContextItem('user_message', 'Keep allowed fact', 10, provenance=allowed))
+        summary = ContextItem('summary', 'CONTAMINATED prose with no verbatim source', 10,
+            provenance={'version': 1, 'summary_version': 1, 'sources': denied['sources'] | allowed['sources']})
+        calls = []
+        def negative(current, digest, **kw):
+            calls.append((digest, kw))
+            return {'state': 'timed_out', 'review_id': 'rejected-file'}
+        agent.material_review_store = SimpleNamespace(negative_decision=negative)
+        snapshot = copy.deepcopy(record.snapshot)
+        snapshot['context'] = agent._context_to_dict(ContextState((summary,), originals, (1, 2)))
+        projected, _ = agent._visible_context(record, snapshot, lease_token=token)
+        self.assertEqual([item.content for item in projected.active], ['Keep allowed fact'])
+        self.assertEqual(projected.transcript, originals)
+        self.assertEqual(calls[0][1]['text_digest'], 'b' * 64)
+
+    def test_rejection_during_summary_rebuilds_from_allowed_sources_before_next_model_call(self):
+        import uuid
+        from core_agent.guardrails import GuardrailClassifier
+        from core_agent.material_reviews import MemoryMaterialReviewStore
+        from core_agent.workflow import WorkflowRecord
+        from tests.test_material_reviews import Model as DetectorModel
+        calls = []
+        def summary(call):
+            calls.append(call)
+            if len(calls) == 1:
+                current = agent.workflow_store.lookup_task('rejection-during-summary')
+                peer = agent.workflow_store.create(WorkflowRecord(str(uuid.uuid4()), str(uuid.uuid4()),
+                    current.context_id, current.tenant_id, current.owner_id, None, 'RUNNING', 1, {'prompt': 'review'}, {}))
+                token = agent.workflow_store.acquire_lease(peer.run_id, tenant_id=peer.tenant_id, owner_id=peer.owner_id, worker_id='reviewer', ttl=100)
+                digest = hashlib.sha256(json.dumps('confirmed result', separators=(',', ':')).encode()).hexdigest()
+                review = agent.material_review_store.create(peer, source_id='later-review', source_kind='input',
+                    payload='confirmed result', completed_result_ref={'material_digest': digest},
+                    deadline=agent.workflow_store.current_time()+60, lease_token=token)
+                review = agent.material_review_store.classify(peer, review['review_id'], GuardrailClassifier(DetectorModel('suspicious')),
+                    lease_token=token, continuation={'version': 1, 'phase': 'input'}, snapshot=peer.snapshot)
+                agent.workflow_store.resolve_wait(review['wait_id'], tenant_id=peer.tenant_id,
+                    outcome={'reason': 'rejected'}, actor_id='owner')
+                return self.semantic_answer(call, 'CONTAMINATED DERIVED CLAIM')
+            self.assertNotIn('confirmed result', call['context'])
+            self.assertNotIn('CONTAMINATED DERIVED CLAIM', call['context'])
+            return self.semantic_answer(call, 'Continue without the unavailable source')
+        agent, model, _ = self.semantic_agent(summary)
+        agent.material_review_store = MemoryMaterialReviewStore(agent.workflow_store)
+        agent.guardrail_classifier = GuardrailClassifier(DetectorModel('clear'))
+        result = agent.run(run_request(), task_id='rejection-during-summary', identity='owner', session_id='same-chat', tenant_id='company')
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('confirmed result', model.calls[-1].context)
+        self.assertNotIn('CONTAMINATED DERIVED CLAIM', model.calls[-1].context)
+        record = agent.workflow_store.lookup_task('rejection-during-summary')
+        self.assertIn('confirmed result', json.dumps(record.snapshot['context']['transcript']))
+        self.assertEqual(result.usage.tool_calls, 1)
+
+    def test_compaction_keeps_exact_runtime_artifact_reference_outside_summary(self):
+        from core_agent.context import ContextState
+        from core_agent.tools import ToolCall
+        agent, _, _ = self.semantic_agent(lambda call: self.semantic_answer(call))
+        record = agent._new_workflow(run_request(), task_id='artifact-pins', identity='owner', session_id='chat', tenant_id='company')[0]
+        snapshot = copy.deepcopy(record.snapshot)
+        snapshot['context'] = agent._context_to_dict(ContextState((), (), (1, 0)))
+        call = ToolCall('saved', 'core_artifact_save', {'filename': 'exact-report.csv', 'path': 'reports/exact.csv'})
+        text = agent._result_text('saved', {'success': True, 'artifact_name': 'exact-report.csv', 'version': 7, 'size': 42}, call.name)
+        agent._append_result(record, snapshot, call, text)
+        context = agent._context_from_dict(snapshot['context'])
+        pins = [item for item in context.active if item.pinned]
+        self.assertEqual(len(pins), 1)
+        self.assertIn('exact-report.csv', pins[0].content)
+        self.assertIn('reports/exact.csv', pins[0].content)
+        self.assertEqual(json.loads(pins[0].content)['artifact']['version'], 7)
+        self.assertEqual(len(context.transcript), 1)
+
+    def test_two_unknown_attempts_do_not_reset_on_a_third_worker(self):
+        class Crash(BaseException):
+            pass
+        calls = []
+        def summary(call):
+            calls.append(call)
+            raise Crash()
+        agent, model, _ = self.semantic_agent(summary)
+        with self.assertRaises(Crash):
+            agent.run(run_request(), task_id='twice-crashed-summary')
+        with self.assertRaises(Crash):
+            agent.resume_task('twice-crashed-summary')
+        result = agent.resume_task('twice-crashed-summary')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result.usage.model_turns, 4)
+        self.assertEqual(result.usage.tool_calls, 1)
+        self.assertIn('confirmed result', model.calls[-1].context)
+        record = agent.workflow_store.lookup_task('twice-crashed-summary')
+        self.assertEqual(record.snapshot['compaction_operation']['outcome'], 'unknown')
+
+    def test_no_summary_budget_with_oversized_context_uses_deterministic_partial(self):
+        def summary(call):
+            self.fail('Finalizer reserve must not fund compaction')
+        agent, model, connector = self.semantic_agent(summary, max_turns=2, context_window=1000)
+        agent.output_reserve = 100
+        connector.results['docs.search'] = 'large result ' * 1000
+        result = agent.run(run_request(), task_id='budget-with-large-context')
+        self.assertFalse(result.complete)
+        self.assertEqual(result.completion_reason, 'budget_exhausted')
+        self.assertEqual(len(model.calls), 1)
+        self.assertIn('incomplete', result.message)
+
+    def test_finalizer_uses_actual_no_tools_instruction_window(self):
+        from dataclasses import replace
+        model = ScriptedModel([ModelResponse(message='must not call provider')])
+        agent = make_agent(model, max_turns=1, mcp=False, memory='disabled', context_window=500,
+                           output_reserve=50, kernel_compiler=KernelCompiler('safety', 'host', 'kernel'))
+        self.addCleanup(agent.close)
+        agent.platform_config = replace(agent.platform_config, allowed_builtin_tools=frozenset(), supported_features=frozenset())
+        result = agent.run({'prompt': 'x' * 1520}, task_id='finalizer-window')
+        self.assertFalse(result.complete)
+        self.assertEqual(model.calls, ())
+        self.assertIn('incomplete', result.message)
+
+    def test_failed_durable_charge_prevents_summary_provider_io(self):
+        calls = []
+        agent, _, _ = self.semantic_agent(lambda call: calls.append(call) or self.semantic_answer(call))
+        transition = agent._record_transition
+        def unavailable(*args, **kwargs):
+            if kwargs.get('event_data', {}).get('purpose') == 'compaction':
+                raise OSError('durable charge unavailable')
+            return transition(*args, **kwargs)
+        with patch.object(agent, '_record_transition', side_effect=unavailable):
+            with self.assertRaisesRegex(OSError, 'durable charge unavailable'):
+                agent.run(run_request(), task_id='storage-summary')
+        self.assertEqual(calls, [])
+        record = agent.workflow_store.lookup_task('storage-summary')
+        self.assertEqual(record.snapshot['turns'], 1)
+        self.assertNotIn('compaction_operation', record.snapshot)
+
+    def test_cancel_during_summary_prevents_summary_commit(self):
+        def summary(call):
+            record = agent.workflow_store.lookup_task('cancel-summary')
+            agent.workflow_store.request_cancel(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            return self.semantic_answer(call)
+        agent, _, _ = self.semantic_agent(summary)
+        with self.assertRaises(CoreError) as caught:
+            agent.run(run_request(), task_id='cancel-summary')
+        self.assertEqual(caught.exception.code, 'TASK_CANCELLED')
+        record = agent.workflow_store.lookup_task('cancel-summary')
+        self.assertEqual(agent.event_store.count(record.run_id, kind='context.compacted'), 0)
+        self.assertEqual(record.snapshot['turns'], 2)
+        self.assertIn('confirmed result', json.dumps(record.snapshot['context']['transcript']))
+
+    def test_summary_http_wire_overrides_stream_and_output_limits_without_mutating_model(self):
+        for api_format, options, expected_limit in [
+            ('openai', {'stream': True, 'stream_options': {'include_usage': True}, 'max_tokens': 4096}, 'max_tokens'),
+            ('openai', {'stream': True, 'max_tokens': 4096, 'max_completion_tokens': 8192}, 'max_completion_tokens'),
+            ('anthropic', {'stream': True, 'stream_options': {}, 'max_tokens': 4096, 'max_completion_tokens': 8192}, 'max_tokens'),
+        ]:
+            with self.subTest(api_format=api_format, expected_limit=expected_limit):
+                class HttpModel(CompatibleHttpModel):
+                    def generate(inner, **call):
+                        if call['instructions'].startswith('SEMANTIC CONTEXT SUMMARY'):
+                            return super().generate(**call)
+                        return inner.script.generate(**call)
+
+                    def _post(inner, body, headers):
+                        inner.bodies.append(body)
+                        answer = self.semantic_answer({'context': body['messages'][-1]['content']})
+                        if inner.api_format == 'openai':
+                            return {'choices': [{'message': {'content': answer.message}, 'finish_reason': 'stop'}]}
+                        return {'content': [{'type': 'text', 'text': answer.message}], 'stop_reason': 'end_turn'}
+
+                model = HttpModel(api_format=api_format, model='test', extra_body=copy.deepcopy(options),
+                                  stream=True, max_tokens=256)
+                model.script = ScriptedModel([ModelResponse(tool_requests=(ToolRequest('once', 'docs_search', {}),)),
+                                              ModelResponse(message='done')])
+                model.bodies = []
+                agent, _, _ = self.semantic_agent(lambda call: self.fail('use actual HTTP adapter'), context_window=1000)
+                agent.output_reserve = 100
+                agent.model = model
+                result = agent.run(run_request(), task_id='wire-' + api_format + expected_limit)
+                self.assertEqual(result.message, 'done')
+                self.assertEqual(len(model.bodies), 1)
+                wire = model.bodies[0]
+                record = agent.workflow_store.lookup_task('wire-' + api_format + expected_limit)
+                self.assertFalse(wire.get('stream', False))
+                self.assertNotIn('stream_options', wire)
+                self.assertEqual(wire[expected_limit], min(256, record.snapshot['compaction_operation']['target']))
+                self.assertNotIn('max_tokens' if expected_limit == 'max_completion_tokens' else 'max_completion_tokens', wire)
+                self.assertNotIn('tools', wire)
+                self.assertTrue(model.stream)
+                self.assertEqual(model.max_tokens, 256)
+                self.assertEqual(model.extra_body, options)
+
+    def test_recovered_summary_attempt_stops_when_new_window_cannot_fit_provider_request(self):
+        class Crash(BaseException):
+            pass
+        calls = []
+        def summary(call):
+            calls.append(call)
+            raise Crash()
+        agent, model, _ = self.semantic_agent(summary)
+        with self.assertRaises(Crash):
+            agent.run(run_request(), task_id='recovery-summary-fit')
+        before = agent.workflow_store.lookup_task('recovery-summary-fit')
+        self.assertEqual(before.snapshot['compaction_operation']['attempts'], 1)
+        agent.context_window = agent.token_counter(calls[0]['context']) + agent.token_counter(calls[0]['instructions']) + 1
+        agent.output_reserve = 1
+        failures = []
+        transition = agent._record_transition
+        def bounded_failure_events(*args, **kwargs):
+            if kwargs['event_kind'] == 'context.compaction.failed':
+                failures.append(kwargs['event_data']['attempt'])
+                self.assertLessEqual(len(failures), 1, 'pre-provider failure retried without paying a new attempt')
+            return transition(*args, **kwargs)
+        with patch.object(agent, '_record_transition', side_effect=bounded_failure_events):
+            result = agent.resume_task('recovery-summary-fit')
+        self.assertEqual(result.message, 'verified partial')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.usage.model_turns, 3)
+        self.assertEqual(result.usage.tool_calls, 1)
+        after = agent.workflow_store.lookup_task('recovery-summary-fit')
+        self.assertEqual(after.snapshot['compaction_operation']['attempts'], 1)
+        self.assertEqual(after.snapshot['context'], before.snapshot['context'])
+        self.assertIn('confirmed result', model.calls[-1].context)
+
+    def test_followup_during_summary_is_in_the_immediately_next_ordinary_model_call(self):
+        calls = []
+        correction = 'Latest correction: retain option B and do not publish yet.'
+        def summary(call):
+            calls.append(call)
+            if len(calls) == 1:
+                record = agent.workflow_store.lookup_task('followup-during-summary')
+                agent.enqueue_message({'prompt': correction}, task_id=record.task_id, message_id='during-summary',
+                    identity=record.owner_id, session_id=record.context_id, tenant_id=record.tenant_id)
+            return self.semantic_answer(call)
+        agent, model, _ = self.semantic_agent(summary)
+        model._responses.append(ModelResponse(message='extra ordinary turn'))
+        result = agent.run(run_request(), task_id='followup-during-summary')
+        self.assertIn(correction, model.calls[1].context)
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(len(calls), 1, 'one safe boundary must not retrigger interval compaction')
+        self.assertEqual(result.usage.model_turns, 3)
+        self.assertEqual(result.usage.tool_calls, 1)
+        record = agent.workflow_store.lookup_task('followup-during-summary')
+        self.assertEqual(agent.workflow_store.pending_inbound(record), ())
+        self.assertEqual([item['content'] for item in record.snapshot['context']['transcript']].count(correction), 1)

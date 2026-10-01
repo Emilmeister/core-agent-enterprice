@@ -1,3 +1,10 @@
+FROM node:24-alpine AS owner-ui
+WORKDIR /app/ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
+COPY ui/ ./
+RUN npm run build
+
 FROM ghcr.io/astral-sh/uv:0.11.6 AS uv
 
 FROM mikefarah/yq:4.53.3 AS yq
@@ -17,6 +24,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         7zip \
+        bubblewrap \
         bzip2 \
         ca-certificates \
         coreutils \
@@ -29,16 +37,20 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
         iproute2 \
         jq \
         libarchive-tools \
+        libseccomp2 \
         netcat-openbsd \
+        nftables \
         openssl \
         poppler-utils \
         qpdf \
         ripgrep \
         sed \
+        slirp4netns \
         sqlite3 \
         tree \
         uchardet \
         unzip \
+        util-linux \
         xmlstarlet \
         xxd \
         xz-utils \
@@ -58,10 +70,11 @@ RUN uv sync --frozen --no-dev --no-install-project && \
     uv cache clean
 
 COPY core_agent ./core_agent
+COPY --from=owner-ui /app/core_agent/ui_dist ./core_agent/ui_dist
 RUN uv sync --frozen --no-dev && \
     uv cache clean && \
     useradd --create-home --uid 10001 agent && \
-    mkdir -p /data/durable /tmp/core-agent/runs && \
+    mkdir -p /data/durable /data/chats /tmp/core-agent/runs && \
     chown -R agent:agent /app /data /tmp/core-agent
 
 COPY --chown=0:0 third_party/skills/ /opt/core-agent/skills/
@@ -69,6 +82,14 @@ RUN cd /opt/core-agent/skills && \
     sha256sum --check SHA256SUMS && \
     test -z "$(find . -type l -print -quit)" && \
     chmod -R a-w .
+
+COPY --chown=0:0 deploy/security/ /opt/core-agent/security/
+COPY --chown=0:0 core_agent/sandbox-policy.json /opt/core-agent/security/sandbox-policy.json
+RUN cd /opt/core-agent/security && \
+    sha256sum --check SHA256SUMS && \
+    test -z "$(find . -type l -print -quit)" && \
+    chmod -R a-w . && \
+    bwrap --version && slirp4netns --version && nft --version
 
 ENV SKILLS_ROOT=/opt/core-agent/skills \
     CORE_AGENT_ALLOWED_SKILLS=systematic-debugging,verification-before-completion,knowledge-synthesis,explore-data,validate-data,statistical-analysis,sql-queries

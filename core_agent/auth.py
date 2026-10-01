@@ -31,6 +31,7 @@ class AuthSettings:
     tenant: str
     owner_role: str = "agent-owner"
     external_role: str = "agent-external"
+    ui_client_id: str = ""
 
     @classmethod
     def from_environment(cls, get, *, production=False, allow_legacy=False):
@@ -38,10 +39,16 @@ class AuthSettings:
             "KEYCLOAK_ISSUER_URL", "KEYCLOAK_CLIENT_ID", "KEYCLOAK_CLIENT_SECRET",
             "KEYCLOAK_AUDIENCE", "CORE_AGENT_TENANT_ID",
         )]
-        if not any(values) and allow_legacy and not production:
+        ui_client_id = get("KEYCLOAK_UI_CLIENT_ID", "")
+        if not any(values) and not ui_client_id and allow_legacy and not production:
             return None
         if not all(isinstance(value, str) and value.strip() for value in values):
             raise CoreError("CONFIG_INVALID", "Complete Keycloak authentication configuration is required")
+        if (not isinstance(ui_client_id, str) or len(ui_client_id) > 255
+                or any(char.isspace() or ord(char) < 32 or 127 <= ord(char) <= 159
+                       or 0xD800 <= ord(char) <= 0xDFFF for char in ui_client_id)
+                or ui_client_id == values[1]):
+            raise CoreError("CONFIG_INVALID", "KEYCLOAK_UI_CLIENT_ID must identify a separate public browser client")
         issuer = values[0].rstrip("/")
         try:
             parsed = urlsplit(issuer)
@@ -63,7 +70,7 @@ class AuthSettings:
         external_role = get("KEYCLOAK_EXTERNAL_ROLE", "agent-external")
         if not owner_role or not external_role or owner_role == external_role:
             raise CoreError("CONFIG_INVALID", "Distinct owner and external Keycloak roles are required")
-        return cls(issuer, *values[1:], owner_role, external_role)
+        return cls(issuer, *values[1:], owner_role, external_role, ui_client_id)
 
 
 @dataclass(frozen=True)
@@ -191,16 +198,19 @@ class KeycloakAuthenticator:
 
 
 class AuthenticationMiddleware:
-    def __init__(self, app, *, authenticator):
+    def __init__(self, app, *, authenticator, public_paths=()):
         self.app = app
         self.authenticator = authenticator
+        self.public_paths = frozenset(public_paths)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         path = scope["path"]
-        if path in {"/health/live", "/health/ready"}:
+        if (path in {"/health/live", "/health/ready"}
+                or (path == "/ui/config" and self.authenticator.settings.ui_client_id)
+                or (scope["method"] in {"GET", "HEAD"} and path in self.public_paths)):
             await self.app(scope, receive, send)
             return
         owner_path = path == "/a2a/owner" or path.startswith(("/a2a/owner/", "/api/"))

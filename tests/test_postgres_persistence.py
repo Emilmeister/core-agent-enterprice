@@ -20,7 +20,7 @@ from a2a.types import (
 )
 from cryptography.fernet import Fernet
 
-from core_agent.app import create_app
+from tests.app_support import create_app
 from core_agent.artifacts import PostgresArtifactStore
 from core_agent.database import (
     PostgresAuditLog,
@@ -186,7 +186,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             self.assertNotIn("core_artifact_get", registry.names())
             python = registry.get("core_python_exec").description
             self.assertIn("datetime.now().astimezone()", python)
-            self.assertIn("not an OS sandbox", python)
+            self.assertIn("Execution is restricted to the chat workspace", python)
             terminal = registry.get("core_terminal_exec").description
             self.assertIn(
                 "Preinstalled CLI: GNU coreutils/findutils/gawk/sed/grep, rg, fd",
@@ -842,7 +842,9 @@ class PostgresRestartTests(unittest.TestCase):
                 self.assertEqual(result.message, "used persisted catalog")
                 self.assertEqual(len(connector.deadlines), 1)
                 self.assertLessEqual(connector.deadlines[0], time.monotonic())
-                self.assertIn("mcp_search", model.calls[0].tools)
+                # Persisted identities remain the ceiling; unavailable live tools
+                # must be absent from the model catalog after failed reconnect.
+                self.assertNotIn("mcp_search", model.calls[0].tools)
                 self.assertEqual(persisted.snapshot["effective_config_digest"], digest)
                 self.assertEqual(
                     persisted.snapshot["mcp_catalogs"],
@@ -1988,7 +1990,7 @@ class PostgresRestartTests(unittest.TestCase):
                     worker = threading.Thread(target=transition)
                     worker.start()
                     self._wait_for_blocked_query(
-                        database, "UPDATE core_budget_ledgers SET"
+                        database, "SELECT 1 FROM core_budget_ledgers WHERE root_run_id"
                     )
                     connection.execute(
                         """SELECT pg_sleep(GREATEST(

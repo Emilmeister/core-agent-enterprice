@@ -16,7 +16,7 @@ from unittest.mock import patch
 import httpx
 
 from core_agent.a2a import ATTACHMENTS_ONLY_PROMPT
-from core_agent.app import create_app
+from tests.app_support import create_app
 from core_agent.artifact_service import ArtifactService, InMemoryArtifactBackend
 from core_agent.config import RunRequest
 from core_agent.errors import CoreError
@@ -48,12 +48,14 @@ class ModelHandler(BaseHTTPRequestHandler):
     reasoning = "Deciding what to do."
     answer = "Streamed answer."
     tool_call = None
+    requests = []
 
     def log_message(self, *args):
         pass
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).requests.append(body)
         seen_tool_result = any(
             message.get("role") == "tool" for message in body["messages"]
         )
@@ -439,6 +441,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         ModelHandler.reasoning = "Deciding what to do."
         ModelHandler.answer = "Streamed answer."
         ModelHandler.tool_call = None
+        ModelHandler.requests = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -524,7 +527,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"}
         ]
 
-    async def test_reasoning_streams_as_thought_parts_before_the_terminal_frame(self):
+    async def test_guarded_stream_keeps_reasoning_private_and_publishes_final_text(self):
         frames = await self._frames(self._app(), "hello")
         thoughts = [
             part["text"]
@@ -532,7 +535,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             for part in self._parts(frame)
             if (part.get("metadata") or {}).get("adk_thought")
         ]
-        self.assertIn("Deciding what to do.", thoughts)
+        self.assertEqual(thoughts, [])
 
         partials = [
             frame
@@ -563,7 +566,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_tool_calls_and_results_stream_as_adk_data_parts(self):
+    async def test_guarded_tool_calls_and_results_remain_private(self):
         ModelHandler.tool_call = ("core_artifact_list", {})
         frames = await self._frames(self._app(), "list my files")
         typed = [
@@ -572,11 +575,11 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             for part in self._parts(frame)
             if (part.get("metadata") or {}).get("adk_type")
         ]
-        self.assertEqual(
-            [kind for kind, _data in typed], ["function_call", "function_response"]
-        )
-        self.assertEqual(typed[0][1]["name"], "core_artifact_list")
-        self.assertEqual(typed[1][1]["response"]["status"], "succeeded")
+        self.assertEqual(typed, [])
+        result = next(json.loads(message["content"]) for message in ModelHandler.requests[-1]["messages"]
+                      if message.get("role") == "tool")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["tool_name"], "core_artifact_list")
 
     async def test_artifact_tools_round_trip_through_the_model_catalog(self):
         ModelHandler.tool_call = (
@@ -584,16 +587,13 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             {"filename": "user:notes.txt", "content": "remember"},
         )
         frames = await self._frames(self._app(), "save a note")
-        responses = [
-            part["data"]["response"]
-            for frame in frames
-            for part in self._parts(frame)
-            if (part.get("metadata") or {}).get("adk_type") == "function_response"
-        ]
+        self.assertEqual(self._status(self._terminal(frames)[-1])["state"], "TASK_STATE_COMPLETED")
+        responses = [json.loads(message["content"]) for message in ModelHandler.requests[-1]["messages"]
+                     if message.get("role") == "tool"]
         self.assertEqual(responses[0]["output"]["version"], 0)
         self.assertEqual(responses[0]["output"]["artifact_name"], "user:notes.txt")
 
-    async def test_send_message_relays_the_remote_agent_progress_and_answer(self):
+    async def test_guarded_remote_result_reaches_model_without_raw_progress_relay(self):
         peer = ThreadingHTTPServer(("127.0.0.1", 0), RemoteAgentHandler)
         threading.Thread(target=peer.serve_forever, daemon=True).start()
         self.addCleanup(peer.server_close)
@@ -613,13 +613,9 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             if "text" in part
             and not (part.get("metadata") or {}).get("adk_thought")
         ]
-        self.assertIn("looking it up", relayed)
-        response = next(
-            part["data"]["response"]
-            for frame in frames
-            for part in self._parts(frame)
-            if (part.get("metadata") or {}).get("adk_type") == "function_response"
-        )
+        self.assertNotIn("looking it up", relayed)
+        response = next(json.loads(message["content"]) for message in ModelHandler.requests[-1]["messages"]
+                        if message.get("role") == "tool")
         self.assertEqual(response["output"]["result"], "24 degrees")
         self.assertTrue(response["output"]["success"])
         _body, headers = RemoteAgentHandler.seen

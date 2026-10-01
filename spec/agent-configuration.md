@@ -76,7 +76,7 @@ Database credentials являются Platform/deployment config и никогд
 
 `DATABASE_AUTO_MIGRATE=false` обязателен production: migration job с DDL role выполняется до app rollout, выдаёт app role только необходимые DML grants, затем app role проверяет schema version. Production startup MUST reject `DATABASE_AUTO_MIGRATE=true`. Test profile MAY явно выбрать SQLite/in-memory adapter; implicit fallback при отсутствии PostgreSQL запрещён.
 
-Production deployment MUST задавать `DURABLE_STORAGE_ROOT` как путь к отдельному S3-backed mount для immutable blobs, snapshots, manifests и artifacts. `LOCAL_WORKSPACE_ROOT` MUST указывать на локальную ephemeral filesystem container-а и не может находиться внутри durable mount. Optional `LOCAL_BASE_SNAPSHOT` содержит content-addressed snapshot ID; если он задан, startup проверяет commit manifest и все blobs до первого terminal call. Active workspace никогда не размещается под `DURABLE_STORAGE_ROOT`.
+Production deployment MUST задавать `DURABLE_STORAGE_ROOT` для immutable blobs, snapshots, manifests и artifacts; S3-backed mount допустим. `LOCAL_WORKSPACE_ROOT` MUST указывать на локальную ephemeral filesystem container-а. Авторизованное развёртывание MUST явно задавать `CHAT_WORKSPACE_ROOT` на постоянном POSIX томе. Все три root MUST быть различны и не находиться друг внутри друга; startup отклоняет пересечение в любом направлении. Optional `LOCAL_BASE_SNAPSHOT` содержит content-addressed snapshot ID для ephemeral scratch; если он задан, startup проверяет commit manifest и все blobs до первого terminal call. Он не материализуется поверх постоянной папки чата. Active workspace никогда не размещается под `DURABLE_STORAGE_ROOT`.
 
 ## Feature switches
 
@@ -123,6 +123,7 @@ legacy routes только в явно выбранном development/test profi
 | `KEYCLOAK_ISSUER_URL` | обязательна | Realm issuer, HTTPS; loopback HTTP только development/test |
 | `KEYCLOAK_CLIENT_ID` | обязательна | Confidential introspection client |
 | `KEYCLOAK_CLIENT_SECRET` | обязательна | Secret introspection credential; не сохраняется в task/model/audit |
+| `KEYCLOAK_UI_CLIENT_ID` | пусто | Отдельный public browser client для Code Flow + PKCE S256. Непустое значение включает публичный bootstrap `/ui/config`; не совпадает с introspection client ID, длина до 255 символов, без whitespace/control characters. Требует полной Keycloak configuration; пустое значение оставляет bootstrap закрытым |
 | `KEYCLOAK_AUDIENCE` | обязательна | Expected audience и scope принимаемых client roles |
 | `KEYCLOAK_OWNER_ROLE` | `agent-owner` | Роль владельца |
 | `KEYCLOAK_EXTERNAL_ROLE` | `agent-external` | Роль внешнего caller; исключает owner/HITL authority |
@@ -158,9 +159,25 @@ legacy routes только в явно выбранном development/test profi
 | `LLM_TIMEOUT` | `120` | Таймаут запроса в секундах |
 | `LLM_TEMPERATURE`, `LLM_TOP_P`, `LLM_TOP_K`, `LLM_FREQUENCY_PENALTY`, `LLM_PRESENCE_PENALTY` | provider default | Пустое значение MUST NOT отправляться в запросе. Anthropic не принимает frequency/presence penalties и отклоняет их при startup |
 | `LLM_HEADERS_JSON` | `{}` | Дополнительные заголовки запроса |
-| `LLM_EXTRA_BODY_JSON` | `{}` | Дополнительные поля тела; explicit `THINKING_LEVEL` имеет приоритет над совпадающим полем |
+| `LLM_EXTRA_BODY_JSON` | `{}` | Дополнительные поля тела; explicit `THINKING_LEVEL` имеет приоритет над совпадающим полем. `tools`, `tool_choice`, legacy `functions` и `function_call` из этого объекта игнорируются: каталог задаётся только текущими разрешёнными tools runtime |
 | `THINKING_ENABLED` | `true` | `false` MUST отправлять явный effort `none` |
 | `THINKING_LEVEL` | provider default | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+
+Guardrails использует отдельный context без tools. Если четыре connection
+переменные ниже пусты, используется подключение модели агента с отдельным
+непотоковым adapter; настройки основного adapter не меняются. Override требует
+все четыре непустых значения; частичный набор даёт `CONFIG_INVALID`.
+Override не наследует credential или дополнительные headers основной модели.
+
+| Переменная | По умолчанию | Семантика |
+|---|---|---|
+| `GUARDRAILS_LLM_PROVIDER` | подключение агента | `anthropic` выбирает Anthropic Messages; остальные provider labels используют OpenAI-compatible binding |
+| `GUARDRAILS_LLM_MODEL` | модель агента | Имя отдельной модели детектора |
+| `GUARDRAILS_LLM_BASE_URL` | подключение агента | Trusted provider URL; не приходит из prompt или tool arguments |
+| `GUARDRAILS_LLM_API_KEY` | подключение агента | Отдельный credential, не передаётся основной модели или в логи |
+| `GUARDRAILS_TIMEOUT_SECONDS` | `60` | Положительный конечный предел времени детектора на материал; сохраняется абсолютным deadline |
+| `GUARDRAILS_MAX_INPUT_TOKENS` | `100000` | Положительный суммарный input budget с инструкциями и overlap |
+| `GUARDRAILS_MAX_CALLS` | `32` | Положительный предел физических попыток на материал, начисляемых до сети |
 
 ### MCP
 
@@ -178,6 +195,15 @@ legacy routes только в явно выбранном development/test profi
 ### Удалённые A2A-агенты
 
 Реестр доверенных агентов и пары имя/значение исходящего auth header настраиваются владельцами в UI; default — `Authorization: Bearer …`. Значения хранятся защищённо и не выдаются модели/процессу/telemetry. Пустой effective registry скрывает `core_agent_send_message`. Runtime использует connection timeout и bounded read-only discovery retry; mutation не повторяется при неизвестном outcome.
+
+Company settings `remote_timeout_seconds` (default86400) и
+`remote_poll_interval_seconds` (default300) —положительные bounded integers
+с общей owner settings revision. Принятая операция сохраняет их snapshot.
+Registry revisions сохраняются immutable с identity actor, изменившего настройку,
+и временем записи. Credential encryption использует deployment Fernet key
+`PUSH_NOTIFICATION_ENCRYPTION_KEY`; ciphertext не является публичной настройкой.
+Development/test in-memory store может иметь ephemeral key. Durable secret
+storage/dispatch без persistent key запрещён, даже в development.
 
 `REMOTE_AGENTS`, прежние retry-настройки и `SEND_MESSAGE_API_KEY` являются legacy configuration для явного migration, а не конкурирующим live источником. Сохранённый owner registry становится authoritative после подтверждённого импорта; incoming credential forwarding удалён. Правила import/rollback определены в [Архитектуре](architecture.md).
 

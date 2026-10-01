@@ -202,6 +202,7 @@ def compile_effective_config(
         "core_fs_": "filesystem_mutation",
         "core_task_": "background_tasks",
         "core_delegate": "delegation",
+        "core_ask_owner": "human_input",
         "core_artifact_": "artifacts",
         "core_agent_": "remote_agents",
         "core_memory_": "memory",

@@ -3,7 +3,10 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+import math
+from copy import deepcopy
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
 
 from psycopg.types.json import Jsonb
 
@@ -11,6 +14,91 @@ from .errors import CoreError
 
 
 TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "REJECTED", "ABORTED"}
+WAIT_KINDS = {"timer", "task", "tool_approval", "owner_question", "guardrail"}
+OWNER_WAIT_KINDS = {"tool_approval", "owner_question", "guardrail"}
+DISPATCH_INTENTS = {"tool.intent", "tool.nested.intent"}
+EXECUTION_ADMISSIONS = DISPATCH_INTENTS | {"model.attempt.started", "tool.attempt.started", "budget.finalization.started"}
+_PRESERVE = object()
+
+
+def _check_inbound_duplicate(duplicate, provenance):
+    if "request_digest" in provenance and any(
+        duplicate["provenance"].get(key) != provenance[key]
+        for key in ("request_digest", "actor_id")
+    ):
+        raise CoreError("MESSAGE_ID_CONFLICT", "messageId was already used with different content or actor")
+
+
+@dataclass(frozen=True)
+class SuspendedRun:
+    run_id: str
+    task_id: str
+    wait_id: str
+    workflow_version: int
+
+
+@dataclass(frozen=True)
+class WaitRecord:
+    wait_id: str
+    run_id: str
+    tenant_id: str
+    owner_id: str
+    context_id: str
+    generation: int
+    kind: str
+    source_id: str
+    subject: dict
+    continuation: dict
+    deadline: float | None
+    outcome: dict | None
+    resolved_at: float | None
+    applied_at: float | None
+    created_at: float
+
+
+def _wait_generation(snapshot, kind, source_id, subject, continuation, deadline):
+    if (
+        kind not in WAIT_KINDS
+        or not isinstance(source_id, str)
+        or not source_id
+        or not isinstance(subject, dict)
+        or not isinstance(continuation, dict)
+        or continuation.get("version") != 1
+        or continuation.get("phase") not in {
+            "tool_gate", "tool_wait", "tool_result", "input", "python_nested"
+        }
+        or (deadline is not None and (
+            not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or not math.isfinite(deadline)
+        ))
+    ):
+        raise CoreError("INVALID_TASK_STATE")
+    generation = snapshot.get("wait_generation", 0)
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        raise CoreError("INVALID_TASK_STATE")
+    return generation if snapshot.get("wait_id") else generation + 1
+
+
+def _wait_outcome(wait, record, outcome, now):
+    if record.cancel_requested or record.state in TERMINAL_STATES:
+        return {"reason": "cancelled", "woke_at": now}
+    if wait.deadline is not None and wait.deadline <= now:
+        return {"reason": "time" if wait.kind == "timer" else "timeout", "woke_at": now}
+    return {**deepcopy(outcome), "woke_at": outcome.get("woke_at", now)}
+
+
+def _applied_wait_snapshot(current, snapshot, wait, state):
+    snapshot = dict(snapshot)
+    if "wait_generation" in current.snapshot and not snapshot.get("wait_id"):
+        snapshot["wait_generation"] = current.snapshot["wait_generation"]
+    if state in TERMINAL_STATES:
+        snapshot.pop("wait_id", None)
+    if wait is not None and snapshot.get("wait_id") != wait.wait_id:
+        if snapshot.get("wait_id") or (wait.outcome is None and state not in TERMINAL_STATES):
+            raise CoreError("INVALID_TASK_STATE")
+        snapshot.pop("wait_ready", None)
+    return snapshot
 
 
 @dataclass(frozen=True)
@@ -31,7 +119,119 @@ class WorkflowRecord:
     cancel_requested: bool = False
 
 
-class InMemoryWorkflowStore:
+class _ExecutionLifecycle:
+    """Shared lifecycle rules; stores supply their existing run/ledger locks."""
+
+    def execution_family(self, record, *, connection=None):
+        records = self._execution_records(record, connection)
+        family = {record.run_id}
+        while True:
+            children = {item.run_id for item in records if item.parent_run_id in family}
+            if children <= family:
+                return tuple(item for item in records if item.run_id in family)
+            family.update(children)
+
+    def execution_ancestors(self, record, *, connection=None):
+        records = {item.run_id: item for item in self._execution_records(record, connection)}
+        ancestors = []
+        parent = record.parent_run_id
+        while parent:
+            if parent in ancestors or parent not in records:
+                raise CoreError("CHECKPOINT_INVALID")
+            ancestors.append(parent)
+            parent = records[parent].parent_run_id
+        return tuple(ancestors)
+
+    def _check_execution_open(self, record, connection=None):
+        records = {item.run_id: item for item in self._execution_records(record, connection)}
+        run_id = record.run_id
+        visited = set()
+        while run_id:
+            if run_id in visited or run_id not in records:
+                raise CoreError("CHECKPOINT_INVALID")
+            visited.add(run_id)
+            item = records[run_id]
+            if item.state in TERMINAL_STATES or item.snapshot.get("terminal_intent"):
+                raise CoreError("EXECUTION_CLOSING")
+            run_id = item.parent_run_id
+
+    def register_execution(self, record, *, instance_id, worker_id, generation, lease_token):
+        owner = dict(instance_id=instance_id, worker_id=worker_id, generation=generation,
+                     cleanup_confirmed=False, local_execution_pending=False)
+        with self._execution_lock(record, lease_token) as (current, connection):
+            self._check_execution_open(current, connection)
+            previous = current.snapshot.get("execution_owner")
+            if previous and all(previous[key] == owner[key] for key in ("instance_id", "worker_id", "generation")):
+                return current
+            if previous and not previous["cleanup_confirmed"]:
+                raise CoreError("EXECUTION_CLEANUP_PENDING")
+            return self._save_execution_owner(current, owner, connection)
+
+    def confirm_execution(self, record, owner):
+        # A stale worker may acknowledge only its own retired generation. This
+        # operational receipt must not invalidate an active child's checkpoint.
+        with self._execution_lock(record) as (current, connection):
+            previous = current.snapshot.get("execution_owner")
+            if previous and all(previous[key] == owner[key] for key in ("instance_id", "worker_id", "generation")):
+                return self._save_execution_owner(current, {**previous, "cleanup_confirmed": True,
+                                                            "local_execution_pending": False}, connection)
+            return current
+
+    def begin_terminal(self, record, intent, *, lease_token):
+        with self._execution_lock(record, lease_token) as (current, connection):
+            if current.state in TERMINAL_STATES:
+                return current
+            existing = current.snapshot.get("terminal_intent")
+            if existing:
+                return current
+            return self.transition(current.run_id, tenant_id=current.tenant_id, owner_id=current.owner_id,
+                                   expected_version=record.version, state=current.state, snapshot=current.snapshot,
+                                   event_kind="execution.terminal_prepared", terminal_intent=deepcopy(intent),
+                                   lease_token=lease_token, connection=connection)
+
+    def clear_terminal(self, record, intent_id, *, lease_token, snapshot=None):
+        with self._execution_lock(record, lease_token) as (current, connection):
+            if current.snapshot.get("terminal_intent", {}).get("id") != intent_id:
+                raise CoreError("LEASE_LOST")
+            return self.transition(current.run_id, tenant_id=current.tenant_id, owner_id=current.owner_id,
+                                   expected_version=current.version, state="RUNNING", snapshot=current.snapshot if snapshot is None else snapshot,
+                                   event_kind="execution.terminal_reopened", terminal_intent=None,
+                                   lease_token=lease_token, connection=connection)
+
+    def _execution_snapshot(self, current, snapshot, state, event_kind, connection=None, *, terminal_intent=_PRESERVE):
+        if event_kind in EXECUTION_ADMISSIONS:
+            self._check_execution_open(current, connection)
+            if current.snapshot.get("execution_owner", {}).get("cleanup_confirmed"):
+                raise CoreError("LEASE_LOST")
+        snapshot = dict(snapshot)
+        for key in ("execution_owner", "terminal_intent"):
+            snapshot.pop(key, None)
+            if key in current.snapshot:
+                snapshot[key] = deepcopy(current.snapshot[key])
+        owner = snapshot.get("execution_owner")
+        if owner is not None:
+            pending_name = (snapshot.get("pending_call") or {}).get("name")
+            if event_kind == "tool.intent" and pending_name in {"core_terminal_exec", "core_python_exec"}:
+                owner["local_execution_pending"] = True
+            elif event_kind == "python.stopped" or (
+                state == "RUNNING" and event_kind in {"tool.completed", "tool.failed", "tool.denied"}
+            ):
+                owner["local_execution_pending"] = False
+        if terminal_intent is not _PRESERVE:
+            if terminal_intent is None:
+                snapshot.pop("terminal_intent", None)
+            else:
+                snapshot["terminal_intent"] = terminal_intent
+        if state in TERMINAL_STATES:
+            # Low-level historical/model-only records need no process receipt.
+            family = self.execution_family(current, connection=connection)
+            if any(item.snapshot.get("execution_owner") and not item.snapshot["execution_owner"]["cleanup_confirmed"] for item in family):
+                raise CoreError("EXECUTION_CLEANUP_PENDING")
+            snapshot.pop("terminal_intent", None)
+        return snapshot
+
+
+class InMemoryWorkflowStore(_ExecutionLifecycle):
     """Test adapter with the same optimistic state contract as PostgreSQL."""
 
     atomic = False
@@ -44,6 +244,31 @@ class InMemoryWorkflowStore:
         self._budgets = {}
         self._inbound = {}
         self._cancel_requested = set()
+        self._waits = {}
+
+    def current_time(self):
+        return self.clock()
+
+    def _execution_records(self, record, connection=None):
+        root = record.snapshot.get("budget_root_id", record.run_id)
+        with self._lock:
+            return tuple(item for item in self._records.values() if item.tenant_id == record.tenant_id
+                         and item.snapshot.get("budget_root_id", item.run_id) == root)
+
+    @contextmanager
+    def _execution_lock(self, record, lease_token=None):
+        with self._lock:
+            current = self.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            if lease_token is not None:
+                lease = self._leases.get(record.run_id)
+                if not lease or lease[1] != lease_token or lease[2] <= self.clock():
+                    raise CoreError("LEASE_LOST")
+            yield current, None
+
+    def _save_execution_owner(self, record, owner, connection):
+        updated = replace(record, snapshot={**record.snapshot, "execution_owner": owner})
+        self._records[record.run_id] = updated
+        return updated
 
     def create(
         self,
@@ -71,8 +296,9 @@ class InMemoryWorkflowStore:
                 raise CoreError("SESSION_CONFLICT")
             if record.parent_run_id:
                 parent = self._records.get(record.parent_run_id)
-                if parent is None:
+                if parent is None or parent.tenant_id != record.tenant_id or parent.owner_id != record.owner_id:
                     raise CoreError("TASK_NOT_FOUND")
+                self._check_execution_open(parent)
                 root_run_id = parent.snapshot.get("budget_root_id", parent.run_id)
             else:
                 root_run_id = record.run_id
@@ -119,6 +345,8 @@ class InMemoryWorkflowStore:
         context_id,
         content,
         provenance,
+        connection=None,
+        on_accept=None,
     ):
         with self._lock:
             record = self.by_task(task_id, tenant_id=tenant_id, owner_id=owner_id)
@@ -128,11 +356,16 @@ class InMemoryWorkflowStore:
                 None,
             )
             if duplicate is not None:
+                _check_inbound_duplicate(duplicate, provenance)
                 return dict(duplicate), False
             if record.context_id != context_id:
                 raise CoreError("INVALID_REQUEST", "context_id does not match task")
-            if record.state in TERMINAL_STATES:
+            if record.state in TERMINAL_STATES or record.cancel_requested:
                 raise CoreError("TASK_TERMINAL")
+            provenance = dict(provenance)
+            if on_accept is not None:
+                provenance.update(on_accept(record, len(messages) + 1, None))
+            provenance["history_after_sequence"] = record.snapshot.get("context", {}).get("sequence_range", [1, 0])[1]
             message = {
                 "sequence": len(messages) + 1,
                 "message_id": message_id,
@@ -143,6 +376,13 @@ class InMemoryWorkflowStore:
                 "consumed": False,
             }
             messages.append(message)
+            wait_id = record.snapshot.get("wait_id")
+            wait = self._waits.get(wait_id)
+            if wait is not None and wait.kind == "timer" and wait.outcome is None:
+                self.resolve_wait(
+                    wait.wait_id, tenant_id=tenant_id,
+                    outcome={"reason": "message", "message_id": message_id},
+                )
             return dict(message), True
 
     def pending_inbound(self, record):
@@ -330,7 +570,8 @@ class InMemoryWorkflowStore:
             if current.state in TERMINAL_STATES and state != current.state:
                 raise CoreError("INVALID_TASK_STATE")
             if (
-                state in {"COMPLETED", "FAILED", "REJECTED"}
+                (state in {"COMPLETED", "FAILED", "REJECTED"}
+                 or _metadata.get("event_kind") in DISPATCH_INTENTS)
                 and current.cancel_requested
             ):
                 raise CoreError("CANCEL_REQUESTED")
@@ -342,6 +583,10 @@ class InMemoryWorkflowStore:
                 lease = self._leases.get(run_id)
                 if not lease or lease[1] != lease_token or lease[2] <= self.clock():
                     raise CoreError("LEASE_LOST")
+            snapshot = self._execution_snapshot(current, snapshot, state, _metadata.get("event_kind"),
+                                                terminal_intent=_metadata.get("terminal_intent", _PRESERVE))
+            wait = self._waits.get(current.snapshot.get("wait_id"))
+            snapshot = _applied_wait_snapshot(current, snapshot, wait, state)
             root = current.snapshot["budget_root_id"]
             budget = self._budgets[root]
             if (
@@ -402,7 +647,123 @@ class InMemoryWorkflowStore:
                 }
             )
             self._records[run_id] = record
+            if wait is not None and snapshot.get("wait_id") != wait.wait_id:
+                now = self.clock()
+                self._waits[wait.wait_id] = replace(
+                    wait, outcome=wait.outcome or {"reason": "cancelled", "woke_at": now},
+                    resolved_at=wait.resolved_at if wait.resolved_at is not None else now,
+                    applied_at=now,
+                )
             return record
+
+    def enter_wait(
+        self, record, *, kind, source_id, subject, continuation, deadline,
+        snapshot, lease_token, connection=None,
+    ):
+        generation = _wait_generation(snapshot, kind, source_id, subject, continuation, deadline)
+        with self._lock:
+            current = self.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            existing = next((wait for wait in self._waits.values()
+                             if wait.run_id == record.run_id and wait.generation == generation), None)
+            if existing is not None:
+                if (existing.kind != kind or existing.source_id != source_id
+                        or existing.subject != subject or existing.continuation != continuation
+                        or existing.deadline != deadline):
+                    raise CoreError("SESSION_CONFLICT")
+                return deepcopy(existing)
+            if current.cancel_requested:
+                raise CoreError("CANCEL_REQUESTED")
+            if current.state in TERMINAL_STATES or current.snapshot.get("wait_id"):
+                raise CoreError("INVALID_TASK_STATE")
+            if generation != current.snapshot.get("wait_generation", 0) + 1:
+                raise CoreError("SESSION_CONFLICT")
+            if not lease_token:
+                raise CoreError("LEASE_LOST")
+            now = self.clock()
+            wait = WaitRecord(str(uuid.uuid4()), record.run_id, record.tenant_id,
+                              record.owner_id, record.context_id, generation, kind, source_id,
+                              deepcopy(subject), deepcopy(continuation), deadline, None, None, None, now)
+            unread = next((item for item in self._inbound[record.run_id] if not item["consumed"]), None)
+            outcome = None
+            if deadline is not None and deadline <= now:
+                outcome = _wait_outcome(wait, current, {}, now)
+            elif kind == "timer" and unread is not None:
+                outcome = {"reason": "message", "message_id": unread["message_id"], "woke_at": now}
+            if outcome is not None:
+                wait = replace(wait, outcome=outcome, resolved_at=now)
+            next_snapshot = {**snapshot, "wait_id": wait.wait_id, "wait_generation": generation}
+            next_snapshot.pop("wait_ready", None)
+            if outcome is not None:
+                next_snapshot["wait_ready"] = True
+            self.transition(
+                record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id,
+                expected_version=record.version,
+                state="WAITING_TASK" if kind in {"timer", "task"} else "WAITING_INPUT",
+                snapshot=next_snapshot, lease_token=lease_token,
+            )
+            self._waits[wait.wait_id] = wait
+            self._leases.pop(record.run_id, None)
+            return deepcopy(wait)
+
+    def get_wait(self, wait_id, *, tenant_id, owner_id=None):
+        with self._lock:
+            wait = self._waits.get(wait_id)
+            if (wait is None or wait.tenant_id != tenant_id
+                    or (owner_id is not None and wait.owner_id != owner_id)):
+                raise CoreError("TASK_NOT_FOUND")
+            return deepcopy(wait)
+
+    def list_interactions(self, task_id, *, tenant_id, status="pending", limit=50, after=None):
+        with self._lock:
+            records = [record for record in self._records.values()
+                       if record.task_id == task_id and record.tenant_id == tenant_id]
+            if len(records) != 1:
+                raise CoreError("TASK_NOT_FOUND")
+            root = records[0].snapshot["budget_root_id"]
+            runs = {record.run_id for record in self._records.values()
+                    if record.tenant_id == tenant_id and record.snapshot["budget_root_id"] == root}
+            waits = sorted((wait for wait in self._waits.values()
+                            if wait.tenant_id == tenant_id and wait.run_id in runs
+                            and wait.kind in OWNER_WAIT_KINDS
+                            and (status == "all" or wait.outcome is None)
+                            and (after is None or (wait.created_at, wait.wait_id) > after)),
+                           key=lambda wait: (wait.created_at, wait.wait_id))
+            return tuple(deepcopy(wait) for wait in waits[:max(0, limit)])
+
+    def resolve_wait(self, wait_id, *, tenant_id, outcome, actor_id=None):
+        with self._lock:
+            wait = self.get_wait(wait_id, tenant_id=tenant_id)
+            current = self.get(wait.run_id, tenant_id=tenant_id)
+            if wait.outcome is not None:
+                return wait
+            now = self.clock()
+            resolved = replace(wait, outcome=_wait_outcome(wait, current, outcome, now), resolved_at=now)
+            if current.state in TERMINAL_STATES:
+                resolved = replace(resolved, applied_at=now)
+            else:
+                self.transition(
+                    current.run_id, tenant_id=tenant_id, owner_id=current.owner_id,
+                    expected_version=current.version, state=current.state,
+                    snapshot={**current.snapshot, "wait_ready": True},
+                )
+            self._waits[wait_id] = resolved
+            return deepcopy(resolved)
+
+    def pending_waits(self, *, kind=None, limit=100, after=None):
+        with self._lock:
+            waits = sorted((wait for wait in self._waits.values()
+                            if wait.outcome is None and (kind is None or wait.kind == kind)
+                            and (after is None or (wait.created_at, wait.wait_id) > after)),
+                           key=lambda wait: (wait.created_at, wait.wait_id))
+            return tuple(deepcopy(wait) for wait in waits[:max(0, limit)])
+
+    def expire_waits(self, *, limit=100):
+        with self._lock:
+            due = [wait for wait in self._waits.values() if wait.outcome is None
+                   and wait.deadline is not None and wait.deadline <= self.clock()]
+            due.sort(key=lambda wait: (wait.deadline, wait.wait_id))
+            return tuple(self.resolve_wait(wait.wait_id, tenant_id=wait.tenant_id, outcome={})
+                         for wait in due[:max(0, limit)])
 
     def enter_approval(
         self,
@@ -514,6 +875,10 @@ class InMemoryWorkflowStore:
                     else record.state not in TERMINAL_STATES
                 )
                 and (not root_only or record.parent_run_id is None)
+                and (record.cancel_requested or record.snapshot.get("terminal_intent") or not any(
+                    wait.run_id == record.run_id and wait.outcome is None
+                    for wait in self._waits.values()
+                ))
                 and (
                     record.run_id not in self._leases
                     or self._leases[record.run_id][2] <= self.clock()
@@ -521,7 +886,7 @@ class InMemoryWorkflowStore:
             )[:limit]
 
 
-class PostgresWorkflowStore:
+class PostgresWorkflowStore(_ExecutionLifecycle):
     """Atomic source of truth for run state, events, checkpoints and outbox."""
 
     atomic = True
@@ -529,6 +894,208 @@ class PostgresWorkflowStore:
     def __init__(self, database, clock=time.time):
         self.database = database
         self.clock = clock
+
+    @staticmethod
+    def _current_time(connection):
+        return connection.execute(
+            "SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision AS now"
+        ).fetchone()["now"]
+
+    def current_time(self):
+        with self.database.pool.connection() as connection:
+            return self._current_time(connection)
+
+    def _execution_records(self, record, connection=None):
+        with (self.database.pool.connection() if connection is None else nullcontext(connection)) as db:
+            rows = db.execute("SELECT * FROM core_runs WHERE tenant_id = %s AND snapshot->>'budget_root_id' = %s",
+                              (record.tenant_id, record.snapshot.get("budget_root_id", record.run_id))).fetchall()
+        return tuple(self._record(row) for row in rows)
+
+    def _lock_execution_ledger(self, record, connection):
+        if connection.execute("SELECT 1 FROM core_budget_ledgers WHERE root_run_id = %s AND tenant_id = %s FOR UPDATE",
+                              (record.snapshot["budget_root_id"], record.tenant_id)).fetchone() is None:
+            raise CoreError("TASK_NOT_FOUND")
+
+    @contextmanager
+    def _execution_lock(self, record, lease_token=None):
+        with self.database.transaction() as connection:
+            current = self.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id, connection=connection, lock=True)
+            self._lock_execution_ledger(current, connection)
+            if lease_token is not None and connection.execute(
+                "SELECT 1 FROM core_runs WHERE run_id = %s AND lease_token = %s AND lease_expires_at > EXTRACT(EPOCH FROM clock_timestamp())",
+                (current.run_id, lease_token),
+            ).fetchone() is None:
+                raise CoreError("LEASE_LOST")
+            yield current, connection
+
+    def _save_execution_owner(self, record, owner, connection):
+        updated = replace(record, snapshot={**record.snapshot, "execution_owner": owner})
+        connection.execute("UPDATE core_runs SET snapshot = %s WHERE run_id = %s AND tenant_id = %s",
+                           (Jsonb(updated.snapshot), record.run_id, record.tenant_id))
+        return updated
+
+    def get_wait(self, wait_id, *, tenant_id, owner_id=None, connection=None, lock=False):
+        with (self.database.pool.connection() if connection is None else nullcontext(connection)) as db:
+            sql = "SELECT * FROM core_waits WHERE wait_id = %s AND tenant_id = %s"
+            values = [wait_id, tenant_id]
+            if owner_id is not None:
+                sql += " AND owner_id = %s"
+                values.append(owner_id)
+            if lock:
+                sql += " FOR UPDATE"
+            row = db.execute(sql, values).fetchone()
+            if row is None:
+                raise CoreError("TASK_NOT_FOUND")
+            return WaitRecord(**row)
+
+    def list_interactions(self, task_id, *, tenant_id, status="pending", limit=50, after=None):
+        with self.database.pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT snapshot FROM core_runs WHERE task_id = %s AND tenant_id = %s LIMIT 2",
+                (task_id, tenant_id),
+            ).fetchall()
+            if len(rows) != 1:
+                raise CoreError("TASK_NOT_FOUND")
+            filters = " AND w.resolved_at IS NULL" if status != "all" else ""
+            values = [tenant_id, rows[0]["snapshot"]["budget_root_id"], sorted(OWNER_WAIT_KINDS)]
+            if after is not None:
+                filters += " AND (w.created_at, w.wait_id) > (%s, %s)"
+                values.extend(after)
+            rows = connection.execute(
+                """SELECT w.* FROM core_waits w JOIN core_runs r
+                   ON r.run_id = w.run_id AND r.tenant_id = w.tenant_id
+                   WHERE w.tenant_id = %s AND r.snapshot->>'budget_root_id' = %s
+                   AND w.kind = ANY(%s)""" + filters
+                + " ORDER BY w.created_at, w.wait_id LIMIT %s", (*values, max(0, limit)),
+            ).fetchall()
+            return tuple(WaitRecord(**row) for row in rows)
+
+    def enter_wait(
+        self, record, *, kind, source_id, subject, continuation, deadline,
+        snapshot, lease_token, connection=None,
+    ):
+        generation = _wait_generation(snapshot, kind, source_id, subject, continuation, deadline)
+        with (self.database.transaction() if connection is None else nullcontext(connection)) as db:
+            current = self.get(record.run_id, tenant_id=record.tenant_id,
+                               owner_id=record.owner_id, connection=db, lock=True)
+            existing = db.execute(
+                "SELECT * FROM core_waits WHERE run_id = %s AND generation = %s FOR UPDATE",
+                (record.run_id, generation),
+            ).fetchone()
+            if existing is not None:
+                if (existing["kind"] != kind or existing["source_id"] != source_id
+                        or existing["subject"] != subject or existing["continuation"] != continuation
+                        or existing["deadline"] != deadline):
+                    raise CoreError("SESSION_CONFLICT")
+                return WaitRecord(**existing)
+            if current.cancel_requested:
+                raise CoreError("CANCEL_REQUESTED")
+            if current.state in TERMINAL_STATES or current.snapshot.get("wait_id"):
+                raise CoreError("INVALID_TASK_STATE")
+            if generation != current.snapshot.get("wait_generation", 0) + 1:
+                raise CoreError("SESSION_CONFLICT")
+            if not lease_token:
+                raise CoreError("LEASE_LOST")
+            now = self._current_time(db)
+            wait = WaitRecord(str(uuid.uuid4()), record.run_id, record.tenant_id,
+                              record.owner_id, record.context_id, generation, kind, source_id,
+                              deepcopy(subject), deepcopy(continuation), deadline, None, None, None, now)
+            unread = None
+            if kind == "timer":
+                unread = db.execute(
+                    """SELECT message_id FROM core_inbound_messages WHERE run_id = %s
+                       AND consumed_at IS NULL ORDER BY sequence LIMIT 1""",
+                    (record.run_id,),
+                ).fetchone()
+            outcome = None
+            if deadline is not None and deadline <= now:
+                outcome = _wait_outcome(wait, current, {}, now)
+            elif unread is not None:
+                outcome = {"reason": "message", "message_id": unread["message_id"], "woke_at": now}
+            if outcome is not None:
+                wait = replace(wait, outcome=outcome, resolved_at=now)
+            db.execute(
+                """INSERT INTO core_waits
+                   (wait_id, run_id, tenant_id, owner_id, context_id, generation,
+                    kind, source_id, subject, continuation, deadline, outcome,
+                    resolved_at, applied_at, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)""",
+                (wait.wait_id, wait.run_id, wait.tenant_id, wait.owner_id, wait.context_id,
+                 generation, kind, source_id, Jsonb(wait.subject), Jsonb(wait.continuation),
+                 deadline, Jsonb(outcome) if outcome is not None else None, wait.resolved_at, now),
+            )
+            next_snapshot = {**snapshot, "wait_id": wait.wait_id, "wait_generation": generation}
+            next_snapshot.pop("wait_ready", None)
+            if outcome is not None:
+                next_snapshot["wait_ready"] = True
+            state = "WAITING_TASK" if kind in {"timer", "task"} else "WAITING_INPUT"
+            self._transition_locked(
+                db, current, expected_version=record.version, state=state,
+                snapshot=next_snapshot, event_kind="wait.entered", event_data={"state": state},
+                audit=(("wait.entered", {"state": state}),), lease_token=lease_token, now=now,
+            )
+            db.execute(
+                """UPDATE core_runs SET lease_owner = NULL, lease_token = NULL,
+                   lease_expires_at = NULL WHERE run_id = %s AND tenant_id = %s""",
+                (record.run_id, record.tenant_id),
+            )
+            return wait
+
+    def _resolve_wait_locked(self, connection, current, wait, outcome, actor_id=None):
+        if wait.outcome is not None:
+            return wait
+        now = self._current_time(connection)
+        outcome = _wait_outcome(wait, current, outcome, now)
+        applied_at = now if current.state in TERMINAL_STATES else None
+        connection.execute(
+            """UPDATE core_waits SET outcome = %s, resolved_at = %s, applied_at = %s
+               WHERE wait_id = %s AND tenant_id = %s""",
+            (Jsonb(outcome), now, applied_at, wait.wait_id, wait.tenant_id),
+        )
+        if current.state not in TERMINAL_STATES:
+            self._transition_locked(
+                connection, current, expected_version=current.version, state=current.state,
+                snapshot={**current.snapshot, "wait_ready": True}, event_kind="wait.resolved",
+                event_data={"state": current.state},
+                audit=(("wait.resolved", {"state": current.state, "actor_id": actor_id}),),
+                now=now,
+            )
+        return replace(wait, outcome=outcome, resolved_at=now, applied_at=applied_at)
+
+    def resolve_wait(self, wait_id, *, tenant_id, outcome, actor_id=None):
+        with self.database.transaction() as connection:
+            # Discover the run without a wait lock; all mutations lock run then wait.
+            wait = self.get_wait(wait_id, tenant_id=tenant_id, connection=connection)
+            current = self.get(wait.run_id, tenant_id=tenant_id, connection=connection, lock=True)
+            wait = self.get_wait(wait_id, tenant_id=tenant_id, connection=connection, lock=True)
+            return self._resolve_wait_locked(connection, current, wait, outcome, actor_id)
+
+    def pending_waits(self, *, kind=None, limit=100, after=None):
+        if limit <= 0:
+            return ()
+        with self.database.pool.connection() as connection:
+            kind_filter = " AND kind = %s" if kind is not None else ""
+            values = [kind] if kind is not None else []
+            if after is not None:
+                kind_filter += " AND (created_at, wait_id) > (%s, %s)"
+                values.extend(after)
+            rows = connection.execute(
+                "SELECT * FROM core_waits WHERE resolved_at IS NULL" + kind_filter
+                + " ORDER BY created_at, wait_id LIMIT %s", (*values, limit),
+            ).fetchall()
+        return tuple(WaitRecord(**row) for row in rows)
+
+    def expire_waits(self, *, limit=100):
+        if limit <= 0:
+            return ()
+        with self.database.pool.connection() as connection:
+            rows = connection.execute(
+                """SELECT wait_id, tenant_id FROM core_waits WHERE resolved_at IS NULL
+                   AND deadline <= EXTRACT(EPOCH FROM clock_timestamp())
+                   ORDER BY deadline, wait_id LIMIT %s""", (limit,),
+            ).fetchall()
+        return tuple(self.resolve_wait(row["wait_id"], tenant_id=row["tenant_id"], outcome={})
+                     for row in rows)
 
     @staticmethod
     def _record(row):
@@ -628,15 +1195,18 @@ class PostgresWorkflowStore:
             nonlocal record
             if record.parent_run_id:
                 parent = db.execute(
-                    """SELECT snapshot FROM core_runs
+                    """SELECT * FROM core_runs
                        WHERE run_id = %s AND tenant_id = %s FOR SHARE""",
                     (record.parent_run_id, record.tenant_id),
                 ).fetchone()
-                if parent is None:
+                if parent is None or parent["owner_id"] != record.owner_id:
                     raise CoreError("TASK_NOT_FOUND")
                 root_run_id = parent["snapshot"].get(
                     "budget_root_id", record.parent_run_id
                 )
+                parent_record = self._record(parent)
+                self._lock_execution_ledger(parent_record, db)
+                self._check_execution_open(parent_record, db)
             else:
                 root_run_id = record.run_id
                 if reserve_model_turns > budget_limits[0]:
@@ -911,9 +1481,11 @@ class PostgresWorkflowStore:
         context_id,
         content,
         provenance,
+        connection=None,
+        on_accept=None,
     ):
         now = self.clock()
-        with self.database.transaction() as connection:
+        with (nullcontext(connection) if connection is not None else self.database.transaction()) as connection:
             record = connection.execute(
                 """SELECT * FROM core_runs
                    WHERE task_id = %s AND tenant_id = %s AND owner_id = %s
@@ -931,19 +1503,24 @@ class PostgresWorkflowStore:
                 (record.run_id, message_id),
             ).fetchone()
             if duplicate is not None:
+                _check_inbound_duplicate(duplicate, provenance)
                 return {
-                    **dict(duplicate),
+                    **{key: value for key, value in duplicate.items() if key != "consumed_at"},
                     "consumed": duplicate["consumed_at"] is not None,
                 }, False
             if record.context_id != context_id:
                 raise CoreError("INVALID_REQUEST", "context_id does not match task")
-            if record.state in TERMINAL_STATES:
+            if record.state in TERMINAL_STATES or record.cancel_requested:
                 raise CoreError("TASK_TERMINAL")
             sequence = connection.execute(
                 """SELECT COALESCE(max(sequence), 0) + 1 AS sequence
                    FROM core_inbound_messages WHERE run_id = %s""",
                 (record.run_id,),
             ).fetchone()["sequence"]
+            provenance = dict(provenance)
+            if on_accept is not None:
+                provenance.update(on_accept(record, sequence, connection))
+            provenance["history_after_sequence"] = record.snapshot.get("context", {}).get("sequence_range", [1, 0])[1]
             connection.execute(
                 """INSERT INTO core_inbound_messages
                    (run_id, sequence, message_id, context_id, role, content,
@@ -977,6 +1554,13 @@ class PostgresWorkflowStore:
                 ),
                 now,
             )
+            wait_id = record.snapshot.get("wait_id")
+            if wait_id is not None:
+                wait = self.get_wait(wait_id, tenant_id=tenant_id, connection=connection, lock=True)
+                if wait.kind == "timer" and wait.outcome is None:
+                    self._resolve_wait_locked(
+                        connection, record, wait, {"reason": "message", "message_id": message_id}
+                    )
         return {
             "sequence": sequence,
             "message_id": message_id,
@@ -1099,13 +1683,17 @@ class PostgresWorkflowStore:
         consume_tool_calls=0,
         release_model_turns=0,
         include_shared_budget=False,
+        terminal_intent=_PRESERVE,
+        now=None,
     ):
-        now = self.clock()
+        now = self.clock() if now is None else now
         if current.version != expected_version:
             raise CoreError("SESSION_CONFLICT")
         if current.state in TERMINAL_STATES and state != current.state:
             raise CoreError("INVALID_TASK_STATE")
-        if state in {"COMPLETED", "FAILED", "REJECTED"} and current.cancel_requested:
+        if current.cancel_requested and (
+            state in {"COMPLETED", "FAILED", "REJECTED"} or event_kind in DISPATCH_INTENTS
+        ):
             raise CoreError("CANCEL_REQUESTED")
         if state in TERMINAL_STATES:
             pending = connection.execute(
@@ -1115,6 +1703,7 @@ class PostgresWorkflowStore:
             ).fetchone()
             if pending is not None:
                 raise CoreError("INBOUND_MESSAGE_PENDING")
+        self._lock_execution_ledger(current, connection)
         if lease_token is not None:
             lease = connection.execute(
                 """SELECT 1 FROM core_runs
@@ -1125,6 +1714,22 @@ class PostgresWorkflowStore:
             ).fetchone()
             if lease is None:
                 raise CoreError("LEASE_LOST")
+        snapshot = self._execution_snapshot(current, snapshot, state, event_kind, connection,
+                                            terminal_intent=terminal_intent)
+        wait = None
+        if current.snapshot.get("wait_id"):
+            wait = self.get_wait(current.snapshot["wait_id"], tenant_id=current.tenant_id,
+                                 connection=connection, lock=True)
+        snapshot = _applied_wait_snapshot(current, snapshot, wait, state)
+        if wait is not None and snapshot.get("wait_id") != wait.wait_id:
+            applied_at = self._current_time(connection)
+            connection.execute(
+                """UPDATE core_waits SET outcome = COALESCE(outcome, %s),
+                   resolved_at = COALESCE(resolved_at, %s), applied_at = %s
+                   WHERE wait_id = %s AND tenant_id = %s""",
+                (Jsonb({"reason": "cancelled", "woke_at": applied_at}), applied_at,
+                 applied_at, wait.wait_id, current.tenant_id),
+            )
         if consume_model_turns < 0 or consume_tool_calls < 0 or release_model_turns < 0:
             raise CoreError("INVALID_TASK_STATE")
         if consume_model_turns:
@@ -1461,8 +2066,10 @@ class PostgresWorkflowStore:
         consume_tool_calls=0,
         release_model_turns=0,
         include_shared_budget=False,
+        connection=None,
+        terminal_intent=_PRESERVE,
     ):
-        with self.database.transaction() as connection:
+        with (self.database.transaction() if connection is None else nullcontext(connection)) as connection:
             current = self.get(
                 run_id,
                 tenant_id=tenant_id,
@@ -1488,6 +2095,7 @@ class PostgresWorkflowStore:
                 consume_tool_calls=consume_tool_calls,
                 release_model_turns=release_model_turns,
                 include_shared_budget=include_shared_budget,
+                terminal_intent=terminal_intent,
             )
 
     def acquire_lease(self, run_id, *, tenant_id, owner_id, worker_id, ttl):
@@ -1570,6 +2178,9 @@ class PostgresWorkflowStore:
                 f"""SELECT * FROM core_runs
                     WHERE {state_filter}
                       {root_filter}
+                      AND (cancel_requested OR snapshot ? 'terminal_intent' OR NOT EXISTS (
+                          SELECT 1 FROM core_waits wait WHERE wait.run_id = core_runs.run_id
+                          AND wait.resolved_at IS NULL))
                       AND (lease_expires_at IS NULL OR lease_expires_at <=
                            EXTRACT(EPOCH FROM clock_timestamp()))
                     ORDER BY updated_at LIMIT %s""",

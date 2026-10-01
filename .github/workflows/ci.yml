@@ -8,6 +8,95 @@ permissions:
   contents: read
 
 jobs:
+  sandbox-linux:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      SANDBOX_CLUSTER: core-sandbox-${{ matrix.arch }}
+      KUBECONFIG: ${{ runner.temp }}/core-sandbox/kubeconfig
+      SANDBOX_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.6"
+      - run: uv python install 3.12
+      - name: Install pinned native kind
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-sandbox/bin"
+          curl --fail --silent --show-error --location --max-time 120 \
+            "https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-$SANDBOX_ARCH" \
+            --output "$RUNNER_TEMP/core-sandbox/bin/kind-linux-$SANDBOX_ARCH"
+          cp deploy/kubernetes/kind.sha256 "$RUNNER_TEMP/core-sandbox/bin/"
+          cd "$RUNNER_TEMP/core-sandbox/bin"
+          sha256sum --check --ignore-missing kind.sha256
+          chmod +x "kind-linux-$SANDBOX_ARCH"
+          mv "kind-linux-$SANDBOX_ARCH" kind
+          echo "$RUNNER_TEMP/core-sandbox/bin" >> "$GITHUB_PATH"
+      - name: Build native application image
+        run: docker build -t core-agent:sandbox .
+      - name: Create disposable dual-stack Kubernetes cluster
+        run: |
+          kind create cluster --name "$SANDBOX_CLUSTER" --kubeconfig "$KUBECONFIG" \
+            --config deploy/kubernetes/kind-sandbox.yaml --wait 120s \
+            --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+          docker cp "$SANDBOX_CLUSTER-control-plane:/usr/bin/kubectl" "$RUNNER_TEMP/core-sandbox/bin/kubectl"
+          kind load docker-image core-agent:sandbox --name "$SANDBOX_CLUSTER"
+          docker exec "$SANDBOX_CLUSTER-control-plane" mkdir -p /var/lib/kubelet/seccomp/core-agent
+          docker cp "deploy/security/oci-$SANDBOX_ARCH.json" \
+            "$SANDBOX_CLUSTER-control-plane:/var/lib/kubelet/seccomp/core-agent/oci.json"
+      - name: Start controlled receivers inside the disposable node network
+        run: |
+          for address in 93.184.216.34/32 93.184.216.35/32 10.77.0.1/32 \
+            2606:4700:abcd::10/128 2606:4700:abcd::11/128 fd77::1/128
+          do
+            docker exec "$SANDBOX_CLUSTER-control-plane" ip address add "$address" dev lo
+          done
+          docker run -d --name core-sandbox-network-fixture \
+            --network "container:$SANDBOX_CLUSTER-control-plane" --user 0 \
+            --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/deploy/kubernetes/network-fixture.py,dst=/fixture.py,readonly" \
+            --entrypoint /usr/local/bin/python3 core-agent:sandbox -I -S /fixture.py 0.0.0.0
+          docker exec core-sandbox-network-fixture curl --fail --silent --show-error \
+            --retry 20 --retry-delay 1 --retry-connrefused --retry-max-time 30 \
+            --max-time 3 http://127.0.0.1:18082/ready
+          docker inspect "$SANDBOX_CLUSTER-control-plane" > "$RUNNER_TEMP/core-sandbox/node.json"
+          uv run --no-project --python 3.12 deploy/kubernetes/network-fixture.py \
+            --environment "$RUNNER_TEMP/core-sandbox/node.json" > "$RUNNER_TEMP/core-sandbox/fixture.env"
+          kubectl --kubeconfig "$KUBECONFIG" create configmap core-agent-sandbox-fixture \
+            --from-env-file="$RUNNER_TEMP/core-sandbox/fixture.env"
+          kubectl --kubeconfig "$KUBECONFIG" create configmap core-agent-sandbox-tests \
+            --from-file=tests/test_sandbox_linux.py
+      - name: Verify mandatory sandbox acceptance in the Pod
+        run: |
+          kubectl --kubeconfig "$KUBECONFIG" apply -f deploy/kubernetes/sandbox-pod.yaml
+          kubectl --kubeconfig "$KUBECONFIG" wait pod/core-agent-sandbox-tests \
+            --for=jsonpath='{.status.phase}'=Succeeded --timeout=800s
+          kubectl --kubeconfig "$KUBECONFIG" logs core-agent-sandbox-tests
+      - name: Collect diagnostics and remove only the disposable cluster
+        if: always()
+        run: |
+          if command -v kubectl >/dev/null; then
+            kubectl --kubeconfig "$KUBECONFIG" describe pod core-agent-sandbox-tests || true
+            kubectl --kubeconfig "$KUBECONFIG" logs core-agent-sandbox-tests || true
+          fi
+          docker logs core-sandbox-network-fixture || true
+          docker rm -f core-sandbox-network-fixture || true
+          if command -v kind >/dev/null; then
+            kind delete cluster --name "$SANDBOX_CLUSTER" --kubeconfig "$KUBECONFIG"
+          fi
+
   verify:
     runs-on: ubuntu-latest
     services:
@@ -55,6 +144,17 @@ jobs:
       - name: Remove isolated Keycloak
         if: always()
         run: docker rm -f core-agent-keycloak-test
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Build owner UI
+        working-directory: ui
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
       - run: uv build --no-sources
       - run: docker build -t core-agent:ci .
       - run: test "$(docker image inspect core-agent:ci --format '{{.Config.User}}')" = agent

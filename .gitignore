@@ -1,5 +1,8 @@
 .venv/
+.cache/
+.local-evidence/
 dist/
+core_agent/ui_dist/
 __pycache__/
 *.py[cod]
 .env

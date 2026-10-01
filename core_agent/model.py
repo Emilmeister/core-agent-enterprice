@@ -387,6 +387,10 @@ class CompatibleHttpModel:
         schemas, reverse = self._tools(tools)
         messages = list(messages or ({"role": "user", "content": context},))
         body = self.invocation_parameters
+        # Provider options cannot reintroduce capabilities hidden by runtime
+        # policy, including the detector's deliberately empty catalog.
+        for key in ("tools", "tool_choice", "functions", "function_call"):
+            body.pop(key, None)
         if self.api_format == "openai":
             body.update(
                 {

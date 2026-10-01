@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from core_agent.app import create_app
+from tests.app_support import create_app
 from core_agent.errors import CoreError
 from core_agent.mcp import InMemoryMcpConnector
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest

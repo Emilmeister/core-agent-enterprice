@@ -128,9 +128,29 @@ policy/approval и generic second opinion без самостоятельног�
 
 Сохраняет отдельное ожидание до абсолютного момента; новый принятый follow-up будит его раньше с причиной `message`. Старый timer/duplicate message не будит следующее ожидание. Runtime освобождает worker; полные правила LONG-03 определены в [Ожиданиях](tasks-and-delegation.md).
 
+Единственный аргумент — обязательный `until` (ISO-8601 строка с явным UTC offset
+или `Z`); неизвестные поля и naive datetime отклоняются как `TOOL_ARGUMENT_INVALID`.
+Прошедший срок возвращает результат сразу. Результат содержит нормализованный
+`until`, `woke_at` в UTC и `reason: time|message`; при сообщении также `message_id`.
+Пробуждение не утверждает, что ожидаемое внешнее событие произошло.
+
 ### Создание cron
 
-Отдельный model-callable tool создаёт расписание с prompt, cron-выражением и IANA timezone. Он подчинён обычной tool policy и по умолчанию требует HITL; запрет tool не отключает owner UI. Семантика CRON-01–07 определена в [Расписаниях](tasks-and-delegation.md).
+`core_cron_create` принимает ровно `{prompt, expression, timezone?}` и создаёт
+расписание текущего canonical чата. Default timezone —`Europe/Moscow`; tenant,
+owner, context, source и request identity модель не задаёт. Tool mutating с
+risk `external_write`, доступен в обоих runtime modes только внутри capability
+intersection и live tool policy. По умолчанию требуется HITL для exact subject; cron approval дополнительно
+содержит `resolved_parameters.timezone` с сохранённым IANA значением либо default
+`Europe/Moscow`. Это metadata для владельца и digest/stale проверки, а исходные
+`arguments` сохраняются без подмены. Direct и nested Python calls используют
+одну процедуру построения subject; старое решение с иным subject не dispatch-ится.
+Python broker и delegation повторно применяют те же проверки. Deny удаляет tool
+из model catalog и отвергает stale dispatch; owner UI сохраняет доступ.
+Повтор accepted call использует deterministic receipt; создание fenced текущим
+workflow lease и не повторяется после unknown outcome. Результат —metadata
+сохранённого расписания. Семантика CRON-01–10 определена в
+[Расписаниях](tasks-and-delegation.md).
 
 Дополнительные native filesystem/search tools SHOULD появляться там, где они дают более строгую path validation и structured output, чем shell. Terminal остаётся универсальным fallback, а не способом обойти typed tool policy.
 
@@ -233,9 +253,13 @@ process-local connection восстановление создаёт отдел�
 deadline и переподключается, но пересобирает EffectiveConfig из сохранённого
 catalog, а не из временной доступности optional server. Поэтому временно
 недоступный optional server не превращает checkpoint в `CHECKPOINT_INVALID` и
-не расширяет либо молча сужает tools. Read-only вызов такого server возвращает
-модели structured transport failure; mutating вызов сохраняет правило
-`SIDE_EFFECT_UNKNOWN`. Ошибка required reconnect или несовместимый checkpoint
+не меняет сохранённый capability ceiling. Каталог модели и dispatch используют
+текущие доступность и schema только тех identities, которые входят в этот ceiling:
+отсутствующий tool не публикуется модели, новая identity не добавляется. До
+dispatch исчезнувшего tool возвращается `TOOL_UNAVAILABLE`; смена schema или
+identity после HITL делает подтверждение устаревшим (`TOOL_APPROVAL_STALE`) и
+не допускает исполнения. Неизвестный outcome уже отправленного mutating вызова
+сохраняет правило `SIDE_EFFECT_UNKNOWN`. Ошибка required reconnect или несовместимый checkpoint
 фиксирует терминальный outcome, а не оставляет Task в бесконечном `RUNNING`.
 
 Ответ на запрос MUST выбираться по `id`, а не по порядку прибытия. Сервер вправе отправить в том же event stream `notifications/progress`, логи и собственные запросы до самого ответа, и медленный tool делает это почти всегда. Первый кадр потока — это, как правило, нотификация: у неё нет ни `result`, ни `error`, поэтому чтение «первого пакета» отдаёт модели пустой результат вместо данных, причём как успех. Такой отказ неотличим для модели от «сервер ничего не нашёл», и она отвечает пользователю выдуманным отсутствием данных. Кадры без `id` и кадры с чужим `id` MUST пропускаться до истечения `MCP_SSE_READ_TIMEOUT`.
@@ -304,3 +328,32 @@ guardrails. Валидация аргументов по схеме, прове�
 Применение исключения связывается с идентичностью конкретного инструмента и
 доверенной конфигурацией, а не с текстом его ответа. Исключение внешнего вызова
 не отключает независимые проверки вложенных `tools.call(...)`.
+
+
+### TOOL-03. Идентичность policy и точка передачи на исполнение
+
+Policy хранится вне immutable EffectiveConfig, под ключом company, canonical
+name и runtime-derived origin (builtin либо MCP server/tool). Новый origin не
+наследует allow или guardrails exception прежнего инструмента с тем же alias.
+Schema digest и arguments конкретного approval неизменяемы; владельцы выбирают
+только allow/reject. Схема решения не содержит editable arguments.
+Несовпадение текущей schema/origin с подтверждённым вызовом возвращает
+`TOOL_APPROVAL_STALE` без dispatch; модель может создать новый вызов.
+
+Проверка текущей policy revision, запись dispatch intent и передача владения
+исполнителю образуют одну transactional admission boundary. Изменение policy,
+закоммиченное до этой границы, влияет на вызов; уже переданный вызов не
+прерывается. Owner approval сам по себе не является dispatch. Lock order:
+policy row, затем run rows в стабильном порядке, затем wait rows. `deny` в той же
+транзакции закрывает pending approvals этой identity во всех чатах company с
+`POLICY_DENIED`; `allow` не меняет существующие ожидания и сроки. Последняя
+проверка deny обязательна также для разрешённого, но ещё не переданного вызова.
+
+### TOOL-04. Вопрос владельцу
+
+`core_ask_owner` принимает ровно непустой `question` длиной до 16 384 символов.
+Tool сначала проходит собственную tool policy, затем создаёт отдельный
+owner_question с отдельным deadline. Ответ возвращается как `{"answer":"..."}`;
+timeout — linked tool result `OWNER_ANSWER_TIMEOUT`. Отказ/timeout approval дают
+`OWNER_APPROVAL_REJECTED`/`OWNER_APPROVAL_TIMEOUT`, позволяют модели продолжить
+задачу и не создают owner question. Обычный A2A follow-up не является ответом.

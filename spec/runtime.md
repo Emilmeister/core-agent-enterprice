@@ -60,6 +60,11 @@
 9. исполняет разрешённый tool, нормализует result и добавляет его в контекст;
 10. продолжает цикл, другую независимую работу или passive wait.
 
+Текст assistant response, который одновременно содержит tool calls, является
+промежуточным. После применения всех результатов нужен следующий ход модели;
+тот прежний текст не становится final Artifact после HITL, вопроса или recovery.
+Финальный ответ допустим только из response без tool calls.
+
 Последовательность является базовой семантикой. Runtime MAY построить dependency graph и параллельно исполнить доказуемо независимые read-only calls или изолированные child Tasks. Каждый call всё равно получает отдельные policy decision, lifecycle и audit. Порядок слияния результатов должен быть стабильным.
 
 ## Live steering
@@ -315,8 +320,10 @@ A2A protocol version. При чтении результата, записанн
   ранняя проверка перед потенциальной блокировкой не является fencing.
 - Recovery coordinator MUST автоматически повторно сканировать durable workflow,
   чтобы продолжить `RUNNING`/`MODEL_RESPONDED` после истечения старого lease без
-  resubscribe или иного запроса клиента. Пассивные `WAITING_*`, `PAUSED` и
-  `APPROVED_RESERVED` при таком сканировании не запускаются. Фильтр root workflow
+  resubscribe или иного запроса клиента. Неразрешённые `WAITING_*`, `PAUSED` и
+  `APPROVED_RESERVED` при таком сканировании не запускаются. Разрешённое, но ещё
+  не applied ожидание возобновляет сохранённый pending call без нового начисления
+  budget. Фильтр root workflow
   применяется до batch limit: очередь child workflow не может вытеснить root из
   каждого сканирования. Если claim или continuation получает `LEASE_LOST`, одна
   попытка recovery завершается без локального busy polling: право следующей

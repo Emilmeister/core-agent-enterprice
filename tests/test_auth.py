@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 import httpx
 
-from core_agent.app import create_app
+from tests.app_support import create_app
+from core_agent.auth import AuthSettings
 from core_agent.errors import CoreError
 from core_agent.database import PostgresDatabase
 from core_agent.model import ModelResponse, ScriptedModel
@@ -25,6 +26,9 @@ class AuthAppTestCase(unittest.IsolatedAsyncioTestCase):
     """ENT-AC-01..05/67: exercise HTTP admission and real A2A task storage."""
 
     use_postgres = False
+    automatic_tools = True
+    ui_client_id = ""
+    push_encryption_key = ""
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -34,11 +38,14 @@ class AuthAppTestCase(unittest.IsolatedAsyncioTestCase):
                 "KEYCLOAK_ISSUER_URL": ISSUER,
                 "CORE_AGENT_ENVIRONMENT": "development",
                 "KEYCLOAK_CLIENT_ID": "agent-introspection",
+                "KEYCLOAK_UI_CLIENT_ID": self.ui_client_id,
                 "KEYCLOAK_CLIENT_SECRET": "test-only-client-secret",
+                "PUSH_NOTIFICATION_ENCRYPTION_KEY": self.push_encryption_key,
                 "KEYCLOAK_AUDIENCE": "company-agent",
                 "CORE_AGENT_TENANT_ID": "auth-test-" + uuid.uuid4().hex,
                 "CORE_AGENT_MEMORY": "disabled",
-                "LOCAL_WORKSPACE_ROOT": self.temp.name,
+                "LOCAL_WORKSPACE_ROOT": self.temp.name + "/scratch",
+                "CHAT_WORKSPACE_ROOT": self.temp.name + "/chats",
             },
             clear=True,
         )
@@ -74,6 +81,16 @@ class AuthAppTestCase(unittest.IsolatedAsyncioTestCase):
             database=database,
         )
         self.addCleanup(self.app.state.close)
+        if self.automatic_tools:
+            from core_agent.owner_api import policy_catalog
+
+            agent = self.app.state.core_agent
+            tenant = self.app.state.authenticator.settings.tenant
+            for name, origin in policy_catalog(agent).items():
+                agent.interaction_store.update_policy(
+                    tenant, name, origin, mode="allow", guardrails_exempt=False,
+                    expected_revision=0, actor_id="test-fixture-owner",
+                )
         self.http = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self.app),
             base_url="https://agent.example.test",
@@ -113,6 +130,11 @@ class AuthAppTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class AuthBoundaryTests(AuthAppTestCase):
+    async def test_browser_bootstrap_is_absent_when_not_configured(self):
+        response = await self.http.get("/ui/config")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.checks, [])
+
     async def test_missing_bearer_and_legacy_route_never_reach_model(self):
         response = await self.http.get("/api/identity")
         self.assertEqual(response.status_code, 401)
@@ -292,7 +314,55 @@ class PostgresAuthBoundaryTests(AuthBoundaryTests):
     use_postgres = True
 
 
+class UIBootstrapTests(AuthAppTestCase):
+    ui_client_id = "agent-browser"
+
+    async def test_public_config_exposes_only_browser_identity_and_keeps_private_routes_closed(self):
+        response = await self.http.get("/ui/config")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"issuer": ISSUER, "client_id": self.ui_client_id})
+        for name, value in {"cache-control": "no-store", "x-content-type-options": "nosniff",
+                            "referrer-policy": "no-referrer", "content-security-policy": "default-src 'none'"}.items():
+            self.assertEqual(response.headers[name], value)
+        self.assertEqual(self.checks, [])
+        self.assertFalse(self.model.calls)
+        changed = await self.http.get("/ui/config?issuer=https://attacker.invalid")
+        self.assertEqual(changed.status_code, 400, changed.text)
+        self.assertEqual(changed.json()["error"]["code"], "REQUEST_INVALID")
+        self.assertEqual((await self.http.get("/ui/anything")).status_code, 404)
+        for path in ("/api/identity", "/api/settings", "/a2a/owner/tasks", "/a2a/external/tasks"):
+            self.assertEqual((await self.http.get(path)).status_code, 401)
+        external = await self.http.get("/api/identity", headers=self.headers("external-a"))
+        self.assertEqual(external.status_code, 403)
+
+
 class AuthenticationConfigurationTests(unittest.TestCase):
+    def test_app_rejects_raw_invalid_browser_id_before_allocating_runtime(self):
+        base = {"CORE_AGENT_ENVIRONMENT": "development", "KEYCLOAK_ISSUER_URL": ISSUER,
+                "KEYCLOAK_CLIENT_ID": "introspection", "KEYCLOAK_CLIENT_SECRET": "private",
+                "KEYCLOAK_AUDIENCE": "agent", "CORE_AGENT_TENANT_ID": "company",
+                "CHAT_WORKSPACE_ROOT": "/unused"}
+        for value in ("browser\n", " browser", " "):
+            with self.subTest(value=value), patch.dict(os.environ, {**base, "KEYCLOAK_UI_CLIENT_ID": value}, clear=True):
+                with patch("core_agent.app._state", side_effect=AssertionError("runtime allocated")) as allocation:
+                    with self.assertRaises(CoreError) as caught:
+                        create_app(model=ScriptedModel([]))
+                    self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                    self.assertIn("KEYCLOAK_UI_CLIENT_ID", str(caught.exception))
+                    allocation.assert_not_called()
+
+    def test_browser_client_requires_complete_auth_and_distinct_valid_client_id(self):
+        base = {"KEYCLOAK_ISSUER_URL": ISSUER, "KEYCLOAK_CLIENT_ID": "introspection",
+                "KEYCLOAK_CLIENT_SECRET": "private", "KEYCLOAK_AUDIENCE": "agent", "CORE_AGENT_TENANT_ID": "company"}
+        for value in ("introspection", " ", "client\n", "x" * 256, "client\0", "client\x80", "\ud800"):
+            with self.subTest(value=value):
+                with self.assertRaises(CoreError) as caught:
+                    AuthSettings.from_environment({**base, "KEYCLOAK_UI_CLIENT_ID": value}.get)
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+        with self.assertRaises(CoreError) as caught:
+            AuthSettings.from_environment({"KEYCLOAK_UI_CLIENT_ID": "browser"}.get, allow_legacy=True)
+        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+
     def test_anonymous_mode_requires_an_explicit_valid_development_profile(self):
         model = ScriptedModel([])
         model.model = "auth-configuration-test"

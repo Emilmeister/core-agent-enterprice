@@ -114,9 +114,19 @@ git diff --check
 Для каждого этапа сначала составляется подробный план по актуальному коду и
 утверждённому нормативному контракту. Этап включает regression proof, подключение
 в composition root и проверки; наличие отдельно написанного модуля не означает
-завершение этапа. Выполнение — в текущей сессии. Отделимый перенос нормативных
-требований выполняется подагентом; интеграцию, проверки и изменения runtime
-ведёт основной агент, без одновременных правок одних файлов.
+завершение этапа. Выполнение — в текущей сессии. Подагент получает отделимый
+implementation scope и явное владение файлами; основной агент отвечает за
+интеграцию, проверки и принятие результата. Одновременные правки одного участка
+не допускаются; независимое review не изменяет implementation.
+
+Подробные планы по текущему коду:
+[workspace/files](2026-09-30-enterprise-files.md),
+[sandbox](2026-09-30-enterprise-sandbox.md),
+[interactions/guardrails](2026-09-30-enterprise-interactions.md),
+[owner UI](2026-09-30-enterprise-owner-ui.md),
+[semantic context/history](2026-09-30-enterprise-context.md),
+[trusted remote A2A](2026-09-30-enterprise-remote-a2a.md),
+[cron](2026-09-30-enterprise-cron.md).
 
 | Этап | Основные существующие точки изменений | Проверяемый результат и зависимость |
 | --- | --- | --- |
@@ -168,6 +178,28 @@ docker build -t core-agent:local .
 кластере; установленный `kubectl` сам по себе не доказывает наличие доступа к нему.
 
 ## Готовность к поставке
+
+Восстановленный enterprise candidate находится в постоянной рабочей копии.
+Подключены owner UI/history, политики/HITL/вопросы/guardrails, durable waits,
+text-only remote A2A, cron, workspace preview/download и ручная очистка.
+Private file batches и атомарный внутренний admission проверены отдельно;
+публичный binary intake пока закрыт. PostgreSQL Task записывается до file bind
+в одной транзакции; исходные имена и metadata сохраняются без потери bytes.
+
+Свежая проверка 1 октября 2026 года на schema22 с настоящими PostgreSQL и
+Keycloak: `uv run python -m unittest discover -s tests -v` — 1351 tests,
+exit0, два skips. Ruff, spec quality/lock и diff-check также проходят.
+UI typecheck и production build проходят; Vite assets включены в wheel/sdist
+и проверенный ARM64 Docker image, который работает от `agent` без Node/npm.
+Исправлены ошибки восстановленного sandbox resource, legacy Task projection,
+file admission FK/JSONB и гонки synthetic PostgreSQL test fixtures.
+
+Полный release gate остаётся открытым: приём/отправка файлов через UI/A2A,
+миграция старых файлов и удаление named artifact service ещё не завершены.
+Linux/Kubernetes sandbox и browser acceptance требуют самостоятельного proof;
+macOS unit suite не доказывает process isolation. Для native sandbox создан
+собственный disposable kind-кластер с отдельным kubeconfig; первый image probe
+обнаружил missing `nft` в trusted helper PATH, исправление ещё требуется.
 
 - Нет новой анонимной production-границы и bypass через list/stream/download,
   Python broker, child task, memory, summary или восстановление.

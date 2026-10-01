@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
+import re
 import time
+import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from a2a.types.a2a_pb2 import SendMessageResponse, Task
+from google.protobuf.json_format import MessageToDict, ParseDict, ParseError
 
 from .errors import CoreError
 from .security import redact
@@ -56,6 +62,7 @@ class RemoteAgentCard:
     url: str
     streaming: bool
     skills: tuple[dict, ...]
+    binding: str = A2A_BINDING
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,157 @@ class RemoteEvent:
     text: str
     final: bool
     parts: tuple[dict, ...]
+    task_id: str | None = None
+    context_id: str | None = None
+
+    @property
+    def has_files(self):
+        return any("raw" in part or "url" in part for part in self.parts)
+
+
+def _trusted_text(value, *, code="REMOTE_AGENT_DENIED"):
+    if not isinstance(value, str) or not value or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in value):
+        raise CoreError(code)
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        raise CoreError(code) from None
+    return value
+
+
+def _trusted_endpoint(url):
+    _trusted_text(url)
+    try:
+        parsed = _validate_endpoint(url)
+        if (not parsed.hostname or parsed.username is not None or parsed.password is not None
+                or "?" in url or "#" in url or any(char.isspace() for char in url)
+                or "\\" in parsed.netloc or parsed.netloc.endswith(":")
+                or (parsed.port is not None and not 1 <= parsed.port <= 65535)):
+            raise ValueError()
+        return urlsplit(url)
+    except (CoreError, ValueError):
+        raise CoreError("REMOTE_AGENT_DENIED") from None
+
+
+def _trusted_headers(headers):
+    if headers is None:
+        return {}
+    if not isinstance(headers, Mapping):
+        raise CoreError("REMOTE_AGENT_DENIED")
+    reserved = {"host", "content-type", "content-length", "connection", "transfer-encoding",
+                "upgrade", "trailer", "te", "proxy-authorization", "accept", "a2a-version"}
+    result, names = {}, set()
+    for name, value in headers.items():
+        if (not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", name)
+                or name.lower() in reserved | names):
+            raise CoreError("REMOTE_AGENT_DENIED")
+        _trusted_text(value)
+        try:
+            if len(value.encode("latin-1")) > 16384:
+                raise ValueError()
+        except (ValueError, UnicodeError):
+            raise CoreError("REMOTE_AGENT_DENIED") from None
+        names.add(name.lower())
+        result[name] = value
+    return result
+
+
+def _request_timeout(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise CoreError("CONFIG_INVALID", "remote request timeout must be finite and positive")
+    return value
+
+
+def _task_event(payload, *, direct=False, expected_task_id=None):
+    """Validate the installed SDK's 1.0 shape without publishing parser diagnostics."""
+    try:
+        parsed = ParseDict(payload, Task() if direct else SendMessageResponse())
+        if direct or parsed.WhichOneof("payload") == "task":
+            task = parsed if direct else parsed.task
+            _trusted_text(task.id, code="REMOTE_AGENT_PROTOCOL_ERROR")
+            _trusted_text(task.context_id, code="REMOTE_AGENT_PROTOCOL_ERROR")
+            if expected_task_id is not None and task.id != expected_task_id:
+                raise ValueError()
+            if task.status.state not in range(1, 9):
+                raise ValueError()
+            raw = MessageToDict(task)
+            parts = list(task.status.message.parts)
+            for artifact in task.artifacts:
+                parts.extend(artifact.parts)
+            state = raw["status"]["state"]
+            task_id, context_id, kind = task.id, task.context_id, "task"
+            final = state in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"}
+        elif parsed.WhichOneof("payload") == "message":
+            message = parsed.message
+            _trusted_text(message.message_id, code="REMOTE_AGENT_PROTOCOL_ERROR")
+            if message.role != 2 or not message.parts:
+                raise ValueError()
+            parts = message.parts
+            for identifier in (message.task_id, message.context_id):
+                if identifier:
+                    _trusted_text(identifier, code="REMOTE_AGENT_PROTOCOL_ERROR")
+            task_id, context_id, kind, state, final = message.task_id or None, message.context_id or None, "message", None, True
+        else:
+            raise ValueError()
+        if any(part.WhichOneof("content") is None for part in parts):
+            raise ValueError()
+        normalized = tuple(MessageToDict(part) for part in parts)
+        return RemoteEvent(kind, state, _parts_text(normalized), final, normalized, task_id, context_id)
+    except (ParseError, ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError, CoreError):
+        raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR") from None
+
+
+def connect_peer(peer, *, headers=None, timeout=30, max_retries=2, retry_delay=0.2):
+    """Discover only the registered destination; credentials live in this call only."""
+    if not isinstance(peer, Mapping) or peer.get("enabled") is not True:
+        raise CoreError("REMOTE_AGENT_DENIED")
+    base = peer.get("url")
+    registered = _trusted_endpoint(base)
+    timeout = _request_timeout(timeout)
+    private_headers = _trusted_headers(headers)
+    if type(max_retries) is not int or not 0 <= max_retries <= 10:
+        raise CoreError("CONFIG_INVALID")
+    if isinstance(retry_delay, bool) or not isinstance(retry_delay, (int, float)) or not math.isfinite(retry_delay) or not 0 <= retry_delay <= 60:
+        raise CoreError("CONFIG_INVALID")
+    request = Request(base.rstrip("/") + AGENT_CARD_WELL_KNOWN_PATH,
+                      headers={"Accept": "application/json", "A2A-Version": A2A_PROTOCOL_VERSION, **private_headers}, method="GET")
+    for attempt in range(max_retries + 1):
+        try:
+            with _open(request, timeout, retryable_status_codes=(500, 502, 503, 504)) as response:
+                body = _read_body(response)
+            break
+        except CoreError as error:
+            if not error.retryable or attempt == max_retries:
+                raise CoreError(error.code, retryable=error.retryable) from None
+            time.sleep(retry_delay)
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError()
+        interfaces = payload.get("supportedInterfaces")
+        if not isinstance(interfaces, list):
+            raise ValueError()
+        for interface in interfaces:
+            if (not isinstance(interface, dict) or interface.get("protocolBinding") not in {"JSONRPC", "HTTP+JSON"}
+                    or interface.get("protocolVersion") != A2A_PROTOCOL_VERSION):
+                continue
+            target = _trusted_endpoint(interface.get("url"))
+            def identity(url):
+                return (url.scheme, url.hostname, url.port or (443 if url.scheme == "https" else 80), url.path.rstrip("/"))
+            if identity(target) != identity(registered):
+                continue
+            capabilities = payload.get("capabilities", {})
+            skills = payload.get("skills", [])
+            if not isinstance(capabilities, dict) or not isinstance(skills, list) or any(not isinstance(skill, dict) for skill in skills):
+                raise ValueError()
+            return RemoteAgentConnection(RemoteAgentCard(
+                name=_trusted_text(peer.get("name")), description=peer.get("description", ""),
+                url=base, streaming=capabilities.get("streaming") is True,
+                skills=tuple(skills), binding=interface["protocolBinding"],
+            ), timeout=timeout)
+    except (ValueError, TypeError, RecursionError, CoreError):
+        raise CoreError("REMOTE_AGENT_CARD_INVALID") from None
+    raise CoreError("REMOTE_AGENT_CARD_INVALID")
 
 
 def _require_text(value, code, detail):
@@ -297,6 +455,73 @@ class RemoteAgentConnection:
     @property
     def supports_streaming(self) -> bool:
         return bool(self.card.streaming)
+
+    def _task_request(self, method, params, *, headers, timeout, request_id=None):
+        _trusted_endpoint(self.card.url)
+        timeout = _request_timeout(self.timeout if timeout is None else timeout)
+        private_headers = _trusted_headers(headers)
+        request_id = request_id or str(uuid.uuid4())
+        url = self.card.url
+        verb = "POST"
+        if self.card.binding == "JSONRPC":
+            payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        elif self.card.binding == "HTTP+JSON":
+            url = url.rstrip("/")
+            payload = params
+            if method == "SendMessage":
+                url += "/message:send"
+            else:
+                identifier = quote(params["id"], safe="")
+                if identifier in {".", ".."}:
+                    identifier = identifier.replace(".", "%2E")
+                url += "/tasks/" + identifier
+                if method == "GetTask":
+                    verb, payload = "GET", None
+                else:
+                    url += ":cancel"
+        else:
+            raise CoreError("REMOTE_AGENT_CARD_INVALID")
+        request = Request(url, data=json.dumps(payload).encode() if payload is not None else None,
+                          headers={"Content-Type": "application/json", "Accept": "application/json",
+                                   "A2A-Version": A2A_PROTOCOL_VERSION, **private_headers}, method=verb)
+        try:
+            with _open(request, timeout, retryable_status_codes=(500, 502, 503, 504) if method == "GetTask" else ()) as response:
+                body = _read_body(response)
+        except CoreError as error:
+            # Mutation retryability belongs to the durable intent owner, never this adapter.
+            raise CoreError(error.code, retryable=error.retryable and method == "GetTask") from None
+        try:
+            result = json.loads(body)
+            if self.card.binding == "JSONRPC":
+                if not isinstance(result, dict) or result.get("jsonrpc") != "2.0" or result.get("id") != request_id:
+                    raise ValueError()
+                if "error" in result:
+                    raise CoreError("REMOTE_AGENT_FAILED")
+                result = result["result"]
+        except (ValueError, TypeError, KeyError, RecursionError):
+            raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR") from None
+        return _task_event(result, direct=method != "SendMessage", expected_task_id=params.get("id"))
+
+    def send_task(self, *, task, message_id, headers=None, timeout=None):
+        """Send one new task nonblocking; no caller task/context or inherited auth."""
+        _require_text(task, "INVALID_REQUEST", "task must be non-empty text")
+        try:
+            task.encode("utf-8")
+        except UnicodeError:
+            raise CoreError("INVALID_REQUEST") from None
+        _trusted_text(message_id, code="INVALID_REQUEST")
+        return self._task_request("SendMessage", {
+            "message": {"role": "ROLE_USER", "messageId": message_id, "parts": [{"text": task}]},
+            "configuration": {"returnImmediately": True},
+        }, headers=headers, timeout=timeout, request_id=message_id)
+
+    def get_task(self, *, task_id, headers=None, timeout=None):
+        _trusted_text(task_id, code="INVALID_REQUEST")
+        return self._task_request("GetTask", {"id": task_id}, headers=headers, timeout=timeout)
+
+    def cancel_task(self, *, task_id, headers=None, timeout=None):
+        _trusted_text(task_id, code="INVALID_REQUEST")
+        return self._task_request("CancelTask", {"id": task_id}, headers=headers, timeout=timeout)
 
     def _request(
         self,

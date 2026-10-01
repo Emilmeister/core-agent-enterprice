@@ -230,6 +230,8 @@ class LocalTerminalTests(unittest.TestCase):
         self.assertEqual(result.cleanup, "process_group_terminated")
 
     def test_transient_exec_reuses_one_owned_workspace_per_run(self):
+        from core_agent.workspace import WorkspaceBinding
+        self.manager.bind_run("persistent-run", WorkspaceBinding("default", "owner", "chat"))
         first = self.manager.execute_transient(
             {
                 "argv": [
@@ -253,6 +255,124 @@ class LocalTerminalTests(unittest.TestCase):
         self.assertEqual(first.exit_code, 0)
         self.assertEqual(second.stdout.strip(), "kept")
         self.assertEqual(first.terminal_session_id, second.terminal_session_id)
+
+    def test_stale_generation_cleanup_preserves_new_worker_session(self):
+        from core_agent.workspace import WorkspaceBinding
+
+        self.manager.bind_run("run", WorkspaceBinding("tenant-1", "owner", "chat"))
+        with self.manager.execution_scope("run", "old-worker", "old-lease"):
+            first = self.manager.execute_transient({"argv": [sys.executable, "-c", "pass"]}, "run")
+            with self.manager.execution_scope("run", "new-worker", "new-lease"):
+                second = self.manager.execute_transient({"argv": [sys.executable, "-c", "pass"]}, "run")
+                self.assertNotEqual(first.terminal_session_id, second.terminal_session_id)
+                self.manager.destroy_execution("run", "old-worker", "old-lease")
+                self.assertIn(second.terminal_session_id, self.manager._environments)
+                third = self.manager.execute_transient({"argv": [sys.executable, "-c", "pass"]}, "run")
+                self.assertEqual(second.terminal_session_id, third.terminal_session_id)
+
+    def test_nonterminal_lease_exit_preserves_ephemeral_run_files(self):
+        from core_agent.workspace import WorkspaceBinding
+
+        binding = WorkspaceBinding("tenant-1", "owner", "chat")
+        self.manager.bind_run("run", binding)
+        with self.manager.execution_scope("run", "worker", "first-lease"):
+            first = self.manager.execute_transient({"argv": [sys.executable, "-c", "open('state.txt', 'w').write('retained')"]}, "run")
+            workspace = self.manager._environments[first.terminal_session_id].workspace
+        self.assertTrue((workspace / 'state.txt').exists())
+        self.manager.bind_run("run", binding)
+        with self.manager.execution_scope("run", "worker", "next-lease"):
+            second = self.manager.execute_transient({"argv": [sys.executable, "-c", "print(open('state.txt').read())"]}, "run")
+            self.assertNotEqual(first.terminal_session_id, second.terminal_session_id)
+            self.assertEqual(second.stdout.strip(), 'retained')
+            self.manager.close_execution_tree('run', 'terminal-intent')
+        self.manager.release_run_workspaces(('run',))
+        self.assertFalse(workspace.exists())
+
+    def test_failed_snapshot_initialization_is_not_reused_as_workspace(self):
+        from unittest.mock import Mock
+        from core_agent.workspace import WorkspaceBinding
+
+        self.manager.backend.base_snapshot = 'snapshot-id'
+        store = self.manager.backend.snapshot_store = Mock()
+        store.materialize.side_effect = CoreError('ARTIFACT_INTEGRITY_FAILED')
+        self.manager.bind_run('run', WorkspaceBinding('tenant-1', 'owner', 'chat'))
+        with self.manager.execution_scope('run', 'worker', 'lease'):
+            for _ in range(2):
+                with self.assertRaises(CoreError) as caught:
+                    self.manager.execute_transient({'argv': [sys.executable, '-c', 'raise AssertionError']}, 'run')
+                self.assertEqual(caught.exception.code, 'ARTIFACT_INTEGRITY_FAILED')
+        self.assertEqual(store.materialize.call_count, 2)
+        self.assertFalse(self.manager._environments)
+
+    def test_family_seal_stops_descendants_and_blocks_late_admission(self):
+        from core_agent.workspace import WorkspaceBinding
+
+        binding = WorkspaceBinding("tenant-1", "owner", "chat")
+        for run in ("parent", "unrelated", "child", "late-child"):
+            self.manager.bind_run(run, binding)
+        with self.manager.execution_scope("unrelated", "worker", "other"):
+            other = self.manager.execute_transient({"argv": [sys.executable, "-c", "pass"]}, "unrelated")
+            with self.manager.execution_scope("parent", "worker", "parent-lease"):
+                with self.manager.execution_scope("child", "worker", "child-lease", parent_run_id="parent"):
+                    child = self.manager.execute_transient({"argv": [sys.executable, "-c", "pass"]}, "child")
+                    session = self.manager._environments[child.terminal_session_id]
+                    handle = self.manager.start(session.id, {"argv": [sys.executable, "-c", "import time; time.sleep(60)"]})
+                    self.manager.close_execution_tree("parent", "terminal-intent")
+                    self.assertTrue(handle._done.is_set())
+                    self.assertIsNotNone(handle._process.poll())
+                    self.assertIn(other.terminal_session_id, self.manager._environments)
+                with self.manager.execution_scope("late-child", "worker", "late", parent_run_id="parent"):
+                    with self.assertRaises(CoreError) as caught:
+                        self.manager.execute_transient({"argv": [sys.executable, "-c", "raise AssertionError"]}, "late-child")
+                    self.assertEqual(caught.exception.code, "TASK_TERMINAL")
+                self.manager.reopen_execution_tree("parent", "stale-intent")
+                with self.assertRaises(CoreError):
+                    self.manager.execute_transient({"argv": [sys.executable, "-c", "pass"]}, "parent")
+                self.manager.reopen_execution_tree("parent", "terminal-intent")
+                with self.assertRaises(CoreError) as caught:
+                    self.manager.execute_transient({"argv": [sys.executable, "-c", "pass"]}, "parent")
+                self.assertEqual(caught.exception.code, "LEASE_LOST")
+                with self.manager.execution_scope("parent", "worker", "new-parent-lease"):
+                    result = self.manager.execute_transient({"argv": [sys.executable, "-c", "pass"]}, "parent")
+                    self.assertEqual(result.exit_code, 0)
+
+    def test_receipt_without_local_session_is_retired_before_reopen(self):
+        self.manager.close_execution_tree(
+            "parent", "intent", run_ids=("grandchild",),
+            execution_owners=(("grandchild", "worker", "admitted-lease"),),
+        )
+        self.manager.reopen_execution_tree("parent", "intent")
+        with self.assertRaises(CoreError) as caught:
+            with self.manager.execution_scope("grandchild", "worker", "admitted-lease",
+                                              ancestor_run_ids=("middle", "parent")):
+                self.fail("A delayed old worker entered its retired execution scope")
+        self.assertEqual(caught.exception.code, "LEASE_LOST")
+
+    def test_stale_terminal_finisher_cannot_stop_reopened_generation(self):
+        from core_agent.workspace import WorkspaceBinding
+
+        self.manager.bind_run('run', WorkspaceBinding('tenant-1', 'owner', 'chat'))
+        with self.manager.execution_scope('run', 'worker', 'old'):
+            self.manager.close_execution_tree('run', 'old-intent', execution_owners=(('run', 'worker', 'old'),))
+            self.manager.reopen_execution_tree('run', 'old-intent')
+            with self.manager.execution_scope('run', 'worker', 'new'):
+                result = self.manager.execute_transient({'argv': [sys.executable, '-c', 'pass']}, 'run')
+                session = self.manager._environments[result.terminal_session_id]
+                handle = self.manager.start(session.id, {'argv': [sys.executable, '-c', 'import time; time.sleep(60)']})
+                with self.assertRaises(CoreError) as caught:
+                    self.manager.close_execution_tree('run', 'old-intent', execution_owners=(('run', 'worker', 'old'),))
+                self.assertEqual(caught.exception.code, 'LEASE_LOST')
+                self.assertIsNone(handle._process.poll())
+                self.assertEqual(self.manager._execution_key('run'), ('run', 'worker', 'new'))
+
+    def test_family_cleanup_includes_grandchild_of_unresumed_middle(self):
+        from core_agent.workspace import WorkspaceBinding
+
+        self.manager.bind_run("leaf", WorkspaceBinding("tenant-1", "owner", "chat"))
+        with self.manager.execution_scope("leaf", "worker", "lease", parent_run_id="middle"):
+            result = self.manager.execute_transient({"argv": [sys.executable, "-c", "pass"]}, "leaf")
+            self.manager.close_execution_tree("root", "intent", run_ids=("middle",))
+            self.assertNotIn(result.terminal_session_id, self.manager._environments)
 
 
 class WorkspaceSnapshotTests(unittest.TestCase):
