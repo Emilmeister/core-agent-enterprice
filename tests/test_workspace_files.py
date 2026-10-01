@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from starlette.requests import ClientDisconnect
 
+from core_agent.errors import CoreError
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.owner_api import WorkspaceDownload
 from core_agent.workspace import ChatWorkspaces, WorkspaceBinding
@@ -102,10 +103,12 @@ class WorkspaceFileAPITests(AuthAppTestCase):
         workspace = self.manager.workspace(self.binding(task))
         (workspace / "plain").write_bytes(b"allowed")
         (workspace / ".manifest.json").write_text("user content")
-        batch = workspace / "attachments" / str(uuid.uuid4())
-        batch.mkdir(parents=True)
-        for name in (".manifest.json", ".manifest-temporary", "published.txt"):
-            (batch / name).write_text(name)
+        identifier = uuid.uuid4()
+        batches = [workspace / "attachments" / value for value in (identifier.hex, str(identifier))]
+        for batch in batches:
+            batch.mkdir(parents=True)
+            for name in (".manifest.json", ".manifest-temporary", "published.txt"):
+                (batch / name).write_text(name)
         private = self.manager.root / "private"
         private.mkdir(exist_ok=True)
         (private / "secret").write_text("private quarantine")
@@ -116,12 +119,43 @@ class WorkspaceFileAPITests(AuthAppTestCase):
         listed = await self.files()
         self.assertEqual(listed.status_code, 200, listed.text)
         self.assertEqual([item["path"] for item in listed.json()["files"]],
-                         [".manifest.json", f"attachments/{batch.name}/published.txt", "plain"])
-        for path in ("link", "dirlink/secret", "hardlink", "fifo", f"attachments/{batch.name}/.manifest.json",
-                     f"attachments/{batch.name}/.manifest-temporary", "missing"):
+                         sorted([".manifest.json", *(f"attachments/{batch.name}/published.txt" for batch in batches), "plain"]))
+        controls = [f"attachments/{batch.name}/{name}" for batch in batches
+                    for name in (".manifest.json", ".manifest-temporary")]
+        for path in ("link", "dirlink/secret", "hardlink", "fifo", *controls, "missing"):
             response = await self.files(content=True, path=path)
             self.assertEqual(response.status_code, 404, (path, response.text))
+        for path in controls:
+            with self.assertRaises(CoreError) as error:
+                self.manager.open_file(self.binding(task), path)
+            self.assertEqual(error.exception.code, "FILE_NOT_FOUND")
         self.assertEqual((await self.files(content=True, path=".manifest.json")).content, b"user content")
+
+    async def test_real_published_hex_batch_manifest_is_private_to_all_workspace_readers(self):
+        response = await self.http.post("/a2a/external/message:send", headers=self.headers("external-a"), json={
+            "message": {"messageId": "published-file", "contextId": "files", "role": "ROLE_USER",
+                        "parts": [{"raw": "aGVsbG8=", "filename": "incoming.txt", "mediaType": "text/plain"}]}})
+        self.assertEqual(response.status_code, 200, response.text)
+        task = response.json()["task"]
+        binding = self.binding(task)
+        receipt = task["metadata"]["file_receipt"]
+        batch_id = receipt["batch_id"]
+        self.assertEqual(uuid.UUID(batch_id).hex, batch_id)
+        service = self.app.state.core_agent.chat_file_service
+        self.assertEqual(service.store.get(batch_id, binding.tenant_id)["state"], "published")
+        control = f"attachments/{batch_id}/.manifest.json"
+        self.assertTrue((self.manager.workspace(binding) / control).is_file())
+        public = receipt["entries"][0]["relative_path"]
+        listed = await self.files()
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual([item["path"] for item in listed.json()["files"]], [public])
+        self.assertEqual([item["path"] for item in self.manager.preview(binding)["files"]], [public])
+        hidden = await self.files(content=True, path=control)
+        self.assertEqual(hidden.status_code, 404, hidden.text)
+        with self.assertRaises(CoreError) as error:
+            self.manager.open_file(binding, control)
+        self.assertEqual(error.exception.code, "FILE_NOT_FOUND")
+        self.assertEqual((await self.files(content=True, path=public)).content, b"hello")
 
     async def test_directory_limit_cursor_binding_restart_and_file_identity(self):
         task = await self.submit("external-a", "root", "files")

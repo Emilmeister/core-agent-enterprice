@@ -108,7 +108,8 @@ class ChatWorkspaces:
         if len(parts) != 3 or parts[0] != "attachments":
             return False
         try:
-            batch = str(uuid.UUID(parts[1])) == parts[1]
+            identifier = uuid.UUID(parts[1])
+            batch = parts[1] in {identifier.hex, str(identifier)}
         except ValueError:
             return False
         return batch and (parts[2] == ".manifest.json" or parts[2].startswith(".manifest-"))
