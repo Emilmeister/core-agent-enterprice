@@ -197,7 +197,7 @@ def compose_document(
 
 
 class MemoryService:
-    """One corpus for one `(app_name, user_id)` scope.
+    """One corpus for one `(tenant_id, app_name, user_id)` scope.
 
     Documents live in RAM because retrieval fuses BM25, vector and graph channels
     over the whole candidate set; the store is consulted at load and at publish.
@@ -209,12 +209,16 @@ class MemoryService:
         *,
         app_name,
         user_id,
+        tenant_id="default",
         entity_extractor=None,
         embedding_provider=None,
         telemetry=None,
         logger=None,
     ):
         self.store = store
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise CoreError("CONFIG_INVALID", "memory requires a trusted tenant")
+        self.tenant_id = tenant_id
         self.app_name = app_name
         self.user_id = user_id
         # None means no model extractor is configured. The builtin still indexes
@@ -250,7 +254,7 @@ class MemoryService:
     # ------------------------------------------------------------------ loading
 
     def _load(self):
-        loaded = self.store.load(app_name=self.app_name, user_id=self.user_id)
+        loaded = self.store.load(tenant_id=self.tenant_id, app_name=self.app_name, user_id=self.user_id)
         documents = {}
         paths = {}
         embeddings = {}
@@ -503,6 +507,7 @@ class MemoryService:
         with self._span("index_publish"):
             try:
                 self.store.publish(
+                    tenant_id=self.tenant_id,
                     app_name=self.app_name,
                     user_id=self.user_id,
                     repository_revision=next_revision,
@@ -560,8 +565,8 @@ class MemoryService:
         return document, result
 
     @_serialized
-    def update(self, memory_id, *, body, expected_revision, title=None, status=None):
-        current = self.read(memory_id)
+    def update(self, memory_id, *, body, expected_revision, title=None, status=None, namespace=None):
+        current = self.read(memory_id, namespace=namespace)
         self._require_revision(current, expected_revision)
         content = compose_document(
             memory_id=current.id,
@@ -586,8 +591,8 @@ class MemoryService:
         return updated, result
 
     @_serialized
-    def split(self, memory_id, *, overview, children, expected_revision):
-        current = self.read(memory_id)
+    def split(self, memory_id, *, overview, children, expected_revision, namespace=None):
+        current = self.read(memory_id, namespace=namespace)
         self._require_revision(current, expected_revision)
         if not children:
             raise CoreError("MEMORY_INVALID", "split requires at least one child")
@@ -637,8 +642,8 @@ class MemoryService:
         return tuple(document.id for document in parsed), result
 
     @_serialized
-    def delete(self, memory_id, *, reason, expected_revision):
-        current = self.read(memory_id)
+    def delete(self, memory_id, *, reason, expected_revision, namespace=None):
+        current = self.read(memory_id, namespace=namespace)
         self._require_revision(current, expected_revision)
         if not reason:
             raise CoreError("MEMORY_INVALID", "delete requires a reason")
@@ -666,9 +671,9 @@ class MemoryService:
 
     # ------------------------------------------------------------------- reading
 
-    def read(self, memory_id):
+    def read(self, memory_id, *, namespace=None):
         document = self._documents.get(memory_id)
-        if document is None:
+        if document is None or (namespace is not None and document.namespace != namespace):
             raise CoreError("NOT_FOUND", "unknown memory id")
         return document
 
@@ -751,6 +756,7 @@ class MemoryService:
         if ranker is not None:
             with self._span("search.vector"):
                 ranked = ranker(
+                    tenant_id=self.tenant_id,
                     app_name=self.app_name,
                     user_id=self.user_id,
                     namespace=namespace,
@@ -952,7 +958,7 @@ def _front_matter_sources(content):
 
 
 class MemoryRegistry:
-    """One service per `(app_name, user_id)` scope, created on first use.
+    """One service per `(tenant_id, app_name, user_id)` scope, created on first use.
 
     Memory is per-user by contract, and a single corpus in RAM for every user of
     a multi-tenant deployment would both leak data across scopes and make the
@@ -978,13 +984,14 @@ class MemoryRegistry:
         self._services = {}
         self._lock = threading.RLock()
 
-    def service(self, app_name, user_id):
-        key = (app_name, user_id)
+    def service(self, app_name, user_id, *, tenant_id="default"):
+        key = (tenant_id, app_name, user_id)
         with self._lock:
             service = self._services.get(key)
             if service is None:
                 service = MemoryService(
                     self.store,
+                    tenant_id=tenant_id,
                     app_name=app_name,
                     user_id=user_id,
                     entity_extractor=self.entity_extractor,

@@ -51,13 +51,14 @@ class InMemoryMemoryStore:
     def __init__(self):
         self._scopes = {}
 
-    def load(self, *, app_name, user_id):
-        return self._scopes.get((app_name, user_id), LoadedMemory())
+    def load(self, *, app_name, user_id, tenant_id="default"):
+        return self._scopes.get((tenant_id, app_name, user_id), LoadedMemory())
 
     def publish(
-        self, *, app_name, user_id, repository_revision, documents, resolutions
+        self, *, app_name, user_id, repository_revision, documents, resolutions,
+        tenant_id="default",
     ):
-        key = (app_name, user_id)
+        key = (tenant_id, app_name, user_id)
         current = self._scopes.get(key, LoadedMemory())
         if repository_revision <= current.repository_revision:
             raise CoreError(
@@ -131,7 +132,7 @@ class PostgresMemoryStore:
                 return False
         return True
 
-    def load(self, *, app_name, user_id):
+    def load(self, *, app_name, user_id, tenant_id="default"):
         with self.database.pool.connection() as connection:
             # The revision is read FIRST on purpose. The pool is autocommit, so
             # each statement gets its own snapshot; reading it last would let a
@@ -141,23 +142,23 @@ class PostgresMemoryStore:
             # which makes the next publish collide and conflict correctly.
             revision = connection.execute(
                 "SELECT repository_revision, resolutions FROM core_memory_revisions "
-                "WHERE app_name = %s AND user_id = %s "
+                "WHERE tenant_id = %s AND app_name = %s AND user_id = %s "
                 "ORDER BY repository_revision DESC LIMIT 1",
-                (app_name, user_id),
+                (tenant_id, app_name, user_id),
             ).fetchone()
             documents = connection.execute(
                 "SELECT memory_id, namespace, path, content, revision, embedding, "
                 "entities FROM core_memory_documents "
-                "WHERE app_name = %s AND user_id = %s "
+                "WHERE tenant_id = %s AND app_name = %s AND user_id = %s "
                 "ORDER BY path",
-                (app_name, user_id),
+                (tenant_id, app_name, user_id),
             ).fetchall()
             versions = connection.execute(
                 "SELECT memory_id, namespace, path, content, revision "
                 "FROM core_memory_document_versions "
-                "WHERE app_name = %s AND user_id = %s "
+                "WHERE tenant_id = %s AND app_name = %s AND user_id = %s "
                 "ORDER BY memory_id, revision",
-                (app_name, user_id),
+                (tenant_id, app_name, user_id),
             ).fetchall()
         return LoadedMemory(
             documents=tuple(self._document(row) for row in documents),
@@ -181,16 +182,18 @@ class PostgresMemoryStore:
         )
 
     def publish(
-        self, *, app_name, user_id, repository_revision, documents, resolutions
+        self, *, app_name, user_id, repository_revision, documents, resolutions,
+        tenant_id="default",
     ):
         keep = [item.memory_id for item in documents]
         try:
             with self.database.transaction() as connection:
                 connection.execute(
                     "INSERT INTO core_memory_revisions "
-                    "(app_name, user_id, repository_revision, resolutions) "
-                    "VALUES (%s, %s, %s, %s)",
+                    "(tenant_id, app_name, user_id, repository_revision, resolutions) "
+                    "VALUES (%s, %s, %s, %s, %s)",
                     (
+                        tenant_id,
                         app_name,
                         user_id,
                         repository_revision,
@@ -205,16 +208,17 @@ class PostgresMemoryStore:
                         else None
                     )
                     connection.execute(
-                        "INSERT INTO core_memory_documents (app_name, user_id, "
+                        "INSERT INTO core_memory_documents (tenant_id, app_name, user_id, "
                         "memory_id, namespace, path, content, revision, embedding, "
                         "entities) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                        "ON CONFLICT (app_name, user_id, memory_id) DO UPDATE SET "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (tenant_id, app_name, user_id, memory_id) DO UPDATE SET "
                         "namespace = EXCLUDED.namespace, path = EXCLUDED.path, "
                         "content = EXCLUDED.content, revision = EXCLUDED.revision, "
                         "embedding = EXCLUDED.embedding, "
                         "entities = EXCLUDED.entities, updated_at = now()",
                         (
+                            tenant_id,
                             app_name,
                             user_id,
                             item.memory_id,
@@ -227,12 +231,13 @@ class PostgresMemoryStore:
                         ),
                     )
                     connection.execute(
-                        "INSERT INTO core_memory_document_versions (app_name, "
+                        "INSERT INTO core_memory_document_versions (tenant_id, app_name, "
                         "user_id, memory_id, namespace, path, content, revision) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
-                        "ON CONFLICT (app_name, user_id, memory_id, revision) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (tenant_id, app_name, user_id, memory_id, revision) "
                         "DO NOTHING",
                         (
+                            tenant_id,
                             app_name,
                             user_id,
                             item.memory_id,
@@ -243,9 +248,9 @@ class PostgresMemoryStore:
                         ),
                     )
                 connection.execute(
-                    "DELETE FROM core_memory_documents WHERE app_name = %s "
+                    "DELETE FROM core_memory_documents WHERE tenant_id = %s AND app_name = %s "
                     "AND user_id = %s AND NOT (memory_id = ANY(%s))",
-                    (app_name, user_id, keep),
+                    (tenant_id, app_name, user_id, keep),
                 )
         except errors.UniqueViolation as error:
             raise CoreError(
@@ -254,19 +259,20 @@ class PostgresMemoryStore:
                 # The caller needs the revision the store is actually at. Deriving
                 # it from the number we just tried only ever returns our own stale
                 # base, which is the one value guaranteed to be useless.
-                data={"current_revision": self._current_revision(app_name, user_id)},
+                data={"current_revision": self._current_revision(app_name, user_id, tenant_id=tenant_id)},
             ) from error
 
-    def _current_revision(self, app_name, user_id):
+    def _current_revision(self, app_name, user_id, *, tenant_id="default"):
         with self.database.pool.connection() as connection:
             row = connection.execute(
                 "SELECT COALESCE(max(repository_revision), 0) AS revision "
-                "FROM core_memory_revisions WHERE app_name = %s AND user_id = %s",
-                (app_name, user_id),
+                "FROM core_memory_revisions WHERE tenant_id = %s AND app_name = %s AND user_id = %s",
+                (tenant_id, app_name, user_id),
             ).fetchone()
         return row["revision"]
 
-    def vector_candidates(self, *, app_name, user_id, namespace, embedding, limit):
+    def vector_candidates(self, *, app_name, user_id, namespace, embedding, limit,
+                          tenant_id="default"):
         """Rank by cosine distance in SQL; None means the caller scores in process."""
         if not self.vector_index_available or not embedding:
             return None
@@ -279,13 +285,13 @@ class PostgresMemoryStore:
                 f"SELECT memory_id, 1 - (embedding::vector({dimension}) <=> "
                 f"%s::vector({dimension})) AS similarity "
                 "FROM core_memory_documents "
-                "WHERE app_name = %s AND user_id = %s AND namespace = %s "
+                "WHERE tenant_id = %s AND app_name = %s AND user_id = %s AND namespace = %s "
                 # A vector of another length is stored but is not in the partial
                 # index; feeding it to the operator would raise instead of rank.
                 "AND embedding IS NOT NULL AND array_length(embedding, 1) = %s "
                 f"ORDER BY embedding::vector({dimension}) <=> "
                 f"%s::vector({dimension}) LIMIT %s",
-                (literal, app_name, user_id, namespace, dimension, literal, limit),
+                (literal, tenant_id, app_name, user_id, namespace, dimension, literal, limit),
             ).fetchall()
         return {row["memory_id"]: float(row["similarity"]) for row in rows}
 

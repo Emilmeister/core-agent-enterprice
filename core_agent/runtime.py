@@ -5801,6 +5801,13 @@ class CoreAgent:
         if self.memory_registry is None:
             raise CoreError("CAPABILITY_DISABLED")
         scope = self._run_scopes.get(run_id, {})
+        if self.interaction_store is not None and (
+            not isinstance(scope.get("tenant_id"), str) or not scope["tenant_id"].strip()
+            or not isinstance(scope.get("identity"), str) or not scope["identity"].strip()
+            or scope["identity"] == "anonymous"
+        ):
+            raise CoreError("AUTHENTICATION_REQUIRED")
+        tenant_id = scope.get("tenant_id") or "default"
         user_id = scope.get("identity") or "anonymous"
         if scope_name == "session":
             session_id = scope.get("session_id")
@@ -5814,7 +5821,8 @@ class CoreAgent:
             namespace = f"subject/{user_id}"
         else:
             raise CoreError("TOOL_ARGUMENT_INVALID", "scope must be user or session")
-        service = self.memory_registry.service(self.agent_config.agent["name"], user_id)
+        service = self.memory_registry.service(self.agent_config.agent["name"], user_id,
+                                               tenant_id=tenant_id)
         return service, namespace
 
     def _memory_sources(self, run_id):
@@ -5850,8 +5858,8 @@ class CoreAgent:
         }
 
     def _memory_read(self, arguments, run_id):
-        service, _ = self._memory(run_id, arguments.get("scope", "user"))
-        document = service.read(arguments["memory_id"])
+        service, namespace = self._memory(run_id, arguments.get("scope", "user"))
+        document = service.read(arguments["memory_id"], namespace=namespace)
         return {
             "memory_id": document.id,
             "title": document.title,
@@ -5883,9 +5891,10 @@ class CoreAgent:
         }
 
     def _memory_update(self, arguments, run_id):
-        service, _ = self._memory(run_id, arguments.get("scope", "user"))
+        service, namespace = self._memory(run_id, arguments.get("scope", "user"))
         document, result = service.update(
             arguments["memory_id"],
+            namespace=namespace,
             body=arguments["body"],
             expected_revision=int(arguments["expected_revision"]),
             title=arguments.get("title"),
@@ -5899,9 +5908,10 @@ class CoreAgent:
         }
 
     def _memory_split(self, arguments, run_id):
-        service, _ = self._memory(run_id, arguments.get("scope", "user"))
+        service, namespace = self._memory(run_id, arguments.get("scope", "user"))
         memory_ids, result = service.split(
             arguments["memory_id"],
+            namespace=namespace,
             overview=arguments["overview"],
             children=arguments["children"],
             expected_revision=int(arguments["expected_revision"]),
@@ -5912,9 +5922,10 @@ class CoreAgent:
         }
 
     def _memory_delete(self, arguments, run_id):
-        service, _ = self._memory(run_id, arguments.get("scope", "user"))
+        service, namespace = self._memory(run_id, arguments.get("scope", "user"))
         result = service.delete(
             arguments["memory_id"],
+            namespace=namespace,
             reason=arguments["reason"],
             expected_revision=int(arguments["expected_revision"]),
         )

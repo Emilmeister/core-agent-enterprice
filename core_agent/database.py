@@ -26,7 +26,7 @@ from .errors import CoreError
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -838,6 +838,29 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+""",
+
+    24: """
+ALTER TABLE core_memory_documents
+    ADD COLUMN tenant_id text NOT NULL DEFAULT '';
+ALTER TABLE core_memory_document_versions
+    ADD COLUMN tenant_id text NOT NULL DEFAULT '';
+ALTER TABLE core_memory_revisions
+    ADD COLUMN tenant_id text NOT NULL DEFAULT '';
+
+ALTER TABLE core_memory_documents DROP CONSTRAINT core_memory_documents_pkey;
+ALTER TABLE core_memory_documents
+    ADD PRIMARY KEY (tenant_id, app_name, user_id, memory_id);
+ALTER TABLE core_memory_document_versions DROP CONSTRAINT core_memory_document_versions_pkey;
+ALTER TABLE core_memory_document_versions
+    ADD PRIMARY KEY (tenant_id, app_name, user_id, memory_id, revision);
+ALTER TABLE core_memory_revisions DROP CONSTRAINT core_memory_revisions_pkey;
+ALTER TABLE core_memory_revisions
+    ADD PRIMARY KEY (tenant_id, app_name, user_id, repository_revision);
+
+DROP INDEX core_memory_namespace_idx;
+CREATE INDEX core_memory_namespace_idx
+    ON core_memory_documents (tenant_id, app_name, user_id, namespace);
 """,
 
 }
