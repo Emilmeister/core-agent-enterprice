@@ -78,7 +78,11 @@ print({marker!r})
         def generate(self, *, context, tools, instructions, messages=None):
             index = len(self.calls)
             assert "core_response_files" in tools
-            if index:
+            if index == 0:
+                assert "core_cron_create" in tools
+            else:
+                assert "core_cron_create" not in tools, "owner deny did not narrow actual model catalog"
+            if 1 <= index <= 4:
                 marker = ("browser-native-root-verified", "browser-native-followup-verified",
                           "browser-native-output-selected", "browser-native-output-deleted")[index - 1]
                 result = next(json.loads(message["content"]) for message in messages
@@ -90,6 +94,8 @@ print({marker!r})
                 else:
                     assert result["output"]["exit_code"] == 0
                     assert result["output"]["stdout"].strip() == marker, "actual native file operation did not succeed"
+            if index == 5:
+                assert "Native file reads completed." in context, "manual cron lost original chat history"
             return super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
 
     model = BrowserModel([
@@ -105,6 +111,7 @@ print({marker!r})
                      "assert not p.exists() and not q.exists()\nprint('browser-native-output-deleted')"],
         }),)),
         ModelResponse(message="Native file reads completed."),
+        ModelResponse(message="Native manual cron completed."),
     ])
     model.model = "owner-browser-fixture"
     app = create_app(model=model, guardrail_classifier=GuardrailClassifier(ClearModel()))

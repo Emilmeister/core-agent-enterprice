@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import psycopg
+from cryptography.fernet import Fernet
 from psycopg import sql
 
 
@@ -140,7 +141,8 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
                     "data": {"server.py": (self.root / "deploy/kubernetes/owner-browser-fixture.py").read_text()}})
         private = {"KEYCLOAK_ISSUER_URL": self.issuer, "KEYCLOAK_CLIENT_ID": "introspection", "KEYCLOAK_CLIENT_SECRET": self.secret,
                    "KEYCLOAK_UI_CLIENT_ID": "browser", "KEYCLOAK_AUDIENCE": "company-agent", "CORE_AGENT_TENANT_ID": self.namespace,
-                   "SESSION_DATABASE_URL": self.pod_dsn, "DATABASE_URL": self.pod_dsn}
+                   "SESSION_DATABASE_URL": self.pod_dsn, "DATABASE_URL": self.pod_dsn,
+                   "PUSH_NOTIFICATION_ENCRYPTION_KEY": Fernet.generate_key().decode("ascii")}
         self.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "server-config", "namespace": self.namespace}, "stringData": private})
         pod = json.loads(self.kube("create", "--dry-run=client", "--validate=false", "-f", str(self.root / "deploy/kubernetes/sandbox-pod.yaml"), "-o", "json"))
         pod["metadata"] = {"name": "owner-browser", "namespace": self.namespace}
@@ -152,7 +154,7 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         backend["command"] = ["uv", "run", "--no-sync", "python", "/browser-fixture/server.py", "backend"]
         backend["envFrom"] = [{"configMapRef": {"name": "native"}}, {"secretRef": {"name": "server-config"}}]
         settings = {"CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled", "SESSION_STORAGE_TYPE": "postgres",
-                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec,core_response_files", "CORE_AGENT_ALLOWED_SKILLS": "",
+                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec,core_response_files,core_cron_create", "CORE_AGENT_ALLOWED_SKILLS": "",
                     "CHAT_WORKSPACE_ROOT": "/data/chats", "LOCAL_WORKSPACE_ROOT": "/data/scratch", "DURABLE_STORAGE_ROOT": "/data/durable",
                     "UV_CACHE_DIR": "/tmp/uv-cache", "PYTHONDONTWRITEBYTECODE": "1", "OTEL_SDK_DISABLED": "true"}
         backend["env"] = [{"name": name, "value": value} for name, value in settings.items()]
@@ -220,6 +222,12 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         proof = self.command(["node", str(Path(__file__).with_name("owner_ui_files_browser.mjs"))], content=json.dumps(config), timeout=180)
         (self.evidence / "browser.log").write_text(proof)
         self.assertIn("PASS actual native file reads and persisted attachment history", proof)
+        self.assertIn("PASS actual owner policy persists independent access and material exemption for core_cron_create", proof)
+        self.assertIn("PASS actual owner policy persists independent access and material exemption for core_terminal_exec", proof)
+        self.assertIn("PASS owner UI runs same-chat cron despite model tool deny", proof)
+        self.assertIn("PASS actual private peer reread exposes configured flag and disabled state only", proof)
+        self.assertIn("PASS confirmed workspace cleanup deletes only the selected actual file", proof)
+        self.assertIn("PASS browser reload preserves both completed roots and immutable file history after cleanup", proof)
 
 
 if __name__ == "__main__":
