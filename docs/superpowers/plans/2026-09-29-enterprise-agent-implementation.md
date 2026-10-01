@@ -180,89 +180,61 @@ docker build -t core-agent:local .
 
 ## Готовность к поставке
 
-Восстановленный enterprise candidate находится в постоянной рабочей копии.
-Подключены owner UI/history, политики/HITL/вопросы/guardrails, durable waits,
-durable remote A2A с явным выбором исходящих файлов, cron, workspace
-preview/download и ручная очистка.
-Private file batches и атомарный внутренний admission проверены отдельно;
-публичный raw FilePart intake и owner UI composer подключены. PostgreSQL Task записывается до file bind
-в одной транзакции; исходные имена и metadata сохраняются без потери bytes.
+Текущий срез включает owner UI, Keycloak scope, per-tool HITL/guardrails policy,
+atomic chat admission/files, durable remote/time waits, same-chat cron,
+семантическую суммаризацию и удаление трёх named artifact tools с exclusive
+инфраструктурой. Старых named файлов нет; export/import исключён по явному
+решению пользователя. Memory изолируется trusted tenant/app/user и namespace;
+schema24 сохраняет legacy bytes под неизвестным tenant без догадок.
 
-Свежая проверка 1 октября 2026 года на schema22 с настоящими PostgreSQL и
-Keycloak: `uv run python -m unittest discover -s tests -v` — 1376 tests,
-exit0, два skips. Ruff, spec quality/lock и diff-check также проходят.
-UI typecheck и production build проходят; Vite assets включены в wheel/sdist
-и проверенный ARM64 Docker image, который работает от `agent` без Node/npm.
-Исправлены ошибки восстановленного sandbox resource, legacy Task projection,
-file admission FK/JSONB и гонки synthetic PostgreSQL test fixtures.
+Проверенные границы и автоматические доказательства:
 
-Полный release gate остаётся открытым: нужны проверки combined cron/HITL,
-restart/compaction и всех private owner projection paths, итоговая traceability,
-actual amd64/целевой Kubernetes и реальный provider/embedding stack.
-Приём файлов завершённых remote Tasks и удаление named artifact service
-подключены. Пользователь подтвердил отсутствие прежних named файлов:
-export/import и перенос таких данных исключены из scope.
-Итоговые вложения подключены через явный `core_response_files`: immutable snapshots,
-canonical A2A results/recovery, owner history/download и source UI. Последний full
-PostgreSQL/Keycloak suite —1465 tests, 208.608 секунды, exit0, три ожидаемых skips;
-последующий targeted card gate подтвердил binary output mode. Extended actual
-browser output gate прошёл на native ARM64: 1 test, 79.291 секунды, exit0, без skips,
-28 browser checks. Реальные кнопки UI скачивают frozen snapshots после изменения
-и удаления originals; chat switch abort не создаёт stale download. Source/image
-hashes, logs и screenshot — `.local-evidence/owner-browser-outgoing/`.
-На native ARM64 Linux в отдельном disposable kind-кластере полный обязательный
-sandbox gate прошёл: 12 tests, 104.268 секунды, exit0, без skips. Реальный Pod
-подтвердил mount/PID/seccomp/rlimits, bootstrap/teardown, Python broker/HITL,
-разделение workspaces и контролируемую IPv4/IPv6 сеть. Node readback подтвердил
-aggregate Pod pids.max512. Исправлены lookup nft, user namespace helper,
-IPv6 readiness и потерянные libseccomp TTY deny rules; последняя проверка
-использует совместно два sealed filters. Сквозная проверка actual Chromium +
-Keycloak + PostgreSQL + application Pod прошла на native ARM64: files-only
-composer, atomic retry после потерянного acknowledgement и изменения лимита,
-owner HITL, sandbox read-only publication, persisted history, authenticated
-download и отсутствие observed credentials/raw files в browser storage обеих
-вкладок. Required browser module — 1 test, 47.793 секунды, exit0, без skips,
-20 browser checks. Ошибка видимости служебного manifest для UUIDhex исправлена
-в общем path guard. CI включает этот dedicated browser gate на amd64 после
-обязательного native sandbox gate; actual CI amd64, целевой deployment/CSI
-ещё не подтверждены, ARM64 browser proof их не заменяет.
+- Обычный Python3.12 CI на свежей БД/schema24 с настоящими PostgreSQL/Keycloak:
+  `uv sync --frozen`, migrations, Ruff и `uv run python -m unittest discover
+  -s tests -v` — 1625 tests, 259.327 секунды, exit0. Три dedicated skips
+  относятся к native sandbox, actual browser и memory-loop ownership case;
+  PostgreSQL/Keycloak tests не пропущены. Evidence —
+  `.local-evidence/compose-ci-final/`.
+- Combined release boundary module входит в ordinary discovery: cron после двух
+  compactions, omitted summary vs authoritative policy/waits, оба remote
+  input/auth-required bindings с follow-up после PG restart, manual/automatic
+  admission race, active HITL после disable/delete schedule и private owner
+  projection по Get/List/artifacts/SSE/encrypted push.
+- Actual Chromium/Keycloak/PostgreSQL/native ARM64 Pod browser gate:
+  1 test, 84.845 секунды, exit0, без skips. Проверены файлы/lost-ACK retry,
+  HITL, per-tool policy, custom header secret editor, cron timezone/edit/manual
+  run/delete, selected workspace cleanup и immutable history/download после
+  удаления originals. Evidence — `.local-evidence/owner-browser-expanded-key/`.
+- Полный required native ARM64 sandbox gate ранее прошёл на removal image:
+  12 tests, exit0, без skips; namespace/seccomp/rlimit/broker/teardown/dual-stack
+  receivers, aggregate Pod pids.max512. Его image snapshot не подменяет
+  проверку нового image/target.
+- Docker Compose задаёт outer native seccomp, `/dev/net/tun`, bounded
+  CPU/memory/PIDs, read-only root и dropped capabilities. Actual composition-root
+  terminal/Python/background test через Compose — 1 test, 23.921 секунды,
+  exit0; controlled model, настоящие launcher/processes, без privileged.
+  Этот check включён в native CI. Evidence —
+  `.local-evidence/docker-compose-sandbox-recovered/`.
+- Native UI build stage позволяет собрать target amd64 на Mac без Node emulation.
+  Образ schema24 с packaged UI/non-root user собран и загружен в закрытый
+  registry; target node успешно скачал exact digest. Evidence —
+  `.local-evidence/target-amd64-native-ui-build.*`,
+  `.local-evidence/target-registry-push.*`,
+  `.local-evidence/target-native-preflight/`.
 
-После удаления трёх named artifact tools, exclusive S3/Mongo adapters,
-dependency и settings полный обычный CI suite на Python3.12/schema23 с
-настоящими PostgreSQL/Keycloak прошёл: 1599 tests, 220.519 секунды, exit0,
-три dedicated skips. `uv sync --frozen`, migrations, Ruff, wheel/sdist build,
-ARM64 image build и CI image/skills/CLI/Python smoke также прошли.
-Новый image: `sha256:952af8c422de6f81ced356bacee8e67d94087c3a2248c973352ef3d05c44a516`.
-Evidence — `.local-evidence/artifact-removal-ci-final-*`,
-`.local-evidence/artifact-removal-image*` и
-`.local-evidence/artifact-removal-smoke-*`.
-Saved native/browser proofs выше относятся к своим прежним image snapshots;
-новый image smoke сам по себе не подтверждает target CSI/amd64/sandbox gates.
+Полный release gate пока открыт:
 
-Исходящие remote attachments подключены отдельным срезом: optional per-call
-`files`, frozen snapshots до HITL, безопасные approval receipts, source-scoped
-job v2 и обе A2A1.0 bindings. Direct/Python runtime tests проверены на памяти и
-реальном PostgreSQL, в том числе отсутствие автоматического наследования final
-set, atomic failure без handle, восстановление snapshot и изменённые arguments.
-Loopback HTTP проверяет binary/empty raw Parts, strict JSON/base64, aggregate
-bounds и unknown Send после malformed redirect. Ранние remote file previews
-не завершают ожидание и не публикуются. Native executor/scheduler gate —68 tests,
-exit0, без skips; transport gate —45 tests, exit0, без skips; root/Python
-runtime gate —14 tests, exit0, без skips. Child metadata proof использует реальные
-PostgreSQL jobs/blobs с in-memory workflow и не доказывает весь delegated-child
-PostgreSQL pipeline. Terminal remote file import остаётся закрыт до atomic
-quarantine/guardrail следующего среза.
-После последних transport/executor исправлений полный прогон на новой БД и
-реальном Keycloak прошёл: `uv run python -m unittest discover -s tests -v` —
-1501 tests, 196.434 секунды, exit0, три ожидаемых skips (dedicated browser,
-native Linux sandbox, отдельный memory loop ownership case). Ruff и diff-check
-прошли. Evidence — `.local-evidence/remote-outbound-final.log` и `.exit`.
-
-- Нет новой анонимной production-границы и bypass через list/stream/download,
-  Python broker, child task, memory, summary или восстановление.
-- Подтверждение владельца, deadline, cancel и follow-up конкурируют через durable
-  переходы; неоднозначные внешние side effects не повторяются автоматически.
-- Данные и история не удаляются миграцией или удалением старого tool backend.
-- `AGENTS.md`, конфигурация и инструкции развёртывания отражают фактический код.
-- Изменённые требования получают `implemented` только после соответствующего
-  автоматического доказательства в проходящем обычном CI suite.
+- В target Kubernetes профиль seccomp установлен по явному разрешению. Обычный
+  Pod имеет finite PID limit9462: изменение kubelet не требуется. Kernel6.8
+  отвергает user-namespace idmapped mount `/dev/net/tun` и `/dev/net`;
+  fallback/privileged для рабочего агента не включены. Подготовлен, но не
+  применён отдельный установщик TUN-device на обычной filesystem.
+- Нужны завершённые actual amd64/target namespace/network checks и target CSI
+  persistence после пересоздания Pod; ARM64 и Compose proofs их не заменяют.
+- Реальный настроенный LLM возвращает HTTP404, Foundation Models embeddings
+  endpoint — HTTP503. Model catalogue доступен, но live provider/embedding
+  proof не прошёл. Контрактные tests не являются proof качества модели.
+- Незавершённые foundation/migration release criteria остаются `partial`
+  в `spec/implementation-status.md`; весь профиль не объявлен production-ready.
+- Main обновляется после согласованных проверок; проверенные логические
+  этапы сохранены в постоянной feature-ветке.
