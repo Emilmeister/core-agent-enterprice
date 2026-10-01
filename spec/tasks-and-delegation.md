@@ -239,12 +239,48 @@ Runtime использует A2A 1.0 `SendMessage`/`SendStreamingMessage`, об�
 
 Вызов отправляет одну сфокусированную задачу и возвращает локальный durable handle. При создании remote Task root task/context IDs не подставляются как remote IDs; полученные remote IDs сохраняются с handle. Вложения проходят общий лимит/transport rules. Сбой до dispatch возвращается structured tool result; неизвестный outcome возможной remote мутации требует reconciliation, а не повторного `SendMessage`. Обрыв SSE требует проверки существующего remote task через GetTask, не повторной отправки задания.
 
-Text schema `core_agent_send_message` содержит ровно обязательные непустые
-`agent_name` и `task`; результат —обычный локальный task snapshot с `task_id`.
+Schema `core_agent_send_message` содержит обязательные непустые `agent_name`
+и `task`, а также optional `files`: ordered array уникальных непустых относительных
+путей существующих regular files текущего workspace. Неизвестные поля отклоняются.
+Модель явно выбирает вложения для каждого вызова. Отсутствие `files` или `[]`
+означает отправку без файлов: содержимое workspace, недавно созданные файлы,
+входящие attachments и выбор `core_response_files` автоматически не добавляются.
+Результат —обычный локальный task snapshot с `task_id`.
 Accepted operation закрепляет peer revision до owner approval/dispatch, чтобы
 registry update не подменил согласуемого адресата. Имена/credentials/remote IDs
 выводятся из trusted binding; prompt не задаёт URL или header. Immediate terminal
 Message завершает локальный handle без GetTask, если remote task ID не выдан.
+
+До owner approval/dispatch весь выбранный набор проходит safe-path/regular-file
+и aggregate-size validation и сохраняется как immutable snapshots. Ошибка любого
+файла не создаёт handle и не отправляет remote Message; исходники и pending final
+selection сохраняются, модель получает structured tool error. Одобренный набор
+не перечитывается из workspace после изменения/удаления originals, restart или
+позднего изменения company limit. Approval содержит ordered safe receipts и digest
+выбора; private blob references и bytes не входят в model/public material.
+Отправляются text Part и только выбранные ordered raw Parts, включая empty files,
+через обе bindings; локальные task/context/run IDs не подставляются как remote IDs.
+
+Persisted remote contract v2 сохраняет прежние поля адресата/message/settings,
+trusted `caller_scope` ровно `{owner_id, context_id, task_id, run_id}` исходного
+WorkflowRecord, `attachment_limit_bytes` и полный `outgoing_files` manifest v1.
+Scheduler owner остаётся owning run ID и совпадает с `caller_scope.run_id`;
+tenant берётся только из authenticated contract. Child использует собственные
+task/run IDs и workspace чата, не получает root/remote grants. Remote IDs не
+разрешают чтение локальных файлов. Before Send intent проверяется весь frozen
+набор. Существующие v1 jobs/checkpoints читаются по прежнему text-only контракту,
+без восстановления вложений из путей или Markdown; неизвестная версия fail closed.
+
+Remote response ограничен encoded transport ceiling независимо от decoded
+company limit. Strict UTF-8/JSON и canonical base64 проверяются до SDK allocation;
+сумма decoded files и весь набор проверяются до relay. `input-required` и
+`auth-required` продолжают ожидание с теми же remote IDs и не публикуют ранние
+attachments. Только полный completed Task/Message может принять файлы в private
+quarantine. Claim/deadline/cancel и привязка к canonical source/root проверяются
+атомарно с terminal result; failed/canceled/expired либо late claim не принимают
+материал. Workspace publication и передача модели происходят только после
+guardrails для полного text/file batch. Root public Task для child выводится из
+канонической ancestry; shadow public Tasks и ослабление existing FK запрещены.
 
 Прогресс разрешённой операции показывается в текущем чате и соответствующей публичной проекции; окончательный result доставляется через существующий task lifecycle. Remote `input-required`/`auth-required` не считаются финальным ответом: чужое HITL разрешает владелец удалённого агента. Детали LONG-01–04 ниже.
 

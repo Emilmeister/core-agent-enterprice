@@ -129,6 +129,18 @@ Deployment ceiling transport storage (`MAX_RESPONSE_SIZE`) остаётся не
 подготовка возвращает `ARTIFACT_TOO_LARGE` без изменения принятого набора;
 увеличение company limit не расширяет platform storage ceilings автоматически.
 
+Для новой задачи внешнему агенту `core_agent_send_message.files` выбирает отдельный
+полный набор только для этого вызова. Он не изменяет final selection и не наследует
+файлы workspace автоматически. Snapshots, их aggregate ceiling и trusted source
+scope закрепляются до HITL; outbound raw Parts содержат safe basename/media type
+и bytes, без локальных путей, private blob IDs и предоставления доступа к чату.
+Общий outbound набор проверяется до Send intent, включая recovery. Файлы remote
+result принимаются атомарно с fenced terminal operation outcome в quarantine
+исходного чата; guardrails и publication barrier предшествуют видимости модели.
+Внутренний child сохраняет свой source run, а public Task FK выводится через
+проверенную root ancestry. Human-wait progress и failed/expired outcomes не
+публикуют attachments. Полный контракт —в [Удалённых A2A-агентах](tasks-and-delegation.md).
+
 ### FILE-04. Очистка workspace через UI
 
 Владелец может удалить старые файлы из workspace выбранного чата через UI.

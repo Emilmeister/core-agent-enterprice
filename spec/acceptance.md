@@ -495,6 +495,21 @@ Remote wait отклоняет любое явно переданное `timeout
 пустой effective registry скрывает Send в model catalog/Agent Card и блокирует
 новый dispatch. Scoped peer credentials/root identifiers не наследуются извне.
 
+Remote file selection proof: workspace содержит выбранные и невыбранные файлы,
+а final response имеет свой выбор. Только явный `core_agent_send_message.files`
+передаётся в обеих bindings; отсутствие/[] передаёт один text Part. Invalid,
+symlink/foreign path, отсутствующий или последний oversized файл дают zero Send
+и zero handle, не меняют originals/final selection. После HITL/restart/изменения
+originals отправляются frozen ordered bytes и empty file. Safe approval receipts
+соответствуют selection digest; private refs не проходят в model/UI/public A2A.
+v1 text-only jobs восстанавливаются прежним способом; v2 source root/child scope
+не позволяет загрузить чужой manifest даже с одинаковыми bytes/известным ID.
+Malformed/noncanonical/oversized remote batch не relay-ится частично. Human-wait
+не импортирует ранние files. Completed terminal result и quarantine acceptance
+атомарны при реальном PostgreSQL pool1; cancel/deadline/lease races не оставляют
+accepted files. Root/child guard allow/reject/timeout/restart соблюдают общий
+publication barrier без shadow Task или обхода canonical ancestry.
+
 Remote progress proof: working/input-required/auth-required metadata появляются
 в текущем root Task и scoped Get/List/Subscribe/push без raw peer data и чужих
 операций. Pending wait, workflow version и model/tool usage не меняются;

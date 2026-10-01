@@ -28,6 +28,12 @@ Session/tenant/auth/trace/task delivery принадлежат A2A context и tr
 
 ### Файлы в transport
 
+Создавая задачу внешнему агенту, модель выбирает `core_agent_send_message.files`
+явно для каждого вызова. Отсутствующее поле или `[]` не прикрепляет файлов;
+созданные файлы и `core_response_files` не являются автоматическим выбором.
+Transport передаёт сохранённые bytes только выбранного набора через standard raw
+Parts; URLs и локальные IDs/пути не дают внешнему агенту доступ к workspace.
+
 UI и A2A принимают вложения вне RunRequest и атомарно сохраняют их в постоянной папке чата по [Файлам и transport artifacts](artifacts.md). Модель получает фактические безопасные имена, размер, media type и путь `/workspace`, а не inline bytes или system instruction. Сообщение только с файлами допустимо: adapter формирует непустой prompt из описания вложений.
 
 Входящий A2A FilePart поддерживает inline bytes; декодирование строгое, лимит считается по декодированным байтам. Ссылочные Parts MAY приниматься только управляемым transport resolver после проверки доступа и фактических сетевых назначений, без передачи credential на произвольный caller URL. Неподдерживаемая ссылка отклоняется до admission, а не игнорируется. Обычный A2A Artifact остаётся формой результата; model-callable artifact tools удалены.

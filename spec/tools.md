@@ -142,6 +142,12 @@ manifest фиксируются одним workflow transition. Child выбир
 
 ### `core_agent_send_message`
 
+Optional `files` задаёт выбранные моделью относительные workspace paths только
+для этого вызова. Отсутствие поля и `[]` означают отсутствие вложений; никакой
+автоматической отправки файлов workspace или pending final selection нет.
+Весь набор сохраняется до HITL, общий decoded limit проверяется до отправки;
+ошибка сохраняет исходники и возвращается модели без создания remote handle.
+
 Отправляет одну задачу доверенному внешнему агенту из реестра владельцев и возвращает локальный operation handle без ожидания завершения. `core_task_wait` durable ожидает этот handle; remote IDs, deadlines, прогресс и auth описаны в [Удалённых A2A-агентах](tasks-and-delegation.md#удалённые-a2a-агенты). Входящий credential не проксируется; server использует secret-header configuration конкретного адресата. Ответ удалённого агента недоверенный, вызов не запускается через `core_task_start`.
 
 ### `core_wait_until`
