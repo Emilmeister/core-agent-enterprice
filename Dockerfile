@@ -1,4 +1,4 @@
-FROM node:24-alpine AS owner-ui
+FROM --platform=$BUILDPLATFORM node:24-alpine AS owner-ui
 WORKDIR /app/ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci

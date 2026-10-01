@@ -127,7 +127,8 @@ criterion должны войти в тот же завершённый change. 
 - `ui/` — исходники общего owner UI на React/TypeScript/Vite; команды
   `npm ci`, `npm run typecheck` и `npm run build` выполняются из этой папки
   с Node.js 24 (минимум 22.12). Production build создаёт ignored `core_agent/ui_dist/`, который
-  входит в Python wheel/sdist; Docker собирает его в отдельном Node stage.
+  входит в Python wheel/sdist; Docker собирает его в отдельном Node stage
+  на build platform, а Python runtime — на target platform.
 - `spec/` — target specification, acceptance и release profiles.
 - `docs/superpowers/specs/` — проектные черновики для согласования; не заменяют
   нормативный `spec/` и не разрешают менять замороженные spec/tests.
