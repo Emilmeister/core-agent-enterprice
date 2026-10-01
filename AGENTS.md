@@ -694,9 +694,11 @@ run получает отдельные MCP session и negotiated version; пе�
   Отражённые секреты в peer IDs отклоняются до checkpoint/URL, текст очищается
   existing redactor. v2 `working`/`input-required`/`auth-required` не импортируют
   ранние raw previews и сохраняют polling с прежними IDs/deadline. Terminal v2
-  files принимаются в quarantine только при подключении одного ChatFileService
-  к executor/scheduler; отсутствие service явно закрывает import. Этот optional
-  backend flow ещё не подключён к composition root до runtime guard/publication.
+  files принимаются в quarantine через один ChatFileService, подключённый
+  composition root к executor/scheduler/runtime; отсутствие service явно закрывает
+  import. Runtime refetch-ит только owned remote completed Task и закрепляет
+  полный text/ordered file receipt до guardrails. Frozen progress не повышается
+  до terminal outcome при повторном чтении scheduler state.
   v1 file response остаётся `REMOTE_FILES_UNSUPPORTED`. Accepted batch хранит
   source run и derived public root Task; child public rows не создаются.
   Shared `caller_scope` держит chat → root → intermediate → source locks,
@@ -704,7 +706,17 @@ run получает отдельные MCP session и negotiated version; пе�
   writer lease; historical sealed reads допускают terminal ancestors.
   Quarantine bind, terminal result и notification/outbox commit-ятся атомарно
   под claim/deadline/revision/cancel fences на одной borrowed connection.
-  Private `file_batch_id` исключается из remote mailbox/outbox projections.
+  Private `file_batch_id` исключается из remote mailbox/outbox и model task
+  snapshots. Text и каждый файл проходят guardrails до whole-batch publication;
+  отказ исключает весь result, task list может сохранить отдельно разрешённые
+  результаты. Вложенный Python останавливается перед ожиданием, recovery не
+  повторяет Send или prefix кода; provenance всех file receipts сохраняется
+  даже для bounded outcomes. Trusted-tool exemption фиксируется durable до
+  публикации и не отменяет предыдущий отказ по точному материалу.
+  Migration23 разрешает только superseding denial `accepted_ready → excluded`.
+  Recovery возвращает уже перенесённый, но не committed каталог в private
+  quarantine и синхронизирует оба родителя до exclusion; published batch и
+  остальные decision references неизменяемы.
   Reflected credentials в metadata/raw files отклоняются до stage, проверяя
   UTF-8 и фактические Latin-1 header bytes; содержимое файлов не переписывается.
   Data Parts отклоняются. Ошибка network/parser после возможного

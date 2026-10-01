@@ -2013,6 +2013,9 @@ def create_app(
                            if state["database"] else MemoryChatFileStore(state["workflow"], admission.validate_workspace_scope))
             file_service = ChatFileService(files_store, agent.tool_runtime.environment_manager.backend.chats)
             agent.chat_file_service = file_service
+            agent.task_scheduler.chat_file_service = file_service
+            if agent.remote_registry is not None:
+                agent.remote_executor.chat_file_service = file_service
             cleanup = WorkspaceCleanupService(admission, agent.tool_runtime.environment_manager.backend.chats)
             admission.workspace_cleanup = cleanup
             agent.workspace_cleanup = cleanup

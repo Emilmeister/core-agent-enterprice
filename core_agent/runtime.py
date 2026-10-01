@@ -50,7 +50,7 @@ from .remote_operations import RemoteA2AExecutor
 from .response_files import ResponseFileService
 from .security import redact
 from .streaming import NullStreamPublisher
-from .tasks import DelegationContract, _remote_contract
+from .tasks import DelegationContract, _remote_contract, remote_result_projection
 from .tools import CRON_CREATE_TOOL, RESPONSE_FILES_TOOL, ToolCall, ToolDefinition, ToolResult
 from .workflow import InMemoryWorkflowStore, SuspendedRun, WorkflowRecord, TERMINAL_STATES
 from .workspace import WorkspaceBinding
@@ -441,13 +441,15 @@ class CoreAgent:
         )
         if self.depth == 0 and hasattr(self.task_scheduler, "register"):
             self.task_scheduler._workflow_outcome = self._scheduler_workflow_outcome
+            self.task_scheduler.chat_file_service = self.chat_file_service
             self.task_scheduler.register(
                 "background_tool", self._recover_background_tool
             )
             self.task_scheduler.register("subagent", self._recover_subagent)
             if self.remote_registry is not None:
-                self.task_scheduler.register("remote_a2a", RemoteA2AExecutor(
-                    self.task_scheduler, self.remote_registry, response_files_service=self.response_files_service))
+                self.remote_executor = RemoteA2AExecutor(self.task_scheduler, self.remote_registry,
+                    response_files_service=self.response_files_service, chat_file_service=self.chat_file_service)
+                self.task_scheduler.register("remote_a2a", self.remote_executor)
 
     @staticmethod
     def _accepts_deltas(model):
@@ -2690,7 +2692,7 @@ class CoreAgent:
         active_text = self._active_tool_result(record, call, text, token_limit)
         context = self._context_from_dict(snapshot["context"])
         provenance = self._context_provenance(snapshot, context.sequence_range[1] + 1,
-                                              material_source_ids=("result:" + call.id,))
+                                              material_source_ids=("result:" + call.id, *snapshot.pop("result_file_sources", {}).pop(call.id, [])))
         transcript_item = ContextItem("tool_result", text, self.token_counter(text), provenance=provenance)
         active_item = (
             transcript_item
@@ -3053,13 +3055,14 @@ class CoreAgent:
             return None
         return review["state"]
 
-    def _guard_file_batch(self, record, snapshot, batch_id, *, sequence, lease_token):
+    def _guard_file_batch(self, record, snapshot, batch_id, *, sequence, lease_token,
+                          continuation=None, before_pending=None, exempt=False, exemption_source=None):
         if self.chat_file_service is None or self.material_review_store is None:
             raise CoreError("MATERIAL_REVIEW_REQUIRED")
         binding = WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id)
         service = self.chat_file_service
         batch = service.store.get(batch_id, record.tenant_id)
-        if (batch["run_id"], batch["task_id"], batch["sequence"]) != (record.run_id, record.task_id, sequence):
+        if (batch["run_id"], batch["sequence"]) != (record.run_id, sequence):
             raise CoreError("FILE_BATCH_NOT_FOUND")
         material = service.review_material(batch_id, binding, run_id=record.run_id, task_id=record.task_id)
         manifest = material["manifest"]
@@ -3074,16 +3077,26 @@ class CoreAgent:
                 payload=payload, sealed_ref={"batch_id": batch_id, "index": entry["index"]},
                 material_digest=entry["sha256"], material_kind="file_sha256", text_digest=document["text_digest"],
                 documents=[encoded, document["text"]], complete=document["complete"],
-                continuation={"version": 1, "phase": "input", "sequence": sequence or 0}, lease_token=lease_token)
+                continuation=continuation or {"version": 1, "phase": "input", "sequence": sequence or 0},
+                lease_token=lease_token, before_pending=before_pending, exempt=exempt)
             review_refs.append(snapshot.get("material_denials", {}).get(source_id)
-                or snapshot["material_reviews"][source_id + ":" + digest])
+                or snapshot.get("material_reviews", {}).get(source_id + ":" + digest)
+                or "exempt:" + hashlib.sha256(json.dumps(manifest, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False).encode()).hexdigest())
             if decision is not None:
                 break
         # Every classification/owner resolution is already committed. Persist a
         # single batch decision before publication; recovery reuses these reviews.
         decision_ref = review_refs[-1]
+        if decision_ref.startswith("exempt:"):
+            current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            evidence = {"decision_ref": decision_ref, **(exemption_source or {})}
+            self._record_transition(current, state=current.state, snapshot=snapshot,
+                event_kind="file.material.exempt", event_data=evidence,
+                audit=(("file.material.exempt", evidence),), lease_token=lease_token)
         try:
-            if material["state"] == "accepted_quarantine":
+            if (material["state"] == "accepted_quarantine"
+                    or material["state"] == "accepted_ready" and decision is not None):
                 service.record_decision(batch_id, binding, decision_ref=decision_ref, allow=decision is None, lease_token=lease_token)
             elif (material["state"] == "excluded") != (decision is not None):
                 raise CoreError("MATERIAL_REVIEW_CONFLICT")
@@ -3099,14 +3112,80 @@ class CoreAgent:
             # Acceptance is already durable. A temporary storage outage leaves
             # the original input unread and recoverable, never an HTTP rejection
             # followed by a later surprise publication.
+            if before_pending is not None:
+                snapshot, continuation = before_pending()
             current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
-            pending = copy.deepcopy(current.snapshot)
+            pending = copy.deepcopy(snapshot)
             pending["file_delivery_pending"] = {"batch_id": batch_id, "error_code": code}
             current = self._record_transition(current, state=current.state, snapshot=pending,
                 event_kind="file.delivery.pending", event_data=pending["file_delivery_pending"], lease_token=lease_token)
             raise _MaterialSuspended(SuspendedRun(current.run_id, current.task_id, "", current.version)) from error
         snapshot.pop("file_delivery_pending", None)
         return "Attached files: " + json.dumps([entry["actual_name"] for entry in manifest["entries"]], ensure_ascii=False) + "; folder: /workspace/attachments/" + batch_id
+
+    def _remote_result_batches(self, record, payload):
+        """Freeze receipts from owned scheduler state; peer/model fields grant nothing."""
+        if payload.get("tool_name") not in {"core_agent_send_message", "core_task_get", "core_task_list",
+                                           "core_task_wait", "core_task_cancel"}:
+            return payload, []
+        candidate = copy.deepcopy(payload)
+        outputs = candidate["output"] if isinstance(candidate["output"], list) else [candidate["output"]]
+        batches = []
+        binding = WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id)
+        for output in outputs:
+            if (not isinstance(output, dict) or not isinstance(output.get("task_id"), str)
+                    or output.get("state") != "completed"):
+                continue
+            if not self.task_scheduler.is_remote(output["task_id"], owner_id=record.run_id, tenant_id=record.tenant_id):
+                continue
+            task = self.task_scheduler.get(output["task_id"], owner_id=record.run_id, tenant_id=record.tenant_id)
+            result = task.result
+            if not isinstance(result, dict) or not result.get("file_batch_id"):
+                continue
+            if self.chat_file_service is None:
+                raise CoreError("MATERIAL_REVIEW_REQUIRED")
+            batch_id = result["file_batch_id"]
+            material = self.chat_file_service.review_material(batch_id, binding,
+                run_id=record.run_id, task_id=record.task_id)
+            output["result"] = self._value(remote_result_projection(result))
+            output["result"]["files"] = [{key: entry[key] for key in
+                ("index", "actual_name", "relative_path", "size_bytes", "sha256")}
+                for entry in material["manifest"]["entries"]]
+            output["result"]["folder"] = "/workspace/attachments/" + batch_id
+            batches.append((batch_id, output))
+        return candidate, batches
+
+    def _guard_remote_results(self, record, snapshot, call, payload, batches, *, decision,
+                              continuation, lease_token, before_pending=None):
+        binding = WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id)
+        for batch_id, output in batches:
+            if decision is not None:
+                denial = snapshot.get("material_denials", {}).get("result:" + call.id)
+                if not denial:
+                    raise CoreError("MATERIAL_REVIEW_CONFLICT")
+                batch = self.chat_file_service.store.get(batch_id, record.tenant_id)
+                if batch["state"] in {"accepted_quarantine", "accepted_ready"}:
+                    self.chat_file_service.record_decision(batch_id, binding, decision_ref=denial,
+                        allow=False, lease_token=lease_token)
+                continue
+            reviewed = self._guard_file_batch(record, snapshot, batch_id, sequence=None,
+                lease_token=lease_token, continuation=continuation, before_pending=before_pending,
+                exempt=self._material_exempt(record, call),
+                exemption_source={"tool_name": call.name, "origin": "builtin:" + call.name})
+            batch = self.chat_file_service.store.get(batch_id, record.tenant_id)
+            if batch["state"] == "excluded":
+                refusal = json.loads(reviewed)
+                snapshot["context_materials"]["result:" + call.id]["allowed"] = False
+                snapshot.setdefault("material_denials", {})["result:" + call.id] = refusal["decision_ref"]
+                output["result"] = {"code": refusal["code"],
+                    "instruction": "The entire remote result is unavailable. Continue without it."}
+                # A list can retain separately approved tasks; a single result is a safe tool failure.
+                if not isinstance(payload["output"], list):
+                    return {**payload, "status": "failed", "output": output["result"], "error_code": refusal["code"]}
+            else:
+                snapshot.setdefault("result_file_sources", {}).setdefault(call.id, []).extend(
+                    f"file:{batch_id}:{entry['index']}" for entry in batch["manifest"]["entries"])
+        return payload
 
     def _apply_material_wait(self, record, *, lease_token):
         snapshot = copy.deepcopy(record.snapshot)
@@ -3163,12 +3242,14 @@ class CoreAgent:
             completed = snapshot.get("pending_completed_result")
             if completed is None:
                 completed = {"call": {"id": call.id, "name": call.name, "arguments": call.arguments},
-                             "outcome": json.loads(self._result_text(call.id, outcome, call.name))}
+                             "outcome": self._remote_result_batches(record, json.loads(
+                                 self._result_text(call.id, outcome, call.name)))[0]}
                 snapshot["pending_completed_result"] = completed
                 # A known completed side effect is durable before any detector I/O.
                 # Removing a prior wait here also atomically applies it before another wait.
                 record = self._record_transition(record, state="MODEL_RESPONDED", snapshot=snapshot,
                     event_kind="tool.result.saved", event_data={"tool_call_id": call.id}, lease_token=lease_token)
+            completed["outcome"], batches = self._remote_result_batches(record, completed["outcome"])
             source_kind = "owner_answer" if call.name == "core_ask_owner" and completed["outcome"]["status"] == "succeeded" else "tool_result"
             # Locally generated rejection/error metadata contains no tool material.
             must_review = (completed["outcome"]["status"] == "succeeded" or record.snapshot.get("pending_mutating") is not None
@@ -3176,6 +3257,10 @@ class CoreAgent:
             decision = self._guard_material(record, snapshot, source_id="result:" + call.id, source_kind=source_kind,
                 payload=completed["outcome"], continuation=self._tool_wait_continuation(snapshot, call, "tool_result"),
                 lease_token=lease_token, exempt=not must_review or (source_kind != "owner_answer" and self._material_exempt(record, call)))
+            guarded = self._guard_remote_results(record, snapshot, call, completed["outcome"], batches,
+                decision=decision, continuation=self._tool_wait_continuation(snapshot, call, "tool_result"), lease_token=lease_token)
+            record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            outcome = ToolResult(call.id, guarded["status"], guarded["output"], guarded.get("error_code"))
             if decision is not None:
                 outcome = ToolResult(call.id, "failed", json.loads(self._material_refusal(decision, source_kind)),
                                      "MATERIAL_TIMEOUT" if decision == "timed_out" else "MATERIAL_REJECTED")
@@ -3183,6 +3268,11 @@ class CoreAgent:
         notification_call = call
         notification_output = outcome.output if isinstance(outcome, ToolResult) else outcome
         frame = snapshot.get("python_execution")
+        if frame and call.name == "core_python_exec":
+            sources = snapshot.setdefault("result_file_sources", {})
+            identities = [source for values in sources.values() for source in values]
+            sources.clear()
+            sources[call.id] = identities
         if frame and frame["phase"] == "stopped" and call.id == frame["nested_call"]["id"]:
             nested = json.loads(self._result_text(call.id, outcome, call.name))
             original = frame["outer_call"]
@@ -3200,6 +3290,10 @@ class CoreAgent:
             }, "PYTHON_CONTINUATION_INTERRUPTED")
             if self.material_review_store is not None:
                 snapshot.pop("python_execution", None)
+                sources = snapshot.setdefault("result_file_sources", {})
+                identities = [source for values in sources.values() for source in values]
+                sources.clear()
+                sources[call.id] = identities
                 return self._record_tool_outcome(record, snapshot, call, outcome,
                     lease_token=lease_token, span=span, active_result_token_limit=active_result_token_limit)
         snapshot.pop("python_execution", None)
@@ -4839,7 +4933,7 @@ class CoreAgent:
         return {
             "task_id": task.id,
             "state": task.state,
-            "result": self._value(task.result),
+            "result": self._value(remote_result_projection(task.result)),
             "error": str(task.error) if task.error else None,
             "revision": task.revision,
         }
@@ -5239,13 +5333,14 @@ class CoreAgent:
 
     def _review_python_material(self, context, call, payload, *, stage):
         if self.material_review_store is None or context is None:
-            return None
+            return payload
         snapshot = copy.deepcopy(context["snapshot"])
         frame = snapshot["python_execution"]
         frame.update(nested_call={"id": call.id, "name": call.name, "arguments": copy.deepcopy(call.arguments)},
                      approval_required=False, subject=snapshot["nested_dispatch"]["subject"])
         if stage == "tool_result":
             self._apply_response_files(snapshot, call, payload.get("status") == "succeeded")
+            payload, batches = self._remote_result_batches(context["record"], payload)
             snapshot["pending_completed_result"] = {"call": frame["nested_call"], "outcome": payload}
             snapshot["nested_dispatch"]["state"] = "result_saved"
             updated = self._record_transition(context["record"], state="EXECUTING", snapshot=snapshot,
@@ -5275,6 +5370,12 @@ class CoreAgent:
                               "call_id": call.id, "outer_call_id": frame["outer_call"]["id"]},
                 lease_token=context["lease_token"], exempt=self._material_exempt(context["record"], call),
                 before_pending=stop_before_wait)
+            if stage == "tool_result":
+                payload = self._guard_remote_results(context["record"], snapshot, call, payload, batches, decision=decision,
+                    continuation=self._tool_wait_continuation(snapshot, call, stage), lease_token=context["lease_token"],
+                    before_pending=stop_before_wait)
+                if payload["status"] == "failed" and payload.get("error_code") in {"MATERIAL_REJECTED", "MATERIAL_TIMEOUT"}:
+                    decision = "timed_out" if payload["error_code"] == "MATERIAL_TIMEOUT" else "rejected"
         except _MaterialSuspended:
             current = self.workflow_store.get(context["record"].run_id,
                 tenant_id=context["record"].tenant_id, owner_id=context["record"].owner_id)
@@ -5286,6 +5387,8 @@ class CoreAgent:
                 context.pop("material_stopping", None)
         snapshot.pop("pending_completed_result", None)
         context["snapshot"] = snapshot
+        context["record"] = self.workflow_store.get(context["record"].run_id,
+            tenant_id=context["record"].tenant_id, owner_id=context["record"].owner_id)
         if decision is not None:
             raise CoreError("MATERIAL_TIMEOUT" if decision == "timed_out" else "MATERIAL_REJECTED")
         return payload
@@ -5548,8 +5651,9 @@ class CoreAgent:
                         run_id, self.mcp_connector
                     ).call(server, remote_tool, arguments)
                     known_outcome = True
-                    self._guard_python_material(context, call, json.loads(self._result_text(
+                    guarded = self._guard_python_material(context, call, json.loads(self._result_text(
                         call.id, self._mcp_outcome(call, output), call.name)), stage="tool_result")
+                    output = guarded["output"]
                     reviewed_outcome = True
                     # The same rule as a failed built-in outcome below: inside
                     # tools.call a failure has to raise, not return a body.
@@ -5570,7 +5674,8 @@ class CoreAgent:
                     )
                     known_outcome = outcome.error_code != "SIDE_EFFECT_UNKNOWN"
                     if known_outcome:
-                        self._guard_python_material(context, call, json.loads(self._result_text(call.id, outcome, call.name)), stage="tool_result")
+                        guarded = self._guard_python_material(context, call, json.loads(self._result_text(call.id, outcome, call.name)), stage="tool_result")
+                        outcome = ToolResult(call.id, guarded["status"], guarded["output"], guarded.get("error_code"))
                         reviewed_outcome = True
                     if outcome.status != "succeeded":
                         raise CoreError(
@@ -5584,7 +5689,8 @@ class CoreAgent:
                     output = outcome.output
                 value = self._value(output)
                 if wait_value is not None and not isinstance(wait_value, tuple):
-                    self._guard_python_material(context, call, json.loads(self._result_text(call.id, value, call.name)), stage="tool_result")
+                    value = self._guard_python_material(context, call, json.loads(self._result_text(
+                        call.id, value, call.name)), stage="tool_result")["output"]
                 span.set_attributes(
                     {
                         "core_agent.tool.outcome": "succeeded",
@@ -5612,8 +5718,9 @@ class CoreAgent:
                 raise unknown from error
             known_error = error if isinstance(error, CoreError) else CoreError("TOOL_EXECUTION_FAILED", type(error).__name__)
             if not reviewed_outcome and known_error.code not in {"MATERIAL_REJECTED", "MATERIAL_TIMEOUT"}:
-                self._guard_python_material(context, call, json.loads(self._result_text(
+                guarded = self._guard_python_material(context, call, json.loads(self._result_text(
                     call.id, self._failed_tool_outcome(call, known_error), call.name)), stage="tool_result")
+                known_error = CoreError(guarded.get("error_code") or known_error.code)
             self._complete_python_nested(context, call, self._failed_tool_outcome(call, known_error))
             self.audit_log.append(
                 run_id,

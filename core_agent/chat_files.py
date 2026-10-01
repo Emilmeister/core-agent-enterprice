@@ -57,7 +57,8 @@ def _check_update(old, new):
         raise CoreError("FILE_BATCH_NOT_PREPARED")
     if new["state"] in {"accepted_ready", "published"} and not new["decision_ref"]:
         raise CoreError("FILE_BATCH_DECISION_REQUIRED")
-    if old["decision_ref"] is not None and new["decision_ref"] != old["decision_ref"]:
+    later_denial = old["state"] == "accepted_ready" and new["state"] == "excluded" and bool(new["decision_ref"])
+    if old["decision_ref"] is not None and new["decision_ref"] != old["decision_ref"] and not later_denial:
         raise CoreError("FILE_BATCH_CONFLICT")
 
 
@@ -651,12 +652,12 @@ class ChatFileService:
         return copy.deepcopy(row)
 
     @contextmanager
-    def _accepted_files(self, batch_id, binding, *, run_id, task_id):
+    def _accepted_files(self, batch_id, binding, *, run_id, task_id, connection=None):
         if not isinstance(task_id, str) or not task_id:
             raise CoreError("FILE_BATCH_NOT_FOUND")
-        row = self.store.get(batch_id, binding.tenant_id)
+        row = self.store.get(batch_id, binding.tenant_id, connection=connection)
         self._scope(row, binding)
-        records = _caller_records(self.store.workflow, binding, run_id, task_id)
+        records = _caller_records(self.store.workflow, binding, run_id, task_id, connection=connection)
         if row["state"] not in _ACCEPTED or (row["run_id"], row["task_id"]) != (run_id, records[0].task_id):
             raise CoreError("FILE_BATCH_NOT_FOUND")
         try:
@@ -748,6 +749,34 @@ class ChatFileService:
             with self.store.locked(batch_id, binding.tenant_id, connection=conn) as (row, _):
                 if row["task_id"] != root.task_id:
                     raise CoreError("FILE_BATCH_NOT_FOUND")
+                if row["state"] == "accepted_ready" and not allow:
+                    # A later exact-material denial supersedes an earlier allow.
+                    # Recovery can find a rename whose DB publication rolled back:
+                    # retract that verified directory before committing exclusion.
+                    with self._accepted_files(batch_id, binding, run_id=source.run_id,
+                            task_id=source.task_id, connection=conn) as (_, directory):
+                        with self._attachments(binding) as attachments:
+                            try:
+                                target = os.stat(batch_id, dir_fd=attachments, follow_symlinks=False)
+                            except FileNotFoundError:
+                                target = None
+                            if target is not None:
+                                opened = os.fstat(directory)
+                                if (not stat.S_ISDIR(target.st_mode) or
+                                        (target.st_dev, target.st_ino) != (opened.st_dev, opened.st_ino)):
+                                    raise CoreError("FILE_PUBLICATION_CONFLICT")
+                                self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
+                                _rename(attachments, batch_id, self.quarantine, batch_id)
+                                moved = os.stat(batch_id, dir_fd=self.quarantine, follow_symlinks=False)
+                                if (moved.st_dev, moved.st_ino) != (opened.st_dev, opened.st_ino):
+                                    raise CoreError("FILE_PUBLICATION_CONFLICT")
+                            # Also sync a recovered retraction whose prior attempt
+                            # died after rename but before either parent was durable.
+                            os.fsync(attachments)
+                            os.fsync(self.quarantine)
+                    self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
+                    row.update(state="excluded", decision_ref=decision_ref, error_code=None)
+                    return
                 if row["state"] != "accepted_quarantine":
                     raise CoreError("FILE_BATCH_CONFLICT")
                 with self._private(batch_id) as (parent, directory):

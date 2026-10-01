@@ -307,7 +307,7 @@ send не объявляется готовым и не должен выдав�
   существующий bind. Delegated child не имеет публичной A2A admission row:
   проверить canonical root/child ancestry для batch binding, сохранив child
   continuation/lease и root liveness. Не создавать shadow Tasks и не ослаблять FK.
-- [ ] В `runtime.py:_guard_file_batch` поддержать существующие tool-result/
+- [x] В `runtime.py:_guard_file_batch` поддержать существующие tool-result/
   Python nested continuation и authorized batch binding. До model/catalog/
   history receipt проверить весь remote text/file batch и пройти существующий
   publication barrier. `_task_snapshot` исключает private batch refs. Owner
@@ -370,4 +370,35 @@ bytes: новый memory/PG regression подтверждает отказ до 
 Evidence — `.local-evidence/remote-inbound/final-targeted.*`, `red-latin1.*` и
 `.local-evidence/chat-files-children/owner-final.*`. Этот foundation не включает
 runtime text/file guard, publication receipt и app wiring следующего среза;
-полный FILE-03 остаётся open.
+  полный FILE-03 остаётся open.
+
+Runtime/composition wiring подключён следующим срезом: один service у executor,
+scheduler и agent; private marker отсутствует в task snapshots. Only owned
+remote completed output получает ordered final receipt; saved progress остаётся
+тем же результатом после позднего completion. Whole text и каждый файл проходят
+existing result/file guard до publication. Отказ исключает весь remote result
+и позволяет продолжить, отдельно разрешённые элементы task list сохраняются.
+Python result broker передаёт guarded payload, stops before owner/file wait и
+сохраняет provenance всех receipts, включая bounded outcomes и stopped recovery.
+Exemption audit/checkpoint сохраняется до publication; прежний negative outcome
+не становится разрешённым через смену tool. Recovery не повторяет Send/prefix.
+
+Настоящие memory/PostgreSQL app flows проверили allow/reject/timeout, empty files,
+owner-only download, child→grandchild canonical ancestry, restart с pool1 и
+frozen tool snapshots. Independent review выявил и проверяемо устранил trusted
+marker на nonremote task, bounded Python ID/provenance и stopped-prefix gaps.
+Final seven-module gate —200 tests, 40.423 секунды, exit0, без skips; новый модуль
+`tests.test_remote_file_results_runtime` —43 tests, включая real app restart.
+Evidence — `.local-evidence/remote-results/targeted.log`, `ruff.log`,
+`diff-check.log`. Gate использовал fresh PostgreSQL database и schema23.
+
+Late exact-material refusal до publication supersedes `accepted_ready` decision,
+но не меняет manifest/source или прежний review. Schema23 меняет только trigger
+для ready→excluded. Если прежний publication rename завершился без DB commit,
+отказ возвращает verified directory в quarantine. Parent fsyncs выполняются и
+при retry после interruption самой retraction. Новый genuine memory/PG red
+воспроизводил оба сбоя; final service/children/file guard gate —72 tests,
+5.533 секунды, exit0, без skips. Evidence — `.local-evidence/ready-denial-final.*`
+и `ready-denial-retry-red.*`. Independent re-review не нашёл blocker.
+Полный fresh PostgreSQL/Keycloak CI suite этого combined среза ещё ожидается;
+200/72 targeted proofs не объявляют whole enterprise release готовым.

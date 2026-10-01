@@ -286,6 +286,17 @@ references; active uploads и accepted/quarantined данные не удаля�
 не открывает binary intake сама по себе. Rollback требует согласованного
 состояния БД и volume по общему контракту выше.
 
+Migration 23 изменяет только guardrail transition trigger, сохраняя shape и
+manifest всех file batches. Для `accepted_ready → excluded` допускается новая
+ссылка на отказ по точному материалу; прежнее одобрение остаётся в immutable
+material review и workflow history. Остальные решения и `published` неизменяемы.
+Если rename в workspace завершился до сбоя publication transaction, перед
+записью отказа тот же проверенный каталог возвращается в private quarantine.
+Неоднозначный или изменённый target не удаляется и требует reconciliation.
+Serving image требует schema 23; migration job выполняется при остановленных
+старых workers. После superseding decision rollback требует согласованного
+DB+volume backup, а не запуска schema-22 image на новых записях.
+
 ### Material reviews: schema 17
 
 `core_material_reviews` хранит owner-private immutable payload или sealed file

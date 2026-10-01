@@ -218,6 +218,75 @@ class ChatFileContract:
         self.assertEqual(error.exception.code, "ARTIFACT_INTEGRITY_FAILED")
         self.assertTrue(self.target(batch).exists())
 
+    def test_later_denial_excludes_ready_batch_before_or_after_uncommitted_rename(self):
+        import core_agent.chat_files as module
+
+        for renamed in (False, True):
+            with self.subTest(uncommitted_rename=renamed):
+                batch = self.prepare()
+                self.accept(batch)
+                before = self.store.get(batch["batch_id"], self.binding.tenant_id)
+                if renamed:
+                    def crash(*args):
+                        _rename(*args)
+                        raise OSError("process died after rename")
+
+                    with patch.object(module, "_rename", side_effect=crash), self.assertRaises(CoreError):
+                        self.service.publish(batch["batch_id"], self.binding)
+                    self.assertTrue(self.target(batch).exists())
+                self.service.record_decision(batch["batch_id"], self.binding,
+                    decision_ref="later-exact-denial", allow=False)
+                row = self.store.get(batch["batch_id"], self.binding.tenant_id)
+                self.assertEqual((row["state"], row["decision_ref"]), ("excluded", "later-exact-denial"))
+                self.assertEqual(row["manifest"], before["manifest"])
+                self.assertFalse(self.target(batch).exists())
+                self.assertEqual(self.service.owner_download(batch["batch_id"], self.binding, 0,
+                    run_id=self.record.run_id, task_id=self.record.task_id)["content"], b"one")
+                restarted = ChatFileService(self.store, self.workspaces, clock=lambda: self.now)
+                self.addCleanup(restarted.close)
+                for publish in (self.service, restarted):
+                    with self.assertRaises(CoreError) as error:
+                        publish.publish(batch["batch_id"], self.binding)
+                    self.assertEqual(error.exception.code, "FILE_BATCH_NOT_READY")
+                with self.assertRaises(CoreError):
+                    self.service.record_decision(batch["batch_id"], self.binding,
+                        decision_ref="new-allow", allow=True)
+
+    def test_denial_retry_syncs_retraction_after_rename_before_exclusion_commit(self):
+        import core_agent.chat_files as module
+
+        batch = self.prepare()
+        self.accept(batch)
+
+        def crash(*args):
+            _rename(*args)
+            raise OSError("process died after rename")
+
+        with patch.object(module, "_rename", side_effect=crash), self.assertRaises(CoreError):
+            self.service.publish(batch["batch_id"], self.binding)
+        with patch.object(module, "_rename", side_effect=crash), self.assertRaises(CoreError):
+            self.service.record_decision(batch["batch_id"], self.binding,
+                decision_ref="later-denial", allow=False)
+        self.assertEqual(self.store.get(batch["batch_id"], self.binding.tenant_id)["state"], "accepted_ready")
+        self.assertFalse(self.target(batch).exists())
+        parents = (self.target(batch).parent.stat(), os.fstat(self.service.quarantine))
+        expected = {(entry.st_dev, entry.st_ino) for entry in parents}
+        synced = set()
+        fsync = os.fsync
+
+        def sync(descriptor):
+            entry = os.fstat(descriptor)
+            synced.add((entry.st_dev, entry.st_ino))
+            return fsync(descriptor)
+
+        with patch.object(module.os, "fsync", side_effect=sync):
+            self.service.record_decision(batch["batch_id"], self.binding,
+                decision_ref="later-denial", allow=False)
+        self.assertTrue(expected <= synced)
+        self.assertEqual(self.store.get(batch["batch_id"], self.binding.tenant_id)["state"], "excluded")
+        self.assertEqual(self.service.owner_download(batch["batch_id"], self.binding, 0,
+            run_id=self.record.run_id, task_id=self.record.task_id)["content"], b"one")
+
     def test_no_replace_target_or_symlink_and_wrong_scope(self):
         batch = self.prepare()
         self.accept(batch)

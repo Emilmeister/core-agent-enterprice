@@ -26,7 +26,7 @@ from .errors import CoreError
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -806,6 +806,38 @@ END;
 $$;
 CREATE TRIGGER core_cron_event_immutable BEFORE UPDATE OR DELETE ON core_cron_events
     FOR EACH ROW EXECUTE FUNCTION core_cron_event_immutable();
+""",
+
+    23: """
+CREATE OR REPLACE FUNCTION core_chat_file_batch_transition() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF ROW(NEW.batch_id, NEW.schema_version, NEW.tenant_id, NEW.actor_id,
+           NEW.message_id, NEW.request_digest, NEW.created_at, NEW.storage_key)
+       IS DISTINCT FROM
+       ROW(OLD.batch_id, OLD.schema_version, OLD.tenant_id, OLD.actor_id,
+           OLD.message_id, OLD.request_digest, OLD.created_at, OLD.storage_key) THEN
+        RAISE EXCEPTION 'immutable file batch identity';
+    END IF;
+    IF OLD.state NOT IN ('staging','rejected') AND
+       ROW(NEW.manifest, NEW.context_id, NEW.owner_id, NEW.task_id, NEW.run_id, NEW.sequence)
+       IS DISTINCT FROM
+       ROW(OLD.manifest, OLD.context_id, OLD.owner_id, OLD.task_id, OLD.run_id, OLD.sequence) THEN
+        RAISE EXCEPTION 'immutable accepted file batch';
+    END IF;
+    IF NOT (NEW.state = OLD.state OR
+       (OLD.state = 'staging' AND NEW.state IN ('accepted_quarantine','rejected')) OR
+       (OLD.state = 'accepted_quarantine' AND NEW.state IN ('accepted_ready','excluded')) OR
+       (OLD.state = 'accepted_ready' AND NEW.state IN ('published','excluded'))) THEN
+        RAISE EXCEPTION 'invalid file batch transition';
+    END IF;
+    IF OLD.decision_ref IS NOT NULL AND NEW.decision_ref IS DISTINCT FROM OLD.decision_ref
+       AND NOT (OLD.state = 'accepted_ready' AND NEW.state = 'excluded'
+                AND NEW.decision_ref IS NOT NULL AND NEW.decision_ref <> '') THEN
+        RAISE EXCEPTION 'immutable file batch decision';
+    END IF;
+    RETURN NEW;
+END;
+$$;
 """,
 
 }

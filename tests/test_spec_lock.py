@@ -8,9 +8,9 @@ SPEC_ROOT = Path(__file__).resolve().parents[1] / "spec"
 EXPECTED_SHA256 = {
     "README.md": "333d8c714dd14322f1c52373aad8f414ae4f7174c0a3f0c32b7e8f5d5f12ba65",
     "a2a-protocol.md": "a99d44c4b75da74031dede656981d44446e71e738eb05231bd185b2306723dc7",
-    "acceptance.md": "68b56a10610d9f4487622538bc2f78bceacfdc15eca8763b8832afdff060e540",
+    "acceptance.md": "1e09034978a3b6c057fd8a03ec768dda4c276c43962d20775bbf74aafb261e25",
     "agent-configuration.md": "3836ab01879594c5612fba52f5fcb9801dbd9106b1c4d6cd93a16b654cf06bc2",
-    "architecture.md": "b562eb706d7be32099b1ee4ec5f16c2d1cc9085b371636e30c2509cc85b781fb",
+    "architecture.md": "ff975a4c4400330d55002a7da89d2886780fdcb248e42ddf9cdaeb48669faf9d",
     "artifacts.md": "2663ce3e99829468e4c4eabd5cb6c3170e979af71c34cd8a75f33a445de2b381",
     "context.md": "6d363c955ce5784b3b28114fdbb80e2d61d4c2885238d0e380c0bf04dcf127d1",
     "development-process.md": "3f0c3cd6881394705a921bbd767efddc56d5290c259b7ca9312eca13dc05a4c9",
