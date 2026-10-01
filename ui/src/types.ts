@@ -15,6 +15,13 @@ export interface AttachmentEntry {
   size_bytes: number;
   sha256: string;
 }
+export interface ResponseFileEntry {
+  file_id: string;
+  name: string;
+  media_type: string;
+  size_bytes: number;
+  sha256: string;
+}
 export interface FileReceipt {
   schema_version: 1;
   batch_id: string;
@@ -67,6 +74,7 @@ export interface HistoryItem {
   created_at?: string;
   review?: { wait_id: string };
   attachments?: AttachmentEntry[];
+  response_files?: ResponseFileEntry[];
   outcome?: {
     state: string;
     complete?: boolean;

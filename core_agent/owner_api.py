@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import io
 import json
 import math
 import re
@@ -162,6 +163,56 @@ class WorkspaceDownload(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             self.stream.close()
+
+
+async def final_response_file(agent, admission, actor, request):
+    require_owner(actor)
+    if request.query_params:
+        raise CoreError("REQUEST_INVALID")
+    if agent.response_files_service is None:
+        raise CoreError("FILE_NOT_FOUND")
+    context_id, task_id, file_id = (request.path_params[key] for key in ("context_id", "task_id", "file_id"))
+
+    def read():
+        def load(row, connection=None):
+            files = row["files"] or ()
+            if not isinstance(files, (list, tuple)) or not all(isinstance(entry, dict) for entry in files):
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+            if row["state"] != "COMPLETED" or not any(entry.get("file_id") == file_id for entry in files):
+                raise CoreError("FILE_NOT_FOUND")
+            binding = WorkspaceBinding(actor.tenant, row["owner_id"], context_id)
+            loaded = agent.response_files_service.load(binding, files, task_id=task_id,
+                run_id=row["run_id"], limit_bytes=files[0].get("limit_bytes"), connection=connection)
+            return next((entry, content) for entry, content in loaded if entry["file_id"] == file_id)
+
+        database = getattr(admission, "database", None)
+        if database is not None:
+            with database.transaction() as connection:
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                row = connection.execute("""SELECT r.owner_id,r.run_id,r.state,r.result->'outgoing_files' AS files
+                    FROM core_runs r JOIN core_chats c
+                      ON c.tenant_id=r.tenant_id AND c.owner_id=r.owner_id AND c.context_id=r.context_id
+                    WHERE r.tenant_id=%s AND r.context_id=%s AND r.task_id=%s AND r.parent_run_id IS NULL
+                      AND EXISTS(SELECT 1 FROM core_root_messages m WHERE m.tenant_id=r.tenant_id
+                        AND m.owner_id=r.owner_id AND m.context_id=r.context_id AND m.task_id=r.task_id)""",
+                    (actor.tenant, context_id, task_id)).fetchone()
+                if row is None:
+                    raise CoreError("FILE_NOT_FOUND")
+                return load(row, connection)
+        with agent.workflow_store._lock:
+            chat = admission.chats.get((actor.tenant, context_id))
+            if chat is None:
+                raise CoreError("FILE_NOT_FOUND")
+            record = agent.workflow_store.by_task(task_id, tenant_id=actor.tenant, owner_id=chat["owner_id"])
+            if (record.parent_run_id is not None or record.context_id != context_id
+                    or not any(key[0] == actor.tenant and message["task_id"] == task_id
+                        and message["owner_id"] == record.owner_id for key, message in admission.messages.items())):
+                raise CoreError("FILE_NOT_FOUND")
+            return load({"owner_id": record.owner_id, "run_id": record.run_id, "state": record.state,
+                "files": (record.result or {}).get("outgoing_files")})
+
+    entry, content = await asyncio.to_thread(read)
+    return WorkspaceDownload(io.BytesIO(content), len(content), entry["name"])
 
 
 async def workspace_files(agent, admission, actor, request):
@@ -461,6 +512,8 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
             elif request.url.path == "/api/chats":
                 result = await list_chats(admission, actor, request.query_params)
             elif "context_id" in request.path_params:
+                if "file_id" in request.path_params:
+                    return await final_response_file(agent, admission, actor, request)
                 if request.url.path.endswith("/files") or request.url.path.endswith("/files/content"):
                     result = await workspace_files(agent, admission, actor, request)
                     if isinstance(result, Response):
@@ -522,6 +575,7 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
     ]
     if admission is not None:
         routes.append(Route("/api/chats", endpoint))
+        routes.append(Route("/api/chats/{context_id:path}/tasks/{task_id}/files/{file_id}", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/history", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/files/delete", endpoint, methods=["GET", "POST"]))
         routes.append(Route("/api/chats/{context_id:path}/files", endpoint))

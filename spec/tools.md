@@ -120,6 +120,26 @@ policy/approval и generic second opinion без самостоятельног�
 
 Обычный model/child text result публикуется adapter-ом как стандартный A2A Task Artifact без дополнительного model turn или tool call.
 
+### `core_response_files`
+
+Выбирает весь набор файлов следующего финального ответа, не отправляя сообщение.
+Схема — ровно `{paths: string[]}`: уникальные непустые относительные пути обычных
+файлов текущего chat workspace. Absolute paths, URLs, traversal, symlinks,
+hardlinks и special files запрещены. `[]` очищает выбор. Два успешных вызова
+заменяют набор целиком, а ошибка сохраняет прежний набор и исходные файлы.
+Tool доступен только при настроенном trusted chat workspace и immutable transport
+storage; проходит обычные capability intersection, schema, policy/HITL, общий
+budget, guardrails и audit, также через Python broker и child allowlist.
+
+Весь набор безопасно читается и проверяется до сохранения нового выбора.
+Возвращаются ordered receipts `{file_id,name,media_type,size_bytes,sha256}`.
+`ATTACHMENTS_TOO_LARGE` содержит `allowed_bytes` и `actual_bytes`; остальные
+recoverable ошибки — `FILE_NOT_FOUND`, `INVALID_FILE_PATH`, `FILE_CHANGED`,
+`FILE_READ_FAILED`, `ARTIFACT_INTEGRITY_FAILED`. Receipt и versioned immutable
+manifest фиксируются одним workflow transition. Child выбирает только свой
+результат; parent не получает автоматический root attachment set.
+Выдача и recovery описаны в [FILE-03](artifacts.md#file-03-выдача-и-отправка).
+
 ### `core_agent_send_message`
 
 Отправляет одну задачу доверенному внешнему агенту из реестра владельцев и возвращает локальный operation handle без ожидания завершения. `core_task_wait` durable ожидает этот handle; remote IDs, deadlines, прогресс и auth описаны в [Удалённых A2A-агентах](tasks-and-delegation.md#удалённые-a2a-агенты). Входящий credential не проксируется; server использует secret-header configuration конкретного адресата. Ответ удалённого агента недоверенный, вызов не запускается через `core_task_start`.

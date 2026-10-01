@@ -105,6 +105,30 @@ guardrails по уже принятому материалу обрабатыв�
 - A2A использует FileParts/Artifact parts по [Публичному контракту](public-contract.md);
   transport reference не открывает чужие данные.
 
+`core_response_files` сохраняет immutable snapshots выбранных workspace файлов
+в transport storage. Manifest version 1 закрепляет trusted tenant/chat/owner,
+Task/run и ordered references; file ID или digest не даёт права читать blob.
+Один успешный tool receipt атомарно заменяет весь pending manifest. Сбой до commit
+не меняет прежний набор. Отсутствие поля у прежних workflow/results означает
+пустой набор; upgrade не восстанавливает выбор из Markdown или legacy artifacts.
+Persisted `outgoing_files` сохраняется при обычном и budget-partial завершении,
+не меняя completion provenance. Recovery читает frozen blobs, а не workspace;
+изменение или удаление исходных файлов не меняет уже выбранный результат.
+
+Перед первым final attachment frame проверяются **все** references, scope,
+actual sizes/digests и общий лимит, закреплённый при успешном выборе этого набора.
+Каждый новый выбор использует текущую company настройку; её позднее изменение
+не инвалидирует уже принятый выбор и чтение завершённого результата.
+Ошибка не публикует часть набора.
+GetTask, live stream, passive subscription и recovery показывают одинаковые
+ordered файлы и IDs; bytes не дублируются в terminal Message. Новое HTTP
+скачивание проверяет текущие права и сохранённый manifest соответствующей Task.
+Проверка scope обязательна и при одинаковых bytes в разных чатах одного tenant.
+Deployment ceiling transport storage (`MAX_RESPONSE_SIZE`) остаётся независимым
+ограничением одного blob. Если увеличенный company limit превышает его,
+подготовка возвращает `ARTIFACT_TOO_LARGE` без изменения принятого набора;
+увеличение company limit не расширяет platform storage ceilings автоматически.
+
 ### FILE-04. Очистка workspace через UI
 
 Владелец может удалить старые файлы из workspace выбранного чата через UI.

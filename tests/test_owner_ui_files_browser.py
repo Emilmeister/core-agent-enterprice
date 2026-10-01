@@ -152,7 +152,7 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         backend["command"] = ["uv", "run", "--no-sync", "python", "/browser-fixture/server.py", "backend"]
         backend["envFrom"] = [{"configMapRef": {"name": "native"}}, {"secretRef": {"name": "server-config"}}]
         settings = {"CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled", "SESSION_STORAGE_TYPE": "postgres",
-                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec", "CORE_AGENT_ALLOWED_SKILLS": "",
+                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec,core_response_files", "CORE_AGENT_ALLOWED_SKILLS": "",
                     "CHAT_WORKSPACE_ROOT": "/data/chats", "LOCAL_WORKSPACE_ROOT": "/data/scratch", "DURABLE_STORAGE_ROOT": "/data/durable",
                     "UV_CACHE_DIR": "/tmp/uv-cache", "PYTHONDONTWRITEBYTECODE": "1", "OTEL_SDK_DISABLED": "true"}
         backend["env"] = [{"name": name, "value": value} for name, value in settings.items()]
@@ -213,8 +213,10 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(stop, process)
         self.wait_url(f"http://127.0.0.1:{self.debug_port}/json/version")
+        downloads = temporary / "downloads"
+        downloads.mkdir()
         config = {"origin": self.origin, "debugPort": self.debug_port, "username": "browser-owner", "password": self.password,
-                  "files": files, "evidence": str(self.evidence)}
+                  "files": files, "downloads": str(downloads), "evidence": str(self.evidence)}
         proof = self.command(["node", str(Path(__file__).with_name("owner_ui_files_browser.mjs"))], content=json.dumps(config), timeout=180)
         (self.evidence / "browser.log").write_text(proof)
         self.assertIn("PASS actual native file reads and persisted attachment history", proof)

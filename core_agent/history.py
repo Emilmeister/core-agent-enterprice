@@ -10,6 +10,7 @@ from itertools import chain, islice
 from .errors import CoreError
 from .security import redact
 from .workflow import TERMINAL_STATES
+from .workspace import WorkspaceBinding
 
 
 def cursor_position(value):
@@ -361,7 +362,9 @@ def _project(admission, root, entry, connection, chat):
             final = root["result"] or {}
         else:
             final = connection.execute("""SELECT jsonb_strip_nulls(jsonb_build_object(
-                'message',result->'message','complete',result->'complete','completion_reason',result->'completion_reason')) AS result
+                'message',result->'message','complete',result->'complete','completion_reason',result->'completion_reason'))
+                || CASE WHEN result ? 'outgoing_files'
+                    THEN jsonb_build_object('outgoing_files',result->'outgoing_files') ELSE '{}'::jsonb END AS result
                 FROM core_runs WHERE run_id=%s AND tenant_id=%s""", (root["run_id"], root["tenant_id"])).fetchone()["result"]
         if (not isinstance(final, dict) or ("complete" in final and type(final["complete"]) is not bool)
                 or ("completion_reason" in final and not isinstance(final["completion_reason"], str))):
@@ -440,6 +443,18 @@ def _project(admission, root, entry, connection, chat):
                 result.setdefault("attachments", []).extend({key: entry[key] for key in (
                     "index", "actual_name", "relative_path", "size_bytes", "sha256")}
                     for entry in batch["manifest"]["entries"])
+    if terminal_result and root["state"] == "COMPLETED" and result["status"] == "available":
+        files = final.get("outgoing_files", ())
+        if not isinstance(files, (tuple, list)) or not all(isinstance(ref, dict) for ref in files):
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        if files:
+            service = admission.agent.response_files_service
+            if service is None:
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+            binding = WorkspaceBinding(root["tenant_id"], root["owner_id"], root["context_id"])
+            validated = service.validate_refs(binding, files, task_id=root["task_id"], run_id=root["run_id"],
+                                              limit_bytes=files[0].get("limit_bytes"))
+            result["response_files"] = list(service.receipts(validated))
     return result
 
 

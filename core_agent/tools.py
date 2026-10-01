@@ -28,6 +28,17 @@ CRON_CREATE_TOOL = ToolDefinition(
     mutating=True, risk_tags=frozenset({"external_write"}),
 )
 
+RESPONSE_FILES_TOOL = ToolDefinition(
+    "core_response_files",
+    "Select workspace files for your next final response. Pass relative paths to existing files; "
+    "the complete selection replaces any previous selection. Pass [] to clear it. "
+    "This snapshots the files and does not send a message; finish with your normal final text.",
+    {"type": "object", "properties": {
+        "paths": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": True},
+    }, "required": ["paths"], "additionalProperties": False},
+    mutating=True, risk_tags=frozenset({"filesystem_read"}),
+)
+
 
 @dataclass(frozen=True)
 class ToolCall:

@@ -175,6 +175,7 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/guardrails.py` | Ограниченный classifier без tools, отдельный context и deployment-configured model adapter |
 | `core_agent/material_reviews.py` | Private material decisions, detector budget и атомарная связь с guardrail waits |
 | `core_agent/chat_files.py` | Private file batches, scoped extraction/download, runtime publication barrier, bounded orphan sweep и atomic raw FilePart admission |
+| `core_agent/response_files.py` | Immutable snapshots выбранных файлов результата, scoped manifest и whole-batch integrity validation |
 | `core_agent/runtime.py` | Agent loop, workflow continuation, recovery, tool handlers и delegation |
 | `core_agent/config.py` | RunRequest, Platform/Agent/EffectiveConfig и capability intersection |
 | `core_agent/a2a.py` | Внутренние A2A contract types и Task representation |
@@ -337,6 +338,7 @@ Target spec может описывать больше текущего runtime.
 - `core_ask_owner` — private вопрос владельцам при подключённом owner plane;
 - `core_delegate`;
 - `core_artifact_save`, `core_artifact_load`, `core_artifact_list`;
+- `core_response_files` при подключённом enterprise owner plane;
 - `core_memory_search`, `core_memory_read`, `core_memory_create`,
   `core_memory_update`, `core_memory_split`, `core_memory_delete`;
 - `core_agent_send_message`;
@@ -616,6 +618,16 @@ run получает отдельные MCP session и negotiated version; пе�
 - Доступные owner history messages после file publication содержат только
   actual name/path/size/digest из scoped batch. Quarantine/excluded names не
   раскрываются через history; bytes и исходная metadata остаются в private store.
+- `core_response_files` принимает полный список относительных workspace paths,
+  замещает предыдущий выбор или очищает его через `[]`. Ошибка сохраняет прежний
+  набор. Snapshot и receipt фиксируются одним durable переходом, включая Python
+  broker; bytes сохраняются в transport store, не в workflow JSON/model context.
+  Новые выборы используют текущий company limit, принятый набор закрепляет его.
+  Final A2A Artifact выдаёт typed raw Parts; live/GetTask/subscription/recovery
+  проверяют весь canonical manifest и blobs до выдачи. Terminal Message не
+  дублирует файлы. Owner final history содержит только safe `response_files`
+  receipts, без blob IDs/raw bytes; download по chat/Task/file ID снова проверяет
+  текущие права и integrity всего набора и не читает изменённый workspace source.
 - File guardrail download `/api/guardrails/{wait_id}/file` получает точный
   sealed reference из сохранённого review, возвращает только owner-scoped
   проверенные bytes как attachment и остаётся доступен для owner history.

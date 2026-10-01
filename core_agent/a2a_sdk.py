@@ -63,7 +63,7 @@ from .a2a import (
 )
 from .auth import OWNER_SCOPE, ScopeUser, is_company_owner
 from .a2a_input import input_error_response, protect_sdk_logs, read_input, request_limit
-from .database import REMOTE_PROGRESS_KEY, reconcile_remote_progress, reconcile_workflow_task
+from .database import REMOTE_PROGRESS_KEY, _has_response_files, reconcile_remote_progress, reconcile_workflow_task
 from .errors import CoreError
 from .workflow import SuspendedRun
 from .streaming import (
@@ -110,6 +110,7 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
         self.workflow_store = workflow_store
         self.task_scheduler = task_scheduler
         self.legacy_identity = legacy_identity
+        self.response_files_service = None
         super().__init__(owner_resolver=lambda context: json.dumps([
             context.tenant, resolve_owner_scope(context),
         ]))
@@ -173,7 +174,7 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
             return None
         task = SdkTask()
         task.CopyFrom(stored)
-        if self.workflow_store is not None and task.status.state not in A2A_TERMINAL_STATES:
+        if self.workflow_store is not None:
             try:
                 record = self._workflow_record(task_id, context, owner)
             except CoreError as error:
@@ -181,7 +182,8 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
                     raise
             else:
                 reconcile_workflow_task(task, run_id=record.run_id, state=record.state,
-                                        result=record.result, error_code=record.error_code, version=record.version)
+                                        result=record.result, error_code=record.error_code, version=record.version,
+                                        record=record, response_files_service=self.response_files_service)
                 self._reconcile_progress(task, record, context=owner_context)
         return task
 
@@ -215,23 +217,29 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
                 raise InvalidParamsError("Task not found")
             if self.workflow_store is not None:
                 current = await super().get(task.id, self._as_owner(context, owner))
-                if current is not None and current.status.state in A2A_TERMINAL_STATES:
-                    return
+                current_terminal = current is not None and current.status.state in A2A_TERMINAL_STATES
                 try:
                     record = self._workflow_record(task.id, context, owner)
                 except CoreError as error:
                     if error.code != "TASK_NOT_FOUND":
                         raise
+                    if current_terminal:
+                        return
                 else:
                     async with self._impl.lock:
                         with self.workflow_store._lock:
                             record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
                             revision = dict(task.metadata).get("core_agent_workflow_version", 0)
-                            if not isinstance(revision, (int, float)) or revision < record.version:
+                            if (current_terminal or record.state == "COMPLETED" and _has_response_files(record.result)
+                                    or not isinstance(revision, (int, float)) or revision < record.version):
                                 reconcile_workflow_task(
-                                    task, run_id=record.run_id, state=record.state, result=record.result,
-                                    error_code=record.error_code, version=record.version, authoritative=True,
+                                    current if current_terminal else task,
+                                    run_id=record.run_id, state=record.state, result=record.result,
+                                    error_code=record.error_code, version=record.version, authoritative=not current_terminal,
+                                    record=record, response_files_service=self.response_files_service,
                                 )
+                            if current_terminal:
+                                return
                             self._reconcile_progress(task, record, previous=current or SdkTask(), context=self._as_owner(context, owner))
                     return
             self._owners[key] = owner
@@ -242,7 +250,7 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
     async def _get_reconciled(self, task_id, context, owner):
         owner_context = self._as_owner(context, owner)
         task = await super().get(task_id, owner_context)
-        if task is None or self.workflow_store is None or task.status.state in A2A_TERMINAL_STATES:
+        if task is None or self.workflow_store is None:
             return task
         try:
             record = self._workflow_record(task_id, context, owner)
@@ -255,7 +263,8 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
                 record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
                 reconcile_workflow_task(
                     task, run_id=record.run_id, state=record.state,
-                    result=record.result, error_code=record.error_code, version=record.version)
+                    result=record.result, error_code=record.error_code, version=record.version,
+                    record=record, response_files_service=self.response_files_service)
                 self._reconcile_progress(task, record, context=owner_context)
         return task
 
@@ -753,20 +762,29 @@ class CoreAgentExecutor(AgentExecutor):
             return
         if not isinstance(artifact, Artifact):
             artifact = Artifact.text(str(artifact))
-        final_text = "\n".join(str(part.data) for part in artifact.parts)
-        chunks = _chunk(final_text, self.max_chunk_size)
+        final_text = "\n".join(part.data for part in artifact.parts if part.kind == "text")
+        typed_parts = []
+        for part in artifact.parts:
+            if part.kind == "file":
+                typed_parts.append(SdkPart(raw=part.data["bytes"], filename=part.data["filename"],
+                    media_type=part.data["media_type"] or "application/octet-stream"))
+            elif part.kind == "data":
+                typed_parts.append(SdkPart(data=_struct_value(part.data), media_type="application/json"))
+            elif part.kind != "text":
+                raise CoreError("CONTENT_TYPE_NOT_SUPPORTED")
+        metadata = {"digest": artifact.digest, "size": artifact.size, "provenance": artifact.provenance}
+        chunks = _chunk(final_text, self.max_chunk_size) if final_text or not typed_parts else []
         for index, chunk in enumerate(chunks):
             await updater.add_artifact(
                 [SdkPart(text=chunk, media_type=artifact.media_type)],
                 artifact_id=artifact.id,
-                metadata={
-                    "digest": artifact.digest,
-                    "size": artifact.size,
-                    "provenance": artifact.provenance,
-                },
+                metadata=metadata,
                 append=index > 0 or None,
-                last_chunk=index == len(chunks) - 1,
+                last_chunk=index == len(chunks) - 1 and not typed_parts,
             )
+        if typed_parts:
+            await updater.add_artifact(typed_parts, artifact_id=artifact.id, metadata=metadata,
+                append=bool(chunks) or None, last_chunk=True)
         await updater.complete(
             message=updater.new_agent_message(
                 [SdkPart(text=final_text, media_type=artifact.media_type)]

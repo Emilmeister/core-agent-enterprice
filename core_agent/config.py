@@ -262,6 +262,8 @@ def compile_effective_config(
         policies.discard("python")
     if not any(tool.startswith("core_artifact_") for tool in allowed):
         policies.discard("artifacts")
+    if "core_response_files" in allowed:
+        policies.add("response_files")
     if "core_agent_send_message" not in allowed:
         policies.discard("remote_agents")
 

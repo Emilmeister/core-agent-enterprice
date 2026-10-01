@@ -426,6 +426,7 @@ export function Chat({
         {row?.latest_task_id && !task && !error && <p role="status">Загружаем задачу…</p>}
         <History
           api={api}
+          contextId={contextId}
           history={history}
           onOlder={() => {
             stickToBottom.current = false;

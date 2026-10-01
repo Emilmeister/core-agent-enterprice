@@ -29,6 +29,7 @@ class AuthAppTestCase(unittest.IsolatedAsyncioTestCase):
     automatic_tools = True
     ui_client_id = ""
     push_encryption_key = ""
+    durable_blobs = False
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -46,6 +47,7 @@ class AuthAppTestCase(unittest.IsolatedAsyncioTestCase):
                 "CORE_AGENT_MEMORY": "disabled",
                 "LOCAL_WORKSPACE_ROOT": self.temp.name + "/scratch",
                 "CHAT_WORKSPACE_ROOT": self.temp.name + "/chats",
+                "DURABLE_STORAGE_ROOT": self.temp.name + "/durable" if self.durable_blobs else "",
             },
             clear=True,
         )
@@ -156,6 +158,7 @@ class AuthBoundaryTests(AuthAppTestCase):
             self.assertEqual(card.status_code, 200, card.text)
             self.assertTrue(card.json()["securitySchemes"])
             self.assertIn("application/octet-stream", card.json()["defaultInputModes"])
+            self.assertIn("application/octet-stream", card.json()["defaultOutputModes"])
             self.assertTrue(all(
                 item["url"] == f"https://agent.example.test/a2a/{kind}"
                 for item in card.json()["supportedInterfaces"]

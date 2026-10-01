@@ -163,6 +163,21 @@ Runtime добавляет принятый input в model transcript как use
 
 User-facing progress и requests передаются Messages/Task status. Critical result не хранится только в transient status Message.
 
+Финальные файлы передаются ordered standard raw FileParts того же result Artifact,
+с безопасными filename/mediaType и точными bytes. `metadata.provenance.outgoingFiles`
+содержит только ordered `{file_id,name,media_type,size_bytes,sha256}` receipts.
+Raw files не повторяются в terminal Message. Перед первым final frame весь набор
+проходит scope, aggregate-limit и integrity проверки; GetTask и recovery сохраняют
+те же IDs и содержимое. Отсутствие attachments у прежнего результата совместимо
+с пустым набором; wire schema/version самого A2A не меняется.
+
+Owner download `GET /api/chats/{context_id}/tasks/{task_id}/files/{file_id}`
+читает immutable final snapshot только после проверки current owner/company,
+canonical chat/Task binding и сохранённого final manifest; затем проверяет
+size/digest. Известный blob ID, digest или file ID другого чата не является
+authority и даёт not-found. Response — attachment, `Cache-Control: no-store`
+и `X-Content-Type-Options: nosniff`; private paths/provenance не выдаются.
+
 ## Cancellation и passive wait
 
 - Внешняя отмена использует A2A cancel Task operation.
@@ -462,6 +477,14 @@ previous-root chain; active summary и импортированные сообщ
 review владелец открывает полный материал через отдельный authorized API.
 Внутренние вопросы/ответы доступны владельцам, external/dual-role не получает
 history route даже для своей Task. Owner чужой company не получает её данные.
+
+Доступная final entry завершённой Task содержит optional `response_files` —
+ordered `{file_id,name,media_type,size_bytes,sha256}` receipts из её immutable
+manifest. Private blob IDs, paths, scope, raw bytes и лимит в history не выдаются.
+Чтение истории проверяет manifest и canonical binding без загрузки blob content;
+скачивание по route final files заново проверяет scope и integrity всего набора.
+UI показывает имена/размеры и выполняет отдельный authenticated download только
+по явному нажатию владельца. Прежние entries без поля означают пустой набор.
 
 Cursor закрепляет последнюю выданную root/позицию; новые roots, append и compaction
 не меняют уже прочитанные позиции. Для новых сообщений UI перечитывает первую

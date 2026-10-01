@@ -65,6 +65,11 @@ for p in files:
     try: p.open('wb')
     except OSError as error: assert error.errno in (errno.EROFS, errno.EACCES)
     else: raise AssertionError('published input is writable')
+if {count} == 3:
+    output = root.parent / 'results'
+    output.mkdir()
+    (output / 'report-output.txt').write_bytes(b'Native immutable output\\n')
+    (output / 'empty.txt').write_bytes(b'')
 print({marker!r})
 """
         return ModelResponse(tool_requests=(ToolRequest(marker, "core_terminal_exec", {"argv": ["python3", "-P", "-c", code]}),))
@@ -72,17 +77,33 @@ print({marker!r})
     class BrowserModel(ScriptedModel):
         def generate(self, *, context, tools, instructions, messages=None):
             index = len(self.calls)
+            assert "core_response_files" in tools
             if index:
-                marker = "browser-native-root-verified" if index == 1 else "browser-native-followup-verified"
+                marker = ("browser-native-root-verified", "browser-native-followup-verified",
+                          "browser-native-output-selected", "browser-native-output-deleted")[index - 1]
                 result = next(json.loads(message["content"]) for message in messages
                               if message.get("role") == "tool" and message.get("tool_call_id") == marker)
-                assert result["status"] == "succeeded" and result["output"]["exit_code"] == 0
-                assert result["output"]["stdout"].strip() == marker, "actual native file read did not succeed"
+                assert result["status"] == "succeeded"
+                if marker == "browser-native-output-selected":
+                    assert [file["name"] for file in result["output"]["files"]] == ["report-output.txt", "empty.txt"]
+                    assert result["output"]["files"][1]["size_bytes"] == 0
+                else:
+                    assert result["output"]["exit_code"] == 0
+                    assert result["output"]["stdout"].strip() == marker, "actual native file operation did not succeed"
             return super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
 
     model = BrowserModel([
         read_files(2, "browser-native-root-verified"),
         read_files(3, "browser-native-followup-verified"),
+        ModelResponse(tool_requests=(ToolRequest("browser-native-output-selected", "core_response_files",
+            {"paths": ["results/report-output.txt", "results/empty.txt"]}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-native-output-deleted", "core_terminal_exec", {
+            "argv": ["python3", "-P", "-c", "from pathlib import Path\np=Path('/workspace/results/report-output.txt')\n"
+                     "assert p.read_bytes()==b'Native immutable output\\n'\np.write_bytes(b'changed after selection')\n"
+                     "assert p.read_bytes()==b'changed after selection'\np.unlink()\n"
+                     "q=Path('/workspace/results/empty.txt')\nassert q.read_bytes()==b''\nq.unlink()\n"
+                     "assert not p.exists() and not q.exists()\nprint('browser-native-output-deleted')"],
+        }),)),
         ModelResponse(message="Native file reads completed."),
     ])
     model.model = "owner-browser-fixture"

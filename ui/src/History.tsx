@@ -1,9 +1,9 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
 import { scheduleTime } from "./Schedules";
 import { InteractionCard } from "./Interactions";
 import { byteCount, mergeHistoryPage } from "./types";
-import type { AttachmentEntry, HistoryItem, HistoryPage, Interaction } from "./types";
+import type { AttachmentEntry, HistoryItem, HistoryPage, Interaction, ResponseFileEntry } from "./types";
 
 const empty: HistoryPage = { items: [], next_cursor: null };
 const statusLabels: Record<HistoryItem["status"], string> = {
@@ -173,7 +173,63 @@ export function Attachments({ entries }: { entries: AttachmentEntry[] }) {
   </ul>;
 }
 
-function Entry({ item }: { item: HistoryItem }) {
+function ResponseFile({ api, contextId, taskId, file }: {
+  api: Api; contextId: string; taskId: string; file: ResponseFileEntry;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const pending = useRef<AbortController | undefined>(undefined);
+  const urls = useRef(new Set<string>());
+  useLayoutEffect(() => {
+    setBusy(false);
+    setError("");
+    pending.current = undefined;
+    return () => {
+      pending.current?.abort();
+      for (const url of urls.current) URL.revokeObjectURL(url);
+      urls.current.clear();
+    };
+  }, [api, contextId, taskId, file.file_id]);
+  async function download() {
+    if (pending.current || !api.session.valid) return;
+    const abort = new AbortController();
+    pending.current = abort;
+    const stopped = () => abort.signal.aborted || pending.current !== abort || !api.session.valid;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await api.request(
+        `/api/chats/${encodeURIComponent(contextId)}/tasks/${encodeURIComponent(taskId)}/files/${encodeURIComponent(file.file_id)}`,
+        { signal: abort.signal },
+      );
+      const blob = await response.blob();
+      if (stopped()) return;
+      const url = URL.createObjectURL(blob);
+      urls.current.add(url);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = file.name.replace(/[\\/\u0000-\u001f\u007f]/g, "_") || "файл";
+      link.click();
+      window.setTimeout(() => { URL.revokeObjectURL(url); urls.current.delete(url); }, 1000);
+    } catch (failure) {
+      if (!stopped()) setError(errorText(failure));
+    } finally {
+      if (!stopped()) setBusy(false);
+      if (pending.current === abort) pending.current = undefined;
+    }
+  }
+  return <li>
+    <strong>{file.name}</strong>
+    <span className="muted">{byteCount(file.size_bytes)}</span>
+    <button type="button" className="secondary" disabled={busy || !api.session.valid}
+      aria-label={`Скачать ${file.name}`} onClick={() => void download()}>
+      {busy ? "Скачиваем…" : "Скачать"}
+    </button>
+    {error && <p className="error" role="alert">{error}</p>}
+  </li>;
+}
+
+function Entry({ api, contextId, item }: { api: Api; contextId?: string; item: HistoryItem }) {
   if (item.kind === "schedule_notice") {
     const reasons: Record<string, string> = {
       context_busy: "чат был занят", late: "время запуска пропущено",
@@ -220,6 +276,12 @@ function Entry({ item }: { item: HistoryItem }) {
         <p className="muted history-status">{statusLabels[item.status]}</p>
       )}
       {item.status === "available" && item.attachments?.length ? <Attachments entries={item.attachments} /> : null}
+      {item.kind === "result" && item.status === "available" && item.outcome?.state === "COMPLETED"
+        && contextId && item.task_id && item.response_files?.length ?
+        <ul className="message-attachments response-files" aria-label="Файлы ответа">
+          {item.response_files.map((file) => <ResponseFile key={`${contextId}:${item.task_id}:${file.file_id}`}
+            api={api} contextId={contextId} taskId={item.task_id!} file={file} />)}
+        </ul> : null}
       {item.outcome && (
         <p className="muted history-status">
           {outcomes[item.outcome.state] ?? "Задача завершена"}
@@ -233,11 +295,13 @@ function Entry({ item }: { item: HistoryItem }) {
 
 export function History({
   api,
+  contextId,
   history,
   refresh,
   onOlder,
 }: {
   api: Api;
+  contextId?: string;
   history: ReturnType<typeof useChatHistory>;
   refresh: () => Promise<void>;
   onOlder: () => void;
@@ -316,7 +380,7 @@ export function History({
               if (review) rendered.add(review.wait_id);
               return (
                 <Fragment key={item.id}>
-                  <Entry item={item} />
+                  <Entry api={api} contextId={contextId} item={item} />
                   {review && (
                     <InteractionCard
                       key={review.wait_id}

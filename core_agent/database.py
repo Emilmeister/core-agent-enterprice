@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import os
 import time
 from contextlib import contextmanager, nullcontext
@@ -20,6 +19,7 @@ from psycopg_pool import ConnectionPool
 from google.protobuf.json_format import MessageToDict
 
 from .audit import AuditRecord
+from .a2a import workflow_result_artifact
 from .auth import ScopeUser, is_company_owner
 from .durability import Event
 from .errors import CoreError
@@ -1144,7 +1144,33 @@ def reconcile_remote_progress(task, *, state, tasks, previous=None):
     return True
 
 
-def reconcile_workflow_task(task, *, run_id, state, result=None, error_code=None, version=None, authoritative=False):
+def _has_response_files(result):
+    refs = (result or {}).get("outgoing_files", ())
+    if not isinstance(refs, (tuple, list)):
+        raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+    return bool(refs)
+
+
+def _project_result_artifact(task, artifact, *, replace_all=False):
+    if replace_all:
+        del task.artifacts[:]
+    projected = next((item for item in task.artifacts if item.artifact_id == artifact.id), None)
+    if projected is None:
+        projected = task.artifacts.add(artifact_id=artifact.id)
+    else:
+        del projected.parts[:]
+        projected.metadata.Clear()
+    for part in artifact.parts:
+        if part.kind == "file":
+            projected.parts.add(raw=part.data["bytes"], filename=part.data["filename"], media_type=part.data["media_type"])
+        else:
+            projected.parts.add(text=part.data, media_type="text/plain")
+    projected.metadata.update({"digest": artifact.digest, "size": artifact.size,
+        "recovered": True, "provenance": artifact.provenance})
+
+
+def reconcile_workflow_task(task, *, run_id, state, result=None, error_code=None, version=None, authoritative=False,
+                            record=None, response_files_service=None, connection=None):
     """Project canonical waiting/terminal state without exposing private waits."""
     terminal = {
         "COMPLETED": a2a_pb2.TASK_STATE_COMPLETED,
@@ -1158,10 +1184,22 @@ def reconcile_workflow_task(task, *, run_id, state, result=None, error_code=None
     )}}
     if state == "RUNNING" and version == 1:
         states[state] = a2a_pb2.TASK_STATE_SUBMITTED
-    if state not in states or (not authoritative and task.status.state in terminal.values()):
+    result = result or {}
+    artifact = None
+    if state == "COMPLETED" and _has_response_files(result):
+        scope = record if isinstance(record, dict) else vars(record) if record is not None else {}
+        if (scope.get("task_id"), scope.get("context_id")) != (task.id, task.context_id):
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        artifact = workflow_result_artifact(record, response_files_service, connection=connection)
+    if state not in states:
+        return False
+    if not authoritative and task.status.state in terminal.values():
+        if artifact is not None and task.status.state == a2a_pb2.TASK_STATE_COMPLETED:
+            _project_result_artifact(task, artifact, replace_all=True)
+            return True
         return False
     prior_version = dict(task.metadata).get("core_agent_workflow_version", 0)
-    if not authoritative and version is not None and isinstance(prior_version, (int, float)) and version <= prior_version:
+    if artifact is None and not authoritative and version is not None and isinstance(prior_version, (int, float)) and version <= prior_version:
         return False
     if version is None and state not in terminal and task.status.state == states[state]:
         return False
@@ -1192,53 +1230,14 @@ def reconcile_workflow_task(task, *, run_id, state, result=None, error_code=None
             text=reason,
             media_type="text/plain",
         )
-    result = result or {}
     message = result.get("message")
     if authoritative and state == "COMPLETED":
         # In-flight SDK chunks are not an additional canonical final artifact.
         del task.artifacts[:]
-    if state == "COMPLETED" and message:
-        encoded = message.encode()
-        digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
-        artifact = next(
-            (item for item in task.artifacts if item.artifact_id == digest),
-            None,
-        )
+    if state == "COMPLETED" and (message or artifact is not None):
         if artifact is None:
-            artifact = task.artifacts.add()
-        else:
-            del artifact.parts[:]
-            artifact.metadata.Clear()
-        artifact.artifact_id = digest
-        part = artifact.parts.add()
-        part.text = message
-        part.media_type = "text/plain"
-        provenance = {
-            "run_id": run_id,
-            "task_id": task.id,
-            "complete": result.get("complete", True),
-            "completion_reason": result.get(
-                "completion_reason", "completed"
-            ),
-            "usage": result.get(
-                "usage", {"model_turns": 0, "tool_calls": 0}
-            ),
-        }
-        if result.get("exhausted_dimension"):
-            provenance["exhausted_dimension"] = result[
-                "exhausted_dimension"
-            ]
-        if result.get("shared_budget") is not None:
-            provenance["shared_budget"] = result["shared_budget"]
-        if result.get("pending_tasks"):
-            provenance["pending_tasks"] = result["pending_tasks"]
-        metadata = {
-            "digest": digest,
-            "size": len(encoded),
-            "recovered": True,
-            "provenance": provenance,
-        }
-        artifact.metadata.update(metadata)
+            artifact = workflow_result_artifact({"state": state, "run_id": run_id, "task_id": task.id, "result": result})
+        _project_result_artifact(task, artifact, replace_all=bool(result.get("outgoing_files")))
     return True
 
 
@@ -1249,6 +1248,7 @@ class PostgresTaskStore(TaskStore):
         self.database = database
         self.owner_resolver = owner_resolver
         self.enqueue_notification = None
+        self.response_files_service = getattr(database, "response_files_service", None)
 
     @staticmethod
     def _remote_rows(connection, run, tenant):
@@ -1273,13 +1273,19 @@ class PostgresTaskStore(TaskStore):
     def _project_progress(self, connection, row):
         """Read projection preserves the established explicit terminal-reconciliation boundary."""
         task = a2a_pb2.Task.FromString(bytes(row["payload"]))
-        if task.status.state in (a2a_pb2.TASK_STATE_COMPLETED, a2a_pb2.TASK_STATE_FAILED,
-                                  a2a_pb2.TASK_STATE_CANCELED, a2a_pb2.TASK_STATE_REJECTED):
+        if task.status.state in (a2a_pb2.TASK_STATE_FAILED, a2a_pb2.TASK_STATE_CANCELED, a2a_pb2.TASK_STATE_REJECTED):
             return task
-        run = connection.execute("""SELECT run_id, state, snapshot FROM core_runs
+        run = connection.execute("""SELECT run_id, task_id, tenant_id, owner_id, context_id,
+            state, version, result, error_code, snapshot FROM core_runs
             WHERE task_id = %s AND tenant_id = %s AND owner_id = %s FOR SHARE""",
             (task.id, row["tenant"], row["owner"])).fetchone()
         if run is None:
+            return task
+        if run["state"] == "COMPLETED" and _has_response_files(run["result"]):
+            reconcile_workflow_task(task, run_id=run["run_id"], state=run["state"], result=run["result"],
+                version=run["version"], record=run, response_files_service=self.response_files_service, connection=connection)
+            return task
+        if task.status.state == a2a_pb2.TASK_STATE_COMPLETED:
             return task
         if run["state"] in {"COMPLETED", "FAILED", "ABORTED", "CANCELLED", "REJECTED"}:
             # Do not enqueue a new working frame while terminal reconciliation is pending.
@@ -1321,13 +1327,14 @@ class PostgresTaskStore(TaskStore):
             for row in rows:
                 # The task lock may have waited; reread canonical state afterwards.
                 run = connection.execute(
-                    "SELECT run_id, state, version, result, error_code, snapshot FROM core_runs WHERE run_id = %s FOR SHARE",
+                    "SELECT run_id, task_id, tenant_id, owner_id, context_id, state, version, result, error_code, snapshot FROM core_runs WHERE run_id = %s FOR SHARE",
                     (row["run_id"],),
                 ).fetchone()
                 task = a2a_pb2.Task.FromString(bytes(row["payload"]))
                 changed = reconcile_workflow_task(
                     task, run_id=row["run_id"], state=run["state"], version=run["version"],
                     result=run["result"], error_code=run["error_code"],
+                    record=run, response_files_service=self.response_files_service, connection=connection,
                 )
                 changed = reconcile_remote_progress(task, state=run["state"],
                     tasks=self._remote_rows(connection, run, row["tenant"])) or changed
@@ -1362,24 +1369,29 @@ class PostgresTaskStore(TaskStore):
             ).fetchone()
             if previous:
                 stored = a2a_pb2.Task.FromString(bytes(previous["payload"]))
-                if stored.status.state in (a2a_pb2.TASK_STATE_COMPLETED, a2a_pb2.TASK_STATE_FAILED,
-                                           a2a_pb2.TASK_STATE_CANCELED, a2a_pb2.TASK_STATE_REJECTED):
-                    return
+                stored_terminal = stored.status.state in (
+                    a2a_pb2.TASK_STATE_COMPLETED, a2a_pb2.TASK_STATE_FAILED,
+                    a2a_pb2.TASK_STATE_CANCELED, a2a_pb2.TASK_STATE_REJECTED,
+                )
                 run = connection.execute(
-                    """SELECT run_id, state, version, result, error_code, snapshot FROM core_runs
+                    """SELECT run_id, task_id, tenant_id, owner_id, context_id, state, version, result, error_code, snapshot FROM core_runs
                        WHERE task_id = %s AND owner_id = %s AND tenant_id = %s FOR SHARE""",
                     (task.id, owner, tenant),
                 ).fetchone()
                 incoming_version = dict(task.metadata).get("core_agent_workflow_version", 0)
-                if run and (not isinstance(incoming_version, (int, float)) or incoming_version < run["version"]):
+                if run and (stored_terminal or run["state"] == "COMPLETED" and _has_response_files(run["result"])
+                            or not isinstance(incoming_version, (int, float)) or incoming_version < run["version"]):
                     # SDK events carry an older Task snapshot; only its history may
                     # advance independently of the canonical workflow revision.
                     reconcile_workflow_task(
-                        task, run_id=run["run_id"], state=run["state"],
+                        stored if stored_terminal else task, run_id=run["run_id"], state=run["state"],
                         result=run["result"], error_code=run["error_code"],
-                        version=run["version"], authoritative=True,
+                        version=run["version"], authoritative=not stored_terminal,
+                        record=run, response_files_service=self.response_files_service, connection=connection,
                     )
                     timestamp = task.status.timestamp.ToMilliseconds() / 1000
+                if stored_terminal:
+                    return
                 if run:
                     reconcile_remote_progress(task, state=run["state"], tasks=self._remote_rows(connection, run, tenant), previous=stored)
                     timestamp = task.status.timestamp.ToMilliseconds() / 1000

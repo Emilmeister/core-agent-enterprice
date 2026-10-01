@@ -718,6 +718,11 @@ main {
   font-size: 12px;
   overflow-wrap: anywhere;
 }
+.response-files button {
+  justify-self: start;
+  padding: 6px 10px;
+  font-size: 12px;
+}
 .accepted-attachments {
   margin-top: 16px;
   font-size: 12px;

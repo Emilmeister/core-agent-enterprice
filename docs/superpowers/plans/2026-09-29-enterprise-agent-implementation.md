@@ -194,8 +194,16 @@ UI typecheck и production build проходят; Vite assets включены 
 Исправлены ошибки восстановленного sandbox resource, legacy Task projection,
 file admission FK/JSONB и гонки synthetic PostgreSQL test fixtures.
 
-Полный release gate остаётся открытым: отправка результирующих файлов через UI/A2A,
-миграция старых файлов и удаление named artifact service ещё не завершены.
+Полный release gate остаётся открытым: файловый обмен при создании задач внешним
+агентам, миграция старых файлов и удаление named artifact service ещё не завершены.
+Итоговые вложения подключены через явный `core_response_files`: immutable snapshots,
+canonical A2A results/recovery, owner history/download и source UI. Последний full
+PostgreSQL/Keycloak suite —1465 tests, 208.608 секунды, exit0, три ожидаемых skips;
+последующий targeted card gate подтвердил binary output mode. Extended actual
+browser output gate прошёл на native ARM64: 1 test, 79.291 секунды, exit0, без skips,
+28 browser checks. Реальные кнопки UI скачивают frozen snapshots после изменения
+и удаления originals; chat switch abort не создаёт stale download. Source/image
+hashes, logs и screenshot — `.local-evidence/owner-browser-outgoing/`.
 На native ARM64 Linux в отдельном disposable kind-кластере полный обязательный
 sandbox gate прошёл: 12 tests, 104.268 секунды, exit0, без skips. Реальный Pod
 подтвердил mount/PID/seccomp/rlimits, bootstrap/teardown, Python broker/HITL,

@@ -311,21 +311,45 @@ admission. Targeted ingress/admission/auth/file/guardrail/transfer suite про�
 308 тестов с реальным PostgreSQL без skips. Owner history показывает только
 опубликованные безопасные attachment receipts; 38 history tests прошли на
 PostgreSQL. UI multiple-file picker и immutable retry проверены 11 сценариями
-в Chromium с контролируемым API. Полный browser + Keycloak + Linux backend
-сценарий ещё не подтверждён; native AMD64 и целевой CSI остаются отдельными gates.
+в Chromium с контролируемым API. Затем actual Chromium + Keycloak + PostgreSQL +
+native Linux application Pod прошли required module без skips: 20 browser checks,
+включая lost-ACK retry, HITL, publication, persisted history/download и storage
+обеих вкладок. Native AMD64 и целевой CSI остаются отдельными gates.
 Эти результаты не закрывают исходящие files и migration/cutover следующего шага.
 
 ### 5. Реализовать final-file selection и полный A2A/remote transport
 
 **Files:** `core_agent/app.py`, `core_agent/runtime.py`, `core_agent/config.py`, `core_agent/kernel.py`, `core_agent/a2a.py`, `core_agent/a2a_sdk.py`, `core_agent/artifacts.py`, `core_agent/remote_agents.py`, `core_agent/chat_files.py`; tests `test_transfer_features.py`, `test_python_exec.py`, `test_end_to_end.py`, `test_runtime_observability.py`.
 
-- [ ] Зарегистрировать core_response_files, schema и concise kernel instruction; capability intersection/delegation/deny/policy действуют как для остальных tools. Не добавлять их в RunRequest или provider-specific response format.
-- [ ] Snapshot весь новый набор и только затем заменить manifest вместе с tool receipt. Assert invalid path/oversize/read error оставляет прежний set и source files, `[]` clears, две успешные команды заменяют set целиком. Проверить recovery после receipt и до final result.
-- [ ] Добавить outgoing_files в RunResult и все result reconstruction branches. Budget-partial result с выбранными файлами сохраняет прежние complete/completion_reason/shared_budget; attachment bytes не попадают в telemetry.
-- [ ] Обновить result_artifact/_publish_artifact, чтобы raw FileParts сохраняли media type/name/bytes и весь batch проверялся до первого final frame. GetTask/live/SSE/recovery одинаковы по IDs, digests и ordered files; stream disconnect не дублирует результат.
+- [x] Зарегистрировать core_response_files, schema и concise kernel instruction; capability intersection/delegation/deny/policy действуют как для остальных tools. Не добавлять их в RunRequest или provider-specific response format.
+- [x] Snapshot весь новый набор и только затем заменить manifest вместе с tool receipt. Assert invalid path/oversize/read error оставляет прежний set и source files, `[]` clears, две успешные команды заменяют set целиком. Проверить recovery после receipt и до final result.
+- [x] Добавить outgoing_files в RunResult и все result reconstruction branches. Budget-partial result с выбранными файлами сохраняет прежние complete/completion_reason/shared_budget; attachment bytes не попадают в telemetry.
+- [x] Обновить result_artifact/_publish_artifact, чтобы raw FileParts сохраняли media type/name/bytes и весь batch проверялся до первого final frame. GetTask/live/SSE/recovery одинаковы по IDs, digests и ordered files; stream disconnect не дублирует результат.
 - [ ] Добавить same-tenant different-chat blob isolation test, включая одинаковые file bytes: известный digest/file_id без доступной Task manifest не даёт download. In-memory и PostgreSQL проходят один observable contract.
 - [ ] Remote outbound files и inbound complete batch проходят общий limit/scope/guardrail service; inbound headers не становятся downstream Authorization. Стуб HTTP проверяет отсутствие первого request при oversized batch и отсутствие relay частичного превышающего лимит remote message.
-- [ ] Выполнить `uv run python -m unittest tests.test_transfer_features tests.test_python_exec tests.test_end_to_end tests.test_runtime_observability -v`.
+- [x] Выполнить `uv run python -m unittest tests.test_transfer_features tests.test_python_exec tests.test_end_to_end tests.test_runtime_observability -v`.
+
+Backend итоговых вложений и source UI подключены: immutable snapshots, whole manifest
+validation, ordered typed Parts, owner final history и отдельный authenticated
+download. Проверены direct/Python selection, HITL, guardrail wait/recovery и
+budget-partial, реальные PostgreSQL save/restart и pool1 reads. Review выявило
+и исправило null manifest, colon basename, cached/equal-version save shortcuts
+и позднее подключение сервиса при startup reconciliation. Full PostgreSQL +
+Keycloak suite —1465 tests, 208.608 секунды, exit0, три ожидаемых skips; отдельный
+card gate подтвердил binary output mode на owner/external endpoints. Ruff и UI
+typecheck/build проходят. Extended actual browser output/download proof прошёл
+на native ARM64 application Pod с реальными Keycloak/PostgreSQL: required module
+1 test, 79.291 секунды, exit0, без skips, 28 browser checks. UI скачал два выбранных
+snapshots, включая empty file, после изменения/удаления originals и позднего
+уменьшения company limit. Проверены current bearer/encoded route, per-file busy,
+abort при смене чата и отсутствие stale download; incoming checks сохранены.
+Image ID: `sha256:d785ee4fa13f38dbd7d3bb43d0a88d9ff93418e550c213d5a99c761c3eb20a8d`.
+Evidence — `.local-evidence/owner-browser-outgoing/`; source hashes включают
+последний binary AgentCard output mode. Remote files, migration/cutover и полный
+release этим не закрыты; actual CI AMD64 и целевой CSI остаются отдельными gates.
+Финальный набор выбирает модель через `core_response_files`; остальные файлы
+workspace не прикрепляются автоматически. Вложения при создании задачи внешнему
+агенту остаются отдельным следующим срезом с явным `files` на каждый вызов.
 
 ### 6. Подключить owner file API и безопасную очистку
 

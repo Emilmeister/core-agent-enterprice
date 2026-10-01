@@ -49,7 +49,7 @@ from .remote_operations import RemoteA2AExecutor
 from .security import redact
 from .streaming import NullStreamPublisher
 from .tasks import DelegationContract, _remote_contract
-from .tools import CRON_CREATE_TOOL, ToolCall, ToolDefinition, ToolResult
+from .tools import CRON_CREATE_TOOL, RESPONSE_FILES_TOOL, ToolCall, ToolDefinition, ToolResult
 from .workflow import InMemoryWorkflowStore, SuspendedRun, WorkflowRecord, TERMINAL_STATES
 from .workspace import WorkspaceBinding
 
@@ -151,6 +151,7 @@ class RunResult:
     exhausted_dimension: str | None = None
     shared_budget: dict | None = None
     pending_tasks: tuple[str, ...] = ()
+    outgoing_files: tuple[dict, ...] = ()
 
     def to_dict(self):
         return {
@@ -178,6 +179,7 @@ class RunResult:
                 "model_turns": self.usage.model_turns,
                 "tool_calls": self.usage.tool_calls,
             },
+            **({"outgoing_files": list(self.outgoing_files)} if self.outgoing_files else {}),
         }
 
 
@@ -306,6 +308,7 @@ class CoreAgent:
         material_review_store=None,
         guardrail_classifier=None,
         chat_file_service=None,
+        response_files_service=None,
         kernel_compiler=None,
         context_window=128_000,
         output_reserve=4_096,
@@ -347,6 +350,7 @@ class CoreAgent:
         if chat_file_service is not None and material_review_store is None:
             raise CoreError("CONFIG_INVALID", "Chat files require material reviews")
         self.chat_file_service = chat_file_service
+        self.response_files_service = response_files_service
         self._file_sweep_due = 0.0
         self._file_sweep_startup = True
         self.kernel_compiler = kernel_compiler or KernelCompiler(
@@ -406,7 +410,8 @@ class CoreAgent:
         self.remote_registry = remote_registry
         self.send_message_api_key = send_message_api_key
         registered = self.tool_runtime.registry.names()
-        for definition in (*_skill_tool_definitions(), CRON_CREATE_TOOL):
+        for definition in (*_skill_tool_definitions(), CRON_CREATE_TOOL,
+                           *((RESPONSE_FILES_TOOL,) if response_files_service is not None else ())):
             if definition.name not in registered:
                 self.tool_runtime.registry.register(definition)
         self.tool_runtime.handlers.update(
@@ -423,6 +428,7 @@ class CoreAgent:
                 "core_artifact_list": self._artifact_list,
                 "core_agent_send_message": self._send_message,
                 "core_cron_create": self._cron_create,
+                "core_response_files": self._response_files,
                 "core_memory_search": self._memory_search,
                 "core_memory_read": self._memory_read,
                 "core_memory_create": self._memory_create,
@@ -1514,7 +1520,7 @@ class CoreAgent:
             return result["output"]
         return RunResult(record.run_id, result["message"], "completed", Usage(**result["usage"]),
                          result.get("complete", True), result.get("completion_reason", "completed"),
-                         result.get("exhausted_dimension"), result.get("shared_budget"), tuple(result.get("pending_tasks", ())))
+                         result.get("exhausted_dimension"), result.get("shared_budget"), tuple(result.get("pending_tasks", ())), tuple(result.get("outgoing_files", ())))
 
     def _run_execution_attempt(self, record, callback, *, lease_token=None):
         token = lease_token or self.workflow_store.acquire_lease(record.run_id, tenant_id=record.tenant_id,
@@ -2166,7 +2172,7 @@ class CoreAgent:
         self._runtime_cache[record.run_id] = (raw, discovered, effective)
         return record, request, raw, discovered, effective
 
-    def _compile_instructions(self, raw, effective, snapshot):
+    def _compile_instructions(self, raw, effective, snapshot, *, model_tools=None):
         catalog = sorted(
             (
                 {
@@ -2199,8 +2205,11 @@ class CoreAgent:
             for skill in snapshot.get("skills", ())
             if skill["name"] in effective.skills
         )
+        capabilities = set(effective.enabled_capability_policies)
+        if model_tools is not None and "core_response_files" not in model_tools:
+            capabilities.discard("response_files")
         return self.kernel_compiler.compile(
-            enabled_capabilities=effective.enabled_capability_policies,
+            enabled_capabilities=capabilities,
             agent_profile=raw["agent"].get("profile_prompt", ""),
             user_prompt="",
             skill_instructions=tuple(skill_instructions),
@@ -3101,6 +3110,7 @@ class CoreAgent:
         span=None,
         active_result_token_limit=None,
     ):
+        self._apply_response_files(snapshot, call, not isinstance(outcome, ToolResult) or outcome.status == "succeeded")
         if self.material_review_store is not None:
             completed = snapshot.get("pending_completed_result")
             if completed is None:
@@ -4171,6 +4181,10 @@ class CoreAgent:
                             else self._tool_catalog(effective, discovered, snapshot, tenant_id=record.tenant_id)
                         )
                         model_instructions = self._instructions(snapshot)
+                        if "response_files" in effective.enabled_capability_policies and "core_response_files" not in model_tools:
+                            model_instructions = self._compile_instructions(
+                                raw, effective, snapshot, model_tools=model_tools
+                            ).text
                     if finalizing:
                         model_instructions = (
                             f"{model_instructions}\n\n{BUDGET_FINALIZATION_INSTRUCTION}"
@@ -4609,6 +4623,8 @@ class CoreAgent:
                         )
                     result = {
                         "message": response["message"],
+                        **({"outgoing_files": copy.deepcopy(snapshot["outgoing_files"])}
+                           if snapshot.get("outgoing_files") else {}),
                         "complete": exhausted is None,
                         "completion_reason": (
                             "completed" if exhausted is None else "budget_exhausted"
@@ -4679,7 +4695,7 @@ class CoreAgent:
                         result["completion_reason"],
                         result.get("exhausted_dimension"),
                         result.get("shared_budget"),
-                        tuple(result.get("pending_tasks", ())),
+                        tuple(result.get("pending_tasks", ())), tuple(result.get("outgoing_files", ())),
                     )
                 snapshot["pending_response"] = None
                 snapshot["finalizing_response"] = False
@@ -5007,6 +5023,38 @@ class CoreAgent:
         context = self._dispatch_context.get()
         return context if context is not None and context["record"].run_id == run_id else None
 
+    @staticmethod
+    def _apply_response_files(snapshot, call, succeeded):
+        prepared = snapshot.pop("prepared_response_files", None)
+        if prepared is None:
+            return
+        if call.name != "core_response_files" or prepared["call_id"] != call.id:
+            raise CoreError("CHECKPOINT_INVALID")
+        if succeeded:
+            snapshot["outgoing_files"] = prepared["files"]
+
+    def _response_files(self, arguments, run_id):
+        context = self._current_dispatch(run_id)
+        if self.response_files_service is None or context is None:
+            raise ExecutionNotStarted("CAPABILITY_DISABLED")
+        record, snapshot = context["record"], context["snapshot"]
+        nested = snapshot.get("nested_dispatch", {})
+        call_id = (nested["call_id"] if nested.get("state") == "executing"
+                   and nested.get("subject", {}).get("tool_name") == "core_response_files"
+                   else snapshot["pending_call"]["id"])
+        limit = (self.interaction_store.get_settings(record.tenant_id).attachment_limit_bytes
+                 if self.interaction_store is not None else 25_000_000)
+        try:
+            files = self.response_files_service.prepare(
+                WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id), arguments["paths"],
+                task_id=record.task_id, run_id=record.run_id, limit_bytes=limit,
+            )
+        except CoreError as error:
+            # Immutable preparation never commits the selected response set.
+            raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+        snapshot["prepared_response_files"] = {"call_id": call_id, "files": list(files)}
+        return {"files": self.response_files_service.receipts(files)}
+
     def _cron_create(self, arguments, run_id):
         context = self._current_dispatch(run_id)
         store = getattr(self, "cron_store", None)
@@ -5085,6 +5133,7 @@ class CoreAgent:
         if context is None or context.get("error") is not None:
             return
         snapshot = copy.deepcopy(context["snapshot"])
+        self._apply_response_files(snapshot, call, not isinstance(outcome, ToolResult) or outcome.status == "succeeded")
         frame = snapshot.get("python_execution")
         if frame is None:
             return
@@ -5142,6 +5191,7 @@ class CoreAgent:
         frame.update(nested_call={"id": call.id, "name": call.name, "arguments": copy.deepcopy(call.arguments)},
                      approval_required=False, subject=snapshot["nested_dispatch"]["subject"])
         if stage == "tool_result":
+            self._apply_response_files(snapshot, call, payload.get("status") == "succeeded")
             snapshot["pending_completed_result"] = {"call": frame["nested_call"], "outcome": payload}
             snapshot["nested_dispatch"]["state"] = "result_saved"
             updated = self._record_transition(context["record"], state="EXECUTING", snapshot=snapshot,
@@ -6149,6 +6199,7 @@ class CoreAgent:
             material_review_store=self.material_review_store,
             guardrail_classifier=self.guardrail_classifier,
             chat_file_service=self.chat_file_service,
+            response_files_service=self.response_files_service,
             kernel_compiler=self.kernel_compiler,
             context_window=self.context_window,
             output_reserve=self.output_reserve,
@@ -6200,7 +6251,7 @@ class CoreAgent:
             result.get("completion_reason", "completed"),
             result.get("exhausted_dimension"),
             result.get("shared_budget"),
-            tuple(result.get("pending_tasks", ())),
+            tuple(result.get("pending_tasks", ())), tuple(result.get("outgoing_files", ())),
         )
 
     def _recover_subagent(self, contract, cancel_event):
@@ -6440,7 +6491,7 @@ class CoreAgent:
                         result.get("completion_reason", "completed"),
                         result.get("exhausted_dimension"),
                         result.get("shared_budget"),
-                        tuple(result.get("pending_tasks", ())),
+                        tuple(result.get("pending_tasks", ())), tuple(result.get("outgoing_files", ())),
                     )
                 if record.state in {"FAILED", "ABORTED", "CANCELLED", "REJECTED"}:
                     raise CoreError(record.error_code or "INVALID_TASK_STATE")
