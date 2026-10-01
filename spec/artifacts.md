@@ -209,4 +209,8 @@ HITL, ответа владельца, внешнего агента или вр
 
 До удаления service все входящие вложения переводятся на chat workspace. Прежние `ARTIFACT_STORAGE_*`, dedicated `ARTIFACT_S3_*`/`ARTIFACT_MONGODB_*` и `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` перестают задавать runtime capabilities. Upgrade MUST диагностировать неподдерживаемые старые настройки; отключение tools не разрешает молча потерять прежние файлы.
 
-Старые пользовательские blobs, имена, версии, digests и доказанная ownership сохраняются для явного migration/export. Неизвестную caller identity нельзя вывести из имени, `anonymous`, токена, последнего caller или общего tenant. Неоднозначные данные остаются недоступными внешним caller-ам до авторизованного сопоставления; они не удаляются автоматически. Миграция metadata и файлов проверяет integrity и публикует новую привязку атомарно; ошибка сохраняет исходные данные и прежнюю опубликованную revision. Контракт миграции и отката описан в [Архитектуре](architecture.md).
+Согласованный cutover не имеет прежних named artifact данных для переноса.
+Export/import utility, перенос S3/MongoDB blobs и новый import journal не входят
+в CLEAN-01. Удаляются только код и конфигурация приложения; внешние S3 buckets,
+MongoDB databases и Kubernetes resources не удаляются. История, chat workspace,
+transport artifacts и snapshots сохраняются по своим прежним правилам.

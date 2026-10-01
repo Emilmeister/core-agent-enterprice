@@ -354,7 +354,7 @@
 - [ ] SDK/path/JSON-RPC tenant не перезаписывает trusted deployment company: mismatch отклоняется, пустое SDK значение сохраняет verified tenant.
 - [ ] Legacy identity явно сопоставляется issuer/sub; неизвестный owner остаётся изолированным, исходные rows/blobs и digests сохраняются при migration.
 - [ ] Versioned wait/cron/file migration сохраняет deadlines, closed outcomes и visibility; unknown dispatched side effects не replay-ятся.
-- [ ] Перенос входящих files предшествует удалению artifact tools; owner registry import не перезаписывается ENV после cutover; rollback после enterprise writes требует безопасного reverse migration/backup boundary.
+- [ ] Перенос входящих files предшествует удалению artifact tools; прежних named artifact данных для переноса нет, отдельный export/import utility не поставляется. Три tools и исключительно их adapters/dependencies/config удалены из приложения без удаления внешних storage resources; устаревшие tool/env настройки диагностируются без вывода values. Owner registry import не перезаписывается ENV после cutover; rollback после enterprise writes требует безопасного reverse migration/backup boundary.
 
 ## Enterprise v1: обязательные сценарии
 
