@@ -121,10 +121,10 @@ class EnterpriseReleaseBoundaryTests(auth_fixtures.AuthAppTestCase):
         self.release_admission(admitted)
         return admitted
 
-    def policy(self, name, mode):
+    def policy(self, name, mode, *, guardrails_exempt=False):
         previous = self.agent.interaction_store.get_policy(self.tenant, name, "builtin:" + name)
         self.agent.interaction_store.update_policy(self.tenant, name, previous.origin, mode=mode,
-            guardrails_exempt=False, expected_revision=previous.revision, actor_id="release-proof-owner")
+            guardrails_exempt=guardrails_exempt, expected_revision=previous.revision, actor_id="release-proof-owner")
 
     def compactions(self):
         raw = self.agent.agent_config.to_dict()
@@ -201,6 +201,9 @@ class EnterpriseReleaseBoundaryTests(auth_fixtures.AuthAppTestCase):
         self.assertFalse(self.agent.model.calls)
 
     async def test_omitted_summary_pending_state_cannot_reopen_timer_or_recharge_work(self):
+        # Keep this summary/wait proof independent of the detector's one-slot
+        # contention policy, covered separately by tests.test_guardrails.
+        self.policy("core_terminal_exec", "allow", guardrails_exempt=True)
         future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
         model = SemanticModel([
             ModelResponse(tool_requests=(ToolRequest("background", "core_task_start", {
@@ -214,7 +217,10 @@ class EnterpriseReleaseBoundaryTests(auth_fixtures.AuthAppTestCase):
         task = await self.submit("owner-a", uuid.uuid4().hex, uuid.uuid4().hex)
         self.tasks.add(task["id"])
         record = self.agent.workflow_store.lookup_task(task["id"])
-        self.assertEqual(record.state, "WAITING_TASK", record.error_code)
+        wait_id = record.snapshot.get("wait_id")
+        current_wait = self.agent.workflow_store.get_wait(wait_id, tenant_id=self.tenant) if wait_id else None
+        self.assertEqual(record.state, "WAITING_TASK", (record.error_code,
+            current_wait.kind if current_wait else None, current_wait.subject if current_wait else None))
         summary = next(item for item in record.snapshot["context"]["active"] if item["kind"] == "summary")
         self.assertEqual(json.loads(summary["content"])["Pending"], [])
         owned = self.agent.task_scheduler.list(owner_id=record.run_id, tenant_id=self.tenant)
