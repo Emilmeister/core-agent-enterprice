@@ -480,6 +480,10 @@ Compose подключает native seccomp profile из `deploy/security/`, `/d
 дополнительно запускает реальные terminal/Python/background операции через
 этот Compose с контролируемой моделью. Отсутствие совместимых Linux namespaces
 или устройств завершает запуск ошибкой.
+На Linux с включённым AppArmor внешняя политика контейнера также должна
+разрешать создание среды Bubblewrap: стандартный профиль может блокировать
+mount и nested user namespaces. Совместимость проверяется для конкретного
+хоста; seccomp и AppArmor настраиваются как отдельные слои защиты.
 Для хранения секретов подключений внешних агентов задайте
 `PUSH_NOTIFICATION_ENCRYPTION_KEY` из `.env.example`; в production он обязателен.
 

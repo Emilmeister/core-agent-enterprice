@@ -248,6 +248,15 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
   профиль не заменён таким обходом. Evidence — `.local-evidence/target-tun-csi/`,
   `.local-evidence/target-userns-diagnostics/` и
   `.local-evidence/target-userns-unconfined-diagnostic/`.
+  Новый именованный профиль `core-agent-runtime-v1` подготовлен на основе
+  containerd baseline с явными userns/mount/pivot_root rules. Syntax/compile
+  AppArmor4.1.0, ABI4.0 и `--Werror=rule-not-enforced` проходят, exit0.
+  Одноразовый установщик добавляет только этот профиль, сохраняет проверенные
+  файлы в `/var/lib/core-agent/apparmor/` и не заменяет existing policies.
+  Target server dry-run принят; временный namespace удалён. Kernel load не
+  выполнялся: нужен отдельный ответ пользователя на запрос про MAC_ADMIN.
+  Evidence — `.local-evidence/target-apparmor-install/`; это подготовка
+  совместимости, не proof actual sandbox на target и не fallback Unconfined.
 - Target Cloud.ru CSI byte persistence после удаления и пересоздания Pod
   подтверждён на exact amd64 digest, checksum совпадает, оба Pod non-root/caps0.
   Namespace и PV удалены. Это подтверждение тома, не сквозной ENT-AC-32:
