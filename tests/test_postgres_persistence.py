@@ -1420,6 +1420,119 @@ class PostgresRestartTests(unittest.TestCase):
             finally:
                 second.state.close()
 
+    def test_repeated_semantic_compaction_survives_postgres_restart_with_original_sources(self):
+        class ProcessStopped(BaseException):
+            pass
+
+        class SemanticModel(ScriptedModel):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.model = "postgres-semantic-model"
+                self.summaries = []
+
+            def generate(self, **call):
+                if not call["instructions"].startswith("SEMANTIC CONTEXT SUMMARY"):
+                    return super().generate(**call)
+                self.summaries.append(call)
+                records = json.loads(call["context"])["records"]
+                sources = list(dict.fromkeys(source for item in records for source in item["sources"]))
+                latest = "C" if any("Correction: C" in item["content"] for item in records) else "B"
+                value = {key: [] for key in ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")}
+                value["Decisions"] = [{"text": "Use " + latest, "basis": "fact", "sources": sources}]
+                value["Pending"] = [{"text": "Publishing remains planned only", "basis": "fact", "sources": sources}]
+                return ModelResponse(message=json.dumps(value), finish_reason="stop")
+
+        database_url = os.environ["TEST_DATABASE_URL"]
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        connector = InMemoryMcpConnector(catalogs={"docs": {"search": {"type": "object"}}})
+        outputs = [{"correction": "Correction: B", "log": "x" * 40_000}, {"correction": "Correction: C"}]
+        dispatched = []
+
+        def search(*args):
+            dispatched.append(args)
+            return outputs[len(dispatched) - 1]
+
+        model = SemanticModel([ModelResponse(tool_requests=(ToolRequest("first", "docs_search", {}),)),
+                               ModelResponse(tool_requests=(ToolRequest("second", "docs_search", {}),))])
+        prompt = "Исходная цель: use A; preserve the latest correction, publish only after verification."
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+            "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+            "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/blobs",
+            "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "MCP_URL": "https://peer.test/docs",
+            "MCP_ALLOWED_SERVERS": "docs", "MCP_ALLOWED_TOOLS": "docs.search",
+            "MCP_READ_ONLY_TOOLS": "docs.search", "LLM_CONTEXT_WINDOW": "20000",
+            "LLM_MAX_TOKENS": "500", "EVENTS_COMPACTION_INTERVAL": "1", "LOG_LEVEL": "ERROR",
+        }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
+            first = create_app(model=model, mcp_connector=connector, database=database)
+            agent = first.state.core_agent
+            compact = agent._compact_context
+
+            def stop_after_second_commit(*args, **kwargs):
+                result = compact(*args, **kwargs)
+                if len(model.summaries) == 2:
+                    saved = agent.workflow_store.lookup_task("semantic-restart")
+                    self.assertEqual(saved.snapshot["context"], result[1]["context"])
+                    self.assertEqual(saved.snapshot["compaction_operation"]["outcome"], "committed")
+                    raise ProcessStopped()
+                return result
+
+            try:
+                with patch.object(connector, "call", side_effect=search), \
+                        patch.object(agent, "_compact_context", side_effect=stop_after_second_commit):
+                    with self.assertRaises(ProcessStopped):
+                        agent.run({"prompt": prompt}, task_id="semantic-restart", session_id="summary-chat",
+                                  identity="owner-1", tenant_id="tenant-1")
+                original = agent.workflow_store.lookup_task("semantic-restart")
+                context = original.snapshot["context"]
+                summary = next(item for item in context["active"] if item["kind"] == "summary")
+                pins = [item for item in context["active"] if item["pinned"]]
+                self.assertEqual(len(model.summaries), 2)
+                self.assertEqual(len(dispatched), 2)
+                self.assertIn("Use B", model.summaries[1]["context"])
+                self.assertEqual(json.loads(summary["content"])["Decisions"][0]["text"], "Use C")
+                self.assertEqual(summary["provenance"]["summary_version"], 1)
+                self.assertEqual(set(summary["provenance"]["sources"]),
+                                 {f"{original.run_id}:{sequence}" for sequence in range(1, 6)})
+                self.assertEqual(next(item["content"] for item in pins if item["kind"] == "prompt"), prompt)
+                reference = json.loads(next(item["content"] for item in pins if item["kind"] == "runtime_references"))["artifact"]
+                self.assertEqual(original.snapshot["compaction_operation"]["outcome"], "committed")
+                self.assertEqual((original.snapshot["turns"], original.snapshot["tool_calls"]), (4, 2))
+            finally:
+                first.state.close()
+
+            reopened = PostgresDatabase(database_url, min_size=0, max_size=3)
+            self.addCleanup(reopened.close)
+            next_model = ScriptedModel([ModelResponse(message="Continue with C; publishing is pending")])
+            next_model.model = model.model
+            next_connector = InMemoryMcpConnector(catalogs=connector.catalogs)
+            second = create_app(model=next_model, mcp_connector=next_connector, database=reopened)
+            try:
+                recovery = second.state.core_agent
+                self.assertEqual(recovery.workflow_store.lookup_task("semantic-restart").snapshot["context"], context)
+                with patch.object(next_connector, "call", side_effect=AssertionError("Unexpected redispatch")) as replay:
+                    result = recovery.resume_task("semantic-restart")
+                replay.assert_not_called()
+                self.assertEqual(len(next_model.calls), 1)
+                self.assertIn("Use C", next_model.calls[0].context)
+                self.assertIn("Publishing remains planned only", next_model.calls[0].context)
+                self.assertIn(prompt, next_model.calls[0].context)
+                self.assertEqual((result.usage.model_turns, result.usage.tool_calls), (5, 2))
+                self.assertEqual(result.shared_budget["used"]["model_turns"], 5)
+                self.assertEqual(result.shared_budget["used"]["tool_calls"], 2)
+                restored = recovery.workflow_store.lookup_task("semantic-restart").snapshot["context"]
+                self.assertEqual(restored["transcript"], context["transcript"])
+                self.assertEqual([item for item in restored["active"] if item["pinned"]], pins)
+                self.assertEqual(next(item for item in restored["active"] if item["kind"] == "summary"), summary)
+                _, content = recovery.artifact_store.get("tenant-1", reference["id"])
+                self.assertEqual(content.decode(), next(item["content"] for item in context["transcript"]
+                                                       if item["kind"] == "tool_result"))
+            finally:
+                second.state.close()
+
     def test_coordinated_retention_deletes_run_family_content_and_keeps_tombstone(self):
         database = self._database()
         database.migrate()

@@ -178,6 +178,29 @@ docker build -t core-agent:local .
 `.github/workflows/ci.yml`. Bubblewrap/egress проверяются на Linux и целевом
 кластере; установленный `kubectl` сам по себе не доказывает наличие доступа к нему.
 
+## PostgreSQL recovery семантической summary
+
+- [x] Проследить repeated compaction → outer SQL commit → application/pool
+  restart → model context; сохранить существующий механизм context snapshots.
+- [x] Добавить regression в `tests/test_postgres_persistence.py`: после второй
+  compaction независимое чтение подтверждает commit, затем fault и новая копия
+  app/pool восстанавливают C, planned-only действие, точные pins/transcript и
+  original sources без нового summary provider call или tool redispatch.
+- [x] Targeted proof — 0.775 секунды, exit0. Read-only review без
+  Critical/Important; дополнительная assert root tool count проходит отдельно:
+  0.840 секунды, exit0 (`.local-evidence/postgres-semantic-reviewed.log`).
+- [x] Ordinary PostgreSQL/Keycloak CI — 1636 tests за 276.326 секунды,
+  exit0, три dedicated skips; sync/migrations/Ruff exit0. Full run начат до
+  дополнительной assert, сохранён в `.local-evidence/postgres-semantic-ci-final/`.
+- [x] Обновить CTX-02 и exact spec hash после proof; product code не менялся.
+
+Первый fault внутри `workflow_store.transition` ещё находился в outer transaction
+и правильно откатывал вторую summary. Final proof прерывает `_compact_context`
+после выхода из transaction и проверяет committed snapshot до fault.
+Live model quality, OS kill и restart PostgreSQL daemon этим тестом не заявляются.
+Более широкий release criterion для всех task/memory/file refs и новых Tasks
+остаётся незакрытым; existing PostgreSQL cron proof не заменяется этим тестом.
+
 ## PostgreSQL heartbeat долгих операций
 
 - [x] Проследить heartbeat и durable joined flow: parent освобождает worker/lease,
@@ -248,11 +271,12 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
 
 - Обычный Python3.12 CI на свежей БД/schema24 с настоящими PostgreSQL/Keycloak:
   `uv sync --frozen`, migrations, Ruff и `uv run python -m unittest discover
-  -s tests -v` — 1635 tests, 262.407 секунды, exit0. Три dedicated skips
+  -s tests -v` — 1636 tests, 276.326 секунды, exit0. Три dedicated skips
   относятся к native sandbox, actual browser и memory-loop ownership case;
   PostgreSQL/Keycloak tests не пропущены. Evidence —
-  `.local-evidence/postgres-long-lease-ci-final/`; полный прогон включает
-  ранее уточнённый offload test и новый long-lease proof после review.
+  `.local-evidence/postgres-semantic-ci-final/`; полный прогон включает
+  offload, long-lease и committed semantic recovery proof. Дополнительная assert
+  root tool count после review проверена отдельно: 0.840 секунды, exit0.
   Предыдущие failed runs сохранены:
   remote-import CI выявил необходимость учесть новые CLI ENV в strict startup
   inventory; актуальный список исправлен без ослабления теста. Ранее
@@ -327,7 +351,9 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
   actual amd64/target namespace/network checks. Evidence —
   `.local-evidence/target-csi-recreate/`.
 - Реальный настроенный LLM возвращает HTTP404, Foundation Models embeddings
-  endpoint — HTTP503. Model catalogue доступен, но live provider/embedding
+  endpoint — HTTP503. Повторная проверка 2 октября в 03:13 UTC даёт те же
+  статусы; TLS проверен через системное доверие без отключения проверки.
+  Model catalogue возвращает HTTP200/95 models, но live provider/embedding
   proof не прошёл. Контрактные tests не являются proof качества модели.
 - Незавершённые foundation/migration release criteria остаются `partial`
   в `spec/implementation-status.md`; весь профиль не объявлен production-ready.
