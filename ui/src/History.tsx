@@ -1,3 +1,4 @@
+import { Markdown } from "./Markdown";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
 import { scheduleTime } from "./Schedules";
@@ -269,7 +270,9 @@ function Entry({ api, contextId, item }: { api: Api; contextId?: string; item: H
             ? item.status === "available" && (
                 <p className="muted">Служебная запись агента</p>
               )
-            : item.text && <p className="prose">{item.text}</p>}
+            : item.text && (item.kind === "user_message"
+              ? <p className="prose">{item.text}</p>
+              : <Markdown text={item.text} />)}
         </>
       )}
       {statusLabels[item.status] && (

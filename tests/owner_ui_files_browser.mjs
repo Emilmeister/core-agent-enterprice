@@ -55,7 +55,8 @@ class CDP {
 
 const page=await CDP.page();
 let second;
-const posts=[],requests=new Map(),history=[],tasks=[],receipts=[],outputRequests=[],cancelledDownloads=new Set();
+const posts=[],requests=new Map(),history=[],tasks=[],receipts=[],outputRequests=[],cancelledDownloads=new Set(),untrustedRequests=[];
+page.on('Network.requestWillBeSent',({request})=>{if(new URL(request.url).hostname==='ui-content.invalid')untrustedRequests.push(request.url);});
 const apiResponses=[],dialogs=[];
 const peerSecret='Browser-private-peer-secret-739',schedulePrompt='Browser manual cron in the original chat';
 function observeOwnerAPI(tab){
@@ -246,6 +247,14 @@ try {
     if(available){if(approvals===3)await setLimit(1);await page.click('Разрешить','.interaction:not(.resolved) button');approvals++;await delay(500);}else await delay(200);
   }
   check(await page.evaluate("document.querySelector('.thread')?.textContent.includes('Native file reads completed.')"),'actual native terminal outcome');
+  await page.wait("[...document.querySelectorAll('.markdown h2')].some(h=>h.textContent==='Formatted response') && [...document.querySelectorAll('.diagram img')].some(img=>img.complete&&img.naturalWidth>0)",'actual Markdown and Mermaid result');
+  check(await page.evaluate("!!document.querySelector('.markdown strong') && !!document.querySelector('.markdown table') && document.querySelectorAll('.markdown ul li').length>=2 && !!document.querySelector('.markdown code.language-python')"),'Markdown headings lists tables and fenced code render');
+  await page.wait("[...document.querySelectorAll('.diagram')].some(d=>d.textContent.includes('Не удалось построить диаграмму')&&d.querySelector('details')?.open)",'invalid Mermaid keeps source');
+  check(await page.evaluate("!window.__markdownExecuted && !document.querySelector('.markdown script, .markdown iframe, .markdown a[href^=javascript], .markdown img:not([src^=\"blob:\"])')")&&untrustedRequests.length===0,'untrusted Markdown and Mermaid cannot execute or fetch external images');
+  const diagramURL=await page.evaluate("document.querySelector('.diagram img').src");
+  await page.click('Обновить историю');
+  await page.wait("!document.querySelector('.history-pagination button:disabled')",'history refresh finished');
+  check(await page.evaluate(`document.querySelector('.diagram img')?.src===${JSON.stringify(diagramURL)} && document.querySelector('.diagram img').naturalWidth>0`),'history refresh preserves the rendered Mermaid image');
   check(approvals===4,'actual owner decisions resume both native reads, snapshot selection and source deletion');
   await page.call('Page.reload');
   await page.wait("!!document.querySelector('.chat-link')",'persisted company chat after browser reload');
@@ -342,7 +351,7 @@ try {
   await page.wait("document.querySelector('.thread')?.textContent.includes('Native manual cron completed.')&&document.querySelectorAll('.message .message-attachments:not(.response-files) li').length===3&&document.querySelectorAll('.response-files li').length===2",'full immutable file history after cleanup reload');
   await waitFor(()=>history.at(-1)?.some(item=>item.text==='Native manual cron completed.'),'actual history response after cleanup reload');
   const retained=history.at(-1);
-  check(retained.length===preservedHistory.length&&retained.every((item,index)=>JSON.stringify(item)===JSON.stringify(preservedHistory[index]))&&retained.some(item=>item.text==='Native file reads completed.')&&retained.some(item=>item.text==='Native manual cron completed.'),'browser reload preserves both completed roots and immutable file history after cleanup');
+  check(retained.length===preservedHistory.length&&retained.every((item,index)=>JSON.stringify(item)===JSON.stringify(preservedHistory[index]))&&retained.some(item=>item.text?.startsWith('Native file reads completed.'))&&retained.some(item=>item.text==='Native manual cron completed.'),'browser reload preserves both completed roots and immutable file history after cleanup');
   check(firstTokens.size===3&&secondTokens.size===3,'actual access, refresh and ID tokens captured for both owner tabs');
   const privateValues=[...credentials,peerSecret,'Native immutable output\n',...posts.flatMap(post=>post.parts.map(part=>part.raw).filter(Boolean)),...tasks.flatMap(task=>(task.artifacts??[]).flatMap(artifact=>(artifact.parts??[]).map(part=>part.raw).filter(Boolean)))];
   const storageChecks=await Promise.all([page,second].map(tab=>tab.evaluate(`(()=>{const privateValues=${JSON.stringify(privateValues)};return [localStorage,sessionStorage].every(store=>Array.from({length:store.length},(_,index)=>store.getItem(store.key(index))).every(value=>privateValues.every(secret=>!value.includes(secret))));})()`)));

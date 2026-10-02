@@ -110,7 +110,39 @@ print({marker!r})
                      "q=Path('/workspace/results/empty.txt')\nassert q.read_bytes()==b''\nq.unlink()\n"
                      "assert not p.exists() and not q.exists()\nprint('browser-native-output-deleted')"],
         }),)),
-        ModelResponse(message="Native file reads completed."),
+        ModelResponse(message="""Native file reads completed.
+
+## Formatted response
+
+**Verified** attachment reads.
+
+- first
+- second
+
+| File | Status |
+| --- | --- |
+| report | ready |
+
+```python
+print('ready')
+```
+
+```mermaid
+flowchart LR
+    A[Request] --> B[Answer]
+    click A "https://ui-content.invalid/mermaid"
+```
+
+```mermaid
+flowchart LR
+    A -->
+```
+
+<script>window.__markdownExecuted = true</script>
+<img src="https://ui-content.invalid/html" onerror="window.__markdownExecuted = true">
+![tracking](https://ui-content.invalid/image)
+[unsafe](javascript:alert('unsafe'))
+"""),
         ModelResponse(message="Native manual cron completed."),
     ])
     model.model = "owner-browser-fixture"

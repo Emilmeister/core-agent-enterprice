@@ -8,6 +8,7 @@ import {
 import { Api, ApiError, errorText } from "./api";
 import { Attachments, History, useChatHistory } from "./History";
 import { WorkspaceFiles } from "./WorkspaceFiles";
+import { Markdown } from "./Markdown";
 import {
   remoteProgress,
   byteCount,
@@ -438,7 +439,7 @@ export function Chat({
         {directAnswer && (
           <article className="message result">
             <div className="eyebrow">Core Agent</div>
-            <p className="prose">{directAnswer}</p>
+            <Markdown text={directAnswer} />
           </article>
         )}
         {acceptedReceipt && <div className="accepted-attachments" role="status">

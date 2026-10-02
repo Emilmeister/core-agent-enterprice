@@ -124,8 +124,11 @@ criterion должны войти в тот же завершённый change. 
 
 - `core_agent/` — policy-enforced agent runtime, встроенная память и A2A
   transport.
-- `ui/` — исходники общего owner UI на React/TypeScript/Vite; команды
-  `npm ci`, `npm run typecheck` и `npm run build` выполняются из этой папки
+- `ui/` — исходники общего owner UI на React/TypeScript/Vite.
+  Ответы агента используют `ui/src/Markdown.tsx` (CommonMark/GFM), Mermaid
+  рендерится как статический SVG Blob в image context. Raw HTML и автоматические
+  Markdown images отключены; CSP разрешает blob только для img-src.
+  Команды `npm ci`, `npm run typecheck` и `npm run build` выполняются из этой папки
   с Node.js 24 (минимум 22.12). Production build создаёт ignored `core_agent/ui_dist/`, который
   входит в Python wheel/sdist; Docker собирает его в отдельном Node stage
   на build platform, а Python runtime — на target platform.

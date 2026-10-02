@@ -43,7 +43,7 @@ def ui_routes(settings, *, directory=None):
         "Referrer-Policy": "no-referrer",
         "Content-Security-Policy": (
             "default-src 'none'; script-src 'self'; style-src 'self'; "
-            "img-src 'self'; font-src 'self'; "
+            "img-src 'self' blob:; font-src 'self'; "
             f"connect-src 'self' {origin}; "
             "frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
         ),

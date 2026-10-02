@@ -39,7 +39,7 @@ The official adapter performs standard code flow with PKCE S256. Tokens stay
 in its memory; every private request refreshes first and attaches Authorization.
 `/api/identity` must confirm owner access before private screens mount. Auth
 failure unmounts private state. No localStorage/sessionStorage token handling,
-third-party font/script resources, HTML rendering of model content, or secret
+third-party font/script resources, execution of model HTML, or secret
 values in query parameters are introduced.
 
 References: [official adapter guide](https://www.keycloak.org/securing-apps/javascript-adapter)
@@ -56,6 +56,13 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   download use stored review IDs only.
 - Owner settings, tool mode/exemption/origin/revision and trusted peer registry.
   CAS conflicts require reading current state; credentials are write-only.
+- Agent replies and persisted history render CommonMark/GFM with tables, lists
+  and fenced code through react-markdown. Mermaid blocks load the local bundle
+  on demand and display static SVG Blob images; invalid diagrams keep source.
+  Raw HTML is skipped and Markdown images never load automatically. Mermaid
+  uses strict security, disabled HTML labels and fixed text/edge limits. Its
+  image context cannot execute scripts or access credentials; CSP allows blob
+  only for images. Tool records and owner input remain plain text.
 
 Full chat history, file upload/workspace/result downloads and cron screens are
 not presented as working. No endpoint for them is invented here. Chat labels

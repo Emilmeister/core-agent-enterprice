@@ -62,6 +62,7 @@ class UIStaticTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(directives["connect-src"], "'self' https://identity.test:8443")
             for name in ("script-src", "style-src"):
                 self.assertEqual(directives[name], "'self'")
+            self.assertEqual(directives["img-src"], "'self' blob:")
             for name in ("frame-ancestors", "object-src", "base-uri"):
                 self.assertEqual(directives[name], "'none'")
         head = await client.head("/ui/")
