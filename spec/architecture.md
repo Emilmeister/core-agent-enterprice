@@ -265,6 +265,32 @@ artifact capabilities, отклоняется как `CHECKPOINT_INVALID`, а н
 
 Legacy `REMOTE_AGENTS` и dedicated auth settings импортируются однократно явным migration в owner registry с проверкой target, identity и защищённым хранением header values. Неоднозначный per-agent auth требует operator mapping; входящий credential автоматически не переносится и не проксируется. После cutover UI registry authoritative: рестарт и старое ENV не перезаписывают его, изменения аудируются. Старые values сохраняются защищённо только для согласованного rollback, не в model/transcript/logs.
 
+Явный import выполняет отдельная operator команда `core-agent-db import-remote-agents
+--file /run/secrets/remote-import.json` после schema migration и до запуска serving
+workers. Компания берётся только из deployment `CORE_AGENT_TENANT_ID`; importer
+не угадывает имена или auth из Agent Card, входящего credential или текущего
+`REMOTE_AGENTS`. Operator заранее сопоставляет каждый legacy URL с новым immutable
+именем и точными `header_name`/`header_value` в защищённом JSON-файле version1.
+Формат содержит ровно `version: 1` и непустой `peers` list, максимум100 entries
+и1MiB encoded bytes; поля entry совпадают с owner registry create contract.
+Неизвестная version, duplicate JSON keys, malformed input или invalid peer
+отклоняются до записи. File access/schema/key/DB errors не раскрывают values;
+PostgreSQL error при import возвращает безопасный `REMOTE_IMPORT_FAILED` без
+исходной DB диагностики.
+
+Import допускается только в пустой registry выбранной компании. В одной
+транзакции блокируются competing registry writes, проверяется пустота и создаются
+все current pointers и encrypted revisions1. Ошибка любого entry откатывает весь
+batch. Actor audit получает `migration:<current_user>` из аутентифицированной DB
+сессии; он не выдаётся за verified Keycloak owner. Повторный import, включая import
+после owner edit/delete, возвращает `REMOTE_IMPORT_NOT_EMPTY` без изменений.
+Другие company scopes сохраняются. Serving process не вызывает importer;
+последующий ENV или restart не перезаписывает UI registry. Это migration remote
+configuration, без переназначения legacy Task/chat/file ownership и без сетевого
+discovery, model call или повторного remote dispatch. Stored registry version1 и
+schema24 не меняются; import является новой enterprise mutation, к которой
+применяется общая rollback boundary.
+
 Migration 23→24 добавляет явный `tenant_id` в memory documents, versions и
 repository revisions, их primary keys и namespace index. Неоднозначные прежние
 memory rows сохраняют пустой legacy tenant и остаются недоступны новым

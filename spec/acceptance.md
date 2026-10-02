@@ -357,6 +357,14 @@
 - [ ] Versioned wait/cron/file migration сохраняет deadlines, closed outcomes и visibility; unknown dispatched side effects не replay-ятся.
 - [ ] Перенос входящих files предшествует удалению artifact tools; прежних named artifact данных для переноса нет, отдельный export/import utility не поставляется. Три tools и исключительно их adapters/dependencies/config удалены из приложения без удаления внешних storage resources; устаревшие tool/env настройки диагностируются без вывода values. Owner registry import не перезаписывается ENV после cutover; rollback после enterprise writes требует безопасного reverse migration/backup boundary.
 
+- [ ] Explicit remote registry import использует bounded version1 operator file,
+  deployment company и database-authenticated migration actor; все encrypted peers
+  коммитятся одним batch без discovery/forwarding. Повтор или nonempty registry
+  отклоняются без перезаписи owner edits; invalid/key/duplicate-name/DB failure
+  не оставляет pointers или revisions. Другой tenant и legacy Task/chat ownership
+  не меняются; serving restart/ENV не запускают import. DB error не раскрывает
+  values и возвращает `REMOTE_IMPORT_FAILED`.
+
 ## Enterprise v1: обязательные сценарии
 
 Все ENT-AC ниже входят в текущий release candidate. Перенос критерия не является автоматическим доказательством: статус исполнения фиксируется отдельно в implementation-status.

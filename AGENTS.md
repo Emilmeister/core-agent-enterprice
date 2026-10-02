@@ -168,6 +168,16 @@ Package entrypoints из `pyproject.toml`:
 - `core-agent` → `core_agent.app:main`;
 - `core-agent-db` → `core_agent.database:main`.
 
+`core-agent-db import-remote-agents --file /run/secrets/remote-import.json`
+переносит явно подготовленный version1 JSON в пустой реестр компании из
+`CORE_AGENT_TENANT_ID` после отдельной миграции схемы и до запуска workers.
+Ограниченный batch записывается одной транзакцией с encrypted credentials и
+actor `migration:<database current_user>`; повторный import не заменяет owner
+настройки. Команда использует `DATABASE_MIGRATION_URL` либо operator
+`DATABASE_URL` и прежний `PUSH_NOTIFICATION_ENCRYPTION_KEY`. Serving process
+не переносит legacy ENV автоматически; формат и ограничения задаёт
+`spec/agent-configuration.md`.
+
 ## Карта ключевых implementation-файлов
 
 | Файл | Ответственность |
@@ -182,7 +192,7 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/cron.py` | Company schedule/event stores, CAS/receipts и shared atomic root admission, включая fenced agent tool creation |
 | `core_agent/cron_service.py` | Bounded recovery-driven coordinator, PostgreSQL company leader session и один memory job на ASGI loop |
 | `core_agent/ui.py` | Отдача packaged browser build и точный перечень публичных GET/HEAD assets |
-| `core_agent/remote_registry.py` | Company-scoped immutable peer revisions, CAS, encrypted credentials и безопасные metadata для owner API |
+| `core_agent/remote_registry.py` | Company-scoped immutable peer revisions, CAS, encrypted credentials, безопасные owner metadata и explicit operator batch import |
 | `core_agent/guardrails.py` | Ограниченный classifier без tools, отдельный context и deployment-configured model adapter |
 | `core_agent/material_reviews.py` | Private material decisions, detector budget и атомарная связь с guardrail waits |
 | `core_agent/chat_files.py` | Private file batches, scoped extraction/download, runtime publication barrier, bounded orphan sweep и atomic raw FilePart admission |

@@ -422,6 +422,41 @@ tenant scope памяти; прежние записи сохраняются п
 присваиваются компании автоматически. Возврат старого image требует
 согласованного отката БД из резервной копии.
 
+Если нужно перенести прежние `REMOTE_AGENTS` в настройки владельцев, после
+миграции схемы и до запуска workers подготовьте защищённый JSON-файл:
+
+```json
+{
+  "version": 1,
+  "peers": [{
+    "name": "delivery",
+    "url": "https://peer.example/a2a",
+    "description": "Delivery agent",
+    "enabled": true,
+    "header_name": "Authorization",
+    "header_value": "Bearer replace-with-peer-credential"
+  }]
+}
+```
+
+Явно укажите стабильные имена, URL и точные headers прежних подключений;
+`header_value` можно не передавать, если авторизация не нужна. Храните файл
+как секрет, например с правами `0600`; не добавляйте его в Git. Команда
+использует deployment `CORE_AGENT_TENANT_ID`, operator database URL и тот же
+`PUSH_NOTIFICATION_ENCRYPTION_KEY`, что и serving process:
+
+```bash
+uv run core-agent-db import-remote-agents --file /run/secrets/remote-import.json
+```
+
+Файл ограничен 1 MiB и 100 подключениями. Вся запись атомарна, секреты
+шифруются, stdout содержит только число импортированных агентов. Реестр
+компании должен быть пустым: повторный вызов возвращает
+`REMOTE_IMPORT_NOT_EMPTY` и не заменяет изменения владельцев, в том числе
+отключённые подключения. Реестры других компаний сохраняются. Команда не
+обращается к внешним агентам; startup не импортирует старые ENV автоматически.
+Ownership старых Task, чатов и файлов этим не определяется.
+
 Минимальный вызов через JSON-RPC 1.0:
 
 ```bash

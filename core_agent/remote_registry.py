@@ -1,7 +1,9 @@
 """Company-scoped peer revisions; only trusted adapters may resolve credentials."""
 
 import json
+import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -15,6 +17,8 @@ from .remote_agents import _validate_endpoint
 
 _FIELDS = frozenset({"url", "description", "enabled", "header_name"})
 _METADATA = ("id", "name", "url", "description", "enabled", "header_name", "revision")
+_IMPORT_MAX_BYTES = 1_048_576
+_IMPORT_MAX_PEERS = 100
 _RESERVED_HEADERS = frozenset({
     "host", "content-type", "content-length", "connection", "transfer-encoding",
     "upgrade", "trailer", "te", "proxy-authorization", "accept", "a2a-version",
@@ -23,6 +27,35 @@ _RESERVED_HEADERS = frozenset({
 
 def _invalid():
     return CoreError("REMOTE_AGENT_INVALID")
+
+
+def read_legacy_peer_import(path):
+    """Read explicit operator configuration; never infer credentials or identity."""
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise CoreError("REMOTE_IMPORT_INVALID")
+            value[key] = item
+        return value
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise CoreError("REMOTE_IMPORT_INVALID")
+            raw = stream.read(_IMPORT_MAX_BYTES + 1)
+        if len(raw) > _IMPORT_MAX_BYTES:
+            raise CoreError("REMOTE_IMPORT_INVALID")
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (OSError, ValueError, TypeError, RecursionError):
+        raise CoreError("REMOTE_IMPORT_INVALID") from None
+    if (not isinstance(payload, dict) or set(payload) != {"version", "peers"}
+            or type(payload["version"]) is not int or payload["version"] != 1
+            or not isinstance(payload["peers"], list)
+            or not 1 <= len(payload["peers"]) <= _IMPORT_MAX_PEERS):
+        raise CoreError("REMOTE_IMPORT_INVALID")
+    return payload["peers"]
 
 
 def _text(value, maximum, *, empty=False):
@@ -235,20 +268,36 @@ class PostgresRemoteRegistry:
                                       "description", "enabled", "header_name", "encrypted_payload", "actor_id", "created_at")),
         )
 
-    def create(self, tenant_id, values, *, actor_id):
+    def create(self, tenant_id, values, *, actor_id, connection=None):
         _validate(values, create=True)
+        with self.database.pool.connection() if connection is None else nullcontext(connection) as connection:
+            with connection.transaction():
+                row = _new_row(self._cipher, tenant_id, str(uuid.uuid4()), values, actor_id=actor_id,
+                               now=self._now(connection))
+                inserted = connection.execute(
+                    """INSERT INTO core_remote_agents (tenant_id, id, name, revision)
+                       VALUES (%s, %s, %s, 1) ON CONFLICT DO NOTHING RETURNING id""",
+                    (tenant_id, row["id"], row["name"]),
+                ).fetchone()
+                if inserted is None:
+                    raise CoreError("REMOTE_AGENT_CONFLICT")
+                self._insert_revision(connection, row)
+                return _metadata(row)
+
+    def import_legacy(self, tenant_id, entries):
+        """One explicit migration into an empty company registry, all or none."""
+        if not isinstance(entries, list) or not 1 <= len(entries) <= _IMPORT_MAX_PEERS:
+            raise CoreError("REMOTE_IMPORT_INVALID")
+        for values in entries:
+            _validate(values, create=True)
         with self.database.transaction() as connection:
-            row = _new_row(self._cipher, tenant_id, str(uuid.uuid4()), values, actor_id=actor_id,
-                           now=self._now(connection))
-            inserted = connection.execute(
-                """INSERT INTO core_remote_agents (tenant_id, id, name, revision)
-                   VALUES (%s, %s, %s, 1) ON CONFLICT DO NOTHING RETURNING id""",
-                (tenant_id, row["id"], row["name"]),
-            ).fetchone()
-            if inserted is None:
-                raise CoreError("REMOTE_AGENT_CONFLICT")
-            self._insert_revision(connection, row)
-            return _metadata(row)
+            # ponytail: a bounded, one-time import locks all registry writes; run before workers.
+            connection.execute("LOCK TABLE core_remote_agents IN SHARE ROW EXCLUSIVE MODE")
+            if connection.execute("SELECT id FROM core_remote_agents WHERE tenant_id = %s LIMIT 1",
+                                  (tenant_id,)).fetchone() is not None:
+                raise CoreError("REMOTE_IMPORT_NOT_EMPTY")
+            actor = "migration:" + connection.execute("SELECT current_user AS actor").fetchone()["actor"]
+            return [self.create(tenant_id, values, actor_id=actor, connection=connection) for values in entries]
 
     @staticmethod
     def _now(connection):

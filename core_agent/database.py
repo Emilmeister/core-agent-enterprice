@@ -12,6 +12,7 @@ from a2a.types import a2a_pb2
 from a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
 from a2a.utils.errors import InvalidParamsError
 from a2a.utils.task import decode_page_token, encode_page_token
+from psycopg import Error as PostgresError
 from psycopg.rows import dict_row
 from psycopg.sql import SQL, Identifier
 from psycopg.types.json import Jsonb
@@ -1555,11 +1556,21 @@ class PostgresTaskStore(TaskStore):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Manage core-agent PostgreSQL schema")
+    parser = argparse.ArgumentParser(description="Manage core-agent PostgreSQL schema and explicit remote import")
     parser.add_argument(
-        "command", nargs="?", default="migrate", choices=("migrate", "check")
+        "command", nargs="?", default="migrate", choices=("migrate", "check", "import-remote-agents")
     )
+    parser.add_argument("--file", help="Protected version1 remote import JSON file")
     args = parser.parse_args(argv)
+    if (args.command == "import-remote-agents") != (args.file is not None):
+        parser.error("--file is required only for import-remote-agents")
+    if args.command == "import-remote-agents":
+        from .remote_registry import PostgresRemoteRegistry, read_legacy_peer_import
+
+        tenant = os.getenv("CORE_AGENT_TENANT_ID", "")
+        if not tenant.strip():
+            raise CoreError("CONFIG_INVALID", "CORE_AGENT_TENANT_ID is required for operator import")
+        entries = read_legacy_peer_import(args.file)
     database = PostgresDatabase.from_environment(
         os.getenv("DATABASE_MIGRATION_URL") or os.getenv("DATABASE_URL", "")
     )
@@ -1570,6 +1581,14 @@ def main(argv=None):
                 database.grant_application_role(os.environ["DATABASE_APP_ROLE"])
         else:
             database.verify_schema()
+            if args.command == "import-remote-agents":
+                registry = PostgresRemoteRegistry(database, os.getenv("PUSH_NOTIFICATION_ENCRYPTION_KEY"))
+                imported = registry.import_legacy(tenant, entries)
+                print(f"Imported {len(imported)} remote agents")
+    except PostgresError:
+        if args.command == "import-remote-agents":
+            raise CoreError("REMOTE_IMPORT_FAILED") from None
+        raise
     finally:
         database.close()
 

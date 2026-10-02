@@ -178,6 +178,30 @@ docker build -t core-agent:local .
 `.github/workflows/ci.yml`. Bubblewrap/egress проверяются на Linux и целевом
 кластере; установленный `kubectl` сам по себе не доказывает наличие доступа к нему.
 
+## Явный перенос remote configuration
+
+- [x] Уточнить operator-only import в architecture/config/acceptance: version1
+  bounded file, deployment tenant, empty registry, atomic encrypted batch,
+  database migration actor, отказ повторного import без overwrite; schema24
+  сохраняется, server startup и legacy ownership не изменяются.
+- [x] Добавить regression в `tests/test_remote_registry.py` для actual CLI,
+  PostgreSQL rollback при duplicate/key failure, nonempty registry после UI edit
+  и malformed input без раскрытия values; выполнить red-phase существующим uv unittest.
+- [x] Переиспользовать `PostgresRemoteRegistry.create` с borrowed transaction для
+  batch import; добавить CLI/file parser в existing modules без новых dependencies.
+- [x] Обновить README/AGENTS с operator workflow и выполнить targeted registry
+  tests, Ruff и полный PostgreSQL/Keycloak suite; proof остаётся partial для
+  ещё не реализованного identity mapping/production cutover.
+- [x] Зафиксировать проверенный implementation commit и обновить evidence matrix.
+
+Actual CLI red-phase подтвердил отсутствие команды. Review отдельно выявил
+raw PostgreSQL diagnostic: real SQL error на втором peer воспроизводит canary
+до safe wrapper; после исправления diagnostic скрыт и batch полностью откатывается.
+Targeted suite — 52 tests, exit0; final ordinary PostgreSQL/Keycloak CI и
+`uv build --no-sources` проходят. Evidence —
+`.local-evidence/remote-import-ci-reviewed-final/` и
+`.local-evidence/remote-import-review-green-final.log`.
+
 ## Готовность к поставке
 
 Текущий срез включает owner UI, Keycloak scope, per-tool HITL/guardrails policy,
@@ -191,10 +215,12 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
 
 - Обычный Python3.12 CI на свежей БД/schema24 с настоящими PostgreSQL/Keycloak:
   `uv sync --frozen`, migrations, Ruff и `uv run python -m unittest discover
-  -s tests -v` — 1628 tests, 262.659 секунды, exit0. Три dedicated skips
+  -s tests -v` — 1633 tests, 256.352 секунды, exit0. Три dedicated skips
   относятся к native sandbox, actual browser и memory-loop ownership case;
   PostgreSQL/Keycloak tests не пропущены. Evidence —
-  `.local-evidence/backup-ci-final/`. Предыдущий failed run сохранён:
+  `.local-evidence/remote-import-ci-reviewed-final/`. Предыдущие failed runs сохранены:
+  remote-import CI выявил необходимость учесть новые CLI ENV в strict startup
+  inventory; актуальный список исправлен без ослабления теста. Ранее
   тест summary пересекался с legitimate detector_busy из background tool.
   Для этого отдельного теста terminal помечен guardrails-exempt; production
   single-slot и owner decision при busy не изменены. 100 повторений проходят.
@@ -206,8 +232,10 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
   после удаления схемы и файлов; сохраняются deadlines, outcomes, scope и
   encrypted peer с прежним ключом. Проверены обратная schema version и повторный
   upgrade; в fixture нет новых application writes после backup. CI использует
-  dump/restore utilities своего PostgreSQL service. Operator mapping/import и
-  production cutover остаются отдельными open gates.
+  dump/restore utilities своего PostgreSQL service. Explicit remote config import
+  проверяет atomic encrypted batch/database actor, отказ overwrite UI edits/disable,
+  safe DB error и rollback; Task/chat identity mapping и production cutover
+  остаются отдельными open gates.
 - Combined release boundary module входит в ordinary discovery: cron после двух
   compactions, omitted summary vs authoritative policy/waits, оба remote
   input/auth-required bindings с follow-up после PG restart, manual/automatic

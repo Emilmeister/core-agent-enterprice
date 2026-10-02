@@ -95,6 +95,7 @@ _CONSULTED_VARIABLES = set()
 # one it never looked at, which is the opposite of what the operator needs.
 _EXTERNAL_VARIABLES = frozenset(
     {
+        "CORE_AGENT_TENANT_ID",
         "DATABASE_APP_ROLE",
         "DATABASE_CONNECT_TIMEOUT_SECONDS",
         "DATABASE_MIGRATION_URL",
@@ -111,6 +112,7 @@ _EXTERNAL_VARIABLES = frozenset(
         "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
         "OTEL_PROJECT_NAME",
         "OTEL_SERVICE_NAME",
+        "PUSH_NOTIFICATION_ENCRYPTION_KEY",
     }
 )
 

@@ -1,13 +1,44 @@
+import io
+import json
 import os
+import tempfile
 import threading
+import traceback
 import unittest
 import uuid
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from core_agent.database import PostgresDatabase
+from core_agent.database import PostgresDatabase, main as database_main
 from core_agent.errors import CoreError
 from core_agent.remote_registry import InMemoryRemoteRegistry, PostgresRemoteRegistry
+
+
+class LegacyRemoteImportFileTests(unittest.TestCase):
+    def test_file_rejects_ambiguous_unbounded_or_malformed_values_without_leaking_secrets(self):
+        from core_agent.remote_registry import read_legacy_peer_import
+
+        invalid = [b'{"secret":"FILE_PRIVATE"', b'\xffFILE_PRIVATE',
+                   b'{"version":1,"version":1,"peers":[{}]}',
+                   b'{"version":true,"peers":[{}]}', b'{"version":2,"peers":[{}]}',
+                   b'{"version":1,"peers":[]}', b'{"version":1,"peers":[{}],"extra":"FILE_PRIVATE"}',
+                   json.dumps({"version": 1, "peers": [{}] * 101}).encode(),
+                   b" " * 1_048_576 + b"{}", b"[" * 1500 + b"0" + b"]" * 1500]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "import.json"
+            for number, raw in enumerate(invalid):
+                with self.subTest(case=number):
+                    path.write_bytes(raw)
+                    with self.assertRaises(CoreError) as error:
+                        read_legacy_peer_import(path)
+                    self.assertEqual(error.exception.code, "REMOTE_IMPORT_INVALID")
+                    self.assertNotIn("FILE_PRIVATE", str(error.exception))
+            with self.assertRaises(CoreError) as error:
+                read_legacy_peer_import(folder)
+            self.assertEqual(error.exception.code, "REMOTE_IMPORT_INVALID")
 
 
 class RemoteRegistryContract:
@@ -284,6 +315,98 @@ class PostgresRemoteRegistryTests(RemoteRegistryContract, unittest.TestCase):
         self.database.migrate()
         self.store = PostgresRemoteRegistry(self.database, self.key)
 
+    def import_cli(self, entries):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "peers.json"
+            path.write_text(json.dumps({"version": 1, "peers": entries}))
+            path.chmod(0o600)
+            environment = {"DATABASE_MIGRATION_URL": os.environ["TEST_DATABASE_URL"],
+                           "CORE_AGENT_TENANT_ID": self.tenant,
+                           "PUSH_NOTIFICATION_ENCRYPTION_KEY": self.key.decode()}
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as output:
+                database_main(["import-remote-agents", "--file", str(path)])
+            return output.getvalue()
+
+    def test_explicit_import_cli_encrypts_batch_and_audits_database_actor(self):
+        other_tenant = self.tenant + "other"
+        other_peer = self.store.create(other_tenant, self.values(name="one", header_value="OTHER_PRIVATE"),
+                                       actor_id="other-owner")
+        entries = [self.values(name="one", header_name="X-Api-Key", header_value="IMPORT_PRIVATE"),
+                   self.values(name="two", url="https://two.example/a2a", enabled=False)]
+        with patch("core_agent.remote_agents.RemoteAgentRegistry.connect",
+                   side_effect=AssertionError("Import must not contact peer agents")):
+            summary = self.import_cli(entries)
+        self.assertEqual(summary, "Imported 2 remote agents\n")
+        peers = {peer["name"]: peer for peer in self.store.list(self.tenant)}
+        self.assertEqual(set(peers), {"one", "two"})
+        self.assertEqual(peers["one"]["revision"], 1)
+        self.assertFalse(peers["two"]["enabled"])
+        self.assertNotIn("IMPORT_PRIVATE", summary + repr(peers))
+        self.assertEqual(self.store.resolve_headers(self.tenant, peers["one"]["id"], 1),
+                         {"X-Api-Key": "IMPORT_PRIVATE"})
+        self.assertEqual(self.store.list(other_tenant), [other_peer])
+        self.assertEqual(self.store.resolve_headers(other_tenant, other_peer["id"], 1),
+                         {"Authorization": "OTHER_PRIVATE"})
+        with self.database.pool.connection() as connection:
+            actor = "migration:" + connection.execute("SELECT current_user AS actor").fetchone()["actor"]
+        self.assertEqual(self.raw(peers["one"]["id"], 1)["actor_id"], actor)
+        self.assertNotIn(b"IMPORT_PRIVATE", bytes(self.raw(peers["one"]["id"], 1)["encrypted_payload"]))
+
+    def test_import_refuses_owner_edits_and_does_not_import_legacy_environment(self):
+        original = self.values(header_value="IMPORT_PRIVATE")
+        self.import_cli([original])
+        peer = self.store.list(self.tenant)[0]
+        edited = self.update(peer, url="https://edited.example/a2a", header_value="UI_PRIVATE")
+        with patch.dict(os.environ, {"REMOTE_AGENTS": "https://old.example/a2a", "SEND_MESSAGE_API_KEY": "OLD_PRIVATE"}):
+            with self.assertRaises(CoreError) as error:
+                self.import_cli([original])
+        self.assertEqual(error.exception.code, "REMOTE_IMPORT_NOT_EMPTY")
+        reopened = PostgresRemoteRegistry(self.database, self.key)
+        self.assertEqual(reopened.list(self.tenant), [edited])
+        self.assertEqual(reopened.resolve_headers(self.tenant, peer["id"], 2),
+                         {"Authorization": "UI_PRIVATE"})
+        self.assertEqual(reopened.get_revision(self.tenant, peer["id"], 1)["revision"], 1)
+        self.store.disable(self.tenant, peer["id"], expected_revision=2, actor_id="owner")
+        with self.assertRaises(CoreError) as error:
+            self.import_cli([original])
+        self.assertEqual(error.exception.code, "REMOTE_IMPORT_NOT_EMPTY")
+
+    def test_import_rolls_back_pointers_and_revisions_after_duplicate_or_missing_key(self):
+        for entries, key, code in (
+            ([self.values(), self.values()], self.key, "REMOTE_AGENT_CONFLICT"),
+            ([self.values(), self.values(name="secret", header_value="IMPORT_PRIVATE")], None,
+             "REMOTE_AGENT_CREDENTIAL_UNAVAILABLE"),
+        ):
+            with self.subTest(error=code):
+                store = PostgresRemoteRegistry(self.database, key)
+                with self.assertRaises(CoreError) as error:
+                    store.import_legacy(self.tenant, entries)
+                self.assertEqual(error.exception.code, code)
+                self.assertEqual(self.store.list(self.tenant), [])
+                with self.database.pool.connection() as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT count(*) AS n FROM core_remote_agent_revisions WHERE tenant_id = %s",
+                        (self.tenant,)).fetchone()["n"], 0)
+
+    def test_import_database_error_is_safe_and_rolls_back_batch(self):
+        insert = PostgresRemoteRegistry._insert_revision
+
+        def fail_second_revision(connection, row):
+            if row["name"] == "two":
+                connection.execute("SELECT %s::integer", ("IMPORT_DB_PRIVATE",))
+            insert(connection, row)
+
+        with patch.object(PostgresRemoteRegistry, "_insert_revision", side_effect=fail_second_revision):
+            with self.assertRaises(CoreError) as error:
+                self.import_cli([self.values(name="one"), self.values(name="two")])
+        self.assertEqual(error.exception.code, "REMOTE_IMPORT_FAILED")
+        self.assertNotIn("IMPORT_DB_PRIVATE", "".join(traceback.format_exception(error.exception)))
+        self.assertEqual(self.store.list(self.tenant), [])
+        with self.database.pool.connection() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT count(*) AS n FROM core_remote_agent_revisions WHERE tenant_id = %s",
+                (self.tenant,)).fetchone()["n"], 0)
+
     def raw(self, peer_id, revision):
         with self.database.pool.connection() as connection:
             return connection.execute("SELECT * FROM core_remote_agent_revisions WHERE tenant_id = %s AND id = %s AND revision = %s",
@@ -318,4 +441,3 @@ class PostgresRemoteRegistryTests(RemoteRegistryContract, unittest.TestCase):
         with self.assertRaises(CoreError) as error:
             wrong.resolve_headers(self.tenant, peer["id"], 1)
         self.assertEqual(error.exception.code, "REMOTE_AGENT_CREDENTIAL_UNAVAILABLE")
-

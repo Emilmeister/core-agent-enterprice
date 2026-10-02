@@ -207,6 +207,14 @@ storage/dispatch без persistent key запрещён, даже в development
 
 `REMOTE_AGENTS`, прежние retry-настройки и `SEND_MESSAGE_API_KEY` являются legacy configuration для явного migration, а не конкурирующим live источником. Сохранённый owner registry становится authoritative после подтверждённого импорта; incoming credential forwarding удалён. Правила import/rollback определены в [Архитектуре](architecture.md).
 
+Operator import получает прежние URL/auth через явно подготовленный version1
+JSON-файл `core-agent-db import-remote-agents --file ...`; live startup не читает
+его. Требуются `CORE_AGENT_TENANT_ID`, подходящий `DATABASE_MIGRATION_URL` либо
+явный operator `DATABASE_URL` и существующий `PUSH_NOTIFICATION_ENCRYPTION_KEY`
+для любых credential-bearing entries. Новые defaults или префиксы не добавляются
+к header value автоматически. Command summary содержит только число imported
+entries; file и values защищаются operator-ом как secrets.
+
 ### A2A и streaming
 
 | Переменная | По умолчанию | Семантика |
