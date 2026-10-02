@@ -308,6 +308,9 @@ A2A protocol version. При чтении результата, записанн
 - `pause` запрещает новые model/tools после ближайшей безопасной границы и создаёт checkpoint.
 - Worker MUST регулярно обновлять lease, в том числе во время долгого model/tool
   call и joined delegation; только владелец актуального lease изменяет run.
+  Durable joined ожидание освобождает parent worker и его compute lease;
+  heartbeat сохраняет lease выполняющего child, а parent возобновляется
+  с новым fenced lease после durable результата child.
 - Recovery MUST пропускать workflow с ещё действующим lease и само получать
   новый fenced lease перед reconciliation; совпадение worker ID не разрешает
   заменить живой token. Истёкший token не может быть продлён или записать

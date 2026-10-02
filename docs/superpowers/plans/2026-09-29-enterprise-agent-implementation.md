@@ -178,6 +178,23 @@ docker build -t core-agent:local .
 `.github/workflows/ci.yml`. Bubblewrap/egress проверяются на Linux и целевом
 кластере; установленный `kubectl` сам по себе не доказывает наличие доступа к нему.
 
+## PostgreSQL heartbeat долгих операций
+
+- [x] Проследить heartbeat и durable joined flow: parent освобождает worker/lease,
+  активный child сохраняет fenced ownership, coordinator разрешает parent wait.
+- [x] Добавить ordinary regression в `tests/test_postgres_persistence.py` для
+  долгих model/MCP-tool/joined-child операций. Настоящий server-clock expiry
+  превышен, lease продлён с прежним owner/token; независимый pool не получает
+  claim и не включает активный run в recovery. Parent продолжает работу с одним child.
+- [x] Targeted test — 8.154 секунды, exit0; read-only review без замечаний.
+- [x] Полный ordinary CI на свежей PostgreSQL БД с настоящим Keycloak:
+  sync/migrations/Ruff, 1635 tests за 262.407 секунды, exit0, три dedicated skips.
+  Evidence — `.local-evidence/postgres-long-lease-ci-final/`.
+- [x] Связать proof с RUN-02/release criterion и обновить exact spec hashes.
+
+Model/MCP контролируются тестом; этот proof проверяет PostgreSQL ownership,
+а не native sandbox или доступность production providers. Product code не менялся.
+
 ## PostgreSQL durability большого результата инструмента
 
 - [x] Проследить actual tool dispatch → full artifact/excerpt → tool.completed
@@ -231,11 +248,12 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
 
 - Обычный Python3.12 CI на свежей БД/schema24 с настоящими PostgreSQL/Keycloak:
   `uv sync --frozen`, migrations, Ruff и `uv run python -m unittest discover
-  -s tests -v` — 1634 tests, 260.004 секунды, exit0. Три dedicated skips
+  -s tests -v` — 1635 tests, 262.407 секунды, exit0. Три dedicated skips
   относятся к native sandbox, actual browser и memory-loop ownership case;
   PostgreSQL/Keycloak tests не пропущены. Evidence —
-  `.local-evidence/offload-postgres-ci-final/`; уточнённый test после review
-  отдельно проходит. Предыдущие failed runs сохранены:
+  `.local-evidence/postgres-long-lease-ci-final/`; полный прогон включает
+  ранее уточнённый offload test и новый long-lease proof после review.
+  Предыдущие failed runs сохранены:
   remote-import CI выявил необходимость учесть новые CLI ENV в strict startup
   inventory; актуальный список исправлен без ослабления теста. Ранее
   тест summary пересекался с legitimate detector_busy из background tool.

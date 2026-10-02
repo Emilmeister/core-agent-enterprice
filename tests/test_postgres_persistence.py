@@ -39,7 +39,7 @@ from core_agent.push import (
 )
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.lifecycle import PostgresRetentionManager
-from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, WorkflowRecord
+from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, SuspendedRun, WorkflowRecord
 from psycopg.types.json import Jsonb
 
 
@@ -1854,6 +1854,128 @@ class PostgresRestartTests(unittest.TestCase):
             self.assertEqual(workflows.lookup_task(record.task_id).state, "RUNNING")
         finally:
             database.close()
+
+    def test_long_model_tool_and_join_preserve_live_postgres_ownership(self):
+        database_url = os.environ["TEST_DATABASE_URL"]
+        for mode in ("model", "tool", "join"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
+                started, release = threading.Event(), threading.Event()
+                database = PostgresDatabase(database_url, min_size=0, max_size=3)
+                self.addCleanup(database.close)
+                database.migrate()
+                self._reset(database)
+                contender_db = PostgresDatabase(database_url, min_size=0, max_size=1)
+                self.addCleanup(contender_db.close)
+                contender = PostgresWorkflowStore(contender_db)
+
+                def block():
+                    started.set()
+                    if not release.wait(10):
+                        raise AssertionError("The controlled long operation was not released")
+
+                class BlockingConnector(InMemoryMcpConnector):
+                    def call(self, server, tool, arguments):
+                        block()
+                        return {"completed": True}
+
+                class BlockingModel(ScriptedModel):
+                    def generate(self, **kwargs):
+                        response = super().generate(**kwargs)
+                        if mode == "model" or (mode == "join" and response.message == "child done"):
+                            block()
+                        return response
+
+                responses = [ModelResponse(message="done")]
+                if mode == "tool":
+                    responses.insert(0, ModelResponse(tool_requests=(ToolRequest("slow-tool", "docs_search", {}),)))
+                elif mode == "join":
+                    responses = [ModelResponse(tool_requests=(ToolRequest("join", "core_delegate", {
+                        "instruction": "Return child done", "tools": [], "skills": [],
+                        "budget": {"turns": 2, "tool_calls": 1}}),)),
+                        ModelResponse(message="child done"), ModelResponse(message="done")]
+                model = BlockingModel(responses)
+                model.model = "postgres-heartbeat-model"
+                connector = BlockingConnector(catalogs={"docs": {"search": {"type": "object"}}})
+                with patch.dict(os.environ, {
+                    "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+                    "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+                    "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/durable",
+                    "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "MCP_URL": "https://peer.test/docs",
+                    "MCP_ALLOWED_SERVERS": "docs", "MCP_ALLOWED_TOOLS": "docs.search",
+                    "MCP_READ_ONLY_TOOLS": "docs.search", "LOG_LEVEL": "ERROR",
+                }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()), \
+                        patch("core_agent.runtime.WORKFLOW_LEASE_TTL", 2), \
+                        patch("core_agent.runtime.WORKFLOW_LEASE_HEARTBEAT_INTERVAL", 0.1):
+                    app = create_app(model=model, mcp_connector=connector, database=database)
+                    agent = app.state.core_agent
+                    task_id = "long-" + mode
+                    results, failures = [], []
+
+                    def run():
+                        try:
+                            results.append(agent.run({"prompt": "Complete the long operation"},
+                                task_id=task_id, identity="owner-1", session_id="heartbeat-chat", tenant_id="tenant-1"))
+                        except BaseException as error:
+                            failures.append(error)
+
+                    worker = threading.Thread(target=run)
+                    try:
+                        worker.start()
+                        self.assertTrue(started.wait(5))
+                        parent = agent.workflow_store.lookup_task(task_id)
+                        active = parent
+                        if mode == "join":
+                            worker.join(2)
+                            self.assertFalse(worker.is_alive())
+                            self.assertEqual(failures, [])
+                            self.assertIsInstance(results[0], SuspendedRun)
+                            wait = agent.workflow_store.get_wait(results[0].wait_id, tenant_id="tenant-1")
+                            active = agent.workflow_store.lookup_task(wait.subject["task_id"])
+                            with contender_db.pool.connection() as connection:
+                                sleeping = connection.execute(
+                                    "SELECT state, lease_token FROM core_runs WHERE run_id = %s", (parent.run_id,)).fetchone()
+                            self.assertEqual(sleeping["state"], "WAITING_TASK")
+                            self.assertIsNone(sleeping["lease_token"])
+                        with contender_db.pool.connection() as connection:
+                            initial = connection.execute("""SELECT lease_owner, lease_token, lease_expires_at,
+                                EXTRACT(EPOCH FROM clock_timestamp())::double precision AS server_now
+                                FROM core_runs WHERE run_id = %s""", (active.run_id,)).fetchone()
+                        self.assertFalse(release.wait(max(0, initial["lease_expires_at"] - initial["server_now"]) + 0.2))
+                        with contender_db.pool.connection() as connection:
+                            current = connection.execute("""SELECT lease_owner, lease_token, lease_expires_at,
+                                EXTRACT(EPOCH FROM clock_timestamp())::double precision AS server_now
+                                FROM core_runs WHERE run_id = %s""", (active.run_id,)).fetchone()
+                        self.assertGreater(current["server_now"], initial["lease_expires_at"])
+                        self.assertGreater(current["lease_expires_at"], current["server_now"])
+                        self.assertEqual((current["lease_owner"], current["lease_token"]),
+                                         (initial["lease_owner"], initial["lease_token"]))
+                        with self.assertRaises(CoreError) as rejected:
+                            contender.acquire_lease(active.run_id, tenant_id="tenant-1", owner_id=active.owner_id,
+                                                    worker_id="contender", ttl=2)
+                        self.assertEqual(rejected.exception.code, "LEASE_LOST")
+                        self.assertNotIn(active.run_id, {record.run_id for record in contender.recoverable()})
+                        release.set()
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive())
+                        self.assertEqual(failures, [])
+                        if mode == "join":
+                            child = agent.task_scheduler.wait(active.task_id, timeout=5,
+                                owner_id=parent.run_id, tenant_id="tenant-1")
+                            self.assertEqual(child.state, "completed", child.error)
+                            with patch.object(agent, "_launch_recovery", return_value=False):
+                                agent._recover_workflows_once()
+                            result = agent.resume_task(task_id)
+                            self.assertEqual(agent.task_scheduler.count(owner_id=parent.run_id, tenant_id="tenant-1"), 1)
+                        else:
+                            result = results[0]
+                        self.assertEqual(result.message, "done")
+                        self.assertEqual(agent.workflow_store.lookup_task(task_id).state, "COMPLETED")
+                    finally:
+                        release.set()
+                        if worker.ident is not None:
+                            worker.join(5)
+                        app.state.close()
+                        contender_db.close()
 
     def test_workflow_lease_acquire_and_recovery_use_database_clock(self):
         database = self._database()
