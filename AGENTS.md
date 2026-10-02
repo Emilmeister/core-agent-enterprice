@@ -158,6 +158,10 @@ criterion должны войти в тот же завершённый change. 
   dropped capabilities и конечные CPU/memory/PID limits. Native CI запускает
   реальный composition-root terminal/Python/background test через Compose;
   профиль inner commands остаётся отдельным и обязательным.
+- `deploy/kubernetes/apparmor/` — именованный outer профиль trusted supervisor
+  и инструкция для hosts с AppArmor namespace restrictions. Operator заранее
+  загружает профиль на eligible nodes; running agent не получает MAC_ADMIN.
+  CSI workaround TUN не отключает Pod user namespaces и отделён от chat volume.
 - `third_party/skills/` — закреплённые пакеты навыков, происхождение, лицензии и
   контрольные суммы для образа.
 - `.env.example` — поддерживаемый шаблон локальной конфигурации; `.env` никогда

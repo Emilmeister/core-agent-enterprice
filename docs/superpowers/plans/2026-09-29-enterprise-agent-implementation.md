@@ -396,6 +396,8 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
   `core-agent-runtime-v1` установлен в enforce; existing profiles не заменялись.
   Installer завершился exit0, его временный namespace удалён. Evidence —
   `.local-evidence/target-apparmor-install/applied.json`.
+  Проверенный source сохранён в `deploy/kubernetes/apparmor/` вместе с
+  требованиями host installation, reboot/replacement и CSI TUN workaround.
   На exact amd64 digest commit7e6cf59 прошли 10 native tests за 99.007 секунды:
   actual app terminal/Python/background, nested HITL, namespace/files/FD,
   inner seccomp, rlimits, teardown, bootstrap/exec failure и scoped broker.
