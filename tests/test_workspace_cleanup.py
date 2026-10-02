@@ -562,6 +562,51 @@ class WorkspaceCleanupTests(AuthAppTestCase):
         self.assertEqual(await asyncio.to_thread(self.service.recover, 1), 1)
         self.assertTrue(self.service.preview_state(self.binding)["cleanup_pending"])
 
+    async def test_company_scope_precedes_recovery_cursor_and_batch_limit(self):
+        files = self.selection("file")
+        with patch("core_agent.workspace_cleanup.uuid.uuid4", return_value=uuid.UUID(int=2)), \
+                patch.object(self.service, "_execute", side_effect=Crash), self.assertRaises(Crash):
+            await self.delete(files)
+        foreign_tenant = str(uuid.uuid4())
+        foreign_operation = str(uuid.UUID(int=1))
+        if self.service.database:
+            database = self.service.database
+            def cleanup_foreign():
+                with database.transaction() as connection:
+                    connection.execute("DELETE FROM core_workspace_cleanups WHERE tenant_id=%s", (foreign_tenant,))
+                    connection.execute("DELETE FROM core_chats WHERE tenant_id=%s", (foreign_tenant,))
+            self.addCleanup(cleanup_foreign)
+            with database.transaction() as connection:
+                connection.execute("INSERT INTO core_chats (tenant_id,context_id,owner_id) VALUES (%s,'foreign-context',%s)",
+                                   (foreign_tenant, self.binding.owner_id))
+                connection.execute("""INSERT INTO core_workspace_cleanups
+                    (tenant_id,context_id,owner_id,request_id,operation_id,actor_id,storage_version,
+                     request_digest,selection,base_revision,workspace_revision,state,results)
+                    SELECT %s,'foreign-context',owner_id,'foreign',%s,actor_id,storage_version,
+                           request_digest,selection,base_revision,workspace_revision,state,results
+                    FROM core_workspace_cleanups WHERE tenant_id=%s AND request_id='request'""",
+                    (foreign_tenant, foreign_operation, self.binding.tenant_id))
+                foreign = connection.execute("SELECT * FROM core_workspace_cleanups WHERE tenant_id=%s", (foreign_tenant,)).fetchone()
+        else:
+            foreign = copy.deepcopy(next(iter(self.admission._workspace_cleanups.values())))
+            foreign.update(tenant_id=foreign_tenant, context_id="foreign-context", request_id="foreign",
+                           operation_id=foreign_operation)
+            self.admission._workspace_cleanups["foreign"] = foreign
+        with patch.object(self.service, "_execute") as execute:
+            self.assertEqual(self.service.recover(limit=1, tenant_id=self.binding.tenant_id), 1)
+            execute.assert_called_once_with(self.binding.tenant_id, self.binding.context_id, "request")
+            self.assertEqual(foreign["state"], "pending")
+            execute.reset_mock()
+            self.assertEqual(self.service.recover(limit=1, tenant_id=self.binding.tenant_id), 1)
+            execute.assert_called_once_with(self.binding.tenant_id, self.binding.context_id, "request")
+            if self.service.database:
+                with database.pool.connection() as connection:
+                    self.assertEqual(connection.execute("SELECT * FROM core_workspace_cleanups WHERE tenant_id=%s", (foreign_tenant,)).fetchone(), foreign)
+            execute.reset_mock()
+            self.service._recovery_after = ""
+            self.assertEqual(self.service.recover(limit=1), 1)
+            execute.assert_called_once_with(foreign_tenant, "foreign-context", "foreign")
+
     async def test_impossible_completed_receipt_does_not_release_admission_barrier(self):
         files = self.selection("file")
         rename = __import__("core_agent.workspace_cleanup", fromlist=["_rename"])._rename

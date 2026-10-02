@@ -365,6 +365,10 @@ Snapshot содержит versions/digests profile prompt, kernel policy packs, 
 - Conflict MUST возвращать path и безопасную причину.
 - Infrastructure/model/budget snapshot меняется только для новой Task. Owner tool policy и guardrails exceptions применяются к последующим calls активных Tasks внутри immutable ceiling; они не прерывают уже dispatched call. Новое разрешение не восстанавливает закрытое ожидание и не автоматически одобряет ожидающий HITL.
 - Agent Card генерируется из Effective AgentConfig и не рекламирует disabled capability.
+- Каждый authenticated GET Agent Card также учитывает текущую owner tool policy
+  компании из проверенной identity. Запрещённые tools не рекламируются на обоих
+  A2A входах и обоих well-known путях; `allow` и `require_hitl` остаются видимыми
+  внутри platform ceiling. Изменение policy не требует перезапуска приложения.
 - Audit/OTel записывают config version/digest без secret values.
 
 ## Границы гибкости

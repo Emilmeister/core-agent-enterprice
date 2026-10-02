@@ -303,6 +303,7 @@ class CoreAgent:
         token_counter=None,
         depth=0,
         workflow_store=None,
+        recovery_tenant_id=None,
         interaction_store=None,
         material_review_store=None,
         guardrail_classifier=None,
@@ -340,6 +341,7 @@ class CoreAgent:
         self.depth = depth
         self._worker_id = str(uuid.uuid4())
         self.workflow_store = workflow_store or InMemoryWorkflowStore()
+        self.recovery_tenant_id = recovery_tenant_id
         self.interaction_store = interaction_store
         if (material_review_store is None) != (guardrail_classifier is None):
             raise CoreError("CONFIG_INVALID", "Material store and classifier must be configured together")
@@ -6754,10 +6756,14 @@ class CoreAgent:
 
     def recover_durable_tasks(self):
         if hasattr(self.task_scheduler, "recover"):
-            return self.task_scheduler.recover(ready=self._task_ready_to_resume)
+            scope = {"tenant_id": self.recovery_tenant_id} if self.recovery_tenant_id is not None else {}
+            return self.task_scheduler.recover(ready=self._task_ready_to_resume,
+                                               **scope)
         return 0
 
     def _task_ready_to_resume(self, task_id, tenant_id):
+        if self.recovery_tenant_id is not None and tenant_id != self.recovery_tenant_id:
+            return False
         try:
             record = self.workflow_store.lookup_task(task_id)
         except CoreError as error:
@@ -6811,6 +6817,8 @@ class CoreAgent:
                     self._recovery_workers.pop(candidate.task_id, None)
 
     def _launch_recovery(self, candidate):
+        if self.recovery_tenant_id is not None and candidate.tenant_id != self.recovery_tenant_id:
+            return False
         with self._recovery_lock:
             if (
                 self._recovery_stop.is_set()
@@ -6829,27 +6837,30 @@ class CoreAgent:
 
     def _recover_workflows_once(self):
         """A run interrupted mid-dispatch cannot prove the side effect did not happen."""
+        scope = {"tenant_id": self.recovery_tenant_id} if self.recovery_tenant_id is not None else {}
         cron = getattr(self, "cron_coordinator", None)
         if cron is not None:
             cron.tick()
         cleanup = getattr(self, "workspace_cleanup", None)
         if cleanup is not None:
             try:
-                cleanup.recover(limit=100)
+                cleanup.recover(limit=100, **scope)
             except Exception as error:
                 # Keep unresolved chat barriers while other workflow recovery proceeds.
                 self._log("workspace.cleanup.scan_failed", error_code=getattr(error, "code", type(error).__name__))
         if self.chat_file_service is not None and time.monotonic() >= self._file_sweep_due:
             while not self._recovery_stop.is_set():
-                result = self.chat_file_service.sweep(startup=self._file_sweep_startup)
+                result = self.chat_file_service.sweep(startup=self._file_sweep_startup,
+                                                     **scope)
                 if not result["has_more"]:
                     self._file_sweep_startup = False
                     self._file_sweep_due = time.monotonic() + 3600
                     break
-        self.workflow_store.expire_waits()
-        self.task_scheduler.expire_remote(limit=100)
+        self.workflow_store.expire_waits(**scope)
+        self.task_scheduler.expire_remote(limit=100, **scope)
         self.recover_durable_tasks()
-        waits = self.workflow_store.pending_waits(kind="task", after=self._task_wait_cursor)
+        waits = self.workflow_store.pending_waits(kind="task", after=self._task_wait_cursor,
+                                                  **scope)
         self._task_wait_cursor = (waits[-1].created_at, waits[-1].wait_id) if len(waits) == 100 else None
         for wait in waits:
             task = self.task_scheduler.get(wait.subject["task_id"], owner_id=wait.run_id, tenant_id=wait.tenant_id)
@@ -6859,6 +6870,7 @@ class CoreAgent:
         for candidate in self.workflow_store.recoverable(
             states=RECOVERABLE_WORKFLOW_STATES,
             root_only=True,
+            **scope,
         ):
             if candidate.state != "EXECUTING" or candidate.snapshot.get("terminal_intent"):
                 if self._launch_recovery(candidate):

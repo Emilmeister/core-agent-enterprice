@@ -269,15 +269,18 @@ class PostgresTaskScheduler:
         self._notify_remote(claim.task_id)
         return self._task(row)
 
-    def expire_remote(self, limit=100):
+    def expire_remote(self, limit=100, *, tenant_id=None):
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise CoreError("CONFIG_INVALID")
         identities = []
         with self.database.transaction() as connection:
+            tenant_filter = " AND tenant_id = %s" if tenant_id is not None else ""
+            values = [REMOTE_KIND, tenant_id] if tenant_id is not None else [REMOTE_KIND]
             rows = connection.execute("""SELECT * FROM core_background_tasks WHERE kind = %s
                 AND state NOT IN ('completed','failed','canceled')
-                AND (checkpoint->>'deadline')::double precision <= EXTRACT(EPOCH FROM clock_timestamp())
-                ORDER BY (checkpoint->>'deadline')::double precision, id LIMIT %s FOR UPDATE SKIP LOCKED""", (REMOTE_KIND, limit)).fetchall()
+                AND (checkpoint->>'deadline')::double precision <= EXTRACT(EPOCH FROM clock_timestamp())""" + tenant_filter
+                + " ORDER BY (checkpoint->>'deadline')::double precision, id LIMIT %s FOR UPDATE SKIP LOCKED",
+                (*values, limit)).fetchall()
             for row in rows:
                 _remote_contract(row["contract"], row["tenant_id"], row["owner_run_id"])
                 _remote_checkpoint(row["checkpoint"])
@@ -865,10 +868,12 @@ class PostgresTaskScheduler:
         if row:
             raise CoreError("REQUIRED_TASK_PENDING")
 
-    def recover(self, *, ready=None):
+    def recover(self, *, ready=None, tenant_id=None):
         if self._closed:
             return 0
         with self.database.pool.connection() as connection:
+            tenant_filter = " AND task.tenant_id = %s" if tenant_id is not None else ""
+            values = [tenant_id] if tenant_id is not None else []
             rows = connection.execute(
                 """SELECT * FROM core_background_tasks AS task
                    WHERE (state = 'submitted'
@@ -887,7 +892,7 @@ class PostgresTaskScheduler:
                            AND NOT run.cancel_requested
                            AND run.snapshot->>'wait_id' IS NOT NULL
                            AND COALESCE(run.snapshot->>'wait_ready', 'false') <> 'true'))
-                   ORDER BY created_at""",
+                   """ + tenant_filter + " ORDER BY created_at", values,
             ).fetchall()
         recovered = 0
         for row in rows:

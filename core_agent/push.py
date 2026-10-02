@@ -119,12 +119,13 @@ class PostgresPushNotificationConfigStore(PushNotificationConfigStore):
             ).fetchall()
         return [self._deserialize(row["encrypted_payload"]) for row in rows]
 
-    def _get_for_dispatch(self, task_id):
+    def _get_for_dispatch(self, task_id, *, tenant_id=None):
         with self.database.pool.connection() as connection:
+            tenant_filter = " AND tenant_id = %s" if tenant_id is not None else ""
             rows = connection.execute(
                 """SELECT encrypted_payload FROM core_push_notification_configs
-                   WHERE task_id = %s ORDER BY tenant_id, owner, config_id""",
-                (task_id,),
+                   WHERE task_id = %s""" + tenant_filter + " ORDER BY tenant_id, owner, config_id",
+                (task_id,) + ((tenant_id,) if tenant_id is not None else ()),
             ).fetchall()
         return [self._deserialize(row["encrypted_payload"]) for row in rows]
 
@@ -147,8 +148,8 @@ class PostgresPushNotificationConfigStore(PushNotificationConfigStore):
     async def get_info(self, task_id, context):
         return await asyncio.to_thread(self._get_info, task_id, context)
 
-    async def get_info_for_dispatch(self, task_id):
-        return await asyncio.to_thread(self._get_for_dispatch, task_id)
+    async def get_info_for_dispatch(self, task_id, *, tenant_id=None):
+        return await asyncio.to_thread(self._get_for_dispatch, task_id, tenant_id=tenant_id)
 
     async def delete_info(self, task_id, context, config_id=None):
         await asyncio.to_thread(self._delete_info, task_id, context, config_id)
@@ -163,6 +164,7 @@ class DurablePushNotificationSender(PushNotificationSender):
         client=None,
         retry_seconds=1.0,
         telemetry=None,
+        tenant_id=None,
     ):
         self.database = database
         self.config_store = config_store
@@ -173,6 +175,7 @@ class DurablePushNotificationSender(PushNotificationSender):
         self._owns_client = client is None
         self.retry_seconds = retry_seconds
         self.telemetry = telemetry
+        self.tenant_id = tenant_id
 
     @staticmethod
     def _event(event):
@@ -219,7 +222,7 @@ class DurablePushNotificationSender(PushNotificationSender):
             )
 
     def enqueue_notification(self, task_id, event, *, owner, tenant, connection):
-        if self._is_transient_snapshot(event):
+        if (self.tenant_id is not None and tenant != self.tenant_id) or self._is_transient_snapshot(event):
             return
         configs = connection.execute(
             """SELECT config_id FROM core_push_notification_configs
@@ -239,14 +242,30 @@ class DurablePushNotificationSender(PushNotificationSender):
     def _claim(self, limit):
         now = time.time()
         with self.database.transaction() as connection:
+            # Legacy deliveries lack tenant provenance. Ambiguous task/config IDs
+            # must remain untouched instead of sending another company's payload.
+            tenant_filter = """
+                     AND NOT EXISTS (SELECT 1 FROM core_push_notification_configs config
+                                     WHERE config.task_id = delivery.task_id AND config.config_id = delivery.config_id
+                                       AND config.tenant_id <> %s)
+                     AND NOT EXISTS (SELECT 1 FROM core_a2a_tasks task
+                                     WHERE task.task_id = delivery.task_id AND task.tenant <> %s)
+                     AND (EXISTS (SELECT 1 FROM core_push_notification_configs config
+                                  WHERE config.task_id = delivery.task_id AND config.config_id = delivery.config_id
+                                    AND config.tenant_id = %s)
+                          OR (NOT EXISTS (SELECT 1 FROM core_push_notification_configs config
+                                          WHERE config.task_id = delivery.task_id AND config.config_id = delivery.config_id)
+                              AND EXISTS (SELECT 1 FROM core_a2a_tasks task
+                                          WHERE task.task_id = delivery.task_id AND task.tenant = %s)))
+            """ if self.tenant_id is not None else ""
+            values = (now, now) + ((self.tenant_id,) * 4 if self.tenant_id is not None else ())
             rows = connection.execute(
                 """SELECT id, task_id, config_id, payload, attempts
-                   FROM core_push_deliveries
+                   FROM core_push_deliveries delivery
                    WHERE state != 'delivered' AND available_at <= %s
-                     AND (locked_until IS NULL OR locked_until < %s)
-                   ORDER BY available_at, created_at
-                   FOR UPDATE SKIP LOCKED LIMIT %s""",
-                (now, now, limit),
+                     AND (locked_until IS NULL OR locked_until < %s)""" + tenant_filter
+                + " ORDER BY available_at, created_at FOR UPDATE SKIP LOCKED LIMIT %s",
+                (*values, limit),
             ).fetchall()
             for row in rows:
                 connection.execute(
@@ -280,7 +299,8 @@ class DurablePushNotificationSender(PushNotificationSender):
             )
 
     async def _config(self, task_id, config_id):
-        configs = await self.config_store.get_info_for_dispatch(task_id)
+        scope = {"tenant_id": self.tenant_id} if self.tenant_id is not None else {}
+        configs = await self.config_store.get_info_for_dispatch(task_id, **scope)
         return next((item for item in configs if item.id == config_id), None)
 
     @staticmethod
@@ -296,7 +316,8 @@ class DurablePushNotificationSender(PushNotificationSender):
     async def send_notification(self, task_id, event):
         if self._is_transient_snapshot(event):
             return
-        configs = await self.config_store.get_info_for_dispatch(task_id)
+        scope = {"tenant_id": self.tenant_id} if self.tenant_id is not None else {}
+        configs = await self.config_store.get_info_for_dispatch(task_id, **scope)
         if not configs:
             return
         event_key, payload = self._event(event)

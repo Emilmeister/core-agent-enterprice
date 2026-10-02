@@ -48,7 +48,7 @@ from .execution import (
 )
 from .sandbox import SandboxLauncher, SandboxPolicy
 from .kernel import KernelCompiler
-from .interactions import InMemoryInteractionStore, PostgresInteractionStore
+from .interactions import InMemoryInteractionStore, PostgresInteractionStore, tool_origin
 from .guardrails import GuardrailClassifier
 from .material_reviews import MemoryMaterialReviewStore, PostgresMaterialReviewStore
 from .chat_files import ChatFileService, MemoryChatFileStore, PostgresChatFileStore
@@ -723,7 +723,7 @@ def _platform_mcp():
 
 def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
            material_review_store=None, guardrail_classifier=None, remote_registry=None,
-           response_files_enabled=False, sandbox_launcher):
+           response_files_enabled=False, sandbox_launcher, recovery_tenant_id=None):
     platform_mcp = _platform_mcp()
     servers = set(_csv("MCP_ALLOWED_SERVERS")) | {item["name"] for item in platform_mcp}
     remote_connections, remote_agents_configured, remote_agent_failures = (
@@ -1438,6 +1438,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         audit_log=state["audit"],
         telemetry=telemetry,
         workflow_store=state["workflow"],
+        recovery_tenant_id=recovery_tenant_id,
         interaction_store=interaction_store,
         material_review_store=material_review_store,
         guardrail_classifier=guardrail_classifier,
@@ -1532,6 +1533,7 @@ def create_app(
         auth_env, production=environment == "production",
         allow_legacy=environment in {"development", "test"},
     )
+    recovery_tenant_id = auth_settings.tenant if auth_settings else None
     if auth_settings and not _env("CHAT_WORKSPACE_ROOT", ""):
         raise CoreError("CONFIG_INVALID", "authenticated deployment requires CHAT_WORKSPACE_ROOT")
     host = _env("HOST", "0.0.0.0")
@@ -1574,7 +1576,8 @@ def create_app(
                                   material_review_store=material_review_store,
                                   guardrail_classifier=guardrail_classifier,
                                   response_files_enabled=auth_settings is not None,
-                                  sandbox_launcher=sandbox_launcher)
+                                  sandbox_launcher=sandbox_launcher,
+                                  recovery_tenant_id=recovery_tenant_id)
         if state["tasks"] is not None:
             state["tasks"].response_files_service = agent.response_files_service
         if state["database"] is not None:
@@ -1598,11 +1601,13 @@ def create_app(
             push_config_store,
             client=push_client,
             telemetry=telemetry,
+            tenant_id=recovery_tenant_id,
         )
 
     def reconcile_workflows(_task_id=None):
         if state["tasks"]:
             return state["tasks"].reconcile_from_workflows(
+                tenant_id=recovery_tenant_id,
                 enqueue_notification=(
                     push_sender.enqueue_notification if push_sender else None
                 )
@@ -1925,8 +1930,11 @@ def create_app(
 
     def card_skills(request):
         skills = set(agent.platform_config.allowed_builtin_tools)
+        principal = request.scope.get("principal")
+        if principal is not None and interaction_store is not None:
+            skills = {name for name in skills if interaction_store.get_policy(
+                principal.tenant, name, tool_origin(name)).mode != "deny"}
         if remote_registry_store is not None:
-            principal = request.scope.get("principal")
             if principal is None or not agent._remote_peers(principal.tenant):
                 skills.discard("core_agent_send_message")
         return skills

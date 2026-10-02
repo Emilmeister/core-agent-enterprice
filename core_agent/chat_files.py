@@ -163,10 +163,11 @@ class MemoryChatFileStore:
                         binding.tenant_id, binding.owner_id, binding.context_id)
                     and row["state"] in _ACCEPTED for entry in row["manifest"]["entries"]}
 
-    def expired(self, now, cutoff, limit):
+    def expired(self, now, cutoff, limit, *, tenant_id=None):
         with self.lock:
             return [(r["batch_id"], r["tenant_id"]) for r in sorted(
-                self.rows.values(), key=lambda r: (r["created_at"], r["batch_id"]))
+                (r for r in self.rows.values() if tenant_id is None or r["tenant_id"] == tenant_id),
+                key=lambda r: (r["created_at"], r["batch_id"]))
                 if r["state"] in {"staging", "rejected"} and r["cleaned_at"] is None
                 and r["lease_expires_at"] <= now and r["created_at"] <= cutoff][:limit]
 
@@ -277,13 +278,15 @@ class PostgresChatFileStore:
         ).fetchall()
         return {entry["actual_name"] for row in rows for entry in row["manifest"]["entries"]}
 
-    def expired(self, now, cutoff, limit):
+    def expired(self, now, cutoff, limit, *, tenant_id=None):
         with self.database.transaction() as connection:
+            tenant_filter = " AND tenant_id=%s" if tenant_id is not None else ""
+            values = (now, cutoff) + ((tenant_id,) if tenant_id is not None else ())
             rows = connection.execute(
                 """SELECT batch_id, tenant_id FROM core_chat_file_batches
                    WHERE state IN ('staging','rejected') AND cleaned_at IS NULL
-                   AND lease_expires_at<=%s AND created_at<=%s
-                   ORDER BY created_at,batch_id LIMIT %s""", (now, cutoff, limit),
+                   AND lease_expires_at<=%s AND created_at<=%s""" + tenant_filter
+                + " ORDER BY created_at,batch_id LIMIT %s", (*values, limit),
             ).fetchall()
         return [(r["batch_id"], r["tenant_id"]) for r in rows]
 
@@ -414,6 +417,7 @@ class ChatFileService:
         self.store, self.workspaces = store, workspaces
         self.limit_bytes, self.clock, self.lease_seconds = limit_bytes, clock, lease_seconds
         self._orphan_scan = None
+        self._orphan_scan_tenant = None
         with ExitStack() as descriptors:
             self.root = os.open(workspaces.root, _DIRECTORY)
             descriptors.callback(os.close, self.root)
@@ -504,7 +508,7 @@ class ChatFileService:
         self.store.create(row)  # Durable original age precedes any filesystem creation.
         directory = None
         try:
-            manifest = dict(schema_version=1, batch_id=batch_id, created_at=now,
+            manifest = dict(schema_version=1, batch_id=batch_id, tenant_id=tenant_id, created_at=now,
                             source=source, metadata=copy.deepcopy(request_metadata or {}), entries=[], total_bytes=0)
             with self.store.locked(batch_id, tenant_id) as (current, _):
                 self._lease(current, token)
@@ -843,7 +847,7 @@ class ChatFileService:
                 raise
             raise CoreError("FILE_PUBLICATION_PENDING", retryable=True) from error
 
-    def sweep(self, *, startup=False, limit=100):
+    def sweep(self, *, startup=False, limit=100, tenant_id=None):
         """Bounded lifecycle hook; call again immediately when has_more is true.
 
         Rowless uploads require intact original-age metadata and a crosscheck of
@@ -854,10 +858,10 @@ class ChatFileService:
             raise CoreError("CONFIG_INVALID")
         now = self.clock()
         cutoff = now if startup else now - 23 * 3600
-        candidates = self.store.expired(now, cutoff, limit + 1)
+        candidates = self.store.expired(now, cutoff, limit + 1, tenant_id=tenant_id)
         cleaned = 0
-        for batch_id, tenant_id in candidates[:limit]:
-            with self.store.locked(batch_id, tenant_id) as (row, _):
+        for batch_id, batch_tenant_id in candidates[:limit]:
+            with self.store.locked(batch_id, batch_tenant_id) as (row, _):
                 if (row["state"] not in {"staging", "rejected"} or row["cleaned_at"] is not None
                         or row["lease_expires_at"] > now or row["created_at"] > cutoff
                         or any(row[k] is not None for k in ("task_id", "run_id", "decision_ref"))):
@@ -865,14 +869,18 @@ class ChatFileService:
                 self._remove(batch_id)
                 row.update(state="rejected", error_code=row["error_code"] or "FILE_UPLOAD_EXPIRED", cleaned_at=now)
                 cleaned += 1
-        orphan_cleaned, more = self._sweep_rowless(now - 23 * 3600, limit)
+        orphan_cleaned, more = self._sweep_rowless(now - 23 * 3600, limit, tenant_id=tenant_id)
         return {"cleaned": cleaned + orphan_cleaned, "has_more": len(candidates) > limit or more}
 
-    def _sweep_rowless(self, cutoff, limit):
+    def _sweep_rowless(self, cutoff, limit, *, tenant_id=None):
+        if self._orphan_scan is not None and self._orphan_scan_tenant != tenant_id:
+            self._orphan_scan.close()
+            self._orphan_scan = None
         if self._orphan_scan is None:
             descriptor = os.open(".", _DIRECTORY, dir_fd=self.uploads)
             try:
                 self._orphan_scan = os.scandir(descriptor)
+                self._orphan_scan_tenant = tenant_id
             finally:
                 os.close(descriptor)
         cleaned = 0
@@ -884,21 +892,24 @@ class ChatFileService:
                 return cleaned, False
             if not re.fullmatch(r"[0-9a-f]{32}", entry.name) or not entry.is_dir(follow_symlinks=False):
                 continue
-            with self.store.orphan(entry.name) as unreferenced:
-                if not unreferenced:
+            directory = None
+            try:
+                directory = os.open(entry.name, _DIRECTORY, dir_fd=self.uploads)
+                descriptor = os.open(".manifest.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                with os.fdopen(descriptor, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > _MANIFEST_LIMIT:
+                        continue
+                    manifest = json.loads(stream.read(_MANIFEST_LIMIT + 1))
+                age = manifest.get("created_at")
+                if tenant_id is not None and manifest.get("tenant_id") != tenant_id:
                     continue
-                directory = None
-                try:
-                    directory = os.open(entry.name, _DIRECTORY, dir_fd=self.uploads)
-                    descriptor = os.open(".manifest.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-                    with os.fdopen(descriptor, "rb") as stream:
-                        info = os.fstat(stream.fileno())
-                        if not stat.S_ISREG(info.st_mode) or info.st_size > _MANIFEST_LIMIT:
-                            continue
-                        manifest = json.loads(stream.read(_MANIFEST_LIMIT + 1))
-                    age = manifest.get("created_at")
-                    if (manifest.get("schema_version") != 1 or manifest.get("batch_id") != entry.name
-                            or type(age) not in (int, float) or not math.isfinite(age) or age > cutoff):
+                if (manifest.get("schema_version") != 1 or manifest.get("batch_id") != entry.name
+                        or type(age) not in (int, float) or not math.isfinite(age) or age > cutoff):
+                    continue
+                # Scope permits inspection; only the global reference fence permits deletion.
+                with self.store.orphan(entry.name) as unreferenced:
+                    if not unreferenced:
                         continue
                     # Do not remove a replaced directory after opening metadata.
                     current = os.stat(entry.name, dir_fd=self.uploads, follow_symlinks=False)
@@ -908,10 +919,10 @@ class ChatFileService:
                     shutil.rmtree(entry.name, dir_fd=self.uploads)
                     os.fsync(self.uploads)
                     cleaned += 1
-                except (OSError, ValueError, AttributeError):
-                    # Missing/corrupt age or inaccessible files require reconciliation.
-                    continue
-                finally:
-                    if directory is not None:
-                        os.close(directory)
+            except (OSError, ValueError, AttributeError):
+                # Missing/corrupt age or inaccessible files require reconciliation.
+                continue
+            finally:
+                if directory is not None:
+                    os.close(directory)
         return cleaned, True

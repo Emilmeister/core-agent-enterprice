@@ -69,6 +69,33 @@ class MissingTerminalBackend:
 
 
 class BackgroundTaskTests(unittest.TestCase):
+    def test_scoped_recovery_skips_foreign_cancellation_before_readiness(self):
+        scheduler = TaskScheduler()
+        self.addCleanup(scheduler.close)
+        tasks = []
+        for tenant in ("foreign", "tenant"):
+            task = scheduler.start(lambda: SuspendedRun("run", "child", "wait", 1),
+                task_id=tenant, owner_id="parent", tenant_id=tenant, kind="subagent",
+                contract={"tenant": tenant}, recoverable=True)
+            tasks.append(task)
+        with scheduler._lock:
+            workers = tuple(scheduler._threads)
+        for worker in workers:
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+        tasks[0].cancel_event.set()
+        dispatched, readiness = [], []
+        scheduler.register("subagent", lambda contract, cancel: dispatched.append(contract["tenant"]) or "done")
+        self.assertEqual(scheduler.recover(tenant_id="tenant",
+            ready=lambda task, tenant: readiness.append(tenant) or True), 1)
+        self.assertEqual(scheduler.wait("tenant", timeout=1, tenant_id="tenant").state, "completed")
+        self.assertEqual(dispatched, ["tenant"])
+        self.assertEqual(readiness, ["tenant"])
+        self.assertEqual(tasks[0].state, "working")
+        self.assertEqual(scheduler.recover(), 0)
+        self.assertEqual(scheduler.wait("foreign", timeout=1, tenant_id="foreign").state, "canceled")
+        self.assertEqual(dispatched, ["tenant", "foreign"])
+
     def suspended_scheduler(self, *, on_cancel=None):
         scheduler = TaskScheduler()
         self.addCleanup(scheduler.close)

@@ -305,6 +305,16 @@ A2A protocol version. При чтении результата, записанн
 
 ## Pause, recovery и lease
 
+- Авторизованный serving process MUST ограничивать все автоматические
+  recovery/timeout/cleanup/projection/push операции company из trusted Keycloak
+  settings. Фильтр применяется до лимитов выборки рабочих записей, row locks, lease/claim,
+  credential decryption и model/tool/network/file side effects, включая
+  cancel-requested и unrecoverable records. Записи другой компании остаются
+  неизменными до обработки deployment с соответствующим trusted scope.
+  Generic runtime без configured tenant сохраняет platform-wide semantics.
+  Legacy push delivery без однозначной company provenance MUST оставаться
+  неизменной для reconciliation: одинаковые Task/config IDs разных компаний
+  не разрешают выбрать credential либо адрес текущего deployment.
 - `pause` запрещает новые model/tools после ближайшей безопасной границы и создаёт checkpoint.
 - Worker MUST регулярно обновлять lease, в том числе во время долгого model/tool
   call и joined delegation; только владелец актуального lease изменяет run.

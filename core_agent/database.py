@@ -1358,9 +1358,10 @@ class PostgresTaskStore(TaskStore):
             owner if context.user.is_authenticated and owner else "anonymous"
         ), context.tenant or "default"
 
-    def reconcile_from_workflows(self, *, enqueue_notification=None):
+    def reconcile_from_workflows(self, *, enqueue_notification=None, tenant_id=None):
         reconciled = 0
         with self.database.transaction() as connection:
+            tenant_filter = " AND task.tenant = %s" if tenant_id is not None else ""
             rows = connection.execute(
                 """SELECT task.payload, task.owner, task.tenant, run.run_id,
                           run.task_id
@@ -1372,13 +1373,13 @@ class PostgresTaskStore(TaskStore):
                      AND (run.state IN ('COMPLETED','FAILED','ABORTED','CANCELLED','REJECTED',
                                         'WAITING_TASK','WAITING_INPUT')
                           OR run.state IN ('RUNNING','MODEL_RESPONDED','EXECUTING') AND run.snapshot ? 'remote_calls')
-                   FOR UPDATE OF task""",
+                   """ + tenant_filter + " FOR UPDATE OF task",
                 (
                     int(a2a_pb2.TASK_STATE_COMPLETED),
                     int(a2a_pb2.TASK_STATE_FAILED),
                     int(a2a_pb2.TASK_STATE_CANCELED),
                     int(a2a_pb2.TASK_STATE_REJECTED),
-                ),
+                ) + ((tenant_id,) if tenant_id is not None else ()),
             ).fetchall()
             for row in rows:
                 # The task lock may have waited; reread canonical state afterwards.

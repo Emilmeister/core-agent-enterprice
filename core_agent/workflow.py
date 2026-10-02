@@ -749,17 +749,19 @@ class InMemoryWorkflowStore(_ExecutionLifecycle):
             self._waits[wait_id] = resolved
             return deepcopy(resolved)
 
-    def pending_waits(self, *, kind=None, limit=100, after=None):
+    def pending_waits(self, *, kind=None, limit=100, after=None, tenant_id=None):
         with self._lock:
             waits = sorted((wait for wait in self._waits.values()
-                            if wait.outcome is None and (kind is None or wait.kind == kind)
+                            if (tenant_id is None or wait.tenant_id == tenant_id)
+                            and wait.outcome is None and (kind is None or wait.kind == kind)
                             and (after is None or (wait.created_at, wait.wait_id) > after)),
                            key=lambda wait: (wait.created_at, wait.wait_id))
             return tuple(deepcopy(wait) for wait in waits[:max(0, limit)])
 
-    def expire_waits(self, *, limit=100):
+    def expire_waits(self, *, limit=100, tenant_id=None):
         with self._lock:
-            due = [wait for wait in self._waits.values() if wait.outcome is None
+            due = [wait for wait in self._waits.values()
+                   if (tenant_id is None or wait.tenant_id == tenant_id) and wait.outcome is None
                    and wait.deadline is not None and wait.deadline <= self.clock()]
             due.sort(key=lambda wait: (wait.deadline, wait.wait_id))
             return tuple(self.resolve_wait(wait.wait_id, tenant_id=wait.tenant_id, outcome={})
@@ -864,12 +866,12 @@ class InMemoryWorkflowStore(_ExecutionLifecycle):
                 raise CoreError("LEASE_LOST")
             del self._leases[run_id]
 
-    def recoverable(self, *, states=None, root_only=False, limit=100):
+    def recoverable(self, *, states=None, root_only=False, limit=100, tenant_id=None):
         with self._lock:
             return tuple(
                 record
                 for record in self._records.values()
-                if (
+                if (tenant_id is None or record.tenant_id == tenant_id) and (
                     record.state in states
                     if states is not None
                     else record.state not in TERMINAL_STATES
@@ -1070,12 +1072,15 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             wait = self.get_wait(wait_id, tenant_id=tenant_id, connection=connection, lock=True)
             return self._resolve_wait_locked(connection, current, wait, outcome, actor_id)
 
-    def pending_waits(self, *, kind=None, limit=100, after=None):
+    def pending_waits(self, *, kind=None, limit=100, after=None, tenant_id=None):
         if limit <= 0:
             return ()
         with self.database.pool.connection() as connection:
             kind_filter = " AND kind = %s" if kind is not None else ""
             values = [kind] if kind is not None else []
+            if tenant_id is not None:
+                kind_filter += " AND tenant_id = %s"
+                values.append(tenant_id)
             if after is not None:
                 kind_filter += " AND (created_at, wait_id) > (%s, %s)"
                 values.extend(after)
@@ -1085,14 +1090,16 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             ).fetchall()
         return tuple(WaitRecord(**row) for row in rows)
 
-    def expire_waits(self, *, limit=100):
+    def expire_waits(self, *, limit=100, tenant_id=None):
         if limit <= 0:
             return ()
         with self.database.pool.connection() as connection:
+            tenant_filter = " AND tenant_id = %s" if tenant_id is not None else ""
+            values = [tenant_id] if tenant_id is not None else []
             rows = connection.execute(
                 """SELECT wait_id, tenant_id FROM core_waits WHERE resolved_at IS NULL
-                   AND deadline <= EXTRACT(EPOCH FROM clock_timestamp())
-                   ORDER BY deadline, wait_id LIMIT %s""", (limit,),
+                   AND deadline <= EXTRACT(EPOCH FROM clock_timestamp())""" + tenant_filter
+                + " ORDER BY deadline, wait_id LIMIT %s", (*values, limit),
             ).fetchall()
         return tuple(self.resolve_wait(row["wait_id"], tenant_id=row["tenant_id"], outcome={})
                      for row in rows)
@@ -2165,7 +2172,7 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             if updated.rowcount != 1:
                 raise CoreError("LEASE_LOST")
 
-    def recoverable(self, *, states=None, root_only=False, limit=100):
+    def recoverable(self, *, states=None, root_only=False, limit=100, tenant_id=None):
         with self.database.pool.connection() as connection:
             state_filter = (
                 "state = ANY(%s)"
@@ -2173,10 +2180,14 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
                 else "state NOT IN ('COMPLETED','FAILED','CANCELLED','REJECTED','ABORTED')"
             )
             values = [list(states)] if states is not None else []
+            tenant_filter = "AND tenant_id = %s" if tenant_id is not None else ""
+            if tenant_id is not None:
+                values.append(tenant_id)
             root_filter = "AND parent_run_id IS NULL" if root_only else ""
             rows = connection.execute(
                 f"""SELECT * FROM core_runs
                     WHERE {state_filter}
+                      {tenant_filter}
                       {root_filter}
                       AND (cancel_requested OR snapshot ? 'terminal_intent' OR NOT EXISTS (
                           SELECT 1 FROM core_waits wait WHERE wait.run_id = core_runs.run_id

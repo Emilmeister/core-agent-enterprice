@@ -258,6 +258,30 @@ Targeted suite — 52 tests, exit0; final ordinary PostgreSQL/Keycloak CI и
 `.local-evidence/remote-import-ci-reviewed-final/` и
 `.local-evidence/remote-import-review-green-final.log`.
 
+## Company scope discovery и automatic recovery
+
+- [x] Owner deny исключает built-in из обеих Agent Cards и обоих well-known
+  путей; allow/HITL видимы без restart и company policy изолированы.
+- [x] Automatic root/background/remote/wait/cleanup/projection/push использует
+  trusted deployment company до limits/locks/claims и side effects. Generic
+  runtime без tenant сохраняет прежнюю platform-wide semantics.
+- [x] Bounded rowless sweep сохраняет legacy/foreign manifests и global
+  authoritative reference fence; неоднозначные legacy push IDs не открывают
+  чужие credentials/network. PostgreSQL selector и app/pool restart proof
+  входят в ordinary CI, общий DB-02 остаётся partial.
+- [x] Полный fresh PostgreSQL/Keycloak CI — 1653 tests за 261.352 секунды,
+  exit0, три dedicated skips; sync/migrations/Ruff/cleanup exit0. Evidence —
+  `.local-evidence/company-recovery-reviewed-ci-final-closed/`. UI npm
+  ci/typecheck/build и package build проходят; read-only review без
+  Critical/Important. Подробности — [company recovery plan](2026-10-02-company-recovery.md).
+
+Первый full run выявил fixture contamination и прежнюю cleanup API assertion
+без tenant. Новая restart fixture закрывает actual pools, после assertions
+завершает только собственные admissions через workflow store; сохранённый
+reference graph не удаляется. Generic runtime и старые artifact recovery
+assertions не ослаблены. Target AppArmor/live providers и production cutover
+этим этапом не подтверждаются.
+
 ## Готовность к поставке
 
 Текущий срез включает owner UI, Keycloak scope, per-tool HITL/guardrails policy,
@@ -351,7 +375,7 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
   actual amd64/target namespace/network checks. Evidence —
   `.local-evidence/target-csi-recreate/`.
 - Реальный настроенный LLM возвращает HTTP404, Foundation Models embeddings
-  endpoint — HTTP503. Повторная проверка 2 октября в 03:13 UTC даёт те же
+  endpoint — HTTP503. Повторная проверка 2 октября в 05:11 UTC даёт те же
   статусы; TLS проверен через системное доверие без отключения проверки.
   Model catalogue возвращает HTTP200/95 models, но live provider/embedding
   proof не прошёл. Контрактные tests не являются proof качества модели.

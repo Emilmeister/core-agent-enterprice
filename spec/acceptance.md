@@ -29,13 +29,20 @@
 
 ## Конфигурация агента
 
+- [ ] При shared PostgreSQL startup/recovery приложения компании B исполняет
+  только работу B; root/background/remote/cancel/wait/cleanup/projection/push
+  записи A не меняются и не используют модель либо credentials B. Более одного
+  batch чужих rows не блокирует B; generic runtime без tenant scope сохраняет
+  прежнюю platform-wide semantics, неизвестные rowless files не удаляются.
 - [ ] PlatformConfig, AgentConfig и Task input разделены; Task не расширяет AgentConfig.
 - [ ] AgentConfig может отключить memory, terminal, filesystem mutations, background tasks, delegation, отдельные built-in/MCP tools и skills.
 - [ ] Disabled tool отсутствует в discovery/model context и stale call получает `CAPABILITY_DISABLED`.
 - [ ] Memory modes `disabled`, `optional`, `required` корректно фильтруют/требуют встроенный memory backend.
 - [ ] MCP tool filters применяются после discovery, но до model context; deny имеет приоритет.
 - [ ] Admission ceiling и config/tool snapshot immutable внутри Task; текущая owner policy применяется к последующим calls, все использованные versions/digests сохраняются в audit.
-- [ ] Agent Card не рекламирует capability, отключённую AgentConfig.
+- [ ] Agent Card не рекламирует capability, отключённую AgentConfig или текущим
+  owner deny. После owner policy update оба A2A входа и оба well-known пути
+  отражают deny/allow/HITL без restart; policy другой компании не влияет на Card.
 - [ ] Присутствующая, но пустая deployment-переменная трактуется как отсутствующая
   и получает документированный default, кроме явно документированных allowlist:
   пустой `CORE_AGENT_ALLOWED_SKILLS` отключает навыки.

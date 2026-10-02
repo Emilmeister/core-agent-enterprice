@@ -504,21 +504,24 @@ class WorkspaceCleanupService:
                 chat["workspace_revision"] = operation["workspace_revision"]
             return self._receipt(operation)
 
-    def recover(self, limit=100):
+    def recover(self, limit=100, *, tenant_id=None):
         if type(limit) is not int or not 1 <= limit <= 100:
             raise CoreError("REQUEST_INVALID")
         if self.database:
             with self.database.transaction() as connection:
+                tenant_filter = " AND tenant_id=%s" if tenant_id is not None else ""
                 def page(after):
                     return connection.execute("""SELECT tenant_id,context_id,request_id,operation_id
-                        FROM core_workspace_cleanups WHERE state<>'completed' AND operation_id>%s
-                        ORDER BY operation_id LIMIT %s""", (after, limit)).fetchall()
+                        FROM core_workspace_cleanups WHERE state<>'completed'""" + tenant_filter
+                        + " AND operation_id>%s ORDER BY operation_id LIMIT %s",
+                        (tenant_id, after, limit) if tenant_id is not None else (after, limit)).fetchall()
                 rows = page(self._recovery_after)
                 if not rows and self._recovery_after:
                     rows = page("")
         else:
             with self.admission.agent.workflow_store._lock:
-                pending = sorted((value for value in self.admission._workspace_cleanups.values() if value["state"] != "completed"),
+                pending = sorted((value for value in self.admission._workspace_cleanups.values()
+                                  if (tenant_id is None or value["tenant_id"] == tenant_id) and value["state"] != "completed"),
                                  key=lambda row: row["operation_id"])
                 rows = [row for row in pending if row["operation_id"] > self._recovery_after][:limit] or pending[:limit]
                 rows = [{key: row[key] for key in ("tenant_id", "context_id", "request_id", "operation_id")} for row in rows]

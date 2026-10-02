@@ -1297,6 +1297,167 @@ class PostgresRestartTests(unittest.TestCase):
         self.assertEqual(asyncio.run(store.get_info("task-push", other)), [])
         database.close()
 
+    def test_push_company_scope_precedes_claim_limit_and_credential_decryption(self):
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        store = PostgresPushNotificationConfigStore(database, Fernet.generate_key())
+        tasks = PostgresTaskStore(database)
+        contexts = {
+            tenant: ServerCallContext(user=NamedUser(), tenant=tenant)
+            for tenant in ("company-a", "company-b")
+        }
+        deliveries = []
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: deliveries.append(request) or httpx.Response(204, request=request)))
+        self.addCleanup(lambda: asyncio.run(client.aclose()))
+        generic = DurablePushNotificationSender(database, store, client=client)
+        scoped = DurablePushNotificationSender(database, store, client=client, tenant_id="company-b")
+        public_dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with patch("core_agent.push.socket.getaddrinfo", return_value=public_dns):
+            for task_id, tenant in (("push-a", "company-a"), ("push-b", "company-b"),
+                                    ("push-deleted-b", "company-b")):
+                task = Task(id=task_id, context_id=task_id, status=TaskStatus(
+                    state=TaskState.TASK_STATE_WORKING))
+                asyncio.run(tasks.save(task, contexts[tenant]))
+                config = TaskPushNotificationConfig(task_id=task_id,
+                    url=f"https://push.example/{task_id}", token=f"secret-{tenant}")
+                asyncio.run(store.set_info(task_id, config, contexts[tenant]))
+                event = TaskStatusUpdateEvent(task_id=task_id, context_id=task_id,
+                    status=task.status)
+                with database.transaction() as connection:
+                    generic.enqueue_notification(task_id, event, owner="owner-1",
+                                                 tenant=tenant, connection=connection)
+            asyncio.run(store.delete_info("push-deleted-b", contexts["company-b"]))
+            # A same-ID task cannot authorize use of another company's existing config.
+            asyncio.run(tasks.save(Task(id="push-a", context_id="decoy-b", status=TaskStatus(
+                state=TaskState.TASK_STATE_WORKING)), contexts["company-b"]))
+            with database.transaction() as connection:
+                encrypted = bytes(connection.execute("""SELECT encrypted_payload
+                    FROM core_push_notification_configs WHERE task_id='push-a'"""
+                ).fetchone()["encrypted_payload"])
+                connection.execute("""UPDATE core_push_notification_configs
+                    SET encrypted_payload=%s WHERE task_id='push-a'""", (b"invalid-foreign-ciphertext",))
+                foreign = connection.execute("""SELECT * FROM core_push_deliveries
+                    WHERE task_id='push-a'""").fetchone()
+                scoped.enqueue_notification("push-a", TaskStatusUpdateEvent(task_id="push-a",
+                    context_id="push-a", status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED)),
+                    owner="owner-1", tenant="company-a", connection=connection)
+
+            self.assertEqual(asyncio.run(store.get_info_for_dispatch(
+                "push-a", tenant_id="company-b")), [])
+            self.assertIsNone(asyncio.run(scoped._config("push-a", foreign["config_id"])))
+            asyncio.run(scoped.send_notification("push-a", TaskStatusUpdateEvent(
+                task_id="push-a", context_id="push-a", status=TaskStatus(state=TaskState.TASK_STATE_WORKING))))
+            self.assertEqual(asyncio.run(scoped.dispatch_pending(limit=1)), 1)
+            self.assertEqual([request.url.path for request in deliveries], ["/push-b"])
+            self.assertEqual(deliveries[0].headers["X-A2A-Notification-Token"], "secret-company-b")
+            self.assertEqual(asyncio.run(scoped.dispatch_pending(limit=1)), 1)
+            with database.pool.connection() as connection:
+                self.assertEqual(connection.execute("""SELECT * FROM core_push_deliveries
+                    WHERE task_id='push-a'""").fetchall(), [foreign])
+                self.assertEqual(connection.execute("""SELECT state, attempts, last_error_code
+                    FROM core_push_deliveries WHERE task_id='push-deleted-b'""").fetchone(),
+                    {"state": "pending", "attempts": 1, "last_error_code": "PUSH_CONFIG_NOT_FOUND"})
+                self.assertEqual(connection.execute("""SELECT state FROM core_push_deliveries
+                    WHERE task_id='push-b'""").fetchone()["state"], "delivered")
+            self.assertEqual(len(deliveries), 1)
+            with database.transaction() as connection:
+                connection.execute("""UPDATE core_push_notification_configs
+                    SET encrypted_payload=%s WHERE task_id='push-a'""", (encrypted,))
+            self.assertEqual(asyncio.run(generic.dispatch_pending(limit=1)), 1)
+            self.assertEqual([request.url.path for request in deliveries], ["/push-b", "/push-a"])
+
+    def test_company_scope_preserves_foreign_waits_and_background_cancellation(self):
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        waits = []
+        for index, tenant in enumerate(("company-a", "company-a", "company-b")):
+            record = workflows.create(WorkflowRecord(f"scope-run-{index}", f"scope-task-{index}",
+                f"scope-chat-{index}", tenant, "owner", None, "RUNNING", 1, {"prompt": "wait"}, {}))
+            token = workflows.acquire_lease(record.run_id, tenant_id=tenant, owner_id="owner",
+                                            worker_id="worker", ttl=100)
+            waits.append(workflows.enter_wait(record, kind="timer", source_id="timer",
+                subject={"until": "private"}, continuation={"version": 1, "phase": "tool_wait", "call_id": "timer"},
+                deadline=time.time() + 3600, snapshot=record.snapshot, lease_token=token))
+        workflows.request_cancel("scope-run-0", tenant_id="company-a", owner_id="owner")
+        with database.transaction() as connection:
+            connection.execute("UPDATE core_waits SET deadline = EXTRACT(EPOCH FROM clock_timestamp()) - 1")
+            foreign_waits = connection.execute("SELECT * FROM core_waits WHERE tenant_id='company-a' ORDER BY wait_id").fetchall()
+            foreign_runs = connection.execute("SELECT * FROM core_runs WHERE tenant_id='company-a' ORDER BY run_id").fetchall()
+        self.assertEqual([wait.wait_id for wait in workflows.pending_waits(tenant_id="company-b", limit=1)], [waits[2].wait_id])
+        self.assertEqual(workflows.recoverable(tenant_id="company-b", limit=1), ())
+        self.assertEqual([wait.wait_id for wait in workflows.expire_waits(tenant_id="company-b", limit=1)], [waits[2].wait_id])
+        self.assertEqual([record.run_id for record in workflows.recoverable(tenant_id="company-b", limit=1)], ["scope-run-2"])
+        with database.transaction() as connection:
+            self.assertEqual(connection.execute("SELECT * FROM core_waits WHERE tenant_id='company-a' ORDER BY wait_id").fetchall(), foreign_waits)
+            self.assertEqual(connection.execute("SELECT * FROM core_runs WHERE tenant_id='company-a' ORDER BY run_id").fetchall(), foreign_runs)
+            for task_id, tenant, recoverable, cancel in (
+                ("foreign-cancel", "company-a", True, True),
+                ("foreign-unknown", "company-a", False, True),
+                ("own-ready", "company-b", True, False)):
+                connection.execute("""INSERT INTO core_background_tasks
+                    (id, owner_run_id, tenant_id, kind, state, required, recoverable,
+                     contract, cancel_requested, created_at, updated_at)
+                    VALUES (%s, 'parent', %s, 'scope-test', 'working', true, %s, %s, %s, %s, %s)""",
+                    (task_id, tenant, recoverable, Jsonb({"tenant": tenant}), cancel, time.time(), time.time()))
+            foreign_tasks = connection.execute("SELECT * FROM core_background_tasks WHERE tenant_id='company-a' ORDER BY id").fetchall()
+        scheduler = PostgresTaskScheduler(database)
+        self.addCleanup(scheduler.close)
+        dispatched, readiness = [], []
+        scheduler.register("scope-test", lambda contract, cancel: dispatched.append(contract["tenant"]) or "done")
+        self.assertEqual(scheduler.recover(tenant_id="company-b", ready=lambda task, tenant: readiness.append(tenant) or True), 1)
+        self.assertEqual(scheduler.wait("own-ready", owner_id="parent", tenant_id="company-b", timeout=2).state, "completed")
+        self.assertEqual(dispatched, ["company-b"])
+        self.assertEqual(readiness, ["company-b"])
+        with database.pool.connection() as connection:
+            self.assertEqual(connection.execute("SELECT * FROM core_background_tasks WHERE tenant_id='company-a' ORDER BY id").fetchall(), foreign_tasks)
+        self.assertEqual(scheduler.mailbox("parent", "company-a").poll(), ())
+        self.assertEqual(len(workflows.expire_waits()), 2)
+
+    def test_ambiguous_cross_company_push_identity_is_not_claimed(self):
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        store = PostgresPushNotificationConfigStore(database, Fernet.generate_key())
+        tasks = PostgresTaskStore(database)
+        deliveries = []
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: deliveries.append(request) or httpx.Response(204, request=request)))
+        self.addCleanup(lambda: asyncio.run(client.aclose()))
+        generic = DurablePushNotificationSender(database, store, client=client)
+        scoped = DurablePushNotificationSender(database, store, client=client, tenant_id="company-b")
+        public_dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with patch("core_agent.push.socket.getaddrinfo", return_value=public_dns):
+            for tenant in ("company-a", "company-b"):
+                context = ServerCallContext(user=NamedUser(), tenant=tenant)
+                task = Task(id="ambiguous-push", context_id=tenant,
+                            status=TaskStatus(state=TaskState.TASK_STATE_WORKING))
+                asyncio.run(tasks.save(task, context))
+                asyncio.run(store.set_info(task.id, TaskPushNotificationConfig(
+                    id="same-config", task_id=task.id, url=f"https://push.example/{tenant}"), context))
+                if tenant == "company-a":
+                    with database.transaction() as connection:
+                        generic.enqueue_notification(task.id, TaskStatusUpdateEvent(
+                            task_id=task.id, context_id=tenant, status=task.status),
+                            owner="owner-1", tenant=tenant, connection=connection)
+            with database.pool.connection() as connection:
+                original = connection.execute("SELECT * FROM core_push_deliveries").fetchall()
+            self.assertEqual(len(original), 1)
+            self.assertEqual(asyncio.run(scoped.dispatch_pending()), 0)
+            # Missing configuration does not prove which same-ID Task owns the payload.
+            for tenant in ("company-a", "company-b"):
+                asyncio.run(store.delete_info("ambiguous-push", ServerCallContext(user=NamedUser(), tenant=tenant)))
+            self.assertEqual(asyncio.run(scoped.dispatch_pending()), 0)
+            self.assertEqual(deliveries, [])
+            with database.pool.connection() as connection:
+                self.assertEqual(connection.execute("SELECT * FROM core_push_deliveries").fetchall(), original)
+
     def test_artifacts_are_durable_verified_and_tenant_scoped(self):
         database = self._database()
         database.migrate()

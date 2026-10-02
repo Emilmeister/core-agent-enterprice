@@ -411,9 +411,71 @@ class ChatFileContract:
             self.service.review_material(batch["batch_id"], self.binding,
                 run_id=self.record.run_id, task_id=self.record.task_id)
         self.assertEqual(caught.exception.code, "ARTIFACT_INTEGRITY_FAILED")
+    def test_company_scope_precedes_expired_upload_limit(self):
+        foreign_options = self.options | {"tenant_id": "foreign"}
+        foreign = self.service.prepare([{"raw": b"foreign"}], **foreign_options)
+        self.now += 1
+        own = self.prepare()
+        self.assertEqual(own["manifest"]["tenant_id"], self.binding.tenant_id)
+        self.now += 301
+        self.assertEqual(self.service.sweep(startup=True, limit=1,
+                         tenant_id=self.binding.tenant_id)["cleaned"], 1)
+        self.assertEqual(self.store.get(foreign["batch_id"], "foreign")["state"], "staging")
+        self.assertIn(foreign["batch_id"], os.listdir(self.service.uploads))
+        self.assertNotIn(own["batch_id"], os.listdir(self.service.uploads))
+        self.assertEqual(self.service.sweep(startup=True)["cleaned"], 1)
 
 
 class MemoryChatFileTests(ChatFileContract, unittest.TestCase):
+    def test_scoped_rowless_cleanup_retains_legacy_foreign_and_global_references(self):
+        import json
+        own, legacy, referenced = self.prepare(), self.prepare(), self.prepare()
+        foreign = self.service.prepare([{"raw": b"foreign"}], **(self.options | {"tenant_id": "foreign"}))
+        for batch in (own, legacy, referenced, foreign):
+            del self.store.rows[batch["batch_id"]]
+        legacy_path = Path(self.directory.name) / "private/uploads" / legacy["batch_id"] / ".manifest.json"
+        manifest = json.loads(legacy_path.read_text())
+        manifest.pop("tenant_id")
+        legacy_path.write_text(json.dumps(manifest))
+        self.workflow.create(WorkflowRecord(str(uuid.uuid4()), str(uuid.uuid4()), "foreign-context",
+            "foreign", "foreign-owner", None, "RUNNING", 1,
+            {}, {"file_batch_id": referenced["batch_id"]}))
+        self.now += 24 * 3600
+        cleaned = 0
+        for _ in range(5):
+            result = self.service.sweep(tenant_id=self.binding.tenant_id, limit=1)
+            cleaned += result["cleaned"]
+            if not result["has_more"]:
+                break
+        self.assertEqual(cleaned, 1)
+        remaining = os.listdir(self.service.uploads)
+        self.assertNotIn(own["batch_id"], remaining)
+        for batch in (legacy, foreign, referenced):
+            self.assertIn(batch["batch_id"], remaining)
+        self.assertEqual(self.service.sweep()["cleaned"], 2)
+        self.assertIn(referenced["batch_id"], os.listdir(self.service.uploads))
+
+    def test_scoped_rowless_scan_is_bounded_and_reaches_own_batch(self):
+        foreign = [self.service.prepare([{"raw": b"foreign"}],
+            **(self.options | {"tenant_id": "foreign"})) for _ in range(3)]
+        own = self.prepare()
+        for batch in (*foreign, own):
+            del self.store.rows[batch["batch_id"]]
+        self.now += 24 * 3600
+        with patch("core_agent.chat_files.os.open", wraps=os.open) as opened:
+            result = self.service.sweep(tenant_id=self.binding.tenant_id, limit=1)
+        self.assertEqual(sum(call.args[0] == ".manifest.json" for call in opened.call_args_list), 1)
+        cleaned = result["cleaned"]
+        for _ in range(4):
+            result = self.service.sweep(tenant_id=self.binding.tenant_id, limit=1)
+            cleaned += result["cleaned"]
+            if not result["has_more"]:
+                break
+        self.assertEqual(cleaned, 1)
+        self.assertNotIn(own["batch_id"], os.listdir(self.service.uploads))
+        for batch in foreign:
+            self.assertIn(batch["batch_id"], os.listdir(self.service.uploads))
+
     def setUp(self):
         self.workflow = InMemoryWorkflowStore()
         self.store = MemoryChatFileStore(self.workflow, lambda binding: None)

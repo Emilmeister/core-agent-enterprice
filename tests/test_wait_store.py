@@ -226,6 +226,35 @@ class WaitStoreTests(unittest.TestCase):
             self.store.get_wait(wait.wait_id, tenant_id="tenant").applied_at
         )
 
+    def test_company_scope_precedes_wait_batches_and_cancel_recovery(self):
+        store = InMemoryWorkflowStore(clock=lambda: self.now)
+        waits, records = [], []
+        for tenant in ("foreign", "foreign", "tenant"):
+            self.now += 1
+            record = store.create(WorkflowRecord(
+                str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), tenant,
+                "owner", None, "RUNNING", 1, {"prompt": "wait"}, {},
+            ))
+            token = store.acquire_lease(record.run_id, tenant_id=tenant, owner_id="owner",
+                                        worker_id="worker", ttl=100)
+            waits.append(store.enter_wait(record, kind="timer", source_id="timer",
+                subject={"until": "private"}, continuation={"version": 1, "phase": "tool_wait", "call_id": "timer"}, deadline=self.now + 10,
+                snapshot=record.snapshot, lease_token=token))
+            records.append(record)
+        store.request_cancel(records[0].run_id, tenant_id="foreign", owner_id="owner")
+        self.assertFalse(store.recoverable(tenant_id="tenant", limit=1))
+        self.assertEqual(store.pending_waits(tenant_id="tenant", limit=1), (waits[2],))
+        self.assertEqual(store.pending_waits(tenant_id="tenant", limit=1,
+            after=(waits[1].created_at, waits[1].wait_id)), (waits[2],))
+        self.now += 20
+        self.assertEqual(store.expire_waits(tenant_id="tenant", limit=1)[0].wait_id, waits[2].wait_id)
+        self.assertIsNone(store.get_wait(waits[0].wait_id, tenant_id="foreign").outcome)
+        self.assertIsNone(store.get_wait(waits[1].wait_id, tenant_id="foreign").outcome)
+        self.assertEqual([r.run_id for r in store.recoverable(tenant_id="tenant", limit=1)],
+                         [records[2].run_id])
+        self.assertEqual(len(store.expire_waits()), 2)
+        self.assertEqual(len(store.recoverable()), 3)
+
     def test_unresolved_wait_cannot_be_applied_and_terminal_transition_closes_it(self):
         wait = self.wait()
         self.token = self.lease()

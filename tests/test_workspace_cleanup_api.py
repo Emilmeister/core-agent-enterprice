@@ -160,7 +160,7 @@ class WorkspaceCleanupAPITests(AuthAppTestCase):
             self.assertEqual((directory / "a.txt").read_bytes(), b"alpha")
         with patch.object(self.service, "recover", wraps=self.service.recover) as recover:
             await asyncio.to_thread(self.agent._recover_workflows_once)
-            recover.assert_called_once_with(limit=100)
+            recover.assert_called_once_with(limit=100, tenant_id=binding.tenant_id)
         self.assertFalse((directory / "a.txt").exists())
         self.assertFalse(self.service.preview_state(binding)["cleanup_pending"])
         final = await self.http.get(self.url(), headers=self.headers("owner-b"))

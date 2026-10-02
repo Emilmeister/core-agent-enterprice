@@ -460,6 +460,35 @@ class MemoryRemoteSchedulerTests(RemoteSchedulerContract, unittest.TestCase):
     def competitor(self, handler):
         return self.scheduler
 
+    def test_company_scope_precedes_remote_recovery_and_timeout_limit(self):
+        calls = []
+        def handler(claim, cancel):
+            calls.append(claim.tenant_id)
+            current = self.scheduler.read_remote_claim(claim)
+            self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
+                checkpoint={**current["checkpoint"], "send_started": True,
+                            "next_poll_at": current["now"]})
+            return REMOTE_TASK_PENDING
+        self.scheduler.register("remote_a2a", handler)
+        foreign_tenant = str(uuid.uuid4())
+        tasks = []
+        for tenant in (foreign_tenant, self.tenant):
+            tasks.append(self.scheduler.start_remote(self.contract(tenant_id=tenant, timeout_seconds=10),
+                owner_id=self.owner, tenant_id=tenant, task_id=str(uuid.uuid4())))
+            self.settle()
+        calls.clear()
+        with self.scheduler._lock:
+            self.scheduler._remote[tasks[0].id]["cancel_requested"] = True
+        self.assertEqual(self.scheduler.recover(tenant_id=self.tenant, ready=lambda *_: False), 1)
+        self.settle()
+        self.assertEqual(calls, [self.tenant])
+        self.assertEqual(tasks[0].state, "working")
+        self.now += 11
+        self.assertEqual(self.scheduler.expire_remote(limit=1, tenant_id=self.tenant), 1)
+        self.assertEqual(tasks[0].state, "working")
+        self.assertEqual(self.scheduler.expire_remote(limit=1), 1)
+        self.assertEqual(tasks[0].error.code, "REMOTE_OPERATION_TIMEOUT")
+
     def test_concurrent_same_id_admission_cannot_reset_send_intent(self):
         admitted, release = threading.Event(), threading.Event()
         accepted, errors, sent = [], [], []
@@ -514,6 +543,46 @@ class MemoryRemoteSchedulerTests(RemoteSchedulerContract, unittest.TestCase):
 
 @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "set TEST_DATABASE_URL to run PostgreSQL remote scheduler tests")
 class PostgresRemoteSchedulerTests(RemoteSchedulerContract, unittest.TestCase):
+    def test_company_scope_precedes_remote_cancel_recovery_and_timeout_limit(self):
+        foreign = str(uuid.uuid4())
+        def cleanup_foreign():
+            with self.database.transaction() as connection:
+                connection.execute("DELETE FROM core_notifications WHERE tenant_id=%s", (foreign,))
+                connection.execute("DELETE FROM core_background_tasks WHERE tenant_id=%s", (foreign,))
+        self.addCleanup(cleanup_foreign)
+        calls = []
+        def handler(claim, cancel):
+            calls.append(claim.tenant_id)
+            current = self.scheduler.read_remote_claim(claim)
+            self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
+                checkpoint={**current["checkpoint"], "send_started": True, "next_poll_at": current["now"]})
+            return REMOTE_TASK_PENDING
+        self.scheduler.register("remote_a2a", handler)
+        tasks = []
+        for tenant in (foreign, self.tenant):
+            tasks.append(self.scheduler.start_remote(self.contract(tenant_id=tenant, timeout_seconds=10),
+                owner_id=self.owner, tenant_id=tenant, task_id=str(uuid.uuid4())))
+            self.settle()
+        calls.clear()
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE core_background_tasks SET cancel_requested=true WHERE id=%s", (tasks[0].id,))
+            original = connection.execute("SELECT * FROM core_background_tasks WHERE id=%s", (tasks[0].id,)).fetchone()
+        self.assertEqual(self.scheduler.recover(tenant_id=self.tenant, ready=lambda *_: True), 1)
+        self.settle()
+        self.assertEqual(calls, [self.tenant])
+        with self.database.pool.connection() as connection:
+            self.assertEqual(connection.execute("SELECT * FROM core_background_tasks WHERE id=%s", (tasks[0].id,)).fetchone(), original)
+        for task in tasks:
+            self.advance(task.id, 11)
+        with self.database.pool.connection() as connection:
+            due_foreign = connection.execute("SELECT * FROM core_background_tasks WHERE id=%s", (tasks[0].id,)).fetchone()
+        self.assertEqual(self.scheduler.expire_remote(limit=1, tenant_id=self.tenant), 1)
+        with self.database.pool.connection() as connection:
+            self.assertEqual(connection.execute("SELECT * FROM core_background_tasks WHERE id=%s", (tasks[0].id,)).fetchone(), due_foreign)
+        self.assertEqual(self.scheduler.expire_remote(limit=1), 1)
+        self.assertEqual(self.scheduler.get(tasks[0].id, tenant_id=foreign, owner_id=self.owner).error.code,
+                         "REMOTE_OPERATION_TIMEOUT")
+
     def setUp(self):
         self.tenant, self.owner = str(uuid.uuid4()), str(uuid.uuid4())
         self.database = PostgresDatabase(os.environ["TEST_DATABASE_URL"], min_size=0, max_size=5)

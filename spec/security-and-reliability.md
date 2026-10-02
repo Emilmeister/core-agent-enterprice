@@ -92,6 +92,11 @@ Durable continuation является свойством целевого runtim
 - Cross-tenant identifiers возвращают not-found semantics, если раскрытие существования запрещено.
 - Quotas применяются до выделения дорогого model/execution ресурса.
 - Child runs всегда наследуют tenant и не могут сменить его через arguments.
+- Authenticated deployment восстанавливает только свою configured company.
+  Tenant чужой persisted row не является разрешением использовать текущий
+  model/provider, process, remote credentials либо cleanup/push executor.
+  Legacy rowless upload manifest без доказанного tenant сохраняется для
+  reconciliation; company не выводится из UUID, имени файла или содержимого.
 
 ## Supply chain
 

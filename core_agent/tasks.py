@@ -440,12 +440,14 @@ class TaskScheduler:
                         raise
                 return task
 
-    def expire_remote(self, limit=100):
+    def expire_remote(self, limit=100, *, tenant_id=None):
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise CoreError("CONFIG_INVALID")
         expired = 0
         with self._lock:
             for identity, row in tuple(self._remote.items()):
+                if tenant_id is not None and row["contract"]["tenant_id"] != tenant_id:
+                    continue
                 task = self._tasks[identity]
                 _remote_checkpoint(row["checkpoint"])
                 if task.state not in _REMOTE_TERMINAL and _remote_expired(row["checkpoint"], self.clock()):
@@ -636,21 +638,22 @@ class TaskScheduler:
             ready.set()
         return task
 
-    def recover(self, *, ready=None):
+    def recover(self, *, ready=None, tenant_id=None):
         if self._closed:
             return 0
         recovered = 0
         with self._lock:
             candidates = tuple((task_id, self._recovery.get(task_id), self._handlers.get(self._kinds.get(task_id)),
                                 self._kinds.get(task_id) == REMOTE_KIND or self._tasks[task_id].cancel_event.is_set())
-                               for task_id in self._suspended - self._active)
+                               for task_id in self._suspended - self._active
+                               if tenant_id is None or self._recovery.get(task_id, (None, None, None))[2] == tenant_id)
         for task_id, recovery, handler, bypass_ready in candidates:
             if recovery is None or handler is None:
                 continue
-            run, contract, tenant_id = recovery
+            run, contract, task_tenant_id = recovery
             # Readiness reads workflow state; SDK projection takes workflow then
             # scheduler locks. Never call the workflow while holding this lock.
-            ready_now = bypass_ready or ready is not None and ready(task_id, tenant_id)
+            ready_now = bypass_ready or ready is not None and ready(task_id, task_tenant_id)
             with self._lock:
                 if (
                     self._closed
@@ -670,7 +673,7 @@ class TaskScheduler:
                     continue
                 # A concurrent pass must not reuse old readiness if this worker
                 # resumes and reaches another wait before that pass returns.
-                self._recovery[task_id] = (run, contract, tenant_id)
+                self._recovery[task_id] = (run, contract, task_tenant_id)
                 self._suspended.remove(task_id)
                 self._active.add(task_id)
                 thread = threading.Thread(

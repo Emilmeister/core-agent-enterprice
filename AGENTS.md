@@ -269,9 +269,15 @@ Target spec может описывать больше текущего runtime.
   публикуется на уровне `CRITICAL`, включая `LOG_LEVEL=CRITICAL/FATAL`.
 - Настроенный Keycloak открывает `/a2a/owner/`, `/a2a/external/` и owner-only
   `/api/identity`; старые корневые A2A routes закрыты. Probes остаются публичными.
+  Agent Card на обоих A2A входах и обоих well-known путях фильтрует owner deny
+  по company из authenticated principal при каждом чтении; allow/HITL видимы.
   Introspection выполняется один раз на HTTP request без кэша; уже открытый
   ответ не проверяется заново. Incoming credentials не передаются remote agents.
 - Company scope задаётся deployment config и не меняется SDK tenant metadata.
+  Автоматические recovery, timeout, cleanup, A2A projection и push ограничены
+  `auth_settings.tenant` до выборки рабочих записей, locks/claims и side effects.
+  Generic runtime без trusted recovery tenant сохраняет platform-wide scope.
+  Неоднозначные legacy push IDs не разрешают пересылать payload другой компании.
   Владельцы используют общий scope, внешний caller — стабильный issuer/sub.
   External role исключает owner authority. Owner-wide доступ к задаче сохраняет
   её исходного owner; actor identity отдельно записывается в admission audit и
@@ -304,6 +310,9 @@ Target spec может описывать больше текущего runtime.
   Memory admission берёт async locks до синхронного workflow/Task commit без await.
 - File service создаётся до recovery. Startup/hourly bounded sweep использует
   original age, немедленно продолжает backlog и не удаляет accepted quarantine.
+  Новые upload manifests v1 содержат trusted tenant; scoped rowless sweep
+  сохраняет legacy/foreign manifests, ограничивает обход каждого прохода и
+  проверяет authoritative references всех компаний перед удалением.
   Временная ошибка публикации принятого immutable batch сохраняет pending
   delivery для recovery вместо ложного отказа приёма; model input ждёт публикации.
 - Run input содержит ровно `prompt`; MCP-серверы и skills задаются

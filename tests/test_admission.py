@@ -648,6 +648,85 @@ class MemoryAtomicAdmissionTests(AuthAppTestCase):
 class PostgresAuthAdmissionTests(AuthAdmissionTests):
     use_postgres = True
 
+    async def test_restart_recovers_only_configured_company_before_batch_limit_and_projection(self):
+        from core_agent.model import ModelResponse, ScriptedModel
+        from core_agent.workflow import PostgresWorkflowStore, TERMINAL_STATES
+        from psycopg.types.json import Jsonb
+
+        first_agent = self.app.state.core_agent
+        first_agent._recovery_stop.set()
+        first_agent._recovery_thread.join(5)
+        self.assertFalse(first_agent._recovery_thread.is_alive())
+        first_context = self.context("owner-a")
+        admitted = []
+        for index in range(102):
+            context = self.context("owner-a")
+            message = self.sdk_message("foreign-" + str(index), "foreign-chat-" + str(index))
+            message.parts[0].text = "foreign company prompt"
+            accepted = await self.app.state.a2a_request_handler.admission_handler(message, context)
+            admitted.append(accepted)
+            first_agent.workflow_store.release_lease(accepted.run_id, tenant_id=context.tenant,
+                worker_id=first_agent._worker_id, token=accepted.lease_token)
+        database = PostgresDatabase(TEST_DATABASE_URL)
+        self.addCleanup(database.close)
+        second_tenant = "company-b-" + uuid.uuid4().hex
+        def cleanup_companies():
+            workflows = PostgresWorkflowStore(database)
+            for admission in admitted:
+                record = workflows.lookup_task(admission.task.id)
+                if record.state not in TERMINAL_STATES:
+                    workflows.transition(record.run_id, tenant_id=record.tenant_id,
+                        owner_id=record.owner_id, expected_version=record.version,
+                        state="CANCELLED", snapshot=record.snapshot, event_kind="test.cleanup")
+        self.addCleanup(cleanup_companies)
+        with database.transaction() as connection:
+            connection.execute("UPDATE core_runs SET state='COMPLETED', result=%s, version=version+1 WHERE run_id=%s",
+                (Jsonb({"message": "foreign company result", "complete": True,
+                        "completion_reason": "completed", "usage": {"model_turns": 0, "tool_calls": 0}}), admitted[0].run_id))
+        self.app.state.close()
+        self.app.state.database.close()
+
+        def foreign_state():
+            with database.pool.connection() as connection:
+                return (
+                    connection.execute("SELECT * FROM core_runs WHERE tenant_id=%s ORDER BY run_id", (first_context.tenant,)).fetchall(),
+                    connection.execute("SELECT * FROM core_a2a_tasks WHERE tenant=%s ORDER BY task_id", (first_context.tenant,)).fetchall(),
+                )
+
+        before = foreign_state()
+        second_model = ScriptedModel([ModelResponse(message="company B result")])
+        second_model.model = "auth-test-model"
+        with patch.dict(os.environ, {"CORE_AGENT_TENANT_ID": second_tenant}):
+            seed_database = PostgresDatabase(TEST_DATABASE_URL)
+            self.addCleanup(seed_database.close)
+            with patch("core_agent.runtime.CoreAgent.recover_workflows"):
+                seed = create_app(model=second_model, database=seed_database,
+                                  auth_transport=httpx.MockTransport(self.introspect))
+            self.addCleanup(seed.state.close)
+            second_context = self.context("owner-a")
+            message = self.sdk_message("own", "own-chat")
+            message.parts[0].text = "company B prompt"
+            accepted = await seed.state.a2a_request_handler.admission_handler(message, second_context)
+            admitted.append(accepted)
+            seed.state.core_agent.workflow_store.release_lease(accepted.run_id, tenant_id=second_context.tenant,
+                worker_id=seed.state.core_agent._worker_id, token=accepted.lease_token)
+            seed.state.close()
+            seed_database.close()
+            self.assertEqual(foreign_state(), before)
+            recovered_database = PostgresDatabase(TEST_DATABASE_URL)
+            self.addCleanup(recovered_database.close)
+            recovered = create_app(model=second_model, database=recovered_database,
+                                   auth_transport=httpx.MockTransport(self.introspect))
+        self.addCleanup(recovered.state.close)
+        agent = recovered.state.core_agent
+        async with asyncio.timeout(5):
+            while agent.workflow_store.lookup_task(accepted.task.id).state != "COMPLETED" or agent._recovery_workers:
+                await asyncio.sleep(0.02)
+        self.assertEqual([call.context for call in second_model.calls], ["company B prompt"])
+        self.assertEqual(agent.workflow_store.lookup_task(accepted.task.id).result["message"], "company B result")
+        self.assertEqual(foreign_state(), before)
+        self.assertFalse(self.model.calls)
+
     async def test_borrowed_connection_keeps_root_dedup_busy_and_history_in_outer_transaction(self):
         previous_task = (await self.send("previous", "borrowed-chat")).json()["task"]
         agent = self.app.state.core_agent

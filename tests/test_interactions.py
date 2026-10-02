@@ -165,6 +165,31 @@ class OwnerSettingsAPITests(AuthAppTestCase):
         })
         self.assertEqual(missing.status_code, 404)
 
+    async def test_owner_deny_refreshes_both_agent_cards_without_changing_other_company(self):
+        policies = await self.http.get("/api/tool-policies", headers=self.headers("owner-a"))
+        tool = next(item for item in policies.json()["tools"] if item["canonical_name"] == "core_python_exec")
+        for mode, revision in (("deny", 0), ("allow", 1), ("require_hitl", 2)):
+            changed = await self.http.put("/api/tool-policies/core_python_exec", headers=self.headers("owner-a"), json={
+                "mode": mode, "guardrails_exempt": False, "expected_revision": revision,
+                "expected_origin": tool["origin"],
+            })
+            self.assertEqual(changed.status_code, 200, changed.text)
+            for kind, token in (("owner", "owner-b"), ("external", "external-a")):
+                for filename in ("agent-card.json", "agent.json"):
+                    with self.subTest(mode=mode, kind=kind, filename=filename):
+                        card = await self.http.get(f"/a2a/{kind}/.well-known/{filename}", headers=self.headers(token))
+                        self.assertEqual(card.status_code, 200, card.text)
+                        skills = {item["id"] for item in card.json()["skills"]}
+                        self.assertEqual("core_python_exec" in skills, mode != "deny")
+                        self.assertIn("core_task_list", skills)
+            if mode == "deny":
+                authenticator = self.app.state.authenticator
+                with patch.object(authenticator, "settings", replace(authenticator.settings, tenant="other-company")):
+                    card = await self.http.get("/a2a/owner/.well-known/agent-card.json", headers=self.headers("owner-a"))
+                    self.assertEqual(card.status_code, 200, card.text)
+                    self.assertIn("core_python_exec", {item["id"] for item in card.json()["skills"]})
+        self.assertFalse(self.model.calls)
+
     async def test_stale_ui_cannot_allow_a_different_mcp_origin_with_same_alias(self):
         agent = self.app.state.core_agent
         agent.platform_config = replace(agent.platform_config, allowed_mcp_servers={"docs_a", "docs"})
