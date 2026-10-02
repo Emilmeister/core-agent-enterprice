@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import tempfile
 import threading
@@ -36,7 +37,7 @@ from core_agent.push import (
     DurablePushNotificationSender,
     PostgresPushNotificationConfigStore,
 )
-from core_agent.model import ModelResponse, ScriptedModel
+from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.lifecycle import PostgresRetentionManager
 from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, WorkflowRecord
 from psycopg.types.json import Jsonb
@@ -1330,6 +1331,94 @@ class PostgresRestartTests(unittest.TestCase):
             store.delete("tenant-2", second.id)
             self.assertFalse(blob.exists())
             reopened.close()
+
+    def test_large_tool_result_survives_postgres_restart_without_redispatch(self):
+        class ProcessStopped(BaseException):
+            pass
+
+        database_url = os.environ["TEST_DATABASE_URL"]
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        blob = "Начало\n" + "x" * 40_000 + "\nCONFIRMED_TAIL"
+        first_connector = InMemoryMcpConnector(
+            catalogs={"docs": {"search": {"type": "object"}}},
+            results={"docs.search": {"blob": blob}},
+        )
+        first_model = ScriptedModel([ModelResponse(
+            tool_requests=(ToolRequest("large-result", "docs_search", {}),))])
+        first_model.model = "offload-test-model"
+        second_model = ScriptedModel([ModelResponse(message="continued after restart")])
+        second_model.model = first_model.model
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+            "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+            "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/blobs",
+            "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "MCP_URL": "https://peer.test/docs",
+            "MCP_ALLOWED_SERVERS": "docs", "MCP_ALLOWED_TOOLS": "docs.search",
+            "MCP_READ_ONLY_TOOLS": "docs.search", "LLM_CONTEXT_WINDOW": "10000",
+            "LLM_MAX_TOKENS": "500",
+        }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
+            first = create_app(model=first_model, mcp_connector=first_connector, database=database)
+            agent = first.state.core_agent
+            transition = agent.workflow_store.transition
+
+            def stop_after_commit(*args, **kwargs):
+                saved = transition(*args, **kwargs)
+                if kwargs.get("event_kind") == "tool.completed":
+                    raise ProcessStopped()
+                return saved
+
+            try:
+                self.assertIsInstance(agent.artifact_store, PostgresArtifactStore)
+                with patch.object(agent.workflow_store, "transition", side_effect=stop_after_commit):
+                    with self.assertRaises(ProcessStopped):
+                        agent.run({"prompt": "Keep the full output"}, task_id="large-output-restart",
+                                  session_id="offload-chat", tenant_id="tenant-1", identity="owner-1")
+                original = agent.workflow_store.lookup_task("large-output-restart")
+                original_context = agent._context_from_dict(original.snapshot["context"])
+                full_result = next(item.content for item in original_context.transcript if item.kind == "tool_result")
+                reference = json.loads(next(item.content for item in original_context.active
+                                            if item.kind == "tool_result"))["output"]["artifact"]
+                self.assertEqual(json.loads(full_result)["output"]["blob"], blob)
+                self.assertEqual(len(first_model.calls), 1)
+            finally:
+                first.state.close()
+
+            reopened = PostgresDatabase(database_url, min_size=0, max_size=3)
+            self.addCleanup(reopened.close)
+            second_connector = InMemoryMcpConnector(catalogs=first_connector.catalogs)
+            second = create_app(model=second_model, mcp_connector=second_connector, database=reopened)
+            try:
+                recovery = second.state.core_agent
+                with patch.object(second_connector, "call", side_effect=AssertionError("Unexpected redispatch")) as dispatched:
+                    result = recovery.resume_task("large-output-restart")
+                self.assertEqual(result.message, "continued after restart")
+                self.assertEqual(result.usage.tool_calls, 1)
+                dispatched.assert_not_called()
+                wire = next(item for item in second_model.calls[0].messages if item.get("role") == "tool")
+                active = json.loads(wire["content"])
+                self.assertEqual(active["output"]["artifact"], reference)
+                self.assertTrue(active["output"]["truncated"])
+                self.assertLess(recovery.token_counter(wire["content"]), recovery.context_window // 2)
+                self.assertNotIn("CONFIRMED_TAIL", active["output"]["excerpt"])
+                final = recovery.workflow_store.lookup_task("large-output-restart")
+                restored = recovery._context_from_dict(final.snapshot["context"])
+                self.assertEqual([item.content for item in restored.transcript if item.kind == "tool_result"],
+                                 [full_result])
+                pins = [json.loads(item.content) for item in restored.active
+                        if item.kind == "runtime_references" and item.pinned]
+                self.assertIn({"artifact": reference}, pins)
+                metadata, content = recovery.artifact_store.get("tenant-1", reference["id"])
+                self.assertEqual(content.decode(), full_result)
+                self.assertEqual((metadata.digest, metadata.size), (reference["digest"], reference["size"]))
+                self.assertEqual(metadata.provenance["tool_call_id"], "large-result")
+                with self.assertRaises(CoreError) as denied:
+                    recovery.artifact_store.get("tenant-2", reference["id"])
+                self.assertEqual(denied.exception.code, "NOT_FOUND")
+            finally:
+                second.state.close()
 
     def test_coordinated_retention_deletes_run_family_content_and_keeps_tombstone(self):
         database = self._database()

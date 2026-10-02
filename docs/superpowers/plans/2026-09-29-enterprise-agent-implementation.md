@@ -178,6 +178,22 @@ docker build -t core-agent:local .
 `.github/workflows/ci.yml`. Bubblewrap/egress проверяются на Linux и целевом
 кластере; установленный `kubectl` сам по себе не доказывает наличие доступа к нему.
 
+## PostgreSQL durability большого результата инструмента
+
+- [x] Проследить actual tool dispatch → full artifact/excerpt → tool.completed
+  commit → context replay; не вводить второй механизм сохранения результата.
+- [x] Добавить ordinary CI regression в `tests/test_postgres_persistence.py`:
+  fault после настоящего commit, закрытие app/pool, новый app/pool и resume_task.
+  Проверяются exact Unicode/full result, bounded model excerpt, прежний pinned
+  reference, transcript/blob/digest/provenance, чужой tenant и отсутствие redispatch.
+- [x] Выполнить полный ordinary PostgreSQL/Keycloak CI: 1634 tests,
+  260.004 секунды, exit0, три dedicated skips. Evidence —
+  `.local-evidence/offload-postgres-ci-final/`. После read-only review уточнены
+  assert pinned и early pool cleanup; targeted test повторён: 0.468 секунды,
+  exit0 (`.local-evidence/offload-postgres-reviewed.log`). Product code не менялся.
+- [x] Обновить CTX-03/release criterion и exact spec hashes после proof.
+  Restart PostgreSQL daemon, OS kill и target CSI этим тестом не подтверждаются.
+
 ## Явный перенос remote configuration
 
 - [x] Уточнить operator-only import в architecture/config/acceptance: version1
@@ -215,10 +231,11 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
 
 - Обычный Python3.12 CI на свежей БД/schema24 с настоящими PostgreSQL/Keycloak:
   `uv sync --frozen`, migrations, Ruff и `uv run python -m unittest discover
-  -s tests -v` — 1633 tests, 256.352 секунды, exit0. Три dedicated skips
+  -s tests -v` — 1634 tests, 260.004 секунды, exit0. Три dedicated skips
   относятся к native sandbox, actual browser и memory-loop ownership case;
   PostgreSQL/Keycloak tests не пропущены. Evidence —
-  `.local-evidence/remote-import-ci-reviewed-final/`. Предыдущие failed runs сохранены:
+  `.local-evidence/offload-postgres-ci-final/`; уточнённый test после review
+  отдельно проходит. Предыдущие failed runs сохранены:
   remote-import CI выявил необходимость учесть новые CLI ENV в strict startup
   inventory; актуальный список исправлен без ослабления теста. Ранее
   тест summary пересекался с legitimate detector_busy из background tool.
