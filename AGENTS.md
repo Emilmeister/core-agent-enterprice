@@ -864,7 +864,11 @@ run получает отдельные MCP session и negotiated version; пе�
 - Existing recovery tick запускает bounded coordinator pass. Production leader
   держит company session advisory lock на выделенной PostgreSQL connection; на
   ней же коммитятся automatic occurrences. Memory tick только планирует один job
-  на ASGI loop. Startup/re-leadership/gap >60 секунд фиксируют cutoff, catch-up
+  на ASGI loop.
+  При graceful close coordinator освобождает свой advisory lock с подтверждением
+  PostgreSQL перед закрытием socket; close всегда выполняется и при ошибке unlock.
+  Release остаётся под `_pg_guard` после завершения current transaction.
+  Startup/re-leadership/gap >60 секунд фиксируют cutoff, catch-up
   отсутствует; healthy lateness до60 секунд допускается. Shutdown не отменяет
   admitted Tasks. No provider call inside schedule/admission transactions.
 - Owner history включает только safe `schedule_notice` проекцию skipped events,

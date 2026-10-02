@@ -306,6 +306,21 @@ assertions не ослаблены. Target AppArmor/live providers и production
 partial до полного fixed-contract audit; target AppArmor/live providers и
 production cutover остаются отдельными gates.
 
+## Подтверждённое освобождение cron leadership
+
+- [x] Full suite обнаружил race graceful close: PostgreSQL мог ещё держать
+  session lock после возврата socket.close(), и successor не получал leadership.
+  Real-PG regression с отложенным disconnect воспроизводит дефект до исправления.
+- [x] Coordinator освобождает только свой lock на той же owning connection
+  под существующим `_pg_guard`, ждёт server acknowledgement и всегда закрывает
+  connection в finally. Unknown commit/dedup и admission semantics сохраняются.
+- [x] Targeted 72 tests, включая весь migration backup/restore, и финальные
+  1660 tests (skipped3) прошли; sync/migration/Ruff/package/cleanup — exit0.
+  Read-only review не нашёл Important/Critical. Evidence —
+  `.local-evidence/cron-graceful-release-red/`,
+  `.local-evidence/cron-graceful-release-targeted/` и
+  `.local-evidence/startup-cron-reviewed-ci-final/`.
+
 ## Готовность к поставке
 
 Текущий срез включает owner UI, Keycloak scope, per-tool HITL/guardrails policy,

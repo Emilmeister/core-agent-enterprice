@@ -236,6 +236,39 @@ class PostgresCronLeaderTests(AuthAppTestCase):
         events = store.events(tenant, context_id=row["context_id"])
         self.assertEqual(sum(event["kind"] == "started" for event in events), 1)
 
+    async def test_graceful_close_releases_leadership_before_socket_disconnect(self):
+        import psycopg
+        from core_agent.cron_service import CronCoordinator
+
+        admission = self.app.state.core_agent.tool_runtime.environment_manager.validate_workspace_scope.__self__
+        store = CronStore(admission)
+        tenant = self.context("owner-a").tenant
+        coordinator = CronCoordinator(store, tenant)
+        self.addAsyncCleanup(coordinator.aclose)
+        await asyncio.to_thread(coordinator.tick)
+        self.assertTrue(coordinator._leader)
+        real = coordinator._connection
+        acquired = []
+        key = json.dumps(["core-agent-cron-leader", tenant], separators=(",", ":"))
+
+        class DelayedDisconnect:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def close(self):
+                try:
+                    with psycopg.connect(store.database.pool.conninfo, autocommit=True) as successor:
+                        acquired.append(successor.execute(
+                            "SELECT pg_try_advisory_lock(hashtextextended(%s,0))", (key,)
+                        ).fetchone()[0])
+                finally:
+                    real.close()
+
+        coordinator._connection = DelayedDisconnect()
+        await coordinator.aclose()
+        self.assertEqual(acquired, [True])
+        self.assertFalse(coordinator._leader)
+
     async def test_dedicated_leader_does_not_borrow_pool_or_stack_session_locks(self):
         from core_agent.cron_service import CronCoordinator
         agent = self.app.state.core_agent

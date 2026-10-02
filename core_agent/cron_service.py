@@ -21,6 +21,7 @@ class CronCoordinator:
     def __init__(self, store, tenant_id, on_admitted=None, log=None):
         self.store = store
         self.tenant_id = _text(tenant_id)
+        self._leader_key = json.dumps(["core-agent-cron-leader", self.tenant_id], separators=(",", ":"))
         self.on_admitted = on_admitted
         self.log = log
         self._guard = threading.Lock()
@@ -139,9 +140,8 @@ class CronCoordinator:
                 self._connection = psycopg.connect(pool.conninfo, autocommit=True, row_factory=dict_row,
                                                    connect_timeout=max(1, math.ceil(pool.timeout)))
             if not self._leader:
-                key = json.dumps(["core-agent-cron-leader", self.tenant_id], separators=(",", ":"))
                 self._leader = self._connection.execute(
-                    "SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS acquired", (key,)).fetchone()["acquired"]
+                    "SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS acquired", (self._leader_key,)).fetchone()["acquired"]
                 if not self._leader:
                     return
                 # A new session/leadership always establishes a fresh DB-clock
@@ -175,15 +175,23 @@ class CronCoordinator:
 
     def _disconnect(self):
         connection, self._connection = self._connection, None
-        self._leader = False
+        leader, self._leader = self._leader, False
         self._cutoff = None
         self._last_completed = None
         self._after = None
         if connection is not None:
             try:
-                connection.close()
+                if leader:
+                    # Wait for the server's release acknowledgement; closing the
+                    # socket alone can race a successor's immediate lock attempt.
+                    connection.execute("SELECT pg_advisory_unlock(hashtextextended(%s,0))", (self._leader_key,))
             except Exception as error:
-                self._log("cron.close_failed", error)
+                self._log("cron.release_failed", error)
+            finally:
+                try:
+                    connection.close()
+                except Exception as error:
+                    self._log("cron.close_failed", error)
 
     def _stop(self):
         with self._guard:
