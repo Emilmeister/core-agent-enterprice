@@ -2495,7 +2495,7 @@ class ConfigurationTransferTests(unittest.TestCase):
         """A misconfigured deployment must exit 1 with one readable line."""
         from core_agent.app import main
 
-        for environment, expected in (
+        cases = [
             ({"LLM_MODEL": ""}, "LLM_MODEL is required"),
             (
                 {"LLM_MODEL": "m", "LLM_API_FORMAT": "gemini"},
@@ -2505,17 +2505,52 @@ class ConfigurationTransferTests(unittest.TestCase):
                 {"LLM_MODEL": "m", "A2A_STREAMING_ENABLED": "maybe"},
                 "A2A_STREAMING_ENABLED must be boolean",
             ),
-        ):
+        ]
+        cases.extend((
+            {"LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled", name: "invalid-number-canary"},
+            name + " must be numeric",
+        ) for name in ("LLM_TIMEOUT", "LLM_MAX_TOKENS", "LLM_CONTEXT_WINDOW",
+                       "RUNTIME_MAX_LLM_CALLS", "EVENTS_COMPACTION_INTERVAL", "PORT",
+                       "A2A_STREAMING_BUFFER_SIZE", "MAX_CHUNK_SIZE"))
+        cases.append(({"LLM_MODEL": "m", "LOG_LEVEL": "invalid-level-canary"}, "LOG_LEVEL must be a valid logging level"))
+        cases.append(({"LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled",
+                       "REMOTE_AGENTS": "https://peer.example/a2a",
+                       "REMOTE_AGENTS_RETRYABLE_STATUS_CODES": "invalid-code-canary"},
+                      "REMOTE_AGENTS_RETRYABLE_STATUS_CODES must contain integers"))
+        cases.extend((
+            {"LLM_MODEL": "m", "LLM_TIMEOUT": "invalid-number-canary", "LOG_LEVEL": level},
+            "LLM_TIMEOUT must be numeric",
+        ) for level in ("CRITICAL", "FATAL"))
+        cases.extend((
+            {"LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled", name: "private-value-canary"},
+            expected,
+        ) for name, expected in (("TASK_STORAGE_TYPE", "unsupported TASK_STORAGE_TYPE"),
+                                 ("A2A_CAPABILITIES", "unknown A2A_CAPABILITIES")))
+        for environment, expected in cases:
             with self.subTest(environment=environment):
                 with patch.dict(
                     os.environ, {**BASE_ENVIRONMENT, **environment}, clear=True
-                ):
+                ), patch("core_agent.app.create_app", side_effect=create_app), patch("uvicorn.run") as listener:
                     with self.assertLogs("core_agent.runtime", "ERROR") as logs:
                         with self.assertRaises(SystemExit) as exit_code:
                             main()
                 self.assertEqual(exit_code.exception.code, 1)
                 self.assertIn(expected, logs.output[0])
                 self.assertIn("CONFIG_INVALID", logs.output[0])
+                self.assertNotIn("canary", "\n".join(logs.output))
+                listener.assert_not_called()
+
+    def test_model_timeout_rejects_nonfinite_values(self):
+        from core_agent.app import _model
+
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {
+                    **BASE_ENVIRONMENT, "LLM_MODEL": "m", "LLM_TIMEOUT": value,
+                }, clear=True), self.assertRaises(CoreError) as caught:
+                    _model()
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                self.assertEqual(caught.exception.message, "LLM_TIMEOUT must be finite")
 
     def test_thinking_disabled_turns_the_effort_off_explicitly(self):
         with patch.dict(

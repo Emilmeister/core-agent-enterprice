@@ -40,6 +40,7 @@
   и получает документированный default, кроме явно документированных allowlist:
   пустой `CORE_AGENT_ALLOWED_SKILLS` отключает навыки.
 - [ ] Невалидная конфигурация не поднимает listener, завершает процесс ненулевым кодом и печатает ровно одну строку с именем настройки и стабильным кодом, без traceback и без значений secret-переменных.
+- [ ] Неразбираемые числовые deployment values, `NaN`/infinite floats, неверный `LOG_LEVEL`, неизвестные `TASK_STORAGE_TYPE`/`A2A_CAPABILITIES` и нечисловые HTTP retry codes отклоняются с `CONFIG_INVALID`, именем настройки и без введённого значения; пустые значения сохраняют documented defaults, listener не запускается. Ошибка старта остаётся видимой при `LOG_LEVEL=CRITICAL/FATAL`.
 
 ## Kernel instructions
 

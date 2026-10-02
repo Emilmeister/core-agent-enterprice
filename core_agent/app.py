@@ -234,14 +234,17 @@ def _read_only_mcp_tools(servers):
     return {server: sorted(names) for server, names in grouped.items()}
 
 
-def _number(name, cast):
-    value = _env(name)
-    if not value:
+def _number(name, cast, default=""):
+    value = _env(name, default)
+    if value == "":
         return None
     try:
-        return cast(value)
-    except ValueError:
+        parsed = cast(value)
+    except (ValueError, TypeError, OverflowError):
         raise CoreError("CONFIG_INVALID", f"{name} must be numeric") from None
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        raise CoreError("CONFIG_INVALID", f"{name} must be finite")
+    return parsed
 
 
 def _reasoning_effort():
@@ -271,7 +274,7 @@ def _advertised_capabilities():
     unknown = requested - A2A_CAPABILITIES
     if unknown:
         raise CoreError(
-            "CONFIG_INVALID", f"unknown A2A_CAPABILITIES {','.join(sorted(unknown))}"
+            "CONFIG_INVALID", "unknown A2A_CAPABILITIES"
         )
     return requested
 
@@ -291,7 +294,7 @@ def _cache_ttl():
     """Anthropic accepts only 5m and 1h prompt-cache lifetimes."""
     if not _boolean("CONTEXT_CACHE_ENABLED", "true"):
         return None
-    return "1h" if int(_env("CONTEXT_CACHE_TTL_SECONDS", "600")) > 300 else "5m"
+    return "1h" if _number("CONTEXT_CACHE_TTL_SECONDS", int, default="600") > 300 else "5m"
 
 
 def _model():
@@ -305,13 +308,13 @@ def _model():
         base_url=_env("LLM_API_BASE"),
         endpoint=_env("LLM_ENDPOINT"),
         api_key=_env("LLM_API_KEY"),
-        timeout=float(_env("LLM_TIMEOUT", "120")),
-        max_tokens=int(_env("LLM_MAX_TOKENS", "4096")),
+        timeout=_number("LLM_TIMEOUT", float, default="120"),
+        max_tokens=_number("LLM_MAX_TOKENS", int, default="4096"),
         headers={**_entity_headers(), **_json("LLM_HEADERS_JSON")},
         extra_body=_json("LLM_EXTRA_BODY_JSON"),
         anthropic_version=_env("ANTHROPIC_VERSION", "2023-06-01"),
-        context_window=int(_env("LLM_CONTEXT_WINDOW", "128000")),
-        token_chars=int(_env("LLM_TOKEN_CHARS", "3")),
+        context_window=_number("LLM_CONTEXT_WINDOW", int, default="128000"),
+        token_chars=_number("LLM_TOKEN_CHARS", int, default="3"),
         reasoning_effort=_reasoning_effort(),
         temperature=_number("LLM_TEMPERATURE", float),
         top_p=_number("LLM_TOP_P", float),
@@ -320,7 +323,7 @@ def _model():
         presence_penalty=_number("LLM_PRESENCE_PENALTY", float),
         stream=_boolean("A2A_STREAMING_ENABLED", "true"),
         cache_ttl=_cache_ttl(),
-        cache_min_tokens=int(_env("CONTEXT_CACHE_MIN_TOKENS", "2048")),
+        cache_min_tokens=_number("CONTEXT_CACHE_MIN_TOKENS", int, default="2048"),
     )
 
 
@@ -330,12 +333,9 @@ def _guardrail_classifier(model):
     overrides = [_env(name) for name in names]
     if any(overrides) and not all(overrides):
         raise CoreError("CONFIG_INVALID", "All four GUARDRAILS_LLM settings are required together")
-    try:
-        timeout = float(_env("GUARDRAILS_TIMEOUT_SECONDS", "60"))
-        max_calls = int(_env("GUARDRAILS_MAX_CALLS", "32"))
-        max_input = int(_env("GUARDRAILS_MAX_INPUT_TOKENS", "100000"))
-    except (ValueError, OverflowError):
-        raise CoreError("CONFIG_INVALID", "Invalid guardrail limits") from None
+    timeout = _number("GUARDRAILS_TIMEOUT_SECONDS", float, default="60")
+    max_calls = _number("GUARDRAILS_MAX_CALLS", int, default="32")
+    max_input = _number("GUARDRAILS_MAX_INPUT_TOKENS", int, default="100000")
     if all(overrides):
         provider, name, base_url, api_key = overrides
         detector = CompatibleHttpModel(
@@ -389,7 +389,7 @@ def _session_database_url():
 def _task_storage_type(session_storage_type):
     backend = _env("TASK_STORAGE_TYPE", session_storage_type)
     if backend not in STORAGE_TYPES:
-        raise CoreError("CONFIG_INVALID", f"unsupported TASK_STORAGE_TYPE {backend}")
+        raise CoreError("CONFIG_INVALID", "unsupported TASK_STORAGE_TYPE")
     if backend == "postgres" and session_storage_type != "postgres":
         raise CoreError("CONFIG_CONFLICT", "durable tasks require postgres sessions")
     return backend
@@ -463,13 +463,13 @@ def _memory_registry(state, telemetry, *, enabled):
             "production requires MEMORY_STORAGE_TYPE=postgres; long-term memory "
             "silently lost on restart is not a production configuration",
         )
-    dimension = int(_env("EMBEDDING_DIMENSION", "768"))
+    dimension = _number("EMBEDDING_DIMENSION", int, default="768")
     headers = {
         "X-Title": _env("AGENT_NAME", "core-agent"),
         "X-Internal-Title": "evo_ai_agents",
         **_entity_headers(),
     }
-    timeout = float(_env("MEMORY_PROVIDER_TIMEOUT_SECONDS", "30"))
+    timeout = _number("MEMORY_PROVIDER_TIMEOUT_SECONDS", float, default="30")
     # Deployments usually serve embeddings and generation from one OpenAI-compatible
     # gateway; requiring the same address twice is its own way to end up with a
     # half-configured layer. The key is not inherited: rights on embeddings and on
@@ -527,7 +527,7 @@ def _memory_registry(state, telemetry, *, enabled):
         entity_extractor=extractor,
         embedding_provider=embedding_provider,
         telemetry=telemetry,
-        search_limit=int(_env("MEMORY_SEARCH_LIMIT", "10")),
+        search_limit=_number("MEMORY_SEARCH_LIMIT", int, default="10"),
     )
     return registry, {
         "backend": storage_type,
@@ -622,16 +622,17 @@ def _remote_agents():
             or "none",
         )
         return {}, configured, ()
+    try:
+        retryable_codes = {int(code) for code in _csv("REMOTE_AGENTS_RETRYABLE_STATUS_CODES", "500,502,503,504")}
+    except ValueError:
+        raise CoreError("CONFIG_INVALID", "REMOTE_AGENTS_RETRYABLE_STATUS_CODES must contain integers") from None
     registry = RemoteAgentRegistry(
         urls,
-        timeout=float(_env("REMOTE_AGENTS_TIMEOUT", "15.0")),
-        max_retries=int(_env("REMOTE_AGENTS_MAX_RETRIES", "3")),
-        retry_delay=float(_env("REMOTE_AGENTS_RETRY_DELAY", "1.0")),
-        retry_backoff=float(_env("REMOTE_AGENTS_RETRY_BACKOFF", "2.0")),
-        retryable_status_codes={
-            int(code)
-            for code in _csv("REMOTE_AGENTS_RETRYABLE_STATUS_CODES", "500,502,503,504")
-        },
+        timeout=_number("REMOTE_AGENTS_TIMEOUT", float, default="15.0"),
+        max_retries=_number("REMOTE_AGENTS_MAX_RETRIES", int, default="3"),
+        retry_delay=_number("REMOTE_AGENTS_RETRY_DELAY", float, default="1.0"),
+        retry_backoff=_number("REMOTE_AGENTS_RETRY_BACKOFF", float, default="2.0"),
+        retryable_status_codes=retryable_codes,
         api_key=_env("SEND_MESSAGE_API_KEY") or None,
     )
     connections = registry.connect()
@@ -804,8 +805,8 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
             "skills",
             "human_input",
         },
-        max_model_turns=int(_env("RUNTIME_MAX_LLM_CALLS", "100")),
-        max_tool_calls=int(_env("CORE_AGENT_MAX_TOOL_CALLS", "200")),
+        max_model_turns=_number("RUNTIME_MAX_LLM_CALLS", int, default="100"),
+        max_tool_calls=_number("CORE_AGENT_MAX_TOOL_CALLS", int, default="200"),
     )
     config = AgentConfig.from_dict(
         {
@@ -846,8 +847,8 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "compact_at_working_ratio": 0.90,
                 "compact_to_working_ratio": 0.15,
                 "compaction_enabled": _boolean("EVENTS_COMPACTION_ENABLED", "true"),
-                "compaction_interval": int(_env("EVENTS_COMPACTION_INTERVAL", "0")),
-                "compaction_overlap": int(_env("EVENTS_COMPACTION_OVERLAP_SIZE", "0")),
+                "compaction_interval": _number("EVENTS_COMPACTION_INTERVAL", int, default="0"),
+                "compaction_overlap": _number("EVENTS_COMPACTION_OVERLAP_SIZE", int, default="0"),
             },
             "execution": {
                 "environment_profile": (
@@ -865,20 +866,15 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
             "budgets": {
                 "model_turns": platform.max_model_turns,
                 "tool_calls": platform.max_tool_calls,
-                "depth": int(_env("CORE_AGENT_MAX_DEPTH", str(MAX_SUBAGENT_DEPTH))),
-                "fan_out": int(_env("CORE_AGENT_MAX_FAN_OUT", "4")),
+                "depth": _number("CORE_AGENT_MAX_DEPTH", int, default=str(MAX_SUBAGENT_DEPTH)),
+                "fan_out": _number("CORE_AGENT_MAX_FAN_OUT", int, default="4"),
             },
         }
     )
     registry = ToolRegistry()
-    try:
-        python_max_code_chars = int(_env("CORE_AGENT_PYTHON_MAX_CODE_CHARS", "100000"))
-        python_max_seconds = float(_env("CORE_AGENT_PYTHON_MAX_SECONDS", "120"))
-        python_max_output_bytes = int(
-            _env("CORE_AGENT_PYTHON_MAX_OUTPUT_BYTES", "1000000")
-        )
-    except ValueError as error:
-        raise CoreError("CONFIG_INVALID", "invalid Python execution limits") from error
+    python_max_code_chars = _number("CORE_AGENT_PYTHON_MAX_CODE_CHARS", int, default="100000")
+    python_max_seconds = _number("CORE_AGENT_PYTHON_MAX_SECONDS", float, default="120")
+    python_max_output_bytes = _number("CORE_AGENT_PYTHON_MAX_OUTPUT_BYTES", int, default="1000000")
     if min(
         python_max_code_chars, python_max_seconds, python_max_output_bytes
     ) <= 0 or not math.isfinite(python_max_seconds):
@@ -1273,7 +1269,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         PostgresArtifactStore(
             state["database"],
             durable_value,
-            max_bytes=int(_env("MAX_RESPONSE_SIZE", "100000000")),
+            max_bytes=_number("MAX_RESPONSE_SIZE", int, default="100000000"),
         )
         if state["database"] and durable_value
         else InMemoryArtifactStore()
@@ -1446,28 +1442,24 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         material_review_store=material_review_store,
         guardrail_classifier=guardrail_classifier,
         kernel_compiler=kernel,
-        context_window=int(
-            _env("LLM_CONTEXT_WINDOW", getattr(model, "context_window", 128_000))
-        ),
-        output_reserve=int(_env("LLM_MAX_TOKENS", getattr(model, "max_tokens", 4_096))),
+        context_window=_number("LLM_CONTEXT_WINDOW", int, default=getattr(model, "context_window", 128_000)),
+        output_reserve=_number("LLM_MAX_TOKENS", int, default=getattr(model, "max_tokens", 4_096)),
         token_counter=token_counter,
         artifact_store=artifact_store,
         response_files_service=response_files_service,
         retention_manager=retention_manager,
         log_content=_boolean("CORE_AGENT_LOG_CONTENT", "false"),
-        log_max_chars=int(_env("CORE_AGENT_LOG_MAX_CHARS", "12000")),
+        log_max_chars=_number("CORE_AGENT_LOG_MAX_CHARS", int, default="12000"),
         memory_registry=memory_registry,
         remote_agents=remote_connections,
         remote_registry=remote_registry,
         send_message_api_key=(_env("SEND_MESSAGE_API_KEY") or None) if remote_registry is None else None,
         platform_mcp=platform_mcp,
         declared_skills=_declared_skills(allowed_skills),
-        model_retries=int(_env("REFLECT_AND_RETRY_MAX_RETRIES", "3"))
+        model_retries=_number("REFLECT_AND_RETRY_MAX_RETRIES", int, default="3")
         if _boolean("REFLECT_AND_RETRY_ENABLED", "true")
         else 0,
-        budget_cancel_grace_seconds=float(
-            _env("CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS", "5")
-        ),
+        budget_cancel_grace_seconds=_number("CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS", float, default="5"),
     )
     agent._log(
         "startup.configuration",
@@ -1542,6 +1534,10 @@ def create_app(
     )
     if auth_settings and not _env("CHAT_WORKSPACE_ROOT", ""):
         raise CoreError("CONFIG_INVALID", "authenticated deployment requires CHAT_WORKSPACE_ROOT")
+    host = _env("HOST", "0.0.0.0")
+    port = _number("PORT", int, default="8000")
+    stream_buffer_size = _number("A2A_STREAMING_BUFFER_SIZE", int, default="10")
+    max_chunk_size = _number("MAX_CHUNK_SIZE", int, default="0")
     model = model or _model()
     push_key = _env("PUSH_NOTIFICATION_ENCRYPTION_KEY", "")
     state = _state(database)
@@ -1804,8 +1800,6 @@ def create_app(
     def signal_cancel(context):
         agent.signal_task_cancel(context.task_id)
 
-    host = _env("HOST", "0.0.0.0")
-    port = int(_env("PORT", "8000"))
     # An explicit AGENT_URL is authoritative; otherwise the card advertises the
     # address each request arrived on, so a proxied deployment stays callable.
     # URL_AGENT is the same setting: hosting platforms publish the public address
@@ -1954,8 +1948,8 @@ def create_app(
         push_config_store=push_config_store,
         push_sender=push_sender,
         shutdown_handler=close,
-        stream_buffer_size=int(_env("A2A_STREAMING_BUFFER_SIZE", "10")),
-        max_chunk_size=int(_env("MAX_CHUNK_SIZE", "0")),
+        stream_buffer_size=stream_buffer_size,
+        max_chunk_size=max_chunk_size,
         streaming_enabled=_boolean("A2A_STREAMING_ENABLED", "true")
         and "streaming" in advertised,
     )
@@ -2054,7 +2048,10 @@ def _configure_logging():
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
-    logger.setLevel(_env("LOG_LEVEL", "INFO").upper())
+    try:
+        logger.setLevel(_env("LOG_LEVEL", "INFO").upper())
+    except ValueError:
+        raise CoreError("CONFIG_INVALID", "LOG_LEVEL must be a valid logging level") from None
     logger.propagate = False
     return logger
 
@@ -2062,13 +2059,14 @@ def _configure_logging():
 def main():
     import uvicorn
 
-    logger = _configure_logging()
+    logger = logging.getLogger("core_agent.runtime")
     try:
+        _configure_logging()
         app = create_app()
     except CoreError as error:
         # A misconfigured deployment is an operator problem, not a bug: report the
         # offending setting on one readable line instead of a Python traceback.
-        logger.error("startup failed: %s [%s]", error.message, error.code)
+        logger.critical("startup failed: %s [%s]", error.message, error.code)
         # The inventory matters most on the path where startup did not finish.
         _log_environment(logger)
         raise SystemExit(1) from None

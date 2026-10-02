@@ -359,3 +359,24 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
   в `spec/implementation-status.md`; весь профиль не объявлен production-ready.
 - Main обновляется после согласованных проверок; проверенные логические
   этапы сохранены в постоянной feature-ветке.
+
+
+### Безопасная диагностика deployment configuration
+
+Числовые env в composition root используют существующий `_number` с сохранением
+пустых/dynamic defaults и нулевых значений. Malformed/NaN/infinite values,
+неверный LOG_LEVEL, storage/capability enums и HTTP retry codes завершают startup
+с CONFIG_INVALID и именем настройки без raw value/traceback; listener не запускается.
+Fatal diagnostic остаётся видимым при CRITICAL/FATAL. Регрессия входит в обычный
+`ConfigurationTransferTests`; общий CFG-03 остаётся partial до полного аудита
+остальных deployment settings.
+
+Проверки финального кода: `uv sync --frozen`, `uv run core-agent-db migrate`,
+`uv run ruff check core_agent tests`, `uv run python -m unittest discover -s tests -v`
+— exit0; 1637 tests за 272.011 секунды, skipped3. PostgreSQL/Keycloak были реальными,
+использовалась отдельная временная test database; cleanup — exit0.
+`uv build --no-sources` — exit0, sdist и wheel собраны. Повторное read-only ревью
+не выявило оставшихся замечаний этого изменения. Evidence —
+`.local-evidence/numeric-config-reviewed-ci/`; ошибочные входы отдельно подтвердили
+red regression перед исправлением. Это не закрывает target sandbox/live-provider
+release gates и не означает перенос feature в main.

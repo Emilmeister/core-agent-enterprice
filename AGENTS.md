@@ -262,6 +262,11 @@ Target spec может описывать больше текущего runtime.
   `development`, `test`. Production требует полный набор `KEYCLOAK_*` и
   `CORE_AGENT_TENANT_ID`; legacy A2A без auth разрешён только при явно выбранном
   development/test и полностью отсутствующей auth-конфигурации.
+- Числовые deployment settings в `core_agent/app.py` разбираются через `_number`,
+  сохраняют documented defaults и отклоняют malformed/NaN/infinite значения
+  с `CONFIG_INVALID` и именем настройки без её raw value. Неверный `LOG_LEVEL`
+  тоже проходит через безопасную startup error boundary; fatal startup diagnostic
+  публикуется на уровне `CRITICAL`, включая `LOG_LEVEL=CRITICAL/FATAL`.
 - Настроенный Keycloak открывает `/a2a/owner/`, `/a2a/external/` и owner-only
   `/api/identity`; старые корневые A2A routes закрыты. Probes остаются публичными.
   Introspection выполняется один раз на HTTP request без кэша; уже открытый
