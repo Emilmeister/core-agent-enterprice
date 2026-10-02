@@ -603,6 +603,15 @@ run получает отдельные MCP session и negotiated version; пе�
   `core_agent/ui_dist/` также доступны shell и перечисленные assets; symlinks и
   произвольные пути не выдаются. Exact public allowlist действует только для
   GET/HEAD; `/api/` и оба A2A входа сохраняют server-side authorization.
+- UI инициирует PKCE login явно после bootstrap/callback; очистка токена
+  не вызывает SDK auto-login. Logout строит Keycloak URL до очистки ID token,
+  завершает SSO и возвращает `/ui/?logged_out=1` без private requests и
+  повторного входа до нажатия «Войти». Токены остаются только в памяти,
+  durable Tasks не отменяются.
+- Общий `InteractionCard` скрывает tool approval и guardrail карточки только
+  после canonical outcome, включая reject/timeout. Решения/audit сохраняются;
+  owner questions с ответами остаются видимыми. Локальный deadline сам по себе
+  не является серверным outcome.
 - Authenticated composition root подключает company settings и per-tool policy
   до запуска recovery. `/api/chats`, `/api/settings`, `/api/tool-policies`, `/api/interactions`,
   `/api/hitl/{wait_id}/decision`, `/api/questions/{wait_id}/answer` и

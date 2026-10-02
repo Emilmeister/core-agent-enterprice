@@ -88,6 +88,7 @@ export function InteractionCard({
       setBusy(false);
     }
   }
+  if (item.outcome && item.kind !== "owner_question") return null;
   return (
     <article className={`interaction ${closed ? "resolved" : ""}`}>
       <div className="eyebrow">

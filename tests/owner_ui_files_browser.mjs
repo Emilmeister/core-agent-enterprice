@@ -256,6 +256,7 @@ try {
   await page.wait("!document.querySelector('.history-pagination button:disabled')",'history refresh finished');
   check(await page.evaluate(`document.querySelector('.diagram img')?.src===${JSON.stringify(diagramURL)} && document.querySelector('.diagram img').naturalWidth>0`),'history refresh preserves the rendered Mermaid image');
   check(approvals===4,'actual owner decisions resume both native reads, snapshot selection and source deletion');
+  check(await page.evaluate("![...document.querySelectorAll('.interaction.resolved')].some(card=>['Разрешение на действие','Проверка материала'].includes(card.querySelector('h3')?.textContent))"),'completed approval cards disappear while native decisions remain persisted');
   await page.call('Page.reload');
   await page.wait("!!document.querySelector('.chat-link')",'persisted company chat after browser reload');
   await page.evaluate("document.querySelector('.chat-link').click()");
@@ -357,6 +358,24 @@ try {
   const storageChecks=await Promise.all([page,second].map(tab=>tab.evaluate(`(()=>{const privateValues=${JSON.stringify(privateValues)};return [localStorage,sessionStorage].every(store=>Array.from({length:store.length},(_,index)=>store.getItem(store.key(index))).every(value=>privateValues.every(secret=>!value.includes(secret))));})()`)));
   check(storageChecks.every(Boolean),'both owner tabs store no observed auth tokens, peer secrets or raw file bytes in local/session storage');
   const screenshot=await page.call('Page.captureScreenshot',{format:'png'});await writeFile(config.evidence+'/actual-browser.png',Buffer.from(screenshot.data,'base64'));
+  const revokedBearer=bearer;
+  const exitRequests=[];
+  page.on('Network.requestWillBeSent',({request})=>{
+    const url=new URL(request.url);
+    exitRequests.push({path:url.pathname,logoutHint:url.pathname.endsWith('/logout')&&url.searchParams.has('id_token_hint')});
+  });
+  await page.click('Выйти');
+  await page.wait("location.pathname==='/ui/'&&new URLSearchParams(location.search).get('logged_out')==='1'&&document.querySelector('h1')?.textContent==='Вы вышли из аккаунта'",'intentional logged-out screen');
+  check(exitRequests.some(request=>request.logoutHint),'real logout preserves ID token hint until Keycloak logout URL is built');
+  check(await page.evaluate(`(async()=>{const response=await fetch('/api/identity',{headers:{Authorization:${JSON.stringify(revokedBearer)}},cache:'no-store',credentials:'omit'});return response.status===401;})()`),'Keycloak logout revokes the old owner token for a new HTTP request');
+  exitRequests.length=0;
+  await page.call('Page.reload');
+  await page.wait("document.querySelector('h1')?.textContent==='Вы вышли из аккаунта'",'logged-out screen after reload');
+  await delay(500);
+  check(!exitRequests.some(request=>request.path.startsWith('/api/')||request.path.endsWith('/protocol/openid-connect/auth'))&&await page.evaluate("!document.querySelector('.sidebar,.composer')"),'logged-out reload exposes no private UI and performs no automatic login or private requests');
+  await page.click('Войти');
+  await page.wait("!!document.querySelector('input[name=username]')",'fresh login form after completed SSO logout');
+  check(exitRequests.some(request=>request.path.endsWith('/protocol/openid-connect/auth')),'explicit sign-in after logout opens real Keycloak login');
 } catch(error){
   const screenshot=await page.call('Page.captureScreenshot',{format:'png'}).catch(()=>null);if(screenshot)await writeFile(config.evidence+'/failed-browser.png',Buffer.from(screenshot.data,'base64'));
   console.error(error.message);process.exitCode=1;

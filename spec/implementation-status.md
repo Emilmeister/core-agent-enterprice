@@ -139,6 +139,13 @@
 | ENT-AC-70 | [Wait generation/dedup](tasks-and-delegation.md), сценарий [acceptance](acceptance.md#enterprise-v1-обязательные-сценарии) | `tests.test_durable_waits`, `tests.test_wait_store`, `tests.test_task_suspension`, `tests.test_python_waits`: worker-free direct/Python/joined-child waits, PG new-pool recovery, working/input-required projection, one charged continuation и wake только текущей timer generation после fresh follow-up | implemented |
 | ENT-MIG-01 | Versioned schema, explicit identity/file/remote config migration и rollback boundary по architecture | `tests.test_enterprise_migrations` в ordinary PostgreSQL CI: schema12→current и каждый enterprise source13–23, repeat migration/new pool, точные admitted rows/deadlines/outcomes/file refs/blobs/encrypted peer revisions, defaults и отказ old/unknown build. Actual schema23 pg_dump/pg_restore и transport blob restore до новых application writes, прежний encryption key и повторный upgrade проверяются тем же ordinary CI suite. `tests.test_remote_registry`: actual operator CLI, encrypted atomic batch/database actor, чужой tenant, invalid bounded file, duplicate/key/DB rollback, безопасная DB error и отказ overwrite owner edit/disable. `tests.test_remote_runtime` исключает legacy ENV discovery в authenticated startup. Explicit legacy Task/chat identity mapping и production cutover ещё не подтверждены | partial |
 
+## Owner UI logout и завершённые подтверждения
+
+| Requirement | Source | Automated proof | Status |
+|---|---|---|---|
+| ENT-AC-72 | [Owner UI logout](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required `tests.test_owner_ui_files_browser`: actual Keycloak logout с ID token hint и exact redirect allowlist, старый bearer401, logged-out reload без private requests/auto-login и явный повторный PKCE login | implemented |
+| ENT-AC-73 | [Owner interaction display](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required `tests.test_owner_ui_files_browser`: активные native approvals, durable decisions и отсутствие завершённых карточек. Guardrail/owner-question варианты пока не имеют отдельного CI rendering proof | partial |
+
 ## Release rule
 
 Production release v1 разрешён только когда все строки, относящиеся к scope `releases/v1.md`, имеют статус `implemented`, а полный test command воспроизводится из чистого checkout без ручных шагов. Target-only exclusions остаются `partial`/`missing` только если явно перечислены в release profile.

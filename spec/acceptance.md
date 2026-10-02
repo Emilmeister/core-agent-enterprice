@@ -465,6 +465,18 @@
 
 ### Дополнительные owner-interaction criteria
 
+- ENT-AC-72: владелец нажимает «Выйти» в реальном браузере с действующей
+  Keycloak-сессией. SSO завершается; старый bearer даёт 401 на новом private
+  request. UI показывает экран выхода без приватных данных и автоматического
+  повторного входа, также после reload. «Войти» открывает обычный PKCE flow
+  с формой авторизации. Logout не отменяет durable Tasks; auth expiry и access
+  error не вызывают самостоятельного login redirect.
+- ENT-AC-73: активные tool approval и guardrail requests видны в чате;
+  canonical allowed/rejected/timeout outcomes скрывают их карточки, в том числе
+  после history refresh/reload. Решения остаются доступны owner API и audit,
+  ответы на owner questions остаются в чате. Локальный deadline без persisted
+  outcome не скрывает ожидание; разрешение не выдаётся за выполненное действие.
+
 - [ ] CAS policy/settings не теряет конкурирующие изменения; новый origin под
   прежним alias требует HITL. Owner allow не закрывает прежний pending request,
   deny закрывает pending во всех чатах до нового dispatch.

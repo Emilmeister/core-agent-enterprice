@@ -39,7 +39,7 @@ export class Session {
   }
   async logout() {
     const action = this.keycloak.logout({
-      redirectUri: `${location.origin}/ui/`,
+      redirectUri: `${location.origin}/ui/?logged_out=1`,
     });
     this.expire();
     await action;
@@ -76,14 +76,14 @@ export async function signIn(): Promise<Session> {
     clientId: config.client_id,
   });
   try {
-    await keycloak.init({
-      onLoad: "login-required",
+    const authenticated = await keycloak.init({
       flow: "standard",
       pkceMethod: "S256",
       checkLoginIframe: false,
       enableLogging: false,
       redirectUri: `${location.origin}/ui/`,
     });
+    if (!authenticated) await keycloak.login();
     await keycloak.updateToken(30);
     const identityResponse = await fetch("/api/identity", {
       headers: { Authorization: `Bearer ${keycloak.token}` },

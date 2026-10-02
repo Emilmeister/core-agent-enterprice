@@ -34,13 +34,23 @@ API/A2A paths never receive the SPA shell. Run development through a same-origin
 reverse proxy to the existing ASGI service; the Vite dev server alone does not
 implement its APIs.
 
-The public Keycloak client needs exact `/ui/` redirect URI and Web Origin.
+The public Keycloak client needs the exact login redirect URI
+`https://<agent-address>/ui/`, the exact logout redirect URI
+`https://<agent-address>/ui/?logged_out=1`, and Web Origin
+`https://<agent-address>`. Register both under Valid Redirect URIs, or configure
+the logout URI separately under Valid Post Logout Redirect URIs. Before
+upgrading a manually configured client that permits only `/ui/`, add the
+logout URI: Keycloak rejects an unregistered query before ending SSO.
 The official adapter performs standard code flow with PKCE S256. Tokens stay
 in its memory; every private request refreshes first and attaches Authorization.
 `/api/identity` must confirm owner access before private screens mount. Auth
 failure unmounts private state. No localStorage/sessionStorage token handling,
 third-party font/script resources, execution of model HTML, or secret
 values in query parameters are introduced.
+Logout builds the Keycloak URL before clearing tokens and ends SSO; it returns
+to an explicit signed-out screen without automatic login, including after
+reload. Only the Sign in button starts login again. Clearing a token on expiry
+or access failure does not initiate SDK login. Accepted Tasks keep running.
 
 References: [official adapter guide](https://www.keycloak.org/securing-apps/javascript-adapter)
 and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
@@ -54,6 +64,9 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
 - Inline HITL, owner questions and guardrail decisions with unchanged digest,
   deadline and server outcome. Scoped material preview and authenticated file
   download use stored review IDs only.
+  Canonically completed tool approvals and guardrail cards disappear from the
+  chat; persisted decisions remain available to owners. Owner question answers
+  remain visible, and local expiry alone does not hide a pending request.
 - Owner settings, tool mode/exemption/origin/revision and trusted peer registry.
   CAS conflicts require reading current state; credentials are write-only.
 - Agent replies and persisted history render CommonMark/GFM with tables, lists
@@ -64,11 +77,11 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   image context cannot execute scripts or access credentials; CSP allows blob
   only for images. Tool records and owner input remain plain text.
 
-Full chat history, file upload/workspace/result downloads and cron screens are
-not presented as working. No endpoint for them is invented here. Chat labels
-are provisional because the current sidebar endpoint returns identifiers only.
-
-Still required: actual browser mobile, keyboard and malicious-content checks;
-real Keycloak login/refresh/logout;
-two-owner races, stream reconnect and durable backend integration. No mocked
-authentication result counts as proof of browser authorization.
+The existing owner APIs also provide full chat history, file uploads,
+workspace/result downloads and cron screens. The required native browser gate
+uses actual Keycloak, PostgreSQL and a sandbox Pod for login/logout, approvals,
+file publication/downloads, settings, schedules and workspace cleanup. See
+`spec/implementation-status.md` for requirement-specific evidence and remaining
+release gates. Chat labels are provisional because the sidebar API returns
+identifiers only. Mobile/keyboard accessibility still needs browser review;
+mocked authentication is not proof of browser authorization.

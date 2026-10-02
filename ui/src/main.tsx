@@ -7,9 +7,11 @@ import "./styles.css";
 
 const root = createRoot(document.getElementById("root")!);
 function Entrance() {
+  const signedOut = new URLSearchParams(location.search).get("logged_out") === "1";
   const [session, setSession] = useState<Session | null>(null);
   const [error, setError] = useState<LoginError | null>(null);
   useEffect(() => {
+    if (signedOut) return;
     let live = true;
     void signIn()
       .then((value) => {
@@ -34,7 +36,7 @@ function Entrance() {
     return () => {
       live = false;
     };
-  }, []);
+  }, [signedOut]);
   return session ? (
     <App session={session} />
   ) : (
@@ -43,14 +45,14 @@ function Entrance() {
         <span className="brand-mark">c</span>core / agent
       </div>
       <div className="eyebrow">Рабочее пространство владельцев</div>
-      <h1>{error ? "Вход не завершён" : "Подключаем рабочее пространство"}</h1>
+      <h1>{signedOut ? "Вы вышли из аккаунта" : error ? "Вход не завершён" : "Подключаем рабочее пространство"}</h1>
       <p role={error ? "alert" : "status"}>
-        {error?.message || "Проверяем сессию и права доступа…"}
+        {signedOut ? "Чтобы продолжить работу, войдите снова." : error?.message || "Проверяем сессию и права доступа…"}
       </p>
-      {error && (
+      {(signedOut || error) && (
         <button
           onClick={() => {
-            if (error.switchAccount)
+            if (error?.switchAccount)
               void error
                 .switchAccount()
                 .catch(() =>
@@ -63,7 +65,7 @@ function Entrance() {
             else location.replace("/ui/");
           }}
         >
-          {error.switchAccount ? "Сменить аккаунт" : "Войти снова"}
+          {signedOut ? "Войти" : error?.switchAccount ? "Сменить аккаунт" : "Войти снова"}
         </button>
       )}
     </main>

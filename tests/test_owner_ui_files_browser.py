@@ -111,7 +111,7 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
                          "protocol": "openid-connect"},
                         {"clientId": "browser", "enabled": True, "publicClient": True, "protocol": "openid-connect",
                          "standardFlowEnabled": True, "implicitFlowEnabled": False, "directAccessGrantsEnabled": False,
-                         "redirectUris": [self.origin + "/ui/"], "webOrigins": [self.origin],
+                         "redirectUris": [self.origin + "/ui/", self.origin + "/ui/?logged_out=1"], "webOrigins": [self.origin],
                          "attributes": {"pkce.code.challenge.method": "S256"}, "protocolMappers": mappers}],
             "users": [{"username": "browser-owner", "enabled": True, "emailVerified": True,
                        "firstName": "Browser", "lastName": "Owner", "email": "owner@example.test",
@@ -231,6 +231,10 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         self.assertIn("PASS actual private peer reread exposes configured flag and disabled state only", proof)
         self.assertIn("PASS confirmed workspace cleanup deletes only the selected actual file", proof)
         self.assertIn("PASS browser reload preserves both completed roots and immutable file history after cleanup", proof)
+        self.assertIn("PASS completed approval cards disappear while native decisions remain persisted", proof)
+        self.assertIn("PASS Keycloak logout revokes the old owner token for a new HTTP request", proof)
+        self.assertIn("PASS logged-out reload exposes no private UI and performs no automatic login or private requests", proof)
+        self.assertIn("PASS explicit sign-in after logout opens real Keycloak login", proof)
 
 
 if __name__ == "__main__":
