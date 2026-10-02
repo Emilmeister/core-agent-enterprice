@@ -43,8 +43,9 @@ def backend():
     from core_agent.sandbox import SandboxLauncher
 
     class ClearModel:
-        def generate(self, **_kwargs):
-            return ModelResponse(message='{"verdict":"clear"}', finish_reason="stop")
+        def generate(self, **kwargs):
+            verdict = "suspicious" if "Browser guardrail review proof" in kwargs.get("context", "") else "clear"
+            return ModelResponse(message=json.dumps({"verdict": verdict}), finish_reason="stop")
 
         def count_tokens(self, text):
             return max(1, len(text.encode()) // 3)
@@ -96,7 +97,14 @@ print({marker!r})
                     assert result["output"]["stdout"].strip() == marker, "actual native file operation did not succeed"
             if index == 5:
                 assert "Native file reads completed." in context, "manual cron lost original chat history"
-            return super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
+            response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
+            if response.tool_requests and response.tool_requests[0].id == "browser-background-wait":
+                admitted = next(json.loads(message["content"]) for message in messages
+                                if message.get("tool_call_id") == "browser-background-failure")
+                assert admitted["status"] == "succeeded"
+                response = ModelResponse(tool_requests=(ToolRequest("browser-background-wait", "core_task_wait",
+                    {"task_id": admitted["output"]["task_id"]}),))
+            return response
 
     model = BrowserModel([
         read_files(2, "browser-native-root-verified"),
@@ -144,6 +152,12 @@ flowchart LR
 [unsafe](javascript:alert('unsafe'))
 """),
         ModelResponse(message="Native manual cron completed."),
+        ModelResponse(tool_requests=(ToolRequest("browser-owner-question", "core_ask_owner", {"question": "Какой номер заказа использовать?"}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-known-failure", "core_terminal_exec", {"argv": ["python3", "-c", "import sys; from pathlib import Path; p=Path('/workspace/preview-proof'); p.mkdir(exist_ok=True); payload='<script>window.__fileExecuted=true</script><img src=\"https://ui-content.invalid/file\">'; [(p/name).write_text(payload) for name in ['unsafe.html','unsafe.svg','safe-preview.txt']]; print('native known failure', file=sys.stderr); sys.exit(3)"]}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-background-failure", "core_task_start", {"tool": "core_terminal_exec", "arguments": {"argv": ["python3", "-c", "print('should not run')"], "cwd": "definitely-missing-browser-folder"}}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-background-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-preview-files", "core_response_files", {"paths": ["preview-proof/unsafe.html", "preview-proof/unsafe.svg", "preview-proof/safe-preview.txt"]}),)),
+        ModelResponse(message="Owner clarification received; the command failed with exit code 3."),
     ])
     model.model = "owner-browser-fixture"
     app = create_app(model=model, guardrail_classifier=GuardrailClassifier(ClearModel()))

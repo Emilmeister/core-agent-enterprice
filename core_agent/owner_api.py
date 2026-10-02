@@ -512,6 +512,12 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
             elif request.url.path == "/api/chats":
                 result = await list_chats(admission, actor, request.query_params)
             elif "context_id" in request.path_params:
+                if request.url.path.endswith("/title"):
+                    if request.query_params:
+                        raise CoreError("REQUEST_INVALID")
+                    payload = await read_payload(request, {"title", "expected_revision"})
+                    result = await admission.rename_chat(actor.tenant, request.path_params["context_id"], **payload)
+                    return JSONResponse(result, headers={"Cache-Control": "no-store"})
                 if "file_id" in request.path_params:
                     return await final_response_file(agent, admission, actor, request)
                 if request.url.path.endswith("/files") or request.url.path.endswith("/files/content"):
@@ -554,6 +560,7 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
                       "FILE_CLEANUP_NOT_FOUND": 404, "CONTEXT_BUSY": 409, "CLEANUP_REQUEST_CONFLICT": 409,
                       "WORKSPACE_CLEANUP_INVALID": 409, "WORKSPACE_CLEANUP_PENDING": 503,
                       "TASK_NOT_FOUND": 404, "INTERACTION_VERSION_CONFLICT": 409,
+                      "CHAT_TITLE_CONFLICT": 409,
                       "TOOL_IDENTITY_CONFLICT": 409,
                       "MATERIAL_REVIEW_NOT_FOUND": 404, "MATERIAL_REVIEW_CONFLICT": 409,
                       "FILE_BATCH_NOT_FOUND": 404, "ARTIFACT_INTEGRITY_FAILED": 409,
@@ -577,6 +584,7 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
         routes.append(Route("/api/chats", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/tasks/{task_id}/files/{file_id}", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/history", endpoint))
+        routes.append(Route("/api/chats/{context_id:path}/title", endpoint, methods=["PUT"]))
         routes.append(Route("/api/chats/{context_id:path}/files/delete", endpoint, methods=["GET", "POST"]))
         routes.append(Route("/api/chats/{context_id:path}/files", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/files/content", endpoint))

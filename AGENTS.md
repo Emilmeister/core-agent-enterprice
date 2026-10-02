@@ -624,6 +624,10 @@ run получает отдельные MCP session и negotiated version; пе�
   workflow. Owners видят общий список; external/dual-role отклоняются до lookup.
   Pagination cursor ссылается на сохранённую root Task и сохраняет позицию при
   появлении новой Task того же чата; длинный context ID не увеличивает cursor.
+  Название, revision и время обновления принадлежат этому mapping. Owner-only
+  `PUT /api/chats/{context_id}/title` сохраняет переименование через CAS, не меняя
+  Task, prompt или workspace. Автоматическое название связано с provenance
+  исходного сообщения и не раскрывает удержанный guardrails материал.
 - `/api/chats/{context_id}/history` читает canonical previous-root chain, полный
   transcript и сохранённые inbound Messages с bounded pagination, не запуская
   workflow, модель или classifier. Cursor привязан к company/chat и сохраняет
@@ -634,6 +638,14 @@ run получает отдельные MCP session и negotiated version; пе�
   decisions проверяются для originals, dependencies и final text; digest всегда
   сопоставляется вместе с material kind. Запрещённый материал заменяется safe
   placeholder со ссылкой на owner review; external/dual-role доступа не получают.
+  Optional `display_text` содержит исходный transport text до добавления путей
+  вложений и раскрывается только вместе с доступным user message. Legacy `text`
+  сохраняется; UI не удаляет произвольный текст регулярными выражениями.
+  Owner UI объединяет вызов и результат по Task/call ID, раскрывает технические
+  данные по запросу и показывает отдельные сохранённые файлы. Текстовый просмотр
+  ограничен 64 KiB и экранируется; HTML/SVG/Office не исполняются в origin агента.
+  Настройки инструментов сохраняются явно по одному правилу, положительный
+  checkbox проверок является инверсией `guardrails_exempt`.
 - Owner file preview/download получают original WorkspaceBinding из canonical
   admission mapping; просматривающий owner не становится execution owner.
   Nofollow directory fds исключают symlinks, hardlinks и special files; private
@@ -903,6 +915,9 @@ run получает отдельные MCP session и negotiated version; пе�
 - `core_chats.latest_root_run_id` указывает на последний root; занятость
   определяется его canonical workflow state. Terminal transition не очищает
   указатель. `core_root_messages` хранит immutable creation dedup ledger без TTL.
+  Schema 25 добавляет original `display_text` в этот ledger и title/revision/source/
+  updated_at в `core_chats`, сохраняя прежние dedup identities. Nullable legacy
+  original text не заменяется догадками из attachment suffix.
   Schema 15 включает durable waits, company settings и per-origin tool policies; migration выполняется отдельной
   job после остановки старых workers;
   после новых записей откат image требует согласованного отката БД.

@@ -1,10 +1,15 @@
 import { Markdown } from "./Markdown";
-import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
 import { scheduleTime } from "./Schedules";
 import { InteractionCard } from "./Interactions";
-import { byteCount, mergeHistoryPage } from "./types";
-import type { AttachmentEntry, HistoryItem, HistoryPage, Interaction, ResponseFileEntry } from "./types";
+import { mergeHistoryPage } from "./types";
+import type { AttachmentEntry, HistoryItem, HistoryPage, Interaction } from "./types";
+import { ActionCard, actionState, historyEntries } from "./ActionCard";
+import type { HistoryEntry } from "./ActionCard";
+import { FileCard } from "./FileCard";
+export { ConversationFiles, FileCard } from "./FileCard";
+export { pendingAction } from "./ActionCard";
 
 const empty: HistoryPage = { items: [], next_cursor: null };
 const statusLabels: Record<HistoryItem["status"], string> = {
@@ -164,70 +169,10 @@ export function useChatHistory(api: Api, contextId?: string) {
   return { page, waits, loading, error, load };
 }
 
-export function Attachments({ entries }: { entries: AttachmentEntry[] }) {
+export function Attachments({ entries, api, contextId }: { entries: AttachmentEntry[]; api?: Api; contextId?: string }) {
   return <ul className="message-attachments" aria-label="Принятые вложения">
-    {entries.map((entry) => <li key={entry.index}>
-      <strong>{entry.actual_name}</strong>
-      <span className="muted">{entry.relative_path}</span>
-      <span className="muted">{byteCount(entry.size_bytes)}</span>
-    </li>)}
+    {entries.map((entry) => <FileCard key={entry.index} api={api} contextId={contextId} file={entry} />)}
   </ul>;
-}
-
-function ResponseFile({ api, contextId, taskId, file }: {
-  api: Api; contextId: string; taskId: string; file: ResponseFileEntry;
-}) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const pending = useRef<AbortController | undefined>(undefined);
-  const urls = useRef(new Set<string>());
-  useLayoutEffect(() => {
-    setBusy(false);
-    setError("");
-    pending.current = undefined;
-    return () => {
-      pending.current?.abort();
-      for (const url of urls.current) URL.revokeObjectURL(url);
-      urls.current.clear();
-    };
-  }, [api, contextId, taskId, file.file_id]);
-  async function download() {
-    if (pending.current || !api.session.valid) return;
-    const abort = new AbortController();
-    pending.current = abort;
-    const stopped = () => abort.signal.aborted || pending.current !== abort || !api.session.valid;
-    setBusy(true);
-    setError("");
-    try {
-      const response = await api.request(
-        `/api/chats/${encodeURIComponent(contextId)}/tasks/${encodeURIComponent(taskId)}/files/${encodeURIComponent(file.file_id)}`,
-        { signal: abort.signal },
-      );
-      const blob = await response.blob();
-      if (stopped()) return;
-      const url = URL.createObjectURL(blob);
-      urls.current.add(url);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = file.name.replace(/[\\/\u0000-\u001f\u007f]/g, "_") || "файл";
-      link.click();
-      window.setTimeout(() => { URL.revokeObjectURL(url); urls.current.delete(url); }, 1000);
-    } catch (failure) {
-      if (!stopped()) setError(errorText(failure));
-    } finally {
-      if (!stopped()) setBusy(false);
-      if (pending.current === abort) pending.current = undefined;
-    }
-  }
-  return <li>
-    <strong>{file.name}</strong>
-    <span className="muted">{byteCount(file.size_bytes)}</span>
-    <button type="button" className="secondary" disabled={busy || !api.session.valid}
-      aria-label={`Скачать ${file.name}`} onClick={() => void download()}>
-      {busy ? "Скачиваем…" : "Скачать"}
-    </button>
-    {error && <p className="error" role="alert">{error}</p>}
-  </li>;
 }
 
 function Entry({ api, contextId, item }: { api: Api; contextId?: string; item: HistoryItem }) {
@@ -238,51 +183,34 @@ function Entry({ api, contextId, item }: { api: Api; contextId?: string; item: H
       workspace_cleanup_pending: "ожидалось завершение очистки файлов",
     };
     const timezone = item.timezone ?? "Europe/Moscow";
-    return <article className="schedule-notice">
+    return <article className="schedule-notice" id={`history-${item.id}`} data-history-id={item.id}>
       <p>Запуск по расписанию пропущен: {reasons[item.reason ?? ""] ?? "запуск был недоступен"}.</p>
       <p className="muted">{scheduleTime(item.due_at, timezone)}{item.through ? " — " + scheduleTime(item.through, timezone) : ""} · {timezone}</p>
     </article>;
   }
-  const tool = item.kind === "tool_call" || item.kind === "tool_result";
   return (
     <article
       className={`message ${item.kind === "user_message" ? "from-owner" : ""} ${item.kind === "placeholder" ? "history-placeholder" : ""}`}
+      id={`history-${item.id}`} data-history-id={item.id}
     >
-      {tool ? (
-        <details>
-          <summary>
-            {item.kind === "tool_call"
-              ? "Вызов инструмента"
-              : "Ответ инструмента"}
-          </summary>
-          <pre>{item.text}</pre>
-        </details>
-      ) : (
-        <>
-          <div className="eyebrow">
-            {item.kind === "user_message"
-              ? "Сообщение"
-              : item.kind === "placeholder"
-                ? "Статус сообщения"
-                : "Core Agent"}
-          </div>
+      <>
+          {item.kind === "placeholder" && <div className="eyebrow">Статус сообщения</div>}
           {item.kind === "placeholder" || item.status !== "available"
             ? item.status === "available" && (
                 <p className="muted">Служебная запись агента</p>
               )
-            : item.text && (item.kind === "user_message"
-              ? <p className="prose">{item.text}</p>
+            : (item.display_text ?? item.text) && (item.kind === "user_message"
+              ? <p className="prose">{item.display_text ?? item.text}</p>
               : <Markdown text={item.text} />)}
-        </>
-      )}
+      </>
       {statusLabels[item.status] && (
         <p className="muted history-status">{statusLabels[item.status]}</p>
       )}
-      {item.status === "available" && item.attachments?.length ? <Attachments entries={item.attachments} /> : null}
+      {item.status === "available" && item.attachments?.length ? <Attachments entries={item.attachments} api={api} contextId={contextId} /> : null}
       {item.kind === "result" && item.status === "available" && item.outcome?.state === "COMPLETED"
         && contextId && item.task_id && item.response_files?.length ?
         <ul className="message-attachments response-files" aria-label="Файлы ответа">
-          {item.response_files.map((file) => <ResponseFile key={`${contextId}:${item.task_id}:${file.file_id}`}
+          {item.response_files.map((file) => <FileCard key={`${contextId}:${item.task_id}:${file.file_id}`}
             api={api} contextId={contextId} taskId={item.task_id!} file={file} />)}
         </ul> : null}
       {item.outcome && (
@@ -309,11 +237,11 @@ export function History({
   refresh: () => Promise<void>;
   onOlder: () => void;
 }) {
-  const groups: { root: string | null; items: HistoryItem[] }[] = [];
-  for (const item of [...history.page.items].reverse()) {
+  const groups: { root: string | null; entries: HistoryEntry[] }[] = [];
+  for (const entry of historyEntries(history.page.items)) {
     const previous = groups.at(-1);
-    if (previous && previous.root === item.task_id) previous.items.push(item);
-    else groups.push({ root: item.task_id, items: [item] });
+    if (previous && previous.root === entry.item.task_id) previous.entries.push(entry);
+    else groups.push({ root: entry.item.task_id, entries: [entry] });
   }
   const reviews = new Map(
     Object.values(history.waits)
@@ -328,9 +256,8 @@ export function History({
   const rendered = new Set<string>();
   return (
     <>
-      {(history.page.next_cursor || history.page.items.length > 0) && (
+      {history.page.next_cursor && (
         <div className="history-pagination">
-          {history.page.next_cursor && (
             <button
               className="secondary"
               disabled={history.loading}
@@ -343,14 +270,6 @@ export function History({
                 ? "Загружаем…"
                 : "Загрузить предыдущие сообщения"}
             </button>
-          )}
-          <button
-            className="text-button"
-            disabled={history.loading}
-            onClick={() => void history.load("reload")}
-          >
-            Обновить историю
-          </button>
         </div>
       )}
       {history.loading && !history.page.items.length && (
@@ -361,40 +280,38 @@ export function History({
       {history.error && (
         <div className="error" role="alert">
           {history.error}
-          <button
-            className="text-button"
-            disabled={history.loading}
-            onClick={() => void history.load("reload")}
-          >
-            Обновить историю
-          </button>
+          <p>Обновите историю кнопкой в шапке чата.</p>
         </div>
       )}
-      {groups.map(({ root, items }, index) => {
+      {groups.map(({ root, entries }, index) => {
+        const waits = root ? history.waits[root] ?? [] : [];
+        const terminal = history.page.items.find((item) => item.task_id === root && item.outcome);
         const interactions = root && !groups.slice(index + 1).some((group) => group.root === root)
-          ? history.waits[root] ?? [] : [];
+          ? waits : [];
+        const blocks: HistoryEntry[][] = [];
+        for (const entry of entries) {
+          const previous = blocks.at(-1);
+          if (entry.action && actionState(entry.action, terminal, waits).kind === "success"
+            && previous?.at(-1)?.action
+            && actionState(previous.at(-1)!.action!, terminal, waits).kind === "success") previous.push(entry);
+          else blocks.push([entry]);
+        }
+        function renderEntry({ item, action }: HistoryEntry) {
+          const review = item.review && !rendered.has(item.review.wait_id) ? reviews.get(item.review.wait_id) : undefined;
+          if (review) rendered.add(review.wait_id);
+          return <Fragment key={action?.key ?? item.id}>
+            {action ? <ActionCard action={action} terminal={terminal} waits={waits} />
+              : <Entry api={api} contextId={contextId} item={item} />}
+            {review && <InteractionCard key={review.wait_id} api={api} item={review} refresh={refresh} />}
+          </Fragment>;
+        }
         return (
-          <section key={items[0].id} className="history-run" aria-label="Обращение">
-            {items.map((item) => {
-              const review =
-                item.review && !rendered.has(item.review.wait_id)
-                  ? reviews.get(item.review.wait_id)
-                  : undefined;
-              if (review) rendered.add(review.wait_id);
-              return (
-                <Fragment key={item.id}>
-                  <Entry api={api} contextId={contextId} item={item} />
-                  {review && (
-                    <InteractionCard
-                      key={review.wait_id}
-                      api={api}
-                      item={review}
-                      refresh={refresh}
-                    />
-                  )}
-                </Fragment>
-              );
-            })}
+          <section key={entries[0].action?.key ?? entries[0].item.id} className="history-run" aria-label="Обращение">
+            {blocks.map((block) => block.length > 1
+              ? <details className="execution-group" key={block[0].action!.key}>
+                <summary>Ход выполнения · {block.length} действий выполнено</summary>
+                {block.map(renderEntry)}
+              </details> : renderEntry(block[0]))}
             {interactions
               .filter((item) => !linked.has(item.wait_id))
               .map((item) => (

@@ -305,6 +305,8 @@ class OwnerHistoryTests(AuthAppTestCase):
             entry = response.json()["items"][0]
             self.assertEqual((entry["kind"], entry["status"], entry["review"]), ("placeholder", expected, {"wait_id": wait.wait_id}))
             self.assertNotIn("Answer briefly", response.text)
+            chats = await self.http.get("/api/chats", headers=self.headers("owner-b"))
+            self.assertEqual(chats.json()["chats"][0]["needs_attention"], expected == "pending_guardrail")
             self.assertEqual(agent.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id), before)
 
     async def test_followup_before_initial_guard_completion_keeps_initial_first(self):
@@ -399,6 +401,7 @@ class OwnerHistoryTests(AuthAppTestCase):
         self.assertEqual(before.status_code, 200, before.text)
         self.assertTrue(before.json()["items"])
         self.assertTrue(all("attachments" not in item for item in before.json()["items"]))
+        self.assertTrue(all("display_text" not in item for item in before.json()["items"]))
         await asyncio.to_thread(agent.workflow_store.release_lease, admitted.run_id,
             tenant_id=context.tenant, worker_id=agent._worker_id, token=admitted.lease_token)
         for _ in range(8):
@@ -418,6 +421,8 @@ class OwnerHistoryTests(AuthAppTestCase):
         self.assertEqual(refreshed.json(), response.json())
         messages = [item for item in response.json()["items"] if item["kind"] == "user_message"]
         self.assertEqual(len(messages), 2)
+        self.assertEqual([item.get("display_text") for item in messages], ["Read this too", "Read attached reports"])
+        self.assertTrue(all("Attached files:" in item["text"] for item in messages))
         self.assertEqual(messages[0].get("attachments"), inbound["provenance"]["file_receipt"]["entries"])
         self.assertEqual(messages[1].get("attachments"), expected)
         self.assertEqual([item["actual_name"] for item in expected], ["report.txt", "report_2.txt"])
@@ -427,7 +432,7 @@ class OwnerHistoryTests(AuthAppTestCase):
 
     async def test_rejected_file_batch_names_stay_out_of_owner_history(self):
         agent = self.app.state.core_agent
-        context = admission_tests.AuthAdmissionTests.context(self, "external-a")
+        context = admission_tests.AuthAdmissionTests.context(self, "owner-a")
         message = Message(message_id="rejected-history-file", context_id="history", role=Role.ROLE_USER,
             parts=[{"text": "Process the file"}, {"raw": b"", "filename": "PRIVATE_FILE_NAME.bin"}])
         admitted = await self.app.state.a2a_request_handler.admission_handler(message, context)
@@ -438,6 +443,9 @@ class OwnerHistoryTests(AuthAppTestCase):
         pending = await self.history()
         self.assertNotIn("PRIVATE_FILE_NAME", pending.text)
         self.assertTrue(all("attachments" not in item for item in pending.json()["items"]))
+        pending_chats = await self.http.get("/api/chats", headers=self.headers("owner-b"))
+        self.assertNotIn("Process the file", pending_chats.text)
+        self.assertNotIn("PRIVATE_FILE_NAME", pending_chats.text)
         agent.workflow_store.resolve_wait(suspended.wait_id, tenant_id=context.tenant,
             outcome={"reason": "rejected"}, actor_id="test-owner")
         outcome = await asyncio.to_thread(agent.resume_task, admitted.task.id)
@@ -446,6 +454,29 @@ class OwnerHistoryTests(AuthAppTestCase):
         self.assertEqual(rejected.status_code, 200, rejected.text)
         self.assertNotIn("PRIVATE_FILE_NAME", rejected.text)
         self.assertTrue(all("attachments" not in item for item in rejected.json()["items"]))
+        self.assertTrue(all("display_text" not in item for item in rejected.json()["items"]))
+        rejected_chats = await self.http.get("/api/chats", headers=self.headers("owner-b"))
+        self.assertNotIn("Process the file", rejected_chats.text)
+        self.assertNotIn("PRIVATE_FILE_NAME", rejected_chats.text)
+
+    async def test_files_only_owner_title_uses_safe_filename_and_empty_display_text(self):
+        agent = self.app.state.core_agent
+        context = admission_tests.AuthAdmissionTests.context(self, "owner-a")
+        message = Message(message_id="only-file", context_id="history", role=Role.ROLE_USER,
+                          parts=[{"raw": b"plain report", "filename": "quarterly.txt", "media_type": "text/plain"}])
+        admitted = await self.app.state.a2a_request_handler.admission_handler(message, context)
+        pending = await self.http.get("/api/chats", headers=self.headers("owner-b"))
+        self.assertEqual(pending.json()["chats"][0]["title"], "")
+        await asyncio.to_thread(agent.workflow_store.release_lease, admitted.run_id,
+            tenant_id=context.tenant, worker_id=agent._worker_id, token=admitted.lease_token)
+        result = await asyncio.to_thread(agent.resume_task, admitted.task.id)
+        self.assertNotIsInstance(result, SuspendedRun)
+        response = await self.history()
+        item = next(item for item in response.json()["items"] if item["kind"] == "user_message")
+        self.assertEqual(item["display_text"], "")
+        self.assertIn("Attached files:", item["text"])
+        chats = await self.http.get("/api/chats", headers=self.headers("owner-b"))
+        self.assertEqual(chats.json()["chats"][0]["title"], "quarterly.txt")
 
     async def test_file_digest_namespace_does_not_reject_json_and_pending_alias_is_not_negative(self):
         task = await self.submit("owner-a", "first", "history")
@@ -516,6 +547,44 @@ class OwnerHistoryTests(AuthAppTestCase):
         self.assertEqual(failed.status_code, 400)
         self.assertEqual(failed.json()["error"]["code"], "CHECKPOINT_INVALID")
         self.assertNotIn("PRIVATE_", failed.text)
+
+    async def test_failed_builtin_process_metadata_is_safe_and_material_guarded(self):
+        task = await self.submit("owner-a", "process-metadata", "history")
+        record = self.record(task)
+        snapshot = copy.deepcopy(record.snapshot)
+        metadata = {"exit_code": 3, "timed_out": False, "truncated": True, "duration": 0.25, "status": "failed"}
+        raw = {**metadata, "stdout": "PRIVATE_STDOUT", "stderr": "PRIVATE_STDERR",
+               "error": "PRIVATE_EXCEPTION", "password": "PRIVATE_SECRET"}
+        cases = [("terminal", "core_terminal_exec", raw, metadata),
+                 ("python", "core_python_exec", {**raw, "exit_code": -15}, {**metadata, "exit_code": -15}),
+                 ("mcp", "mcp_example_run", raw, None),
+                 ("exception", "core_terminal_exec", {"error": "PRIVATE_PROVIDER_EXCEPTION"}, None),
+                 ("forged", "core_terminal_exec", {**raw, "exit_code": True}, None),
+                 ("string", "core_python_exec", {**raw, "duration": "PRIVATE_DURATION"}, None),
+                 ("enum", "core_python_exec", {**raw, "status": "PRIVATE_STATUS"}, None)]
+        for call_id, name, output, _expected in cases:
+            snapshot["context"]["transcript"].append({"kind": "tool_result", "content": json.dumps({
+                "tool_call_id": call_id, "tool_name": name, "status": "failed", "output": output,
+                "error_code": "TOOL_RETURNED_FAILED"}), "tokens": 1})
+        snapshot["context"]["sequence_range"][1] = len(snapshot["context"]["transcript"])
+        self.snapshot(record, snapshot)
+        with patch.object(self.model, "generate", side_effect=AssertionError("history must remain passive")):
+            response = await self.history()
+        self.assertEqual(response.status_code, 200, response.text)
+        outcomes = {value["tool_call_id"]: value for item in response.json()["items"] if item["kind"] == "tool_result"
+                    for value in [json.loads(item["text"])]}
+        for call_id, _name, _output, expected in cases:
+            self.assertEqual(outcomes[call_id].get("output"), expected)
+        self.assertNotIn("PRIVATE_", response.text)
+        review = self.review_material(record, {"material_kind": "json", "material_digest": self.digest(raw)}, source_kind="tool_result")
+        snapshot["context"]["transcript"][1]["provenance"] = {"version": 1, "sources": {
+            "process-result": {"run_id": record.run_id, "sequence": 2, "materials": [{"review_id": review["review_id"]}]}}}
+        self.snapshot(record, snapshot)
+        guarded = await self.history()
+        entry = next(item for item in guarded.json()["items"] if item["id"].endswith("/transcript/2"))
+        self.assertEqual(entry["status"], "rejected")
+        self.assertEqual(entry["kind"], "placeholder")
+        self.assertNotIn("exit_code", entry["text"])
 
     async def test_forged_cursor_cannot_select_foreign_child_or_unmapped_root(self):
         first = await self.submit("owner-a", "first", "history")

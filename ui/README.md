@@ -61,6 +61,10 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   same-Task follow-up, explicit cancel and authenticated passive subscription.
   Reconnection fetches persisted Task first. Ambiguous sends retain one exact
   body/messageId for user-triggered retry; the UI never retries mutations itself.
+  Titles derive from available original owner input or attachment names; owner
+  rename persists company-wide with revision CAS. UUIDs live in the chat menu.
+  Request status comes from canonical Task, interactions and tool results.
+  New events preserve reading position; a button explicitly jumps to the latest.
 - Inline HITL, owner questions and guardrail decisions with unchanged digest,
   deadline and server outcome. Scoped material preview and authenticated file
   download use stored review IDs only.
@@ -69,6 +73,9 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   remain visible, and local expiry alone does not hide a pending request.
 - Owner settings, tool mode/exemption/origin/revision and trusted peer registry.
   CAS conflicts require reading current state; credentials are write-only.
+  Tool rules use a compact searchable/filterable list and explicit per-rule
+  saves. The positive checks checkbox maps to `!guardrails_exempt`; execution
+  mode remains independent. There is no technical mode or batch-save mechanism.
 - Agent replies and persisted history render CommonMark/GFM with tables, lists
   and fenced code through react-markdown. Mermaid blocks load the local bundle
   on demand and display static SVG Blob images; invalid diagrams keep source.
@@ -76,12 +83,19 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   uses strict security, disabled HTML labels and fixed text/edge limits. Its
   image context cannot execute scripts or access credentials; CSP allows blob
   only for images. Tool records and owner input remain plain text.
+  Tool calls/results join by Task/call ID into action cards; successful sequences
+  collapse, while errors and owner requests stay visible. Original owner text
+  remains separate from system attachment instructions. File cards and the
+  incoming/generated file panel use authenticated scoped downloads and escaped,
+  bounded text previews; unsupported formats offer download. Workspace cleanup
+  retains age filtering, manual selection and explicit confirmation.
 
 The existing owner APIs also provide full chat history, file uploads,
 workspace/result downloads and cron screens. The required native browser gate
 uses actual Keycloak, PostgreSQL and a sandbox Pod for login/logout, approvals,
 file publication/downloads, settings, schedules and workspace cleanup. See
 `spec/implementation-status.md` for requirement-specific evidence and remaining
-release gates. Chat labels are provisional because the sidebar API returns
-identifiers only. Mobile/keyboard accessibility still needs browser review;
-mocked authentication is not proof of browser authorization.
+release gates. The native browser gate also covers persisted titles, action
+correlation, approval consequences, policy filters, text previews, reading
+position and mobile keyboard focus. Mocked authentication is not proof of
+browser authorization.

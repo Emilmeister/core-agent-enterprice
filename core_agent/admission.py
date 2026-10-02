@@ -7,6 +7,7 @@ from contextlib import contextmanager, nullcontext
 import hashlib
 import inspect
 import json
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -16,8 +17,8 @@ from google.protobuf.json_format import MessageToDict
 
 from .auth import ScopeUser
 from .errors import CoreError
-from .history import read_history
-from .workflow import TERMINAL_STATES
+from .history import read_history, title_source, title_text
+from .workflow import OWNER_WAIT_KINDS, TERMINAL_STATES
 from .workspace import WorkspaceBinding
 
 
@@ -82,6 +83,60 @@ def validate_message(message):
         raise InvalidParamsError("A nonempty messageId and ROLE_USER are required")
     if any(part.WhichOneof("content") not in {"text", "data", "raw"} for part in message.parts):
         raise CoreError("CONTENT_TYPE_NOT_SUPPORTED")
+
+
+def original_text(message):
+    """Accepted transport parts, before runtime attachment instructions are added."""
+    return "\n".join(part.text if part.HasField("text") else json.dumps(
+        MessageToDict(part.data), sort_keys=True) for part in message.parts
+        if part.HasField("text") or part.HasField("data"))
+
+
+def validate_title(title, expected_revision):
+    if not isinstance(title, str):
+        raise CoreError("REQUEST_INVALID")
+    title = title.strip()
+    if (not 1 <= len(title) <= 120 or any(ord(char) < 32 for char in title)
+            or type(expected_revision) is not int or not 0 <= expected_revision < 2**63 - 1):
+        raise CoreError("REQUEST_INVALID")
+    try:
+        title.encode("utf-8")
+    except UnicodeError:
+        raise CoreError("REQUEST_INVALID") from None
+    return title
+
+
+def generated_title(message, receipt):
+    title = " ".join(original_text(message).split())
+    if not title:
+        title = next((entry["actual_name"] for entry in receipt.get("file_receipt", {}).get("entries", ())), "")
+    return title[:120]
+
+
+def record_chat_input(admission, chat, tenant, context_id, message, receipt, run_id, *, connection=None,
+                      sequence=None, cron_origin=None):
+    """Chat metadata joins the accepted input transaction, never the model context."""
+    actor = receipt.get("actor")
+    title = generated_title(message, receipt) if actor and actor.is_owner and cron_origin is None else ""
+    assign = bool(title and chat.get("title_revision", 0) == 0)
+    if title and chat.get("title_source") is not None and not assign:
+        item = title_source(admission, tenant, {**chat, "context_id": context_id}, chat["title_source"], connection)
+        assign = item is not None and item["status"] in {"rejected", "timed_out", "unprocessed_due_to_failure", "unprocessed_due_to_cancel"}
+    revision = chat.get("title_revision", 0) + 1
+    source = {"run_id": run_id, "sequence": sequence} if assign else chat.get("title_source")
+    if connection is None:
+        chat["updated_at"] = time.time()
+        if assign:
+            chat.update(title=title, title_revision=revision, title_source=source)
+    else:
+        from psycopg.types.json import Jsonb
+
+        connection.execute("""UPDATE core_chats SET updated_at=clock_timestamp(),
+            title=CASE WHEN %s THEN %s ELSE title END,
+            title_revision=CASE WHEN %s THEN title_revision+1 ELSE title_revision END,
+            title_source=CASE WHEN %s THEN %s ELSE title_source END
+            WHERE tenant_id=%s AND context_id=%s""",
+            (assign, title, assign, assign, Jsonb(source), tenant, context_id))
 
 
 def prepare_files(agent, message, context, digest):
@@ -187,16 +242,25 @@ def accept_followup(admission, message, task, request, context):
                         raise _PrepareFiles()
                 else:
                     batch = prepare_files(agent, message, context, digest)
-                return bind_files(agent, batch, task, record.run_id, context, sequence=sequence, connection=conn)
+                receipt = bind_files(agent, batch, task, record.run_id, context, sequence=sequence, connection=conn)
+                record_chat_input(admission, chat, context.tenant, task.context_id, message,
+                    {**receipt, "actor": context.state["principal"]}, record.run_id,
+                    connection=conn, sequence=sequence)
+                return receipt
 
             with (nullcontext() if database else memory_transaction(agent, task.id)):
+                previous_chat = copy.deepcopy(chat) if not database else None
                 try:
                     return workflow.append_inbound(task.id, tenant_id=context.tenant,
                         owner_id=chat["owner_id"], message_id=message.message_id, context_id=task.context_id,
                         content=request.prompt, provenance={"owner_id": chat["owner_id"], "tenant_id": context.tenant,
-                            "actor_id": context.state["principal"].actor_id, "request_digest": digest},
+                            "actor_id": context.state["principal"].actor_id, "request_digest": digest,
+                            "display_text": original_text(message)},
                         connection=connection, on_accept=bind)
                 except BaseException:
+                    if not database:
+                        chat.clear()
+                        chat.update(previous_chat)
                     if batch is not None and not database:
                         with agent.chat_file_service.store.lock:
                             agent.chat_file_service.store.rows[batch["batch_id"]] = copy.deepcopy(batch)
@@ -306,10 +370,46 @@ class MemoryRootAdmission:
                             or (record.tenant_id, record.owner_id, record.context_id) != (tenant, chat["owner_id"], context_id)):
                         continue
                     rows.append({"context_id": context_id, "latest_task_id": record.task_id if record else None,
-                                 "active": record is not None and record.state not in TERMINAL_STATES})
+                                 "active": record is not None and record.state not in TERMINAL_STATES,
+                                 **self.chat_metadata(tenant, context_id, chat, record)})
                     if len(rows) == limit:
                         break
                 return rows
+
+    def chat_metadata(self, tenant_id, context_id, chat, record=None):
+        task = self.task_store._impl.tasks.get(json.dumps([tenant_id, chat["owner_id"]]), {}).get(
+            record.task_id if record else None)
+        workflow = self.agent.workflow_store
+        now = workflow.current_time()
+        needs_attention = bool(record and record.state not in TERMINAL_STATES and not record.cancel_requested and any(
+            wait.tenant_id == tenant_id and wait.owner_id == chat["owner_id"] and wait.context_id == context_id
+            and wait.kind in OWNER_WAIT_KINDS and wait.outcome is None
+            and (wait.deadline is None or wait.deadline > now)
+            and (current := workflow._records.get(wait.run_id)) is not None
+            and (current.tenant_id, current.owner_id, current.context_id) == (tenant_id, chat["owner_id"], context_id)
+            and current.snapshot.get("budget_root_id", current.run_id) == record.snapshot.get("budget_root_id", record.run_id)
+            and current.snapshot.get("wait_id") == wait.wait_id
+            and current.state not in TERMINAL_STATES and not current.cancel_requested
+            for wait in workflow._waits.values()))
+        return {"title": title_text(self, tenant_id, {**chat, "context_id": context_id}),
+                "title_revision": chat.get("title_revision", 0),
+                "updated_at": max(chat.get("updated_at", 0), task.status.timestamp.ToMilliseconds() / 1000 if task else 0),
+                "status": TaskState.Name(task.status.state) if task else None, "needs_attention": needs_attention}
+
+    async def rename_chat(self, tenant_id, context_id, *, title, expected_revision):
+        title = validate_title(title, expected_revision)
+        cursor_context([2, context_id])
+        async with self.lock:
+            with self.agent.workflow_store._lock:
+                chat = self.chats.get((tenant_id, context_id))
+                if chat is None:
+                    raise CoreError("TASK_NOT_FOUND")
+                if chat.get("title_revision", 0) != expected_revision:
+                    raise CoreError("CHAT_TITLE_CONFLICT")
+                chat.update(title=title, title_revision=expected_revision + 1, title_source=None, updated_at=time.time())
+                record = self.agent.workflow_store._records.get(chat["latest_root_run_id"])
+                metadata = self.chat_metadata(tenant_id, context_id, chat, record)
+                return {"context_id": context_id, **{key: metadata[key] for key in ("title", "title_revision", "updated_at")}}
 
     def validate_workspace_scope(self, binding):
         # Ownership is immutable and published before the workflow worker starts.
@@ -397,7 +497,8 @@ class MemoryRootAdmission:
                              for record in self.agent.workflow_store._records.values())
             if legacy_run or self.task_store.has_admitted_context(context_id, context):
                 raise TaskNotFoundError()
-            chat = {"owner_id": actor.owner_id, "latest_root_run_id": None, "workspace_revision": 0}
+            chat = {"owner_id": actor.owner_id, "latest_root_run_id": None, "workspace_revision": 0,
+                    "title": "", "title_revision": 0, "title_source": None, "updated_at": time.time()}
         authorize(context, chat["owner_id"])
         cleanup = getattr(self, "workspace_cleanup", None)
         if cleanup:
@@ -420,7 +521,10 @@ class MemoryRootAdmission:
         self.task_store._save_admission(task, context)
         if admitted.run_id:
             self.chats[chat_key]["latest_root_run_id"] = admitted.run_id
-        self.messages[key] = {"request_digest": digest, "owner_id": chat["owner_id"], "task_id": task.id}
+            record_chat_input(self, self.chats[chat_key], context.tenant, context_id, message,
+                {**MessageToDict(task.metadata), "actor": actor}, admitted.run_id, cron_origin=cron_origin)
+        self.messages[key] = {"request_digest": digest, "owner_id": chat["owner_id"], "task_id": task.id,
+                              "display_text": original_text(message)}
         return admitted
 
     def ensure_chat(self, context, context_id=None, *, connection=None):
@@ -435,7 +539,8 @@ class MemoryRootAdmission:
                 raise CoreError("ACCESS_DENIED")
             context_id = str(uuid.uuid4())
             self.chats[(context.tenant, context_id)] = {
-                "owner_id": actor.owner_id, "latest_root_run_id": None, "workspace_revision": 0}
+                "owner_id": actor.owner_id, "latest_root_run_id": None, "workspace_revision": 0,
+                "title": "", "title_revision": 0, "title_source": None, "updated_at": time.time()}
         cursor_context([2, context_id])
         chat = self.chats.get((context.tenant, context_id))
         if chat is None:
@@ -491,20 +596,54 @@ class PostgresRootAdmission:
                     if row is None:
                         raise CoreError("REQUEST_INVALID")
                     after_context = row["context_id"]
-                query = """SELECT c.context_id, r.task_id AS latest_task_id,
-                           COALESCE(NOT (r.state = ANY(%s)), false) AS active
+                query = """SELECT c.*, r.task_id AS latest_task_id, t.state AS task_state,
+                           GREATEST(extract(epoch FROM c.updated_at), t.status_timestamp,
+                                    extract(epoch FROM t.updated_at))::double precision AS display_updated_at,
+                           COALESCE(NOT (r.state = ANY(%s)), false) AS active,
+                           COALESCE(NOT (r.state = ANY(%s)) AND NOT r.cancel_requested AND EXISTS (
+                               SELECT 1 FROM core_waits w JOIN core_runs waiting
+                                 ON waiting.run_id=w.run_id AND waiting.tenant_id=w.tenant_id
+                               WHERE w.tenant_id=c.tenant_id AND w.owner_id=c.owner_id AND w.context_id=c.context_id
+                                 AND waiting.owner_id=c.owner_id AND waiting.context_id=c.context_id
+                                 AND waiting.snapshot->>'budget_root_id'=r.snapshot->>'budget_root_id'
+                                 AND waiting.snapshot->>'wait_id'=w.wait_id
+                                 AND w.kind=ANY(%s) AND w.resolved_at IS NULL
+                                 AND (w.deadline IS NULL OR w.deadline>extract(epoch FROM clock_timestamp()))
+                                 AND NOT (waiting.state=ANY(%s)) AND NOT waiting.cancel_requested),false) AS needs_attention
                            FROM core_chats c LEFT JOIN core_runs r
                              ON r.run_id=c.latest_root_run_id AND r.tenant_id=c.tenant_id
                              AND r.owner_id=c.owner_id AND r.context_id=c.context_id AND r.parent_run_id IS NULL
+                           LEFT JOIN core_a2a_tasks t ON t.task_id=r.task_id AND t.tenant=c.tenant_id AND t.owner=c.owner_id
                            WHERE c.tenant_id=%s AND (c.latest_root_run_id IS NULL OR r.run_id IS NOT NULL)"""
-                values = [sorted(TERMINAL_STATES), tenant_id]
+                values = [sorted(TERMINAL_STATES), sorted(TERMINAL_STATES), sorted(OWNER_WAIT_KINDS), sorted(TERMINAL_STATES), tenant_id]
                 if after_context is not None:
                     query += " AND c.context_id > %s"
                     values.append(after_context)
-                return [dict(row) for row in connection.execute(
-                    query + " ORDER BY c.context_id LIMIT %s", [*values, limit],
-                ).fetchall()]
+                return [{"context_id": row["context_id"], "latest_task_id": row["latest_task_id"], "active": row["active"],
+                         "title": title_text(self, tenant_id, row, connection=connection),
+                         "title_revision": row["title_revision"], "updated_at": row["display_updated_at"],
+                         "status": TaskState.Name(row["task_state"]) if row["task_state"] is not None else None,
+                         "needs_attention": row["needs_attention"]}
+                        for row in connection.execute(query + " ORDER BY c.context_id LIMIT %s", [*values, limit]).fetchall()]
         return await asyncio.to_thread(read)
+
+    async def rename_chat(self, tenant_id, context_id, *, title, expected_revision):
+        title = validate_title(title, expected_revision)
+        cursor_context([2, context_id])
+        def rename():
+            with self.database.transaction() as connection:
+                chat = connection.execute("SELECT title_revision FROM core_chats WHERE tenant_id=%s AND context_id=%s FOR NO KEY UPDATE",
+                                          (tenant_id, context_id)).fetchone()
+                if chat is None:
+                    raise CoreError("TASK_NOT_FOUND")
+                if chat["title_revision"] != expected_revision:
+                    raise CoreError("CHAT_TITLE_CONFLICT")
+                row = connection.execute("""UPDATE core_chats SET title=%s,title_revision=title_revision+1,
+                    title_source=NULL,updated_at=clock_timestamp() WHERE tenant_id=%s AND context_id=%s
+                    RETURNING context_id,title,title_revision,extract(epoch FROM updated_at)::double precision AS updated_at""",
+                    (title, tenant_id, context_id)).fetchone()
+                return dict(row)
+        return await asyncio.to_thread(rename)
 
     def validate_workspace_scope(self, binding):
         with self.database.transaction() as connection:
@@ -631,9 +770,9 @@ class PostgresRootAdmission:
                 self.task_store._save(task, context, connection=connection)
             connection.execute(
                 """INSERT INTO core_root_messages
-                   (tenant_id, actor_id, message_id, request_digest, owner_id, context_id, task_id)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                (*key, digest, chat["owner_id"], context_id, task.id),
+                   (tenant_id, actor_id, message_id, request_digest, owner_id, context_id, task_id, display_text)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (*key, digest, chat["owner_id"], context_id, task.id, original_text(message)),
             )
             if admitted.run_id:
                 connection.execute(
@@ -641,4 +780,7 @@ class PostgresRootAdmission:
                        WHERE tenant_id = %s AND context_id = %s""",
                     (admitted.run_id, context.tenant, context_id),
                 )
+                record_chat_input(self, chat, context.tenant, context_id, message,
+                    {**MessageToDict(task.metadata), "actor": actor}, admitted.run_id,
+                    connection=connection, cron_origin=cron_origin)
         return admitted

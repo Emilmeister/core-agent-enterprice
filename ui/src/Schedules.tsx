@@ -152,7 +152,7 @@ export function Schedules({ api, chats, onChat, refreshChats, onDirty }: {
           <span className="muted">Пять полей: минуты, часы, день месяца, месяц, день недели. Например: 0 9 * * mon-fri.</span></label>
         <label>Часовой пояс<input required value={draft.timezone} placeholder="Europe/Moscow" onChange={(event) => { setDraft({ ...draft, timezone: event.target.value }); setChanged(true); }} /></label>
         {selection === "new" ? <label className="full">Чат<select value={draft.context_id} onChange={(event) => { setDraft({ ...draft, context_id: event.target.value }); setChanged(true); }}>
-          <option value="">Создать новый пустой чат</option>{chats.map((chat, index) => <option key={chat.context_id} value={chat.context_id}>Чат {index + 1} · {chat.context_id}</option>)}
+          <option value="">Создать новый пустой чат</option>{chats.map((chat) => <option key={chat.context_id} value={chat.context_id}>{chat.title || "Новый чат"}</option>)}
         </select></label> : <label className="check full"><input type="checkbox" checked={draft.enabled} onChange={(event) => { setDraft({ ...draft, enabled: event.target.checked }); setChanged(true); }} />Расписание включено</label>}
       </div><div className="actions"><button type="submit">{busy ? "Сохраняем…" : "Сохранить"}</button></div></fieldset>
     </form>}

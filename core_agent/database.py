@@ -28,7 +28,7 @@ from .errors import CoreError
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -863,6 +863,16 @@ ALTER TABLE core_memory_revisions
 DROP INDEX core_memory_namespace_idx;
 CREATE INDEX core_memory_namespace_idx
     ON core_memory_documents (tenant_id, app_name, user_id, namespace);
+""",
+
+    25: """
+ALTER TABLE core_chats
+    ADD COLUMN title text NOT NULL DEFAULT '' CHECK (char_length(title) <= 120),
+    ADD COLUMN title_revision bigint NOT NULL DEFAULT 0 CHECK (title_revision >= 0),
+    ADD COLUMN title_source jsonb,
+    ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now();
+UPDATE core_chats SET updated_at = created_at;
+ALTER TABLE core_root_messages ADD COLUMN display_text text;
 """,
 
 }

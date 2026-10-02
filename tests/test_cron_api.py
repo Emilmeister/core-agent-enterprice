@@ -32,7 +32,10 @@ class CronAPITests(AuthAppTestCase):
         read = await self.http.get("/api/schedules", headers=self.headers("owner-b"))
         self.assertEqual(read.json(), {"schedules": [row], "next_cursor": None})
         chats = await self.http.get("/api/chats", headers=self.headers("owner-b"))
-        self.assertIn({"context_id": row["context_id"], "latest_task_id": None, "active": False}, chats.json()["chats"])
+        chat = next(item for item in chats.json()["chats"] if item["context_id"] == row["context_id"])
+        self.assertEqual({key: chat[key] for key in ("context_id", "latest_task_id", "active")},
+                         {"context_id": row["context_id"], "latest_task_id": None, "active": False})
+        self.assertEqual((chat["title"], chat["title_revision"], chat["status"]), ("", 0, None))
         history = await self.http.get(f"/api/chats/{row['context_id']}/history", headers=self.headers("owner-a"))
         self.assertEqual(history.json(), {"items": [], "next_cursor": None})
         self.assertFalse(self.model.calls)

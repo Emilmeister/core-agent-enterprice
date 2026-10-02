@@ -41,9 +41,6 @@ function Entrance() {
     <App session={session} />
   ) : (
     <main className="entrance">
-      <div className="brand">
-        <span className="brand-mark">c</span>core / agent
-      </div>
       <div className="eyebrow">Рабочее пространство владельцев</div>
       <h1>{signedOut ? "Вы вышли из аккаунта" : error ? "Вход не завершён" : "Подключаем рабочее пространство"}</h1>
       <p role={error ? "alert" : "status"}>

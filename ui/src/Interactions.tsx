@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Api, ApiError, errorText } from "./api";
 import type { Interaction } from "./types";
+import { actionLabel, actionPreview } from "./toolPresentation";
 
 export function InteractionCard({
   api,
@@ -19,6 +20,32 @@ export function InteractionCard({
   );
   const expired = item.deadline * 1000 <= Date.now();
   const closed = !!item.outcome || expired;
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => {
+    if (closed) {
+      request.current?.abort();
+      setMaterial(null);
+    }
+    return () => request.current?.abort();
+  }, [api, item.context_id, item.wait_id, closed]);
+  function beginRequest() {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setBusy(true);
+    setError("");
+    return controller;
+  }
+  const toolName = typeof item.subject.tool_name === "string"
+    ? item.subject.tool_name : "Неизвестный инструмент";
+  const rawArgs = item.subject.arguments;
+  const resolved = item.subject.resolved_parameters;
+  const args = toolName === "core_cron_create" && rawArgs && typeof rawArgs === "object"
+    && resolved && typeof resolved === "object" && "timezone" in resolved
+    && typeof resolved.timezone === "string"
+    ? { ...rawArgs, timezone: resolved.timezone } : rawArgs;
+  const preview = actionPreview(toolName, args);
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const titles = {
     tool_approval: "Разрешение на действие",
     owner_question: "Вопрос к вам",
@@ -30,8 +57,8 @@ export function InteractionCard({
     guardrail: "guardrails",
   };
   async function decide(decision?: string) {
-    setBusy(true);
-    setError("");
+    if (closed) return;
+    const controller = beginRequest();
     try {
       await api.json(
         `/api/${routes[item.kind]}/${encodeURIComponent(item.wait_id)}/${item.kind === "owner_question" ? "answer" : "decision"}`,
@@ -40,42 +67,46 @@ export function InteractionCard({
           subject_digest: item.subject_digest,
           ...(item.kind === "owner_question" ? { answer } : { decision }),
         },
+        controller.signal,
       );
+      if (controller.signal.aborted || !api.session.valid) return;
       setAnswer("");
       setMaterial(null);
       await refresh();
     } catch (failure) {
+      if (controller.signal.aborted || !api.session.valid) return;
       setError(errorText(failure));
       if (failure instanceof ApiError && failure.status === 409)
         await refresh().catch(() => {});
     } finally {
-      setBusy(false);
+      if (!controller.signal.aborted && api.session.valid) setBusy(false);
     }
   }
   async function inspect() {
-    setBusy(true);
-    setError("");
+    if (closed) return;
+    const controller = beginRequest();
     try {
-      setMaterial(
-        await api.json(
-          `/api/guardrails/${encodeURIComponent(item.wait_id)}/material`,
-        ),
+      const data = await api.json<Record<string, unknown>>(
+        `/api/guardrails/${encodeURIComponent(item.wait_id)}/material`,
+        "GET", undefined, controller.signal,
       );
+      if (!controller.signal.aborted && api.session.valid) setMaterial(data);
     } catch (failure) {
-      setError(errorText(failure));
+      if (!controller.signal.aborted && api.session.valid) setError(errorText(failure));
     } finally {
-      setBusy(false);
+      if (!controller.signal.aborted && api.session.valid) setBusy(false);
     }
   }
   async function download() {
-    setBusy(true);
-    setError("");
+    if (closed) return;
+    const controller = beginRequest();
     try {
       const response = await api.request(
         `/api/guardrails/${encodeURIComponent(item.wait_id)}/file`,
+        { signal: controller.signal },
       );
       const blob = await response.blob();
-      if (!api.session.valid) return;
+      if (controller.signal.aborted || !api.session.valid) return;
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -83,14 +114,15 @@ export function InteractionCard({
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (failure) {
-      setError(errorText(failure));
+      if (!controller.signal.aborted && api.session.valid) setError(errorText(failure));
     } finally {
-      setBusy(false);
+      if (!controller.signal.aborted && api.session.valid) setBusy(false);
     }
   }
   if (item.outcome && item.kind !== "owner_question") return null;
   return (
-    <article className={`interaction ${closed ? "resolved" : ""}`}>
+    <article id={`interaction-${item.wait_id}`} tabIndex={-1}
+      className={`interaction ${closed ? "resolved" : ""}`}>
       <div className="eyebrow">
         {item.outcome
           ? "Решение сохранено"
@@ -99,6 +131,22 @@ export function InteractionCard({
             : "Нужно ваше решение"}
       </div>
       <h3>{titles[item.kind] ?? "Ожидание"}</h3>
+      {item.kind === "tool_approval" && (
+        <>
+          <h4 className="interaction-heading">{actionLabel(toolName, args)}</h4>
+          {preview.length > 0 && (
+            <dl className="action-preview">
+              {preview.map((field, index) => (
+                <div className="action-field" key={`${field.label}:${index}`}>
+                  <dt>{field.label}</dt>
+                  <dd>{field.value}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+          <p className="muted">Разрешение относится только к этому вызову. Результат появится после выполнения.</p>
+        </>
+      )}
       {typeof item.subject.question === "string" && (
         <p className="prose">{item.subject.question}</p>
       )}
@@ -109,11 +157,11 @@ export function InteractionCard({
         </p>
       )}
       <p className="muted">
-        До {new Date(item.deadline * 1000).toLocaleString("ru-RU")}
+        Ответить до {new Date(item.deadline * 1000).toLocaleString("ru-RU", { timeZoneName: "short" })} · {timezone}
       </p>
       {item.kind !== "owner_question" && (
         <details>
-          <summary>Посмотреть детали</summary>
+          <summary>Технические данные</summary>
           <pre>{JSON.stringify(item.subject, null, 2)}</pre>
         </details>
       )}
@@ -132,11 +180,11 @@ export function InteractionCard({
       )}
       {item.kind === "guardrail" && (
         <div className="actions">
-          <button className="secondary" disabled={busy} onClick={inspect}>
+          <button className="secondary" disabled={busy || closed} onClick={inspect}>
             Просмотреть материал
           </button>
           {item.subject.affected_scope === "file_batch" && (
-            <button className="secondary" disabled={busy} onClick={download}>
+            <button className="secondary" disabled={busy || closed} onClick={download}>
               Скачать проверяемый файл
             </button>
           )}

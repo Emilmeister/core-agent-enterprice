@@ -7,6 +7,11 @@ export interface ChatRow {
   context_id: string;
   latest_task_id: string | null;
   active: boolean;
+  title?: string;
+  title_revision?: number;
+  updated_at?: number;
+  status?: string | null;
+  needs_attention?: boolean;
 }
 export interface AttachmentEntry {
   index: number;
@@ -31,6 +36,11 @@ export interface FileReceipt {
   entries: AttachmentEntry[];
 }
 export const byteCount = (bytes: number) => `${new Intl.NumberFormat("ru-RU").format(bytes)} байт`;
+export function formatFileSize(bytes: number): string {
+  const units = ["Б", "КБ", "МБ", "ГБ"];
+  const unit = Math.min(units.length - 1, Math.floor(Math.log10(Math.max(1, bytes)) / 3));
+  return `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 }).format(bytes / 1000 ** unit)} ${units[unit]}`;
+}
 export function fileReceipt(value: unknown): FileReceipt | undefined {
   if (!value || typeof value !== "object") return undefined;
   const receipt = value as FileReceipt;
@@ -57,6 +67,7 @@ export interface HistoryItem {
     | "placeholder"
     | "schedule_notice";
   text: string;
+  display_text?: string;
   status:
     | "available"
     | "queued"
@@ -163,6 +174,7 @@ export function remoteProgress(task?: Task): RemoteProgress[] {
 }
 export interface Interaction {
   wait_id: string;
+  source_id?: string;
   context_id: string;
   kind: "tool_approval" | "owner_question" | "guardrail";
   subject: Record<string, unknown>;

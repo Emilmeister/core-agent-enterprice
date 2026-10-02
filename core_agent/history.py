@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import uuid
 from itertools import chain, islice
@@ -49,12 +50,18 @@ def _root(admission, run_id, tenant, chat, connection):
         value.update(previous=snapshot.get("previous_root_run_id"),
             file_batch_id=snapshot.get("file_batch_id"),
             initial_checked=snapshot.get("initial_material_checked", False),
-            start=snapshot.get("context", {}).get("sequence_range", [1, 0])[0], admitted=admitted)
+            start=snapshot.get("context", {}).get("sequence_range", [1, 0])[0], admitted=admitted,
+            original_prompt=record.request.get("prompt"), cron_origin=snapshot.get("cron_origin"),
+            display_text=next((row.get("display_text") for key, row in admission.messages.items()
+                if key[0] == tenant and row["task_id"] == record.task_id and row["owner_id"] == chat["owner_id"]), None))
     else:
         value = connection.execute("""SELECT r.run_id,r.task_id,r.tenant_id,r.owner_id,r.context_id,
             r.parent_run_id,r.state,r.error_code,
             r.snapshot->>'file_batch_id' AS file_batch_id,
             r.snapshot->>'previous_root_run_id' AS previous,
+            r.request->>'prompt' AS original_prompt,r.snapshot->'cron_origin' AS cron_origin,
+            (SELECT m.display_text FROM core_root_messages m WHERE m.tenant_id=r.tenant_id
+                AND m.task_id=r.task_id AND m.owner_id=r.owner_id AND m.context_id=r.context_id LIMIT 1) AS display_text,
             COALESCE((r.snapshot->>'initial_material_checked')::boolean,false) AS initial_checked,
             COALESCE((r.snapshot#>>'{context,sequence_range,0}')::bigint,1) AS start,
             EXISTS(SELECT 1 FROM core_root_messages m WHERE m.tenant_id=r.tenant_id
@@ -68,7 +75,7 @@ def _root(admission, run_id, tenant, chat, connection):
     return value
 
 
-def _entries(admission, root, connection, *, before, limit, exact=False, inclusive=False):
+def _entries(admission, root, connection, *, before, limit, exact=False, inclusive=False, source_sequence=-1):
     """Only selected JSON elements leave PostgreSQL; no full snapshot is loaded."""
     if connection is None:
         store = admission.agent.workflow_store
@@ -98,12 +105,25 @@ def _entries(admission, root, connection, *, before, limit, exact=False, inclusi
             values.append({"position": (0, 1, 0, 0), "item": {"kind": "prompt", "content": ""}, "input": None})
         if root["state"] in TERMINAL_STATES:
             values.append({"position": (2, 0, 0, 0), "item": None, "input": None})
+        if source_sequence != -1:
+            if source_sequence is None:
+                values = [row for row in values if (row["item"] or {}).get("kind") == "prompt" and row["input"] is None]
+            else:
+                values = [row for row in values if row["input"] and row["input"]["sequence"] == source_sequence]
         return sorted((row for row in values if before is None or
                        (row["position"] == before if exact else
                         row["position"] < before or inclusive and row["position"] == before)),
                       key=lambda row: row["position"], reverse=True)[:limit]
     compare = "=" if exact else "<=" if inclusive else "<"
     predicate = f"WHERE (lane,anchor,part,seq) {compare} (%s,%s,%s,%s)" if before is not None else ""
+    source_values = ()
+    if source_sequence != -1:
+        predicate += " AND " if predicate else "WHERE "
+        if source_sequence is None:
+            predicate += "item->>'kind'='prompt' AND input IS NULL"
+        else:
+            predicate += "(input->>'sequence')::bigint=%s"
+            source_values = (source_sequence,)
     rows = connection.execute(f"""WITH transcript AS (
         SELECT item, ordinal-1+%s AS position FROM core_runs r,
             jsonb_array_elements(COALESCE(r.snapshot#>'{{context,transcript}}','[]'::jsonb))
@@ -126,7 +146,7 @@ def _entries(admission, root, connection, *, before, limit, exact=False, inclusi
     ) SELECT lane,anchor,part,seq,item,input FROM entries {predicate}
       ORDER BY lane DESC,anchor DESC,part DESC,seq DESC LIMIT %s""",
         (root["start"], root["run_id"], root["tenant_id"], root["run_id"],
-         root["state"] in TERMINAL_STATES, *(before or ()), limit)).fetchall()
+         root["state"] in TERMINAL_STATES, *(before or ()), *source_values, limit)).fetchall()
     return [{"position": (row["lane"], row["anchor"], row["part"], row["seq"]),
              "item": row["item"], "input": row["input"]} for row in rows]
 
@@ -184,6 +204,15 @@ def _text(item):
         value = {key: _safe_value(payload[key]) for key in ("tool_call_id", "tool_name", "status", "output") if key in payload}
         if payload.get("status") == "failed":
             value.pop("output", None)  # Exception/provider text is not a public error contract.
+            output = payload.get("output")
+            if (isinstance(payload.get("tool_name"), str) and payload["tool_name"] in {"core_terminal_exec", "core_python_exec"}
+                    and isinstance(output, dict) and type(output.get("exit_code")) is int
+                    and -(2**31) <= output["exit_code"] < 2**31
+                    and type(output.get("timed_out")) is bool and type(output.get("truncated")) is bool
+                    and isinstance(output.get("status"), str) and output["status"] in {"failed", "timed_out"}
+                    and (type(output.get("duration")) is int and 0 <= output["duration"] < 2**63
+                         or type(output.get("duration")) is float and math.isfinite(output["duration"]) and output["duration"] >= 0)):
+                value["output"] = {key: output[key] for key in ("exit_code", "timed_out", "truncated", "duration", "status")}
         if isinstance(payload.get("error_code"), str) and re.fullmatch(r"[A-Z][A-Z0-9_]*", payload["error_code"]):
             value["error_code"] = payload["error_code"]
         return "tool_result", json.dumps(value, ensure_ascii=False, sort_keys=True)
@@ -431,6 +460,12 @@ def _project(admission, root, entry, connection, chat):
         result["kind"], result["text"] = _text(item or {})
         if kind in {"unprocessed_due_to_failure", "unprocessed_due_to_cancel"}:
             result.update(kind="placeholder", status=kind, text="[Accepted message was not processed]")
+    if result["status"] == "available" and result["kind"] == "user_message":
+        display = message["provenance"].get("display_text") if message else root.get("display_text") if kind == "prompt" else None
+        if display is not None:
+            if not isinstance(display, str):
+                raise CoreError("CHECKPOINT_INVALID")
+            result["display_text"] = display
     if result["status"] == "available" and batches:
         service = admission.agent.chat_file_service
         for batch_id in batches:
@@ -456,6 +491,53 @@ def _project(admission, root, entry, connection, chat):
                                               limit_bytes=files[0].get("limit_bytes"))
             result["response_files"] = list(service.receipts(validated))
     return result
+
+
+def title_source(admission, tenant, chat, source, connection=None):
+    if (not isinstance(source, dict) or set(source) != {"run_id", "sequence"}
+            or source["sequence"] is not None and (type(source["sequence"]) is not int or source["sequence"] < 1)):
+        raise CoreError("CHECKPOINT_INVALID")
+    root = _root(admission, source["run_id"], tenant, chat, connection)
+    entries = _entries(admission, root, connection, before=None, limit=1, source_sequence=source["sequence"])
+    return _project(admission, root, entries[0], connection, chat) if entries else None
+
+
+def title_text(admission, tenant, chat, connection=None):
+    """Automatic names follow the same current material decisions as the source."""
+    source = chat.get("title_source")
+    if source is not None:
+        item = title_source(admission, tenant, chat, source, connection)
+        return chat["title"] if item and item["status"] == "available" else ""
+    if chat.get("title_revision", 0):
+        return chat.get("title", "")  # Explicit owner rename is independent metadata.
+    # ponytail: legacy names derive from existing history; no rewrite of old inputs.
+    roots, seen, run_id = [], set(), chat["latest_root_run_id"]
+    while run_id:
+        if run_id in seen:
+            raise CoreError("CHECKPOINT_INVALID")
+        seen.add(run_id)
+        root = _root(admission, run_id, tenant, chat, connection)
+        roots.append(root)
+        run_id = root["previous"]
+    from .a2a import ATTACHMENTS_ONLY_PROMPT
+    from .auth import OWNER_SCOPE
+
+    for root in reversed(roots):
+        if root["owner_id"] != OWNER_SCOPE or root.get("cron_origin") is not None:
+            continue
+        entries = _entries(admission, root, connection, before=None, limit=1, source_sequence=None)
+        if not entries:
+            continue
+        item = _project(admission, root, entries[0], connection, chat)
+        if item["status"] != "available":
+            continue
+        text = item.get("display_text", root.get("original_prompt") or "")
+        if text == ATTACHMENTS_ONLY_PROMPT and root.get("file_batch_id"):
+            text = ""
+        name = " ".join(text.split()) or next((entry["actual_name"] for entry in item.get("attachments", ())), "")
+        if name:
+            return name[:120]
+    return ""
 
 
 def _notices(admission, tenant, chat, connection, **query):

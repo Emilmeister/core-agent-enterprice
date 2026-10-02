@@ -154,7 +154,7 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         backend["command"] = ["uv", "run", "--no-sync", "python", "/browser-fixture/server.py", "backend"]
         backend["envFrom"] = [{"configMapRef": {"name": "native"}}, {"secretRef": {"name": "server-config"}}]
         settings = {"CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled", "SESSION_STORAGE_TYPE": "postgres",
-                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec,core_response_files,core_cron_create", "CORE_AGENT_ALLOWED_SKILLS": "",
+                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec,core_response_files,core_cron_create,core_ask_owner,core_task_start,core_task_wait", "CORE_AGENT_ALLOWED_SKILLS": "",
                     "CHAT_WORKSPACE_ROOT": "/data/chats", "LOCAL_WORKSPACE_ROOT": "/data/scratch", "DURABLE_STORAGE_ROOT": "/data/durable",
                     "UV_CACHE_DIR": "/tmp/uv-cache", "PYTHONDONTWRITEBYTECODE": "1", "OTEL_SDK_DISABLED": "true"}
         backend["env"] = [{"name": name, "value": value} for name, value in settings.items()]

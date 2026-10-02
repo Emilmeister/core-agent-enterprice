@@ -44,7 +44,7 @@ export function App({ session }: { session: Session }) {
       const read = ++chatRead.current;
       const rows = await api.pages<ChatRow>("/api/chats", "chats", signal);
       if (!signal?.aborted && read === chatRead.current) {
-        setChats(rows);
+        setChats(rows.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0) || a.context_id.localeCompare(b.context_id)));
         setError("");
         setLoading(false);
       }
@@ -84,8 +84,14 @@ export function App({ session }: { session: Session }) {
       context_id: task.contextId,
       latest_task_id: task.id,
       active: !terminal(task),
+      status: task.status.state,
     };
     setSelected(row);
+    void refreshChats().catch((e) => setError(errorText(e)));
+  }
+  function renamed(metadata: Partial<ChatRow> & { context_id: string }) {
+    setChats((rows) => rows.map((row) => row.context_id === metadata.context_id ? { ...row, ...metadata } : row));
+    setSelected((row) => row?.context_id === metadata.context_id ? { ...row, ...metadata } : row);
     void refreshChats().catch((e) => setError(errorText(e)));
   }
   return (
@@ -123,19 +129,6 @@ export function App({ session }: { session: Session }) {
         </svg>
       </button>
       <aside className={`sidebar ${menu ? "open" : ""}`} id="sidebar">
-        <a
-          className="brand"
-          href="#"
-          onClick={(event) => {
-            event.preventDefault();
-            navigate(() => {
-              setPage("chats");
-              setMenu(false);
-            });
-          }}
-        >
-          Core Agent
-        </a>
         <button className="new-chat secondary" onClick={() => choose(null)}>
           <svg
             width="18"
@@ -177,7 +170,7 @@ export function App({ session }: { session: Session }) {
             <p className="muted">Ваш первый чат появится здесь.</p>
           )}
           <div className="chat-list">
-            {chats.map((row, index) => (
+            {chats.map((row) => (
               <button
                 className={`chat-link ${selected?.context_id === row.context_id && page === "chats" ? "selected" : ""}`}
                 key={row.context_id}
@@ -186,18 +179,14 @@ export function App({ session }: { session: Session }) {
                     ? "page"
                     : undefined
                 }
-                title={row.context_id}
+                title={row.title || "Новый чат"}
                 onClick={() => choose(row)}
               >
-                <span
-                  className={`status-dot ${row.active ? "green" : ""}`}
-                  aria-label={
-                    row.active ? "Активная задача" : "Нет активной задачи"
-                  }
-                />
-                <span>
-                  <strong>Чат {index + 1}</strong>
-                  <small title={row.context_id}>{row.context_id}</small>
+                <span className="chat-link-content">
+                  <strong>{row.title || "Новый чат"}</strong>
+                  {row.updated_at ? <small><time dateTime={new Date(row.updated_at * 1000).toISOString()}>{new Date(row.updated_at * 1000).toLocaleString("ru-RU", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time></small> : null}
+                  {(row.needs_attention || row.status === "TASK_STATE_INPUT_REQUIRED") && <small className="chat-attention">Нужен ваш ответ</small>}
+                  {["TASK_STATE_FAILED", "TASK_STATE_REJECTED"].includes(row.status ?? "") && <small className="chat-attention danger">Ошибка выполнения</small>}
                 </span>
               </button>
             ))}
@@ -246,6 +235,7 @@ export function App({ session }: { session: Session }) {
             row={selectedRow}
             onTask={submitted}
             onDirty={setDirty}
+            onRenamed={renamed}
           />
         ) : page === "schedules" ? (
           <Schedules api={api} chats={chats} onChat={choose} refreshChats={refreshChats} onDirty={setDirty} />

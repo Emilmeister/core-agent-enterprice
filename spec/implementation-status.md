@@ -144,8 +144,20 @@
 | Requirement | Source | Automated proof | Status |
 |---|---|---|---|
 | ENT-AC-72 | [Owner UI logout](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required `tests.test_owner_ui_files_browser`: actual Keycloak logout с ID token hint и exact redirect allowlist, старый bearer401, logged-out reload без private requests/auto-login и явный повторный PKCE login | implemented |
-| ENT-AC-73 | [Owner interaction display](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required `tests.test_owner_ui_files_browser`: активные native approvals, durable decisions и отсутствие завершённых карточек. Guardrail/owner-question варианты пока не имеют отдельного CI rendering proof | partial |
+| ENT-AC-73 | [Owner interaction display](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required `tests.test_owner_ui_files_browser`: native approvals и guardrail rejection скрываются после durable outcome, owner question и сохранённый ответ остаются видимыми, решения сохраняются в owner API | implemented |
 
 ## Release rule
 
 Production release v1 разрешён только когда все строки, относящиеся к scope `releases/v1.md`, имеют статус `implemented`, а полный test command воспроизводится из чистого checkout без ручных шагов. Target-only exclusions остаются `partial`/`missing` только если явно перечислены в release profile.
+
+## Owner UI presentation
+
+| Requirement | Source | Automated proof | Status |
+|---|---|---|---|
+| ENT-AC-74 | [Action cards](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required `tests.test_owner_ui_files_browser`: correlated Task/call cards, success grouping, newline output, technical disclosure and known failure | implemented |
+| ENT-AC-75 | [Request state](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required browser gate: canonical approval/question state, focus jump and quiet successful connection | implemented |
+| ENT-AC-76 | [Concrete approvals](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required browser gate: native saved command/deadline/timezone, hidden completed tool/guardrail requests and retained answered owner question | implemented |
+| ENT-AC-77 | [Tool settings](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required browser gate: technical-name search, source/mode/check filters and explicit independent CAS rule saves | implemented |
+| ENT-AC-78 | [File presentation](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | `tests.test_owner_history` original display provenance; required browser gate: scoped abortable downloads, text preview, incoming/generated panel/source jumps and cleanup | implemented |
+| ENT-AC-79 | [Chat titles](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | `tests.test_owner_chats` memory/PostgreSQL owner/company CAS, guarded title provenance and additive migration; required browser gate: rename and reload | implemented |
+| ENT-AC-80 | [Composer/accessibility](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required browser gate: growing compact composer, aggregate size, stable reading position, explicit new-message jump and mobile keyboard focus | implemented |
