@@ -147,6 +147,11 @@ criterion должны войти в тот же завершённый change. 
   disposable Pod и реальные Keycloak/PostgreSQL. Он обязателен на amd64 с
   `CORE_AGENT_REQUIRE_BROWSER_TESTS=1`: отсутствие Chromium, Node, конфигурации
   или native fixtures завершает проверку ошибкой, без skip.
+- PostgreSQL migration suite использует `TEST_POSTGRES_CONTAINER` для настоящих
+  `pg_dump`/`pg_restore` того же server version. Ordinary CI передаёт ID своего
+  disposable PostgreSQL service; тест восстанавливает только собственную schema
+  и копию test blobs, сохраняя encryption key вне dump. Это proof отката до новых
+  application writes, а не разрешение восстановить старый backup поверх новых данных.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
   Agent использует native OCI seccomp profile (`SANDBOX_OCI_ARCH=amd64|arm64`),
   `systempaths=unconfined` для nested proc mount, `/dev/net/tun`, read-only root,

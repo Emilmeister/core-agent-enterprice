@@ -191,18 +191,23 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
 
 - Обычный Python3.12 CI на свежей БД/schema24 с настоящими PostgreSQL/Keycloak:
   `uv sync --frozen`, migrations, Ruff и `uv run python -m unittest discover
-  -s tests -v` — 1627 tests, 258.011 секунды, exit0. Три dedicated skips
+  -s tests -v` — 1628 tests, 262.659 секунды, exit0. Три dedicated skips
   относятся к native sandbox, actual browser и memory-loop ownership case;
   PostgreSQL/Keycloak tests не пропущены. Evidence —
-  `.local-evidence/migrations-ci-recovered/`. Предыдущий failed run сохранён:
+  `.local-evidence/backup-ci-final/`. Предыдущий failed run сохранён:
   тест summary пересекался с legitimate detector_busy из background tool.
   Для этого отдельного теста terminal помечен guardrails-exempt; production
   single-slot и owner decision при busy не изменены. 100 повторений проходят.
 - Enterprise schema upgrade proof входит в ordinary discovery: source12 и
   каждый source13–23 переходят на текущую schema, сохраняют admitted state,
   wait deadlines/outcomes, настройки, encrypted peers и transport blob bytes
-  после repeat migration/new pool. Old/unknown build отклоняется. Operator
-  mapping/import и согласованный backup restore остаются отдельными open gates.
+  после repeat migration/new pool. Old/unknown build отклоняется. Actual
+  pg_dump/pg_restore schema23 и отдельная копия transport blobs восстанавливаются
+  после удаления схемы и файлов; сохраняются deadlines, outcomes, scope и
+  encrypted peer с прежним ключом. Проверены обратная schema version и повторный
+  upgrade; в fixture нет новых application writes после backup. CI использует
+  dump/restore utilities своего PostgreSQL service. Operator mapping/import и
+  production cutover остаются отдельными open gates.
 - Combined release boundary module входит в ordinary discovery: cron после двух
   compactions, omitted summary vs authoritative policy/waits, оба remote
   input/auth-required bindings с follow-up после PG restart, manual/automatic

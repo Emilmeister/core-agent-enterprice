@@ -1,17 +1,20 @@
 """ENT-MIG-01: real schema upgrades preserve admitted state and opaque blobs.
 
 These checks cover database compatibility and fail-closed version checks;
-operator mapping/import and a coordinated production backup restore are separate.
+operator mapping/import and a production cutover remain separate.
 """
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 from a2a.types import a2a_pb2
 from cryptography.fernet import Fernet
-from psycopg.conninfo import make_conninfo
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.sql import SQL, Identifier
 from psycopg.types.json import Jsonb
 
@@ -204,3 +207,49 @@ class EnterpriseMigrationTests(unittest.TestCase):
                     self.assertEqual(registry.get_revision(tenant, peer["id"], 1), peer)
                     self.assertEqual(registry.resolve_headers(tenant, peer["id"], 1),
                                      {"X-Api-Key": "migration-secret-canary"})
+
+    @unittest.skipUnless(os.getenv("TEST_POSTGRES_CONTAINER"), "TEST_POSTGRES_CONTAINER is required")
+    def test_quiesced_backup_restores_schema_state_blobs_and_encrypted_peer_before_cutover_writes(self):
+        database, url = self.database_at(23)
+        tables, tenant, peer, artifact, content = self.seed(database, 23)
+        before = self.rows(database, tables)
+        connection = conninfo_to_dict(url)
+        schema = connection["options"].removeprefix("-c search_path=")
+        command = ["docker", "exec", "-i", os.environ["TEST_POSTGRES_CONTAINER"]]
+        target = ["--username", connection["user"], "--dbname", connection["dbname"]]
+        with tempfile.TemporaryDirectory() as backup_folder:
+            backup = Path(backup_folder)
+            dump = subprocess.run(command + ["pg_dump", *target, "--format=custom", "--schema", schema],
+                                  check=True, capture_output=True, timeout=30)
+            (backup / "database.dump").write_bytes(dump.stdout)
+            shutil.copytree(self.temporary.name, backup / "volume")
+            upgraded = self.upgrade_and_restart(database, url, tables)
+            upgraded.close()
+            with self.admin.transaction() as admin:
+                admin.execute(SQL("DROP SCHEMA {} CASCADE").format(Identifier(schema)))
+            shutil.rmtree(self.temporary.name)
+            subprocess.run(command + ["pg_restore", *target, "--exit-on-error"],
+                           input=(backup / "database.dump").read_bytes(), check=True,
+                           capture_output=True, timeout=30)
+            shutil.copytree(backup / "volume", self.temporary.name)
+        restored = PostgresDatabase(url, min_size=0, max_size=1)
+        self.addCleanup(restored.close)
+        self.assertEqual(restored.schema_version(), 23)
+        after = self.rows(restored, tables)
+        for table in tables:
+            self.assertCountEqual(after[table], before[table], table)
+        with self.assertRaises(CoreError) as error:
+            restored.verify_schema()
+        self.assertEqual(error.exception.code, "DATABASE_SCHEMA_MISMATCH")
+        with patch.object(database_module, "SCHEMA_VERSION", 23):
+            restored.verify_schema()
+        stored, retrieved = PostgresArtifactStore(restored, self.temporary.name).get(tenant, artifact.id)
+        self.assertEqual((stored, retrieved), (artifact, content))
+        with self.assertRaises(CoreError) as error:
+            PostgresArtifactStore(restored, self.temporary.name).get("other-company", artifact.id)
+        self.assertEqual(error.exception.code, "NOT_FOUND")
+        registry = PostgresRemoteRegistry(restored, self.key)
+        self.assertEqual(registry.get_revision(tenant, peer["id"], 1), peer)
+        self.assertEqual(registry.resolve_headers(tenant, peer["id"], 1),
+                         {"X-Api-Key": "migration-secret-canary"})
+        self.upgrade_and_restart(restored, url, tables)

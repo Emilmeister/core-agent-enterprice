@@ -203,7 +203,10 @@ jobs:
           curl --fail --silent --show-error --retry 30 --retry-delay 2 \
             --retry-connrefused --retry-max-time 90 --max-time 5 \
             "$TEST_KEYCLOAK_URL/realms/master/.well-known/openid-configuration" >/dev/null
-      - run: uv run python -m unittest discover -s tests -v
+      - name: Verify runtime and coordinated PostgreSQL backup restore
+        env:
+          TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: uv run python -m unittest discover -s tests -v
       - name: Remove isolated Keycloak
         if: always()
         run: docker rm -f core-agent-keycloak-test
