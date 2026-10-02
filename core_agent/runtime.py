@@ -1590,6 +1590,20 @@ class CoreAgent:
         runtime_token = None
         try:
             record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            previous = record.snapshot.get("execution_owner")
+            completed = record.snapshot.get("pending_completed_result") or {}
+            call = completed.get("call") or {}
+            outcome = completed.get("outcome") or {}
+            output = outcome.get("output")
+            if (previous and not previous["cleanup_confirmed"]
+                    and call == record.snapshot.get("pending_call")
+                    and call.get("name") in {"core_terminal_exec", "core_python_exec"}
+                    and outcome.get("status") in {"succeeded", "failed"}
+                    and outcome.get("error_code") != "SIDE_EFFECT_UNKNOWN"
+                    and isinstance(output, dict) and output.get("cleanup") == "sandbox_terminated"):
+                # A persisted local result proves namespace teardown even if the
+                # server stopped during result review before its final receipt.
+                record = self.workflow_store.confirm_execution(record, previous)
             if record.snapshot.get("terminal_intent"):
                 return self._terminal_result(self._finish_terminal(record, lease_token=token))
             if self._unproven_local_execution(record):

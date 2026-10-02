@@ -532,7 +532,10 @@ run получает отдельные MCP session и negotiated version; пе�
   ожидание процессов выполняются вне транзакции БД. Foreign receipt с
   `local_execution_pending=true` или без этого поля требует reconciliation.
   Явное `false` позволяет восстановить model-only или безопасно остановленное
-  ожидание. Принятый follow-up переоткрывает Task с новой lease; старый intent
+  ожидание. Сохранённый результат точного local call с подтверждённым
+  `sandbox_terminated` также позволяет подтвердить старый receipt перед
+  восстановлением; код процесса и уже завершённый tool не повторяются.
+  Принятый follow-up переоткрывает Task с новой lease; старый intent
   не может закрыть новую generation или её cached runtime/connector.
   Сам terminal intent не закрывает inbox: до фактического terminal commit
   follow-up принимается, включая private file batch. Публикация файлов остаётся
