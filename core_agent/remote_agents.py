@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
+import math
+import re
 import time
+import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .errors import CoreError
+from a2a.types.a2a_pb2 import SendMessageResponse, Task
+from google.protobuf.json_format import MessageToDict, ParseDict, ParseError
+
+from .a2a_input import _check_depth, _decode_raw, _invalid_constant, _unique_object
+from .errors import CoreError, ExecutionNotStarted
 from .security import redact
 
 AGENT_CARD_WELL_KNOWN_PATH = "/.well-known/agent-card.json"
@@ -19,6 +27,7 @@ A2A_BINDING = "JSONRPC"
 FORWARDED_CLIENT_HEADERS = ("Authorization", "X-PROJECT-ID", "X-A2A-Extensions")
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_FILE_RESPONSE_BYTES = 40_000_000
 MAX_STREAM_FRAMES = 10_000
 MAX_ERROR_MESSAGE_CHARS = 200
 STREAM_DONE_SENTINEL = "[DONE]"
@@ -56,6 +65,7 @@ class RemoteAgentCard:
     url: str
     streaming: bool
     skills: tuple[dict, ...]
+    binding: str = A2A_BINDING
 
 
 @dataclass(frozen=True)
@@ -65,6 +75,228 @@ class RemoteEvent:
     text: str
     final: bool
     parts: tuple[dict, ...]
+    task_id: str | None = None
+    context_id: str | None = None
+
+    @property
+    def has_files(self):
+        return any("raw" in part or "url" in part for part in self.parts)
+
+
+def _trusted_text(value, *, code="REMOTE_AGENT_DENIED"):
+    if not isinstance(value, str) or not value or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in value):
+        raise CoreError(code)
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        raise CoreError(code) from None
+    return value
+
+
+def _trusted_endpoint(url):
+    _trusted_text(url)
+    try:
+        parsed = _validate_endpoint(url)
+        if (not parsed.hostname or parsed.username is not None or parsed.password is not None
+                or "?" in url or "#" in url or any(char.isspace() for char in url)
+                or "\\" in parsed.netloc or parsed.netloc.endswith(":")
+                or (parsed.port is not None and not 1 <= parsed.port <= 65535)):
+            raise ValueError()
+        return urlsplit(url)
+    except (CoreError, ValueError):
+        raise CoreError("REMOTE_AGENT_DENIED") from None
+
+
+def _trusted_headers(headers):
+    if headers is None:
+        return {}
+    if not isinstance(headers, Mapping):
+        raise CoreError("REMOTE_AGENT_DENIED")
+    reserved = {"host", "content-type", "content-length", "connection", "transfer-encoding",
+                "upgrade", "trailer", "te", "proxy-authorization", "accept", "a2a-version"}
+    result, names = {}, set()
+    for name, value in headers.items():
+        if (not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", name)
+                or name.lower() in reserved | names):
+            raise CoreError("REMOTE_AGENT_DENIED")
+        _trusted_text(value)
+        try:
+            if len(value.encode("latin-1")) > 16384:
+                raise ValueError()
+        except (ValueError, UnicodeError):
+            raise CoreError("REMOTE_AGENT_DENIED") from None
+        names.add(name.lower())
+        result[name] = value
+    return result
+
+
+def _request_timeout(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise CoreError("CONFIG_INVALID", "remote request timeout must be finite and positive")
+    return value
+
+
+def _attachment_limit(value):
+    if value is not None and (type(value) is not int or not 1 <= value <= 2147483647):
+        raise CoreError("CONFIG_INVALID")
+    return value
+
+
+def _outgoing_parts(files, limit):
+    if type(files) not in (tuple, list):
+        raise CoreError("INVALID_FILE_INPUT")
+    if files and limit is None:
+        raise CoreError("CONFIG_INVALID")
+    total = 0
+    for file in files:
+        if type(file) is not dict or file.keys() != {"name", "media_type", "raw"} or type(file["raw"]) is not bytes:
+            raise CoreError("INVALID_FILE_INPUT")
+        name = _trusted_text(file["name"], code="INVALID_FILE_INPUT")
+        _trusted_text(file["media_type"], code="INVALID_FILE_INPUT")
+        if name in {".", ".."} or "/" in name or "\\" in name:
+            raise CoreError("INVALID_FILE_INPUT")
+        total += len(file["raw"])
+    if limit is not None and total > limit:
+        raise CoreError("ATTACHMENTS_TOO_LARGE", data={"allowed_bytes": limit, "actual_bytes": total})
+    return [{"filename": file["name"], "mediaType": file["media_type"],
+             "raw": base64.b64encode(file["raw"]).decode("ascii")} for file in files]
+
+
+def _validate_response_files(payload, *, direct, limit):
+    """Validate every known Part collection before protobuf decodes file bytes."""
+    if not isinstance(payload, dict):
+        return  # The SDK validates the response schema.
+    containers = [payload] if direct else [payload.get("task"), payload.get("message")]
+    total = 0
+    try:
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            collections = [(container, True)]
+            status = container.get("status")
+            if isinstance(status, dict):
+                collections.append((status.get("message"), True))
+            for key in ("artifacts", "history"):
+                items = container.get(key)
+                if isinstance(items, list):
+                    collections.extend((item, key != "history") for item in items)
+            for message, current in collections:
+                if message is None:
+                    continue
+                if not isinstance(message, dict) or not isinstance(message.get("parts", []), list):
+                    raise ValueError()
+                for part in message.get("parts", []):
+                    if (not isinstance(part, dict) or len(part.keys() & {"text", "raw", "url", "data"}) != 1
+                            or part.keys() - {"text", "raw", "url", "data", "filename", "mediaType", "media_type", "metadata"}):
+                        raise ValueError()
+                    for field in ("text", "filename", "mediaType", "media_type"):
+                        if field in part:
+                            if not isinstance(part[field], str):
+                                raise ValueError()
+                            part[field].encode("utf-8")
+                    if "url" in part or any(field in part and not isinstance(part[field], dict) for field in ("data", "metadata")):
+                        raise ValueError()
+                    if "raw" in part:
+                        size = len(_decode_raw(part["raw"]))
+                        if current:
+                            total += size
+        if limit is not None and total > limit:
+            raise CoreError("ATTACHMENTS_TOO_LARGE", data={"allowed_bytes": limit, "actual_bytes": total})
+    except (ValueError, TypeError):
+        raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR") from None
+
+
+def _task_event(payload, *, direct=False, expected_task_id=None, attachment_limit_bytes=None):
+    """Validate the installed SDK's 1.0 shape without publishing parser diagnostics."""
+    _validate_response_files(payload, direct=direct, limit=attachment_limit_bytes)
+    try:
+        parsed = ParseDict(payload, Task() if direct else SendMessageResponse())
+        if direct or parsed.WhichOneof("payload") == "task":
+            task = parsed if direct else parsed.task
+            _trusted_text(task.id, code="REMOTE_AGENT_PROTOCOL_ERROR")
+            _trusted_text(task.context_id, code="REMOTE_AGENT_PROTOCOL_ERROR")
+            if expected_task_id is not None and task.id != expected_task_id:
+                raise ValueError()
+            if task.status.state not in range(1, 9):
+                raise ValueError()
+            raw = MessageToDict(task)
+            parts = list(task.status.message.parts)
+            for artifact in task.artifacts:
+                parts.extend(artifact.parts)
+            state = raw["status"]["state"]
+            task_id, context_id, kind = task.id, task.context_id, "task"
+            final = state in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"}
+        elif parsed.WhichOneof("payload") == "message":
+            message = parsed.message
+            _trusted_text(message.message_id, code="REMOTE_AGENT_PROTOCOL_ERROR")
+            if message.role != 2 or not message.parts:
+                raise ValueError()
+            parts = message.parts
+            for identifier in (message.task_id, message.context_id):
+                if identifier:
+                    _trusted_text(identifier, code="REMOTE_AGENT_PROTOCOL_ERROR")
+            task_id, context_id, kind, state, final = message.task_id or None, message.context_id or None, "message", None, True
+        else:
+            raise ValueError()
+        if any(part.WhichOneof("content") is None for part in parts):
+            raise ValueError()
+        normalized = tuple(MessageToDict(part) for part in parts)
+        return RemoteEvent(kind, state, _parts_text(normalized), final, normalized, task_id, context_id)
+    except (ParseError, ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError, CoreError):
+        raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR") from None
+
+
+def connect_peer(peer, *, headers=None, timeout=30, max_retries=2, retry_delay=0.2):
+    """Discover only the registered destination; credentials live in this call only."""
+    if not isinstance(peer, Mapping) or peer.get("enabled") is not True:
+        raise CoreError("REMOTE_AGENT_DENIED")
+    base = peer.get("url")
+    registered = _trusted_endpoint(base)
+    timeout = _request_timeout(timeout)
+    private_headers = _trusted_headers(headers)
+    if type(max_retries) is not int or not 0 <= max_retries <= 10:
+        raise CoreError("CONFIG_INVALID")
+    if isinstance(retry_delay, bool) or not isinstance(retry_delay, (int, float)) or not math.isfinite(retry_delay) or not 0 <= retry_delay <= 60:
+        raise CoreError("CONFIG_INVALID")
+    request = Request(base.rstrip("/") + AGENT_CARD_WELL_KNOWN_PATH,
+                      headers={"Accept": "application/json", "A2A-Version": A2A_PROTOCOL_VERSION, **private_headers}, method="GET")
+    for attempt in range(max_retries + 1):
+        try:
+            with _open(request, timeout, retryable_status_codes=(500, 502, 503, 504)) as response:
+                body = _read_body(response)
+            break
+        except CoreError as error:
+            if not error.retryable or attempt == max_retries:
+                raise CoreError(error.code, retryable=error.retryable) from None
+            time.sleep(retry_delay)
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError()
+        interfaces = payload.get("supportedInterfaces")
+        if not isinstance(interfaces, list):
+            raise ValueError()
+        for interface in interfaces:
+            if (not isinstance(interface, dict) or interface.get("protocolBinding") not in {"JSONRPC", "HTTP+JSON"}
+                    or interface.get("protocolVersion") != A2A_PROTOCOL_VERSION):
+                continue
+            target = _trusted_endpoint(interface.get("url"))
+            def identity(url):
+                return (url.scheme, url.hostname, url.port or (443 if url.scheme == "https" else 80), url.path.rstrip("/"))
+            if identity(target) != identity(registered):
+                continue
+            capabilities = payload.get("capabilities", {})
+            skills = payload.get("skills", [])
+            if not isinstance(capabilities, dict) or not isinstance(skills, list) or any(not isinstance(skill, dict) for skill in skills):
+                raise ValueError()
+            return RemoteAgentConnection(RemoteAgentCard(
+                name=_trusted_text(peer.get("name")), description=peer.get("description", ""),
+                url=base, streaming=capabilities.get("streaming") is True,
+                skills=tuple(skills), binding=interface["protocolBinding"],
+            ), timeout=timeout)
+    except (ValueError, TypeError, RecursionError, CoreError):
+        raise CoreError("REMOTE_AGENT_CARD_INVALID") from None
+    raise CoreError("REMOTE_AGENT_CARD_INVALID")
 
 
 def _require_text(value, code, detail):
@@ -257,23 +489,24 @@ def _open(request, timeout, *, retryable_status_codes=()):
             f"remote agent responded with status {error.code}",
             retryable=retryable,
         ) from None
-    except ValueError as error:
-        # urllib rejects an unsupported or malformed target before any I/O.
-        raise CoreError("REMOTE_AGENT_DENIED", "malformed agent url") from error
+    except ValueError:
+        # A malformed redirect can raise after the peer has received a mutation.
+        raise CoreError("REMOTE_AGENT_DENIED") from None
     except (URLError, HTTPException, TimeoutError, OSError) as error:
         raise CoreError(
             "REMOTE_AGENT_UNAVAILABLE", "remote agent is unreachable", retryable=True
         ) from error
 
 
-def _read_body(response):
+def _read_body(response, limit=None):
+    limit = MAX_RESPONSE_BYTES if limit is None else limit
     try:
-        body = response.read(MAX_RESPONSE_BYTES + 1)
+        body = response.read(limit + 1)
     except (URLError, HTTPException, TimeoutError, OSError) as error:
         raise CoreError(
             "REMOTE_AGENT_UNAVAILABLE", "remote agent response failed", retryable=True
         ) from error
-    if len(body) > MAX_RESPONSE_BYTES:
+    if len(body) > limit:
         raise CoreError("REMOTE_AGENT_RESPONSE_TOO_LARGE")
     return body
 
@@ -297,6 +530,91 @@ class RemoteAgentConnection:
     @property
     def supports_streaming(self) -> bool:
         return bool(self.card.streaming)
+
+    def _task_request(self, method, params, *, headers, timeout, request_id=None, attachment_limit_bytes=None):
+        try:
+            _attachment_limit(attachment_limit_bytes)
+            body_limit = MAX_RESPONSE_BYTES if attachment_limit_bytes is None else MAX_FILE_RESPONSE_BYTES
+            _trusted_endpoint(self.card.url)
+            timeout = _request_timeout(self.timeout if timeout is None else timeout)
+            private_headers = _trusted_headers(headers)
+            request_id = request_id or str(uuid.uuid4())
+            url = self.card.url
+            verb = "POST"
+            if self.card.binding == "JSONRPC":
+                payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            elif self.card.binding == "HTTP+JSON":
+                url = url.rstrip("/")
+                payload = params
+                if method == "SendMessage":
+                    url += "/message:send"
+                else:
+                    identifier = quote(params["id"], safe="")
+                    if identifier in {".", ".."}:
+                        identifier = identifier.replace(".", "%2E")
+                    url += "/tasks/" + identifier
+                    if method == "GetTask":
+                        verb, payload = "GET", None
+                    else:
+                        url += ":cancel"
+            else:
+                raise CoreError("REMOTE_AGENT_CARD_INVALID")
+            body = json.dumps(payload, allow_nan=False).encode("utf-8") if payload is not None else None
+            if body is not None and len(body) > body_limit:
+                raise CoreError("REMOTE_AGENT_REQUEST_TOO_LARGE")
+            request = Request(url, data=body,
+                              headers={"Content-Type": "application/json", "Accept": "application/json",
+                                       "A2A-Version": A2A_PROTOCOL_VERSION, **private_headers}, method=verb)
+        except CoreError as error:
+            if method == "SendMessage":
+                raise ExecutionNotStarted(error.code, data=error.data) from None
+            raise
+        except (ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
+            error_type = ExecutionNotStarted if method == "SendMessage" else CoreError
+            raise error_type("INVALID_REQUEST") from None
+        try:
+            with _open(request, timeout, retryable_status_codes=(500, 502, 503, 504) if method == "GetTask" else ()) as response:
+                body = _read_body(response, body_limit)
+        except CoreError as error:
+            # Mutation retryability belongs to the durable intent owner, never this adapter.
+            raise CoreError(error.code, retryable=error.retryable and method == "GetTask") from None
+        try:
+            result = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
+            _check_depth(result)
+            if self.card.binding == "JSONRPC":
+                if not isinstance(result, dict) or result.get("jsonrpc") != "2.0" or result.get("id") != request_id:
+                    raise ValueError()
+                if "error" in result:
+                    raise CoreError("REMOTE_AGENT_FAILED")
+                result = result["result"]
+        except (ValueError, TypeError, KeyError, RecursionError):
+            raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR") from None
+        return _task_event(result, direct=method != "SendMessage", expected_task_id=params.get("id"),
+                           attachment_limit_bytes=attachment_limit_bytes)
+
+    def send_task(self, *, task, message_id, headers=None, timeout=None, files=(), attachment_limit_bytes=None):
+        """Send one new task nonblocking; no caller task/context or inherited auth."""
+        try:
+            _require_text(task, "INVALID_REQUEST", "task must be non-empty text")
+            task.encode("utf-8")
+            _trusted_text(message_id, code="INVALID_REQUEST")
+            parts = [{"text": task}, *_outgoing_parts(files, _attachment_limit(attachment_limit_bytes))]
+        except CoreError as error:
+            raise ExecutionNotStarted(error.code, data=error.data) from None
+        except UnicodeError:
+            raise ExecutionNotStarted("INVALID_REQUEST") from None
+        return self._task_request("SendMessage", {
+            "message": {"role": "ROLE_USER", "messageId": message_id, "parts": parts},
+            "configuration": {"returnImmediately": True},
+        }, headers=headers, timeout=timeout, request_id=message_id, attachment_limit_bytes=attachment_limit_bytes)
+
+    def get_task(self, *, task_id, headers=None, timeout=None, attachment_limit_bytes=None):
+        _trusted_text(task_id, code="INVALID_REQUEST")
+        return self._task_request("GetTask", {"id": task_id}, headers=headers, timeout=timeout, attachment_limit_bytes=attachment_limit_bytes)
+
+    def cancel_task(self, *, task_id, headers=None, timeout=None, attachment_limit_bytes=None):
+        _trusted_text(task_id, code="INVALID_REQUEST")
+        return self._task_request("CancelTask", {"id": task_id}, headers=headers, timeout=timeout, attachment_limit_bytes=attachment_limit_bytes)
 
     def _request(
         self,

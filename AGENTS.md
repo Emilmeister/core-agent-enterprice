@@ -124,6 +124,11 @@ criterion должны войти в тот же завершённый change. 
 
 - `core_agent/` — policy-enforced agent runtime, встроенная память и A2A
   transport.
+- `ui/` — исходники общего owner UI на React/TypeScript/Vite; команды
+  `npm ci`, `npm run typecheck` и `npm run build` выполняются из этой папки
+  с Node.js 24 (минимум 22.12). Production build создаёт ignored `core_agent/ui_dist/`, который
+  входит в Python wheel/sdist; Docker собирает его в отдельном Node stage
+  на build platform, а Python runtime — на target platform.
 - `spec/` — target specification, acceptance и release profiles.
 - `docs/superpowers/specs/` — проектные черновики для согласования; не заменяют
   нормативный `spec/` и не разрешают менять замороженные spec/tests.
@@ -131,7 +136,32 @@ criterion должны войти в тот же завершённый change. 
   замороженные spec/tests и не подтверждают готовность runtime capabilities.
 - `tests/` — frozen acceptance, unit, integration, PostgreSQL, A2A и E2E suite.
 - `.github/workflows/ci.yml` — канонический CI-порядок.
+- CI job `sandbox-linux` запускает обязательные Linux sandbox tests в отдельных
+  native amd64/arm64 kind-кластерах. Его fixtures из `deploy/kubernetes/`
+  назначают контрольные адреса только внутри одноразового node network namespace.
+  Node readback проверяет aggregate Pod `pids.max=512`; fork probe ограничен
+  513 попытками независимо от большего container-visible cgroup limit.
+  `CORE_AGENT_REQUIRE_SANDBOX_TESTS=1` запрещает скрыть недоступный sandbox skip-ом;
+  local unit tests не заменяют этот gate и проверку целевого CSI/кластера.
+  Dedicated browser gate `tests/test_owner_ui_files_browser.py` использует
+  disposable Pod и реальные Keycloak/PostgreSQL. Он обязателен на amd64 с
+  `CORE_AGENT_REQUIRE_BROWSER_TESTS=1`: отсутствие Chromium, Node, конфигурации
+  или native fixtures завершает проверку ошибкой, без skip.
+- PostgreSQL migration suite использует `TEST_POSTGRES_CONTAINER` для настоящих
+  `pg_dump`/`pg_restore` того же server version. Ordinary CI передаёт ID своего
+  disposable PostgreSQL service; тест восстанавливает только собственную schema
+  и копию test blobs, сохраняя encryption key вне dump. Это proof отката до новых
+  application writes, а не разрешение восстановить старый backup поверх новых данных.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
+  Agent использует native OCI seccomp profile (`SANDBOX_OCI_ARCH=amd64|arm64`),
+  `systempaths=unconfined` для nested proc mount, `/dev/net/tun`, read-only root,
+  dropped capabilities и конечные CPU/memory/PID limits. Native CI запускает
+  реальный composition-root terminal/Python/background test через Compose;
+  профиль inner commands остаётся отдельным и обязательным.
+- `deploy/kubernetes/apparmor/` — именованный outer профиль trusted supervisor
+  и инструкция для hosts с AppArmor namespace restrictions. Operator заранее
+  загружает профиль на eligible nodes; running agent не получает MAC_ADMIN.
+  CSI workaround TUN не отключает Pod user namespaces и отделён от chat volume.
 - `third_party/skills/` — закреплённые пакеты навыков, происхождение, лицензии и
   контрольные суммы для образа.
 - `.env.example` — поддерживаемый шаблон локальной конфигурации; `.env` никогда
@@ -142,11 +172,35 @@ Package entrypoints из `pyproject.toml`:
 - `core-agent` → `core_agent.app:main`;
 - `core-agent-db` → `core_agent.database:main`.
 
+`core-agent-db import-remote-agents --file /run/secrets/remote-import.json`
+переносит явно подготовленный version1 JSON в пустой реестр компании из
+`CORE_AGENT_TENANT_ID` после отдельной миграции схемы и до запуска workers.
+Ограниченный batch записывается одной транзакцией с encrypted credentials и
+actor `migration:<database current_user>`; повторный import не заменяет owner
+настройки. Команда использует `DATABASE_MIGRATION_URL` либо operator
+`DATABASE_URL` и прежний `PUSH_NOTIFICATION_ENCRYPTION_KEY`. Serving process
+не переносит legacy ENV автоматически; формат и ограничения задаёт
+`spec/agent-configuration.md`.
+
 ## Карта ключевых implementation-файлов
 
 | Файл | Ответственность |
 |---|---|
 | `core_agent/app.py` | Composition root: environment config, stores, tool registry, kernel, A2A app, health и Uvicorn |
+| `core_agent/auth.py` | Keycloak introspection, immutable authenticated scope, owner/external access и SDK context builder |
+| `core_agent/admission.py` | Atomic root admission, stable-caller deduplication и busy guard чата до SDK execution |
+| `core_agent/interactions.py` | Company settings, per-origin tool policies, CAS и транзакционный запрет pending approvals |
+| `core_agent/owner_api.py` | Owner-only settings, policy, HITL/guardrail decisions и приватные ответы на вопросы |
+| `core_agent/history.py` | Bounded owner-only проекция полной истории чата, stable cursors и текущие ограничения на материалы |
+| `core_agent/cron_expression.py` | Закреплённый croniter parser и ZoneInfo adapter: five-field dialect, bounded calendar search и gap/fold semantics |
+| `core_agent/cron.py` | Company schedule/event stores, CAS/receipts и shared atomic root admission, включая fenced agent tool creation |
+| `core_agent/cron_service.py` | Bounded recovery-driven coordinator, PostgreSQL company leader session и один memory job на ASGI loop |
+| `core_agent/ui.py` | Отдача packaged browser build и точный перечень публичных GET/HEAD assets |
+| `core_agent/remote_registry.py` | Company-scoped immutable peer revisions, CAS, encrypted credentials, безопасные owner metadata и explicit operator batch import |
+| `core_agent/guardrails.py` | Ограниченный classifier без tools, отдельный context и deployment-configured model adapter |
+| `core_agent/material_reviews.py` | Private material decisions, detector budget и атомарная связь с guardrail waits |
+| `core_agent/chat_files.py` | Private file batches, scoped extraction/download, runtime publication barrier, bounded orphan sweep и atomic raw FilePart admission |
+| `core_agent/response_files.py` | Immutable snapshots выбранных файлов результата, scoped manifest и whole-batch integrity validation |
 | `core_agent/runtime.py` | Agent loop, workflow continuation, recovery, tool handlers и delegation |
 | `core_agent/config.py` | RunRequest, Platform/Agent/EffectiveConfig и capability intersection |
 | `core_agent/a2a.py` | Внутренние A2A contract types и Task representation |
@@ -156,14 +210,17 @@ Package entrypoints из `pyproject.toml`:
 | `core_agent/context.py` | Context budget, compaction и structured summary |
 | `core_agent/tools.py` | Tool schemas, validation, policy и dispatch |
 | `core_agent/execution.py` | PTY/process groups, owned workspaces, snapshots и limits |
+| `core_agent/workspace.py` | Trusted tenant/owner/context binding, постоянные папки чатов и nofollow owner file preview/download |
+| `core_agent/workspace_cleanup.py` | Подтверждённая exact selection, durable intent/receipt, private capture/journal и bounded recovery очистки |
 | `core_agent/python_exec.py` | Bounded Python process и `tools.call(...)` broker |
+| `core_agent/sandbox.py`, `core_agent/sandbox_exec.py` | Gated Bubblewrap launcher, сетевой профиль, inner seccomp и подтверждённая остановка namespace |
 | `core_agent/tasks.py` | Test scheduler, mailbox и delegation contracts |
 | `core_agent/postgres_tasks.py` | Durable PostgreSQL scheduler и mailbox |
 | `core_agent/workflow.py` | Workflow stores, transitions и durable outbox |
 | `core_agent/database.py` | PostgreSQL schema, migrations, pool и stores |
 | `core_agent/artifacts.py`, `core_agent/audit.py` | Tenant-scoped transport artifacts и append-only audit adapters |
-| `core_agent/artifact_service.py` | Named/scoped/versioned artifact model и in-memory, S3, MongoDB backends |
-| `core_agent/remote_agents.py` | Remote A2A agent registry и synchronous A2A 1.0 JSON-RPC/SSE client |
+| `core_agent/remote_agents.py` | Legacy ENV registry/SSE, bounded pinned peer discovery и A2A1.0 JSONRPC/HTTP+JSON Send/Get/Cancel adapter |
+| `core_agent/remote_operations.py` | Один bounded Send/Get/Cancel step под scheduler claim, pinned credentials, deadline и reconciliation |
 | `core_agent/streaming.py` | Stream chunk merge, snapshot buffer и ADK metadata keys |
 | `core_agent/durability.py`, `core_agent/lifecycle.py` | Events, checkpoints, leases, recovery и retention |
 | `core_agent/mcp.py` | MCP discovery/calls, canonical tool naming и Streamable HTTP connector |
@@ -205,6 +262,67 @@ Target spec может описывать больше текущего runtime.
 
 ### Публичный контракт и инструкции
 
+- `CORE_AGENT_ENVIRONMENT` обязателен и принимает только `production`,
+  `development`, `test`. Production требует полный набор `KEYCLOAK_*` и
+  `CORE_AGENT_TENANT_ID`; legacy A2A без auth разрешён только при явно выбранном
+  development/test и полностью отсутствующей auth-конфигурации.
+- Числовые deployment settings в `core_agent/app.py` разбираются через `_number`,
+  сохраняют documented defaults и отклоняют malformed/NaN/infinite значения
+  с `CONFIG_INVALID` и именем настройки без её raw value. Неверный `LOG_LEVEL`
+  тоже проходит через безопасную startup error boundary; fatal startup diagnostic
+  публикуется на уровне `CRITICAL`, включая `LOG_LEVEL=CRITICAL/FATAL`.
+- Provider и MCP URLs валидируются до serving через общий HTTP parser без raw
+  parser diagnostics. DSN проверяется libpq parser до открытия PostgreSQL pool;
+  его синтаксические ошибки не попадают в worker logs. URL projection для logs
+  удаляет userinfo/query/fragment, сохраняя исходный адрес для transport.
+- Настроенный Keycloak открывает `/a2a/owner/`, `/a2a/external/` и owner-only
+  `/api/identity`; старые корневые A2A routes закрыты. Probes остаются публичными.
+  Agent Card на обоих A2A входах и обоих well-known путях фильтрует owner deny
+  по company из authenticated principal при каждом чтении; allow/HITL видимы.
+  Introspection выполняется один раз на HTTP request без кэша; уже открытый
+  ответ не проверяется заново. Incoming credentials не передаются remote agents.
+- Company scope задаётся deployment config и не меняется SDK tenant metadata.
+  Автоматические recovery, timeout, cleanup, A2A projection и push ограничены
+  `auth_settings.tenant` до выборки рабочих записей, locks/claims и side effects.
+  Generic runtime без trusted recovery tenant сохраняет platform-wide scope.
+  Неоднозначные legacy push IDs не разрешают пересылать payload другой компании.
+  Владельцы используют общий scope, внешний caller — стабильный issuer/sub.
+  External role исключает owner authority. Owner-wide доступ к задаче сохраняет
+  её исходного owner; actor identity отдельно записывается в admission audit и
+  follow-up provenance. Cancel проверяет scoped Task до active SDK registry.
+- Legacy development/test memory adapter связывает anonymous A2A scope с
+  настроенным `USER_ID` и runtime tenant `default` только для canonical workflow
+  projection; проверка доступа к SDK Task предшествует этой проекции.
+- Авторизованные A2A endpoints принимают новый root через общий admission:
+  один нетерминальный root на чат, duplicate по `(tenant, actor, messageId)`
+  проверяется до busy guard. Изменённый Message даёт `MESSAGE_ID_CONFLICT`;
+  новая попытка в занятом чате сохраняется как отдельная failed Task с
+  `CONTEXT_BUSY`, без workflow или worker. Owner сохраняет исходный scope чата.
+- Initial Message, Task, chat mapping, request ledger и workflow записываются
+  одной PostgreSQL транзакцией до запуска SDK. Shutdown или потеря stream
+  после commit оставляет Task для recovery. Legacy context без явного mapping
+  не присваивается новому caller. Enterprise raw FileParts проходят bounded
+  pre-SDK validation и atomic file admission; URL Parts отклоняются.
+- Внутренний file admission выполняет preflight под canonical locks, освобождает
+  соединение до settings/staging и повторяет проверки при commit. Bind batch
+  входит в root/inbox transaction; нет вложенного захвата PostgreSQL pool.
+  Проигравший private stage очищается после выхода из transaction; cleanup
+  failure оставляет прежние age/lease для sweeper, не меняя original receipt.
+  Initial snapshot и follow-up provenance получают только server-owned batch IDs.
+  File receipt содержит фактические безопасные имена, пути, размеры и digest;
+  исходные имена и metadata сохраняются в private immutable batch для guardrails.
+  PostgreSQL Task записывается до file bind в той же admission transaction.
+  PostgreSQL manifest хранит точные originals/metadata как escaped JSON text,
+  сохраняя schema version и безопасные имена в native fields; reader также
+  поддерживает прежние raw manifests без перезаписи принятых rows.
+  Memory admission берёт async locks до синхронного workflow/Task commit без await.
+- File service создаётся до recovery. Startup/hourly bounded sweep использует
+  original age, немедленно продолжает backlog и не удаляет accepted quarantine.
+  Новые upload manifests v1 содержат trusted tenant; scoped rowless sweep
+  сохраняет legacy/foreign manifests, ограничивает обход каждого прохода и
+  проверяет authoritative references всех компаний перед удалением.
+  Временная ошибка публикации принятого immutable batch сохраняет pending
+  delivery для recovery вместо ложного отказа приёма; model input ждёт публикации.
 - Run input содержит ровно `prompt`; MCP-серверы и skills задаются
   конфигурацией развёртывания и не добавляются в RunRequest.
 - Tenant, identity, auth, trace context, model route, policy и budgets приходят
@@ -238,6 +356,9 @@ Target spec может описывать больше текущего runtime.
   AgentConfig и Task/delegation contract. Deny сильнее allow.
 - Disabled capability отсутствует в Agent Card/model catalog и повторно
   отклоняется при dispatch. Prompt или stale tool call не расширяет policy.
+- `LLM_EXTRA_BODY_JSON` не задаёт каталог или выбор tools: adapter удаляет
+  оттуда `tools`, `tool_choice`, legacy `functions` и `function_call` и передаёт
+  только текущий runtime catalog, в том числе пустой каталог детектора.
 - Safety/host/kernel/capability instructions нельзя заменить через
   `AGENT_SYSTEM_PROMPT`, prompt, skill, MCP, memory или tool output.
 - `AGENT_SYSTEM_PROMPT` optional и по умолчанию пуст; user request передаётся
@@ -254,11 +375,15 @@ Target spec может описывать больше текущего runtime.
 - `core_python_exec`;
 - `core_task_start`, `core_task_get`, `core_task_list`, `core_task_wait`,
   `core_task_cancel`;
+- `core_wait_until` — время пробуждения с явным UTC offset; новое сообщение
+  будит текущий таймер, повтор сообщения не будит следующую generation;
+- `core_ask_owner` — private вопрос владельцам при подключённом owner plane;
 - `core_delegate`;
-- `core_artifact_save`, `core_artifact_load`, `core_artifact_list`;
+- `core_response_files` при подключённом enterprise owner plane;
 - `core_memory_search`, `core_memory_read`, `core_memory_create`,
   `core_memory_update`, `core_memory_split`, `core_memory_delete`;
 - `core_agent_send_message`;
+- `core_cron_create` при подключённом enterprise cron store;
 - условные `core_skill_activate` и `core_skill_read_resource`.
 
 `core_skill_activate` появляется в каталоге модели только при непустом наборе
@@ -270,13 +395,20 @@ Target spec может описывать больше текущего runtime.
 Оба имени зарезервированы runtime: совпадающее каноническое имя MCP-tool
 отклоняется с `TOOL_NAME_COLLISION` при построении `EffectiveConfig`.
 
-Artifact tools версионируют именованные файлы внутри агента; `user:`-префикс
-даёт cross-session scope, а `ARTIFACT_STORAGE_TYPE` выбирает in-memory, S3 или
-MongoDB backend без управления схемой внешнего хранилища. Хранилище не является
-файловой системой run-а: `core_artifact_save` принимает либо `content`, либо
-`path` файла в workspace, который runtime читает сам. `core_agent_send_message`
-делегирует задачу удалённому A2A-агенту из `REMOTE_AGENTS` и ретранслирует его
-прогресс в поток корневой Task. Обычный model/child text result по-прежнему
+Три named artifact tools и исключительно их S3/MongoDB adapters удалены.
+Входящие enterprise файлы проходят atomic ChatFileService admission/guardrails,
+а `core_response_files` выбирает frozen набор файлов для итогового ответа.
+Legacy/test transport без ChatFileService явно отклоняет вложения. Transport
+A2A Artifacts, offload и workspace snapshots используют прежние независимые
+stores. Retired artifact tool/env settings отклоняются с names-only upgrade
+diagnostic; новые примеры оставляют builtin allowlist пустым для mode ceiling.
+Отдельный export/import или перенос данных снятого service не поставляется.
+Удаление касается application code/config, не внешних storage resources.
+`core_agent_send_message`
+в authenticated deployment создаёт durable local handle для доверенного peer
+из company registry. `core_task_wait` ждёт его сохранённый outcome без нового
+timeout. Legacy direct/test runtime без registry сохраняет ENV adapter отдельно.
+Обычный model/child text result по-прежнему
 публикуется A2A adapter-ом как Task Artifact без дополнительного tool call.
 
 `core_terminal_write`, `core_fs_apply_patch` и `core.input.request` описаны в
@@ -339,6 +471,9 @@ run получает отдельные MCP session и negotiated version; пе�
 очищаются. Ожидание не расходует model/tool budget. Permanent auth/protocol
 ошибки и неоднозначный mutating `tools/call` не повторяются; cancel прерывает
 ожидание.
+При recovery сохранённый MCP catalog задаёт неизменный ceiling и digest, а
+текущая discovery — доступность и schema внутри него. Исчезнувший tool скрыт;
+изменение schema/origin после HITL возвращает `TOOL_APPROVAL_STALE` без dispatch.
 
 ### Runtime modes и execution
 
@@ -347,11 +482,13 @@ run получает отдельные MCP session и negotiated version; пе�
   MCP и memory.
 - `core_python_exec` доступен в обоих режимах, если не удалён
   `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`.
+- Произвольный Python классифицируется как потенциально mutating; неизвестный
+  outcome после старта требует reconciliation, а не повторного выполнения кода.
 - `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` только сужает выбранный mode ceiling.
 - `CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS` задаёт положительное bounded ожидание
   подтверждения cancel owned Tasks перед возвратом budget-partial результата.
-- `without_terminal` означает отсутствие model-visible terminal tool, а не OS
-  sandbox: Python может использовать `os`, `subprocess` и filesystem APIs.
+- `without_terminal` означает отсутствие model-visible terminal tool. Python
+  может использовать `os`, `subprocess` и filesystem APIs внутри того же sandbox.
 - `core_terminal_exec` принимает `argv` без implicit shell. Pipes, redirects и
   `&&` требуют явного `['sh', '-lc', '...']` и отдельной policy оценки.
 - Образ v1 содержит основной CLI-набор для текста, файлов, структурированных
@@ -365,9 +502,40 @@ run получает отдельные MCP session и negotiated version; пе�
 - Python нельзя вызывать рекурсивно или через `core_task_start`; каждый вложенный
   `tools.call` заново проходит EffectiveConfig, schema, policy, общий budget,
   owner/tenant, audit и OTel.
-- Отдельные PTY, process groups и workspaces дают ownership/lifecycle separation
-  внутри одного container, но не являются mount/PID/network security boundary.
-- Cancel/timeout завершает owned process group. Docker, Kubernetes, A2A, OTel и
+- `create_app` обязательно проверяет SandboxPolicy/SandboxLauncher до recovery
+  и listener, включая development. Без Linux primitives нет runtime fallback.
+  `tests/app_support.py` явно подставляет переносимый adapter для unit tests;
+  native `tests/test_sandbox_linux.py` использует настоящий composition root.
+- Terminal, Python и background target используют один launcher с отдельными
+  mount/PID/network namespaces. Доступен только текущий `/workspace`, вложения
+  монтируются read-only; Python получает один принадлежащий вызову broker socket.
+- Cancel/timeout подтверждает завершение namespace до успешного cleanup result.
+  Ошибка teardown блокирует snapshot/delete; unhealthy launcher закрывает readiness.
+  `SANDBOX_DNS_SERVERS` и `SANDBOX_DENIED_CIDRS` обязательны и дополняют закреплённую
+  `core_agent/sandbox-policy.json`, которая входит в wheel и root-owned image.
+  Slirp входит только в owned user namespace, сохраняя Pod netns для egress;
+  target gate ждёт IPv6 address/default route до исходного startup deadline.
+  Base default-deny и TTY injection deny — отдельные sealed seccomp filters,
+  которые bwrap загружает совместно через `--add-seccomp-fd`.
+  Наличие кода не подтверждает native/target-cluster gate.
+- Process ownership привязано к `(run_id, worker_id, execution_generation)`.
+  Закрытая generation не открывается после follow-up; старая попытка не удаляет
+  новую session. Session teardown сериализован и идемпотентен. При nonterminal
+  suspension сохраняются и ephemeral run-файлы; их инициализация из snapshot
+  публикуется атомарно, постоянные chat-файлы не восстанавливаются поверх live данных.
+- До terminal transition runtime сохраняет terminal intent и закрывает admission
+  новых процессов и дочерних задач во всём дереве. Чат остаётся занят до
+  подтверждения cleanup каждой сохранённой execution generation; сигналы и
+  ожидание процессов выполняются вне транзакции БД. Foreign receipt с
+  `local_execution_pending=true` или без этого поля требует reconciliation.
+  Явное `false` позволяет восстановить model-only или безопасно остановленное
+  ожидание. Принятый follow-up переоткрывает Task с новой lease; старый intent
+  не может закрыть новую generation или её cached runtime/connector.
+  Сам terminal intent не закрывает inbox: до фактического terminal commit
+  follow-up принимается, включая private file batch. Публикация файлов остаётся
+  запрещена до возобновления; failure/cancel сохраняет недоставленный input
+  с disposition вместо запуска новой работы.
+- Docker, Kubernetes, A2A, OTel и
   platform credentials никогда не передаются child process. Разрешённый
   task-specific secret приходит как policy-approved `secret_ref`, materialize-ится
   непосредственно для одного process и не попадает в argv/checkpoint/telemetry.
@@ -375,6 +543,12 @@ run получает отдельные MCP session и negotiated version; пе�
 ### Tool failures и side effects
 
 - Tool arguments валидируются до policy и dispatch.
+- Terminal и Python всегда потенциально mutating. Owner allow и guardrails
+  exemption не разрешают повтор при неизвестном исходе. Вложенная Python
+  мутация с неизвестным outcome durable требует `SIDE_EFFECT_UNKNOWN`; terminal
+  `ABORTED` допустим после подтверждённой очистки owned processes. Неизвестная
+  очистка оставляет nonterminal барьер. Python `try/except` не скрывает этот
+  исход или исчерпание budget от runtime.
 - Доказанная pre-dispatch/schema/start error или определённый
   failed/timed-out outcome возвращается модели как structured tool result, чтобы
   она могла исправиться или объяснить ошибку пользователю.
@@ -383,15 +557,223 @@ run получает отдельные MCP session и negotiated version; пе�
 - Intent внешней мутации фиксируется до dispatch. Runtime не обещает
   exactly-once guarantee downstream.
 
+### Context и compaction
+
+- Base включает system/kernel/profile, tool schemas и output reserve; pinned
+  сравнивается с оставшейся working capacity даже без summarizable history.
+- Неудачное interval compaction ниже pressure сохраняет исходный context;
+  lease/storage ошибки не поглощаются. Overlap освобождается, если занимает
+  всю цель; pinned выше цели получает реальное оставшееся место для summary.
+- Production `StructuredSummarizer` получает отдельный model callback без tools
+  и проверяет семь JSON-секций, basis и immutable source IDs. Runtime до каждой
+  физической попытки сохраняет marker и списывает общий/local model budget;
+  максимум две попытки, reserved finalization turn не расходуется на summary.
+- Provenance и current material decisions проверяются до compaction и model
+  call. Summary с запрещённым источником целиком исключается; допустимые originals
+  восстанавливаются без provider replay и недоставленных failure/cancel inputs.
+  Полный private transcript сохраняется. Compaction operation и source fingerprint
+  переживают recovery; неизвестный outcome не обнуляет оплаченные попытки.
+- Canonical root admission закрепляет `previous_root_run_id` в начальном
+  snapshot до смены latest root. Duplicate и busy Task цепочку не меняют;
+  request metadata не задаёт источник. Legacy отсутствие поля означает, что
+  previous root не закреплён.
+- После проверки нового prompt runtime импортирует предыдущую terminal root
+  только с теми же tenant/owner/context. Старые цели, tool data и outcome идут
+  как plain history без provider replay; новая инструкция остаётся pinned.
+  `context_import` version 1 фиксируется под текущей lease до модели и не
+  повторяется при recovery. Full transcripts источников не копируются.
+- Исторические originals читаются по исходному run/sequence; final result имеет
+  отдельную identity по run и digest полного persisted result. Current rejection
+  проверяется и для dependencies, и для самого итогового текста. Foreign reads
+  используют текущую transaction connection без writer locks завершённых задач.
+  Owner history API использует отдельную read-only проекцию полного transcript;
+  imported model context и summary не являются пользовательской историей.
+
 ### HITL
 
-- Текущий v1 composition root не подключает operator approval plane:
-  policy deny окончателен, а полноценный HITL остаётся target capability.
+- `KEYCLOAK_UI_CLIENT_ID` задаёт отдельный public browser client. Только при
+  непустом значении публичен точный `/ui/config`, возвращающий issuer/client ID
+  без confidential credentials. При наличии regular build в
+  `core_agent/ui_dist/` также доступны shell и перечисленные assets; symlinks и
+  произвольные пути не выдаются. Exact public allowlist действует только для
+  GET/HEAD; `/api/` и оба A2A входа сохраняют server-side authorization.
+- Authenticated composition root подключает company settings и per-tool policy
+  до запуска recovery. `/api/chats`, `/api/settings`, `/api/tool-policies`, `/api/interactions`,
+  `/api/hitl/{wait_id}/decision`, `/api/questions/{wait_id}/answer` и
+  `/api/guardrails/{wait_id}/decision` и `/api/guardrails/{wait_id}/material`
+  доступны только verified owners.
+  Owner API не запускает tool: фиксирует одно решение, runtime продолжает через
+  durable wait. Material route получает tenant из principal, run/owner из
+  сохранённого wait; query parameters не могут подменить scope.
+- `/api/chats` читает canonical company mapping и последний root без запуска
+  workflow. Owners видят общий список; external/dual-role отклоняются до lookup.
+  Pagination cursor ссылается на сохранённую root Task и сохраняет позицию при
+  появлении новой Task того же чата; длинный context ID не увеличивает cursor.
+- `/api/chats/{context_id}/history` читает canonical previous-root chain, полный
+  transcript и сохранённые inbound Messages с bounded pagination, не запуская
+  workflow, модель или classifier. Cursor привязан к company/chat и сохраняет
+  позицию при новых Task, compaction и доставке queued input. Server anchors и
+  delivery provenance сохраняют identity сообщения без двойного отображения.
+  PostgreSQL читает проекцию в read-only repeatable-read transaction. Provider
+  replay, hidden reasoning и private material bytes не выдаются. Current negative
+  decisions проверяются для originals, dependencies и final text; digest всегда
+  сопоставляется вместе с material kind. Запрещённый материал заменяется safe
+  placeholder со ссылкой на owner review; external/dual-role доступа не получают.
+- Owner file preview/download получают original WorkspaceBinding из canonical
+  admission mapping; просматривающий owner не становится execution owner.
+  Nofollow directory fds исключают symlinks, hardlinks и special files; private
+  staging/quarantine и служебные manifests не выдаются. Read не создаёт папку,
+  не запускает workflow и доступен при активной Task. Bounded preview cursor
+  подписан process-local key, связан с company/chat/filter/directory и одним
+  server timestamp; restart требует нового preview. Это отдельный контракт
+  от durable history cursor. File descriptor закрывается при любом окончании
+  download, включая disconnect. Preview не означает готовую cleanup/delete
+  capability: удаление требует отдельного chat-lock/revision/tombstone path.
+- `/api/remote-agents` предоставляет owner-only list/create; PUT/DELETE по server
+  ID создают новую immutable revision через CAS. DELETE отключает peer, сохраняя
+  прежние revisions. Scope берётся из principal; external/dual-role запрещены.
+  Header values принимаются только на запись; responses/errors/cursors содержат
+  безопасные metadata. Fernet envelope связывает secret с tenant/peer/revision/
+  header name. Key — `PUSH_NOTIFICATION_ENCRYPTION_KEY`; in-memory development
+  допускает ephemeral key, PostgreSQL secret operations требуют persistent key.
+  Authenticated composition использует registry как единственный authority;
+  ENV discovery и incoming auth forwarding здесь не выполняются. Legacy ENV
+  переносится только отдельным явным import; автоматического import пока нет.
+  Peer revision, message ID и settings закрепляются до HITL в versioned parent
+  snapshot; atomic scheduler admission возвращает тот же handle после recovery.
+- Новые методы `RemoteAgentConnection.send_task/get_task/cancel_task` работают
+  с обоими A2A1.0 bindings. `connect_peer` сверяет объявленный Card interface
+  с зарегистрированным полным URL path/params; redirects запрещены. Только
+  read-only discovery имеет bounded retry; Get temporary5xx планирует следующую
+  проверку в пределах deadline; Send/Cancel имеют одну attempt.
+  Per-peer headers передаются на один request без хранения в connection;
+  caller/root identifiers и legacy auth не наследуются. Parts и remote IDs
+  сохраняются executor-ом для durable operation. Enterprise Send принимает
+  optional `files` — уникальные относительные workspace paths на каждый вызов;
+  отсутствие поля или `[]` отправляет только текст. Выбор финальных вложений
+  `core_response_files` не используется автоматически. Весь набор snapshot-ится
+  до HITL; ошибка сохраняет прежний final set и не создаёт remote handle.
+  Approval получает только safe receipts и digest выбора, без private refs.
+  Перед Send весь frozen manifest проверяется повторно, затем передаются только
+  стандартные raw Parts с именем/media type, включая пустые файлы.
+  Responses проходят bounded strict JSON/canonical base64 до SDK; decoded
+  aggregate относится к текущему ответу, а не к прежним файлам в Task history.
+  Legacy ENV/text-only schema не получает новый аргумент `files`.
+- Owner settings GET/PUT включают `remote_timeout_seconds` (86400 по умолчанию)
+  и `remote_poll_interval_seconds` (300). PUT со старым набором трёх timeout
+  сохраняет эти настройки и attachment limit; все поля делят settings revision.
+- `attachment_limit_bytes` в company settings задаёт общий decoded aggregate
+  лимит вложений (default 25 000 000). Timeout-only PUT сохраняет прежний лимит;
+  принятые manifests не пересматриваются при его изменении.
+- `A2A_MAX_REQUEST_BYTES` отдельно ограничивает encoded HTTP body до SDK
+  (default 40 000 000 bytes). Для большего company limit deployment ceiling
+  увеличивается с учётом JSON/base64 overhead; старый принятый dedup не зависит
+  от нового company limit. Raw FileParts доступны на owner/external routes;
+  файлы публикуются только после полного batch guardrail решения.
+- Доступные owner history messages после file publication содержат только
+  actual name/path/size/digest из scoped batch. Quarantine/excluded names не
+  раскрываются через history; bytes и исходная metadata остаются в private store.
+- `core_response_files` принимает полный список относительных workspace paths,
+  замещает предыдущий выбор или очищает его через `[]`. Ошибка сохраняет прежний
+  набор. Snapshot и receipt фиксируются одним durable переходом, включая Python
+  broker; bytes сохраняются в transport store, не в workflow JSON/model context.
+  Новые выборы используют текущий company limit, принятый набор закрепляет его.
+  Final A2A Artifact выдаёт typed raw Parts; live/GetTask/subscription/recovery
+  проверяют весь canonical manifest и blobs до выдачи. Terminal Message не
+  дублирует файлы. Owner final history содержит только safe `response_files`
+  receipts, без blob IDs/raw bytes; download по chat/Task/file ID снова проверяет
+  текущие права и integrity всего набора и не читает изменённый workspace source.
+- File guardrail download `/api/guardrails/{wait_id}/file` получает точный
+  sealed reference из сохранённого review, возвращает только owner-scoped
+  проверенные bytes как attachment и остаётся доступен для owner history.
+- Composition root подключает material store и отдельный classifier до recovery.
+  Default использует непотоковую копию подключения модели агента; четыре
+  `GUARDRAILS_LLM_*` overrides требуют полного набора и не наследуют credentials
+  основной модели. Detector имеет отдельные time/token/call limits; его tools
+  всегда пусты. File quarantine подключён к внутреннему canonical admission;
+  public raw FileParts принимаются через scoped admission после native sandbox proof.
+- Initial/follow-up input, owner answers, tool args/results, background и nested
+  Python проходят runtime material gates. Известный результат сохраняется до
+  review; возобновление раскрывает его без повторного dispatch. Pending nested
+  review и ошибка его persistence сначала останавливают Python, поэтому код не
+  может перехватить host-side отказ и продолжить выполнение.
+- Отклонённый/просроченный exact material проверяется по сохранённым решениям
+  того же tenant/owner/chat до exemption и новой классификации, включая другой
+  tool call или новый run. SDK progress не публикует raw call/results, provider
+  reasoning или непроверенные remote frames; owner читает их через private API.
+- Direct model calls используют `allow|require_hitl|deny`, новый tool требует
+  HITL. Deny скрывает tool из последующего model catalog и проверяется перед
+  dispatch; переключение в allow не разрешает уже открытый запрос. Отказ и
+  timeout возвращаются модели как tool results. Background target получает
+  собственный workflow и approval без отдельного model loop. Nested Python
+  сохраняет точный broker call, останавливает процесс до safe wait и после
+  решения исполняет только этот call. Prefix и remainder не повторяются; модель
+  получает interrupted result под исходным outer tool-call ID. Unit proof
+  не заменяет обязательный native Linux gate.
+- `core_ask_owner` доступен при подключённом owner plane; создаёт private question
+  после собственной policy/HITL. External-owned Task публикует generic status и
+  итоговый ответ; внутренние вопросы, ответы и промежуточный tool/model stream
+  остаются приватными.
 - Remote A2A caller не становится approver через текст, request metadata или
   caller JWT. Не документировать модули approval/operator как включённый
   runtime flow, пока они не подключены в `core_agent/app.py` и не имеют CI proof.
 
 ### Background и delegation
+
+- Remote kind `remote_a2a` использует existing scheduler/ownership/mailbox
+  и mutable checkpoint LONG-02. Прежний immutable contract v1 читается без
+  изменений. Enterprise contract v2 закрепляет source `caller_scope` ровно
+  `{owner_id, context_id, task_id, run_id}`, aggregate limit и frozen file refs;
+  scheduler owner совпадает с source run ID. Child сохраняет свои task/run IDs.
+  Parent snapshot wrapper остаётся v1, entry v2 дополнительно закрепляет digest
+  исходных аргументов: recovery не читает изменённые workspace paths заново.
+  Unknown versions/fields/scope и изменённые arguments отклоняются.
+  Local rows имеют null checkpoint. Миграции выполняет database entrypoint,
+  а не serving process.
+- Send/Cancel marker сохраняется до network; один worker выполняет один bounded
+  request и освобождает claim. Unknown Send без remote ID и уже сохранённый
+  Cancel marker требуют reconciliation; они не повторяются после recovery.
+  Shutdown не является caller cancellation. Временные Get ошибки планируют
+  следующую проверку в пределах прежнего deadline; timeout закрывает operation
+  атомарно и выигрывает у позднего ответа.
+- Executor читает credentials только из закреплённой registry revision.
+  Отражённые секреты в peer IDs отклоняются до checkpoint/URL, текст очищается
+  existing redactor. v2 `working`/`input-required`/`auth-required` не импортируют
+  ранние raw previews и сохраняют polling с прежними IDs/deadline. Terminal v2
+  files принимаются в quarantine через один ChatFileService, подключённый
+  composition root к executor/scheduler/runtime; отсутствие service явно закрывает
+  import. Runtime refetch-ит только owned remote completed Task и закрепляет
+  полный text/ordered file receipt до guardrails. Frozen progress не повышается
+  до terminal outcome при повторном чтении scheduler state.
+  v1 file response остаётся `REMOTE_FILES_UNSUPPORTED`. Accepted batch хранит
+  source run и derived public root Task; child public rows не создаются.
+  Shared `caller_scope` держит chat → root → intermediate → source locks,
+  использует actual parent links максимум двух уровней и fence только source
+  writer lease; historical sealed reads допускают terminal ancestors.
+  Quarantine bind, terminal result и notification/outbox commit-ятся атомарно
+  под claim/deadline/revision/cancel fences на одной borrowed connection.
+  Private `file_batch_id` исключается из remote mailbox/outbox и model task
+  snapshots. Text и каждый файл проходят guardrails до whole-batch publication;
+  отказ исключает весь result, task list может сохранить отдельно разрешённые
+  результаты. Вложенный Python останавливается перед ожиданием, recovery не
+  повторяет Send или prefix кода; provenance всех file receipts сохраняется
+  даже для bounded outcomes. Trusted-tool exemption фиксируется durable до
+  публикации и не отменяет предыдущий отказ по точному материалу.
+  Migration23 разрешает только superseding denial `accepted_ready → excluded`.
+  Recovery возвращает уже перенесённый, но не committed каталог в private
+  quarantine и синхронизирует оба родителя до exclusion; published batch и
+  остальные decision references неизменяемы.
+  Reflected credentials в metadata/raw files отклоняются до stage, проверяя
+  UTF-8 и фактические Latin-1 header bytes; содержимое файлов не переписывается.
+  Data Parts отклоняются. Ошибка network/parser после возможного
+  Send/Cancel сохраняет unknown outcome; только доказанная локальная ошибка
+  до dispatch возвращается как известный отказ без blind retry.
+- TaskStore проецирует `core_agent_remote_progress` из scoped working operations
+  как local ID, stable displayed revision, peer name и nonterminal enum. Read-only
+  `remote_progress` не вызывает model-visible task tools. Get/List/Subscribe/push
+  сохраняют одинаковую проекцию, включая stale live Task frames; terminal и
+  просроченные операции исчезают даже до coordinator tick. Повторный status не
+  создаёт event/push и не будит модель, не меняет budget или deadline.
 
 - Main имеет depth `0`, child — `1`, grandchild — `2`; `2` — hard maximum.
 - Depth `2` не получает `core_delegate` ни в instructions, ни в catalog/runtime.
@@ -436,6 +818,17 @@ run получает отдельные MCP session и negotiated version; пе�
   повторять ту же работу. `background: true` разрешает main продолжать только
   независимую работу до notification/wait.
 - `core_task_wait` является passive wait; busy polling запрещён.
+- Direct model calls `core_task_wait`, `core_wait_until` и joined `core_delegate`
+  сохраняют continuation в `core_waits` и возвращают `SuspendedRun`. Он не
+  сериализуется как tool result или Artifact. A2A остаётся `working`, workflow
+  lease и scheduler claim освобождаются; coordinator возобновляет только
+  resolved wait без повторного списания tool budget. Follow-up будит только
+  timer; при ожидании Task он доставляется после результата ожидания.
+- Python nested suspension использует `python_execution` и continuation
+  `python_nested` для HITL, owner question, timer, task wait и joined delegation.
+  Это не checkpoint CPython. Broker переносит trusted execution context в свой
+  thread и удерживает ответ до подтверждения остановки; неподтверждённый stop
+  не превращается в catchable ошибку или EOF для живого interpreter.
 - Parent cancel рекурсивно отменяет owned children. Required pending child
   блокирует успешное завершение parent; нужный финальному ответу result должен
   быть joined/waited.
@@ -449,8 +842,42 @@ run получает отдельные MCP session и negotiated version; пе�
 - Child failure возвращается parent как structured result и сам по себе не
   обязан завершать parent Task.
 - Shared memory существует только при явной делегации memory tools: child
-  наследует ту же тройку scope, а без делегированного tool работает без памяти.
+  наследует trusted tenant/app/user и session scope, а без делегированного tool
+  работает без памяти. Нормативный ключ corpus и migration boundary заданы в
+  `spec/memory-service.md` и `spec/architecture.md`.
   Scratchpad/context не является общей памятью.
+
+### Cron
+
+- Авторизованная enterprise composition подключает owner-only `/api/schedules`
+  CRUD и `/{id}/run-now`. У каждого расписания один canonical chat; create без
+  context создаёт пустой owner chat, а не фиктивную Task. Chat list и UI принимают
+  `latest_task_id: null`; длинные прежние contexts сохраняют legacy task cursor.
+- `core_cron_create` доступен в обоих modes только внутри effective ceiling,
+  live tool policy и явного child allowlist; default HITL действует как для других
+  mutating tools. Run/call/attempt receipt и lease/cancel fence задаются server-ом,
+  аргументы не выбирают tenant, owner или context. Unconfigured legacy runtime
+  не публикует tool. Agent origin не является owner authority.
+- Каждая cron Task проходит общий root admission. Admission/event/next due
+  automatic occurrence сохраняются одной транзакцией; manual run не меняет next
+  due. Busy, late, downtime и pending cleanup дают immutable skip notice без Task
+  и очереди. Delete/disable не отменяют принятые roots или их waits.
+- Календарь использует закреплённый `croniter==6.2.4`, five-field validation и
+  `ZoneInfo` gap/fold adapter. Default timezone `Europe/Moscow`; aware UTC next due
+  строго позже текущего instant. См. CRON-05/08 в нормативной спецификации.
+- Existing recovery tick запускает bounded coordinator pass. Production leader
+  держит company session advisory lock на выделенной PostgreSQL connection; на
+  ней же коммитятся automatic occurrences. Memory tick только планирует один job
+  на ASGI loop.
+  При graceful close coordinator освобождает свой advisory lock с подтверждением
+  PostgreSQL перед закрытием socket; close всегда выполняется и при ошибке unlock.
+  Release остаётся под `_pg_guard` после завершения current transaction.
+  Startup/re-leadership/gap >60 секунд фиксируют cutoff, catch-up
+  отсутствует; healthy lateness до60 секунд допускается. Shutdown не отменяет
+  admitted Tasks. No provider call inside schedule/admission transactions.
+- Owner history включает только safe `schedule_notice` проекцию skipped events,
+  с immutable root/position anchor и version2 event cursor; issued version1 и
+  прежние ordinary entry IDs сохраняются. Notices не становятся model user turns.
 
 ### Persistence и storage
 
@@ -458,6 +885,32 @@ run получает отдельные MCP session и negotiated version; пе�
   DB и совпадающей schema version. Нет SQLite/in-memory fallback.
 - Tasks, workflow events/checkpoints, inbound inbox, outbox и audit
   tenant/owner-scoped и сохраняются в PostgreSQL согласованно.
+- `core_chats.latest_root_run_id` указывает на последний root; занятость
+  определяется его canonical workflow state. Terminal transition не очищает
+  указатель. `core_root_messages` хранит immutable creation dedup ledger без TTL.
+  Schema 15 включает durable waits, company settings и per-origin tool policies; migration выполняется отдельной
+  job после остановки старых workers;
+  после новых записей откат image требует согласованного отката БД.
+  Legacy run-family retention отвечает `RETENTION_PROHIBITED` для enterprise
+  чатов до изменения данных; очистка workspace не удаляет историю или ledger.
+- Schema 22 добавляет company-scoped cron schedules и append-only events с
+  version1, CAS и immutable identity; canonical chat tenant/context/owner keys
+  защищены отдельным trigger. Serving role не удаляет schedules/events и не
+  изменяет events. Canonical chat writers используют `FOR NO KEY UPDATE`, чтобы
+  сохранять взаимное исключение, разрешая FK `KEY SHARE` при fenced tool create.
+  Rollback после новых cron records требует совместимого reader либо DB restore.
+- Schema 21 сохраняет immutable cleanup intent и chat workspace revision.
+  `/api/chats/{context_id}/files/delete` доступен только владельцам: POST принимает
+  точный подтверждённый набор с request ID, GET пассивно читает receipt. Active
+  root отклоняет новую очистку без intent/очереди. Pending/reconciliation intent
+  блокирует новые roots под тем же canonical chat lock; accepted duplicate Task
+  остаётся доступной. HTTP send/stream получает safe retryable 503, JSON-RPC —
+  server error -32000. Preview cursor/identity version2 закрепляют revision.
+  Existing recovery coordinator продолжает committed intent bounded проходами,
+  пропуская требующие ремонта операции без starvation остальных чатов.
+  Private capture/journal находится вне model workspace; missing source без
+  verified deletion proof не считается успешным удалением. Откат после intent
+  требует совместимого reader либо согласованного восстановления DB+volumes.
 - После restart ambiguous dispatched side effect переходит в reconciliation, а
   не replay. Shared storage lock не заменяет lease: у stateful run один active
   owner.
@@ -473,6 +926,15 @@ run получает отдельные MCP session и negotiated version; пе�
   artifacts, обычно на S3-backed mount.
 - `LOCAL_WORKSPACE_ROOT` является отдельным ephemeral filesystem для активных
   процессов и не находится внутри durable mount.
+- `CHAT_WORKSPACE_ROOT` задаёт постоянный POSIX root папок чатов и обязателен
+  при Keycloak authentication. Все три storage roots не пересекаются ни в одном
+  направлении. Anonymous development/test без него сохраняет ephemeral режим.
+- Runtime связывает root, child, background и recovered run с исходными
+  tenant/owner/context. Authenticated binding дополнительно проверяется по
+  `core_chats`; legacy workflow без mapping не получает папку автоматически.
+  TerminalSessionManager требует `bind_run` до `execute_transient`;
+  явный низкоуровневый `create(EnvironmentSpec(...))` поддерживает scratch.
+  Destroy сессии сохраняет папку чата, `LOCAL_BASE_SNAPSHOT` её не перезаписывает.
 - Memory corpus живёт в backend из `MEMORY_STORAGE_TYPE` (процесс или общая БД
   агента) и не имеет собственного filesystem root; не смешивать storage domains.
 - Test/in-memory adapters разрешены только в явно выбранном
@@ -549,7 +1011,7 @@ run получает отдельные MCP session и negotiated version; пе�
 - Сохранять unrelated user changes; не выполнять destructive Git commands.
 - При использовании development subagents давать им узкую независимую задачу.
   Избегать overlapping writes: один владелец файла, main интегрирует и проверяет.
-- Не коммитить `.env`, credentials, tokens, generated state, `.idea/` и другие
+- Не коммитить `.env`, `kubeconfig`, credentials, tokens, generated state, `.idea/` и другие
   локальные IDE-файлы.
 
 ## Канонические команды
@@ -618,6 +1080,10 @@ docker compose logs -f agent
 - Persistence, HITL, race или recovery: PostgreSQL suite с `TEST_DATABASE_URL`;
   отсутствие DB и skipped tests явно сообщить.
 - A2A change: protocol/config tests и соответствующий HTTP E2E.
+- Auth change: `tests.test_auth` на in-memory и PostgreSQL, а также
+  `tests.test_keycloak_integration` с настоящим локальным Keycloak. Последний
+  требует `TEST_KEYCLOAK_URL`, `TEST_KEYCLOAK_ADMIN` и
+  `TEST_KEYCLOAK_ADMIN_PASSWORD`, создаёт и удаляет только свой временный realm.
 - Memory change: `tests.test_memory_service` и PostgreSQL suite с
   `TEST_DATABASE_URL`, так как backend памяти является database concern.
 - Docker/Compose/startup/permissions: повторить релевантные image/Compose smoke

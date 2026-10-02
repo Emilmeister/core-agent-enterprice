@@ -2,8 +2,44 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .errors import CoreError
+
+
+def validate_http_url(value, setting):
+    """Validate configured transport URLs without exposing parser diagnostics."""
+    try:
+        if not isinstance(value, str) or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError
+        parsed = urlparse(value)
+        port = parsed.port
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+        bracket_suffix = authority.split("]", 1)[1] if authority.startswith("[") else ""
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or "\\" in parsed.netloc or parsed.netloc.endswith(":")
+                or (bracket_suffix and not bracket_suffix.startswith(":"))
+                or (port is not None and not 1 <= port <= 65535)):
+            raise ValueError
+    except ValueError:
+        raise CoreError("CONFIG_INVALID", f"{setting} must be a valid HTTP or HTTPS URL") from None
+    return parsed
+
+
+def safe_url(value):
+    """Log-only URL projection; retain the original destination for transport."""
+    try:
+        parsed = validate_http_url(value, "URL")
+        host = parsed.hostname
+        if not host:
+            return "[invalid URL]"
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host += f":{parsed.port}"
+        return f"{parsed.scheme}://{host}{parsed.path}" if parsed.scheme else host
+    except (CoreError, ValueError, TypeError):
+        return "[invalid URL]"
 
 
 def redact(value, known_secrets=()):

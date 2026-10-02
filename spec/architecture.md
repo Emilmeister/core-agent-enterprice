@@ -2,7 +2,7 @@
 
 ## Архитектурная цель
 
-Core Agent — stateful orchestration kernel с портами для моделей, local terminal sessions, MCP, skills, persistence, policy и событий. Целевой deployment работает в одном managed container без Kubernetes API; бизнес-логика agent loop не зависит от HTTP framework или model provider.
+Core Agent — stateful orchestration kernel с портами для моделей, local terminal sessions, MCP, skills, persistence, policy и событий. Целевой deployment работает в одном Kubernetes Pod, с постоянными папками чатов и обязательным Bubblewrap для команд; бизнес-логика agent loop не зависит от HTTP framework или model provider.
 
 ## Подсистемы
 
@@ -49,7 +49,7 @@ Agent Card.
 
 ### Tool runtime
 
-Регистрирует built-ins и MCP tools, валидирует calls и передаёт их policy engine. Terminal, skill scripts и stdio MCP запускаются через owned TerminalSession с отдельными PTY/process group/workspace; runtime нормализует outputs и фиксирует side effects.
+Регистрирует built-ins и MCP tools, валидирует calls и передаёт их policy engine. Terminal, skill scripts и stdio MCP запускаются через owned TerminalSession с отдельными PTY/process group в workspace своего чата либо optional isolated scratch-копии; runtime нормализует outputs и фиксирует side effects.
 
 ### Skill manager
 
@@ -57,11 +57,11 @@ Agent Card.
 
 ### Policy
 
-Policy engine принимает нормализованный proposed action и возвращает `AUTO_ALLOW` или `DENY`. Отдельного пути подтверждения человеком нет: этот runtime не содержит human-in-the-loop, и вердикт policy является окончательным. Граница возможностей задаётся tool allowlist, runtime mode и изоляцией контейнера.
+Policy engine проверяет immutable platform/tenant/mode ceiling и текущую owner policy `allow|require_hitl|deny`. HITL durable связывает точный call/arguments с решением владельца; schema, scope и current policy проверяются перед dispatch. Guardrails независимо допускает конкретную версию материала и не выдаёт capability. UI и owner endpoints находятся за Keycloak, внешний A2A имеет отдельную границу доступа.
 
 ### Durable state
 
-Event log является источником истины для состояния A2A Task/run. Inbound Messages durable сохраняются до model delivery и дедуплицируются по `(task_id, message_id)`; inbox append и terminal transition сериализуются без потери подтверждённого input. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. Transcript и artifacts имеют независимые retention policies. Память является подсистемой Core Agent и ведёт собственные revisions вне event log; Core сохраняет только использованные tool results/provenance согласно Task retention.
+Event log является источником истины для состояния A2A Task/run. Inbound Messages durable сохраняются до model delivery и дедуплицируются по `(task_id, message_id)`; inbox append и terminal transition сериализуются без потери подтверждённого input. Checkpoints ускоряют восстановление, но MUST быть воспроизводимы или сверяемы с log. История чата сохраняется без автоматического удаления по возрасту; служебные blobs/checkpoints имеют отдельные retention policies, не удаляющие историю. Память является подсистемой Core Agent и ведёт собственные revisions вне event log; Core сохраняет только использованные tool results/provenance согласно Task retention.
 
 Production adapter хранит A2A Tasks, event log, checkpoints, и append-only audit в PostgreSQL через один bounded pool. `DATABASE_URL` обязателен и берётся из deployment secret. Нет автоматического fallback на process memory/SQLite при database outage: startup/readiness fail closed, активные protected actions не исполняются. Test adapters не могут быть выбраны production configuration.
 
@@ -93,6 +93,20 @@ CREATED -> VALIDATING -> QUEUED -> RUNNING
 
 - `WAITING_*`, `APPROVED_RESERVED` и `PAUSED` являются durable: worker может освободить ресурсы.
 - `WAITING_TASK` означает пассивное ожидание background task без busy polling и без занятого model worker.
+
+Durable wait хранится в schema 14 в `core_waits`: immutable scope run/tenant/owner/context,
+монотонная generation, kind, source ID, subject, versioned continuation, абсолютный
+deadline и отдельные resolved/applied timestamps. Единственное ещё не applied
+ожидание run создаётся атомарно с checkpoint и освобождением lease. Outcome выбирается
+однократно под run→wait locks; время дедлайна берётся после lock. Applied отмечается
+только транзакцией, которая включила результат в checkpoint. Закрытие terminal run
+также закрывает его wait. Private subject не публикуется в A2A status/outbox.
+
+Runtime возвращает отдельный `SuspendedRun`, который transport и scheduler MUST
+распознавать до сериализации: он не является финальным ответом, Artifact или ошибкой.
+Неразрешённое ожидание не выбирается для execution recovery. Решение или timeout
+делает тот же run готовым к fenced recovery; хранение нового результата не даёт
+само по себе execution lease.
 - `ABORTED` означает, что continuation невозможно доказать безопасным.
 - Переход записывается в event log до публикации соответствующего события.
 - Ровно один actor владеет lease на изменение run; истёкший lease не даёт права повторять внешний side effect.
@@ -146,3 +160,336 @@ Primary agent создаёт сабагента как неблокирующу�
 ## Dependency direction
 
 Domain types и state machine не импортируют provider SDK, transport frameworks или platform shell code. Инфраструктурные adapters зависят от core ports, но не наоборот. Это правило MUST проверяться архитектурными tests или package boundaries.
+
+
+## Enterprise admission и долговечные состояния
+
+Одна компания имеет владельцев и внешних caller-ов со стабильным authenticated scope. Чат привязан к tenant и доказанному caller scope; owners видят все чаты компании, но выполняющаяся Task получает только scope своего чата. Admission атомарно проверяет один active root на чат, сохраняет `(tenant, stable caller, messageId)` и digest content/context/attachments, Task/inbox и files publication. Duplicate сначала возвращает прежнюю Task; changed content конфликтует. Неуспешный CONTEXT_BUSY является отдельной durable terminal Task, не занимает чат и не создаёт очередь.
+
+Waits, решения, timer generation, remote handle↔IDs, final timeout, cron revision/ticks, file staging/publication/quarantine и workspace revision имеют versioned structured records в существующей PostgreSQL workflow модели. Summary не является их источником истины. Lease/fencing и atomic transitions допускают одно продолжение; новые retries не воспроизводят неизвестный side effect. Ожидание освобождает execution worker, сохраняя занятость чата. Cleanup и новый root/cron admission сериализуются по тому же chat guard.
+Canonical chat writers используют совместимый с FK KEY SHARE row lock
+`FOR NO KEY UPDATE`; chat tenant/context/owner keys неизменяемы и защищены БД.
+Последний root/revision можно менять, не нарушая взаимное исключение writers.
+Cron schedules и append-only events имеют storage version1; schedule не является
+второй execution state machine. Automatic admission/event/next due коммитятся
+одной транзакцией на connection, владеющей company leader session lock.
+Owner CRUD использует обычный pool; dedicated leader session допускает pool
+размера1. Memory backend получает все asyncio locks до общего синхронного
+workflow/Task/schedule commit; threading RLock никогда не удерживается через
+await. Recovery thread только планирует один bounded memory scan на ASGI loop.
+Cron не запускает model/tool до commit и не выдаёт operator authority.
+
+
+## Совместимость, migration и rollback
+
+### Schema 13: admission корневой задачи
+
+`core_chats` хранит `(tenant_id, context_id)` как primary key, immutable
+`owner_id`, nullable `latest_root_run_id` со ссылкой на `core_runs`,
+`schema_version=1` и время создания. Последний root — историческая ссылка:
+занятость определяется его canonical workflow state, а не вторым lifecycle.
+Все нетерминальные states, включая ожидания, занимают чат. Terminal state
+освобождает слот без удаления истории и без изменения указателя старым worker.
+Следующий принятый root атомарно заменяет указатель.
+
+`core_root_messages` хранит primary key `(tenant_id, actor_id, message_id)`,
+`request_digest`, `fingerprint_version=1`, `owner_id`, `context_id`, `task_id`,
+`schema_version=1` и время создания. `actor_id` — verified caller, отдельно от
+общего execution owner владельцев. Ledger не удаляется автоматическим TTL.
+Прежний run-family retention не применяется к runs зарегистрированного
+enterprise чата: возвращается `RETENTION_PROHIBITED` до изменений. Очистка
+выбранных workspace файлов не удаляет Task, историю или creation ledger.
+Начальный Message сохраняется в A2A Task.history в той же транзакции, поэтому
+crash до первого SDK события не теряет запрос. Повторное добавление этого
+Message SDK не создаёт копию в истории.
+
+Admission берёт transaction-scoped lock по dedup key, проверяет повтор, затем
+создаёт/блокирует chat row и проверяет scope. Task, ledger и, при успешном старте,
+workflow/checkpoint/audit/outbox, initial lease и budget reservation коммитятся
+вместе. Busy-отказ сохраняет только свою failed Task и ledger, без workflow,
+worker или budget reservation. Model/MCP/tool execution допускается после commit.
+Чтение state последнего root под chat lock не требует встречного run lock;
+terminal transition сохраняет существующие fencing и atomicity.
+
+Migration 12→13 добавляет таблицы, indexes и application grants, сохраняя
+legacy rows и blobs. Старые context IDs без явного migration mapping не
+присваиваются новым caller-ам. До применения DDL останавливаются старые
+admission workers; отдельная migration job обновляет schema, затем стартует
+runtime schema 13. После новых chat/ledger writes старый image не может
+обслуживать базу без согласованного reverse migration/backup restore.
+
+Migration 13→14 добавляет durable waits, не меняя существующие deadlines или
+side-effect markers. Перед DDL старые workers останавливаются; migration job
+создаёт таблицу, constraints и grants, затем запускается image со schema 14.
+После появления wait records rollback требует согласованного DB backup/restore,
+а не запуска schema-13 runtime поверх новых записей.
+
+Enterprise меняет authentication, caller ownership, file placement, tool availability и remote wait semantics, сохраняя A2A 1.0 и однополевой RunRequest. Это явная версия application/persistence contract; старые неаутентифицированные endpoints MUST NOT сохраняться как обход новых owner/external границ. Agent Card рекламирует только фактически подключённые bindings/capabilities. Rollout требует обновлённых клиентов/credentials и отдельного migration job с DDL role; serving процесс только проверяет schema version и fail closed при несовпадении.
+
+Migration заранее делает recoverable backup metadata и blobs, проверяет versions/integrity и задаёт явное сопоставление legacy tenant/user/context со стабильной authenticated identity. Нельзя угадывать caller по текущему токену, `anonymous`, имени файла, последнему запросу или общему tenant. Неоднозначные legacy rows/blobs сохраняются изолированно, недоступны внешним caller-ам до подтверждённого operator mapping. Owner-wide UI доступ не расширяет execution scope. CLEAN-01 удаляет named artifact code/config без отдельного blob export/import: прежних данных этого service для переноса в согласованном cutover нет. Внешние storage resources и generic transport blobs не удаляются.
+
+Wait, cron и file schemas/checkpoints версионируются; migration сохраняет абсолютные deadlines, admission IDs, closed outcomes, visibility и side-effect intent. Старый checkpoint с неизвестным исходом dispatched call переводится в reconciliation, а не переотправляется. Неизвестная schema version не исполняется. Legacy ephemeral workspace нельзя объявить постоянным без переноса на `CHAT_WORKSPACE_ROOT`; старые snapshots не восстанавливают удалённые файлы.
+
+Версия PostgreSQL относится ко всей serving сборке. Enterprise переходы:
+
+| Schema | Persisted изменение |
+| --- | --- |
+| 13 | Trusted chat ownership и caller/messageId creation ledger |
+| 14 | Durable waits с абсолютными deadlines, generation и закрытым outcome |
+| 15 | Company settings и CAS tool policies; отсутствие policy требует HITL |
+| 16 | Version-1 manifests и состояния private file batches |
+| 17 | Version-1 material reviews, usage, decisions и ссылки на waits |
+| 18 | Общий attachment limit с default 25 000 000 bytes |
+| 19 | Version-1 remote registry, encrypted revisions и remote wait settings |
+| 20 | Nullable remote operation checkpoint в background task |
+| 21 | Version-1 workspace cleanup intent и canonical chat binding constraint |
+| 22 | Version-1 cron schedules/events и immutable chat binding |
+| 23 | Уточнение transition/identity constraints file batch; manifest version сохраняется |
+| 24 | Trusted tenant scope memory documents, versions и repository revisions |
+
+Для каждого перехода действует один порядок: сохранить согласованный backup
+БД и blobs, остановить старые workers, выполнить отдельную migration job,
+проверить целевую schema и запустить соответствующий serving image. Migration
+повторяется без повторного изменения уже применённых версий. Serving process
+не выполняет DDL; старый image отклоняет новую schema, а migration build
+отклоняет неизвестные ему versions. До новых mutations возможен возврат
+согласованного pre-migration backup. После новых accepted records действует
+граница rollback ниже; удаление записей о migrations не является downgrade.
+
+CLEAN-01 не меняет PostgreSQL schema. Перед cutover завершаются active Tasks со
+старым frozen capability set. Snapshot, digest которого включает снятые named
+artifact capabilities, отклоняется как `CHECKPOINT_INVALID`, а не пересобирается
+молча с другим набором tools. Сохранённый intent возможного side effect не
+удаляется и не даёт права повторить вызов. Checkpoints нового capability set,
+включая HITL/remote waits, восстанавливаются по обычному контракту.
+
+Legacy `REMOTE_AGENTS` и dedicated auth settings импортируются однократно явным migration в owner registry с проверкой target, identity и защищённым хранением header values. Неоднозначный per-agent auth требует operator mapping; входящий credential автоматически не переносится и не проксируется. После cutover UI registry authoritative: рестарт и старое ENV не перезаписывают его, изменения аудируются. Старые values сохраняются защищённо только для согласованного rollback, не в model/transcript/logs.
+
+Явный import выполняет отдельная operator команда `core-agent-db import-remote-agents
+--file /run/secrets/remote-import.json` после schema migration и до запуска serving
+workers. Компания берётся только из deployment `CORE_AGENT_TENANT_ID`; importer
+не угадывает имена или auth из Agent Card, входящего credential или текущего
+`REMOTE_AGENTS`. Operator заранее сопоставляет каждый legacy URL с новым immutable
+именем и точными `header_name`/`header_value` в защищённом JSON-файле version1.
+Формат содержит ровно `version: 1` и непустой `peers` list, максимум100 entries
+и1MiB encoded bytes; поля entry совпадают с owner registry create contract.
+Неизвестная version, duplicate JSON keys, malformed input или invalid peer
+отклоняются до записи. File access/schema/key/DB errors не раскрывают values;
+PostgreSQL error при import возвращает безопасный `REMOTE_IMPORT_FAILED` без
+исходной DB диагностики.
+
+Import допускается только в пустой registry выбранной компании. В одной
+транзакции блокируются competing registry writes, проверяется пустота и создаются
+все current pointers и encrypted revisions1. Ошибка любого entry откатывает весь
+batch. Actor audit получает `migration:<current_user>` из аутентифицированной DB
+сессии; он не выдаётся за verified Keycloak owner. Повторный import, включая import
+после owner edit/delete, возвращает `REMOTE_IMPORT_NOT_EMPTY` без изменений.
+Другие company scopes сохраняются. Serving process не вызывает importer;
+последующий ENV или restart не перезаписывает UI registry. Это migration remote
+configuration, без переназначения legacy Task/chat/file ownership и без сетевого
+discovery, model call или повторного remote dispatch. Stored registry version1 и
+schema24 не меняются; import является новой enterprise mutation, к которой
+применяется общая rollback boundary.
+
+Migration 23→24 добавляет явный `tenant_id` в memory documents, versions и
+repository revisions, их primary keys и namespace index. Неоднозначные прежние
+memory rows сохраняют пустой legacy tenant и остаются недоступны новым
+authenticated corpus; их tenant не угадывается по имени агента, общему owner ID
+или первому запросу. Новые direct development/test corpus используют tenant
+`default`, отдельно от legacy пустого scope. Public memory tool schemas и opaque
+IDs не меняются; known ID другого namespace возвращает not-found до read/mutation.
+Старые serving workers останавливаются до migration job, затем запускается
+image schema24; image schema23 не обслуживает новую schema. После новых
+tenant-scoped writes rollback требует согласованного совместимого backup/restore,
+а не удаления tenant column поверх действующей базы.
+
+Registry storage version1 хранит company-scoped current peer pointer и append-only
+peer revisions; каждая revision содержит безопасную конфигурацию, encrypted
+credential, actor и timestamp. Name уникален в company и immutable. DELETE —новая
+disabled revision, не физическое удаление. Settings добавляются с defaults в
+существующую owner settings row. Schema migration19 additive: прежние local
+tasks/workflows остаются читаемы; serving image требует актуальную schema.
+Backup/rollback сохраняет старые revisions и encryption key; после записи новых
+state formats допустим только image, читающий их. Новые owner registry API сами
+по себе не означают, что legacy synchronous transport заменён durable lifecycle.
+
+До первой enterprise mutation допускается rollback на проверенный pre-migration snapshot. После новых waits, owner decisions, cron admissions, file revisions или UI registry edits старый runtime не может обслуживать новые records: сначала drain/quiesce, затем проверенный reverse migration либо восстановление согласованного DB+blob backup с учётом новых данных. Нельзя молча потерять принятые сообщения/файлы, воскресить timer/approval или повторить возможный side effect. Rollback, который не сохраняет эти гарантии, блокируется; простой запуск старого image на новой schema запрещён.
+
+
+### Schema 15: настройки владельцев
+
+`core_owner_settings` хранит company-scoped revision и три timeout owner API.
+`core_tool_policies` хранит revision, mode и guardrails_exempt под составным
+ключом `(tenant_id, canonical_name, origin)`. Отсутствующая policy означает
+require_hitl/false/revision=0. Оба хранилища меняются через CAS; CHECK constraints
+сохраняют допустимые mode и положительные bounded timeout. Migration не
+выдаёт существующим инструментам автоматическое разрешение.
+
+Serving process требует совпадения schema version; отдельная migration job
+выполняется после остановки старых workers. Переход с schema 14 сохраняет все
+wait deadlines/outcomes; решения владельцев продолжают использовать core_waits.
+После новых policy/decision writes откат image требует согласованного отката БД.
+
+### Private file batches: schema 16
+
+`core_chat_file_batches` хранит version-1 manifest, trusted tenant/actor/message,
+исходный request digest, original created_at, upload lease и server-owned storage
+key. До admission context/owner/task/run не считаются закреплёнными. Acceptance
+связывает их с существующим chat/workflow в той же транзакции, где принимается
+root или follow-up. После принятия manifest и scope неизменяемы; отдельные состояния
+`staging`, `accepted_quarantine`, `accepted_ready`, `published`, `excluded`,
+`rejected` описывают хранение, не заменяют A2A Task lifecycle.
+
+Все bytes и complete manifest сохраняются с fsync до acceptance. Publication
+допускается после committed guardrail decision и одной атомарной операцией без
+замены публикует весь каталог в readonly attachments. Проверка live Task и
+публикация сериализуются с terminal/cancel через chat/workflow locks. После
+rename и до published commit recovery проверяет тот же immutable manifest и
+не создаёт вторую копию. Ошибка после acceptance сохраняет pending delivery,
+а не имитирует непринятое сообщение.
+
+Rollback admission не удаляет bytes автоматически: вызывающий слой после
+выхода из транзакции отклоняет и очищает только свой непринятый stage. При
+аварии действует original-age sweeper с проверкой lease и authoritative
+references; active uploads и accepted/quarantined данные не удаляются.
+Перезапуск не обновляет возраст. Migration 16 сохраняет прежние rows без
+вложений, выдаёт serving role только SELECT/INSERT/UPDATE новой таблицы и
+не открывает binary intake сама по себе. Rollback требует согласованного
+состояния БД и volume по общему контракту выше.
+
+Migration 23 изменяет только guardrail transition trigger, сохраняя shape и
+manifest всех file batches. Для `accepted_ready → excluded` допускается новая
+ссылка на отказ по точному материалу; прежнее одобрение остаётся в immutable
+material review и workflow history. Остальные решения и `published` неизменяемы.
+Если rename в workspace завершился до сбоя publication transaction, перед
+записью отказа тот же проверенный каталог возвращается в private quarantine.
+Неоднозначный или изменённый target не удаляется и требует reconciliation.
+Serving image требует schema 23; migration job выполняется при остановленных
+старых workers. После superseding decision rollback требует согласованного
+DB+volume backup, а не запуска schema-22 image на новых записях.
+
+### Material reviews: schema 17
+
+`core_material_reviews` хранит owner-private immutable payload или sealed file
+reference, trusted tenant/run/source ID/source kind, content digest и version 1.
+Ключ `(tenant_id, run_id, source_id, content_digest)` обеспечивает повторное
+получение той же проверки. Digest относится к полному payload/version; исходный
+материал и scope не меняются после создания. Ссылки на review не являются
+разрешением прочитать чужой чат и не публикуются в A2A metadata/history.
+
+Состояния `checking`, `clear`, `pending`, `allowed`, `rejected`, `timed_out`
+описывают решение о материале. Таблица сохраняет detector deadline, лимиты,
+начисленные attempts/input tokens, наблюдаемый usage, revision и ссылку на
+существующий `core_waits`. Attempt начисляется до сети под текущей run lease.
+После interruption попытка не становится бесплатной и не запускается повторно
+автоматически: незавершённая проверка требует owner decision. Repeated source
+не переоткрывает уже закрытый отказ после смены exemption или compaction.
+
+Для inline материала runtime сохраняет в private `completed_result_ref` также
+канонический material digest, независимый от ID вызова и transport envelope.
+Negative lookup использует tenant/owner/context, включая предыдущие runs этого
+чата, и authoritative outcome связанного wait. Он выполняется до exemption и
+нового classifier call: rejected/timed-out exact payload не становится доступен
+через повторный вызов другого tool. Source digest продолжает связывать review
+с конкретным continuation/вызовом. Проверяется равенство точного текста или
+канонического JSON содержимого; это не сравнение смысла перефразированных либо
+закодированных представлений и не оценка качества детектора.
+
+Pending review и guardrail wait создаются атомарно с continuation текущего
+workflow. Owner resolution, deadline и cancel используют существующий wait
+contract; material outcome сверяется с ним до раскрытия payload. Clear/allow
+не отменяет current policy, scope, schema или проверки live Task. Result review
+ссылается на сохранённый completed outcome и никогда не разрешает повтор
+исходного tool side effect. Serving role не получает удаления reviews или DDL;
+rollout/rollback выполняется по общей схеме version-check и согласованного backup.
+
+### Company attachment limit: schema 18
+
+Migration 18 добавляет `core_owner_settings.attachment_limit_bytes` с default
+25 000 000 и положительным integer constraint. Текущие rows получают этот default;
+существующие review/workflow/file manifest не меняются. Лимит входит в прежний
+settings CAS; старый timeout-only update сохраняет его. Serving role продолжает
+использовать существующий table grant без DDL. Перед новым image выполняется
+migration job; старый image со schema 17 не обслуживает schema 18 и не выполняет
+автоматический downgrade. Откат требует согласованного backup БД и volumes.
+
+### Remote operation checkpoint: schema 20
+
+Migration20 добавляет nullable JSONB `checkpoint` в `core_background_tasks`.
+Старые local task rows имеют null и сохраняют прежний contract. Remote kind
+`remote_a2a` использует version1 contract/checkpoint из LONG-02; unknown version
+отклоняется fail-closed. Immutable destination ссылается на сохранённую registry
+revision, credentials остаются там. Отдельный remote `core_runs` workflow и
+model budget ledger не создаются. Existing task claim/heartbeat/revision и
+notifications/outbox являются единственными механизмами ownership и completion.
+
+Checkpoint, terminal outcome и notification/outbox коммитятся атомарно.
+Timeout закрывает operation через bounded coordinator pass даже во время
+in-flight request; поздняя claim не может изменить исход. Recovery без committed
+Send marker допускает первую отправку, marker без remote ID требует reconciliation,
+известный ID допускает только GetTask. Один Cancel marker не повторяется после
+restart. Serving role не получает DDL; schema upgrade выполняет migration job.
+После первой remote checkpoint записи rollback требует image, читающий version1,
+либо согласованное восстановление DB и registry key/revisions. Старый image
+не может обслуживать эти rows или автоматически выполнить downgrade.
+
+Parent workflow snapshot закрепляет remote call до HITL в `remote_calls`:
+ключ включает attempt и call ID, значение version1 содержит exact immutable
+operation contract LONG-02. Повторённый моделью call ID в следующем attempt
+не переиспользует прежний destination или message ID. Approval subject включает
+этот safe contract; ожидание HITL и registry update не меняют уже закреплённую
+revision. Credentials и Card body в snapshot/subject отсутствуют.
+`remote_admission` version1 связывает source ID, attempt и deterministic local
+task ID. Existing scheduler admission и fenced parent snapshot коммитятся одной
+транзакцией; recovery возвращает принятый handle без нового Send. Старые snapshots
+без этих optional fields сохраняют прежнюю recovery semantics, а unknown version
+отклоняется до dispatch. Rollback reader обязан понимать эти fields вместе с
+operation version1. Вложенный Python call MAY использовать существующее durable
+поднятие call в continuation, не создавая второй mutating admission path.
+
+Root Task progress является проекцией committed remote scheduler rows, а не новым
+lifecycle. Existing TaskStore reconciliation сохраняет safe metadata вместе с
+существующей push enqueue в той же transaction; serving не запускает новый
+outbox dispatcher. Get/List и stale SDK save используют тот же scope/projection,
+не стирают актуальное progress и не меняют прежний workflow terminal-reconcile
+contract. В memory source читается под workflow→scheduler lock order; PostgreSQL
+повторно читает canonical root и scoped rows после root Task lock.
+Progress не меняет workflow version, wait outcome, lease или budgets и не будит
+агента. Повторный polling того же enum сохраняет прежнюю отображаемую revision
+и не создаёт новое status/push событие. Passive subscription видит safe metadata
+даже при открытом live queue; первое terminal event сохраняет прежнюю границу.
+Terminal root подавляет progress, late operation update его не возвращает.
+Projection additive: schema20 не расширяется, старый клиент MAY игнорировать
+metadata, а rollback requirements operation/checkpoint остаются прежними.
+
+### Workspace cleanup: schema 21
+
+Migration21 добавляет `core_chats.workspace_revision` и таблицу
+`core_workspace_cleanups`, связанную с canonical company/chat/owner. Immutable
+intent version1 хранит request ID, actor, исходную упорядоченную selection,
+подтверждённые identity/content proofs и base revision. Mutable receipt хранит
+только результаты уже подтверждённой операции. Повторное использование request
+ID с другой selection отклоняется; completed receipt и immutable поля защищены
+от изменения. Serving role получает только необходимые SELECT/INSERT/UPDATE,
+а schema upgrade выполняется отдельной migration job.
+
+Intent коммитится до первого файлового side effect. Выполнение и recovery
+используют canonical chat lock, затем operation lock; pending/reconciliation
+intent блокирует admission новых root Tasks в этом чате. Уже принятая duplicate
+Task остаётся доступной. Служебные capture objects и fsynced deletion proofs
+живут в private cleanup directory вне model workspace. Один и тот же recovery
+coordinator продолжает сохранённое намерение после restart; отдельный публичный
+Task lifecycle или очередь неподтверждённых удалений не создаются.
+
+После хотя бы одного подтверждённого удаления workspace revision увеличивается
+однократно при завершении операции. Preview cursor/identity version2 закрепляют
+эту revision; прежний cursor отклоняется, прежний identity token означает stale
+selection. История чата, transcript и бюджеты не меняются. Snapshot recovery не
+восстанавливает удалённый пользовательский файл поверх persistent workspace.
+
+Upgrade требует image, читающий schema21 и cleanup intent version1. После первой
+записи intent старый image не может обслуживать cleanup rows или обходить их
+admission barrier. Откат требует совместимого reader либо согласованного
+восстановления БД и volumes, включая private journal; восстановление одного
+компонента не считается безопасным rollback и не разрешает повторное слепое
+удаление или воскрешение уже удалённых файлов.

@@ -73,13 +73,16 @@ HTTP+JSON. Карточка агента доступна по `/.well-known/age
 | Выполнение | `core_terminal_exec`, `core_python_exec` |
 | Фоновые задачи | `core_task_start`, `core_task_get`, `core_task_list`, `core_task_wait`, `core_task_cancel` |
 | Делегирование | `core_delegate` |
-| Артефакты | `core_artifact_save`, `core_artifact_load`, `core_artifact_list` |
+| Файлы ответа | `core_response_files` |
+| Ожидание, вопросы владельцу и расписание | `core_wait_until`, `core_ask_owner`, `core_cron_create` |
 | Память | `core_memory_search`, `core_memory_read`, `core_memory_create`, `core_memory_update`, `core_memory_split`, `core_memory_delete` |
 | Удалённые агенты | `core_agent_send_message` |
 | Пакеты навыков (условно) | `core_skill_activate`, `core_skill_read_resource` |
 
 `CORE_AGENT_ALLOWED_BUILTIN_TOOLS` может только сузить обычные встроенные
-инструменты.
+инструменты. Пустое значение использует ceiling выбранного runtime mode;
+условные tools по-прежнему требуют настроенных backend и разрешённой policy.
+Явный список через запятую оставляет только указанный набор.
 `with_terminal` разрешает публикацию `core_terminal_exec` и
 `core_task_start`; `without_terminal` удаляет их, но сохраняет управление
 задачами, делегирование, MCP, память и Python, если они разрешены конфигурацией.
@@ -94,6 +97,35 @@ Python остаётся локальным процессом с доступо�
 `core_skill_activate` появляется только при наличии навыков в
 `EffectiveConfig`, а `core_skill_read_resource` — только после подключения
 навыка с объявленными ресурсами.
+
+### Файлы чата и ответа
+
+При настроенной Keycloak-аутентификации владелец работает с файлами через UI
+`/ui/`, а внешний caller — через стандартные A2A raw FileParts. Входящие файлы
+проходят проверку всего набора и публикуются в постоянную папку своего чата;
+они не сохраняются через отдельный named artifact service. Владелец может
+просматривать и скачивать файлы чата через UI и owner API.
+
+`core_response_files` принимает `{paths: ["relative/path"]}` и выбирает весь
+набор файлов следующего финального ответа из chat workspace. `[]` очищает
+выбор. Сохранённый immutable набор передаётся как standard raw FileParts
+результирующего A2A Artifact и доступен владельцу для скачивания; изменение
+исходного workspace-файла не меняет уже выбранные bytes. Tool доступен только
+при настроенных trusted workspace и transport storage.
+
+Прежние `core_artifact_save`, `core_artifact_load`, `core_artifact_list` и их
+алиасы через точки больше не поддерживаются. При обновлении удалите их из
+allowlist, а также старые `ARTIFACT_STORAGE_*`, `ARTIFACT_S3_*`,
+`ARTIFACT_MONGODB_*` и `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` из окружения.
+Startup-диагностика перечисляет неподдерживаемые имена без значений настроек.
+Перед обновлением дождитесь завершения активных Tasks в прежнем image.
+Незавершённые frozen snapshots с прежними named artifact capabilities
+отклоняются с `CHECKPOINT_INVALID`. Если outcome уже начатого mutating вызова
+неизвестен, его intent сохраняется с `SIDE_EFFECT_UNKNOWN`; автоматического
+повтора нет. Ожидания и recovery задач с текущим config работают как прежде.
+Транспортные A2A Artifacts, результат/offload storage и workspace snapshots
+сохраняются. Согласованное обновление не требует переноса прежних named данных
+и не удаляет внешние S3 buckets, MongoDB databases или ресурсы Kubernetes.
 
 ### Пакеты навыков
 
@@ -271,6 +303,7 @@ Phoenix. Запись содержимого в промышленном реж�
 ```bash
 uv sync --frozen
 
+CORE_AGENT_ENVIRONMENT=development \
 LLM_API_FORMAT=openai \
 LLM_API_BASE=http://localhost:11434/v1 \
 LLM_MODEL=model-name \
@@ -285,11 +318,144 @@ Anthropic используйте `LLM_API_FORMAT=anthropic` и соответс�
 запуске переменные должны быть переданы в окружение процесса. По умолчанию
 состояние в режиме разработки хранится в памяти процесса.
 
-После запуска:
+После запуска без настроенного Keycloak (только development/test):
 
 - карточка агента: <http://localhost:8000/.well-known/agent-card.json>;
 - проверка работоспособности: <http://localhost:8000/health/live>;
 - проверка готовности: <http://localhost:8000/health/ready>.
+
+### Авторизация Keycloak
+
+`CORE_AGENT_ENVIRONMENT` задаётся явно: `production`, `development` или `test`.
+В production обязательны все пять переменных: `KEYCLOAK_ISSUER_URL`,
+`KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`, `KEYCLOAK_AUDIENCE` и
+`CORE_AGENT_TENANT_ID`. Частичная конфигурация отклоняется при старте в любом
+режиме. Issuer — HTTPS URL realm; HTTP разрешён только для loopback в
+development/test. Секрет принадлежит confidential client для introspection.
+
+Настроенный Keycloak включает отдельные входы:
+
+| Вход | Доступ |
+| --- | --- |
+| `/a2a/owner/` | Владельцы с ролью `agent-owner` |
+| `/a2a/external/` | Внешние service accounts с ролью `agent-external` |
+| `/api/identity` | Проверенная identity владельца |
+| `/health/live`, `/health/ready` | Kubernetes probes без токена |
+
+Для браузерного входа задайте `KEYCLOAK_UI_CLIENT_ID` отдельного public client.
+Тогда `GET /ui/config` без токена возвращает только issuer и этот client ID;
+секрет introspection туда не попадает. Пустое значение отключает маршрут.
+Собранный UI доступен на `/ui/`; образ включает его статические файлы.
+Браузерный вход через Keycloak, чат, вложения, HITL, настройки инструментов,
+доверенных агентов, cron и очистка workspace проверяются отдельным browser gate.
+
+Карточка агента находится под соответствующим A2A входом, например
+`/a2a/external/.well-known/agent-card.json`. Старые корневые A2A маршруты при
+настроенной авторизации закрыты. Для вызовов передавайте
+`Authorization: Bearer <access_token>` и `A2A-Version: 1.0`.
+
+В Keycloak назначьте владельцам owner role, а отдельной сервисной учётной записи
+каждого внешнего агента — external role. Имена ролей можно изменить через
+`KEYCLOAK_OWNER_ROLE` и `KEYCLOAK_EXTERNAL_ROLE`. Наличие external role исключает
+права владельца даже при одновременном назначении обеих ролей. Настройте audience
+mapper на `KEYCLOAK_AUDIENCE`; роли должны присутствовать в introspection как
+realm roles либо client roles этого audience. Компания берётся только из
+`CORE_AGENT_TENANT_ID`, внешний scope — из issuer и subject, поэтому смена токена
+не теряет доступ к своим задачам. Владельцы видят общие задачи компании; внешний
+агент не может читать, подписываться или отменять чужую задачу.
+
+Каждый HTTP-запрос проходит introspection; открытый поток повторно не проверяется.
+Недоступность Keycloak закрывает допуск. Выпуск, срок и отзыв credentials полностью
+управляются Keycloak. Для access token сервисной учётной записи сроком месяц–год
+согласуйте Access Token Lifespan с ограничивающими его SSO/Client Session Max:
+проверка с Keycloak 26.1.4 выдаёт годовой токен после настройки обоих лимитов.
+Это проверка выданного срока, а не годовое испытание. Пример настройки и отзыва
+в изолированном realm: `tests/test_keycloak_integration.py`.
+См. [руководство Keycloak](https://www.keycloak.org/docs/latest/server_admin/).
+
+Owner API предоставляет `/api/settings`, `/api/tool-policies` и запросы решения
+внутри задачи через `/api/interactions?task_id=...`. Новый инструмент требует
+HITL; владелец может разрешить автоматическое выполнение, оставить подтверждение
+или запретить инструмент. Запрет скрывает инструмент от модели. Решения по
+`/api/hitl/{wait_id}/decision` принимают только `allow` или `reject` вместе с
+полученным `subject_digest`; аргументы ожидающего вызова менять нельзя.
+
+Guardrails использует отдельный контекст без tools. По умолчанию подключение
+модели совпадает с агентом; для отдельного детектора задайте все четыре
+`GUARDRAILS_LLM_PROVIDER`, `GUARDRAILS_LLM_MODEL`, `GUARDRAILS_LLM_BASE_URL` и
+`GUARDRAILS_LLM_API_KEY`. Частичный набор останавливает запуск. Лимиты детектора:
+`GUARDRAILS_TIMEOUT_SECONDS=60`, `GUARDRAILS_MAX_INPUT_TOKENS=100000` и
+`GUARDRAILS_MAX_CALLS=32`. Подозрительный материал, ошибка и неполная проверка
+создают ожидание владельца; они не означают автоматическое разрешение.
+Владелец читает материал через `/api/guardrails/{wait_id}/material` и отправляет
+решение через `/api/guardrails/{wait_id}/decision`. Внешний агент к этим API
+доступа не имеет. Настраиваемый срок решения по умолчанию — 24 часа.
+
+UI показывает запросы guardrails внутри соответствующего чата. Подозрительные
+вложения остаются в карантине до решения владельца. Последующие примеры
+корневого маршрута относятся к локальному development без Keycloak.
+
+На авторизованных A2A входах в одном чате выполняется одна корневая задача.
+Новый запрос без `taskId` в занятом `contextId` получает отдельную сохранённую
+Task со статусом `TASK_STATE_FAILED` и
+`metadata.error = {"code": "CONTEXT_BUSY", "activeTaskId": "..."}`.
+Уточнение к текущей задаче отправляется с её `taskId`.
+
+Каждое новое сообщение требует непустого `messageId` и `ROLE_USER`.
+Повтор исходного Message тем же caller возвращает прежнюю Task, в том числе
+после restart или замены токена; другой Message с этим ключом отклоняется как
+`InvalidParamsError` с `data.code = "MESSAGE_ID_CONFLICT"`. Дедупликация идёт
+до проверки занятости. Два владельца имеют общий доступ к чатам, но разные
+ключи дедупликации. Приём задачи и её начальной истории атомарен с записью
+workflow в PostgreSQL; обрыв соединения не отменяет принятую работу.
+
+Авторизованные входы принимают text/data Parts и raw FileParts. Вложения
+проверяются всем набором и принадлежат только своему чату и caller scope;
+суммарный лимит по умолчанию — 25 000 000 байт на сообщение. Правила приёма,
+карантина и выдачи описаны в [спецификации файлов](spec/artifacts.md).
+Старые чаты без подтверждённого mapping ownership не присваиваются новым
+caller-ам автоматически.
+
+Перед обновлением остановите старые workers, выполните `core-agent-db migrate`
+отдельной migration job, затем запустите новый image. Schema 24 добавляет
+tenant scope памяти; прежние записи сохраняются под неизвестным tenant и не
+присваиваются компании автоматически. Возврат старого image требует
+согласованного отката БД из резервной копии.
+
+Если нужно перенести прежние `REMOTE_AGENTS` в настройки владельцев, после
+миграции схемы и до запуска workers подготовьте защищённый JSON-файл:
+
+```json
+{
+  "version": 1,
+  "peers": [{
+    "name": "delivery",
+    "url": "https://peer.example/a2a",
+    "description": "Delivery agent",
+    "enabled": true,
+    "header_name": "Authorization",
+    "header_value": "Bearer replace-with-peer-credential"
+  }]
+}
+```
+
+Явно укажите стабильные имена, URL и точные headers прежних подключений;
+`header_value` можно не передавать, если авторизация не нужна. Храните файл
+как секрет, например с правами `0600`; не добавляйте его в Git. Команда
+использует deployment `CORE_AGENT_TENANT_ID`, operator database URL и тот же
+`PUSH_NOTIFICATION_ENCRYPTION_KEY`, что и serving process:
+
+```bash
+uv run core-agent-db import-remote-agents --file /run/secrets/remote-import.json
+```
+
+Файл ограничен 1 MiB и 100 подключениями. Вся запись атомарна, секреты
+шифруются, stdout содержит только число импортированных агентов. Реестр
+компании должен быть пустым: повторный вызов возвращает
+`REMOTE_IMPORT_NOT_EMPTY` и не заменяет изменения владельцев, в том числе
+отключённые подключения. Реестры других компаний сохраняются. Команда не
+обращается к внешним агентам; startup не импортирует старые ENV автоматически.
+Ownership старых Task, чатов и файлов этим не определяется.
 
 Минимальный вызов через JSON-RPC 1.0:
 
@@ -325,6 +491,8 @@ curl -sS http://localhost:8000/message:send \
 ```bash
 cp .env.example .env
 # Заполните POSTGRES_PASSWORD и LLM_API_FORMAT/LLM_API_BASE/LLM_MODEL/LLM_API_KEY.
+# Задайте SANDBOX_DENIED_CIDRS для своих внутренних сетей и защищённых адресов.
+# На Apple Silicon/native ARM задайте SANDBOX_OCI_ARCH=arm64; default — amd64.
 docker compose up --build
 ```
 
@@ -338,6 +506,21 @@ Docker Compose запускает PostgreSQL/pgvector, одноразовое о
 Core Agent и Phoenix. Агент доступен на <http://localhost:8000>, Phoenix — на
 <http://localhost:6006>. Эта конфигурация использует
 `CORE_AGENT_ENVIRONMENT=development` и предназначена только для разработки.
+Compose подключает native seccomp profile из `deploy/security/`, `/dev/net/tun`
+и отдельный временный `/tmp`; контейнер остаётся non-root, с read-only root,
+без capabilities, с лимитами 2 CPU, 4 GiB памяти и 512 процессов. Параметр
+`systempaths=unconfined` позволяет Bubblewrap создать собственный proc mount;
+внешний seccomp и отдельный строгий фильтр команд продолжают действовать.
+Обязательный sandbox preflight проверяется при запуске сервиса. Native CI
+дополнительно запускает реальные terminal/Python/background операции через
+этот Compose с контролируемой моделью. Отсутствие совместимых Linux namespaces
+или устройств завершает запуск ошибкой.
+На Linux с включённым AppArmor внешняя политика контейнера также должна
+разрешать создание среды Bubblewrap: стандартный профиль может блокировать
+mount и nested user namespaces. Совместимость проверяется для конкретного
+хоста; seccomp и AppArmor настраиваются как отдельные слои защиты.
+Для хранения секретов подключений внешних агентов задайте
+`PUSH_NOTIFICATION_ENCRYPTION_KEY` из `.env.example`; в production он обязателен.
 
 ## Конфигурация
 
@@ -350,8 +533,8 @@ Core Agent и Phoenix. Агент доступен на <http://localhost:8000>,
 | Возможности | `CORE_AGENT_RUNTIME_MODE`, `CORE_AGENT_ALLOWED_BUILTIN_TOOLS`, `CORE_AGENT_MAX_DEPTH`, `CORE_AGENT_MAX_FAN_OUT` |
 | Лимиты | `RUNTIME_MAX_LLM_CALLS`, `CORE_AGENT_MAX_TOOL_CALLS`, `CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS` |
 | MCP, пакеты навыков и удалённые агенты | `MCP_URL`, `MCP_ALLOWED_SERVERS`, `MCP_ALLOWED_TOOLS`, `MCP_READ_ONLY_TOOLS`, `MCP_COLD_START_TIMEOUT_SECONDS`, `SKILLS_ROOT`, `CORE_AGENT_ALLOWED_SKILLS`, `REMOTE_AGENTS` |
-| Сохраняемое состояние | `SESSION_STORAGE_TYPE`, `TASK_STORAGE_TYPE`, `DATABASE_URL`, `DURABLE_STORAGE_ROOT`, `LOCAL_WORKSPACE_ROOT` |
-| Память и артефакты | `CORE_AGENT_MEMORY`, `MEMORY_STORAGE_TYPE`, `ARTIFACT_STORAGE_TYPE`, `EMBEDDING_API_BASE`, `EMBEDDING_MODEL`, `EMBEDDING_API_KEY`, `EMBEDDING_DIMENSION` |
+| Сохраняемое состояние и файлы чата | `SESSION_STORAGE_TYPE`, `TASK_STORAGE_TYPE`, `DATABASE_URL`, `DURABLE_STORAGE_ROOT`, `LOCAL_WORKSPACE_ROOT`, `CHAT_WORKSPACE_ROOT` |
+| Память | `CORE_AGENT_MEMORY`, `MEMORY_STORAGE_TYPE`, `EMBEDDING_API_BASE`, `EMBEDDING_MODEL`, `EMBEDDING_API_KEY`, `EMBEDDING_DIMENSION` |
 | Наблюдаемость | `ENABLE_OTEL`, `OTEL_EXPORTER_OTLP_*_ENDPOINT`, `CORE_AGENT_LOG_CONTENT` |
 
 `AGENT_SYSTEM_PROMPT` — необязательный слой инструкций роли или профиля. Он не
@@ -409,22 +592,22 @@ uv run python -m unittest tests.test_end_to_end -v
 
 ## Ограничения v1
 
-- Промышленный выпуск пока блокируют четыре требования со статусом `partial`:
-  подтверждение продления аренды во время долгого вызова модели, инструмента или
-  ожидания дочерней задачи; сохранение крупного результата инструмента после
-  перезапуска при хранении в PostgreSQL; полная рекурсивная отмена; единый
-  идентификатор дочерней задачи во всех представлениях.
+- Промышленный выпуск требует завершения всех применимых gates из
+  [профиля поставки](spec/releases/v1.md). Точные доказательства и оставшиеся
+  `partial` требования перечислены в
+  [матрице реализации](spec/implementation-status.md), включая target Kubernetes,
+  миграции и унаследованные foundation guarantees.
 - В v1 нет выбора между несколькими поставщиками модели, автоматического
   перехода на запасного поставщика и продолжения уже запущенного локального
   процесса после аварийного завершения.
-- Операторское подтверждение действий не входит в текущий профиль выпуска:
-  запрет политики окончателен, полноценный механизм операторского подтверждения
-  не подключён.
+- При настроенном Keycloak HITL подключён к runtime и UI. Только владельцы
+  разрешают или отклоняют точный вызов; запрет инструмента остаётся окончательным.
 - Возможности MCP `resources`, `prompts`, `sampling`, `elicitation` и
   удалённый реестр пакетов навыков остаются запланированными.
-- Отдельные рабочие каталоги и группы процессов обеспечивают разделение
-  владения и жизненного цикла, но весь управляемый контейнер остаётся одной
-  границей безопасности на уровне операционной системы.
+- Python, terminal и background команды проходят обязательный Bubblewrap
+  с изоляцией файлов, процессов и сети. Совместимость внешних seccomp/AppArmor
+  правил и постоянных томов проверяется на целевом Linux/Kubernetes;
+  недоступность sandbox останавливает запуск приложения.
 
 ## Документация
 

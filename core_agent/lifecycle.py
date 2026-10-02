@@ -17,12 +17,17 @@ class PostgresRetentionManager:
         now = self.clock()
         with self.database.transaction() as connection:
             root = connection.execute(
-                """SELECT run_id FROM core_runs
+                """SELECT run_id, context_id FROM core_runs
                    WHERE run_id = %s AND tenant_id = %s FOR UPDATE""",
                 (run_id, tenant_id),
             ).fetchone()
             if not root:
                 raise CoreError("TASK_NOT_FOUND")
+            if connection.execute(
+                "SELECT 1 FROM core_chats WHERE tenant_id = %s AND context_id = %s",
+                (tenant_id, root["context_id"]),
+            ).fetchone():
+                raise CoreError("RETENTION_PROHIBITED", "Enterprise chat history must be preserved")
             rows = connection.execute(
                 """WITH RECURSIVE family AS (
                      SELECT run_id, task_id FROM core_runs

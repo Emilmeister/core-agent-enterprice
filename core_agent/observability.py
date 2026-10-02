@@ -6,7 +6,21 @@ import os
 import re
 from dataclasses import dataclass
 
+from requests import Session
+from requests.exceptions import RequestException
+
 from .errors import CoreError
+from .security import safe_url, validate_http_url
+
+
+class _SafeOtlpSession(Session):
+    def post(self, *args, **kwargs):
+        try:
+            return super().post(*args, **kwargs)
+        except RequestException as error:
+            # SDK workers log exception text, which can include URL credentials.
+            # Preserve its type so ConnectionError keeps the existing retry policy.
+            raise type(error)(f"OTLP transport failed ({type(error).__name__})") from None
 
 
 def _hex(bytes_count):
@@ -66,6 +80,14 @@ class OtlpExporter:
         service_name="core-agent",
         api_key=None,
     ):
+        for value, setting in (
+            (endpoint, "OTEL_ENDPOINT"),
+            (trace_endpoint, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
+            (metric_endpoint, "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"),
+            (log_endpoint, "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"),
+        ):
+            if value:
+                validate_http_url(value, setting)
         from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
         from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
             OTLPMetricExporter,
@@ -94,9 +116,9 @@ class OtlpExporter:
         # The SDK reports an export failure by status code alone; without the
         # resolved address a 403 on one signal cannot be told from a wrong URL.
         self.configuration = {
-            "traces": trace_endpoint,
-            "metrics": metric_endpoint,
-            "logs": log_endpoint,
+            "traces": safe_url(trace_endpoint) if trace_endpoint else None,
+            "metrics": safe_url(metric_endpoint) if metric_endpoint else None,
+            "logs": safe_url(log_endpoint) if log_endpoint else None,
             # Boolean only. The value never leaves the exporter.
             "credentials_configured": bool(api_key),
         }
@@ -104,14 +126,14 @@ class OtlpExporter:
         if trace_endpoint:
             self.trace_provider.add_span_processor(
                 BatchSpanProcessor(
-                    OTLPSpanExporter(endpoint=trace_endpoint, headers=headers)
+                    OTLPSpanExporter(endpoint=trace_endpoint, headers=headers, session=_SafeOtlpSession())
                 )
             )
         metric_readers = []
         if metric_endpoint:
             metric_readers.append(
                 PeriodicExportingMetricReader(
-                    OTLPMetricExporter(endpoint=metric_endpoint, headers=headers)
+                    OTLPMetricExporter(endpoint=metric_endpoint, headers=headers, session=_SafeOtlpSession())
                 )
             )
         self.meter_provider = MeterProvider(
@@ -122,7 +144,7 @@ class OtlpExporter:
         if log_endpoint:
             self.logger_provider.add_log_record_processor(
                 BatchLogRecordProcessor(
-                    OTLPLogExporter(endpoint=log_endpoint, headers=headers)
+                    OTLPLogExporter(endpoint=log_endpoint, headers=headers, session=_SafeOtlpSession())
                 )
             )
         self.tracer = self.trace_provider.get_tracer("core_agent", "1.0")

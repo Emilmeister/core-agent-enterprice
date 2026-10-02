@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: core-agent-sandbox-tests
+  labels:
+    app.kubernetes.io/name: core-agent-sandbox-tests
+spec:
+  hostUsers: false
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  activeDeadlineSeconds: 780
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+  containers:
+    - name: tests
+      image: core-agent:sandbox
+      imagePullPolicy: Never
+      command:
+        - sh
+        - -ec
+        - >-
+          test -s /sandbox-tests/test_sandbox_linux.py;
+          exec uv run --no-sync python -m unittest discover
+          -s /sandbox-tests -p test_sandbox_linux.py -v
+      env:
+        - name: UV_CACHE_DIR
+          value: /tmp/uv-cache
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: CORE_AGENT_REQUIRE_SANDBOX_TESTS
+          value: "1"
+      envFrom:
+        - configMapRef:
+            name: core-agent-sandbox-fixture
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+        procMount: Unmasked
+        seccompProfile:
+          type: Localhost
+          localhostProfile: core-agent/oci.json
+      resources:
+        requests:
+          cpu: 250m
+          memory: 256Mi
+        limits:
+          cpu: "2"
+          memory: 4Gi
+      volumeMounts:
+        - name: tests
+          mountPath: /sandbox-tests
+          readOnly: true
+        - name: scratch
+          mountPath: /tmp
+        - name: tun
+          mountPath: /dev/net/tun
+  volumes:
+    - name: tests
+      configMap:
+        name: core-agent-sandbox-tests
+    - name: scratch
+      emptyDir:
+        sizeLimit: 1Gi
+    - name: tun
+      hostPath:
+        path: /dev/net/tun
+        type: CharDevice

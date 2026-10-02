@@ -134,12 +134,21 @@ class Artifact:
 
     @property
     def size(self):
-        return sum(len(str(part.data).encode()) for part in self.parts)
+        return sum(len(self._content(part)) for part in self.parts)
 
     @property
     def digest(self):
-        content = b"\0".join(str(part.data).encode() for part in self.parts)
+        content = b"\0".join(self._content(part) for part in self.parts)
         return "sha256:" + hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def _content(part):
+        if part.kind == "file":
+            content = part.data.get("bytes") if isinstance(part.data, dict) else None
+            if not isinstance(content, bytes):
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+            return content
+        return str(part.data).encode()
 
     def append(self, part, *, chunk_id, sequence, last_chunk):
         if chunk_id in self._chunks:
@@ -153,6 +162,45 @@ class Artifact:
             _chunks=self._chunks + (chunk_id,),
             _last=last_chunk,
         )
+
+
+def workflow_result_artifact(record, response_files_service=None, *, connection=None):
+    """Build the complete final batch from an already authorized canonical run."""
+    from .workspace import WorkspaceBinding
+
+    values = record if isinstance(record, dict) else vars(record)
+    result = values.get("result") or {}
+    message = result.get("message", "")
+    refs = result.get("outgoing_files", ())
+    if values.get("state") != "COMPLETED" or not isinstance(message, str):
+        raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+    if not isinstance(refs, (tuple, list)):
+        raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+    files, receipts = (), ()
+    if refs:
+        if response_files_service is None:
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        try:
+            pinned_limit = refs[0]["limit_bytes"]
+            binding = WorkspaceBinding(values["tenant_id"], values["owner_id"], values["context_id"])
+        except (KeyError, TypeError):
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
+        files = response_files_service.load(binding, refs, task_id=values["task_id"],
+            run_id=values["run_id"], limit_bytes=pinned_limit, connection=connection)
+        receipts = response_files_service.receipts(refs)
+    provenance = {"run_id": values["run_id"], "task_id": values["task_id"],
+        "complete": result.get("complete", True), "completion_reason": result.get("completion_reason", "completed"),
+        "usage": result.get("usage", {"model_turns": 0, "tool_calls": 0})}
+    for key in ("shared_budget", "exhausted_dimension", "pending_tasks"):
+        if key in result and result[key] is not None:
+            provenance[key] = result[key]
+    if receipts:
+        provenance["outgoingFiles"] = list(receipts)
+    parts = (Part.text(message),) if message else ()
+    parts += tuple(Part.file(content, filename=ref["name"], media_type=ref["media_type"]) for ref, content in files)
+    identity = (json.dumps({"message": message, "outgoingFiles": receipts}, sort_keys=True,
+        separators=(",", ":")).encode() if receipts else message.encode())
+    return Artifact("sha256:" + hashlib.sha256(identity).hexdigest(), parts, 1, provenance)
 
 
 @dataclass(frozen=True)

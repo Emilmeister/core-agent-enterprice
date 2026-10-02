@@ -6,12 +6,13 @@
 
 **Architecture:** Сохранить существующие A2A Task lifecycle, PostgreSQL workflow/inbox/outbox, leases и централизованный tool dispatch. Добавить авторизованный доступ владельцев и внешних агентов, постоянные папки чатов и Bubblewrap; ожидания сохранять в БД и освобождать worker.
 
-**Tech Stack:** Python 3.12+, uv, существующие A2A SDK/ASGI, PostgreSQL/psycopg, Keycloak, Bubblewrap, Kubernetes. Стек UI выбирается в плане соответствующего этапа; отдельная БД и брокер сообщений для этих требований не вводятся.
+**Tech Stack:** Python 3.12+, uv, существующие A2A SDK/ASGI, PostgreSQL/psycopg, Keycloak, Bubblewrap, Kubernetes. UI — React, TypeScript и Vite, обычный CSS; сборку отдаёт существующий ASGI сервис в том же Pod. Отдельная БД и брокер сообщений для этих требований не вводятся.
 
 ---
 
-Статус: подготовка реализации. Код продукта, `spec/**` и `tests/**` этим
-изменением не затронуты. План первого этапа ниже касается нормативных
+Статус: реализация начата; 29 сентября 2026 года пользователь явно разрешил
+изменения `spec/**`, `tests/**` и hash lock в рамках согласованного ТЗ.
+План первого этапа ниже касается нормативных
 контрактов; таблица следующих этапов задаёт зависимости и проверяемый результат,
 но не заменяет их подробные планы изменений кода.
 
@@ -25,7 +26,7 @@
 `tests/**` и frozen hashes. Запрос начать реализацию не используется как
 неявное снятие этого ограничения.
 
-Нужно разрешение в рамках согласованного ТЗ:
+Получено разрешение в рамках согласованного ТЗ:
 
 - переносить требования в перечисленные ниже нормативные документы;
 - добавлять и изменять проверки нового поведения в `tests/**`;
@@ -40,8 +41,8 @@
 
 ### 0.1. Перенести согласованные решения в источник истины
 
-- [ ] Получить указанное выше разрешение до любых правок замороженных файлов.
-- [ ] Перенести требования по карте ниже, сохранив их смысл, значения по умолчанию
+- [x] Получить указанное выше разрешение до любых правок замороженных файлов.
+- [x] Перенести требования по карте ниже, сохранив их смысл, значения по умолчанию
   и сценарии отказов; устранить противоречащие старые формулировки.
 
 | Требования рабочего ТЗ | Нормативные документы | Изменение контракта |
@@ -56,44 +57,44 @@
 | GUARD-01–04, §12.3 | `spec/security-and-reliability.md`, `spec/tools.md`, `spec/agent-configuration.md`, `spec/kernel-instructions.md` | Изолированный LLM-детектор, карантин, решение владельца; ошибка детектора также требует решения; исключение tool охватывает аргументы и результаты; benchmark качества на данных исключён |
 | CLEAN-01, SCOPE-01 | `spec/artifacts.md`, `spec/tools.md`, `spec/agent-configuration.md`, `spec/product.md` | Удаление трёх artifact tools и исключительно их инфраструктуры; A2A output artifacts сохраняются; переключение CodeAgent/ReAct не добавляется |
 
-- [ ] Согласовать `spec/README.md` с новой картой capabilities. Не заменять
+- [x] Согласовать `spec/README.md` с новой картой capabilities. Не заменять
   authenticated identity полями в `RunRequest` и не создавать вторую публичную
   task state machine.
-- [ ] Перенести все сценарии AC-01–AC-70, включая AC-17a, из рабочего ТЗ в
+- [x] Перенести все сценарии AC-01–AC-70, включая AC-17a, из рабочего ТЗ в
   `spec/acceptance.md`. Использовать префикс `ENT-AC-` для отличия от существующих
   критериев; сохранить таблицу соответствия исходным идентификаторам.
-- [ ] Расширить scope текущего release candidate в `spec/releases/v1.md`.
+- [x] Расширить scope текущего release candidate в `spec/releases/v1.md`.
   Новые обязательства оставить невыполненными до появления доказательств;
   удалить противоречия вида «HITL отсутствует» из целевого scope.
-- [ ] В `spec/implementation-status.md` отделить новые обязательства от уже
+- [x] В `spec/implementation-status.md` отделить новые обязательства от уже
   доказанного foundation behavior. Статус `implemented` не переносить на
   изменённую семантику по факту существования старого теста.
 
 ### 0.2. Зафиксировать совместимость до изменения соответствующего кода
 
-- [ ] Описать переход со старого A2A входа на два авторизованных входа, mapping
+- [x] Описать переход со старого A2A входа на два авторизованных входа, mapping
   существующих identity/context и отсутствие автоматического присвоения старых
   данных новому внешнему caller. Номер публичного application contract отделить
   от версии A2A протокола.
-- [ ] Определить версии persisted state и порядок миграции: chat ownership,
+- [x] Определить версии persisted state и порядок миграции: chat ownership,
   создание задач/messageId, wait records, pending HITL, remote handles,
   расписания, file metadata и ссылки на содержимое. Миграция выполняется
   отдельной migration job; serving process не повышает schema version сам.
-- [ ] Описать восстановление legacy workflow без повторного mutating dispatch.
+- [x] Описать восстановление legacy workflow без повторного mutating dispatch.
   Старый checkpoint не интерпретировать как новую незапущенную операцию.
-- [ ] Описать перенос `REMOTE_AGENTS` в управляемые владельцами настройки,
+- [x] Описать перенос `REMOTE_AGENTS` в управляемые владельцами настройки,
   отсутствие секретов в UI-ответах и сохранение старых файлов при удалении
   artifact service. До переноса загрузки файлов artifact backend не удалять.
-- [ ] Для каждого изменения схемы указать допустимый порядок обновления image/БД
+- [x] Для каждого изменения схемы указать допустимый порядок обновления image/БД
   и границу отката. Не обещать запуск старого image с неизвестной ему схемой.
 
 ### 0.3. Проверить и закрепить нормативный этап
 
-- [ ] Просмотреть diff на соответствие рабочему ТЗ, в том числе различия между
+- [x] Просмотреть diff на соответствие рабочему ТЗ, в том числе различия между
   пробуждением `core_wait_until` и ожиданиями HITL/remote/ответа владельца.
-- [ ] Обновить только утверждённые entries `EXPECTED_SHA256` по точным bytes
+- [x] Обновить только утверждённые entries `EXPECTED_SHA256` по точным bytes
   нормативных файлов. Сохранить assertions и охват всех `spec/**/*.md`.
-- [ ] Проверить ссылки, примеры и выполнить:
+- [x] Проверить ссылки, примеры и выполнить:
 
 ```bash
 uv run python -m unittest tests.test_spec_quality tests.test_spec_lock -v
@@ -103,9 +104,9 @@ git diff --check
 Ожидаемый результат: обе команды завершаются с exit code 0. Эти проверки
 подтверждают согласованность документов, а не реализацию возможностей.
 
-- [ ] Обновить `AGENTS.md` только в части изменившихся нормативных правил,
+- [x] Обновить `AGENTS.md` только в части изменившихся нормативных правил,
   отделяя их от фактически подключённых runtime capabilities.
-- [ ] Зафиксировать проверенные изменения логическими spec commits, не смешивая
+- [x] Зафиксировать проверенные изменения логическими spec commits, не смешивая
   их с несвязанными изменениями реализации.
 
 ## Порядок следующих этапов
@@ -113,7 +114,20 @@ git diff --check
 Для каждого этапа сначала составляется подробный план по актуальному коду и
 утверждённому нормативному контракту. Этап включает regression proof, подключение
 в composition root и проверки; наличие отдельно написанного модуля не означает
-завершение этапа. Выполнение — в текущей сессии, без автоматического делегирования.
+завершение этапа. Выполнение — в текущей сессии. Подагент получает отделимый
+implementation scope и явное владение файлами; основной агент отвечает за
+интеграцию, проверки и принятие результата. Одновременные правки одного участка
+не допускаются; независимое review не изменяет implementation.
+
+Подробные планы по текущему коду:
+[workspace/files](2026-09-30-enterprise-files.md),
+[sandbox](2026-09-30-enterprise-sandbox.md),
+[interactions/guardrails](2026-09-30-enterprise-interactions.md),
+[owner UI](2026-09-30-enterprise-owner-ui.md),
+[semantic context/history](2026-09-30-enterprise-context.md),
+[trusted remote A2A](2026-09-30-enterprise-remote-a2a.md),
+[cron](2026-09-30-enterprise-cron.md),
+[удаление artifact tools](2026-10-01-remove-artifact-tools.md).
 
 | Этап | Основные существующие точки изменений | Проверяемый результат и зависимость |
 | --- | --- | --- |
@@ -164,13 +178,281 @@ docker build -t core-agent:local .
 `.github/workflows/ci.yml`. Bubblewrap/egress проверяются на Linux и целевом
 кластере; установленный `kubectl` сам по себе не доказывает наличие доступа к нему.
 
+## PostgreSQL recovery семантической summary
+
+- [x] Проследить repeated compaction → outer SQL commit → application/pool
+  restart → model context; сохранить существующий механизм context snapshots.
+- [x] Добавить regression в `tests/test_postgres_persistence.py`: после второй
+  compaction независимое чтение подтверждает commit, затем fault и новая копия
+  app/pool восстанавливают C, planned-only действие, точные pins/transcript и
+  original sources без нового summary provider call или tool redispatch.
+- [x] Targeted proof — 0.775 секунды, exit0. Read-only review без
+  Critical/Important; дополнительная assert root tool count проходит отдельно:
+  0.840 секунды, exit0 (`.local-evidence/postgres-semantic-reviewed.log`).
+- [x] Ordinary PostgreSQL/Keycloak CI — 1636 tests за 276.326 секунды,
+  exit0, три dedicated skips; sync/migrations/Ruff exit0. Full run начат до
+  дополнительной assert, сохранён в `.local-evidence/postgres-semantic-ci-final/`.
+- [x] Обновить CTX-02 и exact spec hash после proof; product code не менялся.
+
+Первый fault внутри `workflow_store.transition` ещё находился в outer transaction
+и правильно откатывал вторую summary. Final proof прерывает `_compact_context`
+после выхода из transaction и проверяет committed snapshot до fault.
+Live model quality, OS kill и restart PostgreSQL daemon этим тестом не заявляются.
+Более широкий release criterion для всех task/memory/file refs и новых Tasks
+остаётся незакрытым; existing PostgreSQL cron proof не заменяется этим тестом.
+
+## PostgreSQL heartbeat долгих операций
+
+- [x] Проследить heartbeat и durable joined flow: parent освобождает worker/lease,
+  активный child сохраняет fenced ownership, coordinator разрешает parent wait.
+- [x] Добавить ordinary regression в `tests/test_postgres_persistence.py` для
+  долгих model/MCP-tool/joined-child операций. Настоящий server-clock expiry
+  превышен, lease продлён с прежним owner/token; независимый pool не получает
+  claim и не включает активный run в recovery. Parent продолжает работу с одним child.
+- [x] Targeted test — 8.154 секунды, exit0; read-only review без замечаний.
+- [x] Полный ordinary CI на свежей PostgreSQL БД с настоящим Keycloak:
+  sync/migrations/Ruff, 1635 tests за 262.407 секунды, exit0, три dedicated skips.
+  Evidence — `.local-evidence/postgres-long-lease-ci-final/`.
+- [x] Связать proof с RUN-02/release criterion и обновить exact spec hashes.
+
+Model/MCP контролируются тестом; этот proof проверяет PostgreSQL ownership,
+а не native sandbox или доступность production providers. Product code не менялся.
+
+## PostgreSQL durability большого результата инструмента
+
+- [x] Проследить actual tool dispatch → full artifact/excerpt → tool.completed
+  commit → context replay; не вводить второй механизм сохранения результата.
+- [x] Добавить ordinary CI regression в `tests/test_postgres_persistence.py`:
+  fault после настоящего commit, закрытие app/pool, новый app/pool и resume_task.
+  Проверяются exact Unicode/full result, bounded model excerpt, прежний pinned
+  reference, transcript/blob/digest/provenance, чужой tenant и отсутствие redispatch.
+- [x] Выполнить полный ordinary PostgreSQL/Keycloak CI: 1634 tests,
+  260.004 секунды, exit0, три dedicated skips. Evidence —
+  `.local-evidence/offload-postgres-ci-final/`. После read-only review уточнены
+  assert pinned и early pool cleanup; targeted test повторён: 0.468 секунды,
+  exit0 (`.local-evidence/offload-postgres-reviewed.log`). Product code не менялся.
+- [x] Обновить CTX-03/release criterion и exact spec hashes после proof.
+  Restart PostgreSQL daemon, OS kill и target CSI этим тестом не подтверждаются.
+
+## Явный перенос remote configuration
+
+- [x] Уточнить operator-only import в architecture/config/acceptance: version1
+  bounded file, deployment tenant, empty registry, atomic encrypted batch,
+  database migration actor, отказ повторного import без overwrite; schema24
+  сохраняется, server startup и legacy ownership не изменяются.
+- [x] Добавить regression в `tests/test_remote_registry.py` для actual CLI,
+  PostgreSQL rollback при duplicate/key failure, nonempty registry после UI edit
+  и malformed input без раскрытия values; выполнить red-phase существующим uv unittest.
+- [x] Переиспользовать `PostgresRemoteRegistry.create` с borrowed transaction для
+  batch import; добавить CLI/file parser в existing modules без новых dependencies.
+- [x] Обновить README/AGENTS с operator workflow и выполнить targeted registry
+  tests, Ruff и полный PostgreSQL/Keycloak suite; proof остаётся partial для
+  ещё не реализованного identity mapping/production cutover.
+- [x] Зафиксировать проверенный implementation commit и обновить evidence matrix.
+
+Actual CLI red-phase подтвердил отсутствие команды. Review отдельно выявил
+raw PostgreSQL diagnostic: real SQL error на втором peer воспроизводит canary
+до safe wrapper; после исправления diagnostic скрыт и batch полностью откатывается.
+Targeted suite — 52 tests, exit0; final ordinary PostgreSQL/Keycloak CI и
+`uv build --no-sources` проходят. Evidence —
+`.local-evidence/remote-import-ci-reviewed-final/` и
+`.local-evidence/remote-import-review-green-final.log`.
+
+## Company scope discovery и automatic recovery
+
+- [x] Owner deny исключает built-in из обеих Agent Cards и обоих well-known
+  путей; allow/HITL видимы без restart и company policy изолированы.
+- [x] Automatic root/background/remote/wait/cleanup/projection/push использует
+  trusted deployment company до limits/locks/claims и side effects. Generic
+  runtime без tenant сохраняет прежнюю platform-wide semantics.
+- [x] Bounded rowless sweep сохраняет legacy/foreign manifests и global
+  authoritative reference fence; неоднозначные legacy push IDs не открывают
+  чужие credentials/network. PostgreSQL selector и app/pool restart proof
+  входят в ordinary CI, общий DB-02 остаётся partial.
+- [x] Полный fresh PostgreSQL/Keycloak CI — 1653 tests за 261.352 секунды,
+  exit0, три dedicated skips; sync/migrations/Ruff/cleanup exit0. Evidence —
+  `.local-evidence/company-recovery-reviewed-ci-final-closed/`. UI npm
+  ci/typecheck/build и package build проходят; read-only review без
+  Critical/Important. Подробности — [company recovery plan](2026-10-02-company-recovery.md).
+
+Первый full run выявил fixture contamination и прежнюю cleanup API assertion
+без tenant. Новая restart fixture закрывает actual pools, после assertions
+завершает только собственные admissions через workflow store; сохранённый
+reference graph не удаляется. Generic runtime и старые artifact recovery
+assertions не ослаблены. Target AppArmor/live providers и production cutover
+этим этапом не подтверждаются.
+
+## Безопасные URL и startup diagnostics
+
+- [x] Воспроизвести malformed/NFKC provider и MCP URLs: raw parser exception
+  раскрывает credential, часть invalid URLs допускает listener. Общий HTTP
+  parser возвращает named CONFIG_INVALID до serving; valid userinfo/query и
+  IPv6 provider destination сохраняются без изменения transport.
+- [x] Проверить DSN до открытия pool существующим libpq parser. Malformed
+  percent encoding больше не попадает в background worker diagnostic;
+  keyword/service/multi-host connection strings не заменяются URI-only policy.
+- [x] Отделить log-only URL projection от OTLP destinations. Startup record
+  и все три exporter signals скрывают userinfo/query/fragment; настоящий
+  controlled HTTP collector получает прежние path/query и Basic auth.
+- [x] Targeted проверки и read-only review не нашли оставшихся Important/Critical
+  замечаний. Combined финальная проверка с исправлением cron: sync, migration,
+  Ruff, 1660 tests за 250.368 секунды (skipped3), package и cleanup — exit0.
+  PostgreSQL, Keycloak и pg_dump/pg_restore были настоящими. Evidence —
+  `.local-evidence/startup-cron-reviewed-ci-final/`.
+- [x] Fresh images commitf7cf5ad собраны для native ARM64 и target amd64;
+  amd64 image загружен в разрешённый registry, digest
+  `sha256:d0a1dd2f6ca00e9cc8d324c9386f4a334ebbc8109a07f8769a5f2ba742df66ed`.
+  Native12 tests за107.186 секунды, target10 за101.248, Compose1 за22.851
+  и actual Chromium/Keycloak/PostgreSQL/native Pod browser1 за88.817 — exit0,
+  без skips. Все созданные этими проверками namespaces/volumes/relay удалены.
+  Evidence — `.local-evidence/startup-cron-native-final/`,
+  `.local-evidence/startup-cron-target-final/`,
+  `.local-evidence/startup-cron-compose-reviewed-final/` и
+  `.local-evidence/startup-cron-browser-reviewed-final/`.
+
+Исправление возвращает диагностику к существующему нормативному контракту;
+новые settings, dependencies и migration schema не вводятся. CFG-03 остаётся
+partial до полного fixed-contract audit; target AppArmor/live providers и
+production cutover остаются отдельными gates.
+
+## Подтверждённое освобождение cron leadership
+
+- [x] Full suite обнаружил race graceful close: PostgreSQL мог ещё держать
+  session lock после возврата socket.close(), и successor не получал leadership.
+  Real-PG regression с отложенным disconnect воспроизводит дефект до исправления.
+- [x] Coordinator освобождает только свой lock на той же owning connection
+  под существующим `_pg_guard`, ждёт server acknowledgement и всегда закрывает
+  connection в finally. Unknown commit/dedup и admission semantics сохраняются.
+- [x] Targeted 72 tests, включая весь migration backup/restore, и финальные
+  1660 tests (skipped3) прошли; sync/migration/Ruff/package/cleanup — exit0.
+  Read-only review не нашёл Important/Critical. Evidence —
+  `.local-evidence/cron-graceful-release-red/`,
+  `.local-evidence/cron-graceful-release-targeted/` и
+  `.local-evidence/startup-cron-reviewed-ci-final/`.
+
 ## Готовность к поставке
 
-- Нет новой анонимной production-границы и bypass через list/stream/download,
-  Python broker, child task, memory, summary или восстановление.
-- Подтверждение владельца, deadline, cancel и follow-up конкурируют через durable
-  переходы; неоднозначные внешние side effects не повторяются автоматически.
-- Данные и история не удаляются миграцией или удалением старого tool backend.
-- `AGENTS.md`, конфигурация и инструкции развёртывания отражают фактический код.
-- Изменённые требования получают `implemented` только после соответствующего
-  автоматического доказательства в проходящем обычном CI suite.
+Текущий срез включает owner UI, Keycloak scope, per-tool HITL/guardrails policy,
+atomic chat admission/files, durable remote/time waits, same-chat cron,
+семантическую суммаризацию и удаление трёх named artifact tools с exclusive
+инфраструктурой. Старых named файлов нет; export/import исключён по явному
+решению пользователя. Memory изолируется trusted tenant/app/user и namespace;
+schema24 сохраняет legacy bytes под неизвестным tenant без догадок.
+
+Проверенные границы и автоматические доказательства:
+
+- Обычный Python3.12 CI на свежей БД/schema24 с настоящими PostgreSQL/Keycloak:
+  `uv sync --frozen`, migrations, Ruff и `uv run python -m unittest discover
+  -s tests -v` — 1636 tests, 276.326 секунды, exit0. Три dedicated skips
+  относятся к native sandbox, actual browser и memory-loop ownership case;
+  PostgreSQL/Keycloak tests не пропущены. Evidence —
+  `.local-evidence/postgres-semantic-ci-final/`; полный прогон включает
+  offload, long-lease и committed semantic recovery proof. Дополнительная assert
+  root tool count после review проверена отдельно: 0.840 секунды, exit0.
+  Предыдущие failed runs сохранены:
+  remote-import CI выявил необходимость учесть новые CLI ENV в strict startup
+  inventory; актуальный список исправлен без ослабления теста. Ранее
+  тест summary пересекался с legitimate detector_busy из background tool.
+  Для этого отдельного теста terminal помечен guardrails-exempt; production
+  single-slot и owner decision при busy не изменены. 100 повторений проходят.
+- Enterprise schema upgrade proof входит в ordinary discovery: source12 и
+  каждый source13–23 переходят на текущую schema, сохраняют admitted state,
+  wait deadlines/outcomes, настройки, encrypted peers и transport blob bytes
+  после repeat migration/new pool. Old/unknown build отклоняется. Actual
+  pg_dump/pg_restore schema23 и отдельная копия transport blobs восстанавливаются
+  после удаления схемы и файлов; сохраняются deadlines, outcomes, scope и
+  encrypted peer с прежним ключом. Проверены обратная schema version и повторный
+  upgrade; в fixture нет новых application writes после backup. CI использует
+  dump/restore utilities своего PostgreSQL service. Explicit remote config import
+  проверяет atomic encrypted batch/database actor, отказ overwrite UI edits/disable,
+  safe DB error и rollback; Task/chat identity mapping и production cutover
+  остаются отдельными open gates.
+- Combined release boundary module входит в ordinary discovery: cron после двух
+  compactions, omitted summary vs authoritative policy/waits, оба remote
+  input/auth-required bindings с follow-up после PG restart, manual/automatic
+  admission race, active HITL после disable/delete schedule и private owner
+  projection по Get/List/artifacts/SSE/encrypted push.
+- Actual Chromium/Keycloak/PostgreSQL/native ARM64 Pod browser gate:
+  1 test, 84.845 секунды, exit0, без skips. Проверены файлы/lost-ACK retry,
+  HITL, per-tool policy, custom header secret editor, cron timezone/edit/manual
+  run/delete, selected workspace cleanup и immutable history/download после
+  удаления originals. Evidence — `.local-evidence/owner-browser-expanded-key/`.
+- Полный required native ARM64 sandbox gate повторён на актуальном image:
+  12 tests, 106.000 секунды, exit0, без skips; namespace/seccomp/rlimit/broker/
+  teardown/dual-stack receivers, actual aggregate Pod pids.max512. Evidence —
+  `.local-evidence/current-native-full/`; image ID закреплён в `image.json`.
+- Docker Compose задаёт outer native seccomp, `/dev/net/tun`, bounded
+  CPU/memory/PIDs, read-only root и dropped capabilities. Actual composition-root
+  terminal/Python/background test через Compose — 1 test, 23.921 секунды,
+  exit0; controlled model, настоящие launcher/processes, без privileged.
+  Этот check включён в native CI. Evidence —
+  `.local-evidence/docker-compose-sandbox-recovered/`.
+- Native UI build stage позволяет собрать target amd64 на Mac без Node emulation.
+  Образ schema24 с packaged UI/non-root user собран и загружен в закрытый
+  registry; target node успешно скачал exact digest. Evidence —
+  `.local-evidence/target-amd64-native-ui-build.*`,
+  `.local-evidence/target-registry-push.*`,
+  `.local-evidence/target-native-preflight/`.
+
+Полный release gate пока открыт:
+
+- В target Kubernetes профиль seccomp установлен по явному разрешению. Обычный
+  Pod имеет finite PID limit9462: изменение kubelet не требуется. Kernel6.8
+  отвергает user-namespace idmapped mount `/dev/net/tun` и `/dev/net`.
+  TUN-device на отдельном временном CSI томе смонтирован через subPath без этой
+  ошибки и без записи в Node filesystem; агент остаётся non-root/caps0.
+  По новому явному разрешению пользователя именованный AppArmor-профиль
+  `core-agent-runtime-v1` установлен в enforce; existing profiles не заменялись.
+  Installer завершился exit0, его временный namespace удалён. Evidence —
+  `.local-evidence/target-apparmor-install/applied.json`.
+  Проверенный source сохранён в `deploy/kubernetes/apparmor/` вместе с
+  требованиями host installation, reboot/replacement и CSI TUN workaround.
+  На exact amd64 digest commit7e6cf59 прошли 10 native tests за 99.007 секунды:
+  actual app terminal/Python/background, nested HITL, namespace/files/FD,
+  inner seccomp, rlimits, teardown, bootstrap/exec failure и scoped broker.
+  Pod non-root/caps0 с Localhost seccomp/AppArmor завершился exit0; temporary
+  namespace удалён. Один запрос статуса прервался TLS handshake timeout;
+  повторный запрос подтвердил persisted Succeeded и actual container exit0.
+  Evidence — `.local-evidence/target-apparmor-sandbox/`.
+  Контролируемый target dual-stack network receiver и dedicated PID512 probe
+  ещё не выполнялись; эти два checks проходили на локальном native ARM64.
+- Target Cloud.ru CSI byte persistence после удаления и пересоздания Pod
+  подтверждён на exact amd64 digest, checksum совпадает, оба Pod non-root/caps0.
+  Namespace и PV удалены. Это подтверждение тома, не сквозной ENT-AC-32:
+  root/child/background/recovered commands после recreate ещё нужны вместе с
+  actual amd64/target namespace/network checks. Evidence —
+  `.local-evidence/target-csi-recreate/`.
+- После обновления `.env` прямой Cloud.ru HTTP probe даёт embeddings200 и
+  actual dimension1024; локальное EMBEDDING_DIMENSION исправлено с768 на1024.
+  Через actual HttpEmbeddingProvider получен vector1024; actual configured
+  streaming CompatibleHttpModel вернул visible answer, finish_reason=stop,
+  completion_tokens514. TLS проверен системными CA; proxy отключён только в
+  процессе этой проверки, alias и настройки пользователя не читались.
+  Evidence — `.local-evidence/cloud-providers-updated/actual-adapters-system-trust.metadata.json`.
+  Это proof доступности provider adapters, не качества модели или полного
+  production memory/provider workflow.
+- Незавершённые foundation/migration release criteria остаются `partial`
+  в `spec/implementation-status.md`; весь профиль не объявлен production-ready.
+- Main обновляется после согласованных проверок; проверенные логические
+  этапы сохранены в постоянной feature-ветке.
+
+
+### Безопасная диагностика deployment configuration
+
+Числовые env в composition root используют существующий `_number` с сохранением
+пустых/dynamic defaults и нулевых значений. Malformed/NaN/infinite values,
+неверный LOG_LEVEL, storage/capability enums и HTTP retry codes завершают startup
+с CONFIG_INVALID и именем настройки без raw value/traceback; listener не запускается.
+Fatal diagnostic остаётся видимым при CRITICAL/FATAL. Регрессия входит в обычный
+`ConfigurationTransferTests`; общий CFG-03 остаётся partial до полного аудита
+остальных deployment settings.
+
+Проверки финального кода: `uv sync --frozen`, `uv run core-agent-db migrate`,
+`uv run ruff check core_agent tests`, `uv run python -m unittest discover -s tests -v`
+— exit0; 1637 tests за 272.011 секунды, skipped3. PostgreSQL/Keycloak были реальными,
+использовалась отдельная временная test database; cleanup — exit0.
+`uv build --no-sources` — exit0, sdist и wheel собраны. Повторное read-only ревью
+не выявило оставшихся замечаний этого изменения. Evidence —
+`.local-evidence/numeric-config-reviewed-ci/`; ошибочные входы отдельно подтвердили
+red regression перед исправлением. Это не закрывает target sandbox/live-provider
+release gates и не означает перенос feature в main.

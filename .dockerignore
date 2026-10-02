@@ -1,7 +1,12 @@
 .git
 .venv
+.cache
+.local-evidence
 .env
 .env.*
+kubeconfig
 __pycache__
 *.py[cod]
 dist
+node_modules
+core_agent/ui_dist

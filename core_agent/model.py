@@ -9,10 +9,10 @@ import uuid
 from dataclasses import dataclass
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .errors import CoreError
+from .security import validate_http_url
 from .streaming import integrate_stream_chunk
 
 
@@ -117,11 +117,10 @@ class CompatibleHttpModel:
             else "https://api.anthropic.com/v1"
         )
         self.endpoint = endpoint or self._endpoint(base_url or default, suffix)
-        if urlparse(self.endpoint).scheme not in {"http", "https"}:
-            raise CoreError("CONFIG_INVALID")
+        parsed = validate_http_url(self.endpoint, "LLM_ENDPOINT" if endpoint else "LLM_API_BASE")
         self.api_format = api_format
         self.model = model
-        hostname = urlparse(self.endpoint).hostname or ""
+        hostname = parsed.hostname
         inferred_provider = next(
             (
                 candidate
@@ -387,6 +386,10 @@ class CompatibleHttpModel:
         schemas, reverse = self._tools(tools)
         messages = list(messages or ({"role": "user", "content": context},))
         body = self.invocation_parameters
+        # Provider options cannot reintroduce capabilities hidden by runtime
+        # policy, including the detector's deliberately empty catalog.
+        for key in ("tools", "tool_choice", "functions", "function_call"):
+            body.pop(key, None)
         if self.api_format == "openai":
             body.update(
                 {

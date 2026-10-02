@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import tempfile
 import threading
@@ -20,7 +21,7 @@ from a2a.types import (
 )
 from cryptography.fernet import Fernet
 
-from core_agent.app import create_app
+from tests.app_support import create_app
 from core_agent.artifacts import PostgresArtifactStore
 from core_agent.database import (
     PostgresAuditLog,
@@ -36,9 +37,9 @@ from core_agent.push import (
     DurablePushNotificationSender,
     PostgresPushNotificationConfigStore,
 )
-from core_agent.model import ModelResponse, ScriptedModel
+from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.lifecycle import PostgresRetentionManager
-from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, WorkflowRecord
+from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, SuspendedRun, WorkflowRecord
 from psycopg.types.json import Jsonb
 
 
@@ -48,6 +49,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
             },
             clear=True,
@@ -72,6 +74,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_task_list",
             },
@@ -92,6 +95,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_artifact_get",
             },
@@ -107,6 +111,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
             },
             clear=True,
@@ -182,7 +187,7 @@ class ProductionConfigurationTests(unittest.TestCase):
             self.assertNotIn("core_artifact_get", registry.names())
             python = registry.get("core_python_exec").description
             self.assertIn("datetime.now().astimezone()", python)
-            self.assertIn("not an OS sandbox", python)
+            self.assertIn("Execution is restricted to the chat workspace", python)
             terminal = registry.get("core_terminal_exec").description
             self.assertIn(
                 "Preinstalled CLI: GNU coreutils/findutils/gawk/sed/grep, rg, fd",
@@ -208,6 +213,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": "without_terminal",
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": (
@@ -244,6 +250,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": "maybe",
             },
@@ -259,6 +266,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "SESSION_STORAGE_TYPE": "in-memory",
                 "CORE_AGENT_RUNTIME_MODE": runtime_mode,
                 "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_python_exec",
@@ -835,7 +843,9 @@ class PostgresRestartTests(unittest.TestCase):
                 self.assertEqual(result.message, "used persisted catalog")
                 self.assertEqual(len(connector.deadlines), 1)
                 self.assertLessEqual(connector.deadlines[0], time.monotonic())
-                self.assertIn("mcp_search", model.calls[0].tools)
+                # Persisted identities remain the ceiling; unavailable live tools
+                # must be absent from the model catalog after failed reconnect.
+                self.assertNotIn("mcp_search", model.calls[0].tools)
                 self.assertEqual(persisted.snapshot["effective_config_digest"], digest)
                 self.assertEqual(
                     persisted.snapshot["mcp_catalogs"],
@@ -1287,6 +1297,167 @@ class PostgresRestartTests(unittest.TestCase):
         self.assertEqual(asyncio.run(store.get_info("task-push", other)), [])
         database.close()
 
+    def test_push_company_scope_precedes_claim_limit_and_credential_decryption(self):
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        store = PostgresPushNotificationConfigStore(database, Fernet.generate_key())
+        tasks = PostgresTaskStore(database)
+        contexts = {
+            tenant: ServerCallContext(user=NamedUser(), tenant=tenant)
+            for tenant in ("company-a", "company-b")
+        }
+        deliveries = []
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: deliveries.append(request) or httpx.Response(204, request=request)))
+        self.addCleanup(lambda: asyncio.run(client.aclose()))
+        generic = DurablePushNotificationSender(database, store, client=client)
+        scoped = DurablePushNotificationSender(database, store, client=client, tenant_id="company-b")
+        public_dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with patch("core_agent.push.socket.getaddrinfo", return_value=public_dns):
+            for task_id, tenant in (("push-a", "company-a"), ("push-b", "company-b"),
+                                    ("push-deleted-b", "company-b")):
+                task = Task(id=task_id, context_id=task_id, status=TaskStatus(
+                    state=TaskState.TASK_STATE_WORKING))
+                asyncio.run(tasks.save(task, contexts[tenant]))
+                config = TaskPushNotificationConfig(task_id=task_id,
+                    url=f"https://push.example/{task_id}", token=f"secret-{tenant}")
+                asyncio.run(store.set_info(task_id, config, contexts[tenant]))
+                event = TaskStatusUpdateEvent(task_id=task_id, context_id=task_id,
+                    status=task.status)
+                with database.transaction() as connection:
+                    generic.enqueue_notification(task_id, event, owner="owner-1",
+                                                 tenant=tenant, connection=connection)
+            asyncio.run(store.delete_info("push-deleted-b", contexts["company-b"]))
+            # A same-ID task cannot authorize use of another company's existing config.
+            asyncio.run(tasks.save(Task(id="push-a", context_id="decoy-b", status=TaskStatus(
+                state=TaskState.TASK_STATE_WORKING)), contexts["company-b"]))
+            with database.transaction() as connection:
+                encrypted = bytes(connection.execute("""SELECT encrypted_payload
+                    FROM core_push_notification_configs WHERE task_id='push-a'"""
+                ).fetchone()["encrypted_payload"])
+                connection.execute("""UPDATE core_push_notification_configs
+                    SET encrypted_payload=%s WHERE task_id='push-a'""", (b"invalid-foreign-ciphertext",))
+                foreign = connection.execute("""SELECT * FROM core_push_deliveries
+                    WHERE task_id='push-a'""").fetchone()
+                scoped.enqueue_notification("push-a", TaskStatusUpdateEvent(task_id="push-a",
+                    context_id="push-a", status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED)),
+                    owner="owner-1", tenant="company-a", connection=connection)
+
+            self.assertEqual(asyncio.run(store.get_info_for_dispatch(
+                "push-a", tenant_id="company-b")), [])
+            self.assertIsNone(asyncio.run(scoped._config("push-a", foreign["config_id"])))
+            asyncio.run(scoped.send_notification("push-a", TaskStatusUpdateEvent(
+                task_id="push-a", context_id="push-a", status=TaskStatus(state=TaskState.TASK_STATE_WORKING))))
+            self.assertEqual(asyncio.run(scoped.dispatch_pending(limit=1)), 1)
+            self.assertEqual([request.url.path for request in deliveries], ["/push-b"])
+            self.assertEqual(deliveries[0].headers["X-A2A-Notification-Token"], "secret-company-b")
+            self.assertEqual(asyncio.run(scoped.dispatch_pending(limit=1)), 1)
+            with database.pool.connection() as connection:
+                self.assertEqual(connection.execute("""SELECT * FROM core_push_deliveries
+                    WHERE task_id='push-a'""").fetchall(), [foreign])
+                self.assertEqual(connection.execute("""SELECT state, attempts, last_error_code
+                    FROM core_push_deliveries WHERE task_id='push-deleted-b'""").fetchone(),
+                    {"state": "pending", "attempts": 1, "last_error_code": "PUSH_CONFIG_NOT_FOUND"})
+                self.assertEqual(connection.execute("""SELECT state FROM core_push_deliveries
+                    WHERE task_id='push-b'""").fetchone()["state"], "delivered")
+            self.assertEqual(len(deliveries), 1)
+            with database.transaction() as connection:
+                connection.execute("""UPDATE core_push_notification_configs
+                    SET encrypted_payload=%s WHERE task_id='push-a'""", (encrypted,))
+            self.assertEqual(asyncio.run(generic.dispatch_pending(limit=1)), 1)
+            self.assertEqual([request.url.path for request in deliveries], ["/push-b", "/push-a"])
+
+    def test_company_scope_preserves_foreign_waits_and_background_cancellation(self):
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        workflows = PostgresWorkflowStore(database)
+        waits = []
+        for index, tenant in enumerate(("company-a", "company-a", "company-b")):
+            record = workflows.create(WorkflowRecord(f"scope-run-{index}", f"scope-task-{index}",
+                f"scope-chat-{index}", tenant, "owner", None, "RUNNING", 1, {"prompt": "wait"}, {}))
+            token = workflows.acquire_lease(record.run_id, tenant_id=tenant, owner_id="owner",
+                                            worker_id="worker", ttl=100)
+            waits.append(workflows.enter_wait(record, kind="timer", source_id="timer",
+                subject={"until": "private"}, continuation={"version": 1, "phase": "tool_wait", "call_id": "timer"},
+                deadline=time.time() + 3600, snapshot=record.snapshot, lease_token=token))
+        workflows.request_cancel("scope-run-0", tenant_id="company-a", owner_id="owner")
+        with database.transaction() as connection:
+            connection.execute("UPDATE core_waits SET deadline = EXTRACT(EPOCH FROM clock_timestamp()) - 1")
+            foreign_waits = connection.execute("SELECT * FROM core_waits WHERE tenant_id='company-a' ORDER BY wait_id").fetchall()
+            foreign_runs = connection.execute("SELECT * FROM core_runs WHERE tenant_id='company-a' ORDER BY run_id").fetchall()
+        self.assertEqual([wait.wait_id for wait in workflows.pending_waits(tenant_id="company-b", limit=1)], [waits[2].wait_id])
+        self.assertEqual(workflows.recoverable(tenant_id="company-b", limit=1), ())
+        self.assertEqual([wait.wait_id for wait in workflows.expire_waits(tenant_id="company-b", limit=1)], [waits[2].wait_id])
+        self.assertEqual([record.run_id for record in workflows.recoverable(tenant_id="company-b", limit=1)], ["scope-run-2"])
+        with database.transaction() as connection:
+            self.assertEqual(connection.execute("SELECT * FROM core_waits WHERE tenant_id='company-a' ORDER BY wait_id").fetchall(), foreign_waits)
+            self.assertEqual(connection.execute("SELECT * FROM core_runs WHERE tenant_id='company-a' ORDER BY run_id").fetchall(), foreign_runs)
+            for task_id, tenant, recoverable, cancel in (
+                ("foreign-cancel", "company-a", True, True),
+                ("foreign-unknown", "company-a", False, True),
+                ("own-ready", "company-b", True, False)):
+                connection.execute("""INSERT INTO core_background_tasks
+                    (id, owner_run_id, tenant_id, kind, state, required, recoverable,
+                     contract, cancel_requested, created_at, updated_at)
+                    VALUES (%s, 'parent', %s, 'scope-test', 'working', true, %s, %s, %s, %s, %s)""",
+                    (task_id, tenant, recoverable, Jsonb({"tenant": tenant}), cancel, time.time(), time.time()))
+            foreign_tasks = connection.execute("SELECT * FROM core_background_tasks WHERE tenant_id='company-a' ORDER BY id").fetchall()
+        scheduler = PostgresTaskScheduler(database)
+        self.addCleanup(scheduler.close)
+        dispatched, readiness = [], []
+        scheduler.register("scope-test", lambda contract, cancel: dispatched.append(contract["tenant"]) or "done")
+        self.assertEqual(scheduler.recover(tenant_id="company-b", ready=lambda task, tenant: readiness.append(tenant) or True), 1)
+        self.assertEqual(scheduler.wait("own-ready", owner_id="parent", tenant_id="company-b", timeout=2).state, "completed")
+        self.assertEqual(dispatched, ["company-b"])
+        self.assertEqual(readiness, ["company-b"])
+        with database.pool.connection() as connection:
+            self.assertEqual(connection.execute("SELECT * FROM core_background_tasks WHERE tenant_id='company-a' ORDER BY id").fetchall(), foreign_tasks)
+        self.assertEqual(scheduler.mailbox("parent", "company-a").poll(), ())
+        self.assertEqual(len(workflows.expire_waits()), 2)
+
+    def test_ambiguous_cross_company_push_identity_is_not_claimed(self):
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        store = PostgresPushNotificationConfigStore(database, Fernet.generate_key())
+        tasks = PostgresTaskStore(database)
+        deliveries = []
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: deliveries.append(request) or httpx.Response(204, request=request)))
+        self.addCleanup(lambda: asyncio.run(client.aclose()))
+        generic = DurablePushNotificationSender(database, store, client=client)
+        scoped = DurablePushNotificationSender(database, store, client=client, tenant_id="company-b")
+        public_dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with patch("core_agent.push.socket.getaddrinfo", return_value=public_dns):
+            for tenant in ("company-a", "company-b"):
+                context = ServerCallContext(user=NamedUser(), tenant=tenant)
+                task = Task(id="ambiguous-push", context_id=tenant,
+                            status=TaskStatus(state=TaskState.TASK_STATE_WORKING))
+                asyncio.run(tasks.save(task, context))
+                asyncio.run(store.set_info(task.id, TaskPushNotificationConfig(
+                    id="same-config", task_id=task.id, url=f"https://push.example/{tenant}"), context))
+                if tenant == "company-a":
+                    with database.transaction() as connection:
+                        generic.enqueue_notification(task.id, TaskStatusUpdateEvent(
+                            task_id=task.id, context_id=tenant, status=task.status),
+                            owner="owner-1", tenant=tenant, connection=connection)
+            with database.pool.connection() as connection:
+                original = connection.execute("SELECT * FROM core_push_deliveries").fetchall()
+            self.assertEqual(len(original), 1)
+            self.assertEqual(asyncio.run(scoped.dispatch_pending()), 0)
+            # Missing configuration does not prove which same-ID Task owns the payload.
+            for tenant in ("company-a", "company-b"):
+                asyncio.run(store.delete_info("ambiguous-push", ServerCallContext(user=NamedUser(), tenant=tenant)))
+            self.assertEqual(asyncio.run(scoped.dispatch_pending()), 0)
+            self.assertEqual(deliveries, [])
+            with database.pool.connection() as connection:
+                self.assertEqual(connection.execute("SELECT * FROM core_push_deliveries").fetchall(), original)
+
     def test_artifacts_are_durable_verified_and_tenant_scoped(self):
         database = self._database()
         database.migrate()
@@ -1321,6 +1492,207 @@ class PostgresRestartTests(unittest.TestCase):
             store.delete("tenant-2", second.id)
             self.assertFalse(blob.exists())
             reopened.close()
+
+    def test_large_tool_result_survives_postgres_restart_without_redispatch(self):
+        class ProcessStopped(BaseException):
+            pass
+
+        database_url = os.environ["TEST_DATABASE_URL"]
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        blob = "Начало\n" + "x" * 40_000 + "\nCONFIRMED_TAIL"
+        first_connector = InMemoryMcpConnector(
+            catalogs={"docs": {"search": {"type": "object"}}},
+            results={"docs.search": {"blob": blob}},
+        )
+        first_model = ScriptedModel([ModelResponse(
+            tool_requests=(ToolRequest("large-result", "docs_search", {}),))])
+        first_model.model = "offload-test-model"
+        second_model = ScriptedModel([ModelResponse(message="continued after restart")])
+        second_model.model = first_model.model
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+            "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+            "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/blobs",
+            "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "MCP_URL": "https://peer.test/docs",
+            "MCP_ALLOWED_SERVERS": "docs", "MCP_ALLOWED_TOOLS": "docs.search",
+            "MCP_READ_ONLY_TOOLS": "docs.search", "LLM_CONTEXT_WINDOW": "10000",
+            "LLM_MAX_TOKENS": "500",
+        }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
+            first = create_app(model=first_model, mcp_connector=first_connector, database=database)
+            agent = first.state.core_agent
+            transition = agent.workflow_store.transition
+
+            def stop_after_commit(*args, **kwargs):
+                saved = transition(*args, **kwargs)
+                if kwargs.get("event_kind") == "tool.completed":
+                    raise ProcessStopped()
+                return saved
+
+            try:
+                self.assertIsInstance(agent.artifact_store, PostgresArtifactStore)
+                with patch.object(agent.workflow_store, "transition", side_effect=stop_after_commit):
+                    with self.assertRaises(ProcessStopped):
+                        agent.run({"prompt": "Keep the full output"}, task_id="large-output-restart",
+                                  session_id="offload-chat", tenant_id="tenant-1", identity="owner-1")
+                original = agent.workflow_store.lookup_task("large-output-restart")
+                original_context = agent._context_from_dict(original.snapshot["context"])
+                full_result = next(item.content for item in original_context.transcript if item.kind == "tool_result")
+                reference = json.loads(next(item.content for item in original_context.active
+                                            if item.kind == "tool_result"))["output"]["artifact"]
+                self.assertEqual(json.loads(full_result)["output"]["blob"], blob)
+                self.assertEqual(len(first_model.calls), 1)
+            finally:
+                first.state.close()
+
+            reopened = PostgresDatabase(database_url, min_size=0, max_size=3)
+            self.addCleanup(reopened.close)
+            second_connector = InMemoryMcpConnector(catalogs=first_connector.catalogs)
+            second = create_app(model=second_model, mcp_connector=second_connector, database=reopened)
+            try:
+                recovery = second.state.core_agent
+                with patch.object(second_connector, "call", side_effect=AssertionError("Unexpected redispatch")) as dispatched:
+                    result = recovery.resume_task("large-output-restart")
+                self.assertEqual(result.message, "continued after restart")
+                self.assertEqual(result.usage.tool_calls, 1)
+                dispatched.assert_not_called()
+                wire = next(item for item in second_model.calls[0].messages if item.get("role") == "tool")
+                active = json.loads(wire["content"])
+                self.assertEqual(active["output"]["artifact"], reference)
+                self.assertTrue(active["output"]["truncated"])
+                self.assertLess(recovery.token_counter(wire["content"]), recovery.context_window // 2)
+                self.assertNotIn("CONFIRMED_TAIL", active["output"]["excerpt"])
+                final = recovery.workflow_store.lookup_task("large-output-restart")
+                restored = recovery._context_from_dict(final.snapshot["context"])
+                self.assertEqual([item.content for item in restored.transcript if item.kind == "tool_result"],
+                                 [full_result])
+                pins = [json.loads(item.content) for item in restored.active
+                        if item.kind == "runtime_references" and item.pinned]
+                self.assertIn({"artifact": reference}, pins)
+                metadata, content = recovery.artifact_store.get("tenant-1", reference["id"])
+                self.assertEqual(content.decode(), full_result)
+                self.assertEqual((metadata.digest, metadata.size), (reference["digest"], reference["size"]))
+                self.assertEqual(metadata.provenance["tool_call_id"], "large-result")
+                with self.assertRaises(CoreError) as denied:
+                    recovery.artifact_store.get("tenant-2", reference["id"])
+                self.assertEqual(denied.exception.code, "NOT_FOUND")
+            finally:
+                second.state.close()
+
+    def test_repeated_semantic_compaction_survives_postgres_restart_with_original_sources(self):
+        class ProcessStopped(BaseException):
+            pass
+
+        class SemanticModel(ScriptedModel):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.model = "postgres-semantic-model"
+                self.summaries = []
+
+            def generate(self, **call):
+                if not call["instructions"].startswith("SEMANTIC CONTEXT SUMMARY"):
+                    return super().generate(**call)
+                self.summaries.append(call)
+                records = json.loads(call["context"])["records"]
+                sources = list(dict.fromkeys(source for item in records for source in item["sources"]))
+                latest = "C" if any("Correction: C" in item["content"] for item in records) else "B"
+                value = {key: [] for key in ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")}
+                value["Decisions"] = [{"text": "Use " + latest, "basis": "fact", "sources": sources}]
+                value["Pending"] = [{"text": "Publishing remains planned only", "basis": "fact", "sources": sources}]
+                return ModelResponse(message=json.dumps(value), finish_reason="stop")
+
+        database_url = os.environ["TEST_DATABASE_URL"]
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        connector = InMemoryMcpConnector(catalogs={"docs": {"search": {"type": "object"}}})
+        outputs = [{"correction": "Correction: B", "log": "x" * 40_000}, {"correction": "Correction: C"}]
+        dispatched = []
+
+        def search(*args):
+            dispatched.append(args)
+            return outputs[len(dispatched) - 1]
+
+        model = SemanticModel([ModelResponse(tool_requests=(ToolRequest("first", "docs_search", {}),)),
+                               ModelResponse(tool_requests=(ToolRequest("second", "docs_search", {}),))])
+        prompt = "Исходная цель: use A; preserve the latest correction, publish only after verification."
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+            "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+            "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/blobs",
+            "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "MCP_URL": "https://peer.test/docs",
+            "MCP_ALLOWED_SERVERS": "docs", "MCP_ALLOWED_TOOLS": "docs.search",
+            "MCP_READ_ONLY_TOOLS": "docs.search", "LLM_CONTEXT_WINDOW": "20000",
+            "LLM_MAX_TOKENS": "500", "EVENTS_COMPACTION_INTERVAL": "1", "LOG_LEVEL": "ERROR",
+        }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
+            first = create_app(model=model, mcp_connector=connector, database=database)
+            agent = first.state.core_agent
+            compact = agent._compact_context
+
+            def stop_after_second_commit(*args, **kwargs):
+                result = compact(*args, **kwargs)
+                if len(model.summaries) == 2:
+                    saved = agent.workflow_store.lookup_task("semantic-restart")
+                    self.assertEqual(saved.snapshot["context"], result[1]["context"])
+                    self.assertEqual(saved.snapshot["compaction_operation"]["outcome"], "committed")
+                    raise ProcessStopped()
+                return result
+
+            try:
+                with patch.object(connector, "call", side_effect=search), \
+                        patch.object(agent, "_compact_context", side_effect=stop_after_second_commit):
+                    with self.assertRaises(ProcessStopped):
+                        agent.run({"prompt": prompt}, task_id="semantic-restart", session_id="summary-chat",
+                                  identity="owner-1", tenant_id="tenant-1")
+                original = agent.workflow_store.lookup_task("semantic-restart")
+                context = original.snapshot["context"]
+                summary = next(item for item in context["active"] if item["kind"] == "summary")
+                pins = [item for item in context["active"] if item["pinned"]]
+                self.assertEqual(len(model.summaries), 2)
+                self.assertEqual(len(dispatched), 2)
+                self.assertIn("Use B", model.summaries[1]["context"])
+                self.assertEqual(json.loads(summary["content"])["Decisions"][0]["text"], "Use C")
+                self.assertEqual(summary["provenance"]["summary_version"], 1)
+                self.assertEqual(set(summary["provenance"]["sources"]),
+                                 {f"{original.run_id}:{sequence}" for sequence in range(1, 6)})
+                self.assertEqual(next(item["content"] for item in pins if item["kind"] == "prompt"), prompt)
+                reference = json.loads(next(item["content"] for item in pins if item["kind"] == "runtime_references"))["artifact"]
+                self.assertEqual(original.snapshot["compaction_operation"]["outcome"], "committed")
+                self.assertEqual((original.snapshot["turns"], original.snapshot["tool_calls"]), (4, 2))
+            finally:
+                first.state.close()
+
+            reopened = PostgresDatabase(database_url, min_size=0, max_size=3)
+            self.addCleanup(reopened.close)
+            next_model = ScriptedModel([ModelResponse(message="Continue with C; publishing is pending")])
+            next_model.model = model.model
+            next_connector = InMemoryMcpConnector(catalogs=connector.catalogs)
+            second = create_app(model=next_model, mcp_connector=next_connector, database=reopened)
+            try:
+                recovery = second.state.core_agent
+                self.assertEqual(recovery.workflow_store.lookup_task("semantic-restart").snapshot["context"], context)
+                with patch.object(next_connector, "call", side_effect=AssertionError("Unexpected redispatch")) as replay:
+                    result = recovery.resume_task("semantic-restart")
+                replay.assert_not_called()
+                self.assertEqual(len(next_model.calls), 1)
+                self.assertIn("Use C", next_model.calls[0].context)
+                self.assertIn("Publishing remains planned only", next_model.calls[0].context)
+                self.assertIn(prompt, next_model.calls[0].context)
+                self.assertEqual((result.usage.model_turns, result.usage.tool_calls), (5, 2))
+                self.assertEqual(result.shared_budget["used"]["model_turns"], 5)
+                self.assertEqual(result.shared_budget["used"]["tool_calls"], 2)
+                restored = recovery.workflow_store.lookup_task("semantic-restart").snapshot["context"]
+                self.assertEqual(restored["transcript"], context["transcript"])
+                self.assertEqual([item for item in restored["active"] if item["pinned"]], pins)
+                self.assertEqual(next(item for item in restored["active"] if item["kind"] == "summary"), summary)
+                _, content = recovery.artifact_store.get("tenant-1", reference["id"])
+                self.assertEqual(content.decode(), next(item["content"] for item in context["transcript"]
+                                                       if item["kind"] == "tool_result"))
+            finally:
+                second.state.close()
 
     def test_coordinated_retention_deletes_run_family_content_and_keeps_tombstone(self):
         database = self._database()
@@ -1609,10 +1981,10 @@ class PostgresRestartTests(unittest.TestCase):
             with patch.dict(
                 os.environ,
                 {
+                    "CORE_AGENT_ENVIRONMENT": "development",
                     "SESSION_STORAGE_TYPE": "postgres",
                     "DATABASE_AUTO_MIGRATE": "false",
                     "CORE_AGENT_MEMORY": "disabled",
-                    "ARTIFACT_STORAGE_ENABLED": "false",
                 },
                 clear=True,
             ):
@@ -1663,10 +2035,10 @@ class PostgresRestartTests(unittest.TestCase):
             with patch.dict(
                 os.environ,
                 {
+                    "CORE_AGENT_ENVIRONMENT": "development",
                     "SESSION_STORAGE_TYPE": "postgres",
                     "DATABASE_AUTO_MIGRATE": "false",
                     "CORE_AGENT_MEMORY": "disabled",
-                    "ARTIFACT_STORAGE_ENABLED": "false",
                 },
                 clear=True,
             ):
@@ -1756,6 +2128,128 @@ class PostgresRestartTests(unittest.TestCase):
             self.assertEqual(workflows.lookup_task(record.task_id).state, "RUNNING")
         finally:
             database.close()
+
+    def test_long_model_tool_and_join_preserve_live_postgres_ownership(self):
+        database_url = os.environ["TEST_DATABASE_URL"]
+        for mode in ("model", "tool", "join"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
+                started, release = threading.Event(), threading.Event()
+                database = PostgresDatabase(database_url, min_size=0, max_size=3)
+                self.addCleanup(database.close)
+                database.migrate()
+                self._reset(database)
+                contender_db = PostgresDatabase(database_url, min_size=0, max_size=1)
+                self.addCleanup(contender_db.close)
+                contender = PostgresWorkflowStore(contender_db)
+
+                def block():
+                    started.set()
+                    if not release.wait(10):
+                        raise AssertionError("The controlled long operation was not released")
+
+                class BlockingConnector(InMemoryMcpConnector):
+                    def call(self, server, tool, arguments):
+                        block()
+                        return {"completed": True}
+
+                class BlockingModel(ScriptedModel):
+                    def generate(self, **kwargs):
+                        response = super().generate(**kwargs)
+                        if mode == "model" or (mode == "join" and response.message == "child done"):
+                            block()
+                        return response
+
+                responses = [ModelResponse(message="done")]
+                if mode == "tool":
+                    responses.insert(0, ModelResponse(tool_requests=(ToolRequest("slow-tool", "docs_search", {}),)))
+                elif mode == "join":
+                    responses = [ModelResponse(tool_requests=(ToolRequest("join", "core_delegate", {
+                        "instruction": "Return child done", "tools": [], "skills": [],
+                        "budget": {"turns": 2, "tool_calls": 1}}),)),
+                        ModelResponse(message="child done"), ModelResponse(message="done")]
+                model = BlockingModel(responses)
+                model.model = "postgres-heartbeat-model"
+                connector = BlockingConnector(catalogs={"docs": {"search": {"type": "object"}}})
+                with patch.dict(os.environ, {
+                    "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+                    "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+                    "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/durable",
+                    "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "MCP_URL": "https://peer.test/docs",
+                    "MCP_ALLOWED_SERVERS": "docs", "MCP_ALLOWED_TOOLS": "docs.search",
+                    "MCP_READ_ONLY_TOOLS": "docs.search", "LOG_LEVEL": "ERROR",
+                }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()), \
+                        patch("core_agent.runtime.WORKFLOW_LEASE_TTL", 2), \
+                        patch("core_agent.runtime.WORKFLOW_LEASE_HEARTBEAT_INTERVAL", 0.1):
+                    app = create_app(model=model, mcp_connector=connector, database=database)
+                    agent = app.state.core_agent
+                    task_id = "long-" + mode
+                    results, failures = [], []
+
+                    def run():
+                        try:
+                            results.append(agent.run({"prompt": "Complete the long operation"},
+                                task_id=task_id, identity="owner-1", session_id="heartbeat-chat", tenant_id="tenant-1"))
+                        except BaseException as error:
+                            failures.append(error)
+
+                    worker = threading.Thread(target=run)
+                    try:
+                        worker.start()
+                        self.assertTrue(started.wait(5))
+                        parent = agent.workflow_store.lookup_task(task_id)
+                        active = parent
+                        if mode == "join":
+                            worker.join(2)
+                            self.assertFalse(worker.is_alive())
+                            self.assertEqual(failures, [])
+                            self.assertIsInstance(results[0], SuspendedRun)
+                            wait = agent.workflow_store.get_wait(results[0].wait_id, tenant_id="tenant-1")
+                            active = agent.workflow_store.lookup_task(wait.subject["task_id"])
+                            with contender_db.pool.connection() as connection:
+                                sleeping = connection.execute(
+                                    "SELECT state, lease_token FROM core_runs WHERE run_id = %s", (parent.run_id,)).fetchone()
+                            self.assertEqual(sleeping["state"], "WAITING_TASK")
+                            self.assertIsNone(sleeping["lease_token"])
+                        with contender_db.pool.connection() as connection:
+                            initial = connection.execute("""SELECT lease_owner, lease_token, lease_expires_at,
+                                EXTRACT(EPOCH FROM clock_timestamp())::double precision AS server_now
+                                FROM core_runs WHERE run_id = %s""", (active.run_id,)).fetchone()
+                        self.assertFalse(release.wait(max(0, initial["lease_expires_at"] - initial["server_now"]) + 0.2))
+                        with contender_db.pool.connection() as connection:
+                            current = connection.execute("""SELECT lease_owner, lease_token, lease_expires_at,
+                                EXTRACT(EPOCH FROM clock_timestamp())::double precision AS server_now
+                                FROM core_runs WHERE run_id = %s""", (active.run_id,)).fetchone()
+                        self.assertGreater(current["server_now"], initial["lease_expires_at"])
+                        self.assertGreater(current["lease_expires_at"], current["server_now"])
+                        self.assertEqual((current["lease_owner"], current["lease_token"]),
+                                         (initial["lease_owner"], initial["lease_token"]))
+                        with self.assertRaises(CoreError) as rejected:
+                            contender.acquire_lease(active.run_id, tenant_id="tenant-1", owner_id=active.owner_id,
+                                                    worker_id="contender", ttl=2)
+                        self.assertEqual(rejected.exception.code, "LEASE_LOST")
+                        self.assertNotIn(active.run_id, {record.run_id for record in contender.recoverable()})
+                        release.set()
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive())
+                        self.assertEqual(failures, [])
+                        if mode == "join":
+                            child = agent.task_scheduler.wait(active.task_id, timeout=5,
+                                owner_id=parent.run_id, tenant_id="tenant-1")
+                            self.assertEqual(child.state, "completed", child.error)
+                            with patch.object(agent, "_launch_recovery", return_value=False):
+                                agent._recover_workflows_once()
+                            result = agent.resume_task(task_id)
+                            self.assertEqual(agent.task_scheduler.count(owner_id=parent.run_id, tenant_id="tenant-1"), 1)
+                        else:
+                            result = results[0]
+                        self.assertEqual(result.message, "done")
+                        self.assertEqual(agent.workflow_store.lookup_task(task_id).state, "COMPLETED")
+                    finally:
+                        release.set()
+                        if worker.ident is not None:
+                            worker.join(5)
+                        app.state.close()
+                        contender_db.close()
 
     def test_workflow_lease_acquire_and_recovery_use_database_clock(self):
         database = self._database()
@@ -1979,7 +2473,7 @@ class PostgresRestartTests(unittest.TestCase):
                     worker = threading.Thread(target=transition)
                     worker.start()
                     self._wait_for_blocked_query(
-                        database, "UPDATE core_budget_ledgers SET"
+                        database, "SELECT 1 FROM core_budget_ledgers WHERE root_run_id"
                     )
                     connection.execute(
                         """SELECT pg_sleep(GREATEST(

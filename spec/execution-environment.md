@@ -2,9 +2,11 @@
 
 ## Deployment constraint
 
-Целевой Core Agent запускается как один пользовательский container в managed-платформе Cloud.ru AI Agents. Runtime не имеет Kubernetes API, container runtime socket и возможности создавать вложенные containers, Pods или VM. Main agent, его сабагенты и разрешённые локальные процессы разделяют container OS и базовую файловую систему.
+Целевой deployment — один Kubernetes Pod для всех чатов компании. Python, terminal и фоновые команды MUST запускаться через Bubblewrap, с собственными mount/PID/IPC/network namespaces, ограничением syscalls и профилем доверенного runtime. Отдельные pods, privileged mode, host runtime socket и широкие node privileges не требуются и не разрешают обходить этот профиль.
 
-Внешний sandbox service не является обязательной частью продукта. Исполнение внутри этого container является осознанной trust-моделью: сабагентов создаёт основной агент, а локальные команды, skill scripts и stdio MCP считаются разрешёнными policy артефактами. Эта модель предоставляет lifecycle и workspace separation, но не является security boundary против намеренно враждебного process.
+Совместимость user namespaces/seccomp/AppArmor/SELinux с целевым кластером требует реальной проверки до release. Установка Bubblewrap сама по себе не доказывает изоляцию. Если обязательный sandbox или сетевой контроль отсутствует, команда отклоняется до запуска с `EXECUTION_ENVIRONMENT_UNAVAILABLE`; fallback без ограничений запрещён.
+
+В sandbox доступны только чат как `/workspace`, собственные временные файлы и необходимые read-only программы/библиотеки. Корень соседних чатов, server data, platform credentials и Kubernetes service-account token не монтируются. `/proc` показывает только изолированные процессы; лишние inherited descriptors закрыты. CPU, memory/process limits ограничиваются отдельно; общее ядро остаётся границей доверия.
 
 ## TerminalSession
 
@@ -13,7 +15,7 @@ Main agent и каждый child-agent Task получают отдельную 
 - stable session ID и owner agent/task ID;
 - отдельный PTY для интерактивного процесса;
 - отдельную process group;
-- отдельные `cwd`, local workspace root и environment allowlist;
+- явные `cwd` в пределах workspace своего чата или выделенной scratch-копии и собственный environment allowlist;
 - независимые stdin/stdout/stderr streams и bounded output;
 - собственные timeout, CPU/process/output budgets;
 - lifecycle `created -> running -> exited|timed_out|canceled|failed -> closed`.
@@ -24,7 +26,7 @@ Main agent и каждый child-agent Task получают отдельную 
 
 Runtime MUST обеспечивать:
 
-- отдельные workspace directories для main и каждого child;
+- постоянный workspace чата для его последовательных root Tasks; отдельные owned process/session для child и optional scratch copies там, где нужна изоляция изменений с последующим merge;
 - отдельные PTY/process groups и независимую отмену;
 - запуск только через typed `argv` по умолчанию; shell string требует отдельной policy;
 - явный `cwd`, очищенный environment и secret allowlist;
@@ -33,33 +35,52 @@ Runtime MUST обеспечивать:
 - отсутствие Docker/container socket, Kubernetes credentials и platform control-plane credentials в command environment;
 - audit и OTel lifecycle без raw command/output по умолчанию.
 
-Runtime не утверждает, что локальные processes имеют отдельные mount/PID/user/network namespaces. Process в общей container OS технически может видеть доступные тому же Unix user файлы или `/proc`. Это принятый риск целевого deployment, а не скрытая sandbox guarantee.
+Runtime MUST обеспечить проверенную mount/PID/IPC/network isolation для недоверенных процессов. Изоляция проверяется для symlink, `/proc`, собственного/чужого broker socket и subprocess; владение Unix user само по себе не является защитой.
 
 Если PTY или process-group primitives недоступны, terminal capability фильтруется до model context либо обязательный terminal завершается `EXECUTION_ENVIRONMENT_UNAVAILABLE`.
 
-## Workspace и S3
+## Постоянный workspace и snapshots
 
-S3-backed mount используется как durable storage для immutable snapshots, checkpoints, event segments и artifacts. Он не является active workspace для Git, package managers, compilers, SQLite или процессов, которым нужна полная POSIX semantics.
+### FILE-01. Workspace
 
-Активный workspace размещается на локальной ephemeral filesystem container-а:
+- Согласованная среда развёртывания — один Kubernetes Pod; все чаты
+  обрабатываются в этом pod. Отдельные pod на чат не предполагаются.
+- Python, terminal и фоновые команды изолируются через Bubblewrap по [профилю Bubblewrap](execution-environment.md).
+- При создании чата ему назначается отдельная постоянная папка.
+- Задачи этого чата работают с одной папкой, в том числе повторные cron-запуски.
+- Родительская папка задаётся переменной окружения.
+- Файлы сохраняются при restart сервиса.
+- Внешний агент и выполняемый по его запросу код не имеют доступа к соседним
+  чатам и их файлам.
 
-```text
-/tmp/core-agent/runs/<run-id>/agents/<agent-id>/workspace
-```
+Текущее `LOCAL_WORKSPACE_ROOT` имеет семантику ephemeral workspace для run.
+Для постоянных папок чатов используется отдельный `CHAT_WORKSPACE_ROOT`,
+с сохранением существующих временных рабочих областей там, где они нужны.
+Имя новой переменной — техническая конкретизация согласованной настройки
+через env. Bubblewrap предоставляет процессу папку текущего чата как
+`/workspace`; смысл существующей переменной нельзя менять молча.
 
-Lifecycle workspace:
+`DURABLE_STORAGE_ROOT` сохраняет immutable snapshots, manifests и transport blobs и MAY использовать S3-backed mount. `CHAT_WORKSPACE_ROOT` требует постоянный том с рабочей POSIX semantics для Git, package managers, compilers и файлов чата. `LOCAL_WORKSPACE_ROOT` остаётся ephemeral scratch; его прежняя семантика не меняется.
 
-1. скопировать и проверить immutable base snapshot из S3 mount;
-2. создать отдельную local directory main/child;
-3. выполнять процессы только с назначенным `cwd`;
-4. сформировать bounded patch и content-addressed artifacts;
-5. записать новый immutable S3 prefix;
-6. последним опубликовать revision/commit manifest;
-7. удалить local workspace после terminal state или retention timeout.
+Каждый чат имеет одну постоянную папку, повторные задачи и cron используют её. Отдельные child scratch copies MAY материализоваться из проверенного base snapshot и возвращать patch с conflict detection. Parent/child не меняют пересекающиеся targets параллельно без явной координации. Terminal completion удаляет временные окружения, но сохраняет папку чата. Snapshot restore учитывает текущую revision и tombstones ручной очистки; удалённые файлы не воскресают.
 
-Parent и child не должны одновременно изменять одну local directory. Каждый получает отдельную копию одного base revision; parent применяет child patch с conflict detection. Shared directory допускается только явной policy для доверенного workflow.
+Shared storage lock не заменяет PostgreSQL lease; у каждого stateful run один fenced owner.
 
-Если несколько replicas используют общий S3 mount, file lock на mount не считается distributed lease. До появления conditional object writes или внешнего lease store stateful run MUST иметь одного active owner.
+Runtime связывает owned run с `(tenant_id, owner_id, context_id)` из сохранённого
+workflow, включая recovery, child и background tool. В авторизованном deployment
+эта тройка MUST совпадать с immutable owner записи `core_chats`; отсутствие mapping
+у legacy workflow не разрешает создавать папку от имени нового caller. Владелец
+компании, работающий в чате внешнего агента, сохраняет исходную привязку. Model/tool
+arguments не задают эти идентификаторы. Непривязанный execution отклоняется до
+процесса с `WORKSPACE_SCOPE_REQUIRED`, смена chat binding существующего run — с
+`WORKSPACE_SCOPE_CONFLICT`. Хешированные имена каталогов не заменяют проверку доступа;
+при открытии дочерних каталогов symlinks не допускаются.
+
+Явный anonymous development/test без Keycloak MAY не задавать
+`CHAT_WORKSPACE_ROOT`; тогда прежние ephemeral области сохраняют свою семантику.
+Это не даёт enterprise isolation guarantees и не разрешает fallback из обязательного
+Bubblewrap. `LOCAL_BASE_SNAPSHOT` применяется только к ephemeral/scratch областям;
+restart и новый run не восстанавливают snapshot поверх живого чата.
 
 ## Secrets
 
@@ -70,28 +91,57 @@ Parent и child не должны одновременно изменять од
 - После завершения process group уничтожается; долговременная TerminalSession не сохраняет secret в своём базовом environment.
 - Child получает только secret refs, явно разрешённые delegation contract и platform policy.
 
-Локальная process isolation не гарантирует защиту секрета от намеренно враждебного process того же Unix user. Поэтому secret-bearing terminal call всегда проходит отдельный risk decision; policy MAY запретить его полностью.
+Task-specific secret допускается только отдельной policy и не ослабляет запрет доступа к platform credentials, соседним процессам и чужому workspace.
 
 ## Network
 
-Локальные процессы наследуют network boundary container-а. Runtime применяет tool/MCP allowlists и MAY использовать application egress proxy, но не рекламирует отдельный network namespace для каждой TerminalSession.
+### NET-01. Публичный интернет и закрытая внутренняя сеть
 
-- remote MCP проходит local policy до соединения и каждого call;
-- redirects/resolved IP проверяются, когда соединение проходит через управляемый egress adapter;
-- stdio MCP запускается как owned local process в TerminalSession;
-- inbound listener разрешается только явной tool policy и закрывается вместе с session;
-- A2A и OTel credentials не передаются в child process environment.
+Python, terminal и их дочерние процессы могут обращаться в публичный интернет,
+в том числе через `requests`, `curl` и менеджеры пакетов. Отдельный перечень
+разрешённых публичных доменов не требуется. Установка пакетов сохраняет общую
+tool policy/HITL и записывает файлы только в разрешённую область чата.
+
+Трафик sandbox проходит через контролируемый выход из его network namespace.
+Нельзя просто разделить с ним сеть серверного процесса или положиться только
+на переменные `HTTP_PROXY`/`HTTPS_PROXY`: произвольный код не должен обходить
+границу прямым socket-соединением. Профиль запуска и сетевые правила нельзя
+изменить из sandbox.
+
+Недоступны приватные, link-local и иные непубличные назначения, адреса соседних
+окружений, Pod/Service/node сети кластера, внутренние API и metadata endpoints.
+Защищённые адреса конкретного развёртывания учитываются явно, в том числе если
+они используют публичный диапазон. Нельзя достичь localhost серверного pod
+через адрес шлюза или иной маршрут; loopback внутри собственного sandbox
+остаётся локальным этому окружению.
+
+Ограничение проверяет фактический адрес назначения каждого соединения, включая
+переходы по redirect и изменение DNS-ответа. Оно распространяется на IPv4 и
+IPv6 и не обходится альтернативным представлением адреса или протоколом.
+DNS для публичных ресурсов должен работать через контролируемый resolver;
+это не открывает произвольный доступ к внутренней сети.
+
+Защищённый сервер сохраняет необходимый ему доступ к PostgreSQL, Keycloak,
+MCP и доверенным A2A endpoints. Доступ sandbox к такому инструменту возможен
+через собственный broker после проверки policy/HITL; сетевые credentials
+сервера процессу не выдаются.
+
+Конкретный egress gateway и поддерживаемые протоколы MUST быть проверены до release. HTTP-only proxy нельзя выдавать за универсальный прямой доступ; конкретный userspace networking компонент этим контрактом не выбран.
+
+Обычная Kubernetes NetworkPolicy применяется к pod и может быть дополнительной
+границей, но не заменяет разные права сервера и чатов внутри одного pod.
+При отказе сетевого контроля нельзя переключаться на неограниченную сеть pod.
 
 ## Lifecycle
 
 1. Проверить effective terminal capability, owner и budgets.
-2. Создать local workspace и TerminalSession.
+2. Открыть постоянный workspace чата и создать owned TerminalSession; при необходимости подготовить отдельную scratch-копию.
 3. Запустить process с новым PTY/process group.
 4. Неблокирующе читать bounded output и принимать input/signal.
 5. На safe boundaries публиковать status/artifacts/notifications.
 6. При cancel/timeout послать graceful signal, затем завершить process group.
-7. Собрать patch/artifacts и опубликовать durable manifest в S3.
-8. Закрыть PTY, удалить local workspace по policy и записать cleanup outcome.
+7. Сохранить committed файлы чата и при необходимости snapshot/transport results.
+8. Закрыть PTY, удалить только ephemeral scratch по policy и записать cleanup outcome.
 
 ## Python CodeAct process
 
@@ -99,11 +149,11 @@ Parent и child не должны одновременно изменять од
 
 Интерпретатор MUST быть тем же, который получает команда в terminal workspace. Разные интерпретаторы у двух тулов означают, что установленный из терминала пакет не импортируется в Python, причём молча: `pip install` завершается успехом, а следующий `import` — `ModuleNotFoundError`, и модель не может связать одно с другим. Собственный virtualenv агента для этого не годится: в нём нет ни pip, ни права на запись. Поэтому user site-packages и `PYTHONPATH` MUST быть видны, а рабочий каталог MUST NOT попадать в `sys.path` автоматически: файл, случайно названный именем модуля stdlib, иначе ломает сам runner.
 
-Этот внутренний process backend работает и в `without_terminal`: model-visible `core_terminal_exec` и `core_task_start` при этом отсутствуют. Python остаётся доверенным локальным кодом и может использовать стандартные OS/process APIs; разделение runtime modes не добавляет OS security boundary.
+Этот внутренний process backend работает и в `without_terminal`: model-visible `core_terminal_exec` и `core_task_start` при этом отсутствуют. Python может использовать OS/process APIs, но все его процессы остаются в обязательной Bubblewrap/egress границе; выбор runtime mode не отключает sandbox.
 
-Граница кадра IPC MUST вмещать самый большой допустимый аргумент tool call. Артефакт размером `MAX_RESPONSE_SIZE`, переданный в `base64`, — это на треть больше байт, и кадр меньше этого превращает разрешённое хранилищем сохранение в отказ, зависящий от того, каким тулом файл сохраняют.
+Граница кадра IPC MUST быть bounded и вмещать допустимые tool arguments. Большие файлы передаются проверенными transport/workspace references, без dedicated artifact tools.
 
-Parent является единственным tool broker: проверяет каждый canonical name/arguments по неизменному EffectiveConfig run-а, списывает общий budget и исполняет вызов через существующий built-in/MCP dispatch. IPC имеет single-run capability token, owner-only local endpoint, bounded JSON frames и закрывается вместе с Python process. Эта схема остаётся process separation, а не OS security boundary.
+Parent является единственным tool broker: проверяет canonical name/arguments по admission ceiling, актуальной owner policy, schema и budgets и использует общий dispatch/HITL. В sandbox доступен только Unix socket собственного вызова с single-run capability token; chat/tenant определяется сервером, а не аргументом процесса. Endpoint и bounded JSON frames закрываются с процессом; socket не открывает серверные credentials или чужие tools.
 
 Пока Python continuation нельзя надёжно checkpoint/resume, capability не поддерживает background start. Timeout или cancel завершают Python process group; уже начатый вложенный side effect следует обычным downstream idempotency/reconciliation guarantees и не повторяется автоматически.
 
@@ -115,6 +165,72 @@ TerminalSession принадлежит ровно одному main/child agent,
 
 После timeout, failed cleanup или terminal agent state session закрывается и не переиспользуется другим agent.
 
+### Terminal transition и владение попыткой выполнения
+
+До terminal commit runtime MUST сохранять durable intent завершения с исходным
+результатом и закрывать допуск новых локальных команд во всём canonical subtree
+Task. Child admission и dispatch проверяют барьер атомарно с общим root ledger;
+родство определяется сохранёнными parent links, а не префиксом run ID.
+Остановка процессов выполняется вне транзакции БД. Пока остановка не подтверждена,
+workflow остаётся nonterminal и чат занят, в том числе при budget-partial результате.
+Нельзя освободить чат через `ABORTED`, если его процессы всё ещё могут писать файлы.
+
+До разрешения локального запуска сохраняется operational receipt с server
+instance, worker и уникальной execution generation. Receipt нельзя заменить или
+удалить устаревшим snapshot. Потерявший lease worker останавливает и подтверждает
+только собственную generation. Пустой список handles другого server instance или
+истечение lease не доказывают завершение прежних процессов: без подтверждения
+очистки сохраняется nonterminal reconciliation, без повторного запуска команды.
+При этом логическое владение задачей не означает запуск процесса: receipt хранит
+явный признак незавершённого local dispatch. Он устанавливается атомарно с intent
+terminal/Python и снимается только при известном завершении либо подтверждённой
+остановке. Сохранённый явный признак отсутствия такого dispatch позволяет новой
+fenced попытке восстановить model-only run или safe wait после сбоя сервера;
+отсутствующий признак не считается этим доказательством.
+Это правило распространяется на legacy checkpoint, указывающий на возможное
+незавершённое локальное выполнение без достаточных сведений для проверки.
+
+Recovery сначала продолжает сохранённый terminal intent. Принятый до commit
+follow-up сохраняет обычную обработку inbox; если он отменяет завершение, следующая
+команда использует новую execution generation. Закрытая generation никогда не
+открывается повторно. Nonterminal suspension сохраняет файлы workspace run-а,
+включая development без постоянного chat root. Повторная или конкурентная очистка
+одной session не публикует новый snapshot из уже удалённой папки.
+
 ## Observability без утечки
 
 Spans отражают session ID, owner kind, process state, duration, exit status, timeout/cancel и bounded byte counts. Raw command, stdin/stdout/stderr, file content, environment и S3 paths выключены по умолчанию. Background terminal process получает новый execution trace со Span Link на task submission.
+
+
+## Python при durable ожидании вложенного инструмента
+
+Произвольные terminal и Python команды считаются потенциально mutating независимо
+от owner allow или guardrails exemption. Прежняя `CORE_AGENT_TRUST_TERMINAL` не
+изменяет эту классификацию. Неизвестный исход после
+старта требует `SIDE_EFFECT_UNKNOWN`/reconciliation, включая legacy checkpoint
+с `pending_mutating=false`. Известный exit/timeout возвращается как structured
+result с частичным output; это не обещает отсутствия предыдущих side effects.
+
+Неизвестный outcome вложенной мутации требует `SIDE_EFFECT_UNKNOWN` и после
+подтверждённой очистки фиксируется как `ABORTED`. При неподтверждённой очистке
+сохраняется описанный выше nonterminal барьер. До возврата broker response
+исход фиксируется durable; Python `try/except` не может скрыть его и разрешить
+следующий вызов или успешное завершение outer run. Исчерпание общего либо локального
+budget также сохраняется до ответа broker независимо от перехвата исключения:
+дальше допускается только предусмотренная runtime финализация без tools.
+
+Произвольный CPython процесс не сериализуется. Если `tools.call(...)` требует
+HITL, вопроса владельцу, проверки материала либо timer/task wait, broker
+сохраняет конкретный frozen nested call, stable request ID, исходный outer call,
+уже начисленный budget и результаты завершённых broker calls. Он прекращает
+принимать следующие вызовы и не возвращает catchable ошибку, позволяющую Python
+продолжить выполнение.
+
+Перед сохранением safe wait runtime подтверждает остановку всего process group
+или sandbox namespace. После решения исполняется только сохранённый nested call
+с повторной проверкой текущей policy; уже завершённый call не повторяется ради
+раскрытия его результата. Модель получает interrupted outer Python result с
+частичными stdout/stderr и известными broker outcomes и сама выбирает следующий
+шаг. Prefix и остаток Python-кода автоматически не запускаются повторно.
+Неподтверждённая остановка или неизвестный outcome возможной мутации требуют
+reconciliation и не допускают повторного dispatch.

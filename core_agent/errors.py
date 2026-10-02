@@ -5,3 +5,7 @@ class CoreError(Exception):
         self.retryable = retryable
         self.data = data or {}
         super().__init__(self.message)
+
+
+class ExecutionNotStarted(CoreError):
+    """Trusted local evidence that the requested command was never released."""

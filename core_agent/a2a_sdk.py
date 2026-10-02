@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 
 from google.protobuf import json_format
 from google.protobuf.struct_pb2 import Value
 
 from a2a.server.agent_execution import AgentExecutor
 from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.jsonrpc_models import JSONRPCError
+from a2a.server.request_handlers.response_helpers import EXCEPTION_MAP
 from a2a.server.request_handlers.request_handler import (
     validate,
     validate_request_params,
@@ -35,11 +38,18 @@ from a2a.types import (
     TaskStatusUpdateEvent as SdkTaskStatusUpdateEvent,
 )
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, request_response
 from a2a.utils.errors import (
+    A2AError,
+    A2A_ERROR_MAPPING,
+    A2A_ERROR_REASONS,
+    ErrorMapping,
+    JSON_RPC_ERROR_CODE_MAP,
     InvalidParamsError,
+    ContentTypeNotSupportedError,
     TaskNotFoundError,
     UnsupportedOperationError,
 )
@@ -51,6 +61,11 @@ from .a2a import (
     Part,
     parse_run_request,
 )
+from .auth import OWNER_SCOPE, ScopeUser, is_company_owner
+from .a2a_input import input_error_response, protect_sdk_logs, read_input, request_limit
+from .database import REMOTE_PROGRESS_KEY, _has_response_files, reconcile_remote_progress, reconcile_workflow_task
+from .errors import CoreError
+from .workflow import SuspendedRun
 from .streaming import (
     ADK_THOUGHT_KEY,
     ADK_TYPE_KEY,
@@ -71,10 +86,230 @@ A2A_TERMINAL_STATES = {
 }
 
 
+class WorkspaceCleanupPendingError(A2AError):
+    message = "Workspace cleanup is pending; retry after reconciliation"
+
+
+# The SDK's public mappings keep HTTP+JSON, SSE and JSON-RPC errors consistent.
+A2A_ERROR_MAPPING[WorkspaceCleanupPendingError] = ErrorMapping(503, "UNAVAILABLE", "WORKSPACE_CLEANUP_PENDING")
+A2A_ERROR_REASONS[WorkspaceCleanupPendingError] = "WORKSPACE_CLEANUP_PENDING"
+JSON_RPC_ERROR_CODE_MAP[WorkspaceCleanupPendingError] = -32000
+EXCEPTION_MAP[WorkspaceCleanupPendingError] = JSONRPCError
+
+
 
 def resolve_owner_scope(context):
     name = context.user.user_name
     return name if context.user.is_authenticated and name else "anonymous"
+
+
+class ScopedMemoryTaskStore(InMemoryTaskStore):
+    """Development adapter: owner access with the same company boundary as SQL."""
+
+    def __init__(self, *, workflow_store=None, task_scheduler=None, legacy_identity="anonymous"):
+        self.workflow_store = workflow_store
+        self.task_scheduler = task_scheduler
+        self.legacy_identity = legacy_identity
+        self.response_files_service = None
+        super().__init__(owner_resolver=lambda context: json.dumps([
+            context.tenant, resolve_owner_scope(context),
+        ]))
+        self._owners = {}
+        self._access_lock = asyncio.Lock()
+
+    @staticmethod
+    def _as_owner(context, owner):
+        return context.model_copy(update={"user": ScopeUser(owner)})
+
+    def _workflow_record(self, task_id, context, owner):
+        identity = owner if context.user.is_authenticated else self.legacy_identity
+        return self.workflow_store.by_task(
+            task_id, tenant_id=context.tenant or "default", owner_id=identity,
+        )
+
+    def _reconcile_progress(self, task, record, previous=None, context=None):
+        rows = []
+        with self.task_scheduler._lock if self.task_scheduler is not None else nullcontext():
+            if self.task_scheduler is not None:
+                rows = [{"id": item["task_id"], "revision": item["revision"],
+                         "result": {"agent_name": item["agent_name"], "remote_state": item["remote_state"]}}
+                        for item in self.task_scheduler.remote_progress(
+                            owner_id=record.run_id, tenant_id=record.tenant_id)]
+            changed = reconcile_remote_progress(task, state=record.state, tasks=rows, previous=previous)
+            if context is not None:
+                self._save_admission(task, context)
+            return changed
+
+    async def admit(self, task, context, commit):
+        """Publish a new Task and its synchronous memory admission together.
+
+        Acquire every asyncio lock before creating a workflow: a threading RLock
+        cannot hide a partial write from a coroutine on the same event-loop thread.
+        The SDK's underlying memory map is touched only while its lock is held.
+        """
+        return await self.admission_transaction(lambda: commit(lambda: self._save_admission(task, context)))
+
+    async def admission_transaction(self, callback):
+        """Acquire SDK asyncio locks before the caller enters a workflow guard."""
+        async with self._access_lock, self._impl.lock:
+            tasks, owners = copy.deepcopy(self._impl.tasks), dict(self._owners)
+            try:
+                return callback()
+            except BaseException:
+                self._impl.tasks.clear()
+                self._impl.tasks.update(tasks)
+                self._owners.clear()
+                self._owners.update(owners)
+                raise
+
+    def get_admitted(self, task_id, context):
+        """Synchronous scoped read inside admission_transaction's held locks."""
+        owner = self._owners.get((context.tenant, task_id))
+        if owner is None or owner != resolve_owner_scope(context) and not is_company_owner(context):
+            return None
+        owner_context = self._as_owner(context, owner)
+        key = self._impl.owner_resolver(owner_context)
+        stored = self._impl.tasks.get(key, {}).get(task_id)
+        if stored is None:
+            return None
+        task = SdkTask()
+        task.CopyFrom(stored)
+        if self.workflow_store is not None:
+            try:
+                record = self._workflow_record(task_id, context, owner)
+            except CoreError as error:
+                if error.code != "TASK_NOT_FOUND":
+                    raise
+            else:
+                reconcile_workflow_task(task, run_id=record.run_id, state=record.state,
+                                        result=record.result, error_code=record.error_code, version=record.version,
+                                        record=record, response_files_service=self.response_files_service)
+                self._reconcile_progress(task, record, context=owner_context)
+        return task
+
+    def has_admitted_context(self, context_id, context):
+        for (tenant, task_id), owner in self._owners.items():
+            if tenant == context.tenant:
+                key = self._impl.owner_resolver(self._as_owner(context, owner))
+                task = self._impl.tasks.get(key, {}).get(task_id)
+                if task is not None and task.context_id == context_id:
+                    return True
+        return False
+
+    def _save_admission(self, task, context):
+        owner = resolve_owner_scope(context)
+        for scope in {owner, OWNER_SCOPE}:
+            copied = SdkTask()
+            copied.CopyFrom(task)
+            key = self._impl.owner_resolver(self._as_owner(context, scope))
+            self._impl.tasks.setdefault(key, {})[task.id] = copied
+        self._owners[(context.tenant, task.id)] = owner
+
+    async def save(self, task, context):
+        persisted = SdkTask()
+        persisted.CopyFrom(task)
+        task = persisted
+        async with self._access_lock:
+            key = (context.tenant, task.id)
+            caller = resolve_owner_scope(context)
+            owner = self._owners.get(key, caller)
+            if owner != caller and not is_company_owner(context):
+                raise InvalidParamsError("Task not found")
+            if self.workflow_store is not None:
+                current = await super().get(task.id, self._as_owner(context, owner))
+                current_terminal = current is not None and current.status.state in A2A_TERMINAL_STATES
+                try:
+                    record = self._workflow_record(task.id, context, owner)
+                except CoreError as error:
+                    if error.code != "TASK_NOT_FOUND":
+                        raise
+                    if current_terminal:
+                        return
+                else:
+                    async with self._impl.lock:
+                        with self.workflow_store._lock:
+                            record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+                            revision = dict(task.metadata).get("core_agent_workflow_version", 0)
+                            if (current_terminal or record.state == "COMPLETED" and _has_response_files(record.result)
+                                    or not isinstance(revision, (int, float)) or revision < record.version):
+                                reconcile_workflow_task(
+                                    current if current_terminal else task,
+                                    run_id=record.run_id, state=record.state, result=record.result,
+                                    error_code=record.error_code, version=record.version, authoritative=not current_terminal,
+                                    record=record, response_files_service=self.response_files_service,
+                                )
+                            if current_terminal:
+                                return
+                            self._reconcile_progress(task, record, previous=current or SdkTask(), context=self._as_owner(context, owner))
+                    return
+            self._owners[key] = owner
+            await super().save(task, self._as_owner(context, owner))
+            if owner != OWNER_SCOPE:
+                await super().save(task, self._as_owner(context, OWNER_SCOPE))
+
+    async def _get_reconciled(self, task_id, context, owner):
+        owner_context = self._as_owner(context, owner)
+        task = await super().get(task_id, owner_context)
+        if task is None or self.workflow_store is None:
+            return task
+        try:
+            record = self._workflow_record(task_id, context, owner)
+        except CoreError as error:
+            if error.code != "TASK_NOT_FOUND":
+                raise
+            return task
+        async with self._impl.lock:
+            with self.workflow_store._lock:
+                record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+                reconcile_workflow_task(
+                    task, run_id=record.run_id, state=record.state,
+                    result=record.result, error_code=record.error_code, version=record.version,
+                    record=record, response_files_service=self.response_files_service)
+                self._reconcile_progress(task, record, context=owner_context)
+        return task
+
+    async def get(self, task_id, context):
+        async with self._access_lock:
+            owner = self._owners.get((context.tenant, task_id))
+            if owner is None:
+                return None
+            if is_company_owner(context):
+                # Follow-up/cancel keep the task's original execution identity.
+                context.user = ScopeUser(owner)
+            elif owner != resolve_owner_scope(context):
+                return None
+            return await self._get_reconciled(task_id, context, owner)
+
+    async def list(self, params, context):
+        async with self._access_lock:
+            company_owner = is_company_owner(context)
+            if self.workflow_store is not None:
+                for (tenant, task_id), owner in self._owners.items():
+                    if tenant == context.tenant and (company_owner or owner == resolve_owner_scope(context)):
+                        await self._get_reconciled(task_id, context, owner)
+            if company_owner:
+                context = self._as_owner(context, OWNER_SCOPE)
+            return await super().list(params, context)
+
+    async def has_context(self, context_id, context):
+        async with self._access_lock:
+            for (tenant, task_id), owner in self._owners.items():
+                if tenant == context.tenant:
+                    task = await super().get(task_id, self._as_owner(context, owner))
+                    if task and task.context_id == context_id:
+                        return True
+        return False
+
+    async def delete(self, task_id, context):
+        async with self._access_lock:
+            key = (context.tenant, task_id)
+            owner = self._owners.get(key)
+            if owner is None or (owner != resolve_owner_scope(context) and not is_company_owner(context)):
+                return
+            await super().delete(task_id, self._as_owner(context, owner))
+            if owner != OWNER_SCOPE:
+                await super().delete(task_id, self._as_owner(context, OWNER_SCOPE))
+            del self._owners[key]
 
 
 def to_sdk_agent_card(card, *, base_url):
@@ -178,23 +413,23 @@ def _strip_envelope(payload):
     extra = frozenset(payload) - frozenset(JSONRPC_ENVELOPE_FIELDS)
     if not extra:
         return payload
-    if extra not in _reported_extra_fields and len(_reported_extra_fields) < 32:
-        _reported_extra_fields.add(extra)
+    marker = hash(extra)
+    if marker not in _reported_extra_fields and len(_reported_extra_fields) < 32:
+        _reported_extra_fields.add(marker)
         logging.getLogger("core_agent.runtime").warning(
-            "ignoring unknown JSON-RPC fields %s; they are not interpreted",
-            ",".join(sorted(extra)),
+            "ignoring %s unknown JSON-RPC fields; they are not interpreted",
+            len(extra),
         )
     return {name: payload[name] for name in payload if name not in extra}
 
 
-def _tolerant_envelope(endpoint):
+def _input_guard(endpoint, limit, *, rpc):
     async def wrapper(request):
-        body = await request.body()
         try:
-            payload = json.loads(body)
-        except ValueError:
-            return await endpoint(request)
-        cleaned = _strip_envelope(payload)
+            body, payload = await read_input(request, limit, rpc=rpc)
+        except A2AError as error:
+            return input_error_response(error, rpc=rpc, request_id=getattr(error, "request_id", None))
+        cleaned = _strip_envelope(payload) if rpc else payload
         if cleaned == payload:
             return await endpoint(Request(request.scope, _replay(body)))
         return await endpoint(
@@ -204,6 +439,18 @@ def _tolerant_envelope(endpoint):
     return wrapper
 
 
+def _file_input_error(error):
+    data = {"code": error.code}
+    for name in ("allowed_bytes", "actual_bytes"):
+        value = error.data.get(name)
+        if type(value) is int and 0 <= value < 2**63:
+            data[name] = str(value)
+    return InvalidParamsError("File input was rejected", data=data)
+
+
+FILE_INPUT_ERRORS = frozenset({"INVALID_FILE_INPUT", "INVALID_FILE_ENCODING", "FILE_METADATA_TOO_LARGE", "ATTACHMENTS_TOO_LARGE"})
+
+
 def _replay(body):
     async def receive():
         return {"type": "http.request", "body": body, "more_body": False}
@@ -211,7 +458,7 @@ def _replay(body):
     return receive
 
 
-def _agent_card_routes(sdk_card, *, derive_base_url):
+def _agent_card_routes(sdk_card, *, derive_base_url, card_skills=None):
     """Serve the card on the canonical and the historical path.
 
     Registries written before the card was renamed still probe the historical
@@ -221,11 +468,22 @@ def _agent_card_routes(sdk_card, *, derive_base_url):
     async def endpoint(request):
         card = sdk_card
         base_url = public_base_url(request) if derive_base_url else None
-        if base_url:
+        prefix = request.scope.get("root_path", "")
+        authenticated = "principal" in request.scope
+        if base_url or prefix or authenticated or card_skills is not None:
             card = SdkAgentCard()
             card.CopyFrom(sdk_card)
             for interface in card.supported_interfaces:
-                interface.url = base_url
+                interface.url = (base_url or interface.url).rstrip("/") + prefix
+            if authenticated:
+                scheme = card.security_schemes["keycloak"]
+                scheme.http_auth_security_scheme.scheme = "bearer"
+                card.security_requirements.add().schemes["keycloak"].SetInParent()
+        if card_skills is not None:
+            allowed = await run_in_threadpool(card_skills, request)
+            skills = [skill for skill in card.skills if skill.id in allowed]
+            del card.skills[:]
+            card.skills.extend(skills)
         return JSONResponse(json_format.MessageToDict(card))
 
     return [
@@ -499,22 +757,34 @@ class CoreAgentExecutor(AgentExecutor):
             self._cancel_publications.pop(context.task_id, None)
 
     async def _publish_artifact(self, updater, artifact):
+        if isinstance(artifact, SuspendedRun):
+            await updater.start_work()
+            return
         if not isinstance(artifact, Artifact):
             artifact = Artifact.text(str(artifact))
-        final_text = "\n".join(str(part.data) for part in artifact.parts)
-        chunks = _chunk(final_text, self.max_chunk_size)
+        final_text = "\n".join(part.data for part in artifact.parts if part.kind == "text")
+        typed_parts = []
+        for part in artifact.parts:
+            if part.kind == "file":
+                typed_parts.append(SdkPart(raw=part.data["bytes"], filename=part.data["filename"],
+                    media_type=part.data["media_type"] or "application/octet-stream"))
+            elif part.kind == "data":
+                typed_parts.append(SdkPart(data=_struct_value(part.data), media_type="application/json"))
+            elif part.kind != "text":
+                raise CoreError("CONTENT_TYPE_NOT_SUPPORTED")
+        metadata = {"digest": artifact.digest, "size": artifact.size, "provenance": artifact.provenance}
+        chunks = _chunk(final_text, self.max_chunk_size) if final_text or not typed_parts else []
         for index, chunk in enumerate(chunks):
             await updater.add_artifact(
                 [SdkPart(text=chunk, media_type=artifact.media_type)],
                 artifact_id=artifact.id,
-                metadata={
-                    "digest": artifact.digest,
-                    "size": artifact.size,
-                    "provenance": artifact.provenance,
-                },
+                metadata=metadata,
                 append=index > 0 or None,
-                last_chunk=index == len(chunks) - 1,
+                last_chunk=index == len(chunks) - 1 and not typed_parts,
             )
+        if typed_parts:
+            await updater.add_artifact(typed_parts, artifact_id=artifact.id, metadata=metadata,
+                append=bool(chunks) or None, last_chunk=True)
         await updater.complete(
             message=updater.new_agent_message(
                 [SdkPart(text=final_text, media_type=artifact.media_type)]
@@ -592,12 +862,16 @@ class TransientStatusTaskStore:
         self.inner = inner
 
     async def save(self, task, context=None):
-        kept = [
-            message
-            for message in task.history
-            if message.role != SdkRole.ROLE_AGENT
-            or not json_format.MessageToDict(message.metadata).get(PARTIAL_KEY)
-        ]
+        kept = []
+        user_ids = set()
+        for message in task.history:
+            if message.role == SdkRole.ROLE_AGENT and json_format.MessageToDict(message.metadata).get(PARTIAL_KEY):
+                continue
+            if message.role == SdkRole.ROLE_USER and message.message_id:
+                if message.message_id in user_ids:
+                    continue
+                user_ids.add(message.message_id)
+            kept.append(message)
         if len(kept) != len(task.history):
             del task.history[:]
             task.history.extend(kept)
@@ -614,9 +888,43 @@ class TransientStatusTaskStore:
 
 
 class CoreRequestHandler(DefaultRequestHandler):
-    def __init__(self, *args, followup_handler, **kwargs):
+    def __init__(self, *args, followup_handler, admission_handler=None, admission_cleanup=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.followup_handler = followup_handler
+        self.admission_handler = admission_handler
+        self.admission_cleanup = admission_cleanup
+
+    def _validate_enterprise_message(self, message):
+        if self.admission_handler is None:
+            return
+        if not message.message_id.strip() or message.role != SdkRole.ROLE_USER:
+            raise InvalidParamsError("A nonempty messageId and ROLE_USER are required")
+        if any(part.HasField("url") for part in message.parts):
+            raise ContentTypeNotSupportedError()
+
+    async def _admit_root(self, params, context):
+        validate_history_length(params.configuration)
+        try:
+            admitted = await self.admission_handler(params.message, context)
+        except CoreError as error:
+            if error.code in FILE_INPUT_ERRORS:
+                raise _file_input_error(error) from None
+            if error.code == "WORKSPACE_CLEANUP_PENDING":
+                raise WorkspaceCleanupPendingError(data={"code": error.code, "retryable": "true"}) from None
+            raise
+        if admitted.lease_token:
+            context.state["initial_admission"] = admitted
+            params.message.task_id = admitted.task.id
+            params.message.context_id = admitted.task.context_id
+        return admitted
+
+    async def _setup_active_task(self, params, call_context):
+        try:
+            return await super()._setup_active_task(params, call_context)
+        except BaseException:
+            if self.admission_cleanup and call_context.state.get("initial_admission"):
+                await self.admission_cleanup(call_context)
+            raise
 
     async def _accept_followup(self, params, context):
         validate_history_length(params.configuration)
@@ -632,28 +940,57 @@ class CoreRequestHandler(DefaultRequestHandler):
             raise InvalidParamsError(message="Follow-up role must be ROLE_USER")
         if params.message.context_id and params.message.context_id != task.context_id:
             raise InvalidParamsError(message="context_id does not match task")
+        if self.admission_handler:
+            initial = next((item for item in task.history if item.role == SdkRole.ROLE_USER
+                            and item.message_id == params.message.message_id), None)
+            if initial is not None:
+                # Task/context IDs were assigned by admission; compare the full
+                # original content rather than silently accepting changed bytes.
+                repeated = type(params.message)()
+                repeated.CopyFrom(params.message)
+                repeated.task_id, repeated.context_id = initial.task_id, initial.context_id
+                if repeated != initial:
+                    raise InvalidParamsError("messageId was already used with different content",
+                                             data={"code": "MESSAGE_ID_CONFLICT"})
+                return apply_history_length(task, params.configuration)
         message = CoreAgentExecutor._from_sdk_message(
             params.message, context_id=task.context_id
         )
         try:
-            await asyncio.to_thread(self.followup_handler, message, task, context)
+            receipt = await asyncio.to_thread(self.followup_handler, message, task, context,
+                **({"original_message": params.message} if self.admission_handler else {}))
         except Exception as error:
             code = getattr(error, "code", None)
+            if isinstance(error, CoreError) and code in FILE_INPUT_ERRORS:
+                raise _file_input_error(error) from None
             if code == "TASK_NOT_FOUND":
                 raise TaskNotFoundError(message=f"Task {task_id} not found") from None
             if code in {"TASK_TERMINAL", "INVALID_TASK_STATE"}:
                 raise UnsupportedOperationError(
                     message=f"Task {task_id} is already terminal"
                 ) from None
-            if code == "INVALID_REQUEST":
-                raise InvalidParamsError(message=str(error)) from None
+            if code in {"INVALID_REQUEST", "MESSAGE_ID_CONFLICT"}:
+                raise InvalidParamsError(message=str(error), data={"code": code}) from None
             raise
+        if self.admission_handler and isinstance(receipt, dict):
+            file_receipt = receipt.get("provenance", {}).get("file_receipt")
+            if file_receipt is not None:
+                response = type(task)()
+                response.CopyFrom(task)
+                response.metadata.update({"accepted_message_id": params.message.message_id,
+                                          "accepted_file_receipt": file_receipt})
+                task = response
         return apply_history_length(task, params.configuration)
 
     @validate_request_params
     async def on_message_send(self, params, context):
+        self._validate_enterprise_message(params.message)
         if params.message.task_id:
             return await self._accept_followup(params, context)
+        if self.admission_handler:
+            admitted = await self._admit_root(params, context)
+            if admitted.lease_token is None:
+                return apply_history_length(admitted.task, params.configuration)
         return await super().on_message_send(params, context)
 
     @validate_request_params
@@ -662,14 +999,28 @@ class CoreRequestHandler(DefaultRequestHandler):
         "Streaming is not supported by the agent",
     )
     async def on_message_send_stream(self, params, context):
+        self._validate_enterprise_message(params.message)
         if params.message.task_id:
             yield await self._accept_followup(params, context)
             return
+        if self.admission_handler:
+            admitted = await self._admit_root(params, context)
+            yield apply_history_length(admitted.task, params.configuration)
+            if admitted.lease_token is None:
+                return
         async for event in super().on_message_send_stream(params, context):
             yield event
 
     async def on_cancel_task(self, params, context):
-        return await super().on_cancel_task(params, context)
+        # The SDK registry can return an active cached task without consulting
+        # its scoped store. Authorize before any cancellation or cached response.
+        task = await self.task_store.get(params.id, context)
+        if task is None:
+            raise TaskNotFoundError(message="Task not found")
+        result = await super().on_cancel_task(params, context)
+        # A suspended execution has closed its SDK event queue. Cancel commits
+        # in the workflow even when that cached dispatcher cannot publish again.
+        return await self.task_store.get(params.id, context) or result
 
     @validate_request_params
     @validate(
@@ -688,6 +1039,7 @@ class CoreRequestHandler(DefaultRequestHandler):
             next_live = asyncio.create_task(anext(live_stream))
             await asyncio.sleep(0)
         previous = task.SerializeToString(deterministic=True)
+        previous_progress = json_format.MessageToDict(task.metadata).get(REMOTE_PROGRESS_KEY)
         try:
             yield task
             if task.status.state in A2A_TERMINAL_STATES:
@@ -704,6 +1056,20 @@ class CoreRequestHandler(DefaultRequestHandler):
                             next_live = None
                         else:
                             next_live = None
+                            if isinstance(event, SdkTask):
+                                persisted = await self.task_store.get(params.id, context)
+                                if persisted is None:
+                                    raise TaskNotFoundError(message=f"Task {params.id} not found")
+                                if persisted.status.state in A2A_TERMINAL_STATES:
+                                    event = persisted
+                                else:
+                                    copied = SdkTask()
+                                    copied.CopyFrom(event)
+                                    event = copied
+                                    if REMOTE_PROGRESS_KEY in event.metadata:
+                                        del event.metadata[REMOTE_PROGRESS_KEY]
+                                    if event.status.state not in A2A_TERMINAL_STATES and REMOTE_PROGRESS_KEY in persisted.metadata:
+                                        event.metadata[REMOTE_PROGRESS_KEY] = persisted.metadata[REMOTE_PROGRESS_KEY]
                             terminal = (
                                 isinstance(event, SdkTask)
                                 and event.status.state in A2A_TERMINAL_STATES
@@ -713,6 +1079,8 @@ class CoreRequestHandler(DefaultRequestHandler):
                             )
                             if not terminal:
                                 next_live = asyncio.create_task(anext(live_stream))
+                            if isinstance(event, SdkTask):
+                                previous_progress = json_format.MessageToDict(event.metadata).get(REMOTE_PROGRESS_KEY)
                             yield event
                             if terminal:
                                 return
@@ -723,7 +1091,10 @@ class CoreRequestHandler(DefaultRequestHandler):
                 if current == previous:
                     continue
                 previous = current
-                if next_live is None or task.status.state in A2A_TERMINAL_STATES:
+                progress = json_format.MessageToDict(task.metadata).get(REMOTE_PROGRESS_KEY)
+                progress_changed = progress != previous_progress
+                previous_progress = progress
+                if next_live is None or task.status.state in A2A_TERMINAL_STATES or progress_changed:
                     yield task
                     if task.status.state in A2A_TERMINAL_STATES:
                         return
@@ -743,9 +1114,12 @@ def build_starlette_app(
     cancel_signal=None,
     base_url,
     derive_base_url=False,
+    card_skills=None,
     resume_handler,
     followup_handler,
     context_builder=None,
+    admission_handler=None,
+    admission_cleanup=None,
     task_store=None,
     push_config_store=None,
     push_sender=None,
@@ -755,6 +1129,8 @@ def build_starlette_app(
     max_chunk_size=0,
 ):
     """Build the official A2A 1.0 JSON-RPC and HTTP+JSON bindings around the runtime."""
+    limit = request_limit()
+    protect_sdk_logs()
     sdk_card = to_sdk_agent_card(agent_card, base_url=base_url)
     request_handler = CoreRequestHandler(
         CoreAgentExecutor(
@@ -767,22 +1143,28 @@ def build_starlette_app(
             max_chunk_size=max_chunk_size,
         ),
         TransientStatusTaskStore(
-            task_store or InMemoryTaskStore(owner_resolver=resolve_owner_scope)
+            task_store or ScopedMemoryTaskStore()
         ),
         sdk_card,
         push_config_store=push_config_store,
         push_sender=push_sender,
         followup_handler=followup_handler,
+        admission_handler=admission_handler,
+        admission_cleanup=admission_cleanup,
     )
-    routes = _agent_card_routes(sdk_card, derive_base_url=derive_base_url)
+    routes = _agent_card_routes(sdk_card, derive_base_url=derive_base_url, card_skills=card_skills)
     for route in create_jsonrpc_routes(
         request_handler, DEFAULT_RPC_URL, context_builder=context_builder
     ):
         # A client that also repeats a field outside `params` must not be rejected.
-        route.endpoint = _tolerant_envelope(route.endpoint)
+        route.endpoint = _input_guard(route.endpoint, limit, rpc=True)
         route.app = request_response(route.endpoint)
         routes.append(route)
-    routes.extend(create_rest_routes(request_handler, context_builder=context_builder))
+    for route in create_rest_routes(request_handler, context_builder=context_builder):
+        if route.path in {"/message:send", "/message:stream"}:
+            route.endpoint = _input_guard(route.endpoint, limit, rpc=False)
+            route.app = request_response(route.endpoint)
+        routes.append(route)
     lifespan = None
     if push_sender or shutdown_handler:
 

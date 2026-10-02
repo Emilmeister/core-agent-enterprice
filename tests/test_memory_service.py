@@ -6,7 +6,7 @@ import unittest
 from urllib.error import HTTPError
 from unittest.mock import patch
 
-from core_agent.app import create_app
+from tests.app_support import create_app
 from core_agent.audit import InMemoryAuditLog
 from core_agent.config import AgentConfig, PlatformConfig, RunRequest
 from core_agent.durability import CheckpointStore, InMemoryEventStore
@@ -34,6 +34,7 @@ MEMORY_TOOLS = (
 NAMESPACE = "subject/user-42"
 
 BASE_ENVIRONMENT = {
+    "CORE_AGENT_ENVIRONMENT": "development",
     "NO_PROXY": "*",
     "no_proxy": "*",
     "SESSION_STORAGE_TYPE": "in-memory",
@@ -446,7 +447,7 @@ class FrontMatterInjectionTests(unittest.TestCase):
         )
 
         class PoisonedStore(InMemoryMemoryStore):
-            def load(self, *, app_name, user_id):
+            def load(self, *, app_name, user_id, tenant_id="default"):
                 return LoadedMemory(
                     documents=(StoredDocument("mem_good", NAMESPACE, "g.md", good, 1),),
                     versions=(
@@ -1460,8 +1461,8 @@ class PostgresMemoryTests(unittest.TestCase):
         original_load = self.store.load
         published = []
 
-        def racing_load(*, app_name, user_id):
-            result = original_load(app_name=app_name, user_id=user_id)
+        def racing_load(*, app_name, user_id, tenant_id="default"):
+            result = original_load(app_name=app_name, user_id=user_id, tenant_id=tenant_id)
             if not published:
                 published.append(True)
                 writer.create(title="Second", body="two", namespace=NAMESPACE)

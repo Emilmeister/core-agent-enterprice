@@ -49,7 +49,7 @@ root, абсолютные пути и внешние файлы модели н
 
 ### `core_terminal_exec`
 
-Запускает process в принадлежащей agent-у [TerminalSession](execution-environment.md) с явными `argv`, local workspace, environment allowlist и timeout. Main и каждый child имеют разные session/process group/workspace. `argv` исполняется напрямую без implicit shell: metacharacters вроде `&&` не интерпретируются. Если нужен shell, модель MUST явно вызвать его, например `{"argv":["sh","-lc","command-a && command-b"]}`, а policy оценивает этот вызов как часть arguments.
+Запускает process в принадлежащей agent-у [TerminalSession](execution-environment.md) с явными `argv`, chat workspace, environment allowlist и timeout. Main и каждый child имеют разные session/process group; постоянный workspace принадлежит их чату, отдельные scratch-копии допустимы для изоляции изменений. `argv` исполняется напрямую без implicit shell: metacharacters вроде `&&` не интерпретируются. Если нужен shell, модель MUST явно вызвать его, например `{"argv":["sh","-lc","command-a && command-b"]}`, а policy оценивает этот вызов как часть arguments.
 
 Образ v1 MUST предоставлять GNU coreutils/findutils/gawk/sed/grep, `rg`, `fd`, `file`,
 `tree`, `xxd`, `uchardet`, `jq`, Mike Farah `yq`, `xmlstarlet`, `sqlite3`,
@@ -71,11 +71,11 @@ root, абсолютные пути и внешние файлы модели н
 
 Выполняет bounded Python-код отдельным process в принадлежащем run workspace и предоставляет синхронный proxy `tools.call(canonical_name, arguments)` плюс immutable `tools.names`. Вложенный вызов built-in или MCP tool MUST повторно пройти EffectiveConfig, schema validation, policy, общий tool-call budget, owner/tenant checks, audit и дочерний OTel span. `core_python_exec` не может вызывать самого себя и не запускается через `core_task_start`.
 
-Agent SHOULD использовать Python для runtime-dependent, non-trivial или accuracy-sensitive deterministic computation, parsing/validation и небольшой synchronous композиции разрешённых tools. Тривиальная language work не требует process call. Текущее время MUST проверяться доступным authoritative runtime tool; при Python используются `datetime.now().astimezone()` и явный timezone/UTC offset, а указанная timezone конвертируется через `zoneinfo`, если доступна. Direct OS/process/network Python calls не подменяют отсутствующий agent tool и не проходят `tools.call` broker; Python process не является OS sandbox.
+Agent SHOULD использовать Python для runtime-dependent, non-trivial или accuracy-sensitive deterministic computation, parsing/validation и небольшой synchronous композиции разрешённых tools. Тривиальная language work не требует process call. Текущее время MUST проверяться доступным authoritative runtime tool; при Python используются `datetime.now().astimezone()` и явный timezone/UTC offset, а указанная timezone конвертируется через `zoneinfo`, если доступна. Direct OS/process/network Python calls не подменяют отсутствующий agent tool и не проходят `tools.call` broker; direct OS/process/network calls ограничены обязательным Bubblewrap и egress profile.
 
 Capability присутствует в обоих runtime-профилях и управляется только built-in allowlist.
 
-Код, timeout, cwd и output limit валидируются до запуска. Process использует очищенный environment, тот же owned workspace/process-group lifecycle и те же ограничения single-container trust model, что terminal. В `without_terminal` этот внутренний process backend не публикует terminal tool, но Python может импортировать `os`/`subprocess`; поэтому режим не является security sandbox от локальных команд. Ненулевой exit, exception, timeout и truncation нормализуются как обычный model-facing tool result; raw credentials в Python process не передаются.
+Код, timeout, cwd и output limit валидируются до запуска. Process использует очищенный environment, тот же owned workspace/process-group lifecycle и те же обязательные ограничения Bubblewrap и сетевой границы, что terminal. В `without_terminal` этот внутренний process backend не публикует terminal tool, но Python может импортировать `os`/`subprocess`; поэтому режим не является security sandbox от локальных команд. Ненулевой exit, exception, timeout и truncation нормализуются как обычный model-facing tool result; raw credentials в Python process не передаются.
 
 ### `core_fs_apply_patch`
 
@@ -104,7 +104,7 @@ policy/approval и generic second opinion без самостоятельног�
 
 ### Task tools
 
-`core_task_start/get/list/wait/cancel` управляют background Tasks. `start` не принимает task/delegate/Python tools. `wait` является passive durable wait, не busy loop, и при timeout возвращает текущий snapshot; новый `get` нужен только для более поздней проверки состояния. Полная semantics описана в [Фоновых задачах и делегировании](tasks-and-delegation.md).
+`core_task_start/get/list/wait/cancel` управляют background Tasks. `start` не принимает task/delegate/Python tools. `wait` является passive durable wait, не busy loop, для локального bounded wait при timeout возвращает текущий snapshot; remote handle подчиняется окончательному deadline LONG-02, который повторный wait не продлевает. Полная semantics описана в [Фоновых задачах и делегировании](tasks-and-delegation.md).
 
 ### Memory tools
 
@@ -114,23 +114,69 @@ policy/approval и generic second opinion без самостоятельног�
 
 Полный контракт scope, tool schemas, лимита 200 строк, backends, эмбеддингов и hybrid retrieval определён в [Памяти агента](memory-service.md).
 
-### Artifact tools
+### Файлы и A2A результаты
 
-`ARTIFACT_STORAGE_ENABLED=false` убирает `core_artifact_*` из каталога целиком и не создаёт backend. Остальные `ARTIFACT_*` переменные в этом случае MUST NOT требоваться и их отсутствие MUST NOT ронять старт: выключенное хранилище — это конфигурация, а не неполная конфигурация.
+`core_artifact_save`, `core_artifact_load`, `core_artifact_list` удалены из model catalog, registry, schemas и handlers. Их прежние allowlist names отклоняются с диагностикой конфигурации, stale calls не выполняются. Файлы доступны через workspace чата и проверенный UI/A2A transport по [Файлам](artifacts.md).
 
-`core_artifact_save/load/list` дают модели именованное версионируемое хранилище файлов. Имя с префиксом `user:` относится к user scope и видно во всех сессиях того же пользователя; без префикса артефакт принадлежит текущей сессии. Сохранение никогда не перезаписывает: каждый вызов создаёт следующую версию `0, 1, 2, ...` и возвращает её номер. `list` разделяет session и user scope, чтобы модель осознанно решала, что загружать. Backend выбирает `ARTIFACT_STORAGE_TYPE` (`in-memory`, `s3`, `mongodb`); внешние backends являются интеграциями и не управляют схемой хранилища. Устаревшие имена `core_artifact_put/get` в built-in allowlist отклоняются при startup, а stale model call не исполняется.
+Обычный model/child text result публикуется adapter-ом как стандартный A2A Task Artifact без дополнительного model turn или tool call.
 
-Хранилище артефактов не является файловой системой run-а, и описание тулов MUST это называть. Артефакт не появляется файлом в workspace, `load` возвращает содержимое модели и ничего не создаёт на диске, а файл, созданный в workspace, не становится артефактом сам по себе — workspace эфемерен, и результат в нём пропадает вместе с run-ом. Без этого модель сохраняет скрипт артефактом и запускает его в терминале по имени, а созданный ею файл отдаёт пользователю ссылкой на путь, которого через минуту не существует. Перенос файла в хранилище MUST быть возможен без прохода содержимого через контекст модели: `core_python_exec` вызывает `core_artifact_save` через `tools.call`, читая файл сам.
+### `core_response_files`
 
-Полный контракт scope, ключей, версионирования, integrity, backends и tool schemas определён в [Артефактах](artifacts.md).
+Выбирает весь набор файлов следующего финального ответа, не отправляя сообщение.
+Схема — ровно `{paths: string[]}`: уникальные непустые относительные пути обычных
+файлов текущего chat workspace. Absolute paths, URLs, traversal, symlinks,
+hardlinks и special files запрещены. `[]` очищает выбор. Два успешных вызова
+заменяют набор целиком, а ошибка сохраняет прежний набор и исходные файлы.
+Tool доступен только при настроенном trusted chat workspace и immutable transport
+storage; проходит обычные capability intersection, schema, policy/HITL, общий
+budget, guardrails и audit, также через Python broker и child allowlist.
 
-Обычный ответ модели и результат child-agent по-прежнему возвращаются как text result: A2A adapter публикует этот текст как стандартный Task Artifact без дополнительного model turn или tool call.
+Весь набор безопасно читается и проверяется до сохранения нового выбора.
+Возвращаются ordered receipts `{file_id,name,media_type,size_bytes,sha256}`.
+`ATTACHMENTS_TOO_LARGE` содержит `allowed_bytes` и `actual_bytes`; остальные
+recoverable ошибки — `FILE_NOT_FOUND`, `INVALID_FILE_PATH`, `FILE_CHANGED`,
+`FILE_READ_FAILED`, `ARTIFACT_INTEGRITY_FAILED`. Receipt и versioned immutable
+manifest фиксируются одним workflow transition. Child выбирает только свой
+результат; parent не получает автоматический root attachment set.
+Выдача и recovery описаны в [FILE-03](artifacts.md#file-03-выдача-и-отправка).
 
 ### `core_agent_send_message`
 
-Делегирует одну задачу настроенному удалённому A2A-агенту из `REMOTE_AGENTS` и возвращает его текст. Реестр строится при старте загрузкой Agent Card с bounded retry/backoff; недоступный агент пропускается, а не роняет startup. Задача передаётся без изменений, а `taskId`/`contextId` связывают подзадачу с корневой Task. Промежуточные события дочернего агента ретранслируются в поток корневой Task. Downstream уходит только allowlist заголовков `Authorization`, `X-PROJECT-ID`, `X-A2A-Extensions`; `SEND_MESSAGE_API_KEY` заменяет `Authorization` на `Api-Key`, иначе входящий токен проксируется как есть. Ответ удалённого агента является недоверенными данными и не может быть запущен в background через `core_task_start`.
+Optional `files` задаёт выбранные моделью относительные workspace paths только
+для этого вызова. Отсутствие поля и `[]` означают отсутствие вложений; никакой
+автоматической отправки файлов workspace или pending final selection нет.
+Весь набор сохраняется до HITL, общий decoded limit проверяется до отправки;
+ошибка сохраняет исходники и возвращается модели без создания remote handle.
 
-Полный контракт реестра, транспорта, проброса заголовков, ретрансляции и формата результата определён в [Удалённых A2A-агентах](tasks-and-delegation.md#удалённые-a2a-агенты).
+Отправляет одну задачу доверенному внешнему агенту из реестра владельцев и возвращает локальный operation handle без ожидания завершения. `core_task_wait` durable ожидает этот handle; remote IDs, deadlines, прогресс и auth описаны в [Удалённых A2A-агентах](tasks-and-delegation.md#удалённые-a2a-агенты). Входящий credential не проксируется; server использует secret-header configuration конкретного адресата. Ответ удалённого агента недоверенный, вызов не запускается через `core_task_start`.
+
+### `core_wait_until`
+
+Сохраняет отдельное ожидание до абсолютного момента; новый принятый follow-up будит его раньше с причиной `message`. Старый timer/duplicate message не будит следующее ожидание. Runtime освобождает worker; полные правила LONG-03 определены в [Ожиданиях](tasks-and-delegation.md).
+
+Единственный аргумент — обязательный `until` (ISO-8601 строка с явным UTC offset
+или `Z`); неизвестные поля и naive datetime отклоняются как `TOOL_ARGUMENT_INVALID`.
+Прошедший срок возвращает результат сразу. Результат содержит нормализованный
+`until`, `woke_at` в UTC и `reason: time|message`; при сообщении также `message_id`.
+Пробуждение не утверждает, что ожидаемое внешнее событие произошло.
+
+### Создание cron
+
+`core_cron_create` принимает ровно `{prompt, expression, timezone?}` и создаёт
+расписание текущего canonical чата. Default timezone —`Europe/Moscow`; tenant,
+owner, context, source и request identity модель не задаёт. Tool mutating с
+risk `external_write`, доступен в обоих runtime modes только внутри capability
+intersection и live tool policy. По умолчанию требуется HITL для exact subject; cron approval дополнительно
+содержит `resolved_parameters.timezone` с сохранённым IANA значением либо default
+`Europe/Moscow`. Это metadata для владельца и digest/stale проверки, а исходные
+`arguments` сохраняются без подмены. Direct и nested Python calls используют
+одну процедуру построения subject; старое решение с иным subject не dispatch-ится.
+Python broker и delegation повторно применяют те же проверки. Deny удаляет tool
+из model catalog и отвергает stale dispatch; owner UI сохраняет доступ.
+Повтор accepted call использует deterministic receipt; создание fenced текущим
+workflow lease и не повторяется после unknown outcome. Результат —metadata
+сохранённого расписания. Семантика CRON-01–10 определена в
+[Расписаниях](tasks-and-delegation.md).
 
 Дополнительные native filesystem/search tools SHOULD появляться там, где они дают более строгую path validation и structured output, чем shell. Terminal остаётся универсальным fallback, а не способом обойти typed tool policy.
 
@@ -233,9 +279,13 @@ process-local connection восстановление создаёт отдел�
 deadline и переподключается, но пересобирает EffectiveConfig из сохранённого
 catalog, а не из временной доступности optional server. Поэтому временно
 недоступный optional server не превращает checkpoint в `CHECKPOINT_INVALID` и
-не расширяет либо молча сужает tools. Read-only вызов такого server возвращает
-модели structured transport failure; mutating вызов сохраняет правило
-`SIDE_EFFECT_UNKNOWN`. Ошибка required reconnect или несовместимый checkpoint
+не меняет сохранённый capability ceiling. Каталог модели и dispatch используют
+текущие доступность и schema только тех identities, которые входят в этот ceiling:
+отсутствующий tool не публикуется модели, новая identity не добавляется. До
+dispatch исчезнувшего tool возвращается `TOOL_UNAVAILABLE`; смена schema или
+identity после HITL делает подтверждение устаревшим (`TOOL_APPROVAL_STALE`) и
+не допускает исполнения. Неизвестный outcome уже отправленного mutating вызова
+сохраняет правило `SIDE_EFFECT_UNKNOWN`. Ошибка required reconnect или несовместимый checkpoint
 фиксирует терминальный outcome, а не оставляет Task в бесконечном `RUNNING`.
 
 Ответ на запрос MUST выбираться по `id`, а не по порядку прибытия. Сервер вправе отправить в том же event stream `notifications/progress`, логи и собственные запросы до самого ответа, и медленный tool делает это почти всегда. Первый кадр потока — это, как правило, нотификация: у неё нет ни `result`, ни `error`, поэтому чтение «первого пакета» отдаёт модели пустой результат вместо данных, причём как успех. Такой отказ неотличим для модели от «сервер ничего не нашёл», и она отвечает пользователю выдуманным отсутствием данных. Кадры без `id` и кадры с чужим `id` MUST пропускаться до истечения `MCP_SSE_READ_TIMEOUT`.
@@ -261,3 +311,77 @@ MCP output всегда считается недоверенным. Server не
 3. после grace period завершить owned process group и закрыть PTY;
 4. закрыть MCP connections;
 5. перевести A2A Task в `canceled` с описанием возможных незавершённых side effects.
+
+## Политика владельцев для каждого инструмента
+
+### TOOL-01. Три режима для каждого инструмента
+
+| Режим | Каталог модели | Вызов |
+| --- | --- | --- |
+| Разрешён | Инструмент виден | Выполнение после остальных проверок |
+| Требует HITL | Инструмент виден | Каждый конкретный вызов ожидает решение владельца |
+| Запрещён | Инструмент отсутствует | Сервер также отклоняет попытку вызова |
+
+Политика применяется к built-ins и MCP. Новый инструмент по умолчанию требует
+HITL. Верхние ограничения platform/tenant и текущего runtime mode сохраняются:
+UI не разрешает возможность, запрещённую более строгим ограничением.
+Рекламируемые built-ins в Agent Card также фильтруются текущим owner deny при
+каждом authenticated чтении, по company вызывающего principal.
+
+Все пути выполнения, включая `tools.call(...)` из Python и делегирование,
+проходят одинаковую серверную проверку. Policy и каталог заново учитывают
+изменения владельца для последующих вызовов уже активной задачи. Начатый вызов
+означает уже переданный на исполнение вызов; он не прерывается из-за изменения
+настройки. Ожидание HITL сохраняется при переходе в автоматический режим
+по HITL-03 и сразу завершается при запрете инструмента по HITL-04.
+
+### TOOL-02. Исключение доверенного инструмента из guardrails
+
+Для каждого built-in и MCP tool владелец может через UI указать, что инструмент
+доверенный и для него не нужна проверка guardrails. Это отдельная настройка от
+трёх режимов TOOL-01: сама метка не разрешает запрещённый инструмент и не
+заменяет решение HITL. Новый инструмент по умолчанию проверяется guardrails;
+исключение включает только владелец.
+
+Метка отключает guardrails и для аргументов вызова, и для результатов конкретного
+инструмента: они не отправляются детектору и не создают связанных запросов
+guardrails. Валидация аргументов по схеме, проверки прав, изоляция и лимиты
+сохраняются в любом случае. Исключение не отключает отдельные проверки входящих
+сообщений и файлов только потому, что они могут использоваться этим инструментом.
+Ответ инструмента не становится системной инструкцией и не повышает права
+агента из-за этой настройки.
+Метка не отменяет уже зафиксированный отказ или timeout по конкретному материалу.
+
+Модель, внешний caller и metadata самого MCP tool не могут установить эту метку.
+Применение исключения связывается с идентичностью конкретного инструмента и
+доверенной конфигурацией, а не с текстом его ответа. Исключение внешнего вызова
+не отключает независимые проверки вложенных `tools.call(...)`.
+
+
+### TOOL-03. Идентичность policy и точка передачи на исполнение
+
+Policy хранится вне immutable EffectiveConfig, под ключом company, canonical
+name и runtime-derived origin (builtin либо MCP server/tool). Новый origin не
+наследует allow или guardrails exception прежнего инструмента с тем же alias.
+Schema digest и arguments конкретного approval неизменяемы; владельцы выбирают
+только allow/reject. Схема решения не содержит editable arguments.
+Несовпадение текущей schema/origin с подтверждённым вызовом возвращает
+`TOOL_APPROVAL_STALE` без dispatch; модель может создать новый вызов.
+
+Проверка текущей policy revision, запись dispatch intent и передача владения
+исполнителю образуют одну transactional admission boundary. Изменение policy,
+закоммиченное до этой границы, влияет на вызов; уже переданный вызов не
+прерывается. Owner approval сам по себе не является dispatch. Lock order:
+policy row, затем run rows в стабильном порядке, затем wait rows. `deny` в той же
+транзакции закрывает pending approvals этой identity во всех чатах company с
+`POLICY_DENIED`; `allow` не меняет существующие ожидания и сроки. Последняя
+проверка deny обязательна также для разрешённого, но ещё не переданного вызова.
+
+### TOOL-04. Вопрос владельцу
+
+`core_ask_owner` принимает ровно непустой `question` длиной до 16 384 символов.
+Tool сначала проходит собственную tool policy, затем создаёт отдельный
+owner_question с отдельным deadline. Ответ возвращается как `{"answer":"..."}`;
+timeout — linked tool result `OWNER_ANSWER_TIMEOUT`. Отказ/timeout approval дают
+`OWNER_APPROVAL_REJECTED`/`OWNER_APPROVAL_TIMEOUT`, позволяют модели продолжить
+задачу и не создают owner question. Обычный A2A follow-up не является ответом.

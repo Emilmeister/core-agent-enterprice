@@ -1,4 +1,5 @@
 import unittest
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -13,6 +14,26 @@ class ComposeContractTests(unittest.TestCase):
         cls.services = yaml.safe_load(
             (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         )["services"]
+
+    def test_agent_supplies_required_sandbox_host_controls(self):
+        agent = self.services["agent"]
+        self.assertGreater(agent.get("pids_limit", 0), 0)
+        self.assertGreater(float(agent.get("cpus", 0)), 0)
+        self.assertTrue(agent.get("mem_limit"))
+        self.assertTrue(agent.get("read_only"))
+        self.assertFalse(agent.get("privileged", False))
+        self.assertIn("ALL", agent.get("cap_drop", []))
+        self.assertFalse(agent.get("cap_add"))
+        options = agent.get("security_opt", [])
+        self.assertIn("no-new-privileges:true", options)
+        self.assertIn("systempaths=unconfined", options)
+        self.assertIn("seccomp=./deploy/security/oci-${SANDBOX_OCI_ARCH:-amd64}.json", options)
+        self.assertNotIn("seccomp=unconfined", options)
+        self.assertIn("/dev/net/tun:/dev/net/tun", agent.get("devices", []))
+        self.assertTrue(any(mount.startswith("/tmp:") for mount in agent.get("tmpfs", [])))
+        self.assertTrue(agent["environment"].get("UV_CACHE_DIR", "").startswith("/tmp/"))
+        self.assertEqual(agent["environment"].get("PUSH_NOTIFICATION_ENCRYPTION_KEY"),
+                         "${PUSH_NOTIFICATION_ENCRYPTION_KEY:-}")
 
     def test_phoenix_is_version_pinned_and_uses_postgres(self):
         phoenix = self.services["phoenix"]
@@ -69,8 +90,9 @@ class ComposeContractTests(unittest.TestCase):
             "${CORE_AGENT_RUNTIME_MODE:-with_terminal}",
         )
         self.assertIn("CORE_AGENT_ALLOWED_BUILTIN_TOOLS", environment)
-        self.assertIn(
-            "core_python_exec", environment["CORE_AGENT_ALLOWED_BUILTIN_TOOLS"]
+        self.assertEqual(
+            environment["CORE_AGENT_ALLOWED_BUILTIN_TOOLS"],
+            "${CORE_AGENT_ALLOWED_BUILTIN_TOOLS:-}",
         )
 
     def test_transfer_scheme_variables_are_wired_through_compose(self):
@@ -79,7 +101,6 @@ class ComposeContractTests(unittest.TestCase):
             ("AGENT_NAME", "${AGENT_NAME:-core-agent}"),
             ("THINKING_ENABLED", "${THINKING_ENABLED:-true}"),
             ("A2A_STREAMING_BUFFER_SIZE", "${A2A_STREAMING_BUFFER_SIZE:-10}"),
-            ("ARTIFACT_STORAGE_TYPE", "${ARTIFACT_STORAGE_TYPE:-in-memory}"),
             ("REMOTE_AGENTS", "${REMOTE_AGENTS:-}"),
             ("SEND_MESSAGE_API_KEY", "${SEND_MESSAGE_API_KEY:-}"),
             ("USER_ID", "${USER_ID:-anonymous}"),
@@ -105,6 +126,52 @@ class ComposeContractTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(environment[name], expected)
         self.assertEqual(environment["SESSION_STORAGE_TYPE"], "postgres")
+
+    def test_retired_named_storage_is_absent_and_defaults_use_runtime_mode_ceiling(self):
+        template = dict(
+            line.split("=", 1)
+            for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#") and "=" in line
+        )
+        environments = [template] + [
+            service.get("environment", {}) for service in self.services.values()
+        ]
+        for environment in environments:
+            for name in environment:
+                with self.subTest(name=name):
+                    self.assertFalse(name.startswith((
+                        "ARTIFACT_STORAGE_", "ARTIFACT_S3_", "ARTIFACT_MONGODB_",
+                    )))
+                    self.assertNotEqual(name, "RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS")
+        for environment in (template, self.services["agent"]["environment"]):
+            allowed = environment["CORE_AGENT_ALLOWED_BUILTIN_TOOLS"]
+            self.assertEqual(allowed, "" if environment is template else "${CORE_AGENT_ALLOWED_BUILTIN_TOOLS:-}")
+            for retired in ("core_artifact_save", "core_artifact_load", "core_artifact_list"):
+                self.assertNotIn(retired, allowed)
+            self.assertEqual(environment["DURABLE_STORAGE_ROOT"], "/data/durable")
+            self.assertEqual(environment["CHAT_WORKSPACE_ROOT"], "/data/chats")
+        self.assertEqual(template["MAX_RESPONSE_SIZE"], "100000000")
+        self.assertEqual(template["MAX_CHUNK_SIZE"], "0")
+        self.assertIn("PUSH_NOTIFICATION_ENCRYPTION_KEY", template)
+        self.assertEqual(
+            self.services["agent"]["environment"]["A2A_MAX_REQUEST_BYTES"],
+            "${A2A_MAX_REQUEST_BYTES:-40000000}",
+        )
+
+    def test_exclusive_mongo_dependency_is_removed_from_project_and_lock(self):
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertFalse(any(
+            dependency.startswith("pymongo")
+            for dependency in project["project"]["dependencies"]
+        ))
+        packages = {
+            package["name"]
+            for package in tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))["package"]
+        }
+        self.assertNotIn("pymongo", packages)
+        self.assertNotIn("dnspython", packages)
+        self.assertIn("a2a-sdk", packages)
+        self.assertIn("psycopg", packages)
 
     def test_preinstalled_skills_are_enabled_by_explicit_defaults(self):
         environment = self.services["agent"]["environment"]

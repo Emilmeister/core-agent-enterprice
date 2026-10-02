@@ -17,7 +17,7 @@ Core Agent публикует public Agent Card и, при наличии зак
 - public Agent Skills в терминах A2A;
 - optional informational extensions, если они объявлены.
 
-A2A Agent Skill описывает внешнюю capability сервера и не равен runtime skill package из RunRequest. Названия могут совпадать, но lifecycle и trust model различаются.
+A2A Agent Skill описывает внешнюю capability сервера и не равен runtime skill package из deployment configuration. Названия могут совпадать, но lifecycle и trust model различаются.
 
 ### Версия на каждый binding
 
@@ -92,7 +92,7 @@ Agent Card MAY объявлять optional informational extensions, не вли
 |---|---|---|
 | `CREATED`, `QUEUED` | `TASK_STATE_SUBMITTED` | задача принята, worker ещё не выполняет turn |
 | `RUNNING`, `WAITING_TASK`, `PAUSED`, `RECOVERING` | `TASK_STATE_WORKING` | точная причина доступна в безопасном status metadata |
-| `WAITING_INPUT` | `TASK_STATE_INPUT_REQUIRED` | caller должен предоставить новые бизнес-данные |
+| `WAITING_INPUT` | `TASK_STATE_INPUT_REQUIRED` | ожидаются бизнес-данные; owner-only вопрос требует владельца, внешний caller видит безопасный факт ожидания |
 | `WAITING_AUTH` | `TASK_STATE_AUTH_REQUIRED` | требуется credential/auth flow |
 | `COMPLETED` | `TASK_STATE_COMPLETED` | результаты представлены Artifacts; `completion_reason=budget_exhausted` и `complete=false` явно помечают честный неполный результат |
 | `FAILED`, `ABORTED` | `TASK_STATE_FAILED` | error metadata различает обычную ошибку и unsafe continuation |
@@ -151,13 +151,13 @@ Caller MAY отправлять дополнительные A2A Messages в у�
 - не прерывать уже начатый model call, tool call или side effect;
 - перед terminal commit атомарно проверить inbox: Message, committed раньше успешного terminal transition, MUST быть доставлен модели; перед `failed`/`canceled` он MUST быть durable перенесён в transcript с явной причиной, что остался необработанным, без нового model/tool call; Message, проигравший race terminal transition, MUST быть отклонён.
 
-Follow-up не пересобирает EffectiveConfig и не пополняет budgets: capabilities принадлежат конфигурации и неизменны на протяжении Task. Новейший turn MAY уточнить или изменить желаемый будущий результат, но не отменяет уже committed side effect; для отмены Task используется `CancelTask`.
+Follow-up не пересобирает admission ceiling и не пополняет budgets: capabilities принадлежат конфигурации, а текущая owner policy применяется отдельно по [Конфигурации](agent-configuration.md). Новейший turn MAY уточнить или изменить желаемый будущий результат, но не отменяет уже committed side effect; для отмены Task используется `CancelTask`.
 
-`WAITING_INPUT` и `WAITING_TASK` Task возобновляются notification-ом о новом inbox Message. В `RUNNING` Message ждёт следующую safe boundary. В `PAUSED` и `WAITING_AUTH` Message сохраняется, но не снимает паузу и не передаётся модели до разрешённого resume.
+Новый inbox Message немедленно будит ожидание времени `core_wait_until`. Во время HITL, owner input, guardrails и remote wait он сохраняется до завершения конкретного ожидания; обычный follow-up не является owner decision и не меняет deadline. В `RUNNING` он ждёт safe boundary, в `PAUSED`/`WAITING_AUTH` не снимает pause/auth boundary.
 
 ## Blocking, background и ожидание
 
-- Простое взаимодействие MAY вернуть direct A2A Message.
+- Enterprise создание root работы возвращает durable A2A Task; отдельная Message не заменяет admission, историю или busy result.
 - Любая работа с tools, side effects, background execution или сабагентом MUST иметь Task.
 - Non-blocking запуск использует A2A `return_immediately`; клиент затем polling, subscription или push notification.
 - Закрытие streaming connection MUST NOT отменять Task.
@@ -188,6 +188,14 @@ Follow-up не пересобирает EffectiveConfig и не пополняе
 - Secret, hidden reasoning и raw sensitive tool output MUST NOT попадать в Message или Artifact без явной data policy. Provider-visible reasoning MAY появляться только как помеченная часть промежуточного status Message при включённом streaming и MUST отсутствовать в терминальном кадре и Artifact.
 
 ## Streaming прогресса выполнения
+
+В enterprise runtime с подключённым material review публичный progress не
+содержит сырых аргументов/результатов tools, provider reasoning и ретранслированных
+кадров удалённого агента. Они могут содержать материал до принятия решения или
+приватные обращения к владельцу. Авторизованные владельцы получают точный subject
+и материал через owner interaction API. Публичный ответ и lifecycle updates
+сохраняются. Описанные ниже ADK-типы задают wire shape разрешённых data-policy
+кадров, но не требуют публикации этих приватных каналов в enterprise deployment.
 
 Streaming показывает вызывающей стороне ход выполнения Task: рассуждение модели, вызовы инструментов, их результаты и растущий текст ответа. Формат кадров фиксирован, потому что клиенты собирают из него состояние.
 
@@ -275,3 +283,14 @@ A2A binding MUST принимать и передавать W3C Trace Context ч
 - A2A protocol version договаривается стандартным способом binding-а; runtime фиксирует `Major.Minor`, а patch не участвует в compatibility negotiation.
 - Новый optional extension field обратно совместим; новый required field требует новой major extension version.
 - Persisted Task хранит A2A и extension versions, с которыми он был создан.
+
+
+## Owner и external представления
+
+Owner и external A2A endpoints используют один A2A lifecycle и отдельные authenticated access gates. На каждом новом HTTP-запросе проверяются Keycloak, tenant, стабильный caller scope и роль; внутри уже открытого ответа повторной introspection нет. Get/List/Subscribe/Cancel, history, push configuration и download не раскрывают чужие IDs. Owner-only решения и настройки недоступны service-account caller-ам независимо от текста/metadata.
+
+`contextId` соответствует одному чату. Создание новой root Task и durable `CONTEXT_BUSY` следуют TASK-01/02 [Публичного контракта](public-contract.md); ответ занятого чата является failed Task с `activeTaskId` только доступной вызывающему задачи, а не одновременно JSON-RPC error.
+
+Ожидание remote операции или таймера остаётся `working`; ожидание owner input/HITL/guardrails обозначается безопасным нетерминальным статусом, а конкретное решение принимает отдельный owner endpoint. Внешний caller видит факт ожидания владельца и предназначенный ему итог, но не внутренний вопрос/ответ. Это единая projection policy для history, Get/List, streams, push, file Parts, Artifacts и metadata, в том числе после recovery; raw transcript/summary не публикуется для обхода ограничения.
+
+Исходящие файлы используют стандартные A2A FileParts/Artifact parts или авторизованные transport references; общий лимит применяется до публикации всего набора, scope проверяется при каждом download. Байты не передаются через RunRequest и не требуют artifact tools. Потоковый прогресс и function args/results проходят ту же visibility policy до публикации; существующий ADK format не разрешает раскрыть внутренние owner данные.

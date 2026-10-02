@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextvars import copy_context
+
 import json
 import os
 from pathlib import Path
@@ -10,12 +12,11 @@ import sys
 import tempfile
 import threading
 
-from .errors import CoreError
+from .errors import CoreError, ExecutionNotStarted
 
 
-# Sized so the largest artifact the storage accepts still fits in one frame
-# as base64: a smaller limit makes core_artifact_save fail from here for a
-# file it accepts from anywhere else.
+# Bound the complete JSON IPC frame, including large tool results.
+# This is independent of file selection and transport attachment limits.
 MAX_RPC_BYTES = 140_000_000
 
 RUNNER = r'''
@@ -92,27 +93,50 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
 '''
 
 
+class PythonContinuationStopped(BaseException):
+    """Host-only control signal: never serialize a catchable Python RPC failure."""
+
+    def __init__(self, *, cleanup_failed=False):
+        self.cleanup_failed = cleanup_failed
+
+
 class PythonToolBroker:
     def __init__(self, code, tool_names, dispatch):
-        self.code = code
-        self.tool_names = tuple(sorted(tool_names))
-        self.dispatch = dispatch
-        self.token = secrets.token_hex(32)
-        self.directory = Path(tempfile.mkdtemp(prefix="core-python-", dir="/tmp"))
-        self.path = self.directory / "broker.sock"
-        self._stop = threading.Event()
-        self._connection = None
-        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.directory = None
         try:
+            self.code = code
+            self.tool_names = tuple(sorted(tool_names))
+            self.dispatch = dispatch
+            self.token = secrets.token_hex(32)
+            self.directory = Path(tempfile.mkdtemp(prefix="core-python-", dir="/tmp"))
+            self.path = self.directory / "broker.sock"
+            self._stop = threading.Event()
+            self._connection = None
+            self._hold_reply = False
+            self._dispatch_done = threading.Event()
+            self._dispatch_done.set()
+            self._listener = None
+            context = copy_context()
+            self._thread = threading.Thread(target=context.run, args=(self._serve,), daemon=True)
+        except Exception as error:
+            if self.directory is not None:
+                shutil.rmtree(self.directory, ignore_errors=True)
+            raise ExecutionNotStarted("TOOL_START_FAILED", "Python broker could not start") from error
+
+    def __enter__(self):
+        try:
+            self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._listener.bind(str(self.path))
-        except Exception:
-            self._listener.close()
+            os.chmod(self.path, 0o600)
+            self._listener.listen(1)
+            self._listener.settimeout(0.1)
+            self._thread.start()
+        except Exception as error:
+            if self._listener is not None:
+                self._listener.close()
             shutil.rmtree(self.directory, ignore_errors=True)
-            raise
-        os.chmod(self.path, 0o600)
-        self._listener.listen(1)
-        self._listener.settimeout(0.1)
-        self._thread = threading.Thread(target=self._serve, daemon=True)
+            raise ExecutionNotStarted("TOOL_START_FAILED", "Python broker could not start") from error
+        return self
 
     @staticmethod
     def _receive(stream):
@@ -168,6 +192,7 @@ class PythonToolBroker:
                 stream,
                 {"code": self.code, "tools": self.tool_names},
             )
+            seen = set()
             while not self._stop.is_set():
                 request = self._receive(stream)
                 if request is None:
@@ -182,7 +207,17 @@ class PythonToolBroker:
                         or not isinstance(arguments, dict)
                     ):
                         raise CoreError("CAPABILITY_DISABLED")
-                    output = self.dispatch(name, arguments)
+                    if request_id in seen or len(seen) >= 10000:
+                        raise CoreError("TOOL_ARGUMENT_INVALID", "Duplicate or excessive Python broker request")
+                    seen.add(request_id)
+                    self._dispatch_done.clear()
+                    try:
+                        output = self.dispatch(name, arguments, request_id)
+                    except PythonContinuationStopped as stopped:
+                        self._hold_reply = stopped.cleanup_failed
+                        raise
+                    finally:
+                        self._dispatch_done.set()
                     response = {"id": request_id, "ok": True, "output": output}
                     try:
                         self._send(stream, response)
@@ -197,6 +232,14 @@ class PythonToolBroker:
                                 "error": {"code": error.code, "message": str(error)},
                             },
                         )
+                except PythonContinuationStopped:
+                    if self._hold_reply:
+                        # Unknown cleanup is reconciliation, never a catchable
+                        # EOF/error to a possibly live interpreter. Stop accepting
+                        # calls and retain this connection until its peer exits.
+                        while connection.recv(4096):
+                            pass
+                    return
                 except CoreError as error:
                     self._send(
                         stream,
@@ -219,17 +262,14 @@ class PythonToolBroker:
                         },
                     )
 
-    def __enter__(self):
-        self._thread.start()
-        return self
-
     def __exit__(self, *_error):
         self._stop.set()
         try:
             self._listener.close()
         except OSError:
             pass
-        if self._connection is not None:
+        self._dispatch_done.wait(12)
+        if self._connection is not None and not self._hold_reply:
             try:
                 self._connection.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -275,11 +315,13 @@ def execute_python(
     cwd=None,
     timeout=30,
     max_output_bytes=100_000,
+    on_start=None,
 ):
+    sandboxed = getattr(getattr(environment_manager, "backend", None), "launcher", None) is not None
     with PythonToolBroker(code, tool_names, dispatch) as broker:
         request = {
             "argv": [
-                _interpreter(),
+                "/usr/local/bin/python3" if sandboxed else _interpreter(),
                 # `-P` only, never `-I`: isolated mode also drops user
                 # site-packages and PYTHONPATH, which is precisely what a
                 # `pip install` from the terminal writes to. `-P` alone keeps
@@ -289,7 +331,7 @@ def execute_python(
                 "-u",
                 "-c",
                 RUNNER,
-                str(broker.path),
+                "/run/core-agent/broker.sock" if sandboxed else str(broker.path),
                 broker.token,
             ],
             "timeout": timeout,
@@ -297,4 +339,7 @@ def execute_python(
         }
         if cwd is not None:
             request["cwd"] = cwd
-        return environment_manager.execute_transient(request, run_id)
+        trusted = {"broker_socket": broker.path} if sandboxed else {}
+        if on_start is not None:
+            trusted["on_start"] = on_start
+        return environment_manager.execute_transient(request, run_id, **trusted)

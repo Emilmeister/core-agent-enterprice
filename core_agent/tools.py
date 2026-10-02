@@ -16,6 +16,30 @@ class ToolDefinition:
     risk_tags: frozenset[str]
 
 
+CRON_CREATE_TOOL = ToolDefinition(
+    "core_cron_create",
+    "Create a recurring task in this chat. Use a five-field cron expression and an IANA timezone "
+    "(default Europe/Moscow). Owner approval and current tool policy apply.",
+    {"type": "object", "properties": {
+        "prompt": {"type": "string", "minLength": 1},
+        "expression": {"type": "string", "minLength": 1, "maxLength": 256},
+        "timezone": {"type": "string", "minLength": 1, "maxLength": 256},
+    }, "required": ["prompt", "expression"], "additionalProperties": False},
+    mutating=True, risk_tags=frozenset({"external_write"}),
+)
+
+RESPONSE_FILES_TOOL = ToolDefinition(
+    "core_response_files",
+    "Select workspace files for your next final response. Pass relative paths to existing files; "
+    "the complete selection replaces any previous selection. Pass [] to clear it. "
+    "This snapshots the files and does not send a message; finish with your normal final text.",
+    {"type": "object", "properties": {
+        "paths": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": True},
+    }, "required": ["paths"], "additionalProperties": False},
+    mutating=True, risk_tags=frozenset({"filesystem_read"}),
+)
+
+
 @dataclass(frozen=True)
 class ToolCall:
     id: str

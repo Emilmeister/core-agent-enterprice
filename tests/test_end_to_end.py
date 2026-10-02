@@ -27,7 +27,7 @@ from a2a.types import (
 )
 from a2a.utils.constants import TransportProtocol
 
-from core_agent.app import create_app
+from tests.app_support import create_app
 from core_agent.a2a import AgentCard, Artifact
 from core_agent.a2a_sdk import build_starlette_app
 from core_agent.errors import CoreError
@@ -396,6 +396,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         cls.environment = patch.dict(
             os.environ,
             {
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "LOCAL_WORKSPACE_ROOT": str(root / "workspaces"),
                 "RUNTIME_MAX_LLM_CALLS": "10",
                 "CORE_AGENT_MAX_TOOL_CALLS": "10",
@@ -415,7 +416,6 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(
             os.environ,
             {
-                "CORE_AGENT_TRUST_TERMINAL": "0",
             },
         ):
             cls.approval_app = create_app(
@@ -451,7 +451,13 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             request.message.role = Role.ROLE_USER
             request.message.parts.add().text = prompt
             events = [event async for event in client.send_message(request)]
-        task = events[-1].task
+            task = events[-1].task
+            deadline = asyncio.get_running_loop().time() + 5
+            while task.status.state in {
+                TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING,
+            } and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.025)
+                task = await client.get_task(GetTaskRequest(id=task.id))
         self.assertEqual(TaskState.Name(task.status.state), "TASK_STATE_COMPLETED")
         return task
 

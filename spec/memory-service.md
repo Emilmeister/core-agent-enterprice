@@ -25,9 +25,9 @@ Markdown-документ является единственным канони
 
 ## Scope
 
-Каждый memory-документ принадлежит тройке `(app_name, user_id, memory_id)`, где `app_name` — имя агента из AgentConfig, `user_id` — identity текущего run (`anonymous`, если identity отсутствует). Тройка является первичным ключом во всех backends.
+Каждый memory-документ принадлежит ключу `(tenant_id, app_name, user_id, memory_id)`, где `tenant_id` приходит только из trusted authenticated run scope, `app_name` — имя агента из AgentConfig, `user_id` — стабильная authenticated identity текущего run. Отсутствие tenant или identity в enterprise отклоняется. `anonymous` допустим только в explicit development/test legacy profile. Этот ключ является первичным во всех backends; совпадение имени агента и owner identity разных компаний не объединяет corpus, revisions, versions, embeddings, graph или caches.
 
-Внутри этой тройки документ дополнительно принадлежит namespace, который определяет видимость между сессиями:
+Внутри этого ключа документ дополнительно принадлежит namespace, который определяет видимость между сессиями:
 
 | Значение аргумента `scope` | Namespace | Видимость |
 |---|---|---|
@@ -36,9 +36,11 @@ Markdown-документ является единственным канони
 
 Namespace MUST выводиться runtime-ом из scope текущего run и MUST NOT приниматься от модели как произвольная строка. Модель выбирает только перечисление `user|session`; путь, `user_id` и `session_id` подставляет runtime. Это исключает чтение чужого namespace подбором аргумента.
 
-Run без `session_id` не может писать и читать `session` scope: такой вызов отклоняется как `TOOL_ARGUMENT_INVALID`. Фоновая задача, запущенная через `core_task_start`, выполняется без run scope, поэтому её память принадлежит `anonymous`; это ограничение, а не дефект, и оно совпадает с поведением artifact tools.
+Read/update/split/delete по известному `memory_id` MUST проверять namespace до чтения содержимого или изменения revision. Идентификатор документа другого namespace имеет те же not-found semantics, что отсутствующий документ; search-фильтр сам по себе не является проверкой доступа. Проверка и mutation сериализованы одной операцией.
 
-Main agent и сабагент имеют общую память только когда delegation contract явно передал memory tools: сабагент наследует ту же тройку scope, поэтому явно делегированный `core_memory_search` видит память родителя. Если parent не делегировал ни одного memory tool, child работает без памяти. Working scratchpad и Core transcript не являются общей памятью.
+Run без `session_id` не может писать и читать `session` scope: такой вызов отклоняется как `TOOL_ARGUMENT_INVALID`. Фоновая задача и child наследуют проверенный tenant/caller/chat scope parent-а; отсутствие scope не допускает fallback к общему `anonymous` corpus. Внешние callers разделены также в памяти, summary и retrieval.
+
+Main agent и сабагент имеют общую память только когда delegation contract явно передал memory tools: сабагент наследует те же trusted tenant/app/user и session scope, поэтому явно делегированный `core_memory_search` видит память родителя. Если parent не делегировал ни одного memory tool, child работает без памяти. Working scratchpad и Core transcript не являются общей памятью.
 
 ## Built-in tools
 
@@ -297,6 +299,7 @@ Backend без `vector_candidates` не теряет векторный кана
 
 ```sql
 CREATE TABLE core_memory_documents (
+    tenant_id   text        NOT NULL,
     app_name    text        NOT NULL,
     user_id     text        NOT NULL,
     memory_id   text        NOT NULL,
@@ -308,26 +311,30 @@ CREATE TABLE core_memory_documents (
     entities    jsonb,
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (app_name, user_id, memory_id)
+    PRIMARY KEY (tenant_id, app_name, user_id, memory_id)
 );
 
 CREATE TABLE core_memory_document_versions (
+    tenant_id   text        NOT NULL,
     app_name    text        NOT NULL,
     user_id     text        NOT NULL,
     memory_id   text        NOT NULL,
+    namespace   text        NOT NULL,
+    path        text        NOT NULL,
     revision    integer     NOT NULL,
     content     text        NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (app_name, user_id, memory_id, revision)
+    PRIMARY KEY (tenant_id, app_name, user_id, memory_id, revision)
 );
 
 CREATE TABLE core_memory_revisions (
+    tenant_id           text        NOT NULL,
     app_name            text        NOT NULL,
     user_id             text        NOT NULL,
     repository_revision integer     NOT NULL,
     resolutions         jsonb       NOT NULL,
     published_at        timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (app_name, user_id, repository_revision)
+    PRIMARY KEY (tenant_id, app_name, user_id, repository_revision)
 );
 ```
 
@@ -462,7 +469,7 @@ Reranker получает query, text/heading, BM25/vector ranks/scores, graph p
 - Conflict возвращает revision, на которой backend находится фактически, а не ту, которую предлагал проигравший writer. Вычислять её из собственного номера бесполезно: получится ровно то устаревшее значение, с которого writer и начал.
 - Получив conflict от backend, подсистема MUST перечитать состояние до того, как вернуть ошибку. Иначе она продолжит предлагать тот же номер, а retry, который эта же ошибка предписывает модели, не сможет выполниться никогда.
 - `load()` MUST NOT возвращать номер revision новее, чем прочитанный им corpus. Чтение по одному соединению без общей транзакции даёт каждому запросу собственный snapshot, поэтому номер revision читается до документов: отставший номер приводит к корректному конфликту при следующей публикации, а опережающий — к молчаливому удалению чужой записи.
-- Publication получает monotonic repository revision в пределах scope `(app_name, user_id)`.
+- Publication получает monotonic repository revision в пределах scope `(tenant_id, app_name, user_id)`.
 
 ## Security и retention
 

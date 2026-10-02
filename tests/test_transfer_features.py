@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -16,9 +18,7 @@ from unittest.mock import patch
 import httpx
 
 from core_agent.a2a import ATTACHMENTS_ONLY_PROMPT
-from core_agent.app import create_app
-from core_agent.artifact_service import ArtifactService, InMemoryArtifactBackend
-from core_agent.config import RunRequest
+from tests.app_support import create_app
 from core_agent.errors import CoreError
 from core_agent.model import CompatibleHttpModel
 from core_agent.remote_agents import (
@@ -32,6 +32,7 @@ from core_agent.streaming import StreamBuffer, integrate_stream_chunk
 BASE_ENVIRONMENT = {
     # patch.dict(clear=True) drops the ambient no_proxy, and urllib would then
     # send the loopback stub calls through the host's system proxy.
+    "CORE_AGENT_ENVIRONMENT": "development",
     "NO_PROXY": "*",
     "no_proxy": "*",
     "SESSION_STORAGE_TYPE": "in-memory",
@@ -47,12 +48,14 @@ class ModelHandler(BaseHTTPRequestHandler):
     reasoning = "Deciding what to do."
     answer = "Streamed answer."
     tool_call = None
+    requests = []
 
     def log_message(self, *args):
         pass
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).requests.append(body)
         seen_tool_result = any(
             message.get("role") == "tool" for message in body["messages"]
         )
@@ -224,90 +227,6 @@ class StreamBufferTests(unittest.TestCase):
         self.assertIsNone(buffer.flush())
 
 
-class ArtifactServiceTests(unittest.TestCase):
-    def setUp(self):
-        self.service = ArtifactService(InMemoryArtifactBackend(), max_bytes=64)
-        self.scope = {"app_name": "agent", "user_id": "u1", "session_id": "s1"}
-
-    def test_mongodb_backend_stores_and_reads_through_an_injected_collection(self):
-        from core_agent.artifact_service import MongoDbArtifactBackend
-
-        class Collection:
-            def __init__(self):
-                self.documents = {}
-
-            def replace_one(self, key, document, upsert=False):
-                self.documents[key["_id"]] = document
-
-            def find_one(self, key):
-                return self.documents.get(key["_id"])
-
-            def find(self, query, projection=None):
-                pattern = re.compile(query["_id"]["$regex"])
-                return [
-                    {"_id": key} for key in sorted(self.documents) if pattern.match(key)
-                ]
-
-        service = ArtifactService(MongoDbArtifactBackend(collection=Collection()))
-        stored = service.save(**self.scope, filename="m.txt", content=b"mongo")
-        self.assertEqual(stored.version, 0)
-        self.assertEqual(service.load(**self.scope, filename="m.txt")[1], b"mongo")
-        self.assertEqual(service.list_keys(**self.scope), (["m.txt"], []))
-
-    def test_every_save_creates_a_new_version_and_never_overwrites(self):
-        first = self.service.save(**self.scope, filename="report.txt", content=b"one")
-        second = self.service.save(**self.scope, filename="report.txt", content=b"two")
-        self.assertEqual((first.version, second.version), (0, 1))
-        self.assertEqual(
-            self.service.load(**self.scope, filename="report.txt")[1], b"two"
-        )
-        self.assertEqual(
-            self.service.load(**self.scope, filename="report.txt", version=0)[1], b"one"
-        )
-
-    def test_user_prefix_is_visible_from_a_different_session(self):
-        self.service.save(**self.scope, filename="user:profile.json", content=b"{}")
-        self.service.save(**self.scope, filename="notes.txt", content=b"local")
-        other = {**self.scope, "session_id": "s2"}
-        session_names, user_names = self.service.list_keys(**other)
-        self.assertEqual(session_names, [])
-        self.assertEqual(user_names, ["user:profile.json"])
-        self.assertEqual(
-            self.service.load(**other, filename="user:profile.json")[1], b"{}"
-        )
-
-    def test_media_type_is_guessed_and_metadata_round_trips(self):
-        stored = self.service.save(
-            **self.scope,
-            filename="data.json",
-            content=b"{}",
-            metadata={"category": "export"},
-        )
-        self.assertEqual(stored.media_type, "application/json")
-        loaded, _content = self.service.load(**self.scope, filename="data.json")
-        self.assertEqual(loaded.metadata, {"category": "export"})
-
-    def test_trust_boundary_rejects_traversal_oversize_and_missing_session(self):
-        for filename in ("../escape", "a/b", "", "\x00null"):
-            with self.subTest(filename=filename):
-                with self.assertRaises(CoreError) as caught:
-                    self.service.save(**self.scope, filename=filename, content=b"x")
-                self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
-        with self.assertRaises(CoreError) as caught:
-            self.service.save(**self.scope, filename="big.bin", content=b"x" * 65)
-        self.assertEqual(caught.exception.code, "ARTIFACT_TOO_LARGE")
-        with self.assertRaises(CoreError) as caught:
-            self.service.save(
-                app_name="agent",
-                user_id="u1",
-                session_id="",
-                filename="x.txt",
-                content=b"x",
-            )
-        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
-        with self.assertRaises(CoreError) as caught:
-            self.service.load(**self.scope, filename="missing.txt")
-        self.assertEqual(caught.exception.code, "NOT_FOUND")
 
 
 class ForwardedHeaderTests(unittest.TestCase):
@@ -438,6 +357,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         ModelHandler.reasoning = "Deciding what to do."
         ModelHandler.answer = "Streamed answer."
         ModelHandler.tool_call = None
+        ModelHandler.requests = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -448,6 +368,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             os.environ,
             {
                 **BASE_ENVIRONMENT,
+                "CORE_AGENT_ENVIRONMENT": "development",
                 "LOCAL_WORKSPACE_ROOT": str(Path(self.temp.name) / "workspaces"),
                 "A2A_STREAMING_BUFFER_SIZE": "4",
                 **environment,
@@ -522,7 +443,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"}
         ]
 
-    async def test_reasoning_streams_as_thought_parts_before_the_terminal_frame(self):
+    async def test_guarded_stream_keeps_reasoning_private_and_publishes_final_text(self):
         frames = await self._frames(self._app(), "hello")
         thoughts = [
             part["text"]
@@ -530,7 +451,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             for part in self._parts(frame)
             if (part.get("metadata") or {}).get("adk_thought")
         ]
-        self.assertIn("Deciding what to do.", thoughts)
+        self.assertEqual(thoughts, [])
 
         partials = [
             frame
@@ -561,8 +482,8 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_tool_calls_and_results_stream_as_adk_data_parts(self):
-        ModelHandler.tool_call = ("core_artifact_list", {})
+    async def test_guarded_tool_calls_and_results_remain_private(self):
+        ModelHandler.tool_call = ("core_task_list", {})
         frames = await self._frames(self._app(), "list my files")
         typed = [
             (part["metadata"]["adk_type"], part["data"])
@@ -570,28 +491,14 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             for part in self._parts(frame)
             if (part.get("metadata") or {}).get("adk_type")
         ]
-        self.assertEqual(
-            [kind for kind, _data in typed], ["function_call", "function_response"]
-        )
-        self.assertEqual(typed[0][1]["name"], "core_artifact_list")
-        self.assertEqual(typed[1][1]["response"]["status"], "succeeded")
+        self.assertEqual(typed, [])
+        result = next(json.loads(message["content"]) for message in ModelHandler.requests[-1]["messages"]
+                      if message.get("role") == "tool")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["tool_name"], "core_task_list")
 
-    async def test_artifact_tools_round_trip_through_the_model_catalog(self):
-        ModelHandler.tool_call = (
-            "core_artifact_save",
-            {"filename": "user:notes.txt", "content": "remember"},
-        )
-        frames = await self._frames(self._app(), "save a note")
-        responses = [
-            part["data"]["response"]
-            for frame in frames
-            for part in self._parts(frame)
-            if (part.get("metadata") or {}).get("adk_type") == "function_response"
-        ]
-        self.assertEqual(responses[0]["output"]["version"], 0)
-        self.assertEqual(responses[0]["output"]["artifact_name"], "user:notes.txt")
 
-    async def test_send_message_relays_the_remote_agent_progress_and_answer(self):
+    async def test_guarded_remote_result_reaches_model_without_raw_progress_relay(self):
         peer = ThreadingHTTPServer(("127.0.0.1", 0), RemoteAgentHandler)
         threading.Thread(target=peer.serve_forever, daemon=True).start()
         self.addCleanup(peer.server_close)
@@ -611,13 +518,9 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             if "text" in part
             and not (part.get("metadata") or {}).get("adk_thought")
         ]
-        self.assertIn("looking it up", relayed)
-        response = next(
-            part["data"]["response"]
-            for frame in frames
-            for part in self._parts(frame)
-            if (part.get("metadata") or {}).get("adk_type") == "function_response"
-        )
+        self.assertNotIn("looking it up", relayed)
+        response = next(json.loads(message["content"]) for message in ModelHandler.requests[-1]["messages"]
+                        if message.get("role") == "tool")
         self.assertEqual(response["output"]["result"], "24 degrees")
         self.assertTrue(response["output"]["success"])
         _body, headers = RemoteAgentHandler.seen
@@ -692,7 +595,8 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertNotIn("error", result)
                 self.assertEqual(result["result"]["task"]["contextId"], "ctx-a")
-                self.assertIn("contextId", logs.output[0])
+                self.assertIn("unknown JSON-RPC fields", logs.output[0])
+                self.assertNotIn("contextId", logs.output[0])
 
                 # Only outside: accepted, but never promoted to a session id.
                 result = await send(envelope("2", {"contextId": "ctx-b"}))
@@ -1258,6 +1162,15 @@ class ConfigurationTransferTests(unittest.TestCase):
         record, _ = startup(OTEL_ENDPOINT="https://collector.test")
         self.assertFalse(record["telemetry"]["credentials_configured"])
 
+        configured, line = startup(**{
+            f"OTEL_EXPORTER_OTLP_{signal.upper()}_ENDPOINT":
+                f"https://user:url-credential-canary@collector.test/v1/{signal}?api_key=query-canary#fragment-canary"
+            for signal in ("traces", "metrics", "logs")
+        })
+        for signal in ("traces", "metrics", "logs"):
+            self.assertEqual(configured["telemetry"][signal], f"https://collector.test/v1/{signal}")
+        self.assertNotIn("canary", line)
+
     def test_telemetry_can_be_switched_off_and_named_by_the_platform(self):
         from core_agent.observability import Telemetry
 
@@ -1314,38 +1227,6 @@ class ConfigurationTransferTests(unittest.TestCase):
         finally:
             app.state.close()
 
-    def test_disabled_artifact_storage_needs_no_other_artifact_variable(self):
-        from core_agent.model import ModelResponse, ScriptedModel
-
-        model = ScriptedModel([ModelResponse(message="ok")])
-        model.model = "artifact-model"
-        with patch.dict(
-            os.environ,
-            {
-                **BASE_ENVIRONMENT,
-                "LLM_MODEL": "m",
-                "LLM_API_BASE": "https://gateway.test/v1",
-                "LLM_API_KEY": "sk-model",
-                "ARTIFACT_STORAGE_ENABLED": "false",
-                # Deliberately no ARTIFACT_STORAGE_TYPE and no ARTIFACT_S3_*.
-                "ARTIFACT_STORAGE_TYPE": "s3",
-            },
-            clear=True,
-        ):
-            app = create_app(model=model)
-        try:
-            agent = app.state.core_agent
-            allowed = agent.agent_config.to_dict()["tools"]["builtins"]["allow"]
-            self.assertIsNone(agent.artifact_service)
-            self.assertFalse(
-                [name for name in allowed if name.startswith("core_artifact_")]
-            )
-            effective = agent._resolve_capabilities(
-                RunRequest.from_dict({"prompt": "x"})
-            )[2]
-            self.assertNotIn("artifacts", effective.enabled_capability_policies)
-        finally:
-            app.state.close()
 
     def test_mcp_server_answering_with_an_event_stream_connects(self):
         """A Streamable HTTP server may answer JSON or SSE; both must work."""
@@ -2374,7 +2255,6 @@ class ConfigurationTransferTests(unittest.TestCase):
                 "mcp_read_only_tools",
                 "remote_agents_configured",
                 "remote_agents_connected",
-                "artifact_storage",
                 "session_storage",
                 "model",
             ):
@@ -2492,7 +2372,7 @@ class ConfigurationTransferTests(unittest.TestCase):
         self.assertEqual(grouped["docs"], ["search"])
         self.assertEqual(grouped["evil"], [])
 
-    def test_subagent_inherits_artifact_and_remote_agent_services(self):
+    def test_subagent_inherits_remote_agent_services_without_named_storage(self):
         """A delegated tool whose service is missing answers CAPABILITY_DISABLED."""
         from core_agent.model import ModelResponse, ScriptedModel
 
@@ -2516,23 +2396,18 @@ class ConfigurationTransferTests(unittest.TestCase):
             parent = app.state.core_agent
             self.assertTrue(parent.remote_agents)
             child_raw = parent.agent_config.to_dict()
-            child = parent._child_agent(child_raw, ["core_artifact_save"])
+            child = parent._child_agent(child_raw, ["core_agent_send_message"])
 
             # Every service backing a delegable tool must reach the child.
-            self.assertIs(child.artifact_service, parent.artifact_service)
+            self.assertFalse(hasattr(parent, "artifact_service"))
+            self.assertFalse(hasattr(child, "artifact_service"))
             self.assertEqual(child.remote_agents, parent.remote_agents)
             self.assertEqual(child.send_message_api_key, "deployment-key")
 
-            # Parent and child share one session scope, so a handover by name works.
-            scope = {"app_name": "core-agent", "user_id": "u1", "session_id": "s1"}
-            parent.artifact_service.save(**scope, filename="hand.txt", content=b"over")
-            self.assertEqual(
-                child.artifact_service.load(**scope, filename="hand.txt")[1], b"over"
-            )
         finally:
             app.state.close()
 
-    def test_incoming_binary_parts_become_artifacts_or_are_refused(self):
+    def test_incoming_binary_parts_are_preserved_then_explicitly_refused_without_workspace_admission(self):
         from core_agent.a2a import Message, Part, parse_run_request
         from core_agent.model import ModelResponse, ScriptedModel
 
@@ -2596,112 +2471,6 @@ class ConfigurationTransferTests(unittest.TestCase):
         finally:
             app.state.close()
 
-        # Switched on, it is stored in session scope and referenced in the prompt.
-        app = build(RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS="true")
-        try:
-            hostile = parse_run_request(
-                message(
-                    Part.text("look"),
-                    Part.file(b"png", filename="user:profile.json"),
-                    Part.file(b"raw", filename="../escape", media_type="image/png"),
-                )
-            )
-            stored = app.state.store_attachments(hostile, "u1", "s1")
-            self.assertEqual(stored.attachments, ())
-            self.assertIn("profile.json", stored.prompt)
-            self.assertIn("attachment-2.png", stored.prompt)
-            service = app.state.core_agent.artifact_service
-            scope = {"app_name": "core-agent", "user_id": "u1", "session_id": "s1"}
-            session_names, user_names = service.list_keys(**scope)
-            # The caller-supplied "user:" prefix must not reach the user scope.
-            self.assertEqual(user_names, [])
-            self.assertEqual(session_names, ["attachment-2.png", "profile.json"])
-            self.assertEqual(service.load(**scope, filename="profile.json")[1], b"png")
-        finally:
-            app.state.close()
-
-    def test_a_stored_object_names_itself_for_the_download(self):
-        """The key ends in the version, so the URL alone would name the file `0`."""
-        from core_agent.artifact_service import ArtifactService, S3ArtifactBackend
-
-        sent = {}
-
-        class Recorder(S3ArtifactBackend):
-            def _request(self, method, path, *, body=b"", headers=None, query=None):
-                sent[method] = {"path": path, "headers": dict(headers or {})}
-                return b"", []
-
-            def list_prefix(self, prefix):
-                return []
-
-        backend = Recorder(
-            bucket="demo",
-            region="ru-central-1",
-            access_key_id="tenant:key",
-            secret_access_key="s",
-            endpoint_url="https://s3.cloud.ru",
-        )
-        service = ArtifactService(backend)
-        for filename, expected in (
-            ("deck.pptx", 'attachment; filename="deck.pptx"'),
-            ("Отчёт.docx", "filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82.docx"),
-        ):
-            with self.subTest(filename=filename):
-                service.save(
-                    app_name="a",
-                    user_id="u",
-                    session_id="s",
-                    filename=filename,
-                    content=b"x",
-                )
-                headers = sent["PUT"]["headers"]
-                self.assertTrue(sent["PUT"]["path"].endswith("/versions/0"))
-                self.assertIn(expected, headers["content-disposition"])
-                # Header values stay ASCII whatever the model named the file.
-                self.assertTrue(headers["content-disposition"].isascii())
-        self.assertEqual(
-            sent["PUT"]["headers"]["content-type"],
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-
-    def test_s3_endpoint_and_access_key_follow_the_cloud_ru_profile(self):
-        from core_agent.artifact_service import CLOUD_RU_ENDPOINT, S3ArtifactBackend
-
-        def build(**kwargs):
-            return S3ArtifactBackend(
-                bucket="demo", region="ru-central-1", secret_access_key="s", **kwargs
-            )
-
-        # A non-canonical endpoint warns and is overridden, it never fails startup.
-        with self.assertLogs("core_agent.runtime", "WARNING") as logs:
-            backend = build(endpoint_url="https://my-minio:9000", access_key_id="t:k")
-        self.assertEqual(backend._base, CLOUD_RU_ENDPOINT)
-        self.assertIn("my-minio", logs.output[0])
-        self.assertIn(CLOUD_RU_ENDPOINT, logs.output[0])
-
-        # A trailing slash is normalised silently.
-        with self.assertNoLogs("core_agent.runtime", "WARNING"):
-            self.assertEqual(
-                build(endpoint_url=CLOUD_RU_ENDPOINT + "/", access_key_id="t:k")._base,
-                CLOUD_RU_ENDPOINT,
-            )
-
-        # Cloud.ru requires exactly one colon with both halves present.
-        self.assertEqual(
-            build(
-                endpoint_url=CLOUD_RU_ENDPOINT, tenant_id="t", access_key_id="k"
-            ).access_key_id,
-            "t:k",
-        )
-        for key in ("AKIAKEY", "a:b:c", ":k", "t:"):
-            with self.subTest(access_key_id=key):
-                with self.assertRaises(CoreError) as caught:
-                    build(endpoint_url=CLOUD_RU_ENDPOINT, access_key_id=key)
-                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
-
-        # The AWS profile keeps plain access key ids.
-        self.assertEqual(build(access_key_id="AKIAKEY").access_key_id, "AKIAKEY")
-
     def test_blank_variables_fall_back_to_their_documented_defaults(self):
         """Compose substitutes "" for an unresolved ${VAR}; that must mean unset."""
         from core_agent.app import _model
@@ -2737,7 +2506,7 @@ class ConfigurationTransferTests(unittest.TestCase):
         """A misconfigured deployment must exit 1 with one readable line."""
         from core_agent.app import main
 
-        for environment, expected in (
+        cases = [
             ({"LLM_MODEL": ""}, "LLM_MODEL is required"),
             (
                 {"LLM_MODEL": "m", "LLM_API_FORMAT": "gemini"},
@@ -2747,17 +2516,122 @@ class ConfigurationTransferTests(unittest.TestCase):
                 {"LLM_MODEL": "m", "A2A_STREAMING_ENABLED": "maybe"},
                 "A2A_STREAMING_ENABLED must be boolean",
             ),
-        ):
+        ]
+        cases.extend((
+            {"LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled", name: "invalid-number-canary"},
+            name + " must be numeric",
+        ) for name in ("LLM_TIMEOUT", "LLM_MAX_TOKENS", "LLM_CONTEXT_WINDOW",
+                       "RUNTIME_MAX_LLM_CALLS", "EVENTS_COMPACTION_INTERVAL", "PORT",
+                       "A2A_STREAMING_BUFFER_SIZE", "MAX_CHUNK_SIZE"))
+        cases.append(({"LLM_MODEL": "m", "LOG_LEVEL": "invalid-level-canary"}, "LOG_LEVEL must be a valid logging level"))
+        cases.append(({"LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled",
+                       "REMOTE_AGENTS": "https://peer.example/a2a",
+                       "REMOTE_AGENTS_RETRYABLE_STATUS_CODES": "invalid-code-canary"},
+                      "REMOTE_AGENTS_RETRYABLE_STATUS_CODES must contain integers"))
+        cases.extend((
+            {"LLM_MODEL": "m", "LLM_TIMEOUT": "invalid-number-canary", "LOG_LEVEL": level},
+            "LLM_TIMEOUT must be numeric",
+        ) for level in ("CRITICAL", "FATAL"))
+        cases.extend((
+            {"LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled", name: "private-value-canary"},
+            expected,
+        ) for name, expected in (("TASK_STORAGE_TYPE", "unsupported TASK_STORAGE_TYPE"),
+                                 ("A2A_CAPABILITIES", "unknown A2A_CAPABILITIES")))
+        for environment, expected in cases:
             with self.subTest(environment=environment):
                 with patch.dict(
                     os.environ, {**BASE_ENVIRONMENT, **environment}, clear=True
-                ):
+                ), patch("core_agent.app.create_app", side_effect=create_app), patch("uvicorn.run") as listener:
                     with self.assertLogs("core_agent.runtime", "ERROR") as logs:
                         with self.assertRaises(SystemExit) as exit_code:
                             main()
                 self.assertEqual(exit_code.exception.code, 1)
                 self.assertIn(expected, logs.output[0])
                 self.assertIn("CONFIG_INVALID", logs.output[0])
+                self.assertNotIn("canary", "\n".join(logs.output))
+                listener.assert_not_called()
+
+    def test_invalid_provider_and_mcp_urls_stop_startup_without_credentials(self):
+        from core_agent.app import main
+
+        invalid = (
+            "https://user:invalid-url-canary＠model.test/path",
+            "https://[invalid-url-canary/path",
+            "https://",
+            "https://model.test:invalid-url-canary/path",
+            "https://model.test:70000/path",
+            "https://model.test:0/path",
+            "https://model.test:\n443/path",
+            "https://[::1]suffix/path",
+            "https://[::1].evil.test/path",
+            "ftp://model.test/path",
+        )
+        def factory():
+            app = create_app(guardrail_classifier=None)
+            self.addCleanup(app.state.close)
+            return app
+
+        for name in ("LLM_API_BASE", "LLM_ENDPOINT", "GUARDRAILS_LLM_BASE_URL", "MCP_URL",
+                     "OTEL_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                     "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"):
+            for value in invalid:
+                environment = {
+                    **BASE_ENVIRONMENT, "LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled", name: value,
+                }
+                if name == "GUARDRAILS_LLM_BASE_URL":
+                    environment.update(GUARDRAILS_LLM_PROVIDER="openai",
+                                       GUARDRAILS_LLM_MODEL="detector", GUARDRAILS_LLM_API_KEY="test-only")
+                with self.subTest(name=name, value=value), patch.dict(os.environ, environment, clear=True), \
+                        patch("core_agent.app.create_app", side_effect=factory), \
+                        patch("uvicorn.run") as listener:
+                    with self.assertLogs("core_agent.runtime", "ERROR") as logs, self.assertRaises(SystemExit) as error:
+                        main()
+                    self.assertEqual(error.exception.code, 1)
+                    failure = [line for line in logs.output if "startup failed:" in line]
+                    self.assertEqual(len(failure), 1)
+                    self.assertIn(name, failure[0])
+                    self.assertIn("CONFIG_INVALID", failure[0])
+                    self.assertNotIn("canary", "\n".join(logs.output))
+                    listener.assert_not_called()
+
+    def test_valid_provider_urls_preserve_endpoint_and_credentials(self):
+        endpoint = "https://user:credential-canary@model.test:443/v1/chat/completions?api_key=query-canary"
+        model = CompatibleHttpModel(api_format="openai", model="m", endpoint=endpoint)
+        self.assertEqual(model.endpoint, endpoint)
+        ipv6 = CompatibleHttpModel(api_format="anthropic", model="m", base_url="http://[::1]:8000/v1")
+        self.assertEqual(ipv6.endpoint, "http://[::1]:8000/v1/messages")
+
+    def test_invalid_database_url_never_reaches_pool_diagnostics_or_listener(self):
+        script = (
+            "from core_agent import app; from tests.app_support import create_app; "
+            "app.create_app=create_app; app.main()"
+        )
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=10,
+            env={**BASE_ENVIRONMENT, "LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled",
+                 "SESSION_STORAGE_TYPE": "postgres", "DATABASE_AUTO_MIGRATE": "false",
+                 "DATABASE_CONNECT_TIMEOUT_SECONDS": "0.1",
+                 "DATABASE_URL": "postgresql://user:database-canary%QQ@127.0.0.1:1/db"})
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        failures = [line for line in output.splitlines() if "startup failed:" in line]
+        self.assertEqual(len(failures), 1, output)
+        self.assertIn("CONFIG_INVALID", failures[0])
+        self.assertIn("DATABASE_URL", failures[0])
+        self.assertNotIn("database-canary", output)
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn("Uvicorn running", output)
+
+    def test_model_timeout_rejects_nonfinite_values(self):
+        from core_agent.app import _model
+
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {
+                    **BASE_ENVIRONMENT, "LLM_MODEL": "m", "LLM_TIMEOUT": value,
+                }, clear=True), self.assertRaises(CoreError) as caught:
+                    _model()
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                self.assertEqual(caught.exception.message, "LLM_TIMEOUT must be finite")
 
     def test_thinking_disabled_turns_the_effort_off_explicitly(self):
         with patch.dict(

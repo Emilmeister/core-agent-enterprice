@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,7 +71,7 @@ class PostgresArtifactStore:
 
     def put(self, tenant_id, content, *, media_type, provenance):
         content = bytes(content)
-        if not content or len(content) > self.max_bytes:
+        if len(content) > self.max_bytes:
             raise CoreError("ARTIFACT_TOO_LARGE")
         digest = "sha256:" + hashlib.sha256(content).hexdigest()
         provenance_bytes = json.dumps(
@@ -85,10 +87,16 @@ class PostgresArtifactStore:
                 stream.flush()
                 os.fsync(stream.fileno())
         except FileExistsError:
-            if hashlib.sha256(blob.read_bytes()).hexdigest() != digest.removeprefix(
-                "sha256:"
-            ):
-                raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
+            with blob.open("rb") as stream:
+                existing = stream.read(len(content) + 1)
+                if len(existing) != len(content) or hashlib.sha256(existing).hexdigest() != digest[7:]:
+                    raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+                os.fsync(stream.fileno())
+        descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         artifact = StoredArtifact(
             artifact_id,
             tenant_id,
@@ -125,9 +133,9 @@ class PostgresArtifactStore:
             raise CoreError("ARTIFACT_CONFLICT")
         return artifact
 
-    def get(self, tenant_id, artifact_id):
-        with self.database.pool.connection() as connection:
-            row = connection.execute(
+    def get(self, tenant_id, artifact_id, *, connection=None):
+        with (nullcontext(connection) if connection is not None else self.database.pool.connection()) as conn:
+            row = conn.execute(
                 """SELECT id, tenant_id, media_type, digest, size, provenance
                    FROM core_artifacts
                    WHERE id = %s AND tenant_id = %s AND state = 'active'""",
@@ -135,8 +143,13 @@ class PostgresArtifactStore:
             ).fetchone()
         if not row:
             raise CoreError("NOT_FOUND")
+        if (type(row["size"]) is not int or not 0 <= row["size"] <= self.max_bytes
+                or not isinstance(row["digest"], str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", row["digest"]) is None):
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
         try:
-            content = self._blob(row["digest"]).read_bytes()
+            with self._blob(row["digest"]).open("rb") as stream:
+                content = stream.read(row["size"] + 1)
         except OSError:
             raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
         if (
