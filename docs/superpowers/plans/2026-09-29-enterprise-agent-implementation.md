@@ -282,6 +282,30 @@ reference graph не удаляется. Generic runtime и старые artifac
 assertions не ослаблены. Target AppArmor/live providers и production cutover
 этим этапом не подтверждаются.
 
+## Безопасные URL и startup diagnostics
+
+- [x] Воспроизвести malformed/NFKC provider и MCP URLs: raw parser exception
+  раскрывает credential, часть invalid URLs допускает listener. Общий HTTP
+  parser возвращает named CONFIG_INVALID до serving; valid userinfo/query и
+  IPv6 provider destination сохраняются без изменения transport.
+- [x] Проверить DSN до открытия pool существующим libpq parser. Malformed
+  percent encoding больше не попадает в background worker diagnostic;
+  keyword/service/multi-host connection strings не заменяются URI-only policy.
+- [x] Отделить log-only URL projection от OTLP destinations. Startup record
+  и все три exporter signals скрывают userinfo/query/fragment; настоящий
+  controlled HTTP collector получает прежние path/query и Basic auth.
+- [x] Targeted проверки и read-only review не нашли оставшихся Important/Critical
+  замечаний. Combined финальная проверка с исправлением cron: sync, migration,
+  Ruff, 1660 tests за 250.368 секунды (skipped3), package и cleanup — exit0.
+  PostgreSQL, Keycloak и pg_dump/pg_restore были настоящими. Evidence —
+  `.local-evidence/startup-cron-reviewed-ci-final/`.
+- [ ] Повторить fresh image/Compose proof после сохранения текущих изменений.
+
+Исправление возвращает диагностику к существующему нормативному контракту;
+новые settings, dependencies и migration schema не вводятся. CFG-03 остаётся
+partial до полного fixed-contract audit; target AppArmor/live providers и
+production cutover остаются отдельными gates.
+
 ## Готовность к поставке
 
 Текущий срез включает owner UI, Keycloak scope, per-tool HITL/guardrails policy,
@@ -353,32 +377,34 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
   отвергает user-namespace idmapped mount `/dev/net/tun` и `/dev/net`.
   TUN-device на отдельном временном CSI томе смонтирован через subPath без этой
   ошибки и без записи в Node filesystem; агент остаётся non-root/caps0.
-  Actual app sandbox test не прошёл: стандартный AppArmor блокирует private
-  mount propagation. Trusted diagnostic с AppArmor Unconfined разрешает mount,
-  но Ubuntu unprivileged_userns ограничивает network capabilities; рабочий
-  профиль не заменён таким обходом. Evidence — `.local-evidence/target-tun-csi/`,
-  `.local-evidence/target-userns-diagnostics/` и
-  `.local-evidence/target-userns-unconfined-diagnostic/`.
-  Новый именованный профиль `core-agent-runtime-v1` подготовлен на основе
-  containerd baseline с явными userns/mount/pivot_root rules. Syntax/compile
-  AppArmor4.1.0, ABI4.0 и `--Werror=rule-not-enforced` проходят, exit0.
-  Одноразовый установщик добавляет только этот профиль, сохраняет проверенные
-  файлы в `/var/lib/core-agent/apparmor/` и не заменяет existing policies.
-  Target server dry-run принят; временный namespace удалён. Kernel load не
-  выполнялся: нужен отдельный ответ пользователя на запрос про MAC_ADMIN.
-  Evidence — `.local-evidence/target-apparmor-install/`; это подготовка
-  совместимости, не proof actual sandbox на target и не fallback Unconfined.
+  По новому явному разрешению пользователя именованный AppArmor-профиль
+  `core-agent-runtime-v1` установлен в enforce; existing profiles не заменялись.
+  Installer завершился exit0, его временный namespace удалён. Evidence —
+  `.local-evidence/target-apparmor-install/applied.json`.
+  На exact amd64 digest commit7e6cf59 прошли 10 native tests за 99.007 секунды:
+  actual app terminal/Python/background, nested HITL, namespace/files/FD,
+  inner seccomp, rlimits, teardown, bootstrap/exec failure и scoped broker.
+  Pod non-root/caps0 с Localhost seccomp/AppArmor завершился exit0; temporary
+  namespace удалён. Один запрос статуса прервался TLS handshake timeout;
+  повторный запрос подтвердил persisted Succeeded и actual container exit0.
+  Evidence — `.local-evidence/target-apparmor-sandbox/`.
+  Контролируемый target dual-stack network receiver и dedicated PID512 probe
+  ещё не выполнялись; эти два checks проходили на локальном native ARM64.
 - Target Cloud.ru CSI byte persistence после удаления и пересоздания Pod
   подтверждён на exact amd64 digest, checksum совпадает, оба Pod non-root/caps0.
   Namespace и PV удалены. Это подтверждение тома, не сквозной ENT-AC-32:
   root/child/background/recovered commands после recreate ещё нужны вместе с
   actual amd64/target namespace/network checks. Evidence —
   `.local-evidence/target-csi-recreate/`.
-- Реальный настроенный LLM возвращает HTTP404, Foundation Models embeddings
-  endpoint — HTTP503. Повторная проверка 2 октября в 05:11 UTC даёт те же
-  статусы; TLS проверен через системное доверие без отключения проверки.
-  Model catalogue возвращает HTTP200/95 models, но live provider/embedding
-  proof не прошёл. Контрактные tests не являются proof качества модели.
+- После обновления `.env` прямой Cloud.ru HTTP probe даёт embeddings200 и
+  actual dimension1024; локальное EMBEDDING_DIMENSION исправлено с768 на1024.
+  Через actual HttpEmbeddingProvider получен vector1024; actual configured
+  streaming CompatibleHttpModel вернул visible answer, finish_reason=stop,
+  completion_tokens514. TLS проверен системными CA; proxy отключён только в
+  процессе этой проверки, alias и настройки пользователя не читались.
+  Evidence — `.local-evidence/cloud-providers-updated/actual-adapters-system-trust.metadata.json`.
+  Это proof доступности provider adapters, не качества модели или полного
+  production memory/provider workflow.
 - Незавершённые foundation/migration release criteria остаются `partial`
   в `spec/implementation-status.md`; весь профиль не объявлен production-ready.
 - Main обновляется после согласованных проверок; проверенные логические

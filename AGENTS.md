@@ -267,6 +267,10 @@ Target spec может описывать больше текущего runtime.
   с `CONFIG_INVALID` и именем настройки без её raw value. Неверный `LOG_LEVEL`
   тоже проходит через безопасную startup error boundary; fatal startup diagnostic
   публикуется на уровне `CRITICAL`, включая `LOG_LEVEL=CRITICAL/FATAL`.
+- Provider и MCP URLs валидируются до serving через общий HTTP parser без raw
+  parser diagnostics. DSN проверяется libpq parser до открытия PostgreSQL pool;
+  его синтаксические ошибки не попадают в worker logs. URL projection для logs
+  удаляет userinfo/query/fragment, сохраняя исходный адрес для transport.
 - Настроенный Keycloak открывает `/a2a/owner/`, `/a2a/external/` и owner-only
   `/api/identity`; старые корневые A2A routes закрыты. Probes остаются публичными.
   Agent Card на обоих A2A входах и обоих well-known путях фильтрует owner deny

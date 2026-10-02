@@ -6,6 +6,7 @@ import time
 import unittest
 import threading
 import tempfile
+import socket
 from pathlib import Path
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -4804,6 +4805,118 @@ class ObservabilityTests(unittest.TestCase):
     def test_otlp_env_is_optional(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(Telemetry.otlp_from_env())
+
+    def test_invalid_otlp_urls_fail_before_sdk_provider_allocation(self):
+        settings = {"endpoint": "OTEL_ENDPOINT", "trace_endpoint": "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    "metric_endpoint": "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                    "log_endpoint": "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"}
+        invalid = ("http://user:url-credential-canary@127.0.0.1:bad/v1/traces",
+                   "https://user:url-credential-canary＠collector.test/v1/traces",
+                   "https://", "ftp://collector.test/v1/traces")
+        for argument, name in settings.items():
+            for endpoint in invalid:
+                with self.subTest(argument=argument, endpoint=endpoint), \
+                        patch("opentelemetry.sdk.trace.TracerProvider") as provider:
+                    telemetry = None
+                    try:
+                        with self.assertRaises(CoreError) as error:
+                            telemetry = Telemetry.otlp(**{argument: endpoint})
+                    finally:
+                        if telemetry is not None:
+                            telemetry.shutdown()
+                    self.assertEqual(error.exception.code, "CONFIG_INVALID")
+                    self.assertIn(name, error.exception.message)
+                    self.assertNotIn("canary", error.exception.message)
+                    provider.assert_not_called()
+
+    def test_failed_otlp_exports_never_log_url_credentials(self):
+        class FailingCollector(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FailingCollector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            base = f"http://user:userinfo-canary@127.0.0.1:{server.server_port}"
+            signals = ("traces", "metrics", "logs")
+            environment = {f"OTEL_EXPORTER_OTLP_{signal.upper()}_TIMEOUT": "3.1" for signal in signals}
+            environment.update(NO_PROXY="*", no_proxy="*")
+            with patch.dict(os.environ, environment), \
+                    patch("opentelemetry.exporter.otlp.proto.http.trace_exporter.random.uniform", return_value=0.8), \
+                    self.assertLogs("opentelemetry.exporter.otlp.proto.http", "WARNING") as captured:
+                telemetry = Telemetry.otlp(**{
+                    argument: f"{base}/v1/{signal}?credential=query-canary"
+                    for argument, signal in (("trace_endpoint", "traces"), ("metric_endpoint", "metrics"), ("log_endpoint", "logs"))
+                })
+                try:
+                    with telemetry.span("core_agent.failed_export"):
+                        pass
+                    telemetry.metric("core_agent.failed_export.count", 1)
+                    telemetry.log("failed-export-event")
+                    telemetry.exporter.trace_provider.force_flush()
+                    telemetry.exporter.meter_provider.force_flush()
+                    telemetry.exporter.logger_provider.force_flush()
+                finally:
+                    telemetry.shutdown()
+            output = "\n".join(captured.output)
+            self.assertIn("Transient error", output)
+            self.assertNotIn("canary", output)
+            self.assertEqual({record.name.rsplit(".", 1)[-1] for record in captured.records},
+                             {"trace_exporter", "metric_exporter", "_log_exporter"})
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_otlp_configuration_hides_url_credentials_without_changing_destinations(self):
+        received = []
+
+        class Collector(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                received.append((self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://collector:url-credential-canary@127.0.0.1:{server.server_port}"
+        signals = ("traces", "metrics", "logs")
+        endpoints = {
+            signal: f"{base}/v1/{signal}?credential=query-credential-canary#fragment-canary"
+            for signal in signals
+        }
+        telemetry = Telemetry.otlp(
+            trace_endpoint=endpoints["traces"],
+            metric_endpoint=endpoints["metrics"],
+            log_endpoint=endpoints["logs"],
+        )
+        try:
+            self.assertEqual(telemetry.exporter.configuration, {
+                **{signal: f"http://127.0.0.1:{server.server_port}/v1/{signal}"
+                   for signal in signals},
+                "credentials_configured": False,
+            })
+            with telemetry.span("core_agent.safe_endpoint"):
+                pass
+            telemetry.metric("core_agent.safe_endpoint.count", 1)
+            telemetry.log("safe-endpoint-event")
+        finally:
+            telemetry.shutdown()
+            server.shutdown()
+            server.server_close()
+        self.assertEqual({path for path, _auth in received}, {
+            f"/v1/{signal}?credential=query-credential-canary" for signal in signals
+        })
+        self.assertTrue(all(auth and auth.startswith("Basic ") for _path, auth in received))
 
     def test_memory_subsystem_owns_in_process_spans_on_the_caller_trace(self):
         class FixedEmbeddings:

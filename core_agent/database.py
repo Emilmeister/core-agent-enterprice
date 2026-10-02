@@ -13,6 +13,7 @@ from a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
 from a2a.utils.errors import InvalidParamsError
 from a2a.utils.task import decode_page_token, encode_page_token
 from psycopg import Error as PostgresError
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 from psycopg.sql import SQL, Identifier
 from psycopg.types.json import Jsonb
@@ -883,6 +884,11 @@ class PostgresDatabase:
                 "DATABASE_URL_REQUIRED",
                 "set SESSION_DATABASE_URL, SESSION_POSTGRES_HOST or DATABASE_URL",
             )
+        try:
+            conninfo_to_dict(url)
+        except (PostgresError, TypeError, ValueError):
+            # Pool workers log parse errors, which can contain credential bytes.
+            raise CoreError("CONFIG_INVALID", "DATABASE_URL must contain valid PostgreSQL connection settings") from None
         if min_size < 0 or max_size < 1 or min_size > max_size or timeout <= 0:
             raise CoreError("CONFIG_INVALID", "invalid database pool configuration")
         self._closed = False

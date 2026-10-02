@@ -66,7 +66,7 @@ from .push import DurablePushNotificationSender, PostgresPushNotificationConfigS
 from .remote_agents import RemoteAgentRegistry
 from .remote_registry import InMemoryRemoteRegistry, PostgresRemoteRegistry
 from .runtime import CoreAgent
-from .security import redact
+from .security import redact, safe_url, validate_http_url
 from .skills import SkillResolver
 from .tasks import TaskScheduler
 from .ui import ui_routes
@@ -338,6 +338,7 @@ def _guardrail_classifier(model):
     max_input = _number("GUARDRAILS_MAX_INPUT_TOKENS", int, default="100000")
     if all(overrides):
         provider, name, base_url, api_key = overrides
+        validate_http_url(base_url, "GUARDRAILS_LLM_BASE_URL")
         detector = CompatibleHttpModel(
             api_format="anthropic" if provider.lower() == "anthropic" else "openai",
             provider=provider, model=name, base_url=base_url, api_key=api_key,
@@ -583,11 +584,7 @@ def _memory_database(state):
 
 def _safe_url(url):
     """Drop userinfo: a configured URL may carry credentials the log must not keep."""
-    parsed = urlparse(url)
-    if not parsed.hostname:
-        return url
-    host = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
-    return f"{parsed.scheme}://{host}{parsed.path}" if parsed.scheme else host
+    return safe_url(url)
 
 
 def _remote_agents():
@@ -699,7 +696,7 @@ def _declared_skills(allowed):
 
 
 def _mcp_name(url, index):
-    parsed = urlparse(url)
+    parsed = validate_http_url(url, "MCP_URL")
     return (
         parsed.path.strip("/").split("/")[-1] or parsed.hostname or f"mcp_{index + 1}"
     )

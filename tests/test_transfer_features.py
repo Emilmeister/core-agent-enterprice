@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1159,6 +1161,15 @@ class ConfigurationTransferTests(unittest.TestCase):
 
         record, _ = startup(OTEL_ENDPOINT="https://collector.test")
         self.assertFalse(record["telemetry"]["credentials_configured"])
+
+        configured, line = startup(**{
+            f"OTEL_EXPORTER_OTLP_{signal.upper()}_ENDPOINT":
+                f"https://user:url-credential-canary@collector.test/v1/{signal}?api_key=query-canary#fragment-canary"
+            for signal in ("traces", "metrics", "logs")
+        })
+        for signal in ("traces", "metrics", "logs"):
+            self.assertEqual(configured["telemetry"][signal], f"https://collector.test/v1/{signal}")
+        self.assertNotIn("canary", line)
 
     def test_telemetry_can_be_switched_off_and_named_by_the_platform(self):
         from core_agent.observability import Telemetry
@@ -2539,6 +2550,76 @@ class ConfigurationTransferTests(unittest.TestCase):
                 self.assertIn("CONFIG_INVALID", logs.output[0])
                 self.assertNotIn("canary", "\n".join(logs.output))
                 listener.assert_not_called()
+
+    def test_invalid_provider_and_mcp_urls_stop_startup_without_credentials(self):
+        from core_agent.app import main
+
+        invalid = (
+            "https://user:invalid-url-canary＠model.test/path",
+            "https://[invalid-url-canary/path",
+            "https://",
+            "https://model.test:invalid-url-canary/path",
+            "https://model.test:70000/path",
+            "https://model.test:0/path",
+            "https://model.test:\n443/path",
+            "https://[::1]suffix/path",
+            "https://[::1].evil.test/path",
+            "ftp://model.test/path",
+        )
+        def factory():
+            app = create_app(guardrail_classifier=None)
+            self.addCleanup(app.state.close)
+            return app
+
+        for name in ("LLM_API_BASE", "LLM_ENDPOINT", "GUARDRAILS_LLM_BASE_URL", "MCP_URL",
+                     "OTEL_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                     "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"):
+            for value in invalid:
+                environment = {
+                    **BASE_ENVIRONMENT, "LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled", name: value,
+                }
+                if name == "GUARDRAILS_LLM_BASE_URL":
+                    environment.update(GUARDRAILS_LLM_PROVIDER="openai",
+                                       GUARDRAILS_LLM_MODEL="detector", GUARDRAILS_LLM_API_KEY="test-only")
+                with self.subTest(name=name, value=value), patch.dict(os.environ, environment, clear=True), \
+                        patch("core_agent.app.create_app", side_effect=factory), \
+                        patch("uvicorn.run") as listener:
+                    with self.assertLogs("core_agent.runtime", "ERROR") as logs, self.assertRaises(SystemExit) as error:
+                        main()
+                    self.assertEqual(error.exception.code, 1)
+                    failure = [line for line in logs.output if "startup failed:" in line]
+                    self.assertEqual(len(failure), 1)
+                    self.assertIn(name, failure[0])
+                    self.assertIn("CONFIG_INVALID", failure[0])
+                    self.assertNotIn("canary", "\n".join(logs.output))
+                    listener.assert_not_called()
+
+    def test_valid_provider_urls_preserve_endpoint_and_credentials(self):
+        endpoint = "https://user:credential-canary@model.test:443/v1/chat/completions?api_key=query-canary"
+        model = CompatibleHttpModel(api_format="openai", model="m", endpoint=endpoint)
+        self.assertEqual(model.endpoint, endpoint)
+        ipv6 = CompatibleHttpModel(api_format="anthropic", model="m", base_url="http://[::1]:8000/v1")
+        self.assertEqual(ipv6.endpoint, "http://[::1]:8000/v1/messages")
+
+    def test_invalid_database_url_never_reaches_pool_diagnostics_or_listener(self):
+        script = (
+            "from core_agent import app; from tests.app_support import create_app; "
+            "app.create_app=create_app; app.main()"
+        )
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=10,
+            env={**BASE_ENVIRONMENT, "LLM_MODEL": "m", "CORE_AGENT_MEMORY": "disabled",
+                 "SESSION_STORAGE_TYPE": "postgres", "DATABASE_AUTO_MIGRATE": "false",
+                 "DATABASE_CONNECT_TIMEOUT_SECONDS": "0.1",
+                 "DATABASE_URL": "postgresql://user:database-canary%QQ@127.0.0.1:1/db"})
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        failures = [line for line in output.splitlines() if "startup failed:" in line]
+        self.assertEqual(len(failures), 1, output)
+        self.assertIn("CONFIG_INVALID", failures[0])
+        self.assertIn("DATABASE_URL", failures[0])
+        self.assertNotIn("database-canary", output)
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn("Uvicorn running", output)
 
     def test_model_timeout_rejects_nonfinite_values(self):
         from core_agent.app import _model
