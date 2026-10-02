@@ -299,7 +299,16 @@ assertions не ослаблены. Target AppArmor/live providers и production
   Ruff, 1660 tests за 250.368 секунды (skipped3), package и cleanup — exit0.
   PostgreSQL, Keycloak и pg_dump/pg_restore были настоящими. Evidence —
   `.local-evidence/startup-cron-reviewed-ci-final/`.
-- [ ] Повторить fresh image/Compose proof после сохранения текущих изменений.
+- [x] Fresh images commitf7cf5ad собраны для native ARM64 и target amd64;
+  amd64 image загружен в разрешённый registry, digest
+  `sha256:d0a1dd2f6ca00e9cc8d324c9386f4a334ebbc8109a07f8769a5f2ba742df66ed`.
+  Native12 tests за107.186 секунды, target10 за101.248, Compose1 за22.851
+  и actual Chromium/Keycloak/PostgreSQL/native Pod browser1 за88.817 — exit0,
+  без skips. Все созданные этими проверками namespaces/volumes/relay удалены.
+  Evidence — `.local-evidence/startup-cron-native-final/`,
+  `.local-evidence/startup-cron-target-final/`,
+  `.local-evidence/startup-cron-compose-reviewed-final/` и
+  `.local-evidence/startup-cron-browser-reviewed-final/`.
 
 Исправление возвращает диагностику к существующему нормативному контракту;
 новые settings, dependencies и migration schema не вводятся. CFG-03 остаётся
