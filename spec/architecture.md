@@ -230,6 +230,32 @@ Migration заранее делает recoverable backup metadata и blobs, пр
 
 Wait, cron и file schemas/checkpoints версионируются; migration сохраняет абсолютные deadlines, admission IDs, closed outcomes, visibility и side-effect intent. Старый checkpoint с неизвестным исходом dispatched call переводится в reconciliation, а не переотправляется. Неизвестная schema version не исполняется. Legacy ephemeral workspace нельзя объявить постоянным без переноса на `CHAT_WORKSPACE_ROOT`; старые snapshots не восстанавливают удалённые файлы.
 
+Версия PostgreSQL относится ко всей serving сборке. Enterprise переходы:
+
+| Schema | Persisted изменение |
+| --- | --- |
+| 13 | Trusted chat ownership и caller/messageId creation ledger |
+| 14 | Durable waits с абсолютными deadlines, generation и закрытым outcome |
+| 15 | Company settings и CAS tool policies; отсутствие policy требует HITL |
+| 16 | Version-1 manifests и состояния private file batches |
+| 17 | Version-1 material reviews, usage, decisions и ссылки на waits |
+| 18 | Общий attachment limit с default 25 000 000 bytes |
+| 19 | Version-1 remote registry, encrypted revisions и remote wait settings |
+| 20 | Nullable remote operation checkpoint в background task |
+| 21 | Version-1 workspace cleanup intent и canonical chat binding constraint |
+| 22 | Version-1 cron schedules/events и immutable chat binding |
+| 23 | Уточнение transition/identity constraints file batch; manifest version сохраняется |
+| 24 | Trusted tenant scope memory documents, versions и repository revisions |
+
+Для каждого перехода действует один порядок: сохранить согласованный backup
+БД и blobs, остановить старые workers, выполнить отдельную migration job,
+проверить целевую schema и запустить соответствующий serving image. Migration
+повторяется без повторного изменения уже применённых версий. Serving process
+не выполняет DDL; старый image отклоняет новую schema, а migration build
+отклоняет неизвестные ему versions. До новых mutations возможен возврат
+согласованного pre-migration backup. После новых accepted records действует
+граница rollback ниже; удаление записей о migrations не является downgrade.
+
 CLEAN-01 не меняет PostgreSQL schema. Перед cutover завершаются active Tasks со
 старым frozen capability set. Snapshot, digest которого включает снятые named
 artifact capabilities, отклоняется как `CHECKPOINT_INVALID`, а не пересобирается

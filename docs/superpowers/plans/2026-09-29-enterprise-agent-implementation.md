@@ -76,7 +76,7 @@
   существующих identity/context и отсутствие автоматического присвоения старых
   данных новому внешнему caller. Номер публичного application contract отделить
   от версии A2A протокола.
-- [ ] Определить версии persisted state и порядок миграции: chat ownership,
+- [x] Определить версии persisted state и порядок миграции: chat ownership,
   создание задач/messageId, wait records, pending HITL, remote handles,
   расписания, file metadata и ссылки на содержимое. Миграция выполняется
   отдельной migration job; serving process не повышает schema version сам.
@@ -85,7 +85,7 @@
 - [x] Описать перенос `REMOTE_AGENTS` в управляемые владельцами настройки,
   отсутствие секретов в UI-ответах и сохранение старых файлов при удалении
   artifact service. До переноса загрузки файлов artifact backend не удалять.
-- [ ] Для каждого изменения схемы указать допустимый порядок обновления image/БД
+- [x] Для каждого изменения схемы указать допустимый порядок обновления image/БД
   и границу отката. Не обещать запуск старого image с неизвестной ему схемой.
 
 ### 0.3. Проверить и закрепить нормативный этап
@@ -191,10 +191,18 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
 
 - Обычный Python3.12 CI на свежей БД/schema24 с настоящими PostgreSQL/Keycloak:
   `uv sync --frozen`, migrations, Ruff и `uv run python -m unittest discover
-  -s tests -v` — 1625 tests, 259.327 секунды, exit0. Три dedicated skips
+  -s tests -v` — 1627 tests, 258.011 секунды, exit0. Три dedicated skips
   относятся к native sandbox, actual browser и memory-loop ownership case;
   PostgreSQL/Keycloak tests не пропущены. Evidence —
-  `.local-evidence/compose-ci-final/`.
+  `.local-evidence/migrations-ci-recovered/`. Предыдущий failed run сохранён:
+  тест summary пересекался с legitimate detector_busy из background tool.
+  Для этого отдельного теста terminal помечен guardrails-exempt; production
+  single-slot и owner decision при busy не изменены. 100 повторений проходят.
+- Enterprise schema upgrade proof входит в ordinary discovery: source12 и
+  каждый source13–23 переходят на текущую schema, сохраняют admitted state,
+  wait deadlines/outcomes, настройки, encrypted peers и transport blob bytes
+  после repeat migration/new pool. Old/unknown build отклоняется. Operator
+  mapping/import и согласованный backup restore остаются отдельными open gates.
 - Combined release boundary module входит в ordinary discovery: cron после двух
   compactions, omitted summary vs authoritative policy/waits, оба remote
   input/auth-required bindings с follow-up после PG restart, manual/automatic
@@ -205,10 +213,10 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
   HITL, per-tool policy, custom header secret editor, cron timezone/edit/manual
   run/delete, selected workspace cleanup и immutable history/download после
   удаления originals. Evidence — `.local-evidence/owner-browser-expanded-key/`.
-- Полный required native ARM64 sandbox gate ранее прошёл на removal image:
-  12 tests, exit0, без skips; namespace/seccomp/rlimit/broker/teardown/dual-stack
-  receivers, aggregate Pod pids.max512. Его image snapshot не подменяет
-  проверку нового image/target.
+- Полный required native ARM64 sandbox gate повторён на актуальном image:
+  12 tests, 106.000 секунды, exit0, без skips; namespace/seccomp/rlimit/broker/
+  teardown/dual-stack receivers, actual aggregate Pod pids.max512. Evidence —
+  `.local-evidence/current-native-full/`; image ID закреплён в `image.json`.
 - Docker Compose задаёт outer native seccomp, `/dev/net/tun`, bounded
   CPU/memory/PIDs, read-only root и dropped capabilities. Actual composition-root
   terminal/Python/background test через Compose — 1 test, 23.921 секунды,
@@ -226,11 +234,21 @@ schema24 сохраняет legacy bytes под неизвестным tenant б
 
 - В target Kubernetes профиль seccomp установлен по явному разрешению. Обычный
   Pod имеет finite PID limit9462: изменение kubelet не требуется. Kernel6.8
-  отвергает user-namespace idmapped mount `/dev/net/tun` и `/dev/net`;
-  fallback/privileged для рабочего агента не включены. Подготовлен, но не
-  применён отдельный установщик TUN-device на обычной filesystem.
-- Нужны завершённые actual amd64/target namespace/network checks и target CSI
-  persistence после пересоздания Pod; ARM64 и Compose proofs их не заменяют.
+  отвергает user-namespace idmapped mount `/dev/net/tun` и `/dev/net`.
+  TUN-device на отдельном временном CSI томе смонтирован через subPath без этой
+  ошибки и без записи в Node filesystem; агент остаётся non-root/caps0.
+  Actual app sandbox test не прошёл: стандартный AppArmor блокирует private
+  mount propagation. Trusted diagnostic с AppArmor Unconfined разрешает mount,
+  но Ubuntu unprivileged_userns ограничивает network capabilities; рабочий
+  профиль не заменён таким обходом. Evidence — `.local-evidence/target-tun-csi/`,
+  `.local-evidence/target-userns-diagnostics/` и
+  `.local-evidence/target-userns-unconfined-diagnostic/`.
+- Target Cloud.ru CSI byte persistence после удаления и пересоздания Pod
+  подтверждён на exact amd64 digest, checksum совпадает, оба Pod non-root/caps0.
+  Namespace и PV удалены. Это подтверждение тома, не сквозной ENT-AC-32:
+  root/child/background/recovered commands после recreate ещё нужны вместе с
+  actual amd64/target namespace/network checks. Evidence —
+  `.local-evidence/target-csi-recreate/`.
 - Реальный настроенный LLM возвращает HTTP404, Foundation Models embeddings
   endpoint — HTTP503. Model catalogue доступен, но live provider/embedding
   proof не прошёл. Контрактные tests не являются proof качества модели.
