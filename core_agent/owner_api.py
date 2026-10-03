@@ -461,7 +461,8 @@ async def schedule_request(cron_store, actor, request, on_admitted):
         raise
 
 
-def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_store=None, on_cron_admitted=None):
+def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_store=None, on_cron_admitted=None,
+                 external_access=None):
     def settings(actor, payload):
         require_owner(actor)
         if payload is None:
@@ -490,6 +491,21 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
     async def endpoint(request):
         try:
             actor = require_owner(request.scope.get("principal"))
+            if external_access is not None and request.url.path.startswith("/api/external-access"):
+                if request.query_params:
+                    raise CoreError("REQUEST_INVALID")
+                identifier = request.path_params.get("account_id")
+                payload = None
+                if request.method == "POST":
+                    payload = await read_payload(request, {"days"} if identifier else {"name", "days", "request_id"})
+                else:
+                    async for chunk in request.stream():
+                        if chunk:
+                            raise CoreError("REQUEST_INVALID")
+                result = await external_access.execute(actor, request.headers["authorization"], request.method,
+                                                       identifier, payload)
+                return JSONResponse(result, status_code=201 if request.method == "POST" and identifier is None else 200,
+                                    headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
             is_settings = request.url.path == "/api/settings"
             payload = None
             if cron_store is not None and (request.url.path == "/api/schedules" or "schedule_id" in request.path_params):
@@ -565,6 +581,9 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
             return JSONResponse(result, headers={"Cache-Control": "no-store"})
         except CoreError as error:
             status = {"ACCESS_DENIED": 403, "TOOL_NOT_FOUND": 404,
+                      "KEYCLOAK_ADMIN_ACCESS_DENIED": 403, "KEYCLOAK_ADMIN_UNAVAILABLE": 503,
+                      "EXTERNAL_ACCESS_NOT_FOUND": 404, "EXTERNAL_ACCESS_CONFLICT": 409,
+                      "EXTERNAL_ACCESS_ALREADY_ISSUED": 409,
                       "FILE_NOT_FOUND": 404, "WORKSPACE_UNAVAILABLE": 409, "WORKSPACE_SCAN_LIMIT": 409,
                       "FILE_CLEANUP_NOT_FOUND": 404, "CONTEXT_BUSY": 409, "CLEANUP_REQUEST_CONFLICT": 409,
                       "WORKSPACE_CLEANUP_INVALID": 409, "WORKSPACE_CLEANUP_PENDING": 503,
@@ -589,6 +608,12 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
         Route("/api/guardrails/{wait_id}/material", endpoint),
         Route("/api/guardrails/{wait_id}/file", endpoint),
     ]
+    if external_access is not None:
+        routes.extend([
+            Route("/api/external-access", endpoint, methods=["GET", "POST"]),
+            Route("/api/external-access/{account_id}/token", endpoint, methods=["POST"]),
+            Route("/api/external-access/{account_id}", endpoint, methods=["DELETE"]),
+        ])
     if admission is not None:
         routes.append(Route("/api/chats", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/tasks/{task_id}/files/{file_id}", endpoint))

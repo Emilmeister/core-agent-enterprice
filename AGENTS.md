@@ -191,6 +191,7 @@ actor `migration:<database current_user>`; повторный import не зам
 |---|---|
 | `core_agent/app.py` | Composition root: environment config, stores, tool registry, kernel, A2A app, health и Uvicorn |
 | `core_agent/auth.py` | Keycloak introspection, immutable authenticated scope, owner/external access и SDK context builder |
+| `core_agent/external_access.py` | Owner-session Keycloak Admin API: external service accounts, issuance metadata, single-display tokens, replacement и native revocation |
 | `core_agent/admission.py` | Atomic root admission, stable-caller deduplication и busy guard чата до SDK execution |
 | `core_agent/interactions.py` | Company settings, per-origin tool policies, CAS и транзакционный запрет pending approvals |
 | `core_agent/owner_api.py` | Owner-only settings, policy, HITL/guardrail decisions и приватные ответы на вопросы |
@@ -1181,3 +1182,17 @@ docker compose logs -f agent
    user changes.
 8. Создан один validated логичный commit, если пользователь явно не попросил не
    коммитить.
+
+## Управление входящим внешним доступом
+
+Owner UI «Доступ к агенту» использует текущий owner bearer для configured
+Keycloak Admin API. Роль agent-owner в deployment также получает принятые
+realm-management права управления clients/users; эти роли должны попасть в
+browser token. Отдельный provisioning secret, собственный API-key registry и
+миграция application DB не требуются. Keycloak client attributes хранят только
+tenant/audience/request ID и issuance metadata. Токен выдаётся один раз,
+не сохраняется в application storage/audit/telemetry и очищается из UI при
+закрытии/unmount. Замена сохраняет service identity; native client notBefore
+и service-user logout после перехода секунды отзывают прежние токены, включая
+старые Keycloak с особенностями realm notBefore. Уже открытый response не
+переавторизуется. См. AUTH-04 и ENT-AC-85.

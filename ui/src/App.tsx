@@ -7,12 +7,14 @@ import { Chat } from "./Chat";
 import { Settings, ToolPolicies } from "./Settings";
 import { Agents } from "./Agents";
 import { Schedules } from "./Schedules";
+import { ExternalAccess } from "./ExternalAccess";
 
-type Page = "chats" | "tools" | "agents" | "settings" | "schedules";
+type Page = "chats" | "tools" | "agents" | "settings" | "schedules" | "access";
 const pages: [Page, string][] = [
   ["schedules", "Расписания"],
   ["tools", "Инструменты"],
   ["agents", "Агенты"],
+  ["access", "Доступ к агенту"],
   ["settings", "Настройки"],
 ];
 export function App({ session }: { session: Session }) {
@@ -248,6 +250,8 @@ export function App({ session }: { session: Session }) {
           />
         ) : page === "schedules" ? (
           <Schedules api={api} chats={chats} onChat={choose} refreshChats={refreshChats} onDirty={setDirty} />
+        ) : page === "access" ? (
+          <ExternalAccess api={api} />
         ) : page === "settings" ? (
           <Settings api={api} />
         ) : page === "tools" ? (

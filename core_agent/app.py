@@ -54,6 +54,7 @@ from .material_reviews import MemoryMaterialReviewStore, PostgresMaterialReviewS
 from .chat_files import ChatFileService, MemoryChatFileStore, PostgresChatFileStore
 from .workspace_cleanup import WorkspaceCleanupService
 from .owner_api import owner_routes
+from .external_access import ExternalAccess
 from .lifecycle import PostgresRetentionManager
 from .mcp import StreamableHttpMcpConnector
 from .memory import MemoryRegistry
@@ -1982,7 +1983,8 @@ def create_app(
             Mount("/a2a/external", routes=routes),
             Route("/api/identity", identity),
             *owner_routes(agent, interaction_store, admission=admission, remote_registry=remote_registry_store,
-                          cron_store=cron_store, on_cron_admitted=cron_handoff),
+                          cron_store=cron_store, on_cron_admitted=cron_handoff,
+                          external_access=ExternalAccess(auth_settings, transport=auth_transport)),
         ]
         if auth_settings.ui_client_id:
             async def ui_config(request):

@@ -1,4 +1,5 @@
 """Real Keycloak smoke in an isolated local realm; no application-issued keys."""
+import asyncio
 import os
 import unittest
 import uuid
@@ -6,7 +7,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from core_agent.auth import AuthSettings, KeycloakAuthenticator
+from core_agent.auth import AuthSettings, KeycloakAuthenticator, Principal
+from core_agent.external_access import ExternalAccess
 from core_agent.errors import CoreError
 
 
@@ -50,6 +52,7 @@ class KeycloakIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     {"clientId": "external", "enabled": True, "publicClient": False,
                      "secret": secret, "protocol": "openid-connect", "fullScopeAllowed": True,
                      "serviceAccountsEnabled": True, "protocolMappers": [role_mapper, audience_mapper]},
+                    {"clientId": "company-agent", "enabled": True, "protocol": "openid-connect"},
                 ],
             })
             self.assertEqual(response.status_code, 201, response.text)
@@ -84,6 +87,69 @@ class KeycloakIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(identity.is_owner)
                     identities.append(identity.owner_id)
                 self.assertEqual(identities[0], identities[1])
+                # Prove provisioning and 30-day expiry despite a shorter online
+                # SSO lifetime, using actual Keycloak rather than a fake token.
+                import time
+                updated = await http.put(admin, headers=headers, json={"ssoSessionMaxLifespan": 36000, "notBefore": int(time.time()) - 120})
+                self.assertEqual(updated.status_code, 204)
+                access = ExternalAccess(authenticator.settings)
+                owner = Principal("fixture-owner", "integration-company", True, False)
+                request = {"name": "External integration", "days": 30, "request_id": str(uuid.uuid4())}
+                granted = await access.execute(owner, headers["Authorization"], "POST", payload=request)
+                self.assertEqual(granted["expires_in"], 30 * 86400)
+                external = await authenticator.authenticate(granted["access_token"])
+                self.assertTrue(external.is_external)
+                self.assertFalse(external.is_owner)
+                listing = await access.execute(owner, headers["Authorization"], "GET")
+                self.assertEqual(listing["total"], 2)  # Includes the manually created external account.
+                self.assertNotIn(granted["access_token"], str(listing))
+                # Discovery must also handle audience mappers in default scopes
+                # and external/owner roles granted through the API client.
+                scope = "legacy-audience"
+                created_scope = await http.post(admin + "/client-scopes", headers=headers, json={
+                    "name": scope, "protocol": "openid-connect", "protocolMappers": [audience_mapper]})
+                self.assertEqual(created_scope.status_code, 201)
+                scope_id = created_scope.headers["location"].rsplit("/", 1)[1]
+                self.assertEqual((await http.put(admin + f"/clients/{client['id']}/default-client-scopes/{scope_id}", headers=headers)).status_code, 204)
+                client["protocolMappers"] = [role_mapper]
+                self.assertEqual((await http.put(admin + f"/clients/{client['id']}", headers=headers, json=client)).status_code, 204)
+                api_client = (await http.get(admin + "/clients", params={"clientId": "company-agent"}, headers=headers)).json()[0]
+                user_path = admin + f"/users/{account.json()['id']}/role-mappings"
+                api_path = admin + f"/clients/{api_client['id']}/roles"
+                for name in ("agent-external", "agent-owner"):
+                    self.assertEqual((await http.post(api_path, headers=headers, json={"name": name})).status_code, 201)
+                external_role = (await http.get(api_path + "/agent-external", headers=headers)).json()
+                owner_role = (await http.get(api_path + "/agent-owner", headers=headers)).json()
+                resource_path = user_path + f"/clients/{api_client['id']}"
+                self.assertEqual((await http.request("DELETE", user_path + "/realm", headers=headers, json=[role.json()])).status_code, 204)
+                self.assertEqual((await http.post(resource_path, headers=headers, json=[external_role])).status_code, 204)
+                self.assertEqual((await access.execute(owner, headers["Authorization"], "GET"))["total"], 2)
+                self.assertEqual((await http.post(resource_path, headers=headers, json=[owner_role])).status_code, 204)
+                self.assertEqual((await access.execute(owner, headers["Authorization"], "GET"))["total"], 1)
+                self.assertEqual((await http.request("DELETE", resource_path, headers=headers, json=[owner_role])).status_code, 204)
+                with self.assertRaises(CoreError) as repeated:
+                    await access.execute(owner, headers["Authorization"], "POST", payload=request)
+                self.assertEqual(repeated.exception.code, "EXTERNAL_ACCESS_ALREADY_ISSUED")
+                replaced = await access.execute(owner, headers["Authorization"], "POST", granted["account"]["id"], {"days": 1})
+                replacement = await authenticator.authenticate(replaced["access_token"])
+                self.assertEqual(external.owner_id, replacement.owner_id)
+                with self.assertRaises(CoreError):
+                    await authenticator.authenticate(granted["access_token"])
+                await access.execute(owner, headers["Authorization"], "DELETE", granted["account"]["id"])
+                with self.assertRaises(CoreError):
+                    await authenticator.authenticate(replaced["access_token"])
+                # Legacy clients may opt into persisted refresh sessions. A
+                # one-time token must survive their shorter offline idle limit.
+                updated = await http.put(admin, headers=headers, json={"offlineSessionIdleTimeout": 3})
+                self.assertEqual(updated.status_code, 204)
+                client["attributes"] = {"client_credentials.use_refresh_token": "true"}
+                updated = await http.put(admin + f"/clients/{client['id']}", headers=headers, json=client)
+                self.assertEqual(updated.status_code, 204)
+                legacy = await access.execute(owner, headers["Authorization"], "POST", client["id"], {"days": 1})
+                await asyncio.sleep(4)
+                self.assertTrue((await authenticator.authenticate(legacy["access_token"])).is_external)
+                client = (await http.get(admin + f"/clients/{client['id']}", headers=headers)).json()
+                self.assertEqual(client["attributes"]["client_credentials.use_refresh_token"], "false")
                 client["enabled"] = False
                 disabled = await http.put(admin + f"/clients/{client['id']}", headers=headers, json=client)
                 self.assertEqual(disabled.status_code, 204)

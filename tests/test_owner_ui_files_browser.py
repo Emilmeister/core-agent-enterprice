@@ -106,7 +106,7 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
                     "config": {"included.custom.audience": "company-agent", "access.token.claim": "true",
                                "introspection.token.claim": "true"}}]
         created = self.http.post(keycloak + "/admin/realms", headers=self.admin_headers, json={
-            "realm": self.realm, "enabled": True, "sslRequired": "none", "roles": {"realm": [{"name": "agent-owner"}]},
+            "realm": self.realm, "enabled": True, "sslRequired": "none", "roles": {"realm": [{"name": "agent-owner"}, {"name": "agent-external"}]},
             "clients": [{"clientId": "introspection", "enabled": True, "publicClient": False, "secret": self.secret,
                          "protocol": "openid-connect"},
                         {"clientId": "browser", "enabled": True, "publicClient": True, "protocol": "openid-connect",
@@ -115,7 +115,7 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
                          "attributes": {"pkce.code.challenge.method": "S256"}, "protocolMappers": mappers}],
             "users": [{"username": "browser-owner", "enabled": True, "emailVerified": True,
                        "firstName": "Browser", "lastName": "Owner", "email": "owner@example.test",
-                       "realmRoles": ["agent-owner"], "credentials": [{"type": "password", "value": self.password, "temporary": False}]}],
+                       "realmRoles": ["agent-owner"], "clientRoles": {"realm-management": ["manage-clients", "manage-users", "view-clients", "view-users", "view-realm", "create-client"]}, "credentials": [{"type": "password", "value": self.password, "temporary": False}]}],
         })
         self.assertEqual(created.status_code, 201, "Actual Keycloak realm creation failed")
         self.addCleanup(self.remove_realm)
@@ -246,6 +246,9 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         self.assertIn("PASS Keycloak logout revokes the old owner token for a new HTTP request", proof)
         self.assertIn("PASS logged-out reload exposes no private UI and performs no automatic login or private requests", proof)
         self.assertIn("PASS explicit sign-in after logout opens real Keycloak login", proof)
+        self.assertIn("PASS actual owner-session Keycloak issues a 30-day external token", proof)
+        self.assertIn("PASS access listing contains no issued token", proof)
+        self.assertIn("PASS issued credential authenticates external A2A entrance", proof)
 
 
 if __name__ == "__main__":

@@ -63,7 +63,7 @@ function observeOwnerAPI(tab){
   const pending=new Map();
   tab.on('Network.requestWillBeSent',({requestId,request})=>{
     const url=new URL(request.url);
-    if(url.origin!==config.origin||!(/^\/api\/(tool-policies|schedules|remote-agents|chats\/[^/]+\/(files|title))(\/|$)/.test(url.pathname)||(request.method==='DELETE'&&/^\/api\/chats\/[^/]+$/.test(url.pathname))))return;
+    if(url.origin!==config.origin||!(/^\/api\/(tool-policies|schedules|remote-agents|external-access|chats\/[^/]+\/(files|title))(\/|$)/.test(url.pathname)||(request.method==='DELETE'&&/^\/api\/chats\/[^/]+$/.test(url.pathname))))return;
     pending.set(requestId,{path:url.pathname,query:url.search,method:request.method,request:request.postData?JSON.parse(request.postData):null,authorized:!!(request.headers.Authorization??request.headers.authorization)});
   });
   tab.on('Network.responseReceived',({requestId,response})=>{const request=pending.get(requestId);if(request)request.status=response.status;});
@@ -106,7 +106,10 @@ try {
   });
   page.on('Network.loadingFailed',({requestId,canceled,errorText})=>{if(canceled||errorText==='net::ERR_ABORTED')cancelledDownloads.add(requestId);});
   page.on('Network.loadingFinished',async({requestId})=>{const request=requests.get(requestId);if(!request)return;requests.delete(requestId);
-    const response=await page.call('Network.getResponseBody',{requestId});const body=JSON.parse(response.base64Encoded?Buffer.from(response.body,'base64').toString():response.body);
+    let response;
+    try{response=await page.call('Network.getResponseBody',{requestId});}
+    catch(error){if(request.kind!=='post'&&error.message==='No resource with given identifier found')return;throw error;}
+    const body=JSON.parse(response.base64Encoded?Buffer.from(response.body,'base64').toString():response.body);
     if(request.kind==='post'&&body.task){receipts.push(body.task.metadata);rootTask??=body.task;}
     if(request.kind==='history'&&body.items)history.push(body.items);
     if(request.kind==='task'&&body.id)tasks.push(body);
@@ -502,10 +505,38 @@ try {
   await boundedPreview();
   await page.call('Emulation.clearDeviceMetricsOverride');
   await page.click('Закрыть',previewCards+' li:nth-child(6) .file-preview button');
+  await second.click('Доступ к агенту','.nav-item');
+  await second.wait("document.querySelector('h1')?.textContent==='Доступ к агенту' && document.querySelector('.page [role=status]')?.textContent.includes('Внешних учёток:')",'external access page uses current owner session');
+  await second.click('Выдать доступ');
+  await second.wait("document.querySelector('.access-dialog')?.open",'native accessible access modal');
+  await second.field('.access-dialog input[maxlength="100"]','Browser external access');
+  await second.field('.access-dialog input[type=number]','30');
+  const issuedAccess=await ownerAction(second,'/api/external-access','POST',()=>second.click('Выдать доступ','.access-dialog button'));
+  check(issuedAccess.status===201 && issuedAccess.body.expires_in===30*86400,'actual owner-session Keycloak issues a 30-day external token');
+  const externalToken=issuedAccess.body.access_token;
+  credentials.add(externalToken);
+  await second.wait("!!document.querySelector('.access-token') && document.querySelector('.access-row h3')?.textContent==='Browser external access'",'token shown once with persisted account metadata');
+  check(await second.evaluate(`document.querySelector('.access-token').value===${JSON.stringify(externalToken)}`),'one-time token matches real issuance');
+  await second.call('Browser.grantPermissions',{origin:config.origin,permissions:['clipboardReadWrite','clipboardSanitizedWrite']});
+  await second.call('Page.bringToFront');
+  await second.click('Скопировать токен','.access-dialog button');
+  await second.wait("document.querySelector('.access-dialog .access-actions button')?.textContent==='Скопировано'",'copy token feedback');
+  await second.click('Готово','.access-dialog button');
+  await second.wait("!document.querySelector('.access-dialog')",'closing modal removes credential from DOM');
+  const accessList=await second.evaluate(`(async()=>{const response=await fetch('/api/external-access',{headers:{Authorization:${JSON.stringify(bearer)}},credentials:'omit',cache:'no-store'});return {body:await response.text(),cache:response.headers.get('cache-control')};})()`);
+  check(accessList.cache==='no-store' && !accessList.body.includes(externalToken),'access listing contains no issued token');
+  await second.click('Выдать новый токен');
+  await second.wait("document.querySelector('.access-dialog')?.open && !document.querySelector('.access-token')",'reopening cannot recover previous token');
+  await second.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  await second.call('Input.dispatchKeyEvent',{type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  await second.wait("!document.querySelector('.access-dialog')",'Escape discards access modal');
+  const accessExternal=await second.evaluate(`(async()=>{const response=await fetch('/a2a/external/.well-known/agent-card.json',{headers:{Authorization:'Bearer '+${JSON.stringify(externalToken)},'A2A-Version':'1.0'},cache:'no-store',credentials:'omit'});return response.status;})()`);
+  check(accessExternal===200,'issued credential authenticates external A2A entrance');
   check(firstTokens.size===3&&secondTokens.size===3,'actual access, refresh and ID tokens captured for both owner tabs');
   const privateValues=[...credentials,peerSecret,'Native immutable output\n',...posts.flatMap(post=>post.parts.map(part=>part.raw).filter(Boolean)),...tasks.flatMap(task=>(task.artifacts??[]).flatMap(artifact=>(artifact.parts??[]).map(part=>part.raw).filter(Boolean)))];
   const storageChecks=await Promise.all([page,second].map(tab=>tab.evaluate(`(()=>{const privateValues=${JSON.stringify(privateValues)};return [localStorage,sessionStorage].every(store=>Array.from({length:store.length},(_,index)=>store.getItem(store.key(index))).every(value=>privateValues.every(secret=>!value.includes(secret))));})()`)));
   check(storageChecks.every(Boolean),'both owner tabs store no observed auth tokens, peer secrets or raw file bytes in local/session storage');
+  await page.call('Page.bringToFront');
   const screenshot=await page.call('Page.captureScreenshot',{format:'png'});await writeFile(config.evidence+'/actual-browser.png',Buffer.from(screenshot.data,'base64'));
   const finalTask=tasks.at(-1);
   await page.evaluate("document.querySelector('.chat-menu').open=true");

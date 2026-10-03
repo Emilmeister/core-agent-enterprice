@@ -628,3 +628,13 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   tools-free reply корректно воспроизводит прежние tool turns без расширения
   каталога. Restart сохраняет phase/usage; transient preview не обязан пережить
   рестарт и не становится history, push, Artifact или источником полномочий.
+
+- ENT-AC-85: owner UI «Доступ к агенту» выдаёт внешний доступ через текущую
+  сессию владельца и реальный Keycloak; отдельные provisioning credentials и
+  собственный API-key registry не нужны. Полный owner HTTP flow доказывает
+  role/audience isolation, переданный owner bearer, сроки 1–365 дней, отсутствие
+  credentials в metadata/errors, no-store и owner-only mutation; повторы и
+  upstream failures не создают дубликаты или ложную выдачу. Замена сохраняет
+  identity и закрывает прежний токен даже в ту же секунду, revoke закрывает новые
+  запросы без удаления задач/файлов. Native browser доказывает accessible modal,
+  count, single display/copy и отсутствие сохранённого токена после закрытия.

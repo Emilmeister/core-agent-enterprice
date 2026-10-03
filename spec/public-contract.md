@@ -806,3 +806,30 @@ Chat list включает пустые canonical chats с `latest_task_id: null
 scoped canonical root mapping. История пустого чата доступна без фиктивной Task;
 cron skip notices добавляются отдельной owner-only immutable проекцией и
 собственным version2 cursor. Version1 transcript cursors продолжают работать.
+
+## Owner API: доступ к агенту (AUTH-04)
+
+Вкладка «Доступ к агенту» показывает число и список внешних сервисных учёток,
+название, время выдачи/истечения и состояние pending/active/expired/revoked.
+Адрес принимающего A2A берётся из trusted deployment origin, не из client input.
+API требует owner authority и отдельные административные права этой же сессии
+в configured Keycloak; bearer не предоставляется runtime или модели.
+
+- `GET /api/external-access`: `{accounts: [...], total}`; credentials отсутствуют.
+- `POST /api/external-access`: ровно `{name, days, request_id}` (UUID); создание
+  или продолжение незавершённого создания. Успех — 201 с `{account, access_token,
+  token_type: "Bearer", expires_in}` для однократного показа.
+- `POST /api/external-access/{account_id}/token`: ровно `{days}`; новый токен
+  той же identity, прежние токены отозваны. Успех — 200 с той же формой.
+- `DELETE /api/external-access/{account_id}`: без body/query; native disable,
+  200 с `{account}`. Не удаляет A2A results и файлы.
+
+Query parameters и неизвестные/повторённые JSON поля не принимаются. Invalid
+name/days/request ID дают 400 REQUEST_INVALID; недоступный чужой account — 404
+EXTERNAL_ACCESS_NOT_FOUND; несовпадающий повтор — 409 EXTERNAL_ACCESS_CONFLICT;
+завершённое создание — 409 EXTERNAL_ACCESS_ALREADY_ISSUED. Ответ не восстанавливает
+потерянный токен; владелец явно выпускает новый для найденной учётки. Keycloak
+401/403 даёт 403 KEYCLOAK_ADMIN_ACCESS_DENIED; временная сеть/неверный ответ/timeout
+даёт 503 KEYCLOAK_ADMIN_UNAVAILABLE. Все ответы no-store и без upstream body.
+Модалка поддерживает native keyboard focus/Escape, copy feedback и закрытие без
+сохранения токена; форма блокирует повторное нажатие на время операции.

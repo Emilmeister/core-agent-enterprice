@@ -140,7 +140,7 @@ class KeycloakAuthenticator:
         self.transport = transport
         self.clock = clock
 
-    async def authenticate(self, token):
+    async def authenticate(self, token, *, include_claims=False):
         settings = self.settings
         # Per-request clients avoid sharing an async connection pool across ASGI
         # event loops. No credential-bearing redirects, proxies or cached verdicts.
@@ -194,7 +194,8 @@ class KeycloakAuthenticator:
         external = settings.external_role in roles
         owner = settings.owner_role in roles and not external
         actor_id = hashlib.sha256((settings.issuer + "\0" + subject).encode()).hexdigest()
-        return Principal(actor_id, settings.tenant, owner, external)
+        principal = Principal(actor_id, settings.tenant, owner, external)
+        return (principal, claims) if include_claims else principal
 
 
 class AuthenticationMiddleware:
