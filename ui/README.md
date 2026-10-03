@@ -81,7 +81,16 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   Tool rules use a compact searchable/filterable list and explicit per-rule
   saves. The positive checks checkbox maps to `!guardrails_exempt`; execution
   mode remains independent. There is no technical mode or batch-save mechanism.
-- Agent replies and persisted history render CommonMark/GFM with tables, lists
+- Live public replies arrive as scoped cumulative A2A snapshots and render as
+  provisional plain text until canonical history supplies the final answer.
+  Partial frames do not fetch history individually. Live text is enabled only
+  for a message accepted in the current open chat; reopening the page reads
+  canonical history/status without restoring an earlier preview. Temporary
+  disconnection within that open chat may restore its process-local preview
+  without starting work; a server restart may discard
+  this transient preview while the durable Task continues. Reasoning and private
+  owner exchanges do not enter this public stream.
+  Persisted replies render CommonMark/GFM with tables, lists
   and fenced code through react-markdown. Mermaid blocks load the local bundle
   on demand and display static SVG Blob images; invalid diagrams keep source.
   Raw HTML is skipped and Markdown images never load automatically. Mermaid

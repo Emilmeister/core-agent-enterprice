@@ -529,11 +529,27 @@ class OwnerRuntimeAPITests(AuthAppTestCase):
 
     async def test_external_task_asks_owner_with_private_publication_and_followup_after_wait(self):
         question, answer = "private-owner-question-739", "private-owner-answer-851"
-        self.agent.model = ScriptedModel([
+        previews = []
+        agent = self.agent
+
+        class ReplyModel(ScriptedModel):
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
+                if response.message == "public-final-result":
+                    if tools:
+                        raise AssertionError("recovered answer must be tools-free")
+                    on_delta("public-final-prefix", "private-reasoning-739")
+                    record = agent.workflow_store.lookup_task(task_id)
+                    previews.append(agent.reply_hub.latest(record.tenant_id, task_id))
+                return response
+
+        self.agent.model = ReplyModel([
             ModelResponse(message="private-intermediate-735", reasoning="private-reasoning-739",
                           tool_requests=(ToolRequest("ask-1", "core_ask_owner", {"question": question}),)),
+            ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),)),
             ModelResponse(message="public-final-result"),
         ])
+        self.agent._model_streams_deltas = True
         response = await asyncio.wait_for(self.http.post(
             "/a2a/external/message:stream", headers=self.headers("external-a"),
             json={"message": {"messageId": "private-wait", "contextId": "external-question-chat",
@@ -574,7 +590,11 @@ class OwnerRuntimeAPITests(AuthAppTestCase):
         result = await asyncio.to_thread(self.agent.resume_task, record.task_id)
         self.assertEqual(result.message, "public-final-result")
         current = self.agent.workflow_store.lookup_task(record.task_id)
-        self.assertEqual(current.snapshot["tool_calls"], 1)
+        self.assertEqual(current.snapshot["tool_calls"], 2)
+        self.assertEqual(current.snapshot["turns"], 3)
+        self.assertEqual(previews[0]["text"], "public-final-prefix")
+        self.assertEqual(previews[0]["generation"], 3)
+        self.assertNotIn("private", json.dumps(previews))
         model_context = json.dumps(self.agent.model.calls[-1].messages)
         self.assertIn(answer, model_context)
         self.assertIn("use-order-51", model_context)

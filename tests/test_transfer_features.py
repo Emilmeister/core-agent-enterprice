@@ -99,6 +99,27 @@ class ModelHandler(BaseHTTPRequestHandler):
 
 
 class StreamedReasoningTests(unittest.TestCase):
+    def test_tools_free_turn_replays_historical_calls_without_reauthorizing_them(self):
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "begin", "function": {
+                "name": "core_response_begin", "arguments": {}}}]},
+            {"role": "tool", "tool_call_id": "begin", "name": "core_response_begin", "content": "{}"},
+        ]
+        for api_format in ("openai", "anthropic"):
+            with self.subTest(api_format=api_format):
+                model = CompatibleHttpModel(api_format=api_format, model="m", base_url="https://model.test/v1")
+                body, _headers, authority = model._request("", "Answer", {}, messages=messages)
+                self.assertNotIn("tools", body)
+                self.assertEqual(authority, {})
+                self.assertIn("core_response_begin", json.dumps(body["messages"]))
+                with self.assertRaises(CoreError):
+                    if api_format == "openai":
+                        model._parse_openai({"choices": [{"message": {"tool_calls": [{"id": "forged",
+                            "function": {"name": "core_response_begin", "arguments": "{}"}}]}}]}, authority)
+                    else:
+                        model._parse_anthropic({"content": [{"type": "tool_use", "id": "forged",
+                            "name": "core_response_begin", "input": {}}]}, authority)
+
     def test_a_reasoning_delta_keeps_the_space_it_arrived_with(self):
         """Trimming each token glues the words of the assembled reasoning."""
         model = CompatibleHttpModel(
@@ -208,6 +229,34 @@ class ModelTransportFailureTests(unittest.TestCase):
 
 
 class StreamBufferTests(unittest.TestCase):
+    def test_public_reply_hub_is_bounded_scoped_and_closes_superseded_generations(self):
+        from core_agent.streaming import ReplyHub
+
+        hub = ReplyHub(min_chars=2, max_tasks=2, max_bytes=6)
+        self.assertIsNone(hub.update("a", "task", "chat", 2, "x"))
+        prefix = hub.update("a", "task", "chat", 2, "éééé")
+        self.assertEqual(prefix["text"], "ééé")
+        self.assertIsNone(hub.latest("b", "task"))
+        reset = hub.supersede("a", "task")
+        self.assertTrue(reset["superseded"])
+        self.assertGreater(reset["sequence"], prefix["sequence"])
+        self.assertIsNone(hub.update("a", "task", "chat", 2, "stale", force=True))
+        self.assertIsNone(hub.update("a", "task", "chat", 1, "older", force=True))
+        fresh = hub.update("a", "task", "chat", 3, "new", force=True)
+        self.assertGreater(fresh["sequence"], reset["sequence"])
+        hub.update("b", "task", "chat", 1, "other", force=True)
+        hub.update("c", "task", "chat", 1, "third", force=True)
+        self.assertIsNone(hub.latest("a", "task"))
+        evicted_reset = hub.supersede("a", "task", generation=3, context_id="chat")
+        self.assertTrue(evicted_reset["superseded"])
+        self.assertGreater(evicted_reset["sequence"], fresh["sequence"])
+        self.assertIsNone(hub.update("a", "task", "chat", 3, "stale", force=True))
+        hub.discard("a", "task")
+        restored = hub.update("a", "task", "chat", 3, "newer", force=True)
+        self.assertGreater(restored["sequence"], fresh["sequence"])
+        hub.discard("b", "task")
+        self.assertIsNone(hub.latest("b", "task"))
+
     def test_snapshot_replaces_while_every_delta_is_appended(self):
         self.assertEqual(integrate_stream_chunk("", "abc"), "abc")
         self.assertEqual(integrate_stream_chunk("abc", "def"), "abcdef")
@@ -425,6 +474,149 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                         frames.append(frame["result"])
         return frames
 
+    async def test_partial_status_is_not_durable_and_legacy_get_is_clean(self):
+        from a2a.server.tasks import InMemoryTaskStore
+        from a2a.types import Task, TaskState, Role, ListTasksRequest
+        from core_agent.a2a_sdk import TransientStatusTaskStore
+
+        inner = InMemoryTaskStore(owner_resolver=lambda _context: "company")
+        store = TransientStatusTaskStore(inner)
+        task = Task(id="preview-task", context_id="preview-chat")
+        task.status.state = TaskState.TASK_STATE_WORKING
+        task.status.message.role = Role.ROLE_AGENT
+        task.status.message.parts.add(text="TRANSIENT_REVIEW_PREFIX")
+        task.status.message.metadata.update({"partial": True, "core_agent_stream": {
+            "version": 1, "generation": 2, "sequence": 1}})
+        await store.save(task)
+        persisted = await inner.get(task.id, None)
+        self.assertFalse(persisted.status.HasField("message"))
+        task.status.message.role = Role.ROLE_AGENT
+        task.status.message.parts.add(text="LEGACY_TRANSIENT_PREFIX")
+        task.status.message.metadata.update({"partial": True})
+        await inner.save(task, None)
+        listed = await store.list(ListTasksRequest())
+        self.assertFalse(listed.tasks[0].status.HasField("message"))
+        public = await store.get(task.id)
+        self.assertFalse(public.status.HasField("message"))
+        task.status.ClearField("message")
+        task.status.state = TaskState.TASK_STATE_COMPLETED
+        task.status.message.role = Role.ROLE_AGENT
+        task.status.message.parts.add(text="Canonical complete answer")
+        await store.save(task)
+        final = await store.get(task.id)
+        self.assertEqual(final.status.message.parts[0].text, "Canonical complete answer")
+
+    async def test_slow_initial_stream_reads_only_latest_public_snapshot(self):
+        from a2a.types import Task, TaskState
+
+        app = self._app()
+        handler = app.state.a2a_request_handler
+        hub = handler.reply_hub
+        finish = asyncio.Event()
+
+        async def source():
+            task = Task(id="slow-reply", context_id="slow-chat")
+            task.status.state = TaskState.TASK_STATE_WORKING
+            yield task
+            await finish.wait()
+            task.status.state = TaskState.TASK_STATE_COMPLETED
+            yield task
+
+        stream = handler._stream_with_public_replies(source(), None)
+        first = await anext(stream)
+        self.assertEqual(first.id, "slow-reply")
+        # The reader is suspended while the producer updates its one snapshot.
+        for number in range(1, 2050):
+            hub.update("default", "slow-reply", "slow-chat", 2, "x" * (number * 4), force=True)
+        latest = hub.latest("default", "slow-reply")
+        event = await asyncio.wait_for(anext(stream), 2)
+        self.assertEqual(event.status.message.parts[0].text, latest["text"])
+        self.assertEqual(len(event.status.message.parts[0].text), 2049 * 4)
+        finish.set()
+        terminal = await asyncio.wait_for(anext(stream), 2)
+        self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
+    async def test_real_tcp_public_prefix_precedes_provider_completion(self):
+        import socket
+        import uvicorn
+
+        release = threading.Event()
+        prefix_sent = threading.Event()
+
+        class GatedHandler(ModelHandler):
+            tool_call = ("core_response_begin", {})
+            answer = "Public prefix and final answer."
+            requests = []
+
+            def _frame(self, delta):
+                super()._frame(delta)
+                if delta.get("content") == "Public ":
+                    prefix_sent.set()
+                    if not release.wait(10):
+                        raise TimeoutError("test did not observe public prefix")
+
+        provider = ThreadingHTTPServer(("127.0.0.1", 0), GatedHandler)
+        threading.Thread(target=provider.serve_forever, daemon=True).start()
+        self.addCleanup(provider.server_close)
+        self.addCleanup(provider.shutdown)
+        self.server = provider
+        app = self._app()
+        ready = threading.Event()
+
+        class Server(uvicorn.Server):
+            async def startup(self, sockets=None):
+                await super().startup(sockets)
+                ready.set()
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        server = Server(uvicorn.Config(app, log_level="error", lifespan="off"))
+        thread = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
+        thread.start()
+        self.assertTrue(await asyncio.to_thread(ready.wait, 5), "ASGI listener did not start")
+        frames = []
+        saw_prefix = False
+        payload = {"jsonrpc": "2.0", "id": "live", "method": "SendStreamingMessage", "params": {
+            "message": {"role": "ROLE_USER", "messageId": str(uuid.uuid4()), "parts": [{"text": "hello"}]}}}
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                async with http.stream("POST", url + "/", json=payload,
+                    headers={"A2A-Version": "1.0", "Accept": "text/event-stream"}) as response:
+                    self.assertEqual(response.status_code, 200)
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        frame = json.loads(line[5:])
+                        self.assertNotIn("error", frame, frame)
+                        event = frame["result"]
+                        frames.append(event)
+                        message = self._status(event).get("message") or {}
+                        marker = (message.get("metadata") or {}).get("core_agent_stream")
+                        if marker and not marker.get("superseded") and not saw_prefix:
+                            self.assertTrue(prefix_sent.is_set())
+                            self.assertFalse(release.is_set(), "generation already completed")
+                            self.assertEqual(message["parts"][0]["text"], "Public")
+                            self.assertEqual(marker["generation"], 2)
+                            self.assertEqual(marker["sequence"], 1)
+                            self.assertEqual(len(GatedHandler.requests), 2)
+                            self.assertEqual(GatedHandler.requests[1].get("tools", []), [])
+                            saw_prefix = True
+                            release.set()
+            self.assertTrue(saw_prefix, "no real-time public prefix arrived")
+            self.assertEqual(len(self._terminal(frames)), 1)
+            self.assertIs(self._terminal(frames)[0], frames[-1])
+            self.assertNotIn("Deciding what to do", json.dumps(frames))
+        finally:
+            release.set()
+            server.should_exit = True
+            await asyncio.to_thread(thread.join, 10)
+            listener.close()
+            self.assertFalse(thread.is_alive())
+
     @staticmethod
     def _status(frame):
         return (frame.get("statusUpdate") or frame.get("task") or {}).get("status") or {}
@@ -444,6 +636,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_guarded_stream_keeps_reasoning_private_and_publishes_final_text(self):
+        ModelHandler.tool_call = ("core_response_begin", {})
         frames = await self._frames(self._app(), "hello")
         thoughts = [
             part["text"]
@@ -460,7 +653,6 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                 (self._status(frame).get("message") or {}).get("metadata") or {}
             ).get("partial")
         ]
-        self.assertGreater(len(partials), 1)
         snapshots = [
             part["text"]
             for frame in partials
@@ -468,12 +660,18 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             if not (part.get("metadata") or {}).get("adk_thought")
         ]
         self.assertEqual(snapshots, sorted(snapshots, key=len))
-        self.assertTrue(snapshots[-1].startswith(snapshots[0]))
+        if snapshots:
+            self.assertTrue(snapshots[-1].startswith(snapshots[0]))
+        # A fast provider may complete before the bounded hub is polled. The
+        # gated real-TCP test separately proves delivery before completion.
+        self.assertEqual(len(ModelHandler.requests), 2)
+        self.assertNotIn("tools", ModelHandler.requests[-1])
 
         terminal = self._terminal(frames)
         self.assertEqual(len(terminal), 1)
         self.assertIs(terminal[0], frames[-1])
         self.assertEqual(self._status(terminal[0])["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual([part["text"] for part in self._parts(terminal[0])], [ModelHandler.answer])
         self.assertNotIn(
             True,
             [

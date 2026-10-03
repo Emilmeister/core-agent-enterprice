@@ -119,7 +119,7 @@ export class Api {
   }
   async subscribe(
     taskId: string,
-    onEvent: () => Promise<void>,
+    onEvent: (payload: unknown) => Promise<void>,
     signal: AbortSignal,
   ) {
     const response = await this.request(
@@ -139,16 +139,28 @@ export class Api {
         const chunk = await reader.read();
         if (chunk.done) return;
         buffer += decoder.decode(chunk.value, { stream: true });
-        if (buffer.length > 1_048_576)
-          throw new Error("Stream frame too large");
         buffer = buffer.replace(/\r\n/g, "\n");
         let boundary: number;
         while ((boundary = buffer.indexOf("\n\n")) >= 0) {
           const frame = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
-          if (frame.split("\n").some((line) => line.startsWith("data:")))
-            await onEvent();
+          if (frame.length > 1_048_576)
+            throw new Error("Stream frame too large");
+          const lines = frame.split("\n");
+          if (lines.some((line) => line.startsWith("data:"))) {
+            const event = lines.filter((line) => line.startsWith("event:")).at(-1)?.slice(6).replace(/^ /, "");
+            const body = JSON.parse(lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).replace(/^ /, "")).join("\n"));
+            if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Invalid stream event");
+            if (event === "error") {
+              const status = body?.error?.code;
+              throw new ApiError(Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500, "STREAM_FAILED");
+            }
+            if (signal.aborted || !this.session.valid) return;
+            await onEvent(body);
+          }
         }
+        if (buffer.length > 1_048_576)
+          throw new Error("Stream frame too large");
       }
     } finally {
       await reader.cancel().catch(() => {});

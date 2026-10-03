@@ -11,6 +11,7 @@ const labels: Record<string, string> = {
   core_ask_owner: "Вопрос владельцу",
   core_wait_until: "Ожидание времени",
   core_cron_create: "Создание расписания",
+  core_response_begin: "Подготовка ответа",
   core_response_files: "Выбор файлов для ответа",
   core_memory_search: "Поиск в памяти",
   core_memory_read: "Чтение записи памяти",

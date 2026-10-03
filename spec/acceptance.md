@@ -611,3 +611,20 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   Другой chat/tenant/owner scope и child не наследуют её; неверная lineage,
   activation source или непроверенный legacy lock дают безопасную ошибку.
   Исторический activation receipt не является источником новой инструкции.
+
+- ENT-AC-84: поток модели достигает owner UI и authenticated external A2A-клиента
+  до окончания фактической генерации. Служебный сигнал списывает tool budget и
+  закрепляет answer phase; следующий turn tools-free и списывает model budget.
+  Reasoning, work/tool stream и private owner conversation не раскрываются.
+  Реальный TCP и native browser доказывают первый prefix при заблокированном
+  provider, накопительные scope/generation/sequence, passive reconnect без нового
+  model call у A2A-клиента и однократную замену сохранённым итогом. В UI повторное
+  открытие страницы использует canonical историю без восстановления preview;
+  отправка из текущего окна включает live текст без сохранения признака в storage.
+  Неполный Markdown остаётся
+  plain text, finished answer получает безопасный существующий renderer.
+  Superseded/retry/follow-up, cancel, HITL/recovery и budget exhaustion не создают
+  ложного final, повторного side effect или бесплатного model/tool call. Legacy
+  tools-free reply корректно воспроизводит прежние tool turns без расширения
+  каталога. Restart сохраняет phase/usage; transient preview не обязан пережить
+  рестарт и не становится history, push, Artifact или источником полномочий.

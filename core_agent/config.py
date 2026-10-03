@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from .errors import CoreError
 from .mcp import mcp_tool_index
 from .skills import SKILL_TOOLS
+from .tools import RESPONSE_BEGIN_TOOL
 
 # Advertised (binding, version) pairs; see core_agent/a2a.py for why they pair up.
 A2A_INTERFACES = (("HTTP+JSON", "1.0"), ("JSONRPC", "1.0"))
@@ -268,7 +269,7 @@ def compile_effective_config(
 
     model_catalog = set(allowed)
     model_catalog.update(
-        mcp_tool_index(mcp_tools, reserved_names=model_catalog | SKILL_TOOLS)
+        mcp_tool_index(mcp_tools, reserved_names=model_catalog | SKILL_TOOLS | {RESPONSE_BEGIN_TOOL.name})
     )
     snapshot_value = {
         "builtin_tools": sorted(allowed),

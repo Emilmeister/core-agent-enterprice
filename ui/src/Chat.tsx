@@ -10,6 +10,7 @@ import { Attachments, ConversationFiles, History, pendingAction, useChatHistory 
 import { actionLabel } from "./toolPresentation";
 import { WorkspaceFiles } from "./WorkspaceFiles";
 import { Markdown } from "./Markdown";
+import { chatStreamEvent, nextLiveAnswer } from "./chatStream";
 import {
   remoteProgress,
   formatFileSize,
@@ -18,7 +19,10 @@ import {
   terminal,
   textParts,
 } from "./types";
-import type { ChatRow, FileReceipt, Message, Part, Settings, Task } from "./types";
+import type { ChatRow, FileReceipt, LiveAnswerSnapshot, Message, Part, Settings, Task } from "./types";
+
+// App remounts the first submitted chat when it receives its context ID.
+const liveHandoff = new WeakMap<Api, string>();
 
 function settingsLimit(settings: Settings): number {
   const value = settings.attachment_limit_bytes;
@@ -72,6 +76,11 @@ export function Chat({
   const [reconnecting, setReconnecting] = useState(false);
   const [cancelConfirm, setCancelConfirm] = useState(false);
   const [directAnswer, setDirectAnswer] = useState("");
+  const [liveAnswer, setLiveAnswer] = useState<LiveAnswerSnapshot>();
+  const liveTask = useRef<{ api: Api; id: string } | undefined>(
+    row?.latest_task_id && liveHandoff.get(api) === row.latest_task_id
+      ? { api, id: row.latest_task_id } : undefined,
+  );
   const [filesOpen, setFilesOpen] = useState(false);
   const [filesDirty, setFilesDirty] = useState(false);
   const [newMessages, setNewMessages] = useState(false);
@@ -115,6 +124,8 @@ export function Chat({
   const thread = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const contextId = row?.context_id ?? task?.contextId;
+  const taskId = task?.id ?? row?.latest_task_id;
+  useLayoutEffect(() => { liveHandoff.delete(api); }, [api]);
   useLayoutEffect(() => {
     const dialog = deleteDialog.current;
     if (deleteConfirm && dialog && !dialog.open) dialog.showModal();
@@ -122,6 +133,12 @@ export function Chat({
   }, [deleteConfirm]);
   const history = useChatHistory(api, contextId);
   const loadHistory = history.load;
+  const liveText = liveTask.current?.api === api && liveTask.current.id === taskId
+    && liveAnswer && liveAnswer.taskId === taskId && !liveAnswer.superseded
+    && (!terminal(task) || task?.status.state === "TASK_STATE_COMPLETED")
+    && !history.page.items.some((item) => item.task_id === taskId && (item.outcome
+      || (item.kind === "agent_message" && item.status === "available" && item.text === liveAnswer.text)))
+    ? liveAnswer.text : "";
   useLayoutEffect(() => {
     if (row?.latest_task_id !== observedRoot.current) {
       observedRoot.current = row?.latest_task_id;
@@ -132,6 +149,8 @@ export function Chat({
           terminal: false,
         };
         setTask(undefined);
+        liveTask.current = undefined;
+        setLiveAnswer(undefined);
         setAcceptedFiles(undefined);
         setCancelConfirm(false);
       }
@@ -148,6 +167,8 @@ export function Chat({
       view.current.revision++;
       setCancelConfirm(false);
       setAcceptedFiles(undefined);
+      liveTask.current = undefined;
+      setLiveAnswer(undefined);
     }
     view.current.taskId = next.id;
     view.current.terminal = terminal(next);
@@ -156,7 +177,7 @@ export function Chat({
   useLayoutEffect(() => {
     const element = thread.current;
     if (!element) return;
-    const signature = JSON.stringify([history.page.items, history.waits, directAnswer]);
+    const signature = JSON.stringify([history.page.items, history.waits, directAnswer, liveText]);
     if (olderAnchor.current) {
       element.scrollTop = olderAnchor.current.top + element.scrollHeight - olderAnchor.current.height;
       olderAnchor.current = null;
@@ -165,7 +186,7 @@ export function Chat({
       setNewMessages(false);
     } else if (signature !== historySignature.current) setNewMessages(true);
     historySignature.current = signature;
-  }, [history.page.items, history.waits, directAnswer]);
+  }, [history.page.items, history.waits, directAnswer, liveText]);
   useLayoutEffect(() => {
     const input = composerInput.current;
     if (!input) return;
@@ -206,7 +227,6 @@ export function Chat({
   }, [draft, attachments, pending, busy, filesDirty, editingTitle, onDirty]);
   const attachmentBytes = attachments.reduce((sum, file) => sum + file.size, 0);
   const acceptedReceipt = acceptedFiles ?? fileReceipt(task?.metadata?.file_receipt);
-  const taskId = task?.id ?? row?.latest_task_id;
   const refresh = useCallback(
     async (signal?: AbortSignal, reloadHistory = false) => {
       if (!taskId || !mounted.current || view.current.taskId !== taskId)
@@ -235,6 +255,7 @@ export function Chat({
     setReconnecting(false);
     if (!taskId) return;
     const abort = new AbortController();
+    const revision = view.current.revision;
     let timer: ReturnType<typeof setTimeout> | undefined;
     async function follow() {
       while (!abort.signal.aborted) {
@@ -246,7 +267,21 @@ export function Chat({
           try {
             await api.subscribe(
               taskId!,
-              async () => {
+              async (payload) => {
+                if (abort.signal.aborted || !mounted.current || !api.session.valid
+                  || view.current.taskId !== taskId || view.current.revision !== revision) return;
+                const event = chatStreamEvent(payload, taskId!, contextId);
+                if (!event) return;
+                if (event.kind === "partial") {
+                  if (event.snapshot && !view.current.terminal
+                    && liveTask.current?.api === api && liveTask.current.id === taskId) {
+                    const snapshot = event.snapshot;
+                    setLiveAnswer((current) => view.current.taskId === taskId && !view.current.terminal
+                      && liveTask.current?.api === api && liveTask.current.id === taskId
+                      ? nextLiveAnswer(current, snapshot) : current);
+                  }
+                  return;
+                }
                 await refresh(abort.signal);
               },
               abort.signal,
@@ -288,7 +323,7 @@ export function Chat({
       abort.abort();
       clearTimeout(timer);
     };
-  }, [api, taskId, refresh]);
+  }, [api, taskId, contextId, refresh]);
   // Re-render deadlines even when the peer's stream is quiet.
   const [, tick] = useState(0);
   useEffect(() => {
@@ -364,6 +399,8 @@ export function Chat({
       }
       if (result.task) {
         acceptTask(result.task);
+        liveTask.current = { api, id: result.task.id };
+        if (!row?.context_id) liveHandoff.set(api, result.task.id);
         onTask(result.task);
         if (result.task.id === taskId) await refresh();
       } else if (result.message)
@@ -601,6 +638,11 @@ export function Chat({
             await refresh(undefined, true);
           }}
         />
+        {liveText && <article className="message live-answer" aria-label="Предварительный ответ">
+          <p className="muted" role="status">{terminal(task)
+            ? "Ответ подготовлен. Загружаем сохранённый результат…" : "Предварительный ответ · формируется"}</p>
+          <div className="prose">{liveText}</div>
+        </article>}
         {directAnswer && (
           <article className="message result">
             <Markdown text={directAnswer} />

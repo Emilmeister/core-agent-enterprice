@@ -754,8 +754,24 @@ run получает отдельные MCP session и negotiated version; пе�
   не заменяет обязательный native Linux gate.
 - `core_ask_owner` доступен при подключённом owner plane; создаёт private question
   после собственной policy/HITL. External-owned Task публикует generic status и
-  итоговый ответ; внутренние вопросы, ответы и промежуточный tool/model stream
-  остаются приватными.
+  публичный ответ, включая безопасный preview; внутренние вопросы, ответы,
+  reasoning и промежуточный tool/model stream остаются приватными.
+- Main-run model-only `core_response_begin({})` открывает durable tools-free
+  answer phase, расходуя обычные tool/model budgets. Он условно добавляется
+  runtime при включённом reply sink и adapter `on_delta`, не делегируется и не
+  доступен через прямой dispatch или nested Python. Нового lifecycle нет.
+  `streaming.ReplyHub` хранит bounded transient cumulative text по tenant/Task;
+  стандартный A2A status Message содержит marker `core_agent_stream` v1 с
+  model-turn generation и sequence. Passive Subscribe выдаёт persisted Task
+  раньше preview и не запускает работу. Retry/follow-up сбрасывает preview;
+  process restart сохраняет phase/usage, но не обещает сохранять черновик.
+  Final Artifact/history остаются авторитетными; public preview не попадает в
+  историю, push и внутренний reasoning stream. UI показывает незавершённый
+  текст безопасным plain text и не запрашивает историю на каждый фрагмент.
+  Live UI включается только после send admission в текущем открытом чате;
+  reopening/reload использует canonical историю без восстановления preview.
+  Признак eligibility не хранится в browser storage. External Subscribe
+  по-прежнему может восстановить preview без запуска новой работы.
 - Remote A2A caller не становится approver через текст, request metadata или
   caller JWT. Не документировать модули approval/operator как включённый
   runtime flow, пока они не подключены в `core_agent/app.py` и не имеют CI proof.

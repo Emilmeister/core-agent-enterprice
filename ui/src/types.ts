@@ -145,6 +145,13 @@ export interface Task {
   artifacts?: { artifactId: string; parts: Part[] }[];
   metadata?: Record<string, unknown>;
 }
+export interface LiveAnswerSnapshot {
+  taskId: string;
+  generation: number;
+  sequence: number;
+  text: string;
+  superseded: boolean;
+}
 export interface RemoteProgress {
   task_id: string;
   revision: number;

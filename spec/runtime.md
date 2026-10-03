@@ -375,3 +375,11 @@ A2A protocol version. При чтении результата, записанн
 - Model streaming MAY быть перезапущен только если незавершённый ответ не породил side effect; частичный пользовательский текст помечается superseded.
 - Любая неопределённость вокруг внешней мутации требует reconciliation или `SIDE_EFFECT_UNKNOWN`, а не оптимистичного продолжения.
 - Доказанная runtime-ом ошибка schema/contract validation либо запуска process до dispatch и завершённые `failed`/`timed_out` tool outcomes записываются в context как tool result и возвращают workflow в `RUNNING`; модель получает следующий turn для исправления вызова или понятного ответа пользователю.
+
+## Фаза публичного ответа
+
+Условный main-run model-only `core_response_begin({})` доступен при включённом live reply sink и поддержке adapter `on_delta`. Он MUST списывать обычный local/shared tool call и атомарно закреплять `response_phase=answer` под существующим lease/CAS. Сигнал является границей: текст данного work turn отбрасывается, co-issued calls после него получают безопасный blocked tool result, затем следующий ordinary model call MUST иметь пустой tools catalog. Активированные protected/skill instructions сохраняются, а ответ адресуется intended Task recipient. Child runs, прямой dispatch и nested Python broker MUST NOT включать эту фазу.
+
+Answer call MUST списывать обычный local/shared model turn, использовать обычную complete provenance и соблюдать pending child/inbound guards. Existing reserved budget finalizer остаётся отдельным incomplete/budget_exhausted путём; он не становится бесплатным обычным ответом. Durable phase/attempt markers восстанавливаются существующим workflow без новой lifecycle state machine или БД migration. Retry/unknown attempt закрывает прежний preview generation и списывает следующий обычный model turn. Принятый follow-up на safe boundary закрывает прежний preview, возвращает фазу work и заставляет модель учесть новое input перед ответом.
+
+Только tools-free answer turn MAY подавать public text в scoped transient reply hub. Work turn с activation/control catalog MUST сохранять discard-on-activation staging. Обычный final answer без signal совместим с прежним buffered путём без дополнительного generation call.

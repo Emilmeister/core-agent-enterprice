@@ -46,6 +46,7 @@ class KernelCompiler:
         skill_instructions=(),
         retrieved=(),
         tool_data=(),
+        response_phase=None,
     ):
         segments = [
             InstructionSegment(InstructionSource.SAFETY, self.safety),
@@ -59,6 +60,15 @@ class KernelCompiler:
             for name in sorted(enabled_capabilities)
             if name in self.capability_policies
         ]
+        if response_phase:
+            segments.append(InstructionSegment(InstructionSource.BASE_KERNEL,
+                "This is the public answer phase. Tools are unavailable. Write only the final answer "
+                "for the Task recipient using verified context. Do not reveal hidden reasoning, "
+                "internal tool calls or raw private owner questions/answers."
+                if response_phase == "answer" else
+                "Complete work and select required response files first. When core_response_begin "
+                "is available, call it with {} as your last tool call before writing the public "
+                "final answer. Do not write a final-answer draft in that work turn."))
         segments += [
             InstructionSegment(source, text)
             for source, text in (

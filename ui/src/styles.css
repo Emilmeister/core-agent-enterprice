@@ -176,6 +176,8 @@ summary {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.live-answer .prose { font-size: 15px; line-height: 1.75; }
+.live-answer > p.muted { margin: 0 0 8px; font-size: 12px; }
 .markdown { overflow-wrap: anywhere; line-height: 1.75; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }

@@ -385,3 +385,7 @@ owner_question с отдельным deadline. Ответ возвращаетс
 timeout — linked tool result `OWNER_ANSWER_TIMEOUT`. Отказ/timeout approval дают
 `OWNER_APPROVAL_REJECTED`/`OWNER_APPROVAL_TIMEOUT`, позволяют модели продолжить
 задачу и не создают owner question. Обычный A2A follow-up не является ответом.
+
+### Служебный переход к публичному ответу
+
+`core_response_begin` — условный model-only control tool основного запуска с закрытой пустой object schema, без side effects и пользовательских аргументов. Он отсутствует в operator capability allowlist, Agent Card и `core_delegate.tools`; его reserved canonical name не может быть заменён MCP tool. Модель вызывает его после завершения работы, необходимых approvals/guardrails и выбора response files, вместо генерации final draft в рабочем turn. Следующий обычный model turn имеет tools-free catalog и формирует предназначенный Task recipient публичный ответ. Вызов расходует обычный tool budget, следующий model call — обычный model budget. Прямой/nested dispatch и child run не меняют фазу. Семантика durable boundary и fallback определена в [runtime](runtime.md), transport preview — в [A2A](a2a-protocol.md).

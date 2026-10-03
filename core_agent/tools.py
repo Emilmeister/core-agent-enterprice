@@ -39,6 +39,15 @@ RESPONSE_FILES_TOOL = ToolDefinition(
     mutating=True, risk_tags=frozenset({"filesystem_read"}),
 )
 
+RESPONSE_BEGIN_TOOL = ToolDefinition(
+    "core_response_begin",
+    "Begin your public final response only after all work, required approvals and response-file "
+    "selection are complete. Call this last, with {}, instead of drafting an answer in this "
+    "work turn. The next model turn has no tools and writes only the answer for the Task recipient.",
+    {"type": "object", "properties": {}, "additionalProperties": False},
+    mutating=False, risk_tags=frozenset(),
+)
+
 
 @dataclass(frozen=True)
 class ToolCall:

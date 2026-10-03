@@ -37,6 +37,8 @@ def relay():
 
 def backend():
     import uvicorn
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
     from core_agent.app import create_app
     from core_agent.guardrails import GuardrailClassifier
     from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
@@ -76,9 +78,32 @@ print({marker!r})
         return ModelResponse(tool_requests=(ToolRequest(marker, "core_terminal_exec", {"argv": ["python3", "-P", "-c", code]}),))
 
     class BrowserModel(ScriptedModel):
-        def generate(self, *, context, tools, instructions, messages=None):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.reply_started = threading.Event()
+            self.reply_release = threading.Event()
+            self.reply_finished = threading.Event()
+            self.reply_waiting = threading.Event()
+
+        def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
             index = len(self.calls)
+            if index == 14:
+                assert not tools, "public answer turn still exposes tools"
+                assert on_delta is not None, "model streaming callback is absent"
+                response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
+                on_delta("# Native streamed reply\n\n```python\nprint('live", "private-native-reasoning")
+                self.reply_started.set()
+                self.reply_waiting.set()
+                try:
+                    assert self.reply_release.wait(120), "browser did not release the blocked provider"
+                finally:
+                    self.reply_waiting.clear()
+                on_delta(response.message, "private-native-reasoning")
+                self.reply_finished.set()
+                return response
             assert "core_response_files" in tools
+            if index == 13:
+                assert "core_response_begin" in tools, "public answer signal is absent"
             if index == 0:
                 assert "core_cron_create" in tools
             else:
@@ -169,9 +194,20 @@ flowchart LR
         ModelResponse(tool_requests=(ToolRequest("browser-background-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-preview-files", "core_response_files", {"paths": ["preview-proof/" + name for name in preview_files]}),)),
         ModelResponse(message="Owner clarification received; the command failed with exit code 3."),
+        ModelResponse(tool_requests=(ToolRequest("browser-public-reply", "core_response_begin", {}),)),
+        ModelResponse(message="# Native streamed reply\n\n```python\nprint('live reply complete')\n```\n\nNative streaming completed."),
     ])
     model.model = "owner-browser-fixture"
     app = create_app(model=model, guardrail_classifier=GuardrailClassifier(ClearModel()))
+    async def reply_fixture(request):
+        # Test-only control, protected by the real application's owner middleware.
+        if request.method == "POST":
+            model.reply_release.set()
+        return JSONResponse({"started": model.reply_started.is_set(), "finished": model.reply_finished.is_set(),
+                             "waiting": model.reply_waiting.is_set()},
+                            headers={"Cache-Control": "no-store"})
+
+    app.routes.append(Route("/api/browser-reply-fixture", reply_fixture, methods=["GET", "POST"]))
     assert isinstance(app.state.core_agent.tool_runtime.environment_manager.backend.launcher, SandboxLauncher)
     uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)
 

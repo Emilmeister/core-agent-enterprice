@@ -306,6 +306,68 @@ class NamedUser(User):
     "set TEST_DATABASE_URL to run PostgreSQL restart tests",
 )
 class PostgresRestartTests(unittest.TestCase):
+    def test_public_reply_phase_survives_database_reopen_with_charged_attempt(self):
+        import uuid
+
+        database_url = os.environ["TEST_DATABASE_URL"]
+
+        class ReplyModel:
+            model = "reply-restart-test"
+            calls = 0
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
+                on_delta("abandoned public prefix", "private reasoning")
+                raise CoreError("LEASE_LOST")
+
+        class RecoveredModel:
+            model = "reply-restart-test"
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                if tools:
+                    raise AssertionError("persisted answer phase lost")
+                on_delta("recovered public prefix", "private reasoning")
+                preview = second.state.core_agent.reply_hub.latest("company", task_id)
+                if preview["generation"] != 3 or preview["text"] != "recovered public prefix":
+                    raise AssertionError("recovery did not publish charged public generation")
+                return ModelResponse(message="Recovered complete answer")
+
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        task_id = "reply-restart-" + uuid.uuid4().hex
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+            "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+            "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/blobs",
+            "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "LOG_LEVEL": "ERROR",
+            "TEST_DATABASE_URL": database_url,
+        }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
+            first = create_app(model=ReplyModel(), database=database)
+            try:
+                with self.assertRaises(CoreError) as lost:
+                    first.state.core_agent.run({"prompt": "reply"}, task_id=task_id, identity="owner",
+                                               session_id="chat", tenant_id="company")
+                self.assertEqual(lost.exception.code, "LEASE_LOST")
+            finally:
+                first.state.close()
+            reopened = self._database()
+            second = create_app(model=RecoveredModel(), database=reopened)
+            try:
+                record = second.state.core_agent.workflow_store.lookup_task(task_id)
+                self.assertEqual(record.snapshot["response_phase"], "answer")
+                self.assertEqual(record.snapshot["turns"], 2)
+                self.assertEqual(record.snapshot["tool_calls"], 1)
+                result = second.state.core_agent.resume_task(task_id)
+                self.assertTrue(result.complete)
+                self.assertEqual(result.usage.model_turns, 3)
+                self.assertEqual(result.usage.tool_calls, 1)
+                self.assertEqual(result.message, "Recovered complete answer")
+            finally:
+                second.state.close()
+
     def _database(self):
         return PostgresDatabase(os.environ["TEST_DATABASE_URL"], min_size=0, max_size=3)
 

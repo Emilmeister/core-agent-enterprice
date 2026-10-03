@@ -48,7 +48,7 @@ from .response_files import ResponseFileService
 from .security import redact
 from .streaming import NullStreamPublisher
 from .tasks import DelegationContract, _remote_contract, remote_result_projection
-from .tools import CRON_CREATE_TOOL, RESPONSE_FILES_TOOL, ToolCall, ToolDefinition, ToolResult
+from .tools import CRON_CREATE_TOOL, RESPONSE_FILES_TOOL, RESPONSE_BEGIN_TOOL, ToolCall, ToolDefinition, ToolResult
 from .workflow import InMemoryWorkflowStore, SuspendedRun, WorkflowRecord, TERMINAL_STATES
 from .workspace import WorkspaceBinding
 
@@ -325,6 +325,7 @@ class CoreAgent:
         declared_skills=(),
         model_retries=0,
         budget_cancel_grace_seconds=DEFAULT_BUDGET_CANCEL_GRACE_SECONDS,
+        reply_hub=None,
     ):
         self.platform_config = platform_config
         self.agent_config = agent_config
@@ -394,6 +395,7 @@ class CoreAgent:
         self._task_streams = {}
         self._task_headers = {}
         self._model_streams_deltas = self._accepts_deltas(self.model)
+        self.reply_hub = reply_hub
         self.memory_registry = memory_registry
         self.platform_mcp = tuple(platform_mcp)
         self.declared_skills = tuple(declared_skills)
@@ -1161,7 +1163,7 @@ class CoreAgent:
             schema["properties"]["skills"]["maxItems"] = 0
         return schema
 
-    def _tool_catalog(self, effective, discovered, snapshot=None, *, tenant_id=None):
+    def _tool_catalog(self, effective, discovered, snapshot=None, *, tenant_id=None, root_run=True):
         catalog = {}
         index = mcp_tool_index(effective.mcp_tools)
         for name in effective.model_tool_catalog:
@@ -1251,6 +1253,12 @@ class CoreAgent:
                        if "files" in catalog["core_agent_send_message"]["input_schema"].get("properties", {}) else "")
                     + "Available agents: "
                     + "; ".join(peer["name"] + ": " + peer["description"] for peer in peers.values()))
+        if (self.reply_hub is not None and self._model_streams_deltas and self.depth == 0
+                and root_run and (snapshot or {}).get("response_root", True)):
+            catalog[RESPONSE_BEGIN_TOOL.name] = {
+                "description": RESPONSE_BEGIN_TOOL.description,
+                "input_schema": RESPONSE_BEGIN_TOOL.input_schema,
+            }
         return catalog
 
     def _remote_peers(self, tenant_id):
@@ -1873,6 +1881,8 @@ class CoreAgent:
             transition_event=event_kind,
             **transition_data,
         )
+        if state in TERMINAL_STATES and self.reply_hub is not None:
+            self.reply_hub.discard(record.tenant_id, record.task_id)
         return updated
 
     def _new_workflow(
@@ -1948,6 +1958,7 @@ class CoreAgent:
                 else ContextState((prompt,), (prompt,), (1, 1))
             ),
             "skills": [],
+            "response_root": parent_run_id is None,
             "pending_response": None,
             "tool_queue": [],
             "pending_call": None,
@@ -2360,6 +2371,9 @@ class CoreAgent:
             agent_profile=raw["agent"].get("profile_prompt", ""),
             user_prompt="",
             skill_instructions=tuple(skill_instructions),
+            response_phase=(snapshot.get("response_phase", "work")
+                            if self.reply_hub is not None and self._model_streams_deltas and self.depth == 0
+                            and snapshot.get("response_root", True) else None),
         )
 
     @staticmethod
@@ -2372,9 +2386,12 @@ class CoreAgent:
     def _context_compactor(self, raw, effective, discovered, snapshot, *, tenant_id=None):
         if self.compactor:
             return self.compactor
-        instructions = self._instructions(snapshot)
+        model_tools = ({} if snapshot.get("response_phase") == "answer" else
+                       self._tool_catalog(effective, discovered, snapshot, tenant_id=tenant_id))
+        instructions = (self._compile_instructions(raw, effective, snapshot, model_tools=model_tools).text
+                        if self.reply_hub is not None else self._instructions(snapshot))
         catalog = json.dumps(
-            self._tool_catalog(effective, discovered, snapshot, tenant_id=tenant_id),
+            model_tools,
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -2540,6 +2557,15 @@ class CoreAgent:
         return mcp_tool_index(effective.mcp_tools).get(name)
 
     def _definition(self, call, effective, discovered, record):
+        if call.name == RESPONSE_BEGIN_TOOL.name:
+            pending = record.snapshot.get("pending_call")
+            if (self.reply_hub is None or not self._model_streams_deltas or self.depth != 0
+                    or record.parent_run_id is not None or record.snapshot.get("python_execution")
+                    or pending is None or pending.get("id") != call.id
+                    or not any(item.get("id") == call.id and item.get("name") == call.name
+                               for item in record.snapshot.get("tool_queue", ()))):
+                raise CoreError("CAPABILITY_DISABLED")
+            return RESPONSE_BEGIN_TOOL, False
         target = self._mcp_target(call.name, effective)
         if target:
             server, remote_tool = target
@@ -2570,7 +2596,7 @@ class CoreAgent:
 
     @staticmethod
     def _require_tool(name, effective):
-        if name not in SKILL_TOOLS:
+        if name not in SKILL_TOOLS and name != RESPONSE_BEGIN_TOOL.name:
             effective.require_tool(name)
 
     def _activate_skill_call(self, call, record, snapshot, raw, effective):
@@ -2863,6 +2889,11 @@ class CoreAgent:
                 consumed.append(notification)
         snapshot["task_notification_revisions"] = [list(item) for item in sorted(seen)]
         if consumed:
+            if snapshot.get("response_phase") == "answer":
+                self._supersede_public_reply(record, snapshot, lease_token=lease_token)
+                snapshot["response_phase"] = "work"
+                snapshot["pending_response"] = None
+                snapshot["tool_queue"] = []
             record = self._record_transition(
                 record,
                 state="RUNNING",
@@ -2906,6 +2937,10 @@ class CoreAgent:
         if not messages:
             return record, snapshot, 0
         snapshot = copy.deepcopy(snapshot)
+        if snapshot.get("response_phase") == "answer" and state not in TERMINAL_STATES:
+            self._supersede_public_reply(record, snapshot, lease_token=lease_token)
+            snapshot["response_phase"] = "work"
+            discard_pending_response = not snapshot.get("finalizing_response")
         if discard_pending_response:
             snapshot["pending_response"] = None
             snapshot["tool_queue"] = []
@@ -3333,7 +3368,7 @@ class CoreAgent:
         active_result_token_limit=None,
     ):
         self._apply_response_files(snapshot, call, not isinstance(outcome, ToolResult) or outcome.status == "succeeded")
-        if self.material_review_store is not None:
+        if self.material_review_store is not None and call.name != RESPONSE_BEGIN_TOOL.name:
             completed = snapshot.get("pending_completed_result")
             if completed is None:
                 completed = {"call": {"id": call.id, "name": call.name, "arguments": call.arguments},
@@ -3724,6 +3759,10 @@ class CoreAgent:
             **({"arguments": call.arguments} if self.log_content else {}),
         )
         self.tool_runtime.validate(call, definition)
+        if call.name == RESPONSE_BEGIN_TOOL.name:
+            snapshot["response_phase"] = "answer"
+            return self._record_tool_outcome(record, snapshot, call, {"phase": "answer"},
+                lease_token=lease_token, span=span, active_result_token_limit=active_result_token_limit)
         if call.name == "core_agent_send_message" and self.remote_registry is not None:
             try:
                 record, snapshot = self._pin_remote_call(record, snapshot, call, lease_token=lease_token)
@@ -3912,6 +3951,28 @@ class CoreAgent:
 
     def _stream(self, record):
         return self._scoped_stream(record.task_id, record.owner_id)
+
+    def _publish_public_reply(self, record, snapshot, text, *, lease_token, force=False):
+        if self.reply_hub is None or record.parent_run_id is not None:
+            return
+        with self.workflow_store._execution_lock(record, lease_token) as (current, _connection):
+            if (current.state in TERMINAL_STATES or current.snapshot.get("response_phase") != "answer"
+                    or current.snapshot.get("turns") != snapshot["turns"]):
+                return
+            preview = self.reply_hub.update(record.tenant_id, record.task_id, record.context_id,
+                                            snapshot["turns"], text, force=force)
+        return preview
+
+    def _supersede_public_reply(self, record, snapshot, *, lease_token):
+        if (self.reply_hub is None or record.parent_run_id is not None
+                or snapshot.get("response_phase") != "answer"):
+            return
+        with self.workflow_store._execution_lock(record, lease_token) as (current, _connection):
+            if (current.state in TERMINAL_STATES or current.snapshot.get("response_phase") != "answer"
+                    or current.snapshot.get("turns") != snapshot["turns"]):
+                return
+            return self.reply_hub.supersede(record.tenant_id, record.task_id, generation=snapshot["turns"],
+                                           context_id=record.context_id)
 
     def _scoped_stream(self, task_id, owner_id):
         if owner_id and owner_id.startswith("external-"):
@@ -4250,6 +4311,7 @@ class CoreAgent:
                     record = self._resume_completed_material(record, snapshot, lease_token=lease_token,
                                                              active_result_token_limit=active_result_token_limit)
                     snapshot = copy.deepcopy(record.snapshot)
+                phase_before_input = snapshot.get("response_phase")
                 record, snapshot = self._consume_task_notifications(
                     record, snapshot, lease_token=lease_token
                 )
@@ -4261,8 +4323,13 @@ class CoreAgent:
                 if delivered_at_boundary and snapshot.get("finalizing_response"):
                     snapshot["pending_response"]["message"] = BUDGET_FOLLOWUP_MESSAGE
                     snapshot["budget_followup_unprocessed"] = True
+                if snapshot.get("response_phase") != phase_before_input:
+                    compactor = self._context_compactor(raw, effective, discovered, snapshot, tenant_id=record.tenant_id)
+                    active_result_token_limit = min(compactor.budget.output_reserve,
+                        max(64, int(compactor.budget.working_capacity * 0.10)))
                 in_flight = snapshot.get("model_attempt_in_flight")
                 if in_flight and not in_flight.get("finalizing", False):
+                    self._supersede_public_reply(record, snapshot, lease_token=lease_token)
                     snapshot["model_attempt_in_flight"] = None
                     record = self._record_transition(
                         record,
@@ -4420,10 +4487,12 @@ class CoreAgent:
                         model_messages = self._model_messages(context)
                         model_tools = (
                             {}
-                            if finalizing
-                            else self._tool_catalog(effective, discovered, snapshot, tenant_id=record.tenant_id)
+                            if finalizing or snapshot.get("response_phase") == "answer"
+                            else self._tool_catalog(effective, discovered, snapshot, tenant_id=record.tenant_id,
+                                                    root_run=record.parent_run_id is None)
                         )
-                        model_instructions = self._instructions(snapshot)
+                        model_instructions = (self._compile_instructions(raw, effective, snapshot, model_tools=model_tools).text
+                                              if self.reply_hub is not None else self._instructions(snapshot))
                         if "response_files" in effective.enabled_capability_policies and "core_response_files" not in model_tools:
                             model_instructions = self._compile_instructions(
                                 raw, effective, snapshot, model_tools=model_tools
@@ -4438,18 +4507,26 @@ class CoreAgent:
                             call_finalizer_model = False
                     retry_limit = max_turns if finalizing else max_turns - 1
                     stream = self._stream(record)
+                    answering = (not finalizing and snapshot.get("response_phase") == "answer"
+                                 and self.reply_hub is not None and record.parent_run_id is None)
                     buffered_delta = (
                         [None, None]
                         if (
                             not finalizing
                             and stream.enabled
                             and self._model_streams_deltas
-                            and SKILL_ACTIVATE_TOOL in model_tools
+                            and (SKILL_ACTIVATE_TOOL in model_tools or RESPONSE_BEGIN_TOOL.name in model_tools)
                         )
                         else None
                     )
 
                     def publish_or_buffer_delta(response_text, reasoning_text):
+                        if answering:
+                            if heartbeat_failures:
+                                raise heartbeat_failures[0]
+                            self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
+                            self._publish_public_reply(record, snapshot, response_text, lease_token=lease_token)
+                            return
                         if self.material_review_store is not None:
                             reasoning_text = None
                         if buffered_delta is None:
@@ -4459,6 +4536,8 @@ class CoreAgent:
 
                     def reserve_retry():
                         nonlocal record, snapshot
+                        if answering:
+                            self._supersede_public_reply(record, snapshot, lease_token=lease_token)
                         if buffered_delta is not None:
                             buffered_delta[:] = [None, None]
                         if snapshot["turns"] >= retry_limit:
@@ -4510,7 +4589,7 @@ class CoreAgent:
                             {"on_delta": publish_or_buffer_delta}
                             if (
                                 not finalizing
-                                and stream.enabled
+                                and (stream.enabled or answering)
                                 and self._model_streams_deltas
                             )
                             else {}
@@ -4581,6 +4660,7 @@ class CoreAgent:
                     else:
                         response_data = self._response_dict(response)
                     activation_call_id = None
+                    response_begin_id = None
                     for requested in response_data["tool_requests"]:
                         if activation_call_id is not None:
                             requested["blocked_by_skill_activation"] = (
@@ -4588,7 +4668,11 @@ class CoreAgent:
                             )
                         elif requested["name"] == SKILL_ACTIVATE_TOOL:
                             activation_call_id = requested["id"]
-                    if activation_call_id is not None:
+                        if response_begin_id is not None:
+                            requested["blocked_by_response_begin"] = response_begin_id
+                        elif requested["name"] == RESPONSE_BEGIN_TOOL.name:
+                            response_begin_id = requested["id"]
+                    if activation_call_id is not None or response_begin_id is not None:
                         # The text and any later calls were produced without the
                         # activated instructions. Preserve provider tool protocol,
                         # but force a fresh model decision before accepting either.
@@ -4598,6 +4682,10 @@ class CoreAgent:
                     ):
                         stream.text(*buffered_delta)
                     stream.flush()
+                    if answering:
+                        if response_data["tool_requests"]:
+                            raise CoreError("MODEL_PROTOCOL_INVALID", "Public answer turn cannot call tools")
+                        self._publish_public_reply(record, snapshot, response_data["message"], lease_token=lease_token, force=True)
                     action = (
                         "request_tools"
                         if response_data["tool_requests"]
@@ -4732,6 +4820,12 @@ class CoreAgent:
                         pending["id"], pending["name"], dict(pending["arguments"])
                     )
                     activation_call_id = pending.get("blocked_by_skill_activation")
+                    response_begin_id = pending.get("blocked_by_response_begin")
+                    if response_begin_id is not None:
+                        error = CoreError("RESPONSE_BEGIN_BOUNDARY", "Reconsider this call before beginning a public answer")
+                        record = self._record_tool_outcome(record, snapshot, call, self._failed_tool_outcome(call, error),
+                            lease_token=lease_token, active_result_token_limit=active_result_token_limit)
+                        continue
                     if activation_call_id is not None:
                         error = CoreError(
                             "SKILL_ACTIVATION_BOUNDARY",

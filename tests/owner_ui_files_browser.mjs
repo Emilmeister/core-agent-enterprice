@@ -544,6 +544,20 @@ try {
   const archivedSchedules=await ownerAction(second,'/api/schedules','GET',()=>second.click('Расписания','.nav-item'));
   check(archivedSchedules.body.schedules.find(row=>row.id===emptySchedule.body.schedule.id)?.enabled===false,'deleting an empty scheduled chat atomically disables its schedule');
   await page.call('Page.bringToFront');
+  await page.field('.composer textarea','Native public reply streaming proof');
+  await page.click('Отправить ↑');
+  await page.wait("document.querySelector('.live-answer .prose')?.textContent===\"# Native streamed reply\\n\\n```python\\nprint('live\"",'actual provider prefix arrives before complete response');
+  const providerBlocked=`(async()=>{const response=await fetch('/api/browser-reply-fixture',{headers:{Authorization:${JSON.stringify(bearer)}},cache:'no-store',credentials:'omit'});const state=await response.json();return response.status===200&&state.started&&state.waiting&&!state.finished;})()`;
+  check(await page.evaluate(providerBlocked),'public reply is visible while the actual provider is blocked');
+  check(await page.evaluate("!document.querySelector('.live-answer code,.live-answer .diagram')&&!document.querySelector('.thread').textContent.includes('private-native-reasoning')"),'incomplete streamed Markdown stays safe plaintext and excludes reasoning');
+  await page.call('Page.reload');
+  await page.wait("!!document.querySelector('.chat-link')",'streaming chat retained after reload');
+  await page.evaluate("document.querySelector('.chat-link').click()");
+  await page.wait("document.querySelector('.chat-link')?.getAttribute('aria-current')==='page' && ['Запрос принят','Готовит ответ'].includes(document.querySelector('.task-status')?.textContent)",'reopened chat restores canonical state');
+  check(await page.evaluate(providerBlocked)&&await page.evaluate("!document.querySelector('.live-answer')&&!document.querySelector('.thread').textContent.includes('Native streamed reply')"),'page reload uses canonical history without restoring the transient prefix');
+  check(await page.evaluate(`(async()=>{const response=await fetch('/api/browser-reply-fixture',{method:'POST',headers:{Authorization:${JSON.stringify(bearer)}},credentials:'omit'});return response.status===200;})()`),'authenticated native fixture releases the actual provider');
+  await page.wait("document.querySelector('.thread .markdown h1')?.textContent==='Native streamed reply'&&!document.querySelector('.live-answer')",'stored final reply replaces provisional text');
+  check(await page.evaluate("document.querySelectorAll('.thread .markdown h1').length===1&&document.querySelector('.thread .markdown .hljs-built_in')?.textContent==='print'&&!document.querySelector('.thread').textContent.includes('private-native-reasoning')"),'canonical final reply replaces preview once with safe Markdown and Python');
   const revokedBearer=bearer;
   const exitRequests=[];
   page.on('Network.requestWillBeSent',({request})=>{

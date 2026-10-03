@@ -243,6 +243,12 @@ messageId и отклонённая busy Task не меняют цепочку. 
 calls и не переносит replay/signatures, старые budgets, разрешения, waits или
 execution state. Failed/partial outcome не превращается в успешное выполнение.
 
+Активированные skills восстанавливаются отдельно от исторической проекции по
+[контракту skills](skills.md): новый root проверяет текущие permissions и
+package locks, закрепляет полное тело в instruction layer и включает его в
+base tokens. Историческая activation receipt не заменяет эту проверку и не
+является provider tool call текущей Task.
+
 `context_import` version 1 и выбранная historical projection сохраняются одной
 fenced transition текущей Task до обращения к модели. Повторное восстановление
 не импортирует её заново. Full transcripts источников не копируются в transcript

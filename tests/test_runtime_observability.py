@@ -257,6 +257,269 @@ def locked_skill_declaration(path, name):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_lost_reply_worker_cannot_supersede_replacement_generation(self):
+        from core_agent.streaming import ReplyHub
+
+        hub = ReplyHub(min_chars=1)
+        agent = make_agent(ScriptedModel([]), reply_hub=hub)
+        self.addCleanup(agent.close)
+        record = agent._new_workflow(RunRequest("reply"), task_id="lease-reply", identity="alice",
+                                    session_id="chat", tenant_id="company")[0]
+        store = agent.workflow_store
+        old_token = store.acquire_lease(record.run_id, tenant_id="company", owner_id="alice", worker_id="old", ttl=60)
+        old_snapshot = {**record.snapshot, "response_phase": "answer", "turns": 2}
+        old = store.transition(record.run_id, tenant_id="company", owner_id="alice", expected_version=record.version,
+                               snapshot=old_snapshot, state="RUNNING", event_kind="test.answer", lease_token=old_token)
+        store.release_lease(record.run_id, tenant_id="company", worker_id="old", token=old_token)
+        new_token = store.acquire_lease(record.run_id, tenant_id="company", owner_id="alice", worker_id="new", ttl=60)
+        new_snapshot = {**old_snapshot, "turns": 3}
+        new = store.transition(record.run_id, tenant_id="company", owner_id="alice", expected_version=old.version,
+                               snapshot=new_snapshot, state="RUNNING", event_kind="test.replacement", lease_token=new_token)
+        try:
+            agent._publish_public_reply(new, new_snapshot, "new prefix", lease_token=new_token)
+            with self.assertRaises(CoreError) as lost:
+                agent._supersede_public_reply(old, old_snapshot, lease_token=old_token)
+            self.assertEqual(lost.exception.code, "LEASE_LOST")
+            self.assertIsNone(hub.supersede("company", "lease-reply", generation=2))
+            agent._publish_public_reply(new, new_snapshot, "new prefix continues", lease_token=new_token)
+            preview = hub.latest("company", "lease-reply")
+            self.assertEqual(preview["text"], "new prefix continues")
+            self.assertEqual(preview["generation"], 3)
+            self.assertNotIn("superseded", preview)
+        finally:
+            store.release_lease(record.run_id, tenant_id="company", worker_id="new", token=new_token)
+
+    def test_public_reply_tools_free_context_fits_without_spending_summary_turn(self):
+        from core_agent.streaming import ReplyHub
+
+        class ReplyModel:
+            calls = 0
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
+                on_delta("Complete answer", None)
+                return ModelResponse(message="Complete answer")
+
+            def generate_summary(self, **kwargs):
+                raise AssertionError("tools-free answer fits; compaction must not consume a turn")
+
+        agent = make_agent(ReplyModel(), reply_hub=ReplyHub(min_chars=1), context_window=870,
+                           output_reserve=128, max_turns=3)
+        self.addCleanup(agent.close)
+        result = agent.run(RunRequest("x" * 1200), task_id="small-window-reply", identity="alice")
+        self.assertTrue(result.complete)
+        self.assertEqual(result.usage.model_turns, 2)
+        self.assertEqual(result.usage.tool_calls, 1)
+
+    def test_public_reply_retry_supersedes_old_prefix_and_uses_new_generation(self):
+        from core_agent.streaming import ReplyHub
+
+        previews = []
+        hub = ReplyHub(min_chars=1)
+
+        class ReplyModel:
+            calls = 0
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
+                if self.calls == 2:
+                    on_delta("failed attempt", "private")
+                    raise CoreError("MODEL_UNAVAILABLE", retryable=True)
+                previews.append(hub.latest("company", "retry-reply"))
+                on_delta("fresh answer", "private")
+                previews.append(hub.latest("company", "retry-reply"))
+                return ModelResponse(message="fresh answer")
+
+        agent = make_agent(ReplyModel(), reply_hub=hub, model_retries=1)
+        self.addCleanup(agent.close)
+        result = agent.run(RunRequest("hello"), task_id="retry-reply", identity="alice", tenant_id="company")
+        self.assertTrue(previews[0]["superseded"])
+        self.assertEqual(previews[0]["generation"], 2)
+        self.assertEqual(previews[1]["generation"], 3)
+        self.assertGreater(previews[1]["sequence"], previews[0]["sequence"])
+        self.assertEqual(result.message, "fresh answer")
+        self.assertEqual(result.usage.model_turns, 3)
+        self.assertEqual(result.usage.tool_calls, 1)
+
+    def test_public_reply_control_schema_and_boundary_do_not_dispatch_coissued_work(self):
+        from core_agent.streaming import ReplyHub
+
+        class ReplyModel:
+            calls = 0
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),
+                        ToolRequest("late", "core_terminal_exec", {"argv": ["must-not-run"]})))
+                if tools:
+                    raise AssertionError("final response must be tools-free")
+                if "RESPONSE_BEGIN_BOUNDARY" not in json.dumps(messages):
+                    raise AssertionError("coissued call lacks protocol result")
+                on_delta("answer", None)
+                return ModelResponse(message="answer")
+
+        agent = make_agent(ReplyModel(), reply_hub=ReplyHub(min_chars=1))
+        self.addCleanup(agent.close)
+        with patch.object(agent.tool_runtime, "execute", side_effect=AssertionError("must not dispatch")):
+            result = agent.run(RunRequest("hello"), task_id="boundary-reply", identity="alice")
+        self.assertEqual(result.usage.tool_calls, 2)
+        from core_agent.tools import RESPONSE_BEGIN_TOOL, ToolCall
+        with self.assertRaises(CoreError) as invalid:
+            agent.tool_runtime.validate(ToolCall("bad", "core_response_begin", {"extra": "forged"}), RESPONSE_BEGIN_TOOL)
+        self.assertEqual(invalid.exception.code, "TOOL_ARGUMENT_INVALID")
+
+    def test_public_reply_control_is_absent_for_child_model_catalog(self):
+        from core_agent.streaming import ReplyHub
+
+        class ChildModel:
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                if "core_response_begin" in tools:
+                    raise AssertionError("child acquired public reply control")
+                return ModelResponse(message="child result")
+
+        agent = make_agent(ChildModel(), reply_hub=ReplyHub(min_chars=1), depth=1)
+        self.addCleanup(agent.close)
+        self.assertEqual(agent.run(RunRequest("work"), task_id="child-reply").message, "child result")
+
+    def test_public_reply_phase_recovers_without_replaying_begin_and_charges_new_attempt(self):
+        from core_agent.streaming import ReplyHub
+
+        class CrashModel:
+            calls = 0
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
+                on_delta("abandoned prefix", "private")
+                raise CoreError("LEASE_LOST")
+
+        first = make_agent(CrashModel(), reply_hub=ReplyHub(min_chars=1))
+        self.addCleanup(first.close)
+        with self.assertRaises(CoreError) as failure:
+            first.run(RunRequest("hello"), task_id="recover-reply", identity="external-alice",
+                      session_id="chat", tenant_id="company")
+        self.assertEqual(failure.exception.code, "LEASE_LOST")
+        record = first.workflow_store.by_task("recover-reply", tenant_id="company", owner_id="external-alice")
+        self.assertEqual(record.snapshot["response_phase"], "answer")
+        self.assertEqual(record.snapshot["tool_calls"], 1)
+        self.assertEqual(record.snapshot["turns"], 2)
+
+        class RecoveryModel:
+            catalog = None
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.catalog = tools
+                on_delta("recovered public answer", "hidden")
+                return ModelResponse(message="recovered public answer")
+
+        model = RecoveryModel()
+        second = make_agent(model, reply_hub=ReplyHub(min_chars=1), workflow_store=first.workflow_store)
+        second.event_store = first.event_store
+        second.checkpoint_store = first.checkpoint_store
+        second.audit_log = first.audit_log
+        self.addCleanup(second.close)
+        result = second.resume_task("recover-reply")
+        self.assertEqual(model.catalog, {})
+        self.assertEqual(result.message, "recovered public answer")
+        self.assertTrue(result.complete)
+        self.assertEqual(result.usage.model_turns, 3)
+        self.assertEqual(result.usage.tool_calls, 1)
+        self.assertIsNone(second.reply_hub.latest("company", "recover-reply"))
+
+    def test_public_reply_begin_keeps_emergency_finalizer_incomplete(self):
+        from core_agent.streaming import ReplyHub
+
+        class ReplyModel:
+            calls = 0
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
+                return ModelResponse(message="Verified partial work")
+
+        agent = make_agent(ReplyModel(), reply_hub=ReplyHub(min_chars=1), max_turns=2)
+        self.addCleanup(agent.close)
+        result = agent.run(RunRequest("hello"), task_id="budget-reply", identity="alice")
+        self.assertFalse(result.complete)
+        self.assertEqual(result.completion_reason, "budget_exhausted")
+        self.assertEqual(result.usage.model_turns, 2)
+        self.assertEqual(result.usage.tool_calls, 1)
+        self.assertTrue(result.message.startswith("Budget exhausted; this task is incomplete."))
+
+    def test_public_reply_begin_uses_an_ordinary_tools_free_turn(self):
+        from core_agent.streaming import ReplyHub
+
+        class ReplyModel:
+            def __init__(self):
+                self.catalogs = []
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.catalogs.append(tools)
+                if len(self.catalogs) == 1:
+                    if on_delta:
+                        on_delta("private work draft", "private reasoning")
+                    return ModelResponse(message="private work draft", tool_requests=(
+                        ToolRequest("begin", "core_response_begin", {}),))
+                self.assert_no_tools = tools == {}
+                on_delta("Public prefix", "hidden reasoning")
+                return ModelResponse(message="Public prefix and final answer.")
+
+        hub = ReplyHub(min_chars=1)
+        model = ReplyModel()
+        agent = make_agent(model, reply_hub=hub)
+        self.addCleanup(agent.close)
+        result = agent.run(RunRequest("hello"), task_id="public-reply", identity="external-alice",
+                           session_id="public-chat", tenant_id="company")
+        self.assertIn("core_response_begin", model.catalogs[0])
+        self.assertEqual(model.catalogs[1], {})
+        self.assertTrue(result.complete)
+        self.assertEqual(result.usage.model_turns, 2)
+        self.assertEqual(result.usage.tool_calls, 1)
+        self.assertEqual(result.message, "Public prefix and final answer.")
+        self.assertNotIn("private work draft", str(agent.workflow_store.by_task(
+            "public-reply", tenant_id="company", owner_id="external-alice").result))
+
+    def test_public_reply_followup_closes_preview_and_returns_to_work(self):
+        from core_agent.streaming import ReplyHub
+
+        class ReplyModel:
+            def __init__(self):
+                self.catalogs = []
+                self.previews = []
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.catalogs.append(tools)
+                turn = len(self.catalogs)
+                if turn in {1, 3}:
+                    return ModelResponse(tool_requests=(ToolRequest(f"begin-{turn}", "core_response_begin", {}),))
+                on_delta("Old answer" if turn == 2 else "New answer", "private")
+                self.previews.append(hub.latest("company", "followup-reply"))
+                if turn == 2:
+                    agent.enqueue_message(RunRequest("new instruction"), task_id="followup-reply",
+                        message_id="followup", identity="alice", session_id="chat", tenant_id="company")
+                return ModelResponse(message="Old answer" if turn == 2 else "New answer")
+
+        hub = ReplyHub(min_chars=1)
+        model = ReplyModel()
+        agent = make_agent(model, reply_hub=hub)
+        self.addCleanup(agent.close)
+        result = agent.run(RunRequest("hello"), task_id="followup-reply", identity="alice",
+                           session_id="chat", tenant_id="company")
+        self.assertEqual(result.message, "New answer")
+        self.assertIn("core_response_begin", model.catalogs[2])
+        self.assertEqual(model.catalogs[1], {})
+        self.assertEqual(model.catalogs[3], {})
+        self.assertEqual([p["generation"] for p in model.previews], [2, 4])
+        self.assertEqual(result.usage.model_turns, 4)
+        self.assertEqual(result.usage.tool_calls, 2)
+
     def test_durable_cancel_poll_survives_a_transient_store_failure(self):
         class FlakyStore:
             atomic = True
@@ -1009,6 +1272,75 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(lock_audit.data["skills"][0]["name"], "release-notes")
         self.assertEqual(len(lock_audit.data["skills"][0]["digest"]), 71)
         self.assertEqual(len(lock_audit.data["skills"][0]["manifest_digest"]), 64)
+
+    def test_activated_skill_continues_across_chat_root_tasks(self):
+        class WireModel(ScriptedModel):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.payloads = []
+                self.summaries = []
+
+            def generate(self, **call):
+                if call["instructions"].startswith("SEMANTIC CONTEXT SUMMARY"):
+                    self.summaries.append(call)
+                    return SemanticRuntimeTests.semantic_answer(call)
+                self.payloads.append({
+                    api_format: CompatibleHttpModel(
+                        api_format=api_format, model="test", cache_ttl="5m",
+                    )._request(**call)[0]
+                    for api_format in ("openai", "anthropic")
+                })
+                return super().generate(**call)
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release-notes"
+            path.mkdir()
+            body = "FULL_CHAT_SKILL_BODY\n  Keep indentation and every line.\n"
+            (path / "SKILL.md").write_text(
+                "---\nname: release-notes\ndescription: Create release notes.\n---\n" + body,
+                encoding="utf-8",
+            )
+            (path / "format.md").write_text("Use headings.\n", encoding="utf-8")
+            model = WireModel([
+                ModelResponse(tool_requests=(ToolRequest("activate", "core_skill_activate", {"names": ["release-notes"]}),)),
+                ModelResponse(message="first done"),
+                ModelResponse(message="second done"),
+                ModelResponse(tool_requests=(ToolRequest("read", "core_skill_read_resource", {"resource": "release-notes/format.md"}),)),
+                ModelResponse(message="third done"),
+            ])
+            agent = make_agent(model, memory="disabled", mcp=False,
+                declared_skills=(locked_skill_declaration(path, "release-notes"),))
+            raw = agent.agent_config.to_dict()
+            raw["features"]["skills"] = True
+            raw["skills"]["allow"] = ["release-notes"]
+            raw["context"]["compaction_interval"] = 1
+            agent.agent_config = AgentConfig.from_dict(raw)
+            agent.platform_config.allowed_skills.add("release-notes")
+            agent.platform_config.supported_features.add("skills")
+            try:
+                first = agent.run({"prompt": "Prepare notes"}, task_id="skill-one", session_id="skill-chat")
+                original = agent.workflow_store.get(first.run_id, tenant_id="default", owner_id="anonymous")
+                previous = first.run_id
+                for task in ("skill-two", "skill-three"):
+                    current = agent._new_workflow({"prompt": "Continue notes"}, task_id=task,
+                        identity=None, session_id="skill-chat", tenant_id=None,
+                        previous_root_run_id=previous, defer_initialization=True)[0]
+                    result = agent.resume_task(task)
+                    saved = agent.workflow_store.get(current.run_id, tenant_id="default", owner_id="anonymous")
+                    self.assertEqual(saved.snapshot["skills"], original.snapshot["skills"])
+                    self.assertEqual(result.usage.tool_calls, 0 if task == "skill-two" else 1)
+                    previous = current.run_id
+                self.assertIn("Use headings.", model.calls[4].context)
+                for index in range(1, len(model.calls)):
+                    self.assertIn(body, model.calls[index].instructions)
+                    self.assertIn(body, model.payloads[index]["openai"]["messages"][0]["content"])
+                    self.assertIn(body, model.payloads[index]["anthropic"]["system"][0]["text"])
+                self.assertIn("Historical data only", model.calls[2].context)
+                self.assertTrue(all(message["role"] == "user" for message in model.calls[2].messages))
+                self.assertTrue(model.summaries)
+                self.assertEqual(saved.snapshot["compaction_operation"]["outcome"], "committed")
+            finally:
+                agent.close()
 
     def test_skill_activation_blocks_remaining_calls_until_next_model_turn(self):
         with tempfile.TemporaryDirectory() as temp:

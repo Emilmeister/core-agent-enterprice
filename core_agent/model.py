@@ -385,6 +385,19 @@ class CompatibleHttpModel:
     def _request(self, context, instructions, tools, messages=None):
         schemas, reverse = self._tools(tools)
         messages = list(messages or ({"role": "user", "content": context},))
+        # Historical protocol is replay data, not the current dispatch authority.
+        replay_names = dict(reverse)
+        historical_names = {call["function"]["name"] for message in messages
+                            for call in message.get("tool_calls", ())}
+        historical_names.update(message["name"] for message in messages
+                                if message.get("role") == "tool" and message.get("name"))
+        for name in sorted(historical_names - set(reverse.values())):
+            wire_name = self._wire_name(name)
+            if wire_name in replay_names:
+                wire_name = self._wire_name(name, disambiguate=True)
+            if wire_name in replay_names:
+                raise CoreError("TOOL_NAME_COLLISION")
+            replay_names[wire_name] = name
         body = self.invocation_parameters
         # Provider options cannot reintroduce capabilities hidden by runtime
         # policy, including the detector's deliberately empty catalog.
@@ -395,7 +408,7 @@ class CompatibleHttpModel:
                 {
                     "model": self.model,
                     "messages": [{"role": "system", "content": instructions}]
-                    + self._openai_messages(messages, reverse),
+                    + self._openai_messages(messages, replay_names),
                 }
             )
         else:
@@ -404,7 +417,7 @@ class CompatibleHttpModel:
                     "model": self.model,
                     "max_tokens": self.max_tokens,
                     "system": self._system_blocks(instructions),
-                    "messages": self._anthropic_messages(messages, reverse),
+                    "messages": self._anthropic_messages(messages, replay_names),
                 }
             )
         if schemas:

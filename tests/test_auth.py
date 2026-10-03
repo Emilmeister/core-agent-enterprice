@@ -132,6 +132,107 @@ class AuthAppTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class AuthBoundaryTests(AuthAppTestCase):
+    async def test_public_external_prefix_reconnect_is_scoped_and_private_work_is_withheld(self):
+        import json
+        import socket
+        import uvicorn
+        from core_agent.model import ToolRequest
+
+        release = threading.Event()
+        agent = self.app.state.core_agent
+
+        class ReplyModel:
+            calls = 0
+
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                self.calls += 1
+                if self.calls == 1:
+                    if on_delta:
+                        on_delta("PRIVATE work/owner QA", "PRIVATE reasoning")
+                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
+                if tools:
+                    raise AssertionError("public reply catalog must be empty")
+                on_delta("Visible public prefix", "PRIVATE reasoning/owner QA")
+                if not release.wait(10):
+                    raise TimeoutError("test did not observe live reply")
+                return ModelResponse(message="Visible public prefix and complete answer")
+
+        agent.model = ReplyModel()
+        agent._model_streams_deltas = True
+        ready = threading.Event()
+
+        class Server(uvicorn.Server):
+            async def startup(self, sockets=None):
+                await super().startup(sockets)
+                ready.set()
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        server = Server(uvicorn.Config(self.app, log_level="error", lifespan="off"))
+        thread = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
+        thread.start()
+        self.assertTrue(await asyncio.to_thread(ready.wait, 5))
+        task_id = None
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                async with http.stream("POST", url + "/a2a/external/message:stream", headers=self.headers("external-a"),
+                    json={"message": {"role": "ROLE_USER", "messageId": "live-public",
+                        "parts": [{"text": "Please answer"}]}}) as response:
+                    self.assertEqual(response.status_code, 200)
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        event = json.loads(line[5:])
+                        self.assertNotIn("error", event)
+                        self.assertNotIn("PRIVATE", json.dumps(event))
+                        if "task" in event:
+                            task_id = event["task"]["id"]
+                        message = (event.get("statusUpdate", {}).get("status", {}).get("message") or {})
+                        if (message.get("metadata") or {}).get("core_agent_stream"):
+                            self.assertIsNotNone(task_id)
+                            self.assertEqual(message["parts"][0]["text"], "Visible public prefix")
+                            self.assertFalse(release.is_set())
+                            break
+                foreign = await http.get(url + f"/a2a/external/tasks/{task_id}:subscribe", headers=self.headers("external-b"))
+                self.assertEqual(foreign.status_code, 404)
+                during = await http.get(url + f"/a2a/external/tasks/{task_id}", headers=self.headers("external-a"))
+                self.assertEqual(during.status_code, 200)
+                self.assertNotIn("Visible public prefix", during.text)
+                self.assertNotIn("core_agent_stream", during.text)
+                frames = []
+                async with http.stream("GET", url + f"/a2a/external/tasks/{task_id}:subscribe",
+                    headers=self.headers("external-a-replaced")) as response:
+                    self.assertEqual(response.status_code, 200)
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        event = json.loads(line[5:])
+                        frames.append(event)
+                        self.assertNotIn("PRIVATE", json.dumps(event))
+                        message = (event.get("statusUpdate", {}).get("status", {}).get("message") or {})
+                        if (message.get("metadata") or {}).get("core_agent_stream") and not release.is_set():
+                            self.assertIn("task", frames[0])
+                            self.assertEqual(message["parts"][0]["text"], "Visible public prefix")
+                            self.assertFalse(release.is_set())
+                            release.set()
+                self.assertTrue(release.is_set(), "reconnect did not receive cached preview")
+                terminal = [event for event in frames if (event.get("task") or event.get("statusUpdate") or {})
+                            .get("status", {}).get("state") in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"}]
+                self.assertEqual(len(terminal), 1)
+                self.assertIs(terminal[0], frames[-1])
+                final = await http.get(url + f"/a2a/external/tasks/{task_id}", headers=self.headers("external-a"))
+                self.assertEqual(final.status_code, 200)
+                self.assertNotIn("core_agent_stream", final.text)
+                self.assertNotIn("PRIVATE", final.text)
+        finally:
+            release.set()
+            server.should_exit = True
+            await asyncio.to_thread(thread.join, 10)
+            listener.close()
+            self.assertFalse(thread.is_alive())
+
     async def test_browser_bootstrap_is_absent_when_not_configured(self):
         response = await self.http.get("/ui/config")
         self.assertEqual(response.status_code, 404)

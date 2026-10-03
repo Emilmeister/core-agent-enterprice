@@ -66,6 +66,7 @@ from .push import DurablePushNotificationSender, PostgresPushNotificationConfigS
 from .remote_agents import RemoteAgentRegistry
 from .remote_registry import InMemoryRemoteRegistry, PostgresRemoteRegistry
 from .runtime import CoreAgent
+from .streaming import ReplyHub
 from .security import redact, safe_url, validate_http_url
 from .skills import SkillResolver
 from .tasks import TaskScheduler
@@ -1458,6 +1459,9 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         if _boolean("REFLECT_AND_RETRY_ENABLED", "true")
         else 0,
         budget_cancel_grace_seconds=_number("CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS", float, default="5"),
+        reply_hub=(ReplyHub(min_chars=_number("A2A_STREAMING_BUFFER_SIZE", int, default="10"))
+                   if _boolean("A2A_STREAMING_ENABLED", "true") and "streaming" in _advertised_capabilities()
+                   and getattr(model, "stream", True) else None),
     )
     agent._log(
         "startup.configuration",
@@ -1957,6 +1961,7 @@ def create_app(
         max_chunk_size=max_chunk_size,
         streaming_enabled=_boolean("A2A_STREAMING_ENABLED", "true")
         and "streaming" in advertised,
+        reply_hub=agent.reply_hub,
     )
 
     if auth_settings:

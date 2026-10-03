@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager, nullcontext
 
 from google.protobuf import json_format
@@ -73,8 +74,10 @@ from .streaming import (
     FUNCTION_CALL_TYPE,
     FUNCTION_RESPONSE_TYPE,
     PARTIAL_KEY,
+    PUBLIC_REPLY_KEY,
     NullStreamPublisher,
     StreamBuffer,
+    public_reply_metadata,
 )
 
 
@@ -541,8 +544,8 @@ class TaskStreamPublisher:
             # The task already reached a terminal state; stop relaying quietly.
             self.closed = True
 
-    def _publish(self, parts, *, partial=False):
-        metadata = {PARTIAL_KEY: True} if partial else None
+    def _publish(self, parts, *, partial=False, metadata=None):
+        metadata = metadata or ({PARTIAL_KEY: True} if partial else None)
         message = self.updater.new_agent_message(parts, metadata=metadata)
         self._submit(
             self.updater.update_status(SdkTaskState.TASK_STATE_WORKING, message=message)
@@ -861,6 +864,13 @@ class TransientStatusTaskStore:
     def __init__(self, inner):
         self.inner = inner
 
+    @staticmethod
+    def _strip_partial_status(task):
+        if (task is not None and task.status.message.role == SdkRole.ROLE_AGENT
+                and json_format.MessageToDict(task.status.message.metadata).get(PARTIAL_KEY)):
+            task.status.ClearField("message")
+        return task
+
     async def save(self, task, context=None):
         kept = []
         user_ids = set()
@@ -875,24 +885,76 @@ class TransientStatusTaskStore:
         if len(kept) != len(task.history):
             del task.history[:]
             task.history.extend(kept)
+        self._strip_partial_status(task)
         return await self.inner.save(task, context)
 
     async def get(self, task_id, context=None):
-        return await self.inner.get(task_id, context)
+        return self._strip_partial_status(await self.inner.get(task_id, context))
 
     async def list(self, params, context=None):
-        return await self.inner.list(params, context)
+        result = await self.inner.list(params, context)
+        for task in result.tasks:
+            self._strip_partial_status(task)
+        return result
 
     async def delete(self, task_id, context=None):
         return await self.inner.delete(task_id, context)
 
 
 class CoreRequestHandler(DefaultRequestHandler):
-    def __init__(self, *args, followup_handler, admission_handler=None, admission_cleanup=None, **kwargs):
+    def __init__(self, *args, followup_handler, admission_handler=None, admission_cleanup=None, reply_hub=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.followup_handler = followup_handler
         self.admission_handler = admission_handler
         self.admission_cleanup = admission_cleanup
+        self.reply_hub = reply_hub
+
+    @staticmethod
+    def _public_reply_event(task_id, context_id, preview):
+        message = SdkTask().status.message
+        message.role = SdkRole.ROLE_AGENT
+        message.message_id = str(uuid.uuid4())
+        message.task_id = task_id
+        message.context_id = context_id
+        message.metadata.update(public_reply_metadata(preview))
+        if preview["text"]:
+            message.parts.add(text=preview["text"], media_type="text/plain")
+        return SdkTaskStatusUpdateEvent(task_id=task_id, context_id=context_id,
+            status=SdkTaskStatus(state=SdkTaskState.TASK_STATE_WORKING, message=message))
+
+    async def _stream_with_public_replies(self, source, context, *, task_id=None, context_id=None):
+        """Public previews use one latest snapshot, never the SDK token FIFO."""
+        source = source.__aiter__()
+        next_event = asyncio.create_task(anext(source))
+        previous = None
+        try:
+            while True:
+                done, _pending = await asyncio.wait((next_event,), timeout=0.25)
+                if done:
+                    try:
+                        event = next_event.result()
+                    except StopAsyncIteration:
+                        return
+                    next_event = None
+                    if isinstance(event, SdkTask):
+                        task_id, context_id = event.id, event.context_id
+                    terminal = (isinstance(event, SdkTask) and event.status.state in A2A_TERMINAL_STATES) or (
+                        isinstance(event, SdkTaskStatusUpdateEvent) and event.status.state in A2A_TERMINAL_STATES)
+                    yield event
+                    if terminal:
+                        return
+                    next_event = asyncio.create_task(anext(source))
+                if task_id and self.reply_hub is not None:
+                    preview = self.reply_hub.latest((context.tenant if context else None) or "default", task_id)
+                    key = (preview["generation"], preview["sequence"]) if preview is not None else None
+                    if key is not None and (previous is None or key > previous):
+                        previous = key
+                        yield self._public_reply_event(task_id, context_id, preview)
+        finally:
+            if next_event is not None:
+                next_event.cancel()
+                await asyncio.gather(next_event, return_exceptions=True)
+            await source.aclose()
 
     def _validate_enterprise_message(self, message):
         if self.admission_handler is None:
@@ -1008,7 +1070,11 @@ class CoreRequestHandler(DefaultRequestHandler):
             yield apply_history_length(admitted.task, params.configuration)
             if admitted.lease_token is None:
                 return
-        async for event in super().on_message_send_stream(params, context):
+        source = super().on_message_send_stream(params, context)
+        if self.reply_hub is not None:
+            source = self._stream_with_public_replies(source, context,
+                task_id=params.message.task_id or None, context_id=params.message.context_id or None)
+        async for event in source:
             yield event
 
     async def on_cancel_task(self, params, context):
@@ -1040,6 +1106,7 @@ class CoreRequestHandler(DefaultRequestHandler):
             await asyncio.sleep(0)
         previous = task.SerializeToString(deterministic=True)
         previous_progress = json_format.MessageToDict(task.metadata).get(REMOTE_PROGRESS_KEY)
+        previous_reply = None
         try:
             yield task
             if task.status.state in A2A_TERMINAL_STATES:
@@ -1081,6 +1148,13 @@ class CoreRequestHandler(DefaultRequestHandler):
                                 next_live = asyncio.create_task(anext(live_stream))
                             if isinstance(event, SdkTask):
                                 previous_progress = json_format.MessageToDict(event.metadata).get(REMOTE_PROGRESS_KEY)
+                            if isinstance(event, SdkTaskStatusUpdateEvent):
+                                marker = json_format.MessageToDict(event.status.message.metadata).get(PUBLIC_REPLY_KEY)
+                                if marker and marker.get("version") == 1:
+                                    key = (marker.get("generation", 0), marker.get("sequence", 0))
+                                    if previous_reply is not None and key <= previous_reply:
+                                        continue
+                                    previous_reply = key
                             yield event
                             if terminal:
                                 return
@@ -1088,6 +1162,12 @@ class CoreRequestHandler(DefaultRequestHandler):
                 if task is None:
                     raise TaskNotFoundError(message=f"Task {params.id} not found")
                 current = task.SerializeToString(deterministic=True)
+                if task.status.state not in A2A_TERMINAL_STATES and self.reply_hub is not None:
+                    preview = self.reply_hub.latest((context.tenant if context else None) or "default", params.id)
+                    key = (preview["generation"], preview["sequence"]) if preview is not None else None
+                    if key is not None and (previous_reply is None or key > previous_reply):
+                        previous_reply = key
+                        yield self._public_reply_event(params.id, task.context_id, preview)
                 if current == previous:
                     continue
                 previous = current
@@ -1127,6 +1207,7 @@ def build_starlette_app(
     stream_buffer_size=DEFAULT_BUFFER_SIZE,
     streaming_enabled=True,
     max_chunk_size=0,
+    reply_hub=None,
 ):
     """Build the official A2A 1.0 JSON-RPC and HTTP+JSON bindings around the runtime."""
     limit = request_limit()
@@ -1151,6 +1232,7 @@ def build_starlette_app(
         followup_handler=followup_handler,
         admission_handler=admission_handler,
         admission_cleanup=admission_cleanup,
+        reply_hub=reply_hub,
     )
     routes = _agent_card_routes(sdk_card, derive_base_url=derive_base_url, card_skills=card_skills)
     for route in create_jsonrpc_routes(
