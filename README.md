@@ -625,8 +625,9 @@ uv run python -m unittest tests.test_end_to_end -v
 Владелец открывает «Доступ к агенту» → «Выдать доступ», задаёт название и срок
 1–365 дней (по умолчанию 30). Бэк использует текущую сессию владельца для
 Keycloak Admin API. Нужны realm-management права create-client/manage-clients,
-manage-users, view-clients, view-users и view-realm; их должен разрешать client
+manage-users, manage-realm, view-clients, view-users и view-realm; их должен разрешать client
 scope браузерного клиента. При изменении прав получить свежий токен сессии.
+`manage-realm` требуется для назначения realm roles в scope внешнего клиента.
 
 После выдачи скопировать показанный access token и адрес `/a2a/external/`.
 Передавать `Authorization: Bearer <access_token>`. Токен не сохраняется

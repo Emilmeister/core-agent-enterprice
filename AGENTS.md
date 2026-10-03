@@ -1188,7 +1188,9 @@ docker compose logs -f agent
 Owner UI «Доступ к агенту» использует текущий owner bearer для configured
 Keycloak Admin API. Роль agent-owner в deployment также получает принятые
 realm-management права управления clients/users; эти роли должны попасть в
-browser token. Отдельный provisioning secret, собственный API-key registry и
+browser token. Также нужен manage-realm для realm role scope mappings внешнего
+клиента.
+Отдельный provisioning secret, собственный API-key registry и
 миграция application DB не требуются. Keycloak client attributes хранят только
 tenant/audience/request ID и issuance metadata. Токен выдаётся один раз,
 не сохраняется в application storage/audit/telemetry и очищается из UI при
