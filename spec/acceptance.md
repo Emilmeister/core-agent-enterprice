@@ -638,3 +638,9 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   identity и закрывает прежний токен даже в ту же секунду, revoke закрывает новые
   запросы без удаления задач/файлов. Native browser доказывает accessible modal,
   count, single display/copy и отсутствие сохранённого токена после закрытия.
+  Отдельное подтверждённое удаление через owner HTTP удаляет native client
+  вместе с service-account user, убирает строку/число и закрывает старый токен.
+  Задачи и файлы остаются доступны владельцам; новая одноимённая учётка
+  не получает старый caller scope. External/foreign/owner-authority client
+  не удаляется; native Keycloak и браузер доказывают реальный cascade,
+  отмену подтверждения без DELETE и обновлённый список после успеха.

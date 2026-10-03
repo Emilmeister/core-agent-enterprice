@@ -7,9 +7,12 @@ from urllib.parse import parse_qs
 import httpx
 
 from tests.test_auth import AuthAppTestCase, ISSUER
+from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 
 
 class ExternalAccessTests(AuthAppTestCase):
+    durable_blobs = True
+
     async def asyncSetUp(self):
         self.clients = {}
         self.admin_calls = []
@@ -19,12 +22,15 @@ class ExternalAccessTests(AuthAppTestCase):
         self.malformed = False
         self.malformed_after_create = False
         self.role_names = ['agent-external']
+        self.delete_fault = ''
         await super().asyncSetUp()
 
     def introspect(self, request):
         if request.url.path.endswith('/token/introspect'):
             form = parse_qs(request.content.decode())
             claims = dict(self.tokens.get(form['token'][0], {'active': False}))
+            if form['token'][0].startswith('issued-'):
+                claims['active'] = False
             for client in self.clients.values():
                 if claims.get('sub') == 'service-' + client['id']:
                     claims['active'] = client['enabled'] and claims.get('iat', 0) >= client.get('notBefore', 0)
@@ -43,7 +49,7 @@ class ExternalAccessTests(AuthAppTestCase):
                 'realm_access': {'roles': ['agent-external']}}
             return httpx.Response(200, json={'access_token': token, 'token_type': 'Bearer', 'expires_in': duration})
         self.admin_calls.append(request)
-        self.assertEqual(request.headers['authorization'], 'Bearer owner-a')
+        self.assertIn(request.headers['authorization'], ('Bearer owner-a', 'Bearer owner-b'))
         if self.admin_status != 200:
             return httpx.Response(self.admin_status, json={'secret': 'never-expose-secret'})
         path = request.url.path.removeprefix('/admin/realms/company')
@@ -84,6 +90,15 @@ class ExternalAccessTests(AuthAppTestCase):
                 return httpx.Response(204)
             if request.method == 'PUT':
                 self.clients[identifier] = payload
+                return httpx.Response(204)
+            if request.method == 'DELETE':
+                if self.delete_fault == 'unavailable':
+                    return httpx.Response(500, json={'secret': 'never-expose-secret'})
+                del self.clients[identifier]
+                if self.delete_fault == 'lost':
+                    raise httpx.ReadTimeout('never-expose-secret', request=request)
+                if self.delete_fault == 'concurrent':
+                    return httpx.Response(404)
                 return httpx.Response(204)
             return httpx.Response(200, json=self.clients[identifier])
         raise AssertionError((request.method, path))
@@ -131,6 +146,107 @@ class ExternalAccessTests(AuthAppTestCase):
         new = await self.http.get('/a2a/external/.well-known/agent-card.json', headers=self.headers(second['access_token']))
         self.assertEqual(old.status_code, 401)
         self.assertEqual(new.status_code, 200)
+
+    async def test_delete_retains_tasks_for_owners_without_reassigning_external_identity(self):
+        first = (await self.create_access()).json()
+        await self.submit(first['access_token'], 'initial', 'external-history')
+        agent = self.app.state.core_agent
+        admission = agent.tool_runtime.environment_manager.validate_workspace_scope.__self__
+        tenant = self.app.state.authenticator.settings.tenant
+        binding, _ = await admission.workspace_scope(tenant, 'external-history')
+        workspace = agent.response_files_service.workspaces.workspace(binding)
+        (workspace / 'result.txt').write_bytes(b'retained result')
+        agent.model = ScriptedModel([
+            ModelResponse(tool_requests=(ToolRequest('publish', 'core_response_files', {'paths': ['result.txt']}),)),
+            ModelResponse(message='File ready'),
+        ])
+        task = await self.submit(first['access_token'], 'before-deletion', 'external-history')
+        record = agent.workflow_store.lookup_task(task['id'])
+        file_id = record.result['outgoing_files'][0]['file_id']
+        identifier = first['account']['id']
+        response = await self.http.delete('/api/external-access/' + identifier + '/account',
+            headers=self.headers('owner-b'))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {'deleted': True, 'account_id': identifier})
+        deletion = next(call for call in self.admin_calls if call.method == 'DELETE')
+        self.assertEqual(deletion.headers['authorization'], 'Bearer owner-b')
+        self.assertEqual(response.headers['cache-control'], 'no-store')
+        self.assertNotIn(identifier, self.clients)
+        listing = await self.http.get('/api/external-access', headers=self.headers('owner-a'))
+        self.assertEqual(listing.json()['total'], 0)
+        old = await self.http.get('/a2a/external/.well-known/agent-card.json',
+            headers=self.headers(first['access_token']))
+        self.assertEqual(old.status_code, 401)
+        owner = await self.http.get('/a2a/owner/tasks/' + task['id'], headers=self.headers('owner-a'))
+        self.assertEqual(owner.status_code, 200, owner.text)
+        file = await self.http.get(f"/api/chats/external-history/tasks/{task['id']}/files/{file_id}",
+            headers=self.headers('owner-b'))
+        self.assertEqual(file.status_code, 200, file.text)
+        self.assertEqual(file.content, b'retained result')
+        self.assertEqual(agent.workflow_store.lookup_task(task['id']), record)
+        second = (await self.create_access()).json()
+        self.assertNotEqual(self.tokens[first['access_token']]['sub'], self.tokens[second['access_token']]['sub'])
+        stranger = await self.http.get('/a2a/external/tasks/' + task['id'],
+            headers=self.headers(second['access_token']))
+        self.assertEqual(stranger.status_code, 404, stranger.text)
+        missing = await self.http.delete('/api/external-access/' + identifier + '/account',
+            headers=self.headers('owner-a'))
+        self.assertEqual(missing.status_code, 404)
+
+    async def test_delete_validates_scope_authority_and_input_before_native_mutation(self):
+        issued = (await self.create_access()).json()
+        identifier = issued['account']['id']
+        path = '/api/external-access/' + identifier + '/account'
+        for token, url, content, expected in [
+            ('external-a', path, None, 403),
+            ('owner-a', path + '?unexpected=1', None, 400),
+            ('owner-a', path, '{}', 400),
+            ('owner-a', '/api/external-access/not-a-uuid/account', None, 404),
+        ]:
+            response = await self.http.request('DELETE', url, headers=self.headers(token), content=content)
+            self.assertEqual(response.status_code, expected, response.text)
+        client = self.clients[identifier]
+        client['attributes']['agent.access.tenant'] = 'another-company'
+        self.assertEqual((await self.http.delete(path, headers=self.headers('owner-a'))).status_code, 404)
+        client['attributes']['agent.access.tenant'] = self.app.state.authenticator.settings.tenant
+        self.role_names.append('agent-owner')
+        self.assertEqual((await self.http.delete(path, headers=self.headers('owner-a'))).status_code, 404)
+        self.assertEqual((await self.http.get('/api/external-access', headers=self.headers('owner-a'))).json()['total'], 0)
+        self.assertFalse(any(call.method == 'DELETE' for call in self.admin_calls))
+        self.role_names = []
+        client['attributes']['agent.access.state'] = 'pending'
+        self.assertEqual((await self.http.delete(path, headers=self.headers('owner-a'))).status_code, 200)
+
+    async def test_delete_upstream_errors_do_not_confirm_or_expose_credentials(self):
+        issued = (await self.create_access()).json()
+        path = '/api/external-access/' + issued['account']['id'] + '/account'
+        for upstream, expected in [(403, 403), (500, 503)]:
+            self.admin_status = upstream
+            response = await self.http.delete(path, headers=self.headers('owner-a'))
+            self.assertEqual(response.status_code, expected, response.text)
+            self.assertNotIn('never-expose-secret', response.text)
+            self.assertNotIn('owner-a', response.text)
+            self.assertIn(issued['account']['id'], self.clients)
+        self.admin_status = 200
+        self.delete_fault = 'unavailable'
+        response = await self.http.delete(path, headers=self.headers('owner-a'))
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertIn(issued['account']['id'], self.clients)
+        before = sum(call.method == 'DELETE' for call in self.admin_calls)
+        self.delete_fault = 'lost'
+        response = await self.http.delete(path, headers=self.headers('owner-a'))
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertNotIn('never-expose-secret', response.text)
+        self.assertNotIn('deleted', response.text)
+        listing = await self.http.get('/api/external-access', headers=self.headers('owner-a'))
+        self.assertEqual(listing.json()['total'], 0)
+        self.assertEqual(sum(call.method == 'DELETE' for call in self.admin_calls), before + 1)
+        concurrent = (await self.create_access()).json()
+        self.delete_fault = 'concurrent'
+        response = await self.http.delete('/api/external-access/' + concurrent['account']['id'] + '/account',
+            headers=self.headers('owner-a'))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()['deleted'])
 
     async def test_external_and_invalid_requests_never_reach_admin(self):
         for method, path, payload in [('GET', '/api/external-access', None),

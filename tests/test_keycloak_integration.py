@@ -138,6 +138,20 @@ class KeycloakIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await access.execute(owner, headers["Authorization"], "DELETE", granted["account"]["id"])
                 with self.assertRaises(CoreError):
                     await authenticator.authenticate(replaced["access_token"])
+                granted_path = admin + "/clients/" + granted["account"]["id"]
+                service = (await http.get(granted_path + "/service-account-user", headers=headers)).json()
+                receipt = await access.execute(owner, headers["Authorization"], "DELETE",
+                    granted["account"]["id"], delete_account=True)
+                self.assertEqual(receipt, {"deleted": True, "account_id": granted["account"]["id"]})
+                self.assertEqual((await http.get(granted_path, headers=headers)).status_code, 404)
+                self.assertEqual((await http.get(admin + "/users/" + service["id"], headers=headers)).status_code, 404)
+                self.assertEqual((await access.execute(owner, headers["Authorization"], "GET"))["total"], 1)
+                recreated = await access.execute(owner, headers["Authorization"], "POST",
+                    payload={**request, "request_id": str(uuid.uuid4())})
+                new_identity = await authenticator.authenticate(recreated["access_token"])
+                self.assertNotEqual(external.owner_id, new_identity.owner_id)
+                with self.assertRaises(CoreError):
+                    await authenticator.authenticate(replaced["access_token"])
                 # Legacy clients may opt into persisted refresh sessions. A
                 # one-time token must survive their shorter offline idle limit.
                 updated = await http.put(admin, headers=headers, json={"offlineSessionIdleTimeout": 3})

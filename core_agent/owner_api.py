@@ -503,7 +503,8 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
                         if chunk:
                             raise CoreError("REQUEST_INVALID")
                 result = await external_access.execute(actor, request.headers["authorization"], request.method,
-                                                       identifier, payload)
+                                                       identifier, payload,
+                                                       delete_account=request.url.path.endswith("/account"))
                 return JSONResponse(result, status_code=201 if request.method == "POST" and identifier is None else 200,
                                     headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
             is_settings = request.url.path == "/api/settings"
@@ -612,6 +613,7 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
         routes.extend([
             Route("/api/external-access", endpoint, methods=["GET", "POST"]),
             Route("/api/external-access/{account_id}/token", endpoint, methods=["POST"]),
+            Route("/api/external-access/{account_id}/account", endpoint, methods=["DELETE"]),
             Route("/api/external-access/{account_id}", endpoint, methods=["DELETE"]),
         ])
     if admission is not None:

@@ -249,6 +249,11 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         self.assertIn("PASS actual owner-session Keycloak issues a 30-day external token", proof)
         self.assertIn("PASS access listing contains no issued token", proof)
         self.assertIn("PASS issued credential authenticates external A2A entrance", proof)
+        self.assertIn("PASS cancelled external account deletion sends no mutation", proof)
+        self.assertIn("PASS confirmed external account deletion returns native receipt", proof)
+        self.assertIn("PASS deleted native account token no longer authenticates external A2A", proof)
+        self.assertIn("PASS late account listing cannot restore a deleted row or count", proof)
+        self.assertIn("PASS unconfirmed deletion rereads canonical account list without replay", proof)
 
 
 if __name__ == "__main__":

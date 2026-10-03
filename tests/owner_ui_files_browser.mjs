@@ -58,6 +58,7 @@ let second;
 const posts=[],requests=new Map(),history=[],tasks=[],receipts=[],outputRequests=[],cancelledDownloads=new Set(),untrustedRequests=[];
 page.on('Network.requestWillBeSent',({request})=>{if(new URL(request.url).hostname==='ui-content.invalid')untrustedRequests.push(request.url);});
 const apiResponses=[],dialogs=[];
+let rejectNextAccessDelete=false;
 const peerSecret='Browser-private-peer-secret-739',schedulePrompt='Browser manual cron in the original chat';
 function observeOwnerAPI(tab){
   const pending=new Map();
@@ -76,8 +77,10 @@ function observeOwnerAPI(tab){
     apiResponses.push({...request,body});
   });
   tab.on('Page.javascriptDialogOpening',async({type,message})=>{
-    if(type!=='confirm'||!['Удалить расписание?', 'Есть неотправленное сообщение', 'Результат удаления ещё не подтверждён.'].some(prefix=>message.startsWith(prefix)))throw new Error('Unexpected actual owner confirmation');
-    dialogs.push(message);await tab.call('Page.handleJavaScriptDialog',{accept:true});
+    if(type!=='confirm'||!['Удалить расписание?', 'Есть неотправленное сообщение', 'Результат удаления ещё не подтверждён.', 'Удалить учётку «'].some(prefix=>message.startsWith(prefix)))throw new Error('Unexpected actual owner confirmation');
+    const reject=rejectNextAccessDelete&&message.startsWith('Удалить учётку «');
+    if(reject)rejectNextAccessDelete=false;
+    dialogs.push(message);await tab.call('Page.handleJavaScriptDialog',{accept:!reject});
   });
 }
 async function ownerAction(tab,path,method,action){
@@ -513,7 +516,7 @@ try {
   await second.field('.access-dialog input[type=number]','30');
   const issuedAccess=await ownerAction(second,'/api/external-access','POST',()=>second.click('Выдать доступ','.access-dialog button'));
   check(issuedAccess.status===201 && issuedAccess.body.expires_in===30*86400,'actual owner-session Keycloak issues a 30-day external token');
-  const externalToken=issuedAccess.body.access_token;
+  let externalToken=issuedAccess.body.access_token;
   credentials.add(externalToken);
   await second.wait("!!document.querySelector('.access-token') && document.querySelector('.access-row h3')?.textContent==='Browser external access'",'token shown once with persisted account metadata');
   check(await second.evaluate(`document.querySelector('.access-token').value===${JSON.stringify(externalToken)}`),'one-time token matches real issuance');
@@ -530,8 +533,50 @@ try {
   await second.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
   await second.call('Input.dispatchKeyEvent',{type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
   await second.wait("!document.querySelector('.access-dialog')",'Escape discards access modal');
+  let holdAccessList=false,heldAccessList,loseAccessDelete=false,nativeAccessDeletes=0;
+  second.on('Fetch.requestPaused',async event=>{
+    if(event.request.method==='DELETE'){
+      nativeAccessDeletes++;
+      if(loseAccessDelete){loseAccessDelete=false;await second.call('Fetch.failRequest',{requestId:event.requestId,errorReason:'Failed'});return;}
+    }
+    if(holdAccessList&&event.request.method==='GET'&&event.responseStatusCode===200){holdAccessList=false;heldAccessList=event;return;}
+    await second.call('Fetch.continueRequest',{requestId:event.requestId});
+  });
+  await second.call('Fetch.enable',{patterns:[{urlPattern:config.origin+'/api/external-access*',requestStage:'Response'}]});
+  await second.click('Выдать новый токен');
+  holdAccessList=true;
+  const renewedAccess=await ownerAction(second,'/api/external-access/'+encodeURIComponent(issuedAccess.body.account.id)+'/token','POST',()=>second.click('Выдать новый токен','.access-dialog button'));
+  externalToken=renewedAccess.body.access_token;credentials.add(externalToken);
+  await waitFor(()=>!!heldAccessList,'actual pre-deletion account listing response held');
+  await second.click('Готово','.access-dialog button');
   const accessExternal=await second.evaluate(`(async()=>{const response=await fetch('/a2a/external/.well-known/agent-card.json',{headers:{Authorization:'Bearer '+${JSON.stringify(externalToken)},'A2A-Version':'1.0'},cache:'no-store',credentials:'omit'});return response.status;})()`);
   check(accessExternal===200,'issued credential authenticates external A2A entrance');
+  const deleteAccessPath='/api/external-access/'+encodeURIComponent(issuedAccess.body.account.id)+'/account';
+  const deletesBefore=apiResponses.filter(response=>response.path===deleteAccessPath&&response.method==='DELETE').length;
+  rejectNextAccessDelete=true;
+  await second.click('Удалить','.access-row button');
+  await second.wait("document.querySelector('.access-row h3')?.textContent==='Browser external access' && !document.querySelector('.access-row button').disabled",'cancelled deletion keeps external account');
+  check(!rejectNextAccessDelete&&apiResponses.filter(response=>response.path===deleteAccessPath&&response.method==='DELETE').length===deletesBefore,'cancelled external account deletion sends no mutation');
+  const deletedAccess=await ownerAction(second,deleteAccessPath,'DELETE',()=>second.click('Удалить','.access-row button'));
+  check(deletedAccess.body.deleted===true&&deletedAccess.body.account_id===issuedAccess.body.account.id&&dialogs.at(-1).includes('новая учётка не получит к ним доступ'),'confirmed external account deletion returns native receipt');
+  await second.wait("!document.querySelector('.access-row') && document.querySelector('.page [role=status]')?.textContent==='Внешних учёток: 0'",'deleted external account disappears from list and count');
+  const accessReadsBefore=apiResponses.filter(response=>response.path==='/api/external-access'&&response.method==='GET').length;
+  await second.call('Fetch.continueRequest',{requestId:heldAccessList.requestId});
+  await waitFor(()=>apiResponses.filter(response=>response.path==='/api/external-access'&&response.method==='GET').length>accessReadsBefore,'actual stale listing delivered after deletion');
+  check(await second.evaluate("!document.querySelector('.access-row') && document.querySelector('.page [role=status]')?.textContent==='Внешних учёток: 0'"),'late account listing cannot restore a deleted row or count');
+  const deletedExternal=await second.evaluate(`(async()=>{const response=await fetch('/a2a/external/.well-known/agent-card.json',{headers:{Authorization:'Bearer '+${JSON.stringify(externalToken)},'A2A-Version':'1.0'},cache:'no-store',credentials:'omit'});return response.status;})()`);
+  check(deletedExternal===401,'deleted native account token no longer authenticates external A2A');
+  await second.click('Выдать доступ');
+  await second.field('.access-dialog input[maxlength="100"]','Lost deletion receipt');
+  const uncertainAccess=await ownerAction(second,'/api/external-access','POST',()=>second.click('Выдать доступ','.access-dialog button'));
+  credentials.add(uncertainAccess.body.access_token);
+  await second.wait("document.querySelector('.access-row h3')?.textContent==='Lost deletion receipt'",'actual account for lost deletion response');
+  await second.click('Готово','.access-dialog button');
+  const deletesBeforeLoss=nativeAccessDeletes;loseAccessDelete=true;
+  await second.click('Удалить','.access-row button');
+  await second.wait("document.querySelector('.page .error')?.textContent.includes('Не удалось подтвердить удаление учётки') && !document.querySelector('.access-row') && document.querySelector('.page [role=status]')?.textContent==='Внешних учёток: 0'",'uncertain deletion rereads actual Keycloak list');
+  check(!loseAccessDelete&&nativeAccessDeletes===deletesBeforeLoss+1,'unconfirmed deletion rereads canonical account list without replay');
+  await second.call('Fetch.disable');
   check(firstTokens.size===3&&secondTokens.size===3,'actual access, refresh and ID tokens captured for both owner tabs');
   const privateValues=[...credentials,peerSecret,'Native immutable output\n',...posts.flatMap(post=>post.parts.map(part=>part.raw).filter(Boolean)),...tasks.flatMap(task=>(task.artifacts??[]).flatMap(artifact=>(artifact.parts??[]).map(part=>part.raw).filter(Boolean)))];
   const storageChecks=await Promise.all([page,second].map(tab=>tab.evaluate(`(()=>{const privateValues=${JSON.stringify(privateValues)};return [localStorage,sessionStorage].every(store=>Array.from({length:store.length},(_,index)=>store.getItem(store.key(index))).every(value=>privateValues.every(secret=>!value.includes(secret))));})()`)));

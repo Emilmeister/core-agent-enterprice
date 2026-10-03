@@ -823,6 +823,12 @@ API требует owner authority и отдельные администрат�
   той же identity, прежние токены отозваны. Успех — 200 с той же формой.
 - `DELETE /api/external-access/{account_id}`: без body/query; native disable,
   200 с `{account}`. Не удаляет A2A results и файлы.
+- `DELETE /api/external-access/{account_id}/account`: без body/query; native
+  удаление клиента Keycloak вместе с service-account user, 200 с
+  `{deleted: true, account_id}`. A2A-задачи/файлы сохраняются для владельцев;
+  новая учётка не наследует прежнюю identity. Старый endpoint отзыва не меняется.
+  Неизвестная/чужая/имеющая owner authority учётка даёт 404; подтверждённый
+  lookup и последующий native DELETE 404 означают конкурентное удаление и успех.
 
 Query parameters и неизвестные/повторённые JSON поля не принимаются. Invalid
 name/days/request ID дают 400 REQUEST_INVALID; недоступный чужой account — 404
@@ -833,3 +839,8 @@ EXTERNAL_ACCESS_NOT_FOUND; несовпадающий повтор — 409 EXTER
 даёт 503 KEYCLOAK_ADMIN_UNAVAILABLE. Все ответы no-store и без upstream body.
 Модалка поддерживает native keyboard focus/Escape, copy feedback и закрытие без
 сохранения токена; форма блокирует повторное нажатие на время операции.
+Кнопки «Отозвать доступ» и «Удалить» независимы. Удаление доступно также для
+pending/expired/revoked учёток; подтверждение называет учётку и объясняет
+необратимость identity и сохранение данных у владельцев. Отмена не посылает
+мутацию; успех убирает строку и обновляет число учёток. При неподтверждённом
+исходе UI показывает ошибку и перечитывает список без автоматического DELETE.

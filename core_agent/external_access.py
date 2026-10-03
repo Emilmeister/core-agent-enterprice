@@ -82,10 +82,9 @@ class ExternalAccess:
             raise CoreError("KEYCLOAK_ADMIN_UNAVAILABLE")
         attrs = self._attributes(client)
         marked = attrs.get(PREFIX + "tenant")
-        if marked is not None:
-            return (marked == self.settings.tenant
-                    and attrs.get(PREFIX + "audience") == self.settings.audience
-                    and client.get("serviceAccountsEnabled") is True)
+        if marked is not None and (marked != self.settings.tenant
+                or attrs.get(PREFIX + "audience") != self.settings.audience):
+            return False
         if client.get("serviceAccountsEnabled") is not True:
             return False
         scopes = await self._admin(http, "GET", "/clients/" + quote(client["id"], safe="") + "/default-client-scopes")
@@ -110,7 +109,7 @@ class ExternalAccess:
             audience_matches |= mapper.get("protocolMapper") == "oidc-audience-mapper" and (
                 config.get("included.client.audience") == self.settings.audience
                 or config.get("included.custom.audience") == self.settings.audience)
-        if not audience_matches:
+        if marked is None and not audience_matches:
             return False
         user = await self._admin(http, "GET", "/clients/" + quote(client["id"], safe="") + "/service-account-user")
         if not isinstance(user, dict) or not isinstance(user.get("id"), str):
@@ -127,7 +126,7 @@ class ExternalAccess:
             resource_roles = await self._admin(http, "GET", "/users/" + quote(user["id"], safe="")
                 + "/role-mappings/clients/" + quote(audience_client["id"], safe="") + "/composite")
             names.update(self._role_names(resource_roles))
-        return self.settings.external_role in names and self.settings.owner_role not in names
+        return self.settings.owner_role not in names and (marked is not None or self.settings.external_role in names)
 
     @staticmethod
     def _role_names(roles):
@@ -273,7 +272,7 @@ class ExternalAccess:
         await self._admin(http, "PUT", path, allowed=(204,), json=client)
         return {"account": self._public(client), "access_token": token, "token_type": "Bearer", "expires_in": duration}
 
-    async def execute(self, actor, bearer, method, identifier=None, payload=None):
+    async def execute(self, actor, bearer, method, identifier=None, payload=None, *, delete_account=False):
         if not actor.is_owner or actor.is_external or actor.tenant != self.settings.tenant:
             raise CoreError("ACCESS_DENIED")
         if method == "POST":
@@ -288,6 +287,9 @@ class ExternalAccess:
                         client = await self._create(http, payload) if identifier is None else await self._client(http, identifier)
                         if method == "POST":
                             return await self._issue(http, client, payload["days"])
+                        if delete_account:
+                            await self._admin(http, "DELETE", "/clients/" + quote(client["id"], safe=""), allowed=(204, 404))
+                            return {"deleted": True, "account_id": client["id"]}
                         client["enabled"] = False
                         await self._admin(http, "PUT", "/clients/" + quote(client["id"], safe=""), allowed=(204,), json=client)
                         return {"account": self._public(client)}

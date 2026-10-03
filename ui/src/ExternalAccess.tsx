@@ -26,9 +26,11 @@ export function ExternalAccess({ api }: { api: Api }) {
   const [selection, setSelection] = useState<Account | "new" | null>(null);
   const [busy, setBusy] = useState(false);
   const request = useRef<AbortController | null>(null);
+  const read = useRef(0);
   async function load(signal?: AbortSignal) {
+    const version = ++read.current;
     const result = await api.json<{ accounts: Account[]; total: number }>("/api/external-access", "GET", undefined, signal);
-    if (!signal?.aborted) setAccounts(result.accounts);
+    if (!signal?.aborted && version === read.current) setAccounts(result.accounts);
   }
   useEffect(() => {
     const abort = new AbortController();
@@ -40,15 +42,24 @@ export function ExternalAccess({ api }: { api: Api }) {
     });
     return () => abort.abort();
   }, [api]);
-  async function revoke(account: Account) {
-    if (!window.confirm(`Отозвать доступ для «${account.name}»? Новые запросы будут отклоняться. Задачи и файлы сохранятся.`)) return;
+  async function changeAccess(account: Account, deleting = false) {
+    const confirmation = deleting
+      ? `Удалить учётку «${account.name}» навсегда? Её токены перестанут работать. Задачи и файлы останутся у владельцев; новая учётка не получит к ним доступ.`
+      : `Отозвать доступ для «${account.name}»? Новые запросы будут отклоняться. Задачи и файлы сохранятся.`;
+    if (!window.confirm(confirmation)) return;
     setBusy(true);
     setError("");
     try {
-      await api.json(`/api/external-access/${encodeURIComponent(account.id)}`, "DELETE", undefined, request.current?.signal);
+      await api.json(`/api/external-access/${encodeURIComponent(account.id)}${deleting ? "/account" : ""}`, "DELETE", undefined, request.current?.signal);
       await load(request.current?.signal);
     } catch (error) {
-      if (!request.current?.signal.aborted) setError(failureText(error));
+      if (!request.current?.signal.aborted) {
+        const message = deleting ? `Не удалось подтвердить удаление учётки. ${failureText(error)}` : failureText(error);
+        setError(message);
+        await load(request.current?.signal).catch((refreshError) => {
+          if (!request.current?.signal.aborted) setError(`${message} Не удалось обновить список: ${failureText(refreshError)}`);
+        });
+      }
     } finally {
       if (!request.current?.signal.aborted) setBusy(false);
     }
@@ -69,7 +80,8 @@ export function ExternalAccess({ api }: { api: Api }) {
         </div>
         <div className="access-actions">
           <button className="secondary" disabled={busy} onClick={() => setSelection(account)}>Выдать новый токен</button>
-          <button className="text-button danger" disabled={busy || account.status === "revoked"} onClick={() => void revoke(account)}>Отозвать доступ</button>
+          <button className="text-button danger" disabled={busy || account.status === "revoked"} onClick={() => void changeAccess(account)}>Отозвать доступ</button>
+          <button className="text-button danger" disabled={busy} onClick={() => void changeAccess(account, true)}>Удалить</button>
         </div>
       </article>)}
     </div>

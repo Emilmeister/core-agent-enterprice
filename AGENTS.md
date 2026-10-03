@@ -1195,4 +1195,8 @@ tenant/audience/request ID и issuance metadata. Токен выдаётся о�
 закрытии/unmount. Замена сохраняет service identity; native client notBefore
 и service-user logout после перехода секунды отзывают прежние токены, включая
 старые Keycloak с особенностями realm notBefore. Уже открытый response не
-переавторизуется. См. AUTH-04 и ENT-AC-85.
+переавторизуется. Отзыв через DELETE /api/external-access/{id} отключает клиент;
+отдельный DELETE /api/external-access/{id}/account удаляет native client вместе
+с service-account user после UI-подтверждения. Учётки с owner authority исключены
+даже при наличии issuance metadata. A2A-задачи/файлы сохраняются для владельцев;
+новая учётка не наследует прежний caller scope. См. AUTH-04 и ENT-AC-85.
