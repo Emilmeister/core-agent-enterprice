@@ -199,6 +199,8 @@ Override не наследует credential или дополнительные 
 Company settings `remote_timeout_seconds` (default86400) и
 `remote_poll_interval_seconds` (default300) —положительные bounded integers
 с общей owner settings revision. Принятая операция сохраняет их snapshot.
+Poll interval задаёт позднюю фазу после780 секунд и ограничивает сверху ранние
+интервалы10/30 секунд; возраст сохраняется после restart (LONG-01).
 Registry revisions сохраняются immutable с identity actor, изменившего настройку,
 и временем записи. Credential encryption использует deployment Fernet key
 `PUSH_NOTIFICATION_ENCRYPTION_KEY`; ciphertext не является публичной настройкой.
@@ -427,7 +429,7 @@ Serving entrypoint MUST:
 | Owner-answer timeout | 24 часа | Отдельный срок вопроса владельцу |
 | Guardrails decision timeout | 24 часа | Отдельный срок решения по материалу |
 | Remote operation timeout | 24 часа | Окончательный срок операции, повторный wait не продлевает |
-| Remote polling interval | 5 минут | GetTask без model/tool budget polling |
+| Remote polling interval | 10 с первые 3 мин; 30 с следующие 10 мин; затем 5 мин | GetTask без model/tool budget; закреплённый configurable интервал ограничивает ранние фазы сверху |
 | Общий лимит вложений сообщения | 25 000 000 байт | Один предел inbound/outbound UI/A2A; 1 МБ = 1 000 000 байт |
 | Cron timezone | `Europe/Moscow` | Сохранённый IANA identifier на расписание |
 

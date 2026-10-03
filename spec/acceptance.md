@@ -607,6 +607,17 @@ Browser proof включает потерянный ответ DELETE и поз�
 discovery прежней регистрации даже после создания нового peer с тем же именем.
 Current check и pin атомарны; уже pinned HITL/remote operation продолжает прежний binding.
 
+RMT-01, adaptive polling proof: при default interval300 первый GetTask назначен
+через10 секунд от завершения Send; до возраста180 секунд повторные проверки
+идут через10 секунд, от180 до780 — через30, после780 — через300. Проверки,
+назначаемые перед границей фазы, ограничены этой границей. Более короткий
+закреплённый интервал сохраняется. Временная ошибка чтения следует тому же графику;
+длительность сетевого запроса учитывается по актуальному server/DB clock.
+Recovery до `next_poll_at` не отправляет GetTask; новый PostgreSQL scheduler/pool
+возобновляет среднюю и позднюю фазы по сохранённому началу без повторного Send.
+Deadline не продлевается, проверка не назначается позже него; после terminal
+outcome новых сетевых запросов нет. Изменение не расходует model/tool budget.
+
 Remote progress proof: working/input-required/auth-required metadata появляются
 в текущем root Task и scoped Get/List/Subscribe/push без raw peer data и чужих
 операций. Pending wait, workflow version и model/tool usage не меняются;

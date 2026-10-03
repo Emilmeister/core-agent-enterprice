@@ -15,7 +15,7 @@ const labels: Record<Exclude<keyof SettingsData, "revision">, string> = {
   guardrails_timeout_seconds: "Ожидание проверки материала, секунд",
   attachment_limit_bytes: "Общий размер вложений, байт",
   remote_timeout_seconds: "Ожидание внешнего агента, секунд",
-  remote_poll_interval_seconds: "Интервал проверки внешнего агента, секунд",
+  remote_poll_interval_seconds: "Интервал проверки после первых 13 минут, секунд",
 };
 export function Settings({ api }: { api: Api }) {
   const [values, setValues] = useState<SettingsData | null>(null);
@@ -101,6 +101,12 @@ export function Settings({ api }: { api: Api }) {
                     })
                   }
                 />
+                {key === "remote_poll_interval_seconds" && (
+                  <small className="muted">
+                    Первые 3 минуты — каждые 10 секунд, следующие 10 минут — каждые
+                    30 секунд. Более короткий заданный интервал действует и на этих этапах.
+                  </small>
+                )}
               </label>
             ))}
           </div>

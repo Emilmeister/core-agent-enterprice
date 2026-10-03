@@ -340,6 +340,67 @@ class RemoteOperationTests(unittest.TestCase):
         self.recover()
         self.assertEqual(task.state, "completed")
 
+    def test_adaptive_polling_obeys_due_times_phase_boundaries_and_terminal_state(self):
+        self.responses.append(self.event())
+        task = self.start(timeout_seconds=86400, poll_interval_seconds=300)
+        checkpoint = self.scheduler._remote[task.id]["checkpoint"]
+        self.assertEqual(checkpoint["next_poll_at"], 1010)
+        self.assertEqual(self.recover(9), 0)
+        for age, state, next_poll in ((10, "WORKING", 1020), (175, "WORKING", 1180),
+                                     (180, "INPUT_REQUIRED", 1210), (779, "AUTH_REQUIRED", 1780),
+                                     (780, "WORKING", 2080)):
+            with self.subTest(age=age):
+                self.now = 1000 + age
+                self.responses.append(self.event(state))
+                self.assertEqual(self.recover(0), 1)
+                checkpoint = self.scheduler._remote[task.id]["checkpoint"]
+                self.assertEqual((checkpoint["deadline"], checkpoint["next_poll_at"]), (87400, next_poll))
+                self.assertEqual(task.state, "working")
+        self.now = 2079
+        self.assertEqual(self.recover(0), 0)
+        self.responses.append(self.event("COMPLETED"))
+        self.assertEqual(self.recover(1), 1)
+        self.assertEqual(task.state, "completed")
+        self.assertIsNone(self.scheduler._remote[task.id]["checkpoint"]["next_poll_at"])
+        self.assertEqual(self.recover(300), 0)
+        self.assertEqual([call[0] for call in self.calls], ["Send"] + ["Get"] * 6)
+
+    def test_adaptive_retry_uses_clock_after_request_and_keeps_original_deadline(self):
+        def delayed_retry():
+            self.now = 1185
+            raise CoreError("REMOTE_AGENT_UNAVAILABLE", retryable=True)
+        self.responses.extend([self.event(), delayed_retry])
+        task = self.start(timeout_seconds=86400, poll_interval_seconds=300)
+        self.now = 1175
+        self.assertEqual(self.recover(0), 1)
+        self.assertEqual(task.state, "working")
+        checkpoint = self.scheduler._remote[task.id]["checkpoint"]
+        self.assertEqual((checkpoint["deadline"], checkpoint["next_poll_at"]), (87400, 1215))
+        self.assertEqual([call[0] for call in self.calls], ["Send", "Get"])
+
+    def test_adaptive_polling_preserves_short_custom_interval(self):
+        self.responses.append(self.event())
+        task = self.start(timeout_seconds=86400, poll_interval_seconds=20)
+        self.assertEqual(self.scheduler._remote[task.id]["checkpoint"]["next_poll_at"], 1010)
+        for age, next_poll in ((180, 1200), (780, 1800)):
+            self.now = 1000 + age
+            self.responses.append(self.event())
+            self.assertEqual(self.recover(0), 1)
+            self.assertEqual(self.scheduler._remote[task.id]["checkpoint"]["next_poll_at"], next_poll)
+
+    def test_adaptive_polling_never_schedules_past_final_deadline(self):
+        self.responses.extend([self.event(), self.event()])
+        task = self.start(timeout_seconds=790, poll_interval_seconds=300)
+        self.now = 1785
+        self.assertEqual(self.recover(0), 1)
+        checkpoint = self.scheduler._remote[task.id]["checkpoint"]
+        self.assertEqual((checkpoint["deadline"], checkpoint["next_poll_at"]), (1790, 1790))
+        self.now = 1790
+        self.recover(0)
+        self.assertEqual((task.state, task.error.code), ("failed", "REMOTE_OPERATION_TIMEOUT"))
+        self.assertEqual(self.recover(300), 0)
+        self.assertEqual([call[0] for call in self.calls], ["Send", "Get"])
+
     def test_timeout_wins_over_inflight_response_and_no_network_reopens(self):
         entered, release = threading.Event(), threading.Event()
         self.addCleanup(release.set)
@@ -627,6 +688,40 @@ class PostgresRemoteOutboundTests(unittest.TestCase):
         self.task_ids.append(task.id)
         self.settle()
         return self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant)
+
+    def test_adaptive_polling_recovers_saved_age_through_new_database_pool(self):
+        self.contract.update(timeout_seconds=86400, poll_interval_seconds=300)
+        self.responses.extend([self.event(), self.event()])
+        tasks = [(self.start(), 200, 30), (self.start(), 800, 300)]
+        saved_deadlines = {}
+        with self.database.transaction() as connection:
+            # Age the persisted fixture, avoiding a thirteen-minute wall-clock sleep.
+            for task, age, _interval in tasks:
+                row = connection.execute("""UPDATE core_background_tasks SET checkpoint =
+                    jsonb_set(jsonb_set(checkpoint, '{deadline}',
+                        to_jsonb((checkpoint->>'deadline')::double precision - %s)),
+                        '{next_poll_at}', to_jsonb(EXTRACT(EPOCH FROM clock_timestamp())::double precision - 1))
+                    WHERE id=%s RETURNING checkpoint""", (age, task.id)).fetchone()
+                saved_deadlines[task.id] = row["checkpoint"]["deadline"]
+        self.scheduler.close()
+        restarted = PostgresDatabase(os.environ["TEST_DATABASE_URL"], min_size=0, max_size=1)
+        self.addCleanup(restarted.close)
+        self.scheduler = PostgresTaskScheduler(restarted)
+        self.addCleanup(self.scheduler.close)
+        self.scheduler.register("remote_a2a", RemoteA2AExecutor(self.scheduler, self.registry))
+        self.responses.extend([self.event(), self.event()])
+        self.assertEqual(self.scheduler.recover(tenant_id=self.tenant), 2)
+        self.settle()
+        with restarted.transaction() as connection:
+            for task, _age, interval in tasks:
+                row = connection.execute("SELECT checkpoint,updated_at FROM core_background_tasks WHERE id=%s",
+                                         (task.id,)).fetchone()
+                self.assertEqual(row["checkpoint"]["deadline"], saved_deadlines[task.id])
+                delay = row["checkpoint"]["next_poll_at"] - row["updated_at"]
+                self.assertGreater(delay, interval - 2)
+                self.assertLessEqual(delay, interval)
+        self.assertEqual([call[0] for call in self.calls], ["Send", "Send", "Get", "Get"])
+        self.assertEqual(self.scheduler.recover(tenant_id=self.tenant), 0)
 
     def test_deleted_peer_wait_recovers_with_exact_credentials_after_new_database_pool(self):
         self.tenant = "delete-recovery-" + uuid.uuid4().hex

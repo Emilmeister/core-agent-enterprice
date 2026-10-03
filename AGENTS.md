@@ -715,6 +715,12 @@ run получает отдельные MCP session и negotiated version; пе�
 - Owner settings GET/PUT включают `remote_timeout_seconds` (86400 по умолчанию)
   и `remote_poll_interval_seconds` (300). PUT со старым набором трёх timeout
   сохраняет эти настройки и attachment limit; все поля делят settings revision.
+  GetTask polling использует10 секунд первые180 секунд,30 следующие600 секунд,
+  затем закреплённый интервал. Более короткий pinned interval ограничивает ранние
+  фазы. Возраст вычисляется из сохранённых deadline/timeout по server/DB clock;
+  restart не сбрасывает его. Следующий poll ограничен фазой и final deadline.
+  Формат contract/checkpoint не меняется; ранее сохранённый next_poll_at остаётся
+  действующим до следующего планирования. UI поясняет область настройки интервала.
 - `attachment_limit_bytes` в company settings задаёт общий decoded aggregate
   лимит вложений (default 25 000 000). Timeout-only PUT сохраняет прежний лимит;
   принятые manifests не пересматриваются при его изменении.

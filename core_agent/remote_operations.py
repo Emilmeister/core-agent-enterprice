@@ -251,5 +251,12 @@ class RemoteA2AExecutor:
 
     def _poll_later(self, claim, current, checkpoint=None, progress=None):
         checkpoint = current["checkpoint"] if checkpoint is None else checkpoint
-        next_poll = min(current["now"] + current["contract"]["poll_interval_seconds"], checkpoint["deadline"])
+        contract, now = current["contract"], current["now"]
+        started_at = checkpoint["deadline"] - contract["timeout_seconds"]
+        next_poll = min(now + contract["poll_interval_seconds"], checkpoint["deadline"])
+        for phase_end, interval in ((180, 10), (780, 30)):
+            boundary = started_at + phase_end
+            if now < boundary:
+                next_poll = min(next_poll, now + interval, boundary)
+                break
         self._commit(claim, current, {**checkpoint, "next_poll_at": next_poll}, progress=progress)

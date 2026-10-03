@@ -670,8 +670,11 @@ Timeout keys: `hitl_timeout_seconds`, `owner_answer_timeout_seconds`,
 Remote settings принадлежат той же settings revision: `remote_timeout_seconds`
 по умолчанию86 400, `remote_poll_interval_seconds` —300. Допустимы целые
 1–2 147 483 647, boolean запрещён. Старый PUT без этих полей сохраняет их
-значения. Изменения задают параметры новых операций, не меняя принятый deadline
-или poll interval. GET settings включает оба поля.
+значения. `remote_poll_interval_seconds` задаёт интервал после первых 780 секунд
+операции и верхнюю границу для ранних проверок: первые 180 секунд — не более
+10 секунд, следующие 600 секунд — не более 30 секунд. UI объясняет эту область
+действия. Изменения задают параметры новых операций, не меняя принятый deadline
+или закреплённый интервал. GET settings включает оба поля; формат API не меняется.
 
 Registry metadata содержит ровно `id`, `name`, `url`, `description`, `enabled`,
 `header_name`, `has_header_value`, `revision`. Все registry routes требуют owner
