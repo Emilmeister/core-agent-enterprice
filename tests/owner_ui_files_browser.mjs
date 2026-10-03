@@ -58,6 +58,7 @@ let second;
 const posts=[],requests=new Map(),history=[],tasks=[],receipts=[],outputRequests=[],cancelledDownloads=new Set(),untrustedRequests=[];
 page.on('Network.requestWillBeSent',({request})=>{if(new URL(request.url).hostname==='ui-content.invalid')untrustedRequests.push(request.url);});
 const apiResponses=[],dialogs=[];
+let peerPostAttempts=0;
 let rejectNextAccessDelete=false;
 const peerSecret='Browser-private-peer-secret-739',schedulePrompt='Browser manual cron in the original chat';
 function observeOwnerAPI(tab){
@@ -65,6 +66,7 @@ function observeOwnerAPI(tab){
   tab.on('Network.requestWillBeSent',({requestId,request})=>{
     const url=new URL(request.url);
     if(url.origin!==config.origin||!(/^\/api\/(tool-policies|schedules|remote-agents|external-access|chats\/[^/]+\/(files|title))(\/|$)/.test(url.pathname)||(request.method==='DELETE'&&/^\/api\/chats\/[^/]+$/.test(url.pathname))))return;
+    if(url.pathname==='/api/remote-agents'&&request.method==='POST')peerPostAttempts++;
     pending.set(requestId,{path:url.pathname,query:url.search,method:request.method,request:request.postData?JSON.parse(request.postData):null,authorized:!!(request.headers.Authorization??request.headers.authorization)});
   });
   tab.on('Network.responseReceived',({requestId,response})=>{const request=pending.get(requestId);if(request)request.status=response.status;});
@@ -153,6 +155,7 @@ try {
   const renamed=await ownerAction(page,'/api/chats/'+encodeURIComponent(rootTask.contextId)+'/title','PUT',()=>page.click('Сохранить название'));
   check(renamed.body.title==='Проверка файлов и диаграмм'&&renamed.body.title_revision===renamed.request.expected_revision+1,'actual owner rename persists company chat title with CAS');
   await page.wait("document.querySelector('.chat-heading h1')?.textContent==='Проверка файлов и диаграмм' && document.querySelector('.chat-link strong')?.textContent==='Проверка файлов и диаграмм'",'header and navigation use saved title instead of UUID');
+  check(await page.evaluate("document.querySelectorAll('.chat-link time,.chat-link small:not(.chat-attention)').length===0"),'chat navigation shows meaningful titles without update dates or times');
   check(await page.evaluate("[...document.querySelectorAll('.chat-menu button')].find(button=>button.textContent==='Удалить чат')?.disabled && !document.querySelector('.connection-line [role=status]').textContent.includes('Соединение потеряно')"),'initial active chat has no false connection warning and cannot be deleted');
   breakStreams=true;
   await page.call('Fetch.enable',{patterns:[{urlPattern:config.origin+'/a2a/owner/tasks/*',requestStage:'Request'}]});
@@ -253,14 +256,23 @@ try {
   await second.wait("[...document.querySelectorAll('button')].some(button=>button.textContent.trim()==='Добавить агента ＋')",'actual owner peer registry');
   await second.click('Добавить агента ＋');
   await second.wait("!!document.querySelector('.form-sheet input[pattern]')",'actual custom-header peer form');
-  await second.field('.form-sheet input[pattern]','browser_disabled_peer');
+  await second.field('.form-sheet input[pattern]','browser-disabled_peer');
   await second.field('.form-sheet input[type=url]','https://peer.invalid/a2a');
   await second.field('.form-sheet textarea','Disabled local browser proof peer');
   await second.field('.form-sheet .form-grid label:nth-child(4) input','X-Browser-Proof-Key');
   await second.field('.form-sheet select','replace');
   await second.wait("!!document.querySelector('.form-sheet input[type=password]')",'actual peer secret editor');
   await second.field('.form-sheet input[type=password]',peerSecret);
+  const peerPostsBefore=peerPostAttempts;
+  for(const invalidName of ['Агент погоды','agent with spaces','x'.repeat(129)]){
+    await second.field('.form-sheet input[pattern]',invalidName);
+    check(await second.evaluate("(()=>{const input=document.querySelector('.form-sheet input[pattern]');return !input.checkValidity()&&input.validity.patternMismatch&&input.maxLength===128&&document.getElementById(input.getAttribute('aria-describedby')).textContent.includes('Латинские буквы');})()"),'peer name validation explains and rejects unsupported names');
+    await second.click('Сохранить подключение','.form-sheet button');
+  }
+  await second.field('.form-sheet input[pattern]','browser-disabled_peer');
+  check(await second.evaluate("document.querySelector('.form-sheet input[pattern]').checkValidity()"),'peer name accepts an ASCII hyphen and underscore');
   const createdPeer=await ownerAction(second,'/api/remote-agents','POST',()=>second.click('Сохранить подключение','.form-sheet button'));
+  check(peerPostAttempts===peerPostsBefore+1,'invalid peer names send no mutation before a valid name is saved');
   const peer=createdPeer.body;
   check(peer.header_name==='X-Browser-Proof-Key'&&peer.has_header_value===true&&peer.enabled===true&&!JSON.stringify(peer).includes(peerSecret)&&!('header_value' in peer),'custom-header secret is saved but omitted from actual owner metadata');
   await second.wait("!!document.querySelector('.peer')&&!document.querySelector('.form-sheet')",'actual saved peer');

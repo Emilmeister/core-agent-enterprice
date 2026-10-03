@@ -178,10 +178,17 @@ function PeerEditor({
             value={name}
             disabled={!!peer || busy}
             onChange={(e) => setName(e.target.value)}
-            pattern="[A-Za-z0-9_-]{1,128}"
+            pattern={"[A-Za-z0-9_\\-]{1,128}"}
+            maxLength={128}
+            placeholder="weather-agent"
+            title="От 1 до 128 символов: латинские буквы, цифры, _ и -."
+            aria-describedby="peer-name-help"
             required
             autoComplete="off"
           />
+          <span className="muted" id="peer-name-help">
+            Латинские буквы, цифры, _ и -, до 128 символов. Например: weather-agent.
+          </span>
         </label>
         <label>
           Адрес A2A

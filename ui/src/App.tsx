@@ -194,7 +194,6 @@ export function App({ session }: { session: Session }) {
               >
                 <span className="chat-link-content">
                   <strong>{row.title || "Новый чат"}</strong>
-                  {row.updated_at ? <small><time dateTime={new Date(row.updated_at * 1000).toISOString()}>{new Date(row.updated_at * 1000).toLocaleString("ru-RU", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time></small> : null}
                   {(row.needs_attention || row.status === "TASK_STATE_INPUT_REQUIRED") && <small className="chat-attention">Нужен ваш ответ</small>}
                   {["TASK_STATE_FAILED", "TASK_STATE_REJECTED"].includes(row.status ?? "") && <small className="chat-attention danger">Ошибка выполнения</small>}
                 </span>

@@ -492,6 +492,8 @@
   после refresh/restart; company owners видят общее имя. External/dual role403,
   другая company404, malformed title400, stale revision409. UUID не занимает
   строку чата и доступен через copy action; task/workspace scope неизменен.
+  Список показывает названия без даты/времени обновления, сохраняя порядок
+  по последнему обновлению и отметки, требующие внимания.
 - ENT-AC-80: shell/sidebar/message authors и login/logout не показывают имя
   продукта или логотип; вкладка имеет нейтральное название «Чат». Composer растёт от двух строк, aggregate limit имеет понятные units;
   новые события не сбрасывают прокрутку читающего пользователя. Видна кнопка
@@ -586,6 +588,11 @@ Malformed/noncanonical/oversized remote batch не relay-ится частичн
 атомарны при реальном PostgreSQL pool1; cancel/deadline/lease races не оставляют
 accepted files. Root/child guard allow/reject/timeout/restart соблюдают общий
 publication barrier без shadow Task или обхода canonical ancestry.
+
+RMT-01, UI proof: при создании подключения видна подсказка о допустимых
+символах и длине имени. Кириллица, пробелы и имя длиннее 128 символов
+не отправляются серверу; допустимое имя с дефисом и подчёркиванием сохраняется.
+Проверка выполняется в реальном браузере; server validation остаётся обязательной.
 
 Remote progress proof: working/input-required/auth-required metadata появляются
 в текущем root Task и scoped Get/List/Subscribe/push без raw peer data и чужих

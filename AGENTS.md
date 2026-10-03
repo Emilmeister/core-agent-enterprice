@@ -635,6 +635,8 @@ run получает отдельные MCP session и negotiated version; пе�
   `PUT /api/chats/{context_id}/title` сохраняет переименование через CAS, не меняя
   Task, prompt или workspace. Автоматическое название связано с provenance
   исходного сообщения и не раскрывает удержанный guardrails материал.
+  UI показывает название и отметки внимания без даты/времени; сортировка по
+  последнему обновлению остаётся прежней.
 - `/api/chats/{context_id}/history` читает canonical previous-root chain, полный
   transcript и сохранённые inbound Messages с bounded pagination, не запуская
   workflow, модель или classifier. Cursor привязан к company/chat и сохраняет

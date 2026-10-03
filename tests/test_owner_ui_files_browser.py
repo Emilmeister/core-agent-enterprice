@@ -240,6 +240,8 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         self.assertIn("PASS actual owner policy persists independent access and material exemption for core_terminal_exec", proof)
         self.assertIn("PASS owner UI runs same-chat cron despite model tool deny", proof)
         self.assertIn("PASS actual private peer reread exposes configured flag and disabled state only", proof)
+        self.assertIn("PASS chat navigation shows meaningful titles without update dates or times", proof)
+        self.assertIn("PASS invalid peer names send no mutation before a valid name is saved", proof)
         self.assertIn("PASS confirmed workspace cleanup deletes only the selected actual file", proof)
         self.assertIn("PASS browser reload preserves both completed roots and immutable file history after cleanup", proof)
         self.assertIn("PASS completed approval cards disappear while native decisions remain persisted", proof)
