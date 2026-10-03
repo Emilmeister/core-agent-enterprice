@@ -473,6 +473,9 @@
   независимо от текста модели. Разрешение не означает выполнение. В шапке
   доступны остановка/обновление, над composer — переход к активному запросу.
   Polite announcements не крадут фокус; нормальная синхронизация не шумит.
+  Initial Task fetch и terminal SSE EOF не показывают потерю соединения;
+  SSE-only failure при рабочем GetTask сохраняет тихий polling. Ошибка GetTask
+  показывает восстановление, успешное чтение снимает его.
 - ENT-AC-76: active approval показывает фактическое действие и параметры,
   deadline с timezone и действия allow/reject; approved/rejected/timeout карточки
   скрыты, owner question answers остаются, решения не стираются из хранения.
@@ -494,6 +497,20 @@
   новые события не сбрасывают прокрутку читающего пользователя. Видна кнопка
   новых сообщений, focus/последняя запись не закрыты sticky elements; desktop,
   mobile, keyboard и contrast thresholds проверены в реальном браузере.
+
+- ENT-AC-81: owner подтверждает удаление чата; он исчезает у всех владельцев
+  company после refresh/restart, cron атомарно отключаются. Active root409,
+  external/dual403, foreign404; повтор200 без новых событий. Архивный context
+  не принимает новые root/follow-up/rename/cron create/enable/run; сохранённые
+  retries не создают новую работу. Старые Task/history/immutable files доступны
+  только прежним scoped callers, identity и bytes не изменяются. Memory/PG
+  race, migration и native browser подтверждают поведение.
+- ENT-AC-82: Python source сохраняет whitespace и получает безопасную подсветку
+  в ответе/tool parameters/file preview; код не исполняется, опасный HTML
+  остаётся текстом. Markdown file preview рендерит таблицы/Mermaid с прежними
+  ограничениями. Длинный preview не перекрывает свойства/следующие сообщения,
+  раскрытие многих успешных действий не делает ответ недоступным; оба scroll
+  regions доступны с клавиатуры на desktop/mobile.
 
 - ENT-AC-72: владелец нажимает «Выйти» в реальном браузере с действующей
   Keycloak-сессией. SSO завершается; старый bearer даёт 401 на новом private

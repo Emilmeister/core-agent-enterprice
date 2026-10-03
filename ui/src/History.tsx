@@ -15,7 +15,7 @@ const empty: HistoryPage = { items: [], next_cursor: null };
 const statusLabels: Record<HistoryItem["status"], string> = {
   available: "",
   queued: "Сообщение принято и ожидает обработки",
-  pending_guardrail: "Материал ожидает проверки",
+  pending_guardrail: "Обработка поручения",
   rejected: "Материал отклонён",
   timed_out: "Срок проверки истёк",
   unprocessed_due_to_failure: "Не обработано: задача завершилась с ошибкой",
@@ -310,7 +310,9 @@ export function History({
             {blocks.map((block) => block.length > 1
               ? <details className="execution-group" key={block[0].action!.key}>
                 <summary>Ход выполнения · {block.length} действий выполнено</summary>
-                {block.map(renderEntry)}
+                <div className="execution-steps" tabIndex={0} role="region" aria-label="Выполненные действия">
+                  {block.map(renderEntry)}
+                </div>
               </details> : renderEntry(block[0]))}
             {interactions
               .filter((item) => !linked.has(item.wait_id))

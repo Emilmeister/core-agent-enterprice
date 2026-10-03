@@ -94,6 +94,14 @@ export function App({ session }: { session: Session }) {
     setSelected((row) => row?.context_id === metadata.context_id ? { ...row, ...metadata } : row);
     void refreshChats().catch((e) => setError(errorText(e)));
   }
+  function deleted(contextId: string) {
+    ++chatRead.current;
+    setChats((rows) => rows.filter((row) => row.context_id !== contextId));
+    setSelected(null);
+    setDirty(false);
+    setNewKey((key) => key + 1);
+    void refreshChats().catch((e) => setError(errorText(e)));
+  }
   return (
     <div
       className="workspace"
@@ -236,6 +244,7 @@ export function App({ session }: { session: Session }) {
             onTask={submitted}
             onDirty={setDirty}
             onRenamed={renamed}
+            onDeleted={deleted}
           />
         ) : page === "schedules" ? (
           <Schedules api={api} chats={chats} onChat={choose} refreshChats={refreshChats} onDirty={setDirty} />

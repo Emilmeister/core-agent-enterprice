@@ -1,11 +1,13 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
 import { formatFileSize } from "./types";
+import { Markdown } from "./Markdown";
+import { CodeBlock } from "./Code";
 import type { AttachmentEntry, HistoryItem, ResponseFileEntry } from "./types";
 
 const previewLimit = 64 * 1024;
 const textTypes: Record<string, string> = {
-  txt: "Текст", md: "Markdown", csv: "CSV", json: "JSON", yaml: "YAML", yml: "YAML",
+  txt: "Текст", md: "Markdown", markdown: "Markdown", csv: "CSV", json: "JSON", yaml: "YAML", yml: "YAML",
   log: "Журнал", py: "Python", js: "JavaScript", ts: "TypeScript", tsx: "TypeScript",
   jsx: "JavaScript", css: "CSS", sh: "Shell", ini: "Конфигурация", toml: "TOML", xml: "XML",
 };
@@ -116,9 +118,15 @@ export function FileCard({ api, contextId, taskId, file }: {
     {opened && <div className="file-preview">
       <div className="file-preview-heading"><strong>Предпросмотр</strong><button type="button" className="text-button"
         aria-label={`Закрыть предпросмотр ${name}`} onClick={() => { pending.current?.abort(); pending.current = undefined; setBusy(null); setOpened(false); }}>Закрыть</button></div>
+      <div className="file-preview-content" tabIndex={0} role="region" aria-label={`Предпросмотр ${name}`}>
       {!textPreview && <p className="muted">Предпросмотр этого формата недоступен. Скачайте файл, чтобы открыть его.</p>}
       {textPreview && busy === "open" && <p className="muted" role="status">Загружаем текст…</p>}
-      {preview && <><pre>{preview.text || "Пустой файл"}</pre>{preview.truncated && <p className="muted">Показаны первые {formatFileSize(previewLimit)}. Полный файл доступен для скачивания.</p>}</>}
+      {preview && <>{["md", "markdown"].includes(extension)
+        ? <Markdown text={preview.text || "Пустой файл"} />
+        : extension === "py" ? <CodeBlock text={preview.text || "Пустой файл"} language="python" />
+        : <pre>{preview.text || "Пустой файл"}</pre>
+        }{preview.truncated && <p className="muted">Показаны первые {formatFileSize(previewLimit)}. Полный файл доступен для скачивания.</p>}</>}
+      </div>
     </div>}
     {error && <p className="error" role="alert">{error}</p>}
     <details className="file-properties"><summary>Свойства файла</summary><dl>

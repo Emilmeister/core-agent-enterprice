@@ -648,10 +648,19 @@ run получает отдельные MCP session и negotiated version; пе�
   вложений и раскрывается только вместе с доступным user message. Legacy `text`
   сохраняется; UI не удаляет произвольный текст регулярными выражениями.
   Owner UI объединяет вызов и результат по Task/call ID, раскрывает технические
-  данные по запросу и показывает отдельные сохранённые файлы. Текстовый просмотр
-  ограничен 64 KiB и экранируется; HTML/SVG/Office не исполняются в origin агента.
+  данные по запросу и показывает отдельные сохранённые файлы. Успешные действия
+  и предпросмотр имеют ограниченные отдельные области прокрутки. Текстовый просмотр
+  ограничен 64 KiB; Markdown использует тот же безопасный renderer, что ответы.
+  Python подсвечивается через lowlight/HAST как React text/spans без raw HTML;
+  большие блоки остаются обычным текстом. HTML/SVG/Office не исполняются в origin агента.
   Настройки инструментов сохраняются явно по одному правилу, положительный
   checkbox проверок является инверсией `guardrails_exempt`.
+- Owner-only DELETE `/api/chats/{context_id}` архивирует неактивный чат для всех
+  владельцев компании и атомарно отключает его расписания. Migration 26 добавляет
+  монотонный tombstone; блокировки следуют порядку chat → schedule. Повторный DELETE
+  идемпотентен, активная root Task возвращает `CONTEXT_BUSY`. Canonical admission,
+  история и выданные файлы сохраняются для прежних Get/Subscribe/download и receipts;
+  новые поручения и включение/запуск расписаний в архивном context запрещены.
 - Owner file preview/download получают original WorkspaceBinding из canonical
   admission mapping; просматривающий owner не становится execution owner.
   Nofollow directory fds исключают symlinks, hardlinks и special files; private

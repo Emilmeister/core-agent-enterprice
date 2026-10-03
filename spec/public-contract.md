@@ -403,7 +403,11 @@ UI не показывает название продукта, логотип �
 Тексты исключений и ошибок провайдера/MCP остаются скрытыми; guardrails withholding
 имеет приоритет и над этими метаданными. Имя инструмента, аргументы, exit code
 и ID доступны отдельно в технических данных. Последовательные
-успешные действия можно сворачивать в «Ход выполнения»; ошибки и активные
+успешные действия можно сворачивать в «Ход выполнения»; раскрытые успешные
+действия имеют ограниченный по высоте, доступный с клавиатуры scroll region,
+чтобы итоговый ответ оставался доступным. Предпросмотр ограничивает свой
+контент внутри отдельного scroll region и не перекрывает свойства/следующие
+сообщения. Ошибки и активные
 разрешения всегда видимы. Отдельного технического режима нет.
 
 Название диалога отделено от состояния текущего запроса и состояния соединения.
@@ -414,6 +418,12 @@ UI не показывает название продукта, логотип �
 Статусы объявляются через polite live region без перемещения фокуса.
 Автоматическое обновление истории является основным сценарием; ручное обновление
 находится в шапке. Успешная синхронизация не занимает постоянное место в чате.
+Первичное подключение и нормальное завершение SSE для terminal Task не считаются
+потерей соединения. При недоступной подписке и успешном canonical GetTask UI
+продолжает polling без ложного сообщения о потере связи. Ошибка canonical чтения
+показывает восстановление до следующего успешного чтения; auth/access errors
+сохраняют прежние правила завершения сессии. Pending guardrail placeholder имеет
+подпись «Обработка поручения»; фактические кнопки owner review остаются видимыми.
 
 Активная карточка разрешения показывает конкретное действие и существенные
 параметры до кнопок: команду, адресата/сообщение/вложения, объект изменения или
@@ -437,7 +447,11 @@ tool approval/guardrail карточки остаются скрыты согл�
 при наличии provenance. Legacy записи без доказуемого original text не очищаются
 эвристическим regex. Путь остаётся в раскрываемых свойствах. Предпросмотр
 недоверенного текста экранируется; HTML/SVG/Office не исполняются как страница
-origin агента. Неподдерживаемый формат предлагает скачивание. Все file requests
+origin агента. Markdown-файлы используют тот же безопасный Markdown/Mermaid renderer,
+что и ответы. Python code blocks, previews и фактические параметры Python
+получают подсветку синтаксиса без исполнения кода, raw HTML или изменения
+отступов. Крупный код отображается простым текстом с тем же сохранением
+отступов. Неподдерживаемый формат предлагает скачивание. Все file requests
 проходят прежнюю owner/scoped авторизацию; смена чата/logout отменяют загрузку.
 Карточки созданных файлов находятся у результата. Панель «Файлы» показывает
 «Прикреплённые»/«Созданные агентом», количество и переход к исходному сообщению,
@@ -446,7 +460,7 @@ origin агента. Неподдерживаемый формат предла�
 Чаты имеют содержательные названия по первому доступному запросу или вложению
 и сохранённое владельцем переименование. UUID находится в меню «Скопировать ID».
 В списке видны время обновления и только состояния, требующие внимания.
-Шапка показывает название текущего чата, имя агента вторично. Переименование
+Шапка показывает название текущего чата. Переименование
 owner-only, company-scoped, ограничено 120 символами и использует CAS;
 оно не меняет task/context IDs, историю, права, workspace или instructions.
 
@@ -468,6 +482,7 @@ Tenant, owner, actor и права не принимаются из JSON. Неи
 | --- | --- |
 | `GET /api/chats` | Общий список canonical чатов company: `context_id`, `latest_task_id`, `active`, `status` последнего root workflow, owner-only `needs_attention` текущего unresolved/unexpired owner wait, `title`, `title_revision` и `updated_at` (Unix seconds). Автоматическое название раскрывается только при доступности исходного сообщения/вложения; withheld material не раскрывается через metadata. Название владельца хранится независимо. Только владельцы; без caller credentials и private material. Limit 1–100 (default 50), стабильный порядок по context_id, непрозрачный cursor, привязанный к company; ответ `{chats, next_cursor}`. Чтение не создаёт чат и не запускает/возобновляет задачу |
 | `PUT /api/chats/{context_id}/title` | Owner-only переименование: ровно `{title, expected_revision}`; trim, непустое название до 120 Unicode символов, неотрицательная integer revision. Ответ `{context_id, title, title_revision, updated_at}`. Неверное тело —400 `REQUEST_INVALID`, роль —403, missing/foreign chat —404 `TASK_NOT_FOUND`, stale revision —409 `CHAT_TITLE_CONFLICT`. Смена названия не меняет Task/context/workspace или prompt; все владельцы company видят сохранённое значение |
+| `DELETE /api/chats/{context_id}` | Owner-only удаление из общего списка: без body/query; ответ200 `{context_id, archived:true}` также при повторе. Missing/foreign404 `TASK_NOT_FOUND`, external/dual role403, любой canonical nonterminal root409 `CONTEXT_BUSY`. Архивирование и отключение всех связанных enabled cron выполняются атомарно. Старые Tasks, история, workspace и выданные transport files сохраняются |
 | `GET /api/chats/{context_id}/history` | Owner-only полная история canonical чата, включая предыдущие root Tasks и принятые уточнения во время ожидания. Limit 1–100 (default 50), newest-first, versioned cursor, привязанный к company/chat и сохранённой позиции; ответ `{items, next_cursor}`. Missing/foreign chat —404; неверные query/cursor —400; чтение не запускает runtime |
 | `GET /api/chats/{context_id}/files` | Owner-only preview обычных файлов постоянного workspace. Optional `directory` — относительный каталог (default корень), `older_than_days` — неотрицательное конечное десятичное число до 100000, `limit` 1–100 (default 50), `cursor`; неизвестные/повторные query запрещены. Ответ `{files, next_cursor, listed_at, active, cleanup_block_reason, workspace_revision}`; элемент содержит ровно `name`, `path`, `size`, `mtime_ns`, `identity_token`. Порядок lexicographic по относительному пути, cursor связан с company/chat/каталогом/фильтром, revision и server timestamp; чтение не создаёт папку и не запускает runtime |
 | `GET /api/chats/{context_id}/files/content?path=...` | Owner-only скачивание существующего обычного файла выбранного workspace; ровно один непустой относительный POSIX path. Свежая проверка company/chat и безопасное открытие по directory fds; symlinks, hardlinks и special files не выдаются. Attachment, `application/octet-stream`, no-store, nosniff и sandbox CSP. Missing/foreign file —404, malformed path/query —400; descriptor закрывается и при disconnect |
@@ -481,6 +496,18 @@ Tenant, owner, actor и права не принимаются из JSON. Неи
 | `GET /api/guardrails/{wait_id}/file` | Owner-only скачивание конкретного файла по сохранённому sealed reference проверки; batch/index/run/owner не принимаются от клиента. Scope и bytes/digest проверяются также после завершения Task. Ответ: attachment, `application/octet-stream`, no-store, nosniff и sandbox CSP; неподходящий/чужой review — 404, повреждённые bytes не выдаются |
 | `GET /api/tool-policies` | Известный catalog внутри deployment ceiling с origin, mode, guardrails_exempt и revision |
 | `PUT /api/tool-policies/{canonical_name}` | Ровно `mode: allow|require_hitl|deny`, boolean `guardrails_exempt`, integer `expected_revision`, string `expected_origin` из прочитанного catalog |
+
+Удаление чата является необратимой меткой архивации, а не удалением сохранённых
+A2A-результатов. UI требует предметного подтверждения, закрывает удалённый чат
+и убирает его из общего списка всех владельцев company. Новый root/follow-up,
+переименование, создание/включение расписания и новый manual/automatic cron
+run для архивного context запрещены без переиспользования его workspace.
+Уже сохранённые dedup receipts возвращают прежний результат без новых эффектов.
+GetTask/Subscribe и прежние owner history/file reads сохраняют прежнюю scoped
+авторизацию и доступ к результатам. Migration26 добавляет monotonic tombstone
+без изменения identity, history, immutable files или accepted-message ledger.
+Архивация сериализуется с admission и cron по chat→schedule lock order;
+workflow-fenced agent tool writers не инвертируют этот порядок.
 
 Chat metadata и `display_text` являются additive полями owner API. Migration 25
 сохраняет существующие Task/context/workspace identities и request dedup ledger;

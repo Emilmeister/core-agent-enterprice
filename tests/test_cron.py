@@ -49,6 +49,58 @@ class CronStoreTests(AuthAppTestCase):
                 return self.store.occur(context, row["id"], row["revision"], connection=connection, cutoff=cutoff)
         return await self.store.occur_memory(context, row["id"], row["revision"], cutoff=cutoff)
 
+    async def test_archive_racing_schedule_creation_never_leaves_enabled_schedule(self):
+        for archive_first in (False, True):
+            original = await self.create(request_id="base-" + str(archive_first))
+            context_id = original["context_id"]
+            context = self.context("owner-a")
+            calls = [self.admission.archive_chat(self.tenant, context_id, actor_id=context.state["principal"].actor_id),
+                     self.create(request_id="race-" + str(archive_first), context_id=context_id)]
+            if not archive_first:
+                calls.reverse()
+            results = await asyncio.wait_for(asyncio.gather(*calls, return_exceptions=True), 10)
+            if not archive_first:
+                results.reverse()
+            archived, created = results
+            self.assertEqual(archived, {"context_id": context_id, "archived": True})
+            if isinstance(created, CoreError):
+                self.assertEqual(created.code, "CRON_NOT_FOUND")
+            else:
+                self.assertFalse(self.store.get(self.tenant, created["id"])["enabled"])
+            self.assertFalse(self.store.get(self.tenant, original["id"])["enabled"])
+            self.assertFalse(any(row["context_id"] == context_id and row["enabled"] for row in self.store.list(self.tenant)))
+
+    async def test_archive_racing_manual_and_automatic_run_share_context_gate(self):
+        for automatic in (False, True):
+            row = await self.create(request_id="base-" + str(automatic), expression="* * * * *")
+            if automatic:
+                self.due_at(row, datetime.now(UTC) - timedelta(seconds=1))
+            context = self.context("owner-a")
+            async def automatic_run():
+                if self.store.database:
+                    def run():
+                        with self.store.database.transaction() as connection:
+                            return self.store.occur(context, row["id"], row["revision"], connection=connection)
+                    return await asyncio.to_thread(run)
+                return await self.store.occur_memory(context, row["id"], row["revision"])
+            run = automatic_run() if automatic else self.run_schedule(row, request="race-run")
+            archived, admitted = await asyncio.wait_for(asyncio.gather(
+                self.admission.archive_chat(self.tenant, row["context_id"], actor_id=context.state["principal"].actor_id),
+                run, return_exceptions=True), 10)
+            if isinstance(archived, dict):
+                self.assertEqual(archived, {"context_id": row["context_id"], "archived": True})
+                self.assertFalse(self.store.get(self.tenant, row["id"])["enabled"])
+                if automatic:
+                    self.assertIsNone(admitted)
+                else:
+                    self.assertIsInstance(admitted, CoreError)
+                    self.assertIn(admitted.code, {"CRON_CONFLICT", "CRON_DISABLED"})
+            else:
+                self.assertIsInstance(archived, CoreError)
+                self.assertEqual(archived.code, "CONTEXT_BUSY")
+                self.assertIsNotNone(admitted.run_id)
+                self.assertEqual(self.store.get(self.tenant, row["id"])["active_task_id"], admitted.task.id)
+
     async def test_create_empty_chat_shared_company_metadata_and_idempotency(self):
         calls = len(self.model.calls)
         row = await self.create()

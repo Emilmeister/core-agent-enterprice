@@ -48,12 +48,14 @@ export function Chat({
   onTask,
   onDirty,
   onRenamed,
+  onDeleted,
 }: {
   api: Api;
   row: ChatRow | null;
   onTask: (task: Task) => void;
   onDirty: (value: boolean) => void;
   onRenamed: (metadata: Partial<ChatRow> & { context_id: string }) => void;
+  onDeleted: (contextId: string) => void;
 }) {
   const [task, setTask] = useState<Task>();
   const [draft, setDraft] = useState("");
@@ -67,7 +69,7 @@ export function Chat({
   }>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [connected, setConnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const [cancelConfirm, setCancelConfirm] = useState(false);
   const [directAnswer, setDirectAnswer] = useState("");
   const [filesOpen, setFilesOpen] = useState(false);
@@ -78,6 +80,10 @@ export function Chat({
   const [titleBusy, setTitleBusy] = useState(false);
   const [titleError, setTitleError] = useState("");
   const [copyNotice, setCopyNotice] = useState("");
+  const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const deleteDialog = useRef<HTMLDialogElement>(null);
+  const deleteRequest = useRef<AbortController | null>(null);
   const titleRequest = useRef<AbortController | null>(null);
   const titleEditRevision = useRef(0);
   const titleMenu = useRef<HTMLDetailsElement>(null);
@@ -109,6 +115,11 @@ export function Chat({
   const thread = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const contextId = row?.context_id ?? task?.contextId;
+  useLayoutEffect(() => {
+    const dialog = deleteDialog.current;
+    if (deleteConfirm && dialog && !dialog.open) dialog.showModal();
+    else if (!deleteConfirm && dialog?.open) dialog.close();
+  }, [deleteConfirm]);
   const history = useChatHistory(api, contextId);
   const loadHistory = history.load;
   useLayoutEffect(() => {
@@ -167,6 +178,7 @@ export function Chat({
       mounted.current = false;
       fileReader.current?.abort();
       titleRequest.current?.abort();
+      deleteRequest.current?.abort();
     };
   }, []);
   useEffect(() => {
@@ -220,6 +232,7 @@ export function Chat({
     [api, taskId, loadHistory, acceptTask],
   );
   useEffect(() => {
+    setReconnecting(false);
     if (!taskId) return;
     const abort = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -228,25 +241,33 @@ export function Chat({
         try {
           const latest = await refresh(abort.signal);
           if (abort.signal.aborted) return;
-          setConnected(true);
+          setReconnecting(false);
           if (terminal(latest)) return;
-          await api.subscribe(
-            taskId!,
-            async () => {
-              await refresh(abort.signal);
-            },
-            abort.signal,
-          );
+          try {
+            await api.subscribe(
+              taskId!,
+              async () => {
+                await refresh(abort.signal);
+              },
+              abort.signal,
+            );
+          } catch (failure) {
+            // The canonical read below can keep the chat current without SSE.
+            if (failure instanceof ApiError && [403, 404].includes(failure.status))
+              throw failure;
+          }
+          if (abort.signal.aborted || !api.session.valid || view.current.terminal) return;
         } catch (failure) {
           if (abort.signal.aborted || !api.session.valid) return;
-          setConnected(false);
           if (
             failure instanceof ApiError &&
             [403, 404].includes(failure.status)
           ) {
+            setReconnecting(false);
             setError(errorText(failure));
             return;
           }
+          setReconnecting(true);
         }
         if (!abort.signal.aborted)
           await new Promise<void>((resolve) => {
@@ -389,6 +410,28 @@ export function Chat({
       if (mounted.current) setBusy(false);
     }
   }
+  async function archive() {
+    if (!contextId || busy || pending || filesDirty || (taskId && (!task || !terminal(task)))) return;
+    const abort = new AbortController();
+    deleteRequest.current = abort;
+    setBusy(true);
+    setDeleteError("");
+    try {
+      const receipt = await api.json<{ context_id: string; archived: boolean }>(
+        `/api/chats/${encodeURIComponent(contextId)}`, "DELETE", undefined, abort.signal,
+      );
+      if (receipt.context_id !== contextId || receipt.archived !== true) throw new Error("Invalid deletion receipt");
+      if (!abort.signal.aborted && mounted.current && api.session.valid) onDeleted(contextId);
+    } catch (failure) {
+      if (!abort.signal.aborted && mounted.current) {
+        setDeleteError(failure instanceof ApiError && failure.code === "CONTEXT_BUSY"
+          ? "В чате выполняется задача. Закройте это окно и остановите её или дождитесь завершения."
+          : errorText(failure));
+      }
+    } finally {
+      if (!abort.signal.aborted && mounted.current) setBusy(false);
+    }
+  }
   async function rename() {
     if (!contextId || titleBusy || !titleDraft.trim() || Array.from(titleDraft.trim()).length > 120) return;
     const abort = new AbortController();
@@ -452,8 +495,8 @@ export function Chat({
           <p className="task-status" role="status" aria-live="polite" aria-atomic="true">{status}</p>
         </div>
         <div className="chat-heading-actions">
-          {taskId && <button className="text-button history-refresh" disabled={history.loading}
-            title="Обновить историю" aria-label="Обновить историю" onClick={() => void refresh(undefined, true).catch((failure) => setError(errorText(failure)))}>
+          {contextId && <button className="text-button history-refresh" disabled={history.loading}
+            title="Обновить историю" aria-label="Обновить историю" onClick={() => void (taskId ? refresh(undefined, true) : loadHistory("reload")).catch((failure) => setError(errorText(failure)))}>
             <span aria-hidden="true">↻</span><span className="sr-only">Обновить историю</span>
           </button>}
           {contextId && (
@@ -472,11 +515,24 @@ export function Chat({
             <div className="chat-menu-actions">
               <button className="text-button" onClick={() => { titleEditRevision.current = row?.title_revision ?? 0; setTitleDraft(row?.title ?? ""); setEditingTitle(true); setTitleError(""); if (titleMenu.current) titleMenu.current.open = false; }}>Переименовать</button>
               <button className="text-button" onClick={() => void navigator.clipboard.writeText(contextId).then(() => setCopyNotice("ID чата скопирован"), () => setCopyNotice("Не удалось скопировать ID чата"))}>Скопировать ID</button>
+              <button className="text-button danger" disabled={busy || !!pending || filesDirty || titleBusy || !!taskId && (!task || !terminal(task))}
+                title={taskId && (!task || !terminal(task)) ? "Сначала остановите текущую задачу или дождитесь её завершения" : undefined}
+                onClick={() => { setDeleteError(""); setDeleteConfirm(true); if (titleMenu.current) titleMenu.current.open = false; }}>Удалить чат</button>
               {copyNotice && <p className="muted" role="status">{copyNotice}</p>}
             </div>
           </details>}
         </div>
       </header>
+      {contextId && <dialog ref={deleteDialog} className="chat-delete-dialog" aria-labelledby="chat-delete-title" aria-describedby="chat-delete-description"
+        onClose={() => titleMenu.current?.querySelector<HTMLElement>("summary")?.focus()}
+        onCancel={(event) => { if (busy) event.preventDefault(); else setDeleteConfirm(false); }}>
+        <h2 id="chat-delete-title">Удалить чат?</h2>
+        <p id="chat-delete-description">Чат исчезнет из списка у всех владельцев. Его расписания отключатся. История, файлы и прежние результаты A2A сохранятся.</p>
+        {(draft || attachments.length > 0) && <p>Неотправленное сообщение и выбранные вложения будут сброшены.</p>}
+        {deleteError && <p className="error" role="alert">{deleteError}</p>}
+        <div className="actions"><button type="button" className="secondary" autoFocus disabled={busy} onClick={() => setDeleteConfirm(false)}>Отмена</button>
+          <button type="button" className="danger" disabled={busy || !!taskId && (!task || !terminal(task))} onClick={() => void archive()}>{busy ? "Удаляем…" : "Подтвердить удаление чата"}</button></div>
+      </dialog>}
       {editingTitle && <form className="chat-title-form" onSubmit={(event) => { event.preventDefault(); void rename(); }}>
         <label>Название чата<input autoFocus maxLength={240} value={titleDraft} disabled={titleBusy} onChange={(event) => setTitleDraft(event.target.value)} /></label>
         <div className="actions"><button disabled={titleBusy || !titleDraft.trim() || Array.from(titleDraft.trim()).length > 120}>{titleBusy ? "Сохраняем…" : "Сохранить название"}</button>
@@ -514,7 +570,10 @@ export function Chat({
         onFocusCapture={(event) => {
           const bounds = event.target.getBoundingClientRect();
           const container = thread.current?.getBoundingClientRect();
-          if (container && (bounds.bottom > container.bottom || bounds.top < container.top)) event.target.scrollIntoView({ block: "nearest" });
+          if (container && (bounds.bottom > container.bottom || bounds.top < container.top)) {
+            stickToBottom.current = false;
+            event.target.scrollIntoView({ block: "nearest" });
+          }
         }}
       >
         {remoteProgress(task).map((entry) => (
@@ -635,7 +694,7 @@ export function Chat({
           </div>
         </form>
         <div className="connection-line">
-          <span role="status">{taskId && !connected ? "Соединение потеряно. Восстанавливаем…" : ""}</span>
+          <span role="status">{taskId && reconnecting ? "Соединение потеряно. Восстанавливаем…" : ""}</span>
           {task && !terminal(task) && (
             <div>
               {cancelConfirm ? (

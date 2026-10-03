@@ -106,6 +106,16 @@ print({marker!r})
                     {"task_id": admitted["output"]["task_id"]}),))
             return response
 
+    preview_python = "value = 7\nif value:\n    print('python highlight verified')\n"
+    preview_markdown = ("# File preview proof\n\n| Item | Status |\n| --- | --- |\n| file | ready |\n\n"
+        "```python\n" + preview_python + "```\n\n```mermaid\nflowchart LR\n    A[File] --> B[Preview]\n```\n\n"
+        '<script>window.__fileExecuted=true</script>\n![tracking](https://ui-content.invalid/preview)\n')
+    unsafe_file = '<script>window.__fileExecuted=true</script><img src="https://ui-content.invalid/file">'
+    preview_files = {"unsafe.html": unsafe_file, "unsafe.svg": unsafe_file, "safe-preview.txt": unsafe_file,
+        "preview.md": preview_markdown, "example.py": preview_python, "long-preview.txt": "preview line\n" * 1000}
+    preview_program = ("import sys\nfrom pathlib import Path\np=Path('/workspace/preview-proof')\np.mkdir(exist_ok=True)\n"
+        f"files={preview_files!r}\nfor name, content in files.items():\n    (p/name).write_text(content)\n"
+        "print('native known failure', file=sys.stderr)\nsys.exit(3)\n")
     model = BrowserModel([
         read_files(2, "browser-native-root-verified"),
         read_files(3, "browser-native-followup-verified"),
@@ -153,10 +163,11 @@ flowchart LR
 """),
         ModelResponse(message="Native manual cron completed."),
         ModelResponse(tool_requests=(ToolRequest("browser-owner-question", "core_ask_owner", {"question": "Какой номер заказа использовать?"}),)),
-        ModelResponse(tool_requests=(ToolRequest("browser-known-failure", "core_terminal_exec", {"argv": ["python3", "-c", "import sys; from pathlib import Path; p=Path('/workspace/preview-proof'); p.mkdir(exist_ok=True); payload='<script>window.__fileExecuted=true</script><img src=\"https://ui-content.invalid/file\">'; [(p/name).write_text(payload) for name in ['unsafe.html','unsafe.svg','safe-preview.txt']]; print('native known failure', file=sys.stderr); sys.exit(3)"]}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-python-syntax", "core_python_exec", {"code": preview_python}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-known-failure", "core_terminal_exec", {"argv": ["python3", "-c", preview_program]}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-background-failure", "core_task_start", {"tool": "core_terminal_exec", "arguments": {"argv": ["python3", "-c", "print('should not run')"], "cwd": "definitely-missing-browser-folder"}}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-background-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
-        ModelResponse(tool_requests=(ToolRequest("browser-preview-files", "core_response_files", {"paths": ["preview-proof/unsafe.html", "preview-proof/unsafe.svg", "preview-proof/safe-preview.txt"]}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-preview-files", "core_response_files", {"paths": ["preview-proof/" + name for name in preview_files]}),)),
         ModelResponse(message="Owner clarification received; the command failed with exit code 3."),
     ])
     model.model = "owner-browser-fixture"

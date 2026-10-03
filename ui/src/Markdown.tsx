@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { HighlightedCode } from "./Code";
 
 function Diagram({ source }: { source: string }) {
   const id = "diagram-" + useId().replace(/[^a-zA-Z0-9_-]/g, "");
@@ -59,6 +60,8 @@ const components: Components = {
   pre: ({ children }) => <div className="code-block">{children}</div>,
   code: ({ className, children }) => className === "language-mermaid"
     ? <Diagram source={String(children).replace(/\n$/, "")} />
+    : className && /^language-(python|py|python3)$/i.test(className)
+    ? <HighlightedCode language="python" text={String(children)} />
     : <code className={className}>{children}</code>,
 };
 

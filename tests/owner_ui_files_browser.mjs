@@ -63,7 +63,7 @@ function observeOwnerAPI(tab){
   const pending=new Map();
   tab.on('Network.requestWillBeSent',({requestId,request})=>{
     const url=new URL(request.url);
-    if(url.origin!==config.origin||!/^\/api\/(tool-policies|schedules|remote-agents|chats\/[^/]+\/(files|title))(\/|$)/.test(url.pathname))return;
+    if(url.origin!==config.origin||!(/^\/api\/(tool-policies|schedules|remote-agents|chats\/[^/]+\/(files|title))(\/|$)/.test(url.pathname)||(request.method==='DELETE'&&/^\/api\/chats\/[^/]+$/.test(url.pathname))))return;
     pending.set(requestId,{path:url.pathname,query:url.search,method:request.method,request:request.postData?JSON.parse(request.postData):null,authorized:!!(request.headers.Authorization??request.headers.authorization)});
   });
   tab.on('Network.responseReceived',({requestId,response})=>{const request=pending.get(requestId);if(request)request.status=response.status;});
@@ -88,6 +88,7 @@ async function ownerAction(tab,path,method,action){
   return response;
 }
 let bearer,rootTask,lostReceipt,loseNext=false,dropped=0,pkce=false,pauseDownload=false,pausedDownload;
+let breakStreams=false,breakTaskReads=false,failedStreams=0;
 try {
   await page.call('Page.enable');await page.call('Runtime.enable');
   observeOwnerAPI(page);
@@ -111,7 +112,11 @@ try {
     if(request.kind==='task'&&body.id)tasks.push(body);
   });
   page.on('Fetch.requestPaused',async event=>{
-    if(pauseDownload&&event.responseStatusCode===200){pauseDownload=false;pausedDownload=event;}
+    const path=new URL(event.request.url).pathname;
+    if((breakStreams&&path.endsWith(':subscribe'))||(breakTaskReads&&/^\/a2a\/owner\/tasks\/[^:]+$/.test(path))){
+      if(path.endsWith(':subscribe'))failedStreams++;
+      await page.call('Fetch.failRequest',{requestId:event.requestId,errorReason:'ConnectionClosed'});
+    }else if(pauseDownload&&event.responseStatusCode===200){pauseDownload=false;pausedDownload=event;}
     else if(loseNext&&event.responseStatusCode===200){loseNext=false;dropped++;
       const response=await page.call('Fetch.getResponseBody',{requestId:event.requestId});const body=JSON.parse(response.base64Encoded?Buffer.from(response.body,'base64').toString():response.body);
       lostReceipt=body.task.metadata.accepted_file_receipt;
@@ -142,6 +147,21 @@ try {
   const renamed=await ownerAction(page,'/api/chats/'+encodeURIComponent(rootTask.contextId)+'/title','PUT',()=>page.click('Сохранить название'));
   check(renamed.body.title==='Проверка файлов и диаграмм'&&renamed.body.title_revision===renamed.request.expected_revision+1,'actual owner rename persists company chat title with CAS');
   await page.wait("document.querySelector('.chat-heading h1')?.textContent==='Проверка файлов и диаграмм' && document.querySelector('.chat-link strong')?.textContent==='Проверка файлов и диаграмм'",'header and navigation use saved title instead of UUID');
+  check(await page.evaluate("[...document.querySelectorAll('.chat-menu button')].find(button=>button.textContent==='Удалить чат')?.disabled && !document.querySelector('.connection-line [role=status]').textContent.includes('Соединение потеряно')"),'initial active chat has no false connection warning and cannot be deleted');
+  breakStreams=true;
+  await page.call('Fetch.enable',{patterns:[{urlPattern:config.origin+'/a2a/owner/tasks/*',requestStage:'Request'}]});
+  const readsBefore=tasks.length;
+  await page.call('Page.reload');
+  await page.wait("!!document.querySelector('.chat-link')",'chat list after reconnect test reload');
+  await page.evaluate("document.querySelector('.chat-link').click()");
+  await waitFor(()=>failedStreams>=2&&tasks.length>=readsBefore+2,'actual failed SSE with successful canonical reads');
+  check(await page.evaluate("!document.querySelector('.connection-line [role=status]').textContent.includes('Соединение потеряно')"),'SSE outage with healthy canonical polling does not claim connection loss');
+  breakTaskReads=true;
+  await page.wait("document.querySelector('.connection-line [role=status]').textContent.includes('Соединение потеряно')",'actual canonical read outage is visible');
+  breakTaskReads=false;breakStreams=false;
+  await page.call('Fetch.disable');
+  await page.wait("!document.querySelector('.connection-line [role=status]').textContent.includes('Соединение потеряно') && !!document.querySelector('.interaction:not(.resolved) button')",'canonical recovery clears actual outage without losing approval');
+  check(true,'actual canonical read failure and recovery preserve pending chat work');
   await page.files([config.files[2]]);
   await page.wait("document.querySelectorAll('.composer-attachments li').length===1",'follow-up selected file');
   loseNext=true;
@@ -178,7 +198,7 @@ try {
   check(receipts.at(-1).accepted_file_receipt.batch_id===lostReceipt.batch_id&&receipts.at(-1).accepted_file_receipt.entries[0].actual_name==='report_3.txt','repeated follow-up ACK reuses server-owned actual filename and batch');
   await setLimit(25000000);
   await second.click('Инструменты','.nav-item');
-  await second.wait("document.querySelectorAll('form.policy:not([hidden])').length===6",'actual configured tool policy catalog');
+  await second.wait("document.querySelectorAll('form.policy:not([hidden])').length===7",'actual configured tool policy catalog');
   async function setPolicy(name,mode,exempt){
     const response=await ownerAction(second,'/api/tool-policies/'+name,'PUT',async()=>{
       await second.evaluate(`(()=>{const form=[...document.querySelectorAll('form.policy')].find(form=>form.dataset.toolName===${JSON.stringify(name)});const select=form.querySelector('select');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(select,${JSON.stringify(mode)});select.dispatchEvent(new Event('change',{bubbles:true}));const checkbox=form.querySelector('input[type=checkbox]');if(checkbox.checked!==${!exempt})checkbox.click();})()`);
@@ -276,6 +296,7 @@ try {
   check(await page.evaluate("document.querySelector('.thread')?.textContent.includes('Native file reads completed.')"),'actual native terminal outcome');
   await page.wait("[...document.querySelectorAll('.markdown h2')].some(h=>h.textContent==='Formatted response') && [...document.querySelectorAll('.diagram img')].some(img=>img.complete&&img.naturalWidth>0)",'actual Markdown and Mermaid result');
   check(await page.evaluate("!!document.querySelector('.markdown strong') && !!document.querySelector('.markdown table') && document.querySelectorAll('.markdown ul li').length>=2 && !!document.querySelector('.markdown code.language-python')"),'Markdown headings lists tables and fenced code render');
+  check(await page.evaluate("!!document.querySelector('.markdown code.language-python .hljs-built_in')"),'Python fenced code has native syntax highlighting');
   await page.wait("[...document.querySelectorAll('.diagram')].some(d=>d.textContent.includes('Не удалось построить диаграмму')&&d.querySelector('details')?.open)",'invalid Mermaid keeps source');
   check(await page.evaluate("!window.__markdownExecuted && !document.querySelector('.markdown script, .markdown iframe, .markdown a[href^=javascript], .markdown img:not([src^=\"blob:\"])')")&&untrustedRequests.length===0,'untrusted Markdown and Mermaid cannot execute or fetch external images');
   check(await page.evaluate("document.querySelector('.thread').scrollTop<8 && !!document.querySelector('.new-messages')"),'new runtime events preserve reading position and offer new-message jump');
@@ -284,11 +305,18 @@ try {
   check(await page.evaluate("(()=>{const keys=[...document.querySelectorAll('[data-action-key]')].map(card=>card.dataset.actionKey);return keys.length===4&&new Set(keys).size===4&&!!document.querySelector('.execution-group')&&!document.querySelector('.thread').textContent.includes('Вызов инструмента');})()"),'one correlated card per Task/call and consecutive successful execution group');
   await page.evaluate("document.querySelector('.execution-group').open=true;document.querySelector('.action-output').open=true");
   check(await page.evaluate("document.querySelector('.action-output pre')?.textContent.includes('browser-native-root-verified') && document.querySelector('.action-technical')?.textContent.includes('ID вызова')"),'real terminal output preserves readable newlines and technical data remains disclosed separately');
+  async function readableAnswer(){
+    check(await page.evaluate("(()=>{const steps=document.querySelector('.execution-steps');return steps.getBoundingClientRect().height<=Math.min(innerHeight*.48,480)+1&&getComputedStyle(steps).overflowY==='auto'&&steps.tabIndex===0;})()"),'expanded execution remains a bounded keyboard-accessible region');
+    await page.evaluate("(()=>{const thread=document.querySelector('.thread');thread.scrollTop=thread.scrollHeight;})()");
+    check(await page.evaluate("(()=>{const thread=document.querySelector('.thread'),answer=document.querySelector('.history-run .message:last-child'),t=thread.getBoundingClientRect(),a=answer.getBoundingClientRect(),composer=document.querySelector('.composer').getBoundingClientRect();return thread.scrollHeight-thread.scrollTop-thread.clientHeight<2&&a.bottom<=t.bottom+1&&t.bottom<=composer.top+1;})()"),'final answer stays reachable above composer after expanding execution');
+  }
+  await readableAnswer();
   await page.field('.composer textarea','Первая строка\nВторая строка\nТретья строка\nЧетвёртая строка');
   check(await page.evaluate("document.querySelector('.composer textarea').getBoundingClientRect().height>70"),'composer grows with actual multiline input');
   await page.field('.composer textarea','');
   check(await page.evaluate("document.querySelector('.composer textarea').getBoundingClientRect().height<90 && document.querySelector('.attachment-summary').textContent.includes('До 25 МБ суммарно') && !document.querySelector('.connection-line').textContent.includes('синхронизировано')"),'compact composer shows aggregate human-sized limit and quiet successful connection');
   await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  await readableAnswer();
   check(await page.evaluate("document.documentElement.scrollWidth<=innerWidth && document.querySelector('.thread').clientHeight>100"),'actual mobile viewport keeps bounded readable history without horizontal overflow');
   await page.evaluate("document.querySelector('.composer textarea').focus()");
   await page.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Tab',code:'Tab',windowsVirtualKeyCode:9});
@@ -419,12 +447,13 @@ try {
   check(retained.length===preservedHistory.length&&retained.every((item,index)=>JSON.stringify(item)===JSON.stringify(preservedHistory[index]))&&retained.some(item=>item.text?.startsWith('Native file reads completed.'))&&retained.some(item=>item.text==='Native manual cron completed.'),'browser reload preserves both completed roots and immutable file history after cleanup');
   await setLimit(25000000);
   await second.click('Инструменты','.nav-item');
-  await second.wait("document.querySelectorAll('form.policy:not([hidden])').length===6",'owner-question policy catalog');
+  await second.wait("document.querySelectorAll('form.policy:not([hidden])').length===7",'owner-question policy catalog');
   await setPolicy('core_ask_owner','allow',true);
   await setPolicy('core_task_start','allow',true);
   await setPolicy('core_task_wait','allow',true);
   await setPolicy('core_response_files','allow',true);
   await setPolicy('core_terminal_exec','allow',true);
+  await setPolicy('core_python_exec','allow',true);
   await page.field('.composer textarea','Browser guardrail review proof');
   await page.click('Отправить ↑');
   await page.wait("[...document.querySelectorAll('.interaction:not(.resolved) h3')].some(h=>h.textContent==='Проверка материала')",'actual suspicious input owner guardrail request');
@@ -437,7 +466,7 @@ try {
   check(await page.evaluate("[...document.querySelectorAll('.action-error')].some(card=>card.textContent.includes('кодом 3')) && [...document.querySelectorAll('.interaction.resolved')].some(card=>card.textContent.includes('Заказ 42'))"),'known command failure remains visible and answered owner question is retained');
   check(await page.evaluate("(()=>{const card=[...document.querySelectorAll('.action-error')].find(card=>card.textContent.includes('Ожидание задачи'));return card && card.textContent.includes('Ошибка') && !card.closest('.execution-group');})()"),'actual failed background task stays visible despite successful status read');
   const previewCards='.thread .history-run:last-child .response-files';
-  await page.wait("document.querySelectorAll('.thread .history-run:last-child .response-files li').length===3",'native selected preview proof files');
+  await page.wait("document.querySelectorAll('.thread .history-run:last-child .response-files li').length===6",'native selected preview proof files');
   for(const position of [1,2]){
     await page.click('Открыть',previewCards+' li:nth-child('+position+') button');
     check(await page.evaluate("[...document.querySelectorAll('.file-preview')].some(preview=>preview.textContent.includes('Предпросмотр этого формата недоступен'))"),'unsupported active file format uses safe download fallback '+position);
@@ -446,11 +475,75 @@ try {
   await page.click('Открыть',previewCards+' li:nth-child(3) button');
   await page.wait("document.querySelector('.thread .history-run:last-child .file-preview pre')?.textContent.includes('<script>window.__fileExecuted=true</script>')",'authenticated dangerous text is displayed literally');
   check(await page.evaluate("window.__fileExecuted!==true && !document.querySelector('.file-preview script,.file-preview img,.file-preview iframe')")&&untrustedRequests.length===0,'file preview neither executes supplied markup nor loads external content');
+  await page.click('Закрыть',previewCards+' li:nth-child(3) .file-preview button');
+  await page.click('Открыть',previewCards+' li:nth-child(4) button');
+  await page.wait("document.querySelector('.file-preview .markdown h1')?.textContent==='File preview proof' && !!document.querySelector('.file-preview .markdown table') && !!document.querySelector('.file-preview .hljs-keyword') && document.querySelector('.file-preview .diagram img')?.naturalWidth>0",'actual Markdown file preview renders table Python and Mermaid');
+  check(await page.evaluate("window.__fileExecuted!==true && !document.querySelector('.file-preview script,.file-preview iframe,.file-preview img:not([src^=\"blob:\"])')")&&untrustedRequests.length===0,'Markdown file preview preserves safe rendering without external fetches');
+  await page.click('Закрыть',previewCards+' li:nth-child(4) .file-preview button');
+  await page.click('Открыть',previewCards+' li:nth-child(5) button');
+  await page.wait("!!document.querySelector('.file-preview .hljs-keyword')",'Python preview authenticated read is complete');
+  check(await page.evaluate(`document.querySelector('.file-preview code')?.textContent===${JSON.stringify("value = 7\nif value:\n    print('python highlight verified')\n")} && !!document.querySelector('.file-preview .hljs-keyword') && getComputedStyle(document.querySelector('.file-preview pre')).whiteSpace==='pre'`),'Python file preview preserves exact indentation with syntax highlighting');
+  check(await page.evaluate("!!document.querySelector('.action-card .action-preview .hljs-keyword')"),'Python action parameters have syntax highlighting');
+  await page.click('Закрыть',previewCards+' li:nth-child(5) .file-preview button');
+  await page.click('Открыть',previewCards+' li:nth-child(6) button');
+  await page.wait("document.querySelector('.file-preview pre')?.textContent.includes('preview line')",'long native file preview');
+  async function boundedPreview(){
+    check(await page.evaluate("(()=>{const box=document.querySelector('.file-preview'),body=box.querySelector('.file-preview-content'),properties=box.parentElement.querySelector('.file-properties');const b=box.getBoundingClientRect();return b.height<=281&&body.scrollHeight>body.clientHeight&&['auto','scroll'].includes(getComputedStyle(body).overflowY)&&properties.getBoundingClientRect().top>=b.bottom-1;})()"),'long file preview scrolls inside its bounds without covering properties');
+    await page.call('Page.bringToFront');
+    await page.evaluate("document.querySelector('.file-preview-content').focus()");
+    await page.wait("document.hasFocus() && document.activeElement===document.querySelector('.file-preview-content')",'long preview receives actual keyboard focus');
+    const before=await page.evaluate("document.querySelector('.file-preview-content').scrollTop");
+    await page.call('Input.dispatchKeyEvent',{type:'keyDown',key:'PageDown',code:'PageDown',windowsVirtualKeyCode:34});
+    await page.call('Input.dispatchKeyEvent',{type:'keyUp',key:'PageDown',code:'PageDown',windowsVirtualKeyCode:34});
+    await page.wait(`document.querySelector('.file-preview-content').scrollTop>${before}`,'keyboard scrolls actual long preview');
+  }
+  await boundedPreview();
+  await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  await boundedPreview();
+  await page.call('Emulation.clearDeviceMetricsOverride');
+  await page.click('Закрыть',previewCards+' li:nth-child(6) .file-preview button');
   check(firstTokens.size===3&&secondTokens.size===3,'actual access, refresh and ID tokens captured for both owner tabs');
   const privateValues=[...credentials,peerSecret,'Native immutable output\n',...posts.flatMap(post=>post.parts.map(part=>part.raw).filter(Boolean)),...tasks.flatMap(task=>(task.artifacts??[]).flatMap(artifact=>(artifact.parts??[]).map(part=>part.raw).filter(Boolean)))];
   const storageChecks=await Promise.all([page,second].map(tab=>tab.evaluate(`(()=>{const privateValues=${JSON.stringify(privateValues)};return [localStorage,sessionStorage].every(store=>Array.from({length:store.length},(_,index)=>store.getItem(store.key(index))).every(value=>privateValues.every(secret=>!value.includes(secret))));})()`)));
   check(storageChecks.every(Boolean),'both owner tabs store no observed auth tokens, peer secrets or raw file bytes in local/session storage');
   const screenshot=await page.call('Page.captureScreenshot',{format:'png'});await writeFile(config.evidence+'/actual-browser.png',Buffer.from(screenshot.data,'base64'));
+  const finalTask=tasks.at(-1);
+  await page.evaluate("document.querySelector('.chat-menu').open=true");
+  await page.click('Удалить чат');
+  await page.wait("document.querySelector('.chat-delete-dialog')?.open",'native accessible delete confirmation');
+  await page.click('Отмена','.chat-delete-dialog button');
+  await page.wait("!document.querySelector('.chat-delete-dialog').open && document.activeElement===document.querySelector('.chat-menu > summary')",'cancel returns focus to visible chat menu');
+  check(await page.evaluate("!!document.querySelector('.chat-link')"),'cancelled chat deletion keeps shared chat');
+  await page.evaluate("document.querySelector('.chat-menu').open=true");
+  await page.click('Удалить чат');
+  await page.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  await page.call('Input.dispatchKeyEvent',{type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  await page.wait("!document.querySelector('.chat-delete-dialog').open && document.activeElement===document.querySelector('.chat-menu > summary')",'Escape returns focus without deleting chat');
+  await page.evaluate("document.querySelector('.chat-menu').open=true");
+  await page.click('Удалить чат');
+  const archivePath='/api/chats/'+encodeURIComponent(rootTask.contextId);
+  const archive=await ownerAction(page,archivePath,'DELETE',()=>page.click('Подтвердить удаление чата','.chat-delete-dialog button'));
+  check(archive.body.archived===true&&archive.body.context_id===rootTask.contextId,'actual confirmed chat deletion returns durable archive receipt');
+  await page.wait("document.querySelectorAll('.chat-link').length===0 && !document.querySelector('.thread .history-run')",'deleted chat closes into empty composer');
+  await second.call('Page.reload');
+  await second.wait("!!document.querySelector('.composer textarea') && document.querySelectorAll('.chat-link').length===0",'deleted shared chat is absent for second owner tab');
+  const archivedReads=await page.evaluate(`(async()=>{const headers={Authorization:${JSON.stringify(bearer)},'A2A-Version':'1.0'},paths=${JSON.stringify(['/a2a/owner/tasks/'+finalTask.id,'/api/chats/'+rootTask.contextId+'/history?limit=50',outputRequests[0].path+outputRequests[0].query])};const results=[];for(const path of paths){const response=await fetch(path,{headers,cache:'no-store',credentials:'omit'});const error=response.status===200?undefined:(await response.json()).error?.code;results.push({status:response.status,error});}return results;})()`);
+  check(archivedReads.every(result=>result.status===200),'archived chat retains authenticated canonical Task history and issued file access'+(archivedReads.some(result=>result.status!==200)?': '+JSON.stringify(archivedReads):''));
+  await second.click('Расписания','.nav-item');
+  await second.wait("!!document.querySelector('.schedules')&&!document.querySelector('.schedules [role=status]')",'schedule screen after shared archive');
+  await second.click('Создать расписание ＋');
+  await second.field('.schedules textarea','Empty scheduled chat archive proof');
+  await second.field('.schedules .form-grid input','0 0 1 1 *');
+  const emptySchedule=await ownerAction(second,'/api/schedules','POST',()=>second.click('Сохранить','.schedules form button'));
+  await second.wait("!!document.querySelector('.chat-link')",'actual empty scheduled chat appears');
+  await second.evaluate("document.querySelector('.chat-link').click()");
+  await second.wait("!!document.querySelector('.composer textarea') && !!document.querySelector('.chat-menu')",'empty chat with no root Task');
+  await second.evaluate("document.querySelector('.chat-menu').open=true");
+  await second.click('Удалить чат');
+  await ownerAction(second,'/api/chats/'+encodeURIComponent(emptySchedule.body.schedule.context_id),'DELETE',()=>second.click('Подтвердить удаление чата','.chat-delete-dialog button'));
+  const archivedSchedules=await ownerAction(second,'/api/schedules','GET',()=>second.click('Расписания','.nav-item'));
+  check(archivedSchedules.body.schedules.find(row=>row.id===emptySchedule.body.schedule.id)?.enabled===false,'deleting an empty scheduled chat atomically disables its schedule');
+  await page.call('Page.bringToFront');
   const revokedBearer=bearer;
   const exitRequests=[];
   page.on('Network.requestWillBeSent',({request})=>{
@@ -471,6 +564,6 @@ try {
   check(exitRequests.some(request=>request.path.endsWith('/protocol/openid-connect/auth')),'explicit sign-in after logout opens real Keycloak login');
 } catch(error){
   const screenshot=await page.call('Page.captureScreenshot',{format:'png'}).catch(()=>null);if(screenshot)await writeFile(config.evidence+'/failed-browser.png',Buffer.from(screenshot.data,'base64'));
-  const ui=await page.evaluate("({preview:[...document.querySelectorAll('.file-preview')].map(p=>p.textContent),actions:[...document.querySelectorAll('.action-card')].map(p=>({title:p.querySelector('.action-heading')?.textContent,reason:[...p.querySelectorAll(':scope > p')].map(p=>p.textContent)})),status:document.querySelector('.task-status')?.textContent})").catch(()=>null);if(ui)await writeFile(config.evidence+'/failed-state.json',JSON.stringify(ui,null,2));
+  const ui=await page.evaluate("({focused:document.hasFocus(),active:document.activeElement?.className,preview:[...document.querySelectorAll('.file-preview-content')].map(p=>({scrollTop:p.scrollTop,scrollHeight:p.scrollHeight,clientHeight:p.clientHeight,rect:p.getBoundingClientRect().toJSON()})),thread:(()=>{const p=document.querySelector('.thread');return p&&{scrollTop:p.scrollTop,scrollHeight:p.scrollHeight,clientHeight:p.clientHeight};})(),actions:[...document.querySelectorAll('.action-card')].map(p=>({title:p.querySelector('.action-heading')?.textContent,reason:[...p.querySelectorAll(':scope > p')].map(p=>p.textContent)})),status:document.querySelector('.task-status')?.textContent})").catch(()=>null);if(ui)await writeFile(config.evidence+'/failed-state.json',JSON.stringify(ui,null,2));
   console.error(error.message);process.exitCode=1;
 } finally {second?.close();page.close();}

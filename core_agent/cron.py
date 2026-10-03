@@ -301,7 +301,7 @@ class CronStore:
             if previous:
                 return copy.deepcopy(previous["payload"])
             try:
-                binding = self.admission.ensure_chat(context, payload.get("context_id"), connection=conn)
+                binding = self.admission.ensure_chat(context, payload.get("context_id"), connection=conn, lock=source == "owner")
             except TaskNotFoundError:
                 raise CoreError("CRON_NOT_FOUND") from None
             row = {"id": str(uuid.uuid4()), "tenant_id": binding.tenant_id, "context_id": binding.context_id,
@@ -343,9 +343,12 @@ class CronStore:
         expected = _revision(payload["expected_revision"])
         _text(actor_id)
         with self._transaction() as conn:
+            chat = self._chat(self._row(tenant_id, schedule_id, conn), conn, lock=True)
             row = self._row(tenant_id, schedule_id, conn, lock=True)
             if row["revision"] != expected:
                 raise CoreError("CRON_CONFLICT")
+            if chat.get("archived_at") is not None and payload["enabled"]:
+                raise CoreError("CRON_DISABLED")
             now = self._now(conn)
             values, due = self._values(payload, now)
             row.update(values, enabled=payload["enabled"], next_due_at=due if payload["enabled"] else None,
@@ -354,6 +357,22 @@ class CronStore:
             result = self._metadata(row, conn)
             self._event(row, "updated", actor_id, "owner", conn, payload=result)
             return result
+
+    def disable_context(self, tenant_id, context_id, owner_id, *, actor_id, connection=None):
+        """Archive already holds the canonical chat gate; disable every enabled schedule."""
+        with self._transaction(connection) as conn:
+            if conn is None:
+                rows = sorted((copy.deepcopy(row) for row in self.admission._cron_schedules.values()
+                               if (row["tenant_id"], row["context_id"], row["owner_id"]) == (tenant_id, context_id, owner_id)
+                               and row["enabled"] and not row["deleted"]), key=lambda row: row["id"])
+            else:
+                rows = conn.execute("""SELECT * FROM core_cron_schedules WHERE tenant_id=%s AND context_id=%s
+                    AND owner_id=%s AND enabled AND NOT deleted ORDER BY id FOR UPDATE""",
+                    (tenant_id, context_id, owner_id)).fetchall()
+            for row in rows:
+                row.update(enabled=False, next_due_at=None, revision=row["revision"] + 1, updated_at=self._now(conn))
+                self._save(row, conn)
+                self._event(row, "updated", actor_id, "owner", conn, payload=self._metadata(row, conn))
 
     def delete(self, tenant_id, schedule_id, *, expected_revision, actor_id):
         expected = _revision(expected_revision)
@@ -409,10 +428,11 @@ class CronStore:
                 previous = self._receipt(context.tenant, request, digest, conn)
                 if previous:
                     return self._replay_task(previous, context, conn)
+                chat = self._chat(self._row(context.tenant, schedule_id, conn), conn, lock=True)
                 row = self._row(context.tenant, schedule_id, conn, lock=True)
                 if row["revision"] != expected:
                     raise CoreError("CRON_CONFLICT")
-                if not row["enabled"]:
+                if not row["enabled"] or chat.get("archived_at") is not None:
                     raise CoreError("CRON_DISABLED")
                 message = Message(message_id=message_id, context_id=row["context_id"], role=Role.ROLE_USER, parts=[{"text": row["prompt"]}])
                 origin = self._origin(row, "manual")
@@ -444,12 +464,12 @@ class CronStore:
             due = candidate["next_due_at"]
             message_id = "cron:automatic:" + _digest([schedule_id, expected_revision, due.isoformat()])
             self._admission_lock(context, message_id, conn)
+            chat = self._chat(candidate, conn, lock=True)
             row = self._row(context.tenant, schedule_id, conn, lock=True, deleted=True)
             now = self._now(conn)
             if (row["deleted"] or not row["enabled"] or row["revision"] != expected_revision
-                    or row["next_due_at"] != due or due > now):
+                    or row["next_due_at"] != due or due > now or chat.get("archived_at") is not None):
                 return None
-            chat = self._chat(row, conn, lock=True)
             root = self._root(row, chat, conn, lock=True)
             now = self._now(conn)
             reason, through = None, None

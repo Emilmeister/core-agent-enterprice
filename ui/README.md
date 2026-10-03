@@ -65,6 +65,11 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   rename persists company-wide with revision CAS. UUIDs live in the chat menu.
   Request status comes from canonical Task, interactions and tool results.
   New events preserve reading position; a button explicitly jumps to the latest.
+  Initial reads and SSE-only failures with healthy canonical polling stay quiet;
+  an actual canonical read outage displays the recovery notice until restored.
+  Confirmed deletion archives an idle chat for all company owners and disables
+  its schedules. Active work must finish or stop first. Existing A2A results,
+  history and issued files remain available through authenticated scoped APIs.
 - Inline HITL, owner questions and guardrail decisions with unchanged digest,
   deadline and server outcome. Scoped material preview and authenticated file
   download use stored review IDs only.
@@ -87,7 +92,12 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   collapse, while errors and owner requests stay visible. Original owner text
   remains separate from system attachment instructions. File cards and the
   incoming/generated file panel use authenticated scoped downloads and escaped,
-  bounded text previews; unsupported formats offer download. Workspace cleanup
+  bounded text previews; Markdown previews use the same safe reply renderer.
+  Python source uses lowlight and the pinned highlight.js grammar, rendered as
+  React text/spans. Indentation remains intact and large code uses plain text.
+  Expanded action groups and file previews scroll within bounded regions with
+  keyboard access, keeping the answer and file properties reachable.
+  Unsupported formats offer download. Workspace cleanup
   retains age filtering, manual selection and explicit confirmation.
 
 The existing owner APIs also provide full chat history, file uploads,

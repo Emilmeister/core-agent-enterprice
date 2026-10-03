@@ -498,7 +498,8 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
             if remote_registry is not None and (request.url.path == "/api/remote-agents"
                                                 or "peer_id" in request.path_params):
                 result = await registry_request(remote_registry, actor, request)
-            elif "context_id" in request.path_params and request.url.path.endswith("/files/delete"):
+            elif ("context_id" in request.path_params and request.method in {"GET", "POST"}
+                  and request.url.path.endswith("/files/delete")):
                 result = await workspace_cleanup(agent, actor, request)
                 return JSONResponse(result, status_code=200 if result["state"] == "completed" else 202,
                                     headers={"Cache-Control": "no-store"})
@@ -512,6 +513,14 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
             elif request.url.path == "/api/chats":
                 result = await list_chats(admission, actor, request.query_params)
             elif "context_id" in request.path_params:
+                if request.method == "DELETE":
+                    if request.query_params:
+                        raise CoreError("REQUEST_INVALID")
+                    async for chunk in request.stream():
+                        if chunk:
+                            raise CoreError("REQUEST_INVALID")
+                    result = await admission.archive_chat(actor.tenant, request.path_params["context_id"], actor_id=actor.actor_id)
+                    return JSONResponse(result, headers={"Cache-Control": "no-store"})
                 if request.url.path.endswith("/title"):
                     if request.query_params:
                         raise CoreError("REQUEST_INVALID")
@@ -588,6 +597,7 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
         routes.append(Route("/api/chats/{context_id:path}/files/delete", endpoint, methods=["GET", "POST"]))
         routes.append(Route("/api/chats/{context_id:path}/files", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/files/content", endpoint))
+        routes.append(Route("/api/chats/{context_id:path}", endpoint, methods=["DELETE"]))
     if remote_registry is not None:
         routes.extend([
             Route("/api/remote-agents", endpoint, methods=["GET", "POST"]),

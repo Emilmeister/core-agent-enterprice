@@ -10,11 +10,85 @@ from unittest.mock import patch
 from core_agent.errors import CoreError
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from tests.test_auth import AuthAppTestCase, TEST_DATABASE_URL
+from tests.test_admission import AuthAdmissionTests
 
 
 class CronAPITests(AuthAppTestCase):
     automatic_tools = False
+    context = AuthAdmissionTests.context
     values = {"request_id": "create", "prompt": "Check deliveries", "expression": "0 18 * * *"}
+
+    async def test_archive_disables_schedules_atomically_and_prevents_new_work(self):
+        row = await self.create_schedule()
+        context_id = row["context_id"]
+        second = await self.create_schedule(request_id="second", context_id=context_id)
+        unrelated = await self.create_schedule(request_id="unrelated")
+        payload = {"request_id": "accepted-run", "expected_revision": row["revision"]}
+        run = await self.http.post(f"/api/schedules/{row['id']}/run-now", json=payload, headers=self.headers("owner-a"))
+        self.assertEqual(run.status_code, 200, run.text)
+        task_id = run.json()["task"]["id"]
+        agent = self.app.state.core_agent
+        await asyncio.to_thread(agent.resume_task, task_id)
+        store = agent.cron_store
+        tenant = self.app.state.authenticator.settings.tenant
+        before = store.events(tenant)
+        response = await self.http.delete(f"/api/chats/{context_id}", headers=self.headers("owner-b"))
+        self.assertEqual(response.status_code, 200, response.text)
+        for original in (row, second):
+            disabled = store.get(tenant, original["id"])
+            self.assertFalse(disabled["enabled"])
+            self.assertIsNone(disabled["next_due_at"])
+            self.assertEqual(disabled["revision"], original["revision"] + 1)
+            values = {key: disabled[key] for key in ("prompt", "expression", "timezone", "enabled")}
+            enabled = await self.http.put(f"/api/schedules/{original['id']}", headers=self.headers("owner-a"),
+                                         json={**values, "enabled": True, "expected_revision": disabled["revision"]})
+            self.assertEqual(enabled.status_code, 409, enabled.text)
+            fresh = await self.http.post(f"/api/schedules/{original['id']}/run-now", headers=self.headers("owner-a"),
+                                         json={"request_id": "fresh-" + original["id"], "expected_revision": disabled["revision"]})
+            self.assertEqual(fresh.status_code, 409, fresh.text)
+            self.assertEqual(fresh.json()["error"]["code"], "CRON_DISABLED")
+        self.assertTrue(store.get(tenant, unrelated["id"])["enabled"])
+        events = store.events(tenant)
+        self.assertEqual(len(events), len(before) + 2)
+        self.assertEqual([event["kind"] for event in events[-2:]], ["updated", "updated"])
+        retry = await self.http.delete(f"/api/chats/{context_id}", headers=self.headers("owner-a"))
+        self.assertEqual(retry.json(), response.json())
+        self.assertEqual(store.events(tenant), events)
+        replay = await self.http.post(f"/api/schedules/{row['id']}/run-now", json=payload, headers=self.headers("owner-b"))
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json()["task"]["id"], task_id)
+        created = await self.http.post("/api/schedules", headers=self.headers("owner-a"),
+                                       json={**self.values, "request_id": "new", "context_id": context_id})
+        self.assertEqual(created.status_code, 404, created.text)
+        self.assertEqual(await self.create_schedule(), row)
+        if self.use_postgres:
+            with store.database.transaction() as connection:
+                self.assertIsNone(store.occur(self.context("owner-a"), row["id"], row["revision"], connection=connection))
+        else:
+            self.assertIsNone(await store.occur_memory(self.context("owner-a"), row["id"], row["revision"]))
+
+    async def test_archive_cron_failure_rolls_back_tombstone_and_all_schedules(self):
+        row = await self.create_schedule()
+        await self.create_schedule(request_id="second", context_id=row["context_id"])
+        agent = self.app.state.core_agent
+        tenant = self.app.state.authenticator.settings.tenant
+        before = (agent.cron_store.list(tenant), agent.cron_store.events(tenant))
+        with patch.object(agent.cron_store, "_event", side_effect=CoreError("CRON_INVALID")):
+            response = await self.http.delete(f"/api/chats/{row['context_id']}", headers=self.headers("owner-a"))
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual((agent.cron_store.list(tenant), agent.cron_store.events(tenant)), before)
+        listed = await self.http.get("/api/chats", headers=self.headers("owner-b"))
+        self.assertEqual([chat["context_id"] for chat in listed.json()["chats"]], [row["context_id"]])
+
+    async def test_active_chat_cannot_archive_or_disable_its_schedules(self):
+        self.app.state.core_agent.model = ScriptedModel([ModelResponse(tool_requests=(
+            ToolRequest("question", "core_ask_owner", {"question": "Continue?"}),))])
+        await self.submit("owner-a", "active", "active-chat")
+        row = await self.create_schedule(context_id="active-chat")
+        response = await self.http.delete("/api/chats/active-chat", headers=self.headers("owner-b"))
+        self.assertEqual(response.status_code, 409, response.text)
+        store = self.app.state.core_agent.cron_store
+        self.assertEqual(store.get(self.app.state.authenticator.settings.tenant, row["id"]), row)
 
     async def create_schedule(self, **values):
         response = await self.http.post("/api/schedules", json={**self.values, **values},

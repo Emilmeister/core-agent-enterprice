@@ -44,6 +44,11 @@ def authorize(context, owner_id):
     context.user = ScopeUser(owner_id)
 
 
+def require_open_chat(chat):
+    if chat.get("archived_at") is not None:
+        raise TaskNotFoundError()
+
+
 def check_duplicate(context, row, digest):
     authorize(context, row["owner_id"])
     if row["request_digest"] != digest:
@@ -233,6 +238,7 @@ def accept_followup(admission, message, task, request, context):
             if chat is None:
                 raise TaskNotFoundError()
             authorize(context, chat["owner_id"])
+            require_open_chat(chat)
             # Both passes repeat the same locked duplicate/terminal checks.
             # Preparation commits independently, without holding a pool slot.
             def bind(record, sequence, conn):
@@ -363,7 +369,8 @@ class MemoryRootAdmission:
                     after_context = previous.context_id
                 rows = []
                 for (tenant, context_id), chat in sorted(self.chats.items()):
-                    if tenant != tenant_id or (after_context is not None and context_id <= after_context):
+                    if (tenant != tenant_id or chat.get("archived_at") is not None
+                            or (after_context is not None and context_id <= after_context)):
                         continue
                     record = self.agent.workflow_store._records.get(chat["latest_root_run_id"])
                     if chat["latest_root_run_id"] is not None and (record is None or record.parent_run_id is not None
@@ -402,7 +409,7 @@ class MemoryRootAdmission:
         async with self.lock:
             with self.agent.workflow_store._lock:
                 chat = self.chats.get((tenant_id, context_id))
-                if chat is None:
+                if chat is None or chat.get("archived_at") is not None:
                     raise CoreError("TASK_NOT_FOUND")
                 if chat.get("title_revision", 0) != expected_revision:
                     raise CoreError("CHAT_TITLE_CONFLICT")
@@ -410,6 +417,25 @@ class MemoryRootAdmission:
                 record = self.agent.workflow_store._records.get(chat["latest_root_run_id"])
                 metadata = self.chat_metadata(tenant_id, context_id, chat, record)
                 return {"context_id": context_id, **{key: metadata[key] for key in ("title", "title_revision", "updated_at")}}
+
+    async def archive_chat(self, tenant_id, context_id, *, actor_id):
+        cursor_context([2, context_id])
+        async with self.lock:
+            with self.agent.workflow_store._lock:
+                chat = self.chats.get((tenant_id, context_id))
+                if chat is None:
+                    raise CoreError("TASK_NOT_FOUND")
+                if chat.get("archived_at") is None:
+                    record = self.agent.workflow_store._records.get(chat["latest_root_run_id"])
+                    if chat["latest_root_run_id"] is not None:
+                        if (record is None or record.parent_run_id is not None
+                                or (record.tenant_id, record.owner_id, record.context_id) != (tenant_id, chat["owner_id"], context_id)):
+                            raise CoreError("TASK_NOT_FOUND")
+                        if record.state not in TERMINAL_STATES:
+                            raise CoreError("CONTEXT_BUSY")
+                    self.cron_store.disable_context(tenant_id, context_id, chat["owner_id"], actor_id=actor_id)
+                    chat.update(archived_at=time.time(), archived_by=actor_id, updated_at=time.time())
+                return {"context_id": context_id, "archived": True}
 
     def validate_workspace_scope(self, binding):
         # Ownership is immutable and published before the workflow worker starts.
@@ -500,6 +526,7 @@ class MemoryRootAdmission:
             chat = {"owner_id": actor.owner_id, "latest_root_run_id": None, "workspace_revision": 0,
                     "title": "", "title_revision": 0, "title_source": None, "updated_at": time.time()}
         authorize(context, chat["owner_id"])
+        require_open_chat(chat)
         cleanup = getattr(self, "workspace_cleanup", None)
         if cleanup:
             cleanup.check_ready(WorkspaceBinding(context.tenant, chat["owner_id"], context_id))
@@ -527,7 +554,7 @@ class MemoryRootAdmission:
                               "display_text": original_text(message)}
         return admitted
 
-    def ensure_chat(self, context, context_id=None, *, connection=None):
+    def ensure_chat(self, context, context_id=None, *, connection=None, lock=False):
         """Create a server-named empty chat, or authorize an existing canonical chat.
 
         Creation runs only inside transaction's synchronous callback. Looking up
@@ -546,6 +573,7 @@ class MemoryRootAdmission:
         if chat is None:
             raise TaskNotFoundError()
         authorize(context, chat["owner_id"])
+        require_open_chat(chat)
         return WorkspaceBinding(context.tenant, chat["owner_id"], context_id)
 
 
@@ -614,7 +642,8 @@ class PostgresRootAdmission:
                              ON r.run_id=c.latest_root_run_id AND r.tenant_id=c.tenant_id
                              AND r.owner_id=c.owner_id AND r.context_id=c.context_id AND r.parent_run_id IS NULL
                            LEFT JOIN core_a2a_tasks t ON t.task_id=r.task_id AND t.tenant=c.tenant_id AND t.owner=c.owner_id
-                           WHERE c.tenant_id=%s AND (c.latest_root_run_id IS NULL OR r.run_id IS NOT NULL)"""
+                           WHERE c.tenant_id=%s AND c.archived_at IS NULL
+                             AND (c.latest_root_run_id IS NULL OR r.run_id IS NOT NULL)"""
                 values = [sorted(TERMINAL_STATES), sorted(TERMINAL_STATES), sorted(OWNER_WAIT_KINDS), sorted(TERMINAL_STATES), tenant_id]
                 if after_context is not None:
                     query += " AND c.context_id > %s"
@@ -632,9 +661,9 @@ class PostgresRootAdmission:
         cursor_context([2, context_id])
         def rename():
             with self.database.transaction() as connection:
-                chat = connection.execute("SELECT title_revision FROM core_chats WHERE tenant_id=%s AND context_id=%s FOR NO KEY UPDATE",
+                chat = connection.execute("SELECT title_revision,archived_at FROM core_chats WHERE tenant_id=%s AND context_id=%s FOR NO KEY UPDATE",
                                           (tenant_id, context_id)).fetchone()
-                if chat is None:
+                if chat is None or chat["archived_at"] is not None:
                     raise CoreError("TASK_NOT_FOUND")
                 if chat["title_revision"] != expected_revision:
                     raise CoreError("CHAT_TITLE_CONFLICT")
@@ -645,6 +674,31 @@ class PostgresRootAdmission:
                 return dict(row)
         return await asyncio.to_thread(rename)
 
+    async def archive_chat(self, tenant_id, context_id, *, actor_id):
+        cursor_context([2, context_id])
+        def archive():
+            with self.database.transaction() as connection:
+                chat = connection.execute("SELECT * FROM core_chats WHERE tenant_id=%s AND context_id=%s FOR NO KEY UPDATE",
+                                          (tenant_id, context_id)).fetchone()
+                if chat is None:
+                    raise CoreError("TASK_NOT_FOUND")
+                if chat["archived_at"] is None:
+                    if chat["latest_root_run_id"] is not None:
+                        # No workflow lock follows this chat lock: tool writers
+                        # fence their active root and only read immutable binding.
+                        root = connection.execute("""SELECT state FROM core_runs WHERE run_id=%s AND tenant_id=%s
+                            AND owner_id=%s AND context_id=%s AND parent_run_id IS NULL""",
+                            (chat["latest_root_run_id"], tenant_id, chat["owner_id"], context_id)).fetchone()
+                        if root is None:
+                            raise CoreError("TASK_NOT_FOUND")
+                        if root["state"] not in TERMINAL_STATES:
+                            raise CoreError("CONTEXT_BUSY")
+                    self.cron_store.disable_context(tenant_id, context_id, chat["owner_id"], actor_id=actor_id, connection=connection)
+                    connection.execute("""UPDATE core_chats SET archived_at=clock_timestamp(),archived_by=%s,
+                        updated_at=clock_timestamp() WHERE tenant_id=%s AND context_id=%s""", (actor_id, tenant_id, context_id))
+                return {"context_id": context_id, "archived": True}
+        return await asyncio.to_thread(archive)
+
     def validate_workspace_scope(self, binding):
         with self.database.transaction() as connection:
             row = connection.execute(
@@ -654,8 +708,8 @@ class PostgresRootAdmission:
         if row is None or row["owner_id"] != binding.owner_id:
             raise CoreError("WORKSPACE_SCOPE_REQUIRED")
 
-    def ensure_chat(self, context, context_id=None, *, connection=None):
-        """An existing binding needs no row lock; immutable keys are FK-protected."""
+    def ensure_chat(self, context, context_id=None, *, connection=None, lock=False):
+        """Owner mutations lock chat first; workflow-fenced tools only read binding."""
         actor = context.state["principal"]
         with self.database.transaction() if connection is None else nullcontext(connection) as connection:
             if context_id is None:
@@ -665,11 +719,13 @@ class PostgresRootAdmission:
                 connection.execute("INSERT INTO core_chats(tenant_id,context_id,owner_id) VALUES(%s,%s,%s)",
                                    (context.tenant, context_id, actor.owner_id))
             cursor_context([2, context_id])
-            row = connection.execute("SELECT owner_id FROM core_chats WHERE tenant_id=%s AND context_id=%s",
+            row = connection.execute("SELECT owner_id,archived_at FROM core_chats WHERE tenant_id=%s AND context_id=%s" +
+                                     (" FOR NO KEY UPDATE" if lock else ""),
                                      (context.tenant, context_id)).fetchone()
             if row is None:
                 raise TaskNotFoundError()
             authorize(context, row["owner_id"])
+            require_open_chat(row)
             return WorkspaceBinding(context.tenant, row["owner_id"], context_id)
 
     def followup(self, message, task, request, context):
@@ -737,6 +793,7 @@ class PostgresRootAdmission:
                 (context.tenant, context_id),
             ).fetchone()
             authorize(context, chat["owner_id"])
+            require_open_chat(chat)
             cleanup = getattr(self, "workspace_cleanup", None)
             if cleanup:
                 cleanup.check_ready(WorkspaceBinding(context.tenant, chat["owner_id"], context_id), connection)

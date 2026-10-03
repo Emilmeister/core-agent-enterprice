@@ -1,5 +1,6 @@
 import { actionLabel, actionPreview } from "./toolPresentation";
 import type { HistoryItem, Interaction } from "./types";
+import { CodeBlock } from "./Code";
 
 type ToolResult = { status?: string; output?: unknown; error_code?: string };
 type ActionState = { kind: "success" | "error" | "waiting" | "active" | "unknown"; label: string; reason?: string };
@@ -153,6 +154,8 @@ export function ActionCard({ action, terminal, waits }: {
   const stdout = typeof output?.stdout === "string" ? output.stdout : undefined;
   const stderr = typeof output?.stderr === "string" ? output.stderr : undefined;
   const preview = action.name ? actionPreview(action.name, action.args) : [];
+  const pythonSource = action.name === "core_python_exec" && typeof object(action.args)?.code === "string"
+    ? object(action.args)!.code as string : undefined;
   const compact = (text: string) => text.length > 240 ? text.slice(0, 239) + "…" : text;
   const hasOutput = stdout !== undefined || stderr !== undefined || action.result?.output !== undefined;
   return <article className={`action-card action-${state.kind}`} data-action-key={action.key}
@@ -160,7 +163,8 @@ export function ActionCard({ action, terminal, waits }: {
     <div className="action-heading"><strong>{action.name ? compact(actionLabel(action.name, action.args)) : "Действие агента"}</strong>
       <span className={`action-status ${state.kind === "error" || state.kind === "unknown" ? "error" : "muted"}`}>{state.label}</span></div>
     {preview.length > 0 && <dl className="action-preview">{preview.map((field, index) => <div key={`${field.label}:${index}`}>
-      <dt>{field.label}</dt><dd className="prose">{compact(field.value)}</dd>
+      <dt>{field.label}</dt><dd className="prose">{field.label === "Код Python"
+        ? <CodeBlock text={compact(field.value)} language="python" /> : compact(field.value)}</dd>
     </div>)}</dl>}
     {state.reason && <p className={state.kind === "error" ? "error" : "muted"}>{state.reason}</p>}
     {hasOutput && <details className="action-output"><summary>Вывод действия</summary>
@@ -173,6 +177,7 @@ export function ActionCard({ action, terminal, waits }: {
     </details>}
     <details className="action-technical"><summary>Технические данные</summary><dl>
       <dt>Инструмент</dt><dd>{action.name || "Неизвестен"}</dd>
+      {pythonSource !== undefined && <><dt>Код Python</dt><dd><CodeBlock text={pythonSource} language="python" /></dd></>}
       <dt>Аргументы</dt><dd><pre>{action.args === undefined ? "Недоступны" : JSON.stringify(action.args, null, 2)}</pre></dd>
       <dt>ID вызова</dt><dd>{action.callId ?? "Недоступен"}</dd><dt>ID задачи</dt><dd>{action.taskId ?? "Недоступен"}</dd>
       {typeof output?.exit_code === "number" && <><dt>Exit code</dt><dd>{output.exit_code}</dd></>}

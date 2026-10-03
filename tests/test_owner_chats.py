@@ -5,6 +5,7 @@ import unittest
 import uuid
 from dataclasses import replace
 from unittest.mock import patch
+from urllib.parse import quote
 from psycopg.conninfo import make_conninfo
 from psycopg.sql import SQL, Identifier
 from a2a.types import Message, Role, Task, TaskState, TaskStatus
@@ -14,13 +15,167 @@ from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.errors import CoreError
 from core_agent.database import PostgresDatabase, PostgresTaskStore
 from core_agent.admission import PostgresRootAdmission
+from core_agent.config import RunRequest
+from a2a.utils.errors import TaskNotFoundError
 from tests import test_admission as admission_tests
 from tests.test_auth import AuthAppTestCase, TEST_DATABASE_URL
 
 
 class OwnerChatAPITests(AuthAppTestCase):
+    durable_blobs = True
+    context = admission_tests.AuthAdmissionTests.context
+
     def legacy_rows(self, rows):
         return [{key: row[key] for key in ("context_id", "latest_task_id", "active")} for row in rows]
+
+    async def test_archive_is_shared_idempotent_and_preserves_scoped_results_and_files(self):
+        initial = await self.submit("external-a", "initial", "archive-chat")
+        agent = self.app.state.core_agent
+        admission = agent.tool_runtime.environment_manager.validate_workspace_scope.__self__
+        tenant = self.context("owner-a").tenant
+        binding, active = await admission.workspace_scope(tenant, "archive-chat")
+        self.assertFalse(active)
+        workspace = agent.response_files_service.workspaces.workspace(binding)
+        (workspace / "result.txt").write_bytes(b"immutable result bytes")
+        agent.model = ScriptedModel([
+            ModelResponse(tool_requests=(ToolRequest("publish", "core_response_files", {"paths": ["result.txt"]}),)),
+            ModelResponse(message="File ready"),
+        ])
+        task = await self.submit("external-a", "published", "archive-chat")
+        record = agent.workflow_store.lookup_task(task["id"])
+        files = record.result["outgoing_files"]
+        self.assertEqual(len(files), 1)
+        path = f"/api/chats/archive-chat/tasks/{task['id']}/files/{files[0]['file_id']}"
+        original_task = await self.http.get(f"/a2a/external/tasks/{task['id']}", headers=self.headers("external-a"))
+        original_history = await self.http.get("/api/chats/archive-chat/history", headers=self.headers("owner-a"))
+        calls = len(agent.model.calls)
+        for token in ("owner-b", "owner-a"):
+            archived = await self.http.delete("/api/chats/archive-chat", headers=self.headers(token))
+            self.assertEqual(archived.status_code, 200, archived.text)
+            self.assertEqual(archived.json(), {"context_id": "archive-chat", "archived": True})
+            self.assertEqual(archived.headers["cache-control"], "no-store")
+            self.assertEqual((await self.http.get("/api/chats", headers=self.headers(token))).json()["chats"], [])
+        self.assertEqual(agent.workflow_store.lookup_task(task["id"]), record)
+        self.assertEqual(await admission.workspace_scope(tenant, "archive-chat"), (binding, False))
+        self.assertEqual((workspace / "result.txt").read_bytes(), b"immutable result bytes")
+        self.assertEqual((await self.http.get(path, headers=self.headers("owner-b"))).content, b"immutable result bytes")
+        history = await self.http.get("/api/chats/archive-chat/history", headers=self.headers("owner-b"))
+        self.assertEqual(history.json(), original_history.json())
+        for token in ("external-a-replaced", "owner-b"):
+            kind = "owner" if token.startswith("owner") else "external"
+            fetched = await self.http.get(f"/a2a/{kind}/tasks/{task['id']}", headers=self.headers(token))
+            self.assertEqual(fetched.json(), original_task.json())
+            subscribed = await self.http.post(f"/a2a/{kind}/tasks/{task['id']}:subscribe", headers=self.headers(token))
+            self.assertEqual(subscribed.status_code, 200, subscribed.text)
+            self.assertIn(task["id"], subscribed.text)
+        foreign = await self.http.get(f"/a2a/external/tasks/{task['id']}", headers=self.headers("external-b"))
+        self.assertEqual(foreign.status_code, 404, foreign.text)
+        repeated = await self.submit("external-a", "initial", "archive-chat")
+        self.assertEqual(repeated["id"], initial["id"])
+        for token in ("owner-a", "external-a"):
+            kind = "owner" if token.startswith("owner") else "external"
+            for extra in ({}, {"taskId": task["id"]}):
+                denied = await self.http.post(f"/a2a/{kind}/message:send", headers=self.headers(token), json={
+                    "message": {"messageId": "new-" + token, "contextId": "archive-chat", "role": "ROLE_USER",
+                                "parts": [{"text": "New input"}], **extra}})
+                self.assertEqual(denied.status_code, 400 if extra else 404, denied.text)
+                if extra:
+                    self.assertEqual(denied.json()["error"]["details"][0]["reason"], "UNSUPPORTED_OPERATION")
+        renamed = await self.http.put("/api/chats/archive-chat/title", headers=self.headers("owner-a"),
+                                     json={"title": "Reopened", "expected_revision": 0})
+        self.assertEqual(renamed.status_code, 404, renamed.text)
+        self.assertEqual(len(agent.model.calls), calls)
+        if self.use_postgres:
+            with self.assertRaises(CoreError) as caught:
+                agent.delete_run_data(tenant, record.run_id, operator_principal_id="retention-check")
+            self.assertEqual(caught.exception.code, "RETENTION_PROHIBITED")
+            reopened = PostgresDatabase(TEST_DATABASE_URL)
+            self.addCleanup(reopened.close)
+            restored = PostgresRootAdmission(agent, PostgresTaskStore(reopened))
+            self.assertEqual(await restored.list_chats(tenant, limit=10), [])
+            self.assertEqual(await restored.archive_chat(tenant, "archive-chat", actor_id="retry"), archived.json())
+
+    async def test_archive_role_scope_validation_and_active_root(self):
+        agent = self.app.state.core_agent
+        agent.model = ScriptedModel([
+            ModelResponse(tool_requests=(ToolRequest("question", "core_ask_owner", {"question": "Continue?"}),)),
+            ModelResponse(message="Done"),
+        ])
+        task = await self.submit("owner-a", "active", "active-chat")
+        record = agent.workflow_store.lookup_task(task["id"])
+        self.tokens["dual"] = {**self.tokens["external-a"], "realm_access": {"roles": ["agent-owner", "agent-external"]}}
+        for token in ("external-a", "dual"):
+            denied = await self.http.delete("/api/chats/active-chat", headers=self.headers(token))
+            self.assertEqual(denied.status_code, 403, denied.text)
+        for suffix, content in (("?force=true", b""), ("", b"{}"), ("", b" ")):
+            invalid = await self.http.request("DELETE", "/api/chats/active-chat" + suffix, content=content,
+                                              headers=self.headers("owner-a"))
+            self.assertEqual(invalid.status_code, 400, invalid.text)
+        blocked = await self.http.delete("/api/chats/active-chat", headers=self.headers("owner-b"))
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertEqual(blocked.json()["error"]["code"], "CONTEXT_BUSY")
+        self.assertEqual(agent.workflow_store.lookup_task(task["id"]), record)
+        missing = await self.http.delete("/api/chats/missing", headers=self.headers("owner-a"))
+        self.assertEqual(missing.status_code, 404, missing.text)
+        with patch.object(self.app.state.authenticator, "settings", replace(self.app.state.authenticator.settings, tenant="foreign")):
+            foreign = await self.http.delete("/api/chats/active-chat", headers=self.headers("owner-a"))
+            self.assertEqual(foreign.status_code, 404, foreign.text)
+        agent.workflow_store.resolve_wait(record.snapshot["wait_id"], tenant_id=record.tenant_id,
+                                         outcome={"reason": "answer", "answer": "yes"})
+        await asyncio.to_thread(agent.resume_task, task["id"])
+        archived = await self.http.delete("/api/chats/active-chat", headers=self.headers("owner-b"))
+        self.assertEqual(archived.status_code, 200, archived.text)
+
+    async def test_archive_preserves_issued_chat_cursor(self):
+        await self.submit("owner-a", "first", "a-chat")
+        await self.submit("owner-a", "last", "z-chat")
+        first = (await self.http.get("/api/chats?limit=1", headers=self.headers("owner-a"))).json()
+        self.assertEqual(first["chats"][0]["context_id"], "a-chat")
+        archived = await self.http.delete("/api/chats/a-chat", headers=self.headers("owner-a"))
+        self.assertEqual(archived.status_code, 200, archived.text)
+        second = await self.http.get("/api/chats", params={"cursor": first["next_cursor"]}, headers=self.headers("owner-b"))
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual([row["context_id"] for row in second.json()["chats"]], ["z-chat"])
+
+    async def test_archive_context_with_cleanup_suffix_and_existing_receipt(self):
+        context_id = "suffix/files/delete"
+        await self.submit("owner-a", "suffix-root", context_id)
+        path = "/api/chats/" + quote(context_id, safe="")
+        cleanup = await self.http.post(path + "/files/delete", headers=self.headers("owner-a"),
+                                       json={"request_id": "empty-cleanup", "files": []})
+        self.assertEqual(cleanup.status_code, 200, cleanup.text)
+        self.assertEqual(cleanup.json()["state"], "completed")
+        receipt = await self.http.get(path + "/files/delete", headers=self.headers("owner-b"))
+        self.assertEqual(receipt.json(), cleanup.json())
+        archived = await self.http.delete(path, headers=self.headers("owner-b"))
+        self.assertEqual(archived.status_code, 200, archived.text)
+        self.assertEqual(archived.json(), {"context_id": context_id, "archived": True})
+        listed = await self.http.get("/api/chats", headers=self.headers("owner-a"))
+        self.assertEqual(listed.json()["chats"], [])
+        preserved = await self.http.get(path + "/files/delete", headers=self.headers("owner-a"))
+        self.assertEqual(preserved.json(), cleanup.json())
+
+    async def test_archive_and_new_root_share_one_atomic_context_gate(self):
+        await self.submit("owner-a", "initial", "race-chat")
+        agent = self.app.state.core_agent
+        admission = agent.tool_runtime.environment_manager.validate_workspace_scope.__self__
+        context = self.context("owner-a")
+        results = await asyncio.wait_for(asyncio.gather(
+            admission.archive_chat(context.tenant, "race-chat", actor_id=context.state["principal"].actor_id),
+            admission.admit(admission_tests.AuthAdmissionTests.sdk_message("racing", "race-chat"),
+                            RunRequest("Answer briefly"), context), return_exceptions=True), 10)
+        archived, admitted = results
+        if isinstance(archived, dict):
+            self.assertEqual(archived, {"context_id": "race-chat", "archived": True})
+            self.assertIsInstance(admitted, TaskNotFoundError)
+            self.assertEqual(await admission.list_chats(context.tenant, limit=10), [])
+        else:
+            self.assertIsInstance(archived, CoreError)
+            self.assertEqual(archived.code, "CONTEXT_BUSY")
+            self.assertIsNotNone(admitted.run_id)
+            listed = await admission.list_chats(context.tenant, limit=10)
+            self.assertEqual(listed[0]["latest_task_id"], admitted.task.id)
+            self.assertTrue(listed[0]["active"])
 
     async def test_titles_are_shared_cas_metadata_without_changing_task_or_workspace(self):
         response = await self.http.post("/a2a/owner/message:send", headers=self.headers("owner-a"), json={
@@ -282,6 +437,49 @@ class OwnerChatAPITests(AuthAppTestCase):
 class PostgresOwnerChatAPITests(OwnerChatAPITests):
     use_postgres = True
 
+    async def test_schema25_upgrade_preserves_metadata_and_prevents_tombstone_reversal(self):
+        import psycopg
+        database = self.app.state.core_agent.workflow_store.database
+        schema = "owner_archive_upgrade_" + uuid.uuid4().hex
+        with database.transaction() as connection:
+            connection.execute(SQL("CREATE SCHEMA {}").format(Identifier(schema)))
+        def remove_schema():
+            with database.transaction() as connection:
+                connection.execute(SQL("DROP SCHEMA {} CASCADE").format(Identifier(schema)))
+        self.addCleanup(remove_schema)
+        upgraded = PostgresDatabase(make_conninfo(TEST_DATABASE_URL, options="-c search_path=" + schema))
+        self.addCleanup(upgraded.close)
+        previous = {version: sql for version, sql in database_module.MIGRATIONS.items() if version <= 25}
+        with patch.object(database_module, "SCHEMA_VERSION", 25), patch.dict(database_module.MIGRATIONS, previous, clear=True):
+            upgraded.migrate()
+        task = Task(id=uuid.uuid4().hex, context_id="pre-archive", status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED))
+        payload = task.SerializeToString()
+        with upgraded.transaction() as connection:
+            connection.execute("INSERT INTO core_a2a_tasks(task_id,owner,tenant,context_id,state,payload) VALUES(%s,%s,%s,%s,%s,%s)",
+                               (task.id, "company-owners", "legacy-company", task.context_id, int(task.status.state), payload))
+            connection.execute("""INSERT INTO core_chats(tenant_id,context_id,owner_id,title,title_revision,workspace_revision)
+                VALUES(%s,%s,%s,%s,7,3)""", ("legacy-company", task.context_id, "company-owners", "Retained title"))
+            old_chat = connection.execute("SELECT * FROM core_chats").fetchone()
+        upgraded.migrate()
+        upgraded.migrate()
+        with upgraded.transaction() as connection:
+            chat = connection.execute("SELECT * FROM core_chats").fetchone()
+            self.assertIsNone(chat.pop("archived_at"))
+            self.assertIsNone(chat.pop("archived_by"))
+            self.assertEqual(chat, old_chat)
+            self.assertEqual(bytes(connection.execute("SELECT payload FROM core_a2a_tasks").fetchone()["payload"]), payload)
+            connection.execute("UPDATE core_chats SET archived_at=clock_timestamp(),archived_by='original-owner'")
+            archived = connection.execute("SELECT * FROM core_chats").fetchone()
+        for statement in ("UPDATE core_chats SET archived_at=NULL,archived_by=NULL",
+                          "UPDATE core_chats SET archived_at=archived_at+interval '1 second'",
+                          "UPDATE core_chats SET archived_by='new-owner'",
+                          "UPDATE core_chats SET owner_id='new-owner'"):
+            with self.assertRaises(psycopg.Error):
+                with upgraded.transaction() as connection:
+                    connection.execute(statement)
+        with upgraded.transaction() as connection:
+            self.assertEqual(connection.execute("SELECT * FROM core_chats").fetchone(), archived)
+
     async def test_schema24_upgrade_preserves_chat_binding_and_original_task_bytes(self):
         database = self.app.state.core_agent.workflow_store.database
         schema = "owner_title_upgrade_" + uuid.uuid4().hex
@@ -315,6 +513,8 @@ class PostgresOwnerChatAPITests(OwnerChatAPITests):
             chat = connection.execute("SELECT * FROM core_chats").fetchone()
             self.assertEqual((chat.pop("title"), chat.pop("title_revision"), chat.pop("title_source")), ("", 0, None))
             self.assertEqual(chat.pop("updated_at"), old_chat["created_at"])
+            self.assertIsNone(chat.pop("archived_at"))
+            self.assertIsNone(chat.pop("archived_by"))
             self.assertEqual(chat, old_chat)
             message = connection.execute("SELECT * FROM core_root_messages").fetchone()
             self.assertIsNone(message.pop("display_text"))

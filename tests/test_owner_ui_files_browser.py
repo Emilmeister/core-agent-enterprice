@@ -154,7 +154,7 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         backend["command"] = ["uv", "run", "--no-sync", "python", "/browser-fixture/server.py", "backend"]
         backend["envFrom"] = [{"configMapRef": {"name": "native"}}, {"secretRef": {"name": "server-config"}}]
         settings = {"CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled", "SESSION_STORAGE_TYPE": "postgres",
-                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec,core_response_files,core_cron_create,core_ask_owner,core_task_start,core_task_wait", "CORE_AGENT_ALLOWED_SKILLS": "",
+                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec,core_response_files,core_cron_create,core_ask_owner,core_task_start,core_task_wait,core_python_exec", "CORE_AGENT_ALLOWED_SKILLS": "",
                     "CHAT_WORKSPACE_ROOT": "/data/chats", "LOCAL_WORKSPACE_ROOT": "/data/scratch", "DURABLE_STORAGE_ROOT": "/data/durable",
                     "UV_CACHE_DIR": "/tmp/uv-cache", "PYTHONDONTWRITEBYTECODE": "1", "OTEL_SDK_DISABLED": "true"}
         backend["env"] = [{"name": name, "value": value} for name, value in settings.items()]
@@ -219,12 +219,20 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         downloads.mkdir()
         config = {"origin": self.origin, "debugPort": self.debug_port, "username": "browser-owner", "password": self.password,
                   "files": files, "downloads": str(downloads), "evidence": str(self.evidence)}
-        proof = self.command(["node", str(Path(__file__).with_name("owner_ui_files_browser.mjs"))], content=json.dumps(config), timeout=180)
+        proof = self.command(["node", str(Path(__file__).with_name("owner_ui_files_browser.mjs"))], content=json.dumps(config), timeout=240)
         (self.evidence / "browser.log").write_text(proof)
         self.assertIn("PASS actual native file reads and persisted attachment history", proof)
         self.assertIn("PASS Markdown headings lists tables and fenced code render", proof)
         self.assertIn("PASS untrusted Markdown and Mermaid cannot execute or fetch external images", proof)
         self.assertIn("PASS history refresh preserves the rendered Mermaid image", proof)
+        self.assertIn("PASS SSE outage with healthy canonical polling does not claim connection loss", proof)
+        self.assertIn("PASS actual canonical read failure and recovery preserve pending chat work", proof)
+        self.assertIn("PASS final answer stays reachable above composer after expanding execution", proof)
+        self.assertIn("PASS Markdown file preview preserves safe rendering without external fetches", proof)
+        self.assertIn("PASS Python file preview preserves exact indentation with syntax highlighting", proof)
+        self.assertIn("PASS long file preview scrolls inside its bounds without covering properties", proof)
+        self.assertIn("PASS actual confirmed chat deletion returns durable archive receipt", proof)
+        self.assertIn("PASS archived chat retains authenticated canonical Task history and issued file access", proof)
         self.assertIn("PASS actual owner policy persists independent access and material exemption for core_cron_create", proof)
         self.assertIn("PASS actual owner policy persists independent access and material exemption for core_terminal_exec", proof)
         self.assertIn("PASS owner UI runs same-chat cron despite model tool deny", proof)

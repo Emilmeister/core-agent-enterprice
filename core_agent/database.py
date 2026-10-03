@@ -28,7 +28,7 @@ from .errors import CoreError
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -873,6 +873,25 @@ ALTER TABLE core_chats
     ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now();
 UPDATE core_chats SET updated_at = created_at;
 ALTER TABLE core_root_messages ADD COLUMN display_text text;
+""",
+
+    26: """
+ALTER TABLE core_chats ADD COLUMN archived_at timestamptz, ADD COLUMN archived_by text,
+    ADD CONSTRAINT core_chat_archive_actor CHECK ((archived_at IS NULL) = (archived_by IS NULL));
+CREATE OR REPLACE FUNCTION core_chat_immutable_binding() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (NEW.tenant_id,NEW.context_id,NEW.owner_id,NEW.schema_version)
+        IS DISTINCT FROM (OLD.tenant_id,OLD.context_id,OLD.owner_id,OLD.schema_version) THEN
+        RAISE EXCEPTION 'immutable canonical chat binding';
+    END IF;
+    IF OLD.archived_at IS NOT NULL AND
+        (NEW.archived_at,NEW.archived_by,NEW.latest_root_run_id)
+        IS DISTINCT FROM (OLD.archived_at,OLD.archived_by,OLD.latest_root_run_id) THEN
+        RAISE EXCEPTION 'immutable canonical chat archive';
+    END IF;
+    RETURN NEW;
+END;
+$$;
 """,
 
 }
