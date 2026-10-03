@@ -58,8 +58,8 @@ let second;
 const posts=[],requests=new Map(),history=[],tasks=[],receipts=[],outputRequests=[],cancelledDownloads=new Set(),untrustedRequests=[];
 page.on('Network.requestWillBeSent',({request})=>{if(new URL(request.url).hostname==='ui-content.invalid')untrustedRequests.push(request.url);});
 const apiResponses=[],dialogs=[];
-let peerPostAttempts=0;
-let rejectNextAccessDelete=false;
+let peerPostAttempts=0,peerDeleteAttempts=0;
+let rejectNextAccessDelete=false,rejectNextPeerDelete=false;
 const peerSecret='Browser-private-peer-secret-739',schedulePrompt='Browser manual cron in the original chat';
 function observeOwnerAPI(tab){
   const pending=new Map();
@@ -67,6 +67,7 @@ function observeOwnerAPI(tab){
     const url=new URL(request.url);
     if(url.origin!==config.origin||!(/^\/api\/(tool-policies|schedules|remote-agents|external-access|chats\/[^/]+\/(files|title))(\/|$)/.test(url.pathname)||(request.method==='DELETE'&&/^\/api\/chats\/[^/]+$/.test(url.pathname))))return;
     if(url.pathname==='/api/remote-agents'&&request.method==='POST')peerPostAttempts++;
+    if(request.method==='DELETE'&&/^\/api\/remote-agents\/[^/]+\/connection$/.test(url.pathname))peerDeleteAttempts++;
     pending.set(requestId,{path:url.pathname,query:url.search,method:request.method,request:request.postData?JSON.parse(request.postData):null,authorized:!!(request.headers.Authorization??request.headers.authorization)});
   });
   tab.on('Network.responseReceived',({requestId,response})=>{const request=pending.get(requestId);if(request)request.status=response.status;});
@@ -79,9 +80,12 @@ function observeOwnerAPI(tab){
     apiResponses.push({...request,body});
   });
   tab.on('Page.javascriptDialogOpening',async({type,message})=>{
-    if(type!=='confirm'||!['Удалить расписание?', 'Есть неотправленное сообщение', 'Результат удаления ещё не подтверждён.', 'Удалить учётку «'].some(prefix=>message.startsWith(prefix)))throw new Error('Unexpected actual owner confirmation');
-    const reject=rejectNextAccessDelete&&message.startsWith('Удалить учётку «');
-    if(reject)rejectNextAccessDelete=false;
+    if(type!=='confirm'||!['Удалить расписание?', 'Есть неотправленное сообщение', 'Результат удаления ещё не подтверждён.', 'Удалить учётку «','Удалить подключение «'].some(prefix=>message.startsWith(prefix)))throw new Error('Unexpected actual owner confirmation');
+    const rejectAccess=rejectNextAccessDelete&&message.startsWith('Удалить учётку «');
+    const rejectPeer=rejectNextPeerDelete&&message.startsWith('Удалить подключение «');
+    const reject=rejectAccess||rejectPeer;
+    if(rejectAccess)rejectNextAccessDelete=false;
+    if(rejectPeer)rejectNextPeerDelete=false;
     dialogs.push(message);await tab.call('Page.handleJavaScriptDialog',{accept:!reject});
   });
 }
@@ -257,6 +261,7 @@ try {
   await second.click('Добавить агента ＋');
   await second.wait("!!document.querySelector('.form-sheet input[pattern]')",'actual custom-header peer form');
   await second.field('.form-sheet input[pattern]','browser-disabled_peer');
+  await second.click('Добавить агента ＋');
   await second.field('.form-sheet input[type=url]','https://peer.invalid/a2a');
   await second.field('.form-sheet textarea','Disabled local browser proof peer');
   await second.field('.form-sheet .form-grid label:nth-child(4) input','X-Browser-Proof-Key');
@@ -278,6 +283,7 @@ try {
   await second.wait("!!document.querySelector('.peer')&&!document.querySelector('.form-sheet')",'actual saved peer');
   await second.click('Настроить','.peer button');
   await second.wait("!!document.querySelector('.form-sheet input[type=checkbox]')",'actual peer disable form');
+  await second.click('Настроить','.peer button');
   await second.evaluate("document.querySelector('.form-sheet input[type=checkbox]').click()");
   const disabledPeer=await ownerAction(second,'/api/remote-agents/'+peer.id,'PUT',()=>second.click('Сохранить подключение','.form-sheet button'));
   check(disabledPeer.body.enabled===false&&disabledPeer.body.has_header_value===true&&disabledPeer.request.header_value===undefined&&disabledPeer.body.revision===peer.revision+1,'UI disable preserves private peer secret without resending it');
@@ -292,6 +298,65 @@ try {
   await second.wait("!!document.querySelector('.form-sheet input[type=password]')",'private secret replacement field');
   check(await second.evaluate("document.querySelector('.form-sheet input[type=password]').value===''&&document.querySelector('.form-sheet .form-grid label:nth-child(4) input').value==='X-Browser-Proof-Key'&&!document.querySelector('.form-sheet input[type=checkbox]').checked"),'persisted custom header rereads with empty secret field and disabled peer');
   await second.click('Закрыть','.form-sheet button');
+
+  const peerDeletesBefore=peerDeleteAttempts;
+  rejectNextPeerDelete=true;
+  await second.click('Удалить','.peer button');
+  await waitFor(()=>!rejectNextPeerDelete,'peer deletion confirmation cancelled');
+  check(peerDeleteAttempts===peerDeletesBefore&&await second.evaluate("document.querySelectorAll('.peer').length===1"),'cancelled peer deletion sends no mutation');
+  let holdPeerList=false,heldPeerList,losePeerDelete=false;
+  second.on('Fetch.requestPaused',async event=>{
+    if(!new URL(event.request.url).pathname.startsWith('/api/remote-agents'))return;
+    if(losePeerDelete&&event.request.method==='DELETE'&&event.responseStatusCode===200){losePeerDelete=false;await second.call('Fetch.failRequest',{requestId:event.requestId,errorReason:'Failed'});return;}
+    if(holdPeerList&&event.request.method==='GET'&&event.responseStatusCode===200){holdPeerList=false;heldPeerList=event;return;}
+    await second.call('Fetch.continueRequest',{requestId:event.requestId});
+  });
+  await second.call('Fetch.enable',{patterns:[{urlPattern:config.origin+'/api/remote-agents*',requestStage:'Response'}]});
+  await second.click('Добавить агента ＋');
+  await second.field('.form-sheet input[pattern]','browser-delete-unknown');
+  await second.field('.form-sheet input[type=url]','https://peer.invalid/a2a');
+  await second.evaluate("document.querySelector('.form-sheet input[type=checkbox]').click()");
+  holdPeerList=true;
+  const extraPeer=await ownerAction(second,'/api/remote-agents','POST',()=>second.click('Сохранить подключение','.form-sheet button'));
+  await waitFor(()=>!!heldPeerList,'actual pre-deletion peer listing response held');
+  await second.click('Закрыть','.form-sheet button');
+  await second.click('Добавить агента ＋');
+  await second.field('.form-sheet input[pattern]','unsaved-new-editor');
+  let peerReadsBefore=apiResponses.length;
+  await second.call('Fetch.continueRequest',{requestId:heldPeerList.requestId});
+  await waitFor(()=>apiResponses.slice(peerReadsBefore).some(response=>response.path==='/api/remote-agents'&&response.method==='GET'),'save reread released after opening another editor');
+  check(await second.evaluate("document.querySelector('.form-sheet input[pattern]')?.value==='unsaved-new-editor'"),'late saved callback preserves the new editor and its input');
+  await second.click('Закрыть','.form-sheet button');
+  await second.evaluate("([...document.querySelectorAll('.peer')].find(article=>article.querySelector('h3').textContent==='browser-delete-unknown')).querySelector('button.secondary').click()");
+  await second.wait("!!document.querySelector('.form-sheet textarea')",'other peer editor reopened');
+  await second.field('.form-sheet textarea','Before deletion');
+  heldPeerList=null;holdPeerList=true;
+  await ownerAction(second,'/api/remote-agents/'+extraPeer.body.id,'PUT',()=>second.click('Сохранить подключение','.form-sheet button'));
+  await waitFor(()=>!!heldPeerList,'second pre-deletion peer listing held');
+  await second.click('Закрыть','.form-sheet button');
+  const deletedPeer=await ownerAction(second,'/api/remote-agents/'+peer.id+'/connection','DELETE',()=>second.evaluate(`([...document.querySelectorAll('.peer')].find(article=>article.querySelector('h3').textContent===${JSON.stringify(peer.name)})).querySelector('button.danger').click()`));
+  check(deletedPeer.body.id===peer.id&&!deletedPeer.body.enabled&&!deletedPeer.body.has_header_value&&deletedPeer.request.expected_revision===disabledPeer.body.revision,'confirmed peer deletion returns a scoped disabled receipt');
+  await second.wait("document.querySelectorAll('.peer').length===1&&document.querySelector('.peer h3').textContent==='browser-delete-unknown'",'deleted peer absent from current shared list');
+  peerReadsBefore=apiResponses.length;
+  await second.call('Fetch.continueRequest',{requestId:heldPeerList.requestId});
+  await waitFor(()=>apiResponses.slice(peerReadsBefore).some(response=>response.path==='/api/remote-agents'&&response.method==='GET'&&response.body.agents.some(agent=>agent.id===peer.id)),'actual stale peer listing released');
+  check(await second.evaluate("document.querySelectorAll('.peer').length===1&&document.querySelector('.peer h3').textContent==='browser-delete-unknown'"),'late peer listing cannot restore a deleted connection');
+  losePeerDelete=true;
+  await second.click('Удалить','.peer button');
+  await second.wait("document.querySelector('.page .error')?.textContent.includes('Не удалось подтвердить удаление подключения')&&document.querySelectorAll('.peer').length===0",'lost peer deletion receipt reconciled with shared list');
+  check(peerDeleteAttempts===peerDeletesBefore+2&&!losePeerDelete&&extraPeer.body.id!==peer.id,'unconfirmed peer deletion rereads shared state without replay');
+  await second.call('Fetch.disable');
+  await second.click('Добавить агента ＋');
+  await second.field('.form-sheet input[pattern]',peer.name);
+  await second.field('.form-sheet input[type=url]','https://peer.invalid/a2a');
+  await second.evaluate("document.querySelector('.form-sheet input[type=checkbox]').click()");
+  const recreatedPeer=await ownerAction(second,'/api/remote-agents','POST',()=>second.click('Сохранить подключение','.form-sheet button'));
+  check(recreatedPeer.body.id!==peer.id&&recreatedPeer.body.revision===1&&!recreatedPeer.body.has_header_value,'recreated peer name has a new identity without old credentials');
+  await second.wait("!document.querySelector('.form-sheet')&&document.querySelectorAll('.peer').length===1",'new peer saved');
+  await second.call('Page.reload');
+  await second.wait("!!document.querySelector('.composer textarea')",'peer deletion survives browser reload');
+  await second.click('Агенты','.nav-item');
+  await second.wait(`document.querySelectorAll('.peer').length===1&&document.querySelector('.peer h3').textContent===${JSON.stringify(peer.name)}`,'only recreated peer remains after reload');
 
   await page.click('Файлы');
   await page.evaluate("document.querySelector('.file-cleanup').open=true");

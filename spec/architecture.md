@@ -403,6 +403,25 @@ contract; material outcome сверяется с ним до раскрытия 
 исходного tool side effect. Serving role не получает удаления reviews или DDL;
 rollout/rollback выполняется по общей схеме version-check и согласованного backup.
 
+### Удаление регистрации доверенного адресата: schema 27
+
+Migration27 добавляет монотонный `core_remote_agents.deleted` и заменяет уникальность
+company/name частичным unique index для неудалённых регистраций. Existing rows
+остаются видимыми; ID/name исторической регистрации и её immutable revisions
+не меняются. Owner delete под row lock/CAS атомарно создаёт disabled revision
+без нового credential и ставит tombstone. Database trigger запрещает изменения
+удалённой регистрации. Current lookup и list исключают tombstone; internal exact
+revision lookup/credential resolution сохраняются для ранее принятых операций.
+Повторное добавление имени создаёт новый ID без подмены старых handles.
+Старый image отвергает schema27; upgrade требует migration job и остановки старого
+writer, rollback — согласованного восстановления DB/image. Serving grants прежние.
+
+После discovery/file preparation pin проверяет current enabled/revision/deleted
+под тем же root row lock и сохраняет `remote.pinned` в этой transaction через
+существующий workflow connection. Сетевые вызовы не удерживают registry lock.
+Memory adapter использует существующий RLock. Уже pinned contract обходит current
+lookup и продолжает exact revision; удаление, завершившееся раньше pin, имеет приоритет.
+
 ### Company attachment limit: schema 18
 
 Migration 18 добавляет `core_owner_settings.attachment_limit_bytes` с default

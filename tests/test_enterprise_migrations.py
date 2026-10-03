@@ -15,6 +15,7 @@ from unittest.mock import patch
 from a2a.types import a2a_pb2
 from cryptography.fernet import Fernet
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from psycopg.errors import RaiseException
 from psycopg.sql import SQL, Identifier
 from psycopg.types.json import Jsonb
 
@@ -53,6 +54,37 @@ class EnterpriseMigrationTests(unittest.TestCase):
             database.migrate()
         self.assertEqual(database.schema_version(), version)
         return database, url
+
+    def test_remote_registration_delete_upgrade_restart_and_tombstone(self):
+        database, url = self.database_at(26)
+        registry = PostgresRemoteRegistry(database, self.key)
+        values = {"name": "upgrade-peer", "url": "https://peer.example/a2a", "description": "Pinned",
+                  "enabled": True, "header_name": "Authorization", "header_value": "Bearer migration-pinned"}
+        peer = registry.create("company", values, actor_id="owner")
+        database.migrate()
+        with patch.object(database_module, "SCHEMA_VERSION", 26):
+            with self.assertRaises(CoreError) as error:
+                database.verify_schema()
+            self.assertEqual(error.exception.code, "DATABASE_SCHEMA_MISMATCH")
+        reopened = PostgresDatabase(url, min_size=0, max_size=1)
+        self.addCleanup(reopened.close)
+        reopened.verify_schema()
+        registry = PostgresRemoteRegistry(reopened, self.key)
+        self.assertEqual(registry.list("company"), [peer])
+        registry.delete("company", peer["id"], expected_revision=1, actor_id="owner")
+        restarted = PostgresDatabase(url, min_size=0, max_size=1)
+        self.addCleanup(restarted.close)
+        registry = PostgresRemoteRegistry(restarted, self.key)
+        self.assertEqual(registry.list("company"), [])
+        self.assertEqual(registry.get_revision("company", peer["id"], 1), peer)
+        self.assertEqual(registry.resolve_headers("company", peer["id"], 1), {"Authorization": values["header_value"]})
+        replacement = registry.create("company", values, actor_id="owner")
+        self.assertNotEqual(replacement["id"], peer["id"])
+        with self.assertRaises(RaiseException):
+            with restarted.transaction() as connection:
+                connection.execute("UPDATE core_remote_agents SET deleted=false WHERE tenant_id=%s AND id=%s",
+                                   ("company", peer["id"]))
+        self.assertEqual(registry.list("company"), [replacement])
 
     def seed(self, database, version):
         tenant, owner = ("default", "anonymous") if version == 12 else ("company", "company-owners")

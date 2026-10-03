@@ -652,6 +652,7 @@ classifier/model/tool dispatch и изменения wait/deadline/budget. Priva
 | `POST /api/remote-agents` | Создаёт адресата с immutable company-unique `name`; обязательны `name`, `url`, `description`, `enabled`, `header_name`; optional `header_value` (строка либо null). Server назначает `id`, revision1. Повтор name —409 `REMOTE_AGENT_CONFLICT` |
 | `PUT /api/remote-agents/{id}` | Полная замена `url`, `description`, `enabled`, `header_name` при integer `expected_revision`; optional `header_value`: omission сохраняет секрет, null очищает. Name/id не меняются. CAS создаёт новую immutable revision; несовпадение —409 |
 | `DELETE /api/remote-agents/{id}` | Ровно integer `expected_revision`; создаёт новую disabled revision и сохраняет старые revisions/credentials для принятых операций. Ответ —metadata новой revision; повтор со stale revision даёт409 |
+| `DELETE /api/remote-agents/{id}/connection` | Ровно integer `expected_revision`; атомарно создаёт disabled revision без нового credential и необратимо удаляет регистрацию из общего списка и новых обращений. Старые revisions/credentials сохраняются для принятых операций. Ответ —metadata disabled revision; stale active revision даёт409, уже удалённый/чужой ID —404. Имя можно использовать для нового подключения с новым ID |
 
 Timeout keys: `hitl_timeout_seconds`, `owner_answer_timeout_seconds`,
 `guardrails_timeout_seconds`. Default каждого — 86 400 секунд; допустимы целые
@@ -677,6 +678,23 @@ Registry metadata содержит ровно `id`, `name`, `url`, `description`
 и no-store; external/dual-role403 до lookup, чужой company ID —404
 `REMOTE_AGENT_NOT_FOUND`. Секретные значения не возвращаются после записи,
 включая errors, cursor, audit, модель и process environment.
+UI предлагает «Удалить» с подтверждением имени подключения и последствий:
+новые обращения запрещены, уже принятые операции продолжаются по закреплённым
+revisions. Удаление не отзывает входящий Keycloak доступ внешнего агента,
+не отменяет Task и не удаляет историю или файлы. Чтение current revision,
+изменение и отключение удалённого ID возвращают404; внутреннее чтение exact
+historical revision остаётся доступным под прежним company scope. Пагинация
+принимает прежний cursor после удаления его anchor. Отключённые подключения
+остаются видимыми; прежний DELETE без `/connection` сохраняет эту семантику.
+После неизвестного HTTP исхода UI перечитывает список без автоматического
+повтора DELETE; позднее чтение не восстанавливает удалённую строку.
+Граница принятия исходящей операции — durable `remote.pinned`. После сетевого
+discovery текущие enabled/revision/регистрация проверяются под registry lock,
+а проверка и запись pin выполняются в одной PostgreSQL transaction. Если
+удаление завершилось раньше pin, запоздавший discovery не разрешает обращение.
+Уже закреплённая операция использует exact revision без этой current-проверки.
+Запоздавшее сохранение закрытого редактора не закрывает новый редактор и не
+сбрасывает введённые в нём данные.
 POST/PUT/DELETE registry routes не принимают query parameters. Неверный JSON или
 набор полей запроса возвращает400 `REQUEST_INVALID` до записи.
 Decoded peer ID с NUL или некорректным Unicode отклоняется до lookup с400

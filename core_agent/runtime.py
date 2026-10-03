@@ -1383,9 +1383,16 @@ class CoreAgent:
         entry = {"version": 1, "contract": contract}
         if contract["version"] == 2:
             entry["arguments_digest"] = self._remote_arguments_digest(call)
-        snapshot.setdefault("remote_calls", {})[f"{attempt}:{call.id}"] = entry
-        record = self._record_transition(record, state=record.state, snapshot=snapshot,
-            event_kind="remote.pinned", event_data={"tool_call_id": call.id, "peer_id": peer["id"], "peer_revision": peer["revision"]}, lease_token=lease_token)
+        try:
+            with self.remote_registry.pin_current(record.tenant_id, peer["id"], peer["revision"]) as connection:
+                snapshot.setdefault("remote_calls", {})[f"{attempt}:{call.id}"] = entry
+                record = self._record_transition(record, state=record.state, snapshot=snapshot,
+                    event_kind="remote.pinned", event_data={"tool_call_id": call.id, "peer_id": peer["id"], "peer_revision": peer["revision"]},
+                    lease_token=lease_token, connection=connection)
+        except CoreError as error:
+            if error.code in {"REMOTE_AGENT_NOT_FOUND", "REMOTE_AGENT_CONFLICT"}:
+                raise ExecutionNotStarted("TOOL_UNAVAILABLE", "Registered remote agent changed before admission") from None
+            raise
         return record, copy.deepcopy(record.snapshot)
 
     def _safe_telemetry(self, value):

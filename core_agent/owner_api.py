@@ -307,7 +307,8 @@ async def registry_request(registry, actor, request):
         return await asyncio.to_thread(registry.create, actor.tenant, payload, actor_id=actor.actor_id)
     if request.method == "DELETE":
         payload = await read_payload(request, {"expected_revision"})
-        return await asyncio.to_thread(registry.disable, actor.tenant, request.path_params["peer_id"],
+        operation = registry.delete if request.url.path.endswith("/connection") else registry.disable
+        return await asyncio.to_thread(operation, actor.tenant, request.path_params["peer_id"],
                                        expected_revision=payload["expected_revision"], actor_id=actor.actor_id)
     payload = await read_payload(request, fields | {"expected_revision"}, optional_fields={"header_value"})
     revision = payload.pop("expected_revision")
@@ -628,6 +629,7 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
     if remote_registry is not None:
         routes.extend([
             Route("/api/remote-agents", endpoint, methods=["GET", "POST"]),
+            Route("/api/remote-agents/{peer_id}/connection", endpoint, methods=["DELETE"]),
             Route("/api/remote-agents/{peer_id}", endpoint, methods=["PUT", "DELETE"]),
         ])
     if cron_store is not None:

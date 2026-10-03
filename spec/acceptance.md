@@ -593,6 +593,19 @@ RMT-01, UI proof: при создании подключения видна по
 символах и длине имени. Кириллица, пробелы и имя длиннее 128 символов
 не отправляются серверу; допустимое имя с дефисом и подчёркиванием сохраняется.
 Проверка выполняется в реальном браузере; server validation остаётся обязательной.
+Кнопка «Удалить» требует подтверждения; отмена не отправляет запрос. Подтверждённое
+удаление сохраняется после refresh/restart и скрывает регистрацию у всех владельцев
+и из каталога модели. Отключённые подключения остаются видимыми. Повторное создание
+того же имени получает новый ID; accepted operation продолжает использовать прежние
+ID/revision/credential, включая после PostgreSQL restart. Старые current ID
+не изменяются и не включаются заново; foreign/invalid/CAS запросы не удаляют данные.
+Migration26→27 сохраняет существующие registry/revisions и legacy DELETE semantics;
+serving role не получает DDL/DELETE, tombstone не возвращается в active state.
+Browser proof включает потерянный ответ DELETE и поздний GET без слепого повтора
+удаления или появления уже удалённой строки; поздний callback сохранения не закрывает
+новый редактор. DELETE, завершившийся до durable `remote.pinned`, блокирует поздний
+discovery прежней регистрации даже после создания нового peer с тем же именем.
+Current check и pin атомарны; уже pinned HITL/remote operation продолжает прежний binding.
 
 Remote progress proof: working/input-required/auth-required metadata появляются
 в текущем root Task и scoped Get/List/Subscribe/push без raw peer data и чужих

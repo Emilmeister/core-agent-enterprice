@@ -322,7 +322,7 @@ class PostgresMemoryCorpusScopeTests(MemoryCorpusScopeTests):
                       for table in tables}
         upgraded.migrate()
         upgraded.migrate()
-        self.assertEqual(upgraded.schema_version(), 26)
+        self.assertEqual(upgraded.schema_version(), 27)
         with upgraded.pool.connection() as connection:
             for table in tables:
                 row = connection.execute(SQL("SELECT * FROM {}").format(Identifier(table))).fetchone()

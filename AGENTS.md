@@ -677,6 +677,14 @@ run получает отдельные MCP session и negotiated version; пе�
 - `/api/remote-agents` предоставляет owner-only list/create; PUT/DELETE по server
   ID создают новую immutable revision через CAS. DELETE отключает peer, сохраняя
   прежние revisions. Scope берётся из principal; external/dual-role запрещены.
+  DELETE `/api/remote-agents/{id}/connection` удаляет регистрацию через schema27
+  tombstone и освобождает имя. Current lookup/list исключают её, exact historical
+  revision и credentials сохраняются для принятых операций; старый DELETE остаётся
+  отключением. Trigger запрещает изменение удалённой регистрации. UI подтверждает
+  удаление и перечитывает список после неизвестного исхода без повторного DELETE.
+  Новая операция проверяет current enabled/revision/registration под registry lock
+  и сохраняет `remote.pinned` в той же PostgreSQL transaction. Уже pinned binding
+  обходит current lookup и продолжает закреплённую revision после удаления.
   Header values принимаются только на запись; responses/errors/cursors содержат
   безопасные metadata. Fernet envelope связывает secret с tenant/peer/revision/
   header name. Key — `PUSH_NOTIFICATION_ENCRYPTION_KEY`; in-memory development

@@ -93,6 +93,85 @@ class RemoteRegistryContract:
             self.store.disable(self.tenant, peer["id"], expected_revision=1, actor_id="owner")
         self.assertEqual(error.exception.code, "REMOTE_AGENT_CONFLICT")
 
+    def test_pin_current_fences_delete_and_rejects_changed_or_deleted_registration(self):
+        peer = self.create(header_value="Bearer PINNED")
+        started, finished = threading.Event(), threading.Event()
+        failures = []
+        def delete():
+            started.set()
+            try:
+                self.store.delete(self.tenant, peer["id"], expected_revision=1, actor_id="owner")
+            except Exception as error:
+                failures.append(error)
+            finally:
+                finished.set()
+        with self.store.pin_current(self.tenant, peer["id"], 1) as connection:
+            self.assertEqual(self.store.get_revision(self.tenant, peer["id"], connection=connection), peer)
+            worker = threading.Thread(target=delete)
+            worker.start()
+            self.assertTrue(started.wait(3))
+            self.assertFalse(finished.wait(0.05), "delete crossed the pin transaction")
+        worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        with self.assertRaises(CoreError) as error, self.store.pin_current(self.tenant, peer["id"], 1):
+            self.fail("deleted registration was admitted")
+        self.assertEqual(error.exception.code, "REMOTE_AGENT_NOT_FOUND")
+        replacement = self.create()
+        self.store.disable(self.tenant, replacement["id"], expected_revision=1, actor_id="owner")
+        for revision in (1, 2):
+            with self.assertRaises(CoreError) as error, self.store.pin_current(self.tenant, replacement["id"], revision):
+                self.fail("disabled or stale registration was admitted")
+            self.assertEqual(error.exception.code, "REMOTE_AGENT_CONFLICT")
+
+    def test_delete_hides_current_registration_and_preserves_pinned_revisions(self):
+        peer = self.create(header_value="Bearer PINNED")
+        cipher, self.store._cipher = self.store._cipher, None
+        try:
+            removed = self.store.delete(self.tenant, peer["id"], expected_revision=1, actor_id="owner")
+        finally:
+            self.store._cipher = cipher
+        self.assertFalse(removed["enabled"])
+        self.assertFalse(removed["has_header_value"])
+        self.assertEqual(removed["revision"], 2)
+        self.assertEqual(self.store.list(self.tenant), [])
+        self.assertEqual(self.store.list(self.tenant, after_id=peer["id"]), [])
+        self.assertEqual(self.store.get_revision(self.tenant, peer["id"], 1), peer)
+        self.assertEqual(self.store.resolve_headers(self.tenant, peer["id"], 1), {"Authorization": "Bearer PINNED"})
+        for operation in (
+            lambda: self.store.get_revision(self.tenant, peer["id"]),
+            lambda: self.update(peer, enabled=True),
+            lambda: self.store.disable(self.tenant, peer["id"], expected_revision=2, actor_id="owner"),
+            lambda: self.store.delete(self.tenant, peer["id"], expected_revision=1, actor_id="owner"),
+        ):
+            with self.assertRaises(CoreError) as error:
+                operation()
+            self.assertEqual(error.exception.code, "REMOTE_AGENT_NOT_FOUND")
+        replacement = self.create(header_value="Bearer NEW")
+        self.assertNotEqual(replacement["id"], peer["id"])
+        self.assertEqual(replacement["revision"], 1)
+        self.assertEqual(self.store.list(self.tenant), [replacement])
+        self.assertEqual(self.store.resolve_headers(self.tenant, peer["id"], 1), {"Authorization": "Bearer PINNED"})
+
+    def test_delete_validates_revision_identity_company_and_cas_before_mutation(self):
+        peer = self.create()
+        for revision in (True, 0, -1, "1", 1.5, None):
+            with self.assertRaises(CoreError) as error:
+                self.store.delete(self.tenant, peer["id"], expected_revision=revision, actor_id="owner")
+            self.assertEqual(error.exception.code, "REMOTE_AGENT_INVALID")
+        with self.assertRaises(CoreError) as error:
+            self.store.delete(self.tenant + "-other", peer["id"], expected_revision=1, actor_id="owner")
+        self.assertEqual(error.exception.code, "REMOTE_AGENT_NOT_FOUND")
+        for identity in ("", "\x00", "\ud800"):
+            with self.assertRaises(CoreError) as error:
+                self.store.delete(self.tenant, identity, expected_revision=1, actor_id="owner")
+            self.assertEqual(error.exception.code, "REMOTE_AGENT_INVALID")
+        changed = self.update(peer, description="Changed")
+        with self.assertRaises(CoreError) as error:
+            self.store.delete(self.tenant, peer["id"], expected_revision=1, actor_id="owner")
+        self.assertEqual(error.exception.code, "REMOTE_AGENT_CONFLICT")
+        self.assertEqual(self.store.list(self.tenant), [changed])
+
     def test_list_stable_pagination_and_detached_metadata(self):
         peers = [self.create(name="peer" + str(index)) for index in range(3)]
         expected = sorted(peers, key=lambda peer: peer["id"])

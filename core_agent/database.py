@@ -28,7 +28,7 @@ from .errors import CoreError
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -892,6 +892,24 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+""",
+
+    27: """
+ALTER TABLE core_remote_agents ADD COLUMN deleted boolean NOT NULL DEFAULT false;
+ALTER TABLE core_remote_agents DROP CONSTRAINT core_remote_agents_tenant_id_name_key;
+CREATE UNIQUE INDEX core_remote_agent_active_name
+    ON core_remote_agents(tenant_id,name) WHERE NOT deleted;
+CREATE FUNCTION core_remote_agent_immutable_registration() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (NEW.tenant_id,NEW.id,NEW.name) IS DISTINCT FROM (OLD.tenant_id,OLD.id,OLD.name)
+        OR (OLD.deleted AND NEW IS DISTINCT FROM OLD) THEN
+        RAISE EXCEPTION 'immutable remote agent registration';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER core_remote_agent_immutable_registration BEFORE UPDATE ON core_remote_agents
+    FOR EACH ROW EXECUTE FUNCTION core_remote_agent_immutable_registration();
 """,
 
 }

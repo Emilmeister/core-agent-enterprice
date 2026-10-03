@@ -7,7 +7,7 @@ import stat
 import threading
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -188,11 +188,13 @@ class InMemoryRemoteRegistry:
         self._lock = threading.RLock()
         self._current = {}
         self._revisions = {}
+        self._deleted = set()
 
     def create(self, tenant_id, values, *, actor_id):
         _validate(values, create=True)
         with self._lock:
-            if any(scope == tenant_id and row["name"] == values["name"] for (scope, _), row in self._current.items()):
+            if any(scope == tenant_id and row["name"] == values["name"] and (scope, peer_id) not in self._deleted
+                   for (scope, peer_id), row in self._current.items()):
                 raise CoreError("REMOTE_AGENT_CONFLICT")
             row = _new_row(self._cipher, tenant_id, str(uuid.uuid4()), values, actor_id=actor_id, now=self._clock())
             self._save(row)
@@ -208,7 +210,7 @@ class InMemoryRemoteRegistry:
             _revision(revision)
         row = (self._current.get((tenant_id, peer_id)) if revision is None
                else self._revisions.get((tenant_id, peer_id, revision)))
-        if row is None:
+        if row is None or (revision is None and (tenant_id, peer_id) in self._deleted):
             raise CoreError("REMOTE_AGENT_NOT_FOUND")
         _metadata(row)
         return row
@@ -239,11 +241,31 @@ class InMemoryRemoteRegistry:
             if after_id is not None and (tenant_id, after_id) not in self._current:
                 raise CoreError("REQUEST_INVALID")
             return [_metadata(row) for (tenant, peer_id), row in sorted(self._current.items())
-                    if tenant == tenant_id and (after_id is None or peer_id > after_id)][:limit]
+                    if tenant == tenant_id and (tenant, peer_id) not in self._deleted
+                    and (after_id is None or peer_id > after_id)][:limit]
+
+    def delete(self, tenant_id, peer_id, *, expected_revision, actor_id):
+        _revision(expected_revision)
+        with self._lock:
+            previous = self._get(tenant_id, peer_id)
+            values = {key: previous[key] for key in _FIELDS}
+            removed = self.update(tenant_id, peer_id, {**values, "enabled": False, "header_value": None},
+                                  expected_revision=expected_revision, actor_id=actor_id)
+            self._deleted.add((tenant_id, peer_id))
+            return removed
 
     def get_revision(self, tenant_id, peer_id, revision=None, *, connection=None):
         with self._lock:
             return _metadata(self._get(tenant_id, peer_id, revision))
+
+    @contextmanager
+    def pin_current(self, tenant_id, peer_id, revision):
+        _revision(revision)
+        with self._lock:
+            current = self._get(tenant_id, peer_id)
+            if not current["enabled"] or current["revision"] != revision:
+                raise CoreError("REMOTE_AGENT_CONFLICT")
+            yield None
 
     def resolve_headers(self, tenant_id, peer_id, revision, *, connection=None):
         with self._lock:
@@ -310,17 +332,19 @@ class PostgresRemoteRegistry:
             _revision(revision)
         if lock:
             current = connection.execute(
-                "SELECT revision FROM core_remote_agents WHERE tenant_id = %s AND id = %s FOR UPDATE",
+                "SELECT revision FROM core_remote_agents WHERE tenant_id = %s AND id = %s AND NOT deleted FOR UPDATE",
                 (tenant_id, peer_id),
             ).fetchone()
             if current is None:
                 raise CoreError("REMOTE_AGENT_NOT_FOUND")
             revision = current["revision"]
+        # Exact revisions also verify restored backups before their schema upgrade.
+        visibility = " AND NOT a.deleted" if revision is None else ""
         row = connection.execute(
             """SELECT r.*, a.name FROM core_remote_agents a
                JOIN core_remote_agent_revisions r ON r.tenant_id = a.tenant_id AND r.id = a.id
                AND r.revision = COALESCE(%s, a.revision)
-               WHERE a.tenant_id = %s AND a.id = %s""",
+               WHERE a.tenant_id = %s AND a.id = %s""" + visibility,
             (revision, tenant_id, peer_id),
         ).fetchone()
         if row is None:
@@ -328,17 +352,19 @@ class PostgresRemoteRegistry:
         _metadata(row)
         return row
 
-    def _update(self, connection, tenant_id, peer_id, values, expected_revision, actor_id):
+    def _update(self, connection, tenant_id, peer_id, values, expected_revision, actor_id, *, deleted=False):
         previous = self._get(connection, tenant_id, peer_id, lock=True)
         if previous["revision"] != expected_revision:
             raise CoreError("REMOTE_AGENT_CONFLICT")
         if values is None:
             values = {**{key: previous[key] for key in _FIELDS}, "enabled": False}
+        if deleted:
+            values = {**values, "header_value": None}
         row = _new_row(self._cipher, tenant_id, peer_id, values, actor_id=actor_id,
                        now=self._now(connection), previous=previous)
         self._insert_revision(connection, row)
-        connection.execute("UPDATE core_remote_agents SET revision = %s WHERE tenant_id = %s AND id = %s",
-                           (row["revision"], tenant_id, peer_id))
+        connection.execute("UPDATE core_remote_agents SET revision = %s, deleted = %s WHERE tenant_id = %s AND id = %s",
+                           (row["revision"], deleted, tenant_id, peer_id))
         return _metadata(row)
 
     def update(self, tenant_id, peer_id, values, *, expected_revision, actor_id):
@@ -352,6 +378,11 @@ class PostgresRemoteRegistry:
         with self.database.transaction() as connection:
             return self._update(connection, tenant_id, peer_id, None, expected_revision, actor_id)
 
+    def delete(self, tenant_id, peer_id, *, expected_revision, actor_id):
+        _revision(expected_revision)
+        with self.database.transaction() as connection:
+            return self._update(connection, tenant_id, peer_id, None, expected_revision, actor_id, deleted=True)
+
     def list(self, tenant_id, *, limit=50, after_id=None):
         _page(limit, after_id)
         with self.database.pool.connection() as connection:
@@ -363,7 +394,7 @@ class PostgresRemoteRegistry:
                 """SELECT r.*, a.name FROM core_remote_agents a
                    JOIN core_remote_agent_revisions r ON r.tenant_id = a.tenant_id
                      AND r.id = a.id AND r.revision = a.revision
-                   WHERE a.tenant_id = %s AND (%s::text IS NULL OR a.id > %s)
+                   WHERE a.tenant_id = %s AND NOT a.deleted AND (%s::text IS NULL OR a.id > %s)
                    ORDER BY a.id LIMIT %s""", (tenant_id, after_id, after_id, limit),
             ).fetchall()
             return [_metadata(row) for row in rows]
@@ -371,6 +402,15 @@ class PostgresRemoteRegistry:
     def get_revision(self, tenant_id, peer_id, revision=None, *, connection=None):
         with self.database.pool.connection() if connection is None else nullcontext(connection) as connection:
             return _metadata(self._get(connection, tenant_id, peer_id, revision))
+
+    @contextmanager
+    def pin_current(self, tenant_id, peer_id, revision):
+        _revision(revision)
+        with self.database.transaction() as connection:
+            current = self._get(connection, tenant_id, peer_id, lock=True)
+            if not current["enabled"] or current["revision"] != revision:
+                raise CoreError("REMOTE_AGENT_CONFLICT")
+            yield connection
 
     def resolve_headers(self, tenant_id, peer_id, revision, *, connection=None):
         with self.database.pool.connection() if connection is None else nullcontext(connection) as connection:

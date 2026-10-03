@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Api, ApiError, errorText } from "./api";
 import type { Peer } from "./types";
 
@@ -7,14 +7,27 @@ export function Agents({ api }: { api: Api }) {
   const [selection, setSelection] = useState<Peer | "new" | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  async function load() {
-    setPeers(await api.pages<Peer>("/api/remote-agents", "agents"));
+  const [busy, setBusy] = useState(false);
+  const request = useRef<AbortController | null>(null);
+  const read = useRef(0);
+  const editor = useRef(0);
+  const editorVersion = editor.current;
+  function select(peer: Peer | "new" | null) {
+    if (peer === selection) return;
+    ++editor.current;
+    setSelection(peer);
+  }
+  async function load(signal = request.current?.signal) {
+    const version = ++read.current;
+    const peers = await api.pages<Peer>("/api/remote-agents", "agents", signal);
+    const current = !signal?.aborted && version === read.current;
+    if (current) setPeers(peers);
+    return current;
   }
   useEffect(() => {
     const abort = new AbortController();
-    void api
-      .pages<Peer>("/api/remote-agents", "agents", abort.signal)
-      .then(setPeers)
+    request.current = abort;
+    void load(abort.signal)
       .catch((e) => {
         if (!abort.signal.aborted) setError(errorText(e));
       })
@@ -23,6 +36,26 @@ export function Agents({ api }: { api: Api }) {
       });
     return () => abort.abort();
   }, [api]);
+  async function remove(peer: Peer) {
+    if (!window.confirm(`Удалить подключение «${peer.name}»? Новые обращения к нему станут недоступны. Уже принятые задачи продолжат работу; история и файлы сохранятся.`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.json(`/api/remote-agents/${encodeURIComponent(peer.id)}/connection`, "DELETE",
+        { expected_revision: peer.revision }, request.current?.signal);
+      await load();
+    } catch (failure) {
+      if (!request.current?.signal.aborted) {
+        const message = `Не удалось подтвердить удаление подключения. ${errorText(failure)}`;
+        setError(message);
+        await load().catch((refreshError) => {
+          if (!request.current?.signal.aborted) setError(`${message} Не удалось обновить список: ${errorText(refreshError)}`);
+        });
+      }
+    } finally {
+      if (!request.current?.signal.aborted) setBusy(false);
+    }
+  }
   return (
     <section className="page">
       <div className="section-line">
@@ -30,7 +63,7 @@ export function Agents({ api }: { api: Api }) {
           <div className="eyebrow">Доверенные подключения</div>
           <h1>Внешние агенты</h1>
         </div>
-        <button onClick={() => setSelection("new")}>
+        <button disabled={busy} onClick={() => select("new")}>
           Добавить агента <span aria-hidden="true">＋</span>
         </button>
       </div>
@@ -44,19 +77,18 @@ export function Agents({ api }: { api: Api }) {
         </p>
       )}
       {loading && <p role="status">Загружаем подключения…</p>}
+      {busy && <p role="status">Удаляем подключение…</p>}
       {selection && (
         <PeerEditor
-          key={
-            selection === "new"
-              ? "new"
-              : `${selection.id}:${selection.revision}`
-          }
+          key={editorVersion}
           api={api}
           peer={selection === "new" ? null : selection}
-          close={() => setSelection(null)}
+          close={() => select(null)}
           saved={async () => {
-            await load();
-            setSelection(null);
+            if (await load() && editor.current === editorVersion) {
+              select(null);
+              setError("");
+            }
           }}
         />
       )}
@@ -80,9 +112,14 @@ export function Agents({ api }: { api: Api }) {
                 {peer.has_header_value ? "Секрет настроен" : "Без секрета"}
               </p>
             </div>
-            <button className="secondary" onClick={() => setSelection(peer)}>
-              Настроить
-            </button>
+            <div className="peer-actions">
+              <button className="secondary" disabled={busy} onClick={() => select(peer)}>
+                Настроить
+              </button>
+              <button className="text-button danger" disabled={busy || !!selection} onClick={() => void remove(peer)}>
+                Удалить
+              </button>
+            </div>
           </article>
         ))}
       </div>

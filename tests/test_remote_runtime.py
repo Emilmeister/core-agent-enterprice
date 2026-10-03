@@ -93,6 +93,24 @@ class RemoteRuntimeTests(AuthAppTestCase):
         self.assertIn("TOOL_UNAVAILABLE", str(model.calls[1].messages))
         self.assertEqual(self.sent.call_count, 0)
 
+    async def test_delete_during_discovery_blocks_unpinned_old_identity(self):
+        model = self.script(self.request(), ModelResponse(message="unavailable"))
+        removed = []
+        def discovery(peer, **kwargs):
+            if model.calls and not removed:
+                removed.append(self.registry.delete(self.tenant, peer["id"], expected_revision=1, actor_id="alice"))
+                self.registry.create(self.tenant, {"name": peer["name"], "url": "https://replacement.example/a2a",
+                    "description": "Replacement", "enabled": True, "header_name": "Authorization"}, actor_id="alice")
+            return RemoteAgentConnection(RemoteAgentCard(peer["name"], peer["description"], peer["url"], False, (), "HTTP+JSON"))
+        with patch("core_agent.remote_agents.connect_peer", side_effect=discovery):
+            task = await self.submit("owner-a", "deleted-discovery", "deleted-discovery-chat")
+        self.assertTrue(removed)
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertIn("TOOL_UNAVAILABLE", str(model.calls[-1].messages))
+        self.assertEqual(self.sent.call_count, 0)
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertFalse(record.snapshot.get("remote_calls"))
+
     async def test_only_pinned_private_peer_headers_reach_send(self):
         self.registry.update(self.tenant, self.peer["id"], {"url": self.peer["url"], "description": "Delivery status",
             "enabled": True, "header_name": "Authorization", "header_value": "Bearer peer-private-secret"},
@@ -147,6 +165,9 @@ class RemoteRuntimeTests(AuthAppTestCase):
         self.assertEqual(approval["subject"]["remote_binding"]["peer_revision"], 1)
         self.assertEqual(self.sent.call_count, 0)
         self.registry.disable(self.tenant, self.peer["id"], expected_revision=1, actor_id="alice")
+        self.registry.delete(self.tenant, self.peer["id"], expected_revision=2, actor_id="alice")
+        self.registry.create(self.tenant, {"name": self.peer["name"], "url": "https://replacement.example/a2a",
+            "description": "Replacement", "enabled": True, "header_name": "Authorization"}, actor_id="alice")
         allowed = await self.http.post(f"/api/hitl/{approval['wait_id']}/decision", headers=self.headers("owner-a"),
             json={"decision": "allow", "subject_digest": approval["subject_digest"]})
         self.assertEqual(allowed.status_code, 200, allowed.text)

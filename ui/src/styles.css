@@ -918,6 +918,12 @@ main {
 .peer button {
   font-size: 12px;
 }
+.peer-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
 .empty {
   padding: 65px 20px;
   text-align: center;
@@ -1052,7 +1058,7 @@ main {
   .peer {
     grid-template-columns: 8px minmax(0, 1fr);
   }
-  .peer > button {
+  .peer > .peer-actions {
     grid-column: 2;
     justify-self: start;
   }

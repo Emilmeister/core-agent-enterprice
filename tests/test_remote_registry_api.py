@@ -108,6 +108,41 @@ class RemoteRegistryAPITests(AuthAppTestCase):
         self.assertEqual(duplicate.status_code, 409, duplicate.text)
         self.assertNotIn("registry-test-value", conflict.text + duplicate.text)
 
+    async def test_delete_connection_hides_shared_registration_and_reuses_name_without_old_identity(self):
+        peer = await self.create_peer()
+        path = "/api/remote-agents/" + peer["id"] + "/connection"
+        for token, status in ((None, 401), ("external-a", 403), ("dual-role", 403)):
+            if token == "dual-role":
+                self.tokens[token] = {**self.tokens["owner-a"], "realm_access": {"roles": ["agent-owner", "agent-external"]}}
+            response = await self.http.request("DELETE", path, headers=self.headers(token) if token else {},
+                                               json={"expected_revision": 1})
+            self.assertEqual(response.status_code, status, response.text)
+        for payload in ({}, {"expected_revision": True}, {"expected_revision": 1, "extra": 1}):
+            response = await self.http.request("DELETE", path, headers=self.headers("owner-a"), json=payload)
+            self.assertEqual(response.status_code, 400, response.text)
+        response = await self.http.request("DELETE", path, headers=self.headers("owner-a"), json={"expected_revision": 2})
+        self.assertEqual(response.status_code, 409, response.text)
+        response = await self.http.request("DELETE", path, headers=self.headers("owner-b"), json={"expected_revision": 1})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(set(response.json()), self.metadata_fields)
+        self.assertFalse(response.json()["enabled"])
+        self.assertFalse(response.json()["has_header_value"])
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertNotIn("registry-test-value", response.text)
+        for token in ("owner-a", "owner-b"):
+            listed = await self.http.get("/api/remote-agents", headers=self.headers(token))
+            self.assertEqual(listed.json(), {"agents": [], "next_cursor": None})
+        self.assertEqual((await self.update_peer(peer, enabled=True)).status_code, 404)
+        self.assertEqual((await self.http.request("DELETE", path, headers=self.headers("owner-a"), json={"expected_revision": 1})).status_code, 404)
+        replacement = await self.create_peer()
+        self.assertNotEqual(replacement["id"], peer["id"])
+        self.assertEqual(replacement["revision"], 1)
+        registry = self.app.state.remote_registry_store
+        tenant = self.app.state.authenticator.settings.tenant
+        self.assertEqual(registry.get_revision(tenant, peer["id"], 1), peer)
+        self.assertEqual(registry.resolve_headers(tenant, peer["id"], 1), {"Authorization": self.values["header_value"]})
+        self.assertFalse(self.model.calls)
+
     async def test_company_ids_and_cursors_do_not_cross_scope(self):
         peers = [await self.create_peer(name=name) for name in ("first", "second")]
         first = await self.http.get("/api/remote-agents?limit=1", headers=self.headers("owner-a"))

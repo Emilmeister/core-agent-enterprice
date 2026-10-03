@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from dataclasses import replace
@@ -12,12 +13,14 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from unittest.mock import patch
 
+from cryptography.fernet import Fernet
+
 from core_agent.artifacts import InMemoryArtifactStore, PostgresArtifactStore
 from core_agent.database import PostgresDatabase
 from core_agent.errors import CoreError, ExecutionNotStarted
 from core_agent.postgres_tasks import PostgresTaskScheduler
 from core_agent.remote_agents import RemoteAgentConnection, RemoteEvent
-from core_agent.remote_registry import InMemoryRemoteRegistry
+from core_agent.remote_registry import InMemoryRemoteRegistry, PostgresRemoteRegistry
 from core_agent.response_files import ResponseFileService
 from core_agent.tasks import REMOTE_TASK_PENDING, TaskScheduler, _remote_contract, remote_timeout_result
 from core_agent.workflow import InMemoryWorkflowStore, WorkflowRecord
@@ -422,7 +425,7 @@ class RemoteOperationTests(unittest.TestCase):
         self.assertEqual(task.error.code, "SIDE_EFFECT_UNKNOWN")
         self.assertEqual([call[0] for call in self.calls], ["Send"])
 
-    def test_registry_rotation_and_disable_preserve_approved_binding(self):
+    def test_registry_rotation_disable_and_delete_preserve_approved_binding(self):
         self.responses.extend([self.event(), self.event("COMPLETED")])
         task = self.start()
         changed = self.registry.update(self.tenant, self.peer["id"], {
@@ -430,6 +433,12 @@ class RemoteOperationTests(unittest.TestCase):
             "description": "Changed", "enabled": True, "header_name": "Authorization",
         }, expected_revision=1, actor_id="owner")
         self.registry.disable(self.tenant, self.peer["id"], expected_revision=changed["revision"], actor_id="owner")
+        self.registry.delete(self.tenant, self.peer["id"], expected_revision=changed["revision"] + 1, actor_id="owner")
+        self.registry.create(self.tenant, {
+            "name": self.peer["name"], "url": "https://replacement.example/a2a",
+            "description": "Replacement", "enabled": True, "header_name": "Authorization",
+            "header_value": "Bearer replacement-key",
+        }, actor_id="owner")
         self.recover()
         self.assertEqual(task.state, "completed")
         for _, card, arguments in self.calls:
@@ -618,6 +627,49 @@ class PostgresRemoteOutboundTests(unittest.TestCase):
         self.task_ids.append(task.id)
         self.settle()
         return self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant)
+
+    def test_deleted_peer_wait_recovers_with_exact_credentials_after_new_database_pool(self):
+        self.tenant = "delete-recovery-" + uuid.uuid4().hex
+        key = Fernet.generate_key()
+        self.registry = PostgresRemoteRegistry(self.database, key)
+        def cleanup_peers():
+            with self.database.transaction() as connection:
+                connection.execute("DELETE FROM core_remote_agent_revisions WHERE tenant_id=%s", (self.tenant,))
+                connection.execute("DELETE FROM core_remote_agents WHERE tenant_id=%s", (self.tenant,))
+        self.addCleanup(cleanup_peers)
+        self.peer = self.registry.create(self.tenant, {"name": "delivery", "url": "https://peer.example/a2a",
+            "description": "Delivery", "enabled": True, "header_name": "Authorization", "header_value": "Bearer private-key"}, actor_id="owner")
+        self.contract.update(tenant_id=self.tenant, peer_id=self.peer["id"], peer_revision=1)
+        self.scheduler._handlers["remote_a2a"] = RemoteA2AExecutor(self.scheduler, self.registry)
+        self.responses.extend([self.event(), self.event("COMPLETED")])
+        task = self.start()
+        self.assertEqual(task.state, "working")
+        self.registry.delete(self.tenant, self.peer["id"], expected_revision=1, actor_id="owner")
+        replacement = self.registry.create(self.tenant, {"name": "delivery", "url": "https://replacement.example/a2a",
+            "description": "Replacement", "enabled": True, "header_name": "X-Replacement", "header_value": "new-key"}, actor_id="owner")
+        self.assertNotEqual(replacement["id"], self.peer["id"])
+        self.scheduler.close()
+        restarted = PostgresDatabase(os.environ["TEST_DATABASE_URL"], min_size=0, max_size=1)
+        self.addCleanup(restarted.close)
+        self.registry = PostgresRemoteRegistry(restarted, key)
+        self.scheduler = PostgresTaskScheduler(restarted)
+        self.addCleanup(self.scheduler.close)
+        self.scheduler.register("remote_a2a", RemoteA2AExecutor(self.scheduler, self.registry))
+        # Read the persisted deadline and let the real database poll become due.
+        with self.database.transaction() as connection:
+            poll_at = connection.execute("SELECT checkpoint FROM core_background_tasks WHERE id=%s", (task.id,)).fetchone()["checkpoint"]["next_poll_at"]
+        time.sleep(max(0, poll_at - time.time()) + 0.05)
+        self.assertEqual(self.scheduler.recover(tenant_id=self.tenant), 1)
+        self.settle()
+        completed = self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant)
+        self.assertEqual(completed.state, "completed", getattr(completed.error, "code", None))
+        self.assertEqual([method for method, _, _ in self.calls], ["Send", "Get"])
+        for _, card, arguments in self.calls:
+            self.assertEqual(card.url, self.peer["url"])
+            self.assertEqual(arguments["headers"], {"Authorization": "Bearer private-key"})
+        with self.database.pool.connection() as connection:
+            binding = connection.execute("SELECT contract FROM core_background_tasks WHERE id=%s", (task.id,)).fetchone()["contract"]
+        self.assertEqual((binding["peer_id"], binding["peer_revision"]), (self.peer["id"], 1))
 
     def test_native_v2_root_and_actual_child_send_frozen_blobs_and_reject_corrupt_last_before_marker(self):
         for child in (False, True):
