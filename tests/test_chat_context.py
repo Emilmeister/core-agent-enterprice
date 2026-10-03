@@ -5,13 +5,173 @@ import json
 import os
 import unittest
 import uuid
+import tempfile
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 from core_agent.context import ContextItem, ContextState
 from core_agent.errors import CoreError
-from core_agent.model import ModelResponse
+from core_agent.config import AgentConfig
+from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from tests import test_runtime_guardrails as guardrails
+from tests.test_runtime_observability import make_agent, locked_skill_declaration
+
+
+class SkillChatContextTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "chat-skill"
+        self.path.mkdir()
+        self.header = "---\nname: chat-skill\ndescription: Verify chat work.\n---\n"
+        self.body = "PINNED_CHAT_SKILL_BODY\n"
+        (self.path / "SKILL.md").write_text(self.header + self.body, encoding="utf-8")
+        (self.path / "reference.md").write_text("Original reference.\n", encoding="utf-8")
+        self.model = ScriptedModel([
+            ModelResponse(tool_requests=(ToolRequest("activate", "core_skill_activate", {"names": ["chat-skill"]}),)),
+            ModelResponse(message="verified first task"),
+        ])
+        self.agent = make_agent(self.model, memory="disabled", mcp=False,
+            declared_skills=(locked_skill_declaration(self.path, "chat-skill"),))
+        self.addCleanup(self.agent.close)
+        raw = self.agent.agent_config.to_dict()
+        raw["features"]["skills"] = True
+        raw["skills"]["allow"] = ["chat-skill"]
+        self.agent.agent_config = AgentConfig.from_dict(raw)
+        self.agent.platform_config.allowed_skills.add("chat-skill")
+        self.agent.platform_config.supported_features.add("skills")
+        first = self.agent.run({"prompt": "Verify work"}, task_id="activated",
+            identity="owner", session_id="chat", tenant_id="company")
+        self.first = self.agent.workflow_store.get(first.run_id, tenant_id="company", owner_id="owner")
+
+    def admit(self, task="next", previous=None, **scope):
+        return self.agent._new_workflow({"prompt": "Continue verification"}, task_id=task,
+            identity=scope.get("owner", "owner"), session_id=scope.get("chat", "chat"),
+            tenant_id=scope.get("tenant", "company"), parent_run_id=scope.get("parent"),
+            previous_root_run_id=self.first.run_id if previous is None else previous,
+            defer_initialization=True)[0]
+
+    def continue_task(self, record):
+        self.agent.model = self.model = ScriptedModel([ModelResponse(message="verified next task")])
+        self.agent.resume_task(record.task_id)
+        return self.agent.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+
+    def seed_empty_root(self, task, previous, *, initializing=False):
+        record = self.admit(task, previous)
+        snapshot = copy.deepcopy(record.snapshot)
+        snapshot["initializing"] = initializing
+        saved = replace(record, state="FAILED" if initializing else "COMPLETED",
+            snapshot=snapshot, result={"message": "Historical task", "complete": not initializing})
+        self.agent.workflow_store._records[record.run_id] = saved
+        return saved
+
+    def test_rollout_restores_activation_before_initialized_empty_roots(self):
+        previous = self.first.run_id
+        for index in range(3):
+            previous = self.seed_empty_root(f"legacy-{index}", previous).run_id
+        saved = self.continue_task(self.admit(previous=previous))
+        self.assertEqual(saved.snapshot["skills"], self.first.snapshot["skills"])
+        self.assertIn(self.body, self.model.calls[0].instructions)
+
+    def test_failed_initialization_does_not_clear_chat_activation(self):
+        failed = self.seed_empty_root("initialization-failed", self.first.run_id, initializing=True)
+        saved = self.continue_task(self.admit(previous=failed.run_id))
+        self.assertEqual(saved.snapshot["skills"], self.first.snapshot["skills"])
+
+    def test_temporary_deny_preserves_activation_for_later_reenable(self):
+        self.agent.platform_config.allowed_skills.clear()
+        denied = self.continue_task(self.admit("denied"))
+        self.assertEqual(denied.snapshot["skills"], [])
+        self.assertNotIn(self.body, self.model.calls[0].instructions)
+        self.assertNotIn("core_skill_read_resource", self.model.calls[0].tools)
+        self.agent.platform_config.allowed_skills.add("chat-skill")
+        restored = self.continue_task(self.admit("reenabled", denied.run_id))
+        self.assertEqual(restored.snapshot["skills"], self.first.snapshot["skills"])
+        self.assertIn(self.body, self.model.calls[0].instructions)
+
+    def test_new_root_refreshes_body_and_resources_from_current_pin(self):
+        updated = "CURRENT_DEPLOYMENT_SKILL_BODY\n"
+        (self.path / "SKILL.md").write_text(self.header + updated, encoding="utf-8")
+        (self.path / "reference.md").unlink()
+        (self.path / "updated.md").write_text("Current reference.\n", encoding="utf-8")
+        declaration = locked_skill_declaration(self.path, "chat-skill")
+        self.agent.declared_skills = (declaration,)
+        saved = self.continue_task(self.admit())
+        skill = saved.snapshot["skills"][0]
+        self.assertEqual(skill["instructions"], updated)
+        self.assertEqual(skill["digest"], declaration["digest"].removeprefix("sha256:"))
+        self.assertEqual(skill["resources"], ["updated.md"])
+        self.assertIn(updated, self.model.calls[0].instructions)
+        self.assertNotIn(self.body, self.model.calls[0].instructions)
+        self.assertEqual(self.first.snapshot["skills"][0]["instructions"], self.body)
+
+    def test_unpinned_legacy_activation_fails_before_model(self):
+        snapshot = copy.deepcopy(self.first.snapshot)
+        snapshot["skills"][0].pop("digest")
+        self.agent.workflow_store._records[self.first.run_id] = replace(self.first, snapshot=snapshot)
+        current = self.admit()
+        self.agent.model = self.model = ScriptedModel([ModelResponse(message="must not run")])
+        with self.assertRaises(CoreError) as caught:
+            self.agent.resume_task(current.task_id)
+        self.assertEqual(caught.exception.code, "SKILL_INVALID")
+        self.assertEqual(self.model.calls, ())
+
+    def test_other_chat_and_subagent_do_not_inherit_without_lineage(self):
+        parent = self.agent._new_workflow({"prompt": "Parent work"}, task_id="parent-open",
+            identity="owner", session_id="parent-chat", tenant_id="company", defer_initialization=True)[0]
+        for task, scope in (("other-chat", {"chat": "other"}), ("child", {"parent": parent.run_id})):
+            with self.subTest(task=task):
+                current = self.agent._new_workflow({"prompt": "Separate work"}, task_id=task,
+                    identity="owner", session_id=scope.get("chat", "chat"), tenant_id="company",
+                    parent_run_id=scope.get("parent"), defer_initialization=True)[0]
+                saved = self.continue_task(current)
+                self.assertEqual(saved.snapshot["skills"], [])
+                self.assertNotIn(self.body, self.model.calls[0].instructions)
+
+    def test_foreign_lineage_and_cycle_fail_before_model(self):
+        for index, scope in enumerate(({"chat": "other"}, {"owner": "other"}, {"tenant": "other"}, {})):
+            with self.subTest(scope=scope):
+                current = self.admit(f"invalid-{index}", **scope)
+                if not scope:
+                    snapshot = copy.deepcopy(current.snapshot)
+                    snapshot["previous_root_run_id"] = current.run_id
+                    self.agent.workflow_store._records[current.run_id] = replace(current, snapshot=snapshot)
+                self.agent.model = self.model = ScriptedModel([ModelResponse(message="must not run")])
+                with self.assertRaises(CoreError) as caught:
+                    self.agent.resume_task(current.task_id)
+                self.assertEqual(caught.exception.code, "CHECKPOINT_INVALID")
+                self.assertEqual(self.model.calls, ())
+
+    def test_malformed_baseline_cannot_override_verified_activation_source(self):
+        for index, baseline in enumerate((
+            {"version": 2, "sources": {}},
+            {"version": 1, "sources": []},
+            {"version": 1, "sources": {}},
+            {"version": 1, "sources": {"chat-skill": "foreign-source"}},
+        )):
+            with self.subTest(baseline=baseline):
+                snapshot = copy.deepcopy(self.first.snapshot)
+                snapshot["skill_activation_sources"] = baseline
+                self.agent.workflow_store._records[self.first.run_id] = replace(self.first, snapshot=snapshot)
+                current = self.admit(f"invalid-baseline-{index}")
+                self.agent.model = self.model = ScriptedModel([ModelResponse(message="must not run")])
+                with self.assertRaises(CoreError) as caught:
+                    self.agent.resume_task(current.task_id)
+                self.assertEqual(caught.exception.code, "CHECKPOINT_INVALID")
+                self.assertEqual(self.model.calls, ())
+
+    def test_inherited_skill_body_counts_toward_context_window(self):
+        (self.path / "SKILL.md").write_text(self.header + "X" * 200_000 + "\n", encoding="utf-8")
+        self.agent.declared_skills = (locked_skill_declaration(self.path, "chat-skill"),)
+        self.agent.context_window = 50_000
+        self.agent.output_reserve = 1_000
+        current = self.admit()
+        self.agent.model = self.model = ScriptedModel([ModelResponse(message="must not run")])
+        with self.assertRaises(CoreError) as caught:
+            self.agent.resume_task(current.task_id)
+        self.assertEqual(caught.exception.code, "CONTEXT_UNRECOVERABLE")
+        self.assertEqual(self.model.calls, ())
 
 
 class ChatContextTests(unittest.TestCase):

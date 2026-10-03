@@ -161,3 +161,5 @@ Production release v1 разрешён только когда все строк
 | ENT-AC-78 | [File presentation](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | `tests.test_owner_history` original display provenance; required browser gate: scoped abortable downloads, text preview, incoming/generated panel/source jumps and cleanup | implemented |
 | ENT-AC-79 | [Chat titles](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | `tests.test_owner_chats` memory/PostgreSQL owner/company CAS, guarded title provenance and additive migration; required browser gate: rename and reload | implemented |
 | ENT-AC-80 | [Composer/accessibility](public-contract.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Required browser gate: growing compact composer, aggregate size, stable reading position, explicit new-message jump and mobile keyboard focus | implemented |
+
+| ENT-AC-83 | [Chat skill lifetime](skills.md), [acceptance](acceptance.md#дополнительные-owner-interaction-criteria) | Existing skill/runtime/context/HTTP provider and PostgreSQL restart regression suites | partial |

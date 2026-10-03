@@ -74,7 +74,7 @@ BUDGET_FOLLOWUP_MESSAGE = (
     "finalization and was recorded but could not be processed within the budget. "
     "Completed durable work remains recorded, and no missing result was invented."
 )
-SKILL_CONTRACT_VERSION = 2
+SKILL_CONTRACT_VERSION = 3
 
 
 class _MaterialSuspended(Exception):
@@ -1020,6 +1020,93 @@ class CoreAgent:
         )
         resolver.resolve_lock()
         return tuple(resolver.discover())
+
+    @staticmethod
+    def _activation_sources(snapshot):
+        state = snapshot.get("skill_activation_sources")
+        if state is None:
+            return None
+        if (not isinstance(state, dict) or type(state.get("version")) is not int
+                or state["version"] != 1 or not isinstance(state.get("sources"), dict)
+                or any(not isinstance(name, str) or not name
+                    or not isinstance(run_id, str) or not run_id
+                    for name, run_id in state["sources"].items())):
+            raise CoreError("CHECKPOINT_INVALID")
+        return state["sources"]
+
+    def _inherited_skills(self, record, effective, declarations, *, lease_token=None):
+        sources, originals = {}, {}
+        previous = record.snapshot.get("previous_root_run_id")
+        if record.parent_run_id is None:
+            visited = {record.run_id}
+            with self.workflow_store._execution_lock(record, lease_token) as (current, connection):
+                while previous is not None:
+                    if not isinstance(previous, str) or not previous or previous in visited:
+                        raise CoreError("CHECKPOINT_INVALID")
+                    visited.add(previous)
+                    source = self._history_source(current, previous, connection=connection)
+                    originals[source.run_id] = source
+                    prior = source.snapshot.get("skills", [])
+                    if not isinstance(prior, list) or any(
+                        not isinstance(skill, dict) or not isinstance(skill.get("name"), str)
+                        or not skill["name"] for skill in prior
+                    ):
+                        raise CoreError("SKILL_INVALID")
+                    for skill in prior:
+                        sources.setdefault(skill["name"], source.run_id)
+                    baseline = self._activation_sources(source.snapshot)
+                    if baseline is not None:
+                        if source.snapshot.get("initializing") or any(
+                            baseline.get(skill["name"]) != source.run_id for skill in prior
+                        ):
+                            raise CoreError("CHECKPOINT_INVALID")
+                        for name, run_id in baseline.items():
+                            sources.setdefault(name, run_id)
+                        break
+                    previous = source.snapshot.get("previous_root_run_id")
+                for run_id in set(sources.values()) - originals.keys():
+                    originals[run_id] = self._history_source(current, run_id, connection=connection)
+        resolver = (self._skill_resolver(effective, declarations, require_lock=True)
+            if any(name in effective.skills for name in sources) else None)
+        inherited = []
+        for name, run_id in sorted(sources.items()):
+            source = originals[run_id]
+            prior = source.snapshot.get("skills", [])
+            if not isinstance(prior, list):
+                raise CoreError("SKILL_INVALID")
+            active = [skill for skill in prior
+                if isinstance(skill, dict) and skill.get("name") == name]
+            if len(active) != 1:
+                raise CoreError("SKILL_INVALID")
+            if name not in effective.skills:
+                continue
+            previous_skill = active[0]
+            old_declarations = source.snapshot.get("admission", {}).get("declared_skills", ())
+            if not isinstance(old_declarations, (list, tuple)) or any(
+                not isinstance(item, dict) or not isinstance(item.get("name"), str)
+                for item in old_declarations
+            ):
+                raise CoreError("SKILL_INVALID")
+            lock = next((item for item in old_declarations if item["name"] == name), {})
+            digest = previous_skill.get("digest")
+            resources = lock.get("resources")
+            if (not isinstance(digest, str)
+                    or not SkillResolver._valid_digest("sha256:" + digest)
+                    or lock.get("digest") != "sha256:" + digest
+                    or not isinstance(resources, dict)
+                    or any(not isinstance(path, str) or not SkillResolver._valid_digest(value)
+                        for path, value in resources.items())
+                    or previous_skill.get("resources") != sorted(resources)
+                    or not isinstance(previous_skill.get("instructions"), str)
+                    or not previous_skill["instructions"].strip()):
+                raise CoreError("SKILL_INVALID")
+            skill = resolver.activate(name)
+            if skill.digest == digest and skill.instructions != previous_skill["instructions"]:
+                raise CoreError("SKILL_INVALID")
+            inherited.append({"name": skill.name, "instructions": skill.instructions,
+                "digest": skill.digest, "resources": list(skill.resources)})
+            sources[name] = record.run_id
+        return inherited, {"version": 1, "sources": sources}
 
     @staticmethod
     def _delegate_schema(schema, effective):
@@ -1999,7 +2086,9 @@ class CoreAgent:
                 {"name": skill.name, "description": skill.description}
                 for skill in skills
             ]
-            snapshot["skills"] = []
+            snapshot["skills"], snapshot["skill_activation_sources"] = self._inherited_skills(
+                record, effective, admitted_skills, lease_token=lease_token
+            )
             compiled = self._compile_instructions(raw, effective, snapshot)
             snapshot["compiled_instructions"] = compiled.text
             snapshot["protected_kernel_digest"] = compiled.protected_digest
@@ -2533,6 +2622,9 @@ class CoreAgent:
                 }
             )
         snapshot.setdefault("skills", []).extend(additions)
+        sources = self._activation_sources(snapshot)
+        if sources is not None:
+            sources.update({name: record.run_id for name in names})
         compiled = self._compile_instructions(raw, effective, snapshot)
         snapshot["compiled_instructions"] = compiled.text
         snapshot["protected_kernel_digest"] = compiled.protected_digest

@@ -315,6 +315,99 @@ class PostgresRestartTests(unittest.TestCase):
         if agent._recovery_thread is not None:
             agent._recovery_thread.join(timeout=1)
 
+    def test_chat_skill_activation_survives_legacy_empty_roots_and_store_restarts(self):
+        import copy
+        from pathlib import Path
+
+        database_url = os.environ["TEST_DATABASE_URL"]
+        database = self._database()
+        self.addCleanup(database.close)
+        database.migrate()
+        self._reset(database)
+        body = "POSTGRES_CHAT_SKILL_BODY\n  Preserve this complete instruction.\n"
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+            "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+            "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/blobs",
+            "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "SKILLS_ROOT": root + "/skills",
+            "CORE_AGENT_ALLOWED_SKILLS": "chat-skill", "LOG_LEVEL": "ERROR",
+        }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
+            package = Path(root) / "skills" / "chat-skill"
+            package.mkdir(parents=True)
+            (package / "SKILL.md").write_text(
+                "---\nname: chat-skill\ndescription: Verify chat work.\n---\n" + body,
+                encoding="utf-8",
+            )
+            (package / "reference.md").write_text("Verified reference.\n", encoding="utf-8")
+            first_model = ScriptedModel([
+                ModelResponse(tool_requests=(ToolRequest("activate", "core_skill_activate", {"names": ["chat-skill"]}),)),
+                ModelResponse(message="verified initial task"),
+            ])
+            first_model.model = "skill-continuity-test"
+            first = create_app(model=first_model, database=database)
+            try:
+                agent = first.state.core_agent
+                activated = agent.run({"prompt": "Verify work"}, task_id="skill-pg-first",
+                    session_id="skill-pg-chat", tenant_id="company", identity="owner")
+                original = agent.workflow_store.lookup_task("skill-pg-first")
+                legacy = agent._new_workflow({"prompt": "Old initialized root"}, task_id="skill-pg-legacy",
+                    session_id="skill-pg-chat", tenant_id="company", identity="owner",
+                    previous_root_run_id=activated.run_id, defer_initialization=True)[0]
+                snapshot = copy.deepcopy(legacy.snapshot)
+                snapshot["initializing"] = False
+                token = agent.workflow_store.acquire_lease(legacy.run_id, tenant_id="company", owner_id="owner",
+                    worker_id="legacy-fixture", ttl=100)
+                agent.workflow_store.transition(legacy.run_id, tenant_id="company", owner_id="owner",
+                    expected_version=legacy.version, state="COMPLETED", snapshot=snapshot,
+                    result={"message": "Old initialized task", "complete": True},
+                    event_kind="task.completed", lease_token=token)
+                agent.workflow_store.release_lease(legacy.run_id, tenant_id="company",
+                    worker_id="legacy-fixture", token=token)
+            finally:
+                first.state.close()
+            reopened = PostgresDatabase(database_url, min_size=0, max_size=1)
+            self.addCleanup(reopened.close)
+            next_model = ScriptedModel([ModelResponse(message="restored skill"), ModelResponse(message="temporarily denied")])
+            next_model.model = first_model.model
+            second = create_app(model=next_model, database=reopened)
+            try:
+                agent = second.state.core_agent
+                following = agent._new_workflow({"prompt": "Continue work"}, task_id="skill-pg-next",
+                    session_id="skill-pg-chat", tenant_id="company", identity="owner",
+                    previous_root_run_id=legacy.run_id, defer_initialization=True)[0]
+                restored = agent.resume_task(following.task_id)
+                saved = agent.workflow_store.lookup_task(following.task_id)
+                self.assertEqual(saved.snapshot["skills"], original.snapshot["skills"])
+                self.assertIn(body, next_model.calls[0].instructions)
+                self.assertEqual(restored.usage.tool_calls, 0)
+                agent.platform_config.allowed_skills.clear()
+                denied = agent._new_workflow({"prompt": "Continue safely"}, task_id="skill-pg-denied",
+                    session_id="skill-pg-chat", tenant_id="company", identity="owner",
+                    previous_root_run_id=following.run_id, defer_initialization=True)[0]
+                agent.resume_task(denied.task_id)
+                denied = agent.workflow_store.lookup_task(denied.task_id)
+                self.assertEqual(denied.snapshot["skills"], [])
+                self.assertNotIn(body, next_model.calls[1].instructions)
+            finally:
+                second.state.close()
+            enabled_database = PostgresDatabase(database_url, min_size=0, max_size=1)
+            self.addCleanup(enabled_database.close)
+            enabled_model = ScriptedModel([ModelResponse(message="reenabled after restart")])
+            enabled_model.model = first_model.model
+            third = create_app(model=enabled_model, database=enabled_database)
+            try:
+                agent = third.state.core_agent
+                enabled = agent._new_workflow({"prompt": "Continue verification"}, task_id="skill-pg-enabled",
+                    session_id="skill-pg-chat", tenant_id="company", identity="owner",
+                    previous_root_run_id=denied.run_id, defer_initialization=True)[0]
+                agent.resume_task(enabled.task_id)
+                saved = agent.workflow_store.lookup_task(enabled.task_id)
+                self.assertEqual(saved.snapshot["skills"], original.snapshot["skills"])
+                self.assertIn(body, enabled_model.calls[0].instructions)
+                self.assertEqual(saved.snapshot["skill_activation_sources"]["sources"], {"chat-skill": enabled.run_id})
+            finally:
+                third.state.close()
+
     def test_pool_replaces_a_connection_the_server_closed_while_idle(self):
         """Managed PostgreSQL drops idle connections; the caller must not see it."""
         import psycopg

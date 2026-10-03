@@ -585,3 +585,12 @@ HTML fallback. CSP ограничивает connections deployment issuer origin
 scripts/styles self, shell не кешируется. Disabled client/absent build дают404.
 Synthetic static fixture доказывает routing/security, но не SPA build,
 реальный Keycloak login и browser interactions.
+
+- ENT-AC-83: активация навыка действует в пределах canonical чата между root
+  Tasks. Новый root перед первым model call получает полное тело текущей
+  разрешённой закреплённой версии, даже после прежних initialized пустых roots
+  или сбоя инициализации. PostgreSQL reopen и compaction сохраняют активацию;
+  отключение скрывает инструкции, повторное включение восстанавливает активацию.
+  Другой chat/tenant/owner scope и child не наследуют её; неверная lineage,
+  activation source или непроверенный legacy lock дают безопасную ошибку.
+  Исторический activation receipt не является источником новой инструкции.

@@ -161,6 +161,7 @@ class ModelHandler(BaseHTTPRequestHandler):
         elif "SKILL_E2E" in context:
             if "E2E_SKILL_MARKER" in body["messages"][0]["content"]:
                 type(self).skill_instructions_seen = True
+                type(self).skill_instruction_payload = body["messages"][0]["content"]
                 message = _text("skill-e2e-ok")
             else:
                 message = _tool(
@@ -388,7 +389,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             "name: e2e-skill\n"
             "description: Applies the specialized response procedure.\n"
             "---\n"
-            "E2E_SKILL_MARKER\n",
+            "E2E_SKILL_MARKER\n  Verify all expected outputs.\nSecond instruction remains exact.\n",
             encoding="utf-8",
         )
         cls.model_server = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
@@ -1251,6 +1252,22 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             "skill-e2e-ok",
         )
         self.assertTrue(ModelHandler.skill_instructions_seen)
+
+    async def test_activated_skill_body_reaches_provider_on_new_root_in_same_chat(self):
+        first = await self._send_task("SKILL_E2E apply the specialized response procedure")
+        ModelHandler.skill_instructions_seen = False
+        agent = self.app.state.core_agent
+        original = agent.workflow_store.lookup_task(first.id)
+        following = agent._new_workflow({"prompt": "SKILL_E2E continue the procedure"},
+            task_id=str(uuid.uuid4()), identity=original.owner_id, tenant_id=original.tenant_id,
+            session_id=original.context_id, previous_root_run_id=original.run_id,
+            defer_initialization=True)[0]
+        result = await asyncio.to_thread(agent.resume_task, following.task_id)
+        self.assertTrue(ModelHandler.skill_instructions_seen)
+        self.assertIn("E2E_SKILL_MARKER\n  Verify all expected outputs.\nSecond instruction remains exact.\n",
+            ModelHandler.skill_instruction_payload)
+        self.assertEqual((result.usage.model_turns, result.usage.tool_calls), (1, 0))
+        self.assertEqual(result.message, "skill-e2e-ok")
 
     async def test_delegated_skill_implies_child_activation_tool(self):
         self.assertEqual(

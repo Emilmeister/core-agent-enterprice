@@ -144,8 +144,35 @@ Composition root закрепляет digest `SKILL.md` и полный manifest
   и текущим tool schemas до следующего model call. Если они не помещаются вместе
   с output reserve, следующий call не отправляется и возвращается
   `CONTEXT_UNRECOVERABLE`.
-- Инструкции активного skill являются pinned, пока его workflow не завершён.
-- После завершения workflow инструкции MAY быть заменены структурированной записью о результате.
+- Активация skill сохраняется между root Tasks одного чата. Перед первым model
+  call нового root runtime MUST восстановить активированные имена из snapshot
+  канонической цепочки `previous_root_run_id`, проверив terminal/root и точное
+  совпадение tenant/owner/context. Квитанции в импортированной истории не являются
+  источником активации. Сабагенты и другой чат не наследуют этот набор.
+- Новый root MUST применить текущий EffectiveConfig и проверить прежний
+  activation digest/resource list против прежней закреплённой declaration.
+  Для оставшихся разрешённых имён он MUST проверить текущий admission lock и
+  закрепить полные инструкции, digest и список ресурсов текущей версии пакета
+  до компиляции инструкций. Новый root является явной policy точкой обновления:
+  смена корректного deployment pin обновляет тело и ресурсы; прежние bytes
+  нельзя использовать с новым pin. Запрещённый сейчас skill не наследуется.
+- Новый initialized root MUST сохранить `skill_activation_sources` version 1:
+  map `sources` из имени в immutable source run ID. Для применённых навыков
+  source — текущий root с проверенным body/pin, для запрещённых — прежний
+  источник активации без предоставления model body или доступа к ресурсам.
+  Снятие временного запрета восстанавливает активацию на новом root boundary.
+- При rollout runtime MUST объединить активации из canonical root snapshots
+  newest-first до первого versioned baseline либо начала чата. Пустой список
+  старого initialized root и failed-before-initialization root не означают
+  деактивацию. После создания baseline следующий root читает его вместо
+  повторного обхода всей истории. Квитанции tool calls не анализируются.
+  Каждая ссылка и activation source проверяются в исходном scope;
+  malformed/unknown-version baseline, missing/foreign/nonterminal/child source
+  или цикл дают `CHECKPOINT_INVALID`, а не пустой набор навыков.
+- Инструкции активного skill являются pinned на каждом model turn его root
+  Task, включая последующие root Tasks чата после указанной проверки. Compaction
+  MUST NOT заменять полное тело summary. Recovery уже инициализированной Task
+  сохраняет её собственную версию инструкций и не обновляет пакет из lineage.
 - Все прочитанные skill resources отражаются в audit по пути и digest.
 - Сабагент видит skill только если parent явно включил его в delegation allowlist;
   остальные skills отсутствуют даже на discovery. Служебные tools активации и
@@ -165,12 +192,17 @@ Composition root закрепляет digest `SKILL.md` и полный manifest
 - Core capability requirements проверяются до model call.
 - Lock snapshot входит в audit и session provenance.
 - Deprecated skill MAY испускать warning, но не менять выбранную версию внутри run.
-- Автоматическое обновление MAY применяться только к новой session или после явной policy точки; reproducible replay всегда использует исходный snapshot.
+- Автоматическое обновление MAY применяться только к новой session или после
+  явной policy точки, включая admission нового root Task; reproducible replay
+  всегда использует исходный snapshot.
 - При восстановлении legacy snapshot с активным `{name, instructions}`, но без
   закреплённых declaration/catalog/digest/resources, runtime продолжает только
   сохранённые instructions. Он не раскрывает ресурсы и не активирует новые
   skills из незакреплённого admission; такой вызов получает `SKILL_INVALID`.
   Молчаливое дополнение из текущей версии на диске запрещено.
+- Legacy activation без закреплённых digest/resources/declaration не может
+  автоматически наследоваться новым root: для разрешённого текущим policy
+  имени инициализация завершается `SKILL_INVALID` до первого model call.
 
 ## Lifecycle registry
 
