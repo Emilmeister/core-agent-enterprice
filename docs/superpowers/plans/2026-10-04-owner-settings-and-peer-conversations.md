@@ -39,7 +39,9 @@
 
 - [x] Update acceptance, release, implementation evidence, exact spec hashes and stable `AGENTS.md` facts after passing checks.
 - [x] Obtain read-only spec/security/code review and resolve material findings.
-- [ ] Commit logical changes, merge into local main and deploy the checked amd64 image to both existing clusters under prior authorization.
-- [ ] Verify actual running image and public UI/readiness. Do not connect the agents or send production A2A tasks automatically.
+- [x] Commit logical changes, merge into local main and deploy the checked amd64 image to both existing clusters under prior authorization.
+- [x] Verify actual running image and public UI/readiness. Do not connect the agents or send production A2A tasks automatically.
 
 Verification: full suite with real PostgreSQL and Keycloak passed (1843 tests, 3 dedicated environment skips); the separate native owner browser gate passed in 180.528 seconds. TypeScript/build, Ruff, spec quality/lock and the final amd64 image module smoke passed. Security/code reviews covered immutable settings, current-material visibility, bounded provenance, owner scope and fenced polling.
+
+Deployment verified on both existing clusters: https://37.44.196.209/ui/ and https://37.44.197.46/ui/. Each has one ready updated agent replica; HTTPS UI/readiness returned 200 and deployed settings, peer, runtime and history sources match the checked repository. Both run `core-agent-enterprice.cr.cloud.ru/core-agent@sha256:006efbe4f07b81e067a0a9ab5aaf8469d74ea8dd376ecd0a3c2a8f19d38d7216`. The agents were not connected and no production A2A tasks were sent.
