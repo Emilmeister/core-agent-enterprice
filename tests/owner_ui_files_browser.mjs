@@ -1,6 +1,6 @@
 // Actual app DOM/network proof. Credentials and wire payloads stay in memory.
 import {createHash} from 'node:crypto';
-import {readFile,writeFile} from 'node:fs/promises';
+import {readFile,writeFile,unlink} from 'node:fs/promises';
 let input='';
 for await(const chunk of process.stdin) input+=chunk;
 const config=JSON.parse(input);
@@ -61,26 +61,32 @@ const apiResponses=[],dialogs=[];
 let peerPostAttempts=0,peerDeleteAttempts=0;
 let rejectNextAccessDelete=false,rejectNextPeerDelete=false;
 const peerSecret='Browser-private-peer-secret-739',schedulePrompt='Browser manual cron in the original chat';
+const configuredBuiltinTools=['core_terminal_exec','core_response_files','core_cron_create','core_ask_owner',
+  'core_task_start','core_task_wait','core_python_exec','core_agent_send_message'].sort();
+const configuredPolicyCatalog=`JSON.stringify([...document.querySelectorAll('form.policy:not([hidden])')].map(form=>form.dataset.toolName).sort())===${JSON.stringify(JSON.stringify(configuredBuiltinTools))}`;
 function observeOwnerAPI(tab){
   const pending=new Map();
   tab.on('Network.requestWillBeSent',({requestId,request})=>{
     const url=new URL(request.url);
-    if(url.origin!==config.origin||!(/^\/api\/(tool-policies|schedules|remote-agents|external-access|chats\/[^/]+\/(files|title))(\/|$)/.test(url.pathname)||(request.method==='DELETE'&&/^\/api\/chats\/[^/]+$/.test(url.pathname))))return;
+    if(url.origin!==config.origin||!(/^\/api\/(tool-policies|schedules|remote-agents|external-access|agent-settings|chats\/[^/]+\/(files|title|peer-conversations))(\/|$)/.test(url.pathname)||(request.method==='DELETE'&&/^\/api\/chats\/[^/]+$/.test(url.pathname))))return;
     if(url.pathname==='/api/remote-agents'&&request.method==='POST')peerPostAttempts++;
     if(request.method==='DELETE'&&/^\/api\/remote-agents\/[^/]+\/connection$/.test(url.pathname))peerDeleteAttempts++;
     pending.set(requestId,{path:url.pathname,query:url.search,method:request.method,request:request.postData?JSON.parse(request.postData):null,authorized:!!(request.headers.Authorization??request.headers.authorization)});
   });
   tab.on('Network.responseReceived',({requestId,response})=>{const request=pending.get(requestId);if(request)request.status=response.status;});
+  tab.on('Network.loadingFailed',({requestId})=>{pending.delete(requestId);});
   tab.on('Network.loadingFinished',async({requestId})=>{
     const request=pending.get(requestId);if(!request)return;pending.delete(requestId);
     // Content downloads are binary and are measured separately below.
-    if(request.path.endsWith('/content'))return;
-    const response=await tab.call('Network.getResponseBody',{requestId});
+    if(request.path.endsWith('/content')||request.path.includes('/outgoing-files/'))return;
+    let response;
+    try{response=await tab.call('Network.getResponseBody',{requestId});}
+    catch(error){if(request.method==='GET'&&error.message==='No resource with given identifier found')return;throw error;}
     const body=JSON.parse(response.base64Encoded?Buffer.from(response.body,'base64').toString():response.body);
     apiResponses.push({...request,body});
   });
   tab.on('Page.javascriptDialogOpening',async({type,message})=>{
-    if(type!=='confirm'||!['Удалить расписание?', 'Есть неотправленное сообщение', 'Результат удаления ещё не подтверждён.', 'Удалить учётку «','Удалить подключение «'].some(prefix=>message.startsWith(prefix)))throw new Error('Unexpected actual owner confirmation');
+    if(type!=='confirm'||!['Удалить расписание?', 'Есть неотправленное сообщение', 'Результат удаления ещё не подтверждён.', 'Удалить учётку «','Удалить подключение «','Удалить MCP-подключение'].some(prefix=>message.startsWith(prefix)))throw new Error('Unexpected actual owner confirmation');
     const rejectAccess=rejectNextAccessDelete&&message.startsWith('Удалить учётку «');
     const rejectPeer=rejectNextPeerDelete&&message.startsWith('Удалить подключение «');
     const reject=rejectAccess||rejectPeer;
@@ -91,7 +97,7 @@ function observeOwnerAPI(tab){
 }
 async function ownerAction(tab,path,method,action){
   const before=apiResponses.length;await action();
-  await waitFor(()=>apiResponses.slice(before).some(response=>response.path===path&&response.method===method),'actual owner '+method+' response');
+  await waitFor(()=>{if(tab.failure)throw tab.failure;return apiResponses.slice(before).some(response=>response.path===path&&response.method===method);},'actual owner '+method+' '+path+' response');
   const response=apiResponses.slice(before).find(response=>response.path===path&&response.method===method);
   if(!response.authorized||response.status<200||response.status>=300)throw new Error('Actual owner action was not accepted: '+method+' '+path+' status='+response.status);
   return response;
@@ -180,7 +186,7 @@ try {
   loseNext=true;
   await page.call('Fetch.enable',{patterns:[{urlPattern:config.origin+'/a2a/owner/message:send',requestStage:'Response'}]});
   await page.click('Отправить ↑');
-  await page.wait("document.querySelector('.thread [role=alert]')?.textContent.includes('Повторите тот же запрос')",'uncertain accepted follow-up');
+  await page.wait("document.querySelector('.thread [role=alert]')?.textContent.includes('Повторите тот же запрос')&&document.querySelector('.composer textarea').disabled&&document.querySelector('input[type=file]').disabled&&document.querySelector('.composer-attachments button').disabled",'uncertain accepted follow-up is frozen');
   check(dropped===1&&!!lostReceipt&&await page.evaluate("document.querySelector('.composer textarea').disabled&&document.querySelector('input[type=file]').disabled&&document.querySelector('.composer-attachments button').disabled"),'lost completed ACK preserves and freezes pending follow-up');
 
   const created=await page.call('Target.createTarget',{url:'about:blank'});second=await CDP.page(created.targetId);
@@ -211,7 +217,7 @@ try {
   check(receipts.at(-1).accepted_file_receipt.batch_id===lostReceipt.batch_id&&receipts.at(-1).accepted_file_receipt.entries[0].actual_name==='report_3.txt','repeated follow-up ACK reuses server-owned actual filename and batch');
   await setLimit(25000000);
   await second.click('Инструменты','.nav-item');
-  await second.wait("document.querySelectorAll('form.policy:not([hidden])').length===7",'actual configured tool policy catalog');
+  await second.wait(configuredPolicyCatalog,'actual configured tool policy catalog');
   async function setPolicy(name,mode,exempt){
     const response=await ownerAction(second,'/api/tool-policies/'+name,'PUT',async()=>{
       await second.evaluate(`(()=>{const form=[...document.querySelectorAll('form.policy')].find(form=>form.dataset.toolName===${JSON.stringify(name)});const select=form.querySelector('select');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(select,${JSON.stringify(mode)});select.dispatchEvent(new Event('change',{bubbles:true}));const checkbox=form.querySelector('input[type=checkbox]');if(checkbox.checked!==${!exempt})checkbox.click();})()`);
@@ -535,7 +541,7 @@ try {
   check(retained.length===preservedHistory.length&&retained.every((item,index)=>JSON.stringify(item)===JSON.stringify(preservedHistory[index]))&&retained.some(item=>item.text?.startsWith('Native file reads completed.'))&&retained.some(item=>item.text==='Native manual cron completed.'),'browser reload preserves both completed roots and immutable file history after cleanup');
   await setLimit(25000000);
   await second.click('Инструменты','.nav-item');
-  await second.wait("document.querySelectorAll('form.policy:not([hidden])').length===7",'owner-question policy catalog');
+  await second.wait(configuredPolicyCatalog,'owner-question policy catalog');
   await setPolicy('core_ask_owner','allow',true);
   await setPolicy('core_task_start','allow',true);
   await setPolicy('core_task_wait','allow',true);
@@ -720,6 +726,96 @@ try {
   check(await page.evaluate(`(async()=>{const response=await fetch('/api/browser-reply-fixture',{method:'POST',headers:{Authorization:${JSON.stringify(bearer)}},credentials:'omit'});return response.status===200;})()`),'authenticated native fixture releases the actual provider');
   await page.wait("document.querySelector('.thread .markdown h1')?.textContent==='Native streamed reply'&&!document.querySelector('.live-answer')",'stored final reply replaces provisional text');
   check(await page.evaluate("document.querySelectorAll('.thread .markdown h1').length===1&&document.querySelector('.thread .markdown .hljs-built_in')?.textContent==='print'&&!document.querySelector('.thread').textContent.includes('private-native-reasoning')"),'canonical final reply replaces preview once with safe Markdown and Python');
+  // New settings and peer conversation exercise real owner routes, provider GET,
+  // loopback A2A transport, PostgreSQL scheduler and actual DOM; no response mock.
+  {
+  await second.click('Настройки','.nav-item');
+  await second.wait("!!document.querySelector('.agent-profile-settings textarea')",'owner agent configuration forms');
+  await second.field('.agent-profile-settings textarea','Native owner profile proof');
+  const savedProfile=await ownerAction(second,'/api/agent-settings','PUT',()=>second.click('Сохранить профиль','.agent-profile-settings button'));
+  check(savedProfile.body.profile_prompt==='Native owner profile proof'&&!savedProfile.body.inherits.profile_prompt,'owner profile is persisted independently');
+  await second.wait("[...document.querySelector('.agent-model-settings select').options].some(option=>option.value==='browser-model-two')",'actual fixed-provider model list');
+  await second.field('.agent-model-settings select','browser-model-two');
+  const savedModel=await ownerAction(second,'/api/agent-settings','PUT',()=>second.click('Сохранить модель','.agent-model-settings button'));
+  check(savedModel.body.model_id==='browser-model-two'&&savedModel.body.profile_prompt==='Native owner profile proof','provider model selection preserves independently saved profile');
+  const fixtureCommand=async command=>page.evaluate(`(async()=>{const response=await fetch('/api/browser-peer-fixture',{method:'POST',headers:{Authorization:${JSON.stringify(bearer)},'Content-Type':'application/json'},body:${JSON.stringify(JSON.stringify(command))},cache:'no-store',credentials:'omit'});if(response.status!==200)throw new Error('Controlled peer request failed');return response.json();})()`);
+  await fixtureCommand({models_available:false});
+  const beforeModels=apiResponses.length;
+  await second.click('Обновить список моделей','.agent-model-settings button');
+  await waitFor(()=>apiResponses.slice(beforeModels).some(response=>response.path==='/api/agent-settings/models'&&response.status===503),'actual provider discovery outage');
+  check(await second.evaluate("document.querySelector('.agent-model-settings select').value==='browser-model-two'"),'provider model outage preserves current selection');
+  await fixtureCommand({models_available:true});
+  await second.click('Обновить список моделей','.agent-model-settings button');
+  await second.click('Добавить MCP-сервер','.agent-mcp-settings button');
+  await second.field('.agent-mcp-connection input[pattern]','browser-mcp');
+  await second.field('.agent-mcp-connection input[type=url]','http://127.0.0.1:8001/mcp');
+  await second.field('.agent-mcp-connection input[type=password]','Bearer browser-mcp-credential');
+  await second.evaluate("[...document.querySelectorAll('.agent-mcp-connection label')].find(label=>label.textContent.includes('Подключён')).querySelector('input').click()");
+  const savedMcp=await ownerAction(second,'/api/agent-settings','PUT',()=>second.click('Сохранить подключение','.agent-mcp-connection button'));
+  const mcp=savedMcp.body.mcp_servers.find(server=>server.name==='browser-mcp');
+  check(mcp&&!mcp.enabled&&mcp.has_header_value&&!('header_value' in mcp)&&!JSON.stringify(savedMcp.body).includes('browser-mcp-credential'),'MCP owner connection is persisted with write-only credentials');
+  for(const enabled of [true,false]){
+    await second.evaluate("[...document.querySelectorAll('.agent-mcp-connection label')].find(label=>label.textContent.includes('Подключён')).querySelector('input').click()");
+    const changed=await ownerAction(second,'/api/agent-settings','PUT',()=>second.click('Сохранить подключение','.agent-mcp-connection button'));
+    check(changed.body.mcp_servers.find(server=>server.name==='browser-mcp')?.enabled===enabled,'MCP individual connection '+(enabled?'enable':'disable')+' persists');
+  }
+  // Give a second row an unsaved draft: saving the first must not commit it.
+  await second.click('Добавить MCP-сервер','.agent-mcp-settings button');
+  await second.field('.agent-mcp-connection:last-of-type input[pattern]','unsaved-mcp');
+  const isolatedSave=await ownerAction(second,'/api/agent-settings','PUT',()=>second.click('Сохранить подключение','.agent-mcp-connection:first-of-type button'));
+  check(!isolatedSave.body.mcp_servers.some(server=>server.name==='unsaved-mcp')&&await second.evaluate("document.querySelector('.agent-mcp-connection:last-of-type input[pattern]').value==='unsaved-mcp'"),'saving one MCP connection preserves and does not commit another draft');
+  await second.click('Удалить подключение','.agent-mcp-connection:last-of-type button');
+  const deletedMcp=await ownerAction(second,'/api/agent-settings','PUT',()=>second.click('Удалить подключение','.agent-mcp-connection button'));
+  check(deletedMcp.body.mcp_servers.length===0,'confirmed MCP deletion affects only the selected connection');
+  await second.click('Агенты','.nav-item');
+  await second.wait("!document.querySelector('.page [role=status]')&&!!document.querySelector('.peer')",'actual peer registry is ready');
+  await second.click('Добавить агента ＋');
+  await second.field('.form-sheet input[pattern]','browser-peer');
+  await second.field('.form-sheet input[type=url]','http://127.0.0.1:8001/a2a/');
+  await second.field('.form-sheet textarea','Native public peer');
+  await second.field('.form-sheet select','replace');
+  await second.wait("!!document.querySelector('.form-sheet input[type=password]')",'controlled peer credentials editor');
+  await second.field('.form-sheet input[type=password]','Bearer browser-peer-credential');
+  const peer=await ownerAction(second,'/api/remote-agents','POST',()=>second.click('Сохранить подключение','.form-sheet button'));
+  check(peer.body.name==='browser-peer','controlled native peer is admitted through real owner registry');
+  await second.wait("!document.querySelector('.form-sheet')",'controlled peer connection is saved');
+  await second.click('Инструменты','.nav-item');
+  await second.wait(configuredPolicyCatalog,'tool catalog before controlled peer task');
+  await setPolicy('core_agent_send_message','allow',false);
+  await page.call('Page.bringToFront');
+  await page.call('Emulation.setDeviceMetricsOverride',{width:1440,height:960,deviceScaleFactor:1,mobile:false});
+  await page.files(config.files.slice(0,1));
+  await page.wait("document.querySelectorAll('.composer-attachments li').length===1",'selected outgoing peer file');
+  await page.field('.composer textarea','Native public peer conversation proof');
+  await page.click('Отправить ↑');
+  await page.wait("document.querySelectorAll('.thread .peer-conversation-card').length===1",'compact canonical peer conversation card');
+  const observationBefore=apiResponses.length;
+  await page.click('Переписка','.peer-conversation-card button');
+  await page.wait("document.querySelector('.peer-messages')?.textContent.includes('Подготовь краткий отчёт по поручению.')&&document.querySelector('.peer-messages')?.textContent.includes('Поручение принято.')",'public outgoing request and initial peer reply');
+  await waitFor(()=>apiResponses.slice(observationBefore).some(response=>response.path.endsWith('/observation')&&response.method==='POST'&&response.status===200),'real visible observation heartbeat');
+  await page.wait("!!document.querySelector('.peer-outgoing .file-card')",'selected outgoing file appears with the actual request');
+  await unlink(config.downloads+'/report.txt').catch(error=>{if(error.code!=='ENOENT')throw error;});
+  await page.click('Скачать','.peer-outgoing .file-card button');
+  check((await downloaded({name:'report.txt'})).equals(await readFile(config.files[0])),'outgoing peer file download preserves selected frozen bytes');
+  check(await page.evaluate("(()=>{const thread=document.querySelector('.thread'),panel=document.querySelector('.peer-conversation-panel');return thread.getBoundingClientRect().right<=panel.getBoundingClientRect().left+1&&thread.clientHeight>100;})()"),'desktop peer panel leaves the main chat visible');
+  await page.wait("document.querySelector('.peer-messages')?.textContent.includes('Проверяю данные для поручения.')",'public peer progress arrives before task completion');
+  const workingPeer=await page.evaluate(`(async()=>{const response=await fetch('/api/browser-peer-fixture',{headers:{Authorization:${JSON.stringify(bearer)}},credentials:'omit'});return response.json();})()`);
+  check(!workingPeer.finished&&workingPeer.sends===1&&workingPeer.gets>0&&!await page.evaluate("document.querySelector('.peer-conversation-panel').textContent.includes('private-peer-reasoning')"),'intermediate A2A updates are real and exclude private reasoning');
+  const mainScroll=await page.evaluate("(()=>{const thread=document.querySelector('.thread');thread.scrollTop=0;thread.dispatchEvent(new Event('scroll',{bubbles:true}));const panel=document.querySelector('.peer-messages');panel.scrollTop=0;panel.dispatchEvent(new Event('scroll',{bubbles:true}));return thread.scrollTop;})()");
+  await fixtureCommand({finish:true});
+  await page.wait("[...document.querySelectorAll('.peer-message .markdown strong')].some(node=>node.textContent==='Проверка завершена.')&&document.querySelector('.peer-files')?.textContent.includes('peer-report.txt')",'persisted final peer response and authenticated file');
+  check(await page.evaluate(`document.querySelector('.thread').scrollTop===${mainScroll}&&!!document.querySelector('.peer-new-messages')&&new Set([...document.querySelectorAll('[data-peer-message]')].map(node=>node.dataset.peerMessage)).size===document.querySelectorAll('[data-peer-message]').length`),'peer final update preserves main and panel reading position without duplicate messages');
+  await page.click('Новые сообщения ↓','.peer-new-messages');
+  await page.click('Скачать','.peer-files button');
+  check((await downloaded({name:'peer-report.txt'})).toString()==='Native peer report\n','peer file download retains original authenticated bytes');
+  await page.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  await page.wait("!document.querySelector('.peer-conversation-panel')&&document.activeElement?.textContent.includes('Переписка')",'Escape closes peer panel and returns focus');
+  await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  await page.evaluate("document.querySelector('.peer-panel-toggle').click()");
+  check(await page.evaluate("document.documentElement.scrollWidth<=innerWidth&&getComputedStyle(document.querySelector('.thread')).visibility==='hidden'&&document.querySelector('.peer-conversation-panel').getBoundingClientRect().width<=innerWidth"),'mobile peer panel avoids hidden chat controls and horizontal overflow');
+  await page.click('×','.peer-panel-heading button');
+  await page.call('Emulation.clearDeviceMetricsOverride');
+  }
   const revokedBearer=bearer;
   const exitRequests=[];
   page.on('Network.requestWillBeSent',({request})=>{

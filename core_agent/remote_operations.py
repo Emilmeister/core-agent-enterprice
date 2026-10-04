@@ -7,6 +7,7 @@ import json
 from .errors import CoreError, ExecutionNotStarted
 from .remote_agents import RemoteAgentCard, RemoteAgentConnection, _trusted_headers, _validate_response_files
 from .security import redact
+from .peer_conversations import public_identity
 from .tasks import REMOTE_PROGRESS_STATES, REMOTE_TASK_PENDING
 from .workspace import WorkspaceBinding
 
@@ -39,9 +40,10 @@ class RemoteA2AExecutor:
                     pass
         return REMOTE_TASK_PENDING
 
-    def _commit(self, claim, current, checkpoint, outcome=None, progress=None, prepared_file_batch=None):
+    def _commit(self, claim, current, checkpoint, outcome=None, progress=None, prepared_file_batch=None, conversation_observation=None):
         return self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
                                                   checkpoint=checkpoint, outcome=outcome, progress=progress,
+                                                  conversation_observation=conversation_observation,
                                                   **({"prepared_file_batch": prepared_file_batch} if prepared_file_batch is not None else {}))
 
     def _finish(self, claim, current, state, result, error_code=None):
@@ -88,7 +90,7 @@ class RemoteA2AExecutor:
         return tuple({"name": ref["name"], "media_type": ref["media_type"], "raw": content}
                      for ref, content in loaded)
 
-    def _accept_files(self, claim, current, checkpoint, event, result, headers):
+    def _accept_files(self, claim, current, checkpoint, event, result, headers, conversation_observation):
         service = self.chat_file_service
         if service is None or service is not getattr(self.scheduler, "chat_file_service", None):
             raise CoreError("FILE_ADMISSION_TRANSACTION_REQUIRED")
@@ -131,7 +133,7 @@ class RemoteA2AExecutor:
             limit_bytes=contract["attachment_limit_bytes"])
         prepared = {key: stage[key] for key in ("batch_id", "lease_token", "actor_id", "message_id", "request_digest")}
         try:
-            return self._commit(claim, current, checkpoint, ("completed", result, None), prepared_file_batch=prepared)
+            return self._commit(claim, current, checkpoint, ("completed", result, None), prepared_file_batch=prepared, conversation_observation=conversation_observation)
         finally:
             # The transaction and every source/job/batch lock have exited before cleanup.
             stored = service.store.get(stage["batch_id"], claim.tenant_id)
@@ -220,6 +222,15 @@ class RemoteA2AExecutor:
             }, "REMOTE_PARTS_UNSUPPORTED"))
             return
 
+        published = list(event.messages)
+        if not event.public_messages_complete and not published and event.text and event.state not in {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"}:
+            # Legacy adapters supply only the current public snapshot, never reconstructed history.
+            published = [{"id": public_identity("snapshot", event.text), "text": event.text}]
+        safe_messages = []
+        for message in published:
+            text = redact(message["text"], known_secrets=self._secrets(headers))
+            safe_messages.append({"id": public_identity(message["id"], text), "text": text})
+        observation = {"messages": safe_messages, "history_truncated": event.history_truncated}
         result = {"agent_name": current["contract"]["peer_name"], "remote_state": event.state,
                   "text": redact(event.text, known_secrets=self._secrets(headers))}
         terminal = {
@@ -233,7 +244,7 @@ class RemoteA2AExecutor:
         if terminal is not None:
             if completed_files and event.has_files:
                 try:
-                    self._accept_files(claim, current, checkpoint, event, result, headers)
+                    self._accept_files(claim, current, checkpoint, event, result, headers, observation)
                 except CoreError as error:
                     if error.code in {"LEASE_LOST", "WORKER_STOPPED"}:
                         raise
@@ -242,14 +253,14 @@ class RemoteA2AExecutor:
                         "agent_name": current["contract"]["peer_name"], "reason": error.code.lower()},
                         None if state == "canceled" else error.code))
             else:
-                self._commit(claim, current, checkpoint, (terminal[0], result, terminal[1]))
+                self._commit(claim, current, checkpoint, (terminal[0], result, terminal[1]), conversation_observation=observation)
         elif method == "cancel_task":
             # A non-terminal cancel response has not confirmed the mutation. Do not repeat it.
             self._unknown(claim, current)
         else:
-            self._poll_later(claim, current, checkpoint, progress={"agent_name": current["contract"]["peer_name"], "remote_state": event.state})
+            self._poll_later(claim, current, checkpoint, progress={"agent_name": current["contract"]["peer_name"], "remote_state": event.state}, conversation_observation=observation)
 
-    def _poll_later(self, claim, current, checkpoint=None, progress=None):
+    def _poll_later(self, claim, current, checkpoint=None, progress=None, conversation_observation=None):
         checkpoint = current["checkpoint"] if checkpoint is None else checkpoint
         contract, now = current["contract"], current["now"]
         started_at = checkpoint["deadline"] - contract["timeout_seconds"]
@@ -259,4 +270,7 @@ class RemoteA2AExecutor:
             if now < boundary:
                 next_poll = min(next_poll, now + interval, boundary)
                 break
-        self._commit(claim, current, {**checkpoint, "next_poll_at": next_poll}, progress=progress)
+        if (current.get("observed_until") or 0) > now:
+            next_poll = min(next_poll, now + 15)
+        self._commit(claim, current, {**checkpoint, "next_poll_at": next_poll}, progress=progress,
+                     conversation_observation=conversation_observation)

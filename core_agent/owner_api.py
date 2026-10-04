@@ -626,6 +626,8 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
             Route("/api/external-access/{account_id}", endpoint, methods=["DELETE"]),
         ])
     if admission is not None:
+        from .peer_conversations import peer_conversation_routes
+        routes.extend(peer_conversation_routes(agent, admission))
         routes.append(Route("/api/chats", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/tasks/{task_id}/files/{file_id}", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/history", endpoint))

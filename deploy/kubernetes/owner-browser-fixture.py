@@ -6,6 +6,9 @@ import socket
 import socketserver
 import sys
 import threading
+import time
+import base64
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 def relay():
@@ -41,7 +44,7 @@ def backend():
     from starlette.routing import Route
     from core_agent.app import create_app
     from core_agent.guardrails import GuardrailClassifier
-    from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
+    from core_agent.model import CompatibleHttpModel, ModelResponse, ScriptedModel, ToolRequest
     from core_agent.sandbox import SandboxLauncher
 
     class ClearModel:
@@ -77,9 +80,65 @@ print({marker!r})
 """
         return ModelResponse(tool_requests=(ToolRequest(marker, "core_terminal_exec", {"argv": ["python3", "-P", "-c", code]}),))
 
-    class BrowserModel(ScriptedModel):
+    peer_release = threading.Event()
+    peer_state = {"sends": 0, "gets": 0, "message": None, "models_available": True}
+    peer_url = "http://127.0.0.1:8001/a2a/"
+
+    class PublicPeer(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def send_json(self, value, status=200):
+            body = json.dumps(value).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/v1/models":
+                assert self.headers.get("Authorization") == "Bearer browser-provider-credential"
+                return self.send_json({"data": [{"id": "owner-browser-fixture"}, {"id": "browser-model-two"}]},
+                                      200 if peer_state["models_available"] else 503)
+            if self.path.endswith("/.well-known/agent-card.json"):
+                return self.send_json({"name": "browser-peer", "description": "Native public A2A peer",
+                    "supportedInterfaces": [{"url": peer_url, "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
+                    "capabilities": {"streaming": False}, "skills": []})
+            return self.send_json({}, 404)
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert self.path == "/a2a/" and self.headers.get("Authorization") == "Bearer browser-peer-credential"
+            method = payload["method"]
+            if method == "SendMessage":
+                peer_state["sends"] += 1
+                peer_state["message"] = payload["params"]["message"]
+            else:
+                assert method == "GetTask", "Unexpected remote mutation"
+                peer_state["gets"] += 1
+            messages = [{"messageId": "peer-accepted", "role": "ROLE_AGENT", "parts": [{"text": "Поручение принято."}]}]
+            if peer_state["gets"]:
+                messages.append({"messageId": "peer-progress", "role": "ROLE_AGENT", "parts": [
+                    {"text": "Проверяю данные для поручения.\n\n" + "\n".join(f"- Пункт проверки {index}" for index in range(55))},
+                    {"text": "private-peer-reasoning", "metadata": {"kind": "reasoning"}}]})
+            task = {"id": "browser-public-peer-task", "contextId": "browser-public-peer-context",
+                    "status": {"state": "TASK_STATE_COMPLETED" if peer_release.is_set() else "TASK_STATE_WORKING"},
+                    "history": messages}
+            if peer_release.is_set():
+                task["artifacts"] = [{"artifactId": "peer-result", "parts": [
+                    {"text": "**Проверка завершена.** Отчёт подготовлен."},
+                    {"filename": "peer-report.txt", "mediaType": "text/plain", "raw": base64.b64encode(b"Native peer report\n").decode()}]}]
+            self.send_json({"jsonrpc": "2.0", "id": payload["id"], "result": {"task": task} if method == "SendMessage" else task})
+
+    peer_server = ThreadingHTTPServer(("127.0.0.1", 8001), PublicPeer)
+    threading.Thread(target=peer_server.serve_forever, daemon=True).start()
+
+    class BrowserModel(ScriptedModel, CompatibleHttpModel):
         def __init__(self, responses):
             super().__init__(responses)
+            CompatibleHttpModel.__init__(self, api_format="openai", model="owner-browser-fixture",
+                                         base_url="http://127.0.0.1:8001/v1", api_key="browser-provider-credential", stream=True)
             self.reply_started = threading.Event()
             self.reply_release = threading.Event()
             self.reply_finished = threading.Event()
@@ -87,6 +146,9 @@ print({marker!r})
 
         def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
             index = len(self.calls)
+            if index == 15:
+                assert self.model == "browser-model-two", "new root did not use owner model selection"
+                assert "Native owner profile proof" in str(instructions), "new root did not use owner profile"
             if index == 14:
                 assert not tools, "public answer turn still exposes tools"
                 assert on_delta is not None, "model streaming callback is absent"
@@ -123,11 +185,20 @@ print({marker!r})
             if index == 5:
                 assert "Native file reads completed." in context, "manual cron lost original chat history"
             response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
-            if response.tool_requests and response.tool_requests[0].id == "browser-background-wait":
+            if index == 15:
+                attached = next(message["content"] for message in reversed(messages)
+                                if message.get("role") == "user" and "Attached files: " in message.get("content", ""))
+                folder = attached.rsplit("; folder: /workspace/", 1)[1].strip()
+                response = ModelResponse(tool_requests=(ToolRequest("browser-peer-send", "core_agent_send_message", {
+                    "agent_name": "browser-peer", "task": "Подготовь краткий отчёт по поручению.",
+                    "files": [folder + "/report.txt"]}),))
+            if response.tool_requests and response.tool_requests[0].id in {"browser-background-wait", "browser-peer-wait"}:
+                waiting = response.tool_requests[0].id
+                source = "browser-peer-send" if waiting == "browser-peer-wait" else "browser-background-failure"
                 admitted = next(json.loads(message["content"]) for message in messages
-                                if message.get("tool_call_id") == "browser-background-failure")
+                                if message.get("tool_call_id") == source)
                 assert admitted["status"] == "succeeded"
-                response = ModelResponse(tool_requests=(ToolRequest("browser-background-wait", "core_task_wait",
+                response = ModelResponse(tool_requests=(ToolRequest(waiting, "core_task_wait",
                     {"task_id": admitted["output"]["task_id"]}),))
             return response
 
@@ -201,6 +272,10 @@ flowchart LR
         ModelResponse(message="Owner clarification received; the command failed with exit code 3."),
         ModelResponse(tool_requests=(ToolRequest("browser-public-reply", "core_response_begin", {}),)),
         ModelResponse(message="# Native streamed reply\n\n```python\nprint('live reply complete')\n```\n\nNative streaming completed."),
+        ModelResponse(tool_requests=(ToolRequest("browser-peer-send", "core_agent_send_message", {
+            "agent_name": "browser-peer", "task": "Подготовь краткий отчёт по поручению."}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-peer-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
+        ModelResponse(message="Ответ внешнего агента и отчёт получены."),
     ])
     model.model = "owner-browser-fixture"
     app = create_app(model=model, guardrail_classifier=GuardrailClassifier(ClearModel()))
@@ -213,6 +288,16 @@ flowchart LR
                             headers={"Cache-Control": "no-store"})
 
     app.routes.append(Route("/api/browser-reply-fixture", reply_fixture, methods=["GET", "POST"]))
+    async def peer_fixture(request):
+        if request.method == "POST":
+            payload = await request.json()
+            if payload.get("finish"):
+                peer_release.set()
+            if "models_available" in payload:
+                peer_state["models_available"] = payload["models_available"]
+        return JSONResponse({"sends": peer_state["sends"], "gets": peer_state["gets"], "finished": peer_release.is_set(),
+                             "now": time.time()}, headers={"Cache-Control": "no-store"})
+    app.routes.append(Route("/api/browser-peer-fixture", peer_fixture, methods=["GET", "POST"]))
     assert isinstance(app.state.core_agent.tool_runtime.environment_manager.backend.launcher, SandboxLauncher)
     uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)
 

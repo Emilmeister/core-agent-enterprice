@@ -1181,6 +1181,54 @@ main {
 .conversation-files-panel .workspace-files { width: 100%; max-height: none; margin: 8px 0 0; padding: 0; border: 0; background: transparent; }
 .file-cleanup { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 20px; }
 .file-card { min-width: 0; }
+.peer-conversation-card { padding: 14px 16px; margin: 12px 0; border: 1px solid var(--line); border-radius: 14px; background: #fafafa; }
+.peer-card-heading, .peer-card-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.peer-card-heading strong { font-size: 14px; overflow-wrap: anywhere; }
+.peer-status { font-size: 12px; color: var(--muted); }
+.peer-status-error { color: #a43a32; }
+.peer-card-preview { font-size: 13px; margin: 10px 0; white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.peer-card-footer { margin-top: 10px; }
+.peer-card-footer .muted { font-size: 11px; }
+.peer-card-footer button { padding: 6px 12px; min-height: 34px; font-size: 12px; }
+.peer-action-details { margin: 0 4px 16px; }
+.peer-action-details > summary { color: var(--muted); font-size: 12px; }
+.peer-panel-open { padding-right: 380px; }
+.peer-panel-open .chat-heading { padding-inline: 20px; gap: 12px; flex-wrap: wrap; }
+.peer-conversation-panel { position: absolute; top: 0; bottom: 0; right: 0; width: 380px; display: flex; flex-direction: column; min-width: 0; background: #fff; border-left: 1px solid var(--line); z-index: 7; }
+.peer-panel-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; padding: 22px 18px 14px; }
+.peer-panel-heading h2 { font-size: 18px; letter-spacing: -.2px; }
+.peer-panel-heading .muted { font-size: 12px; margin-top: 4px; overflow-wrap: anywhere; }
+.chat-heading-actions { flex-wrap: wrap; justify-content: flex-end; }
+.peer-panel-heading button { min-width: 34px; font-size: 24px; line-height: 1; }
+.peer-operation-select { padding: 0 18px 12px; font-size: 12px; }
+.peer-operation-select select { font-size: 12px; min-height: 36px; padding: 8px; }
+.peer-panel-status { padding: 0 18px 12px; font-size: 12px; color: var(--muted); }
+.peer-messages { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 14px 18px 22px; scroll-padding-block: 16px; border-block: 1px solid var(--line); }
+.peer-message { margin-bottom: 16px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; overflow-wrap: anywhere; }
+.peer-outgoing { background: #f7f7f7; }
+.peer-incoming { border-color: transparent; padding-inline: 0; }
+.peer-message-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; font-size: 11px; color: var(--muted); }
+.peer-message-heading strong { min-width: 0; overflow-wrap: anywhere; }
+.peer-message-heading time { flex-shrink: 0; }
+.peer-message .markdown { font-size: 13px; }
+.peer-message pre { max-height: 280px; font-size: 11px; }
+.peer-message .markdown table { display: block; overflow-x: auto; }
+.peer-files h3 { font-size: 13px; margin: 18px 0 8px; }
+.peer-availability-note { font-size: 11px; line-height: 1.6; }
+.peer-panel-footer { padding: 12px 18px; }
+.peer-panel-footer .section-line { margin: 0; gap: 12px; }
+.peer-panel-footer .muted, .peer-panel-footer button { font-size: 11px; }
+.peer-panel-footer .error { font-size: 12px; margin-bottom: 10px; }
+.peer-new-messages { position: absolute; bottom: 64px; left: 50%; transform: translateX(-50%); white-space: nowrap; font-size: 12px; background: #fff !important; box-shadow: 0 2px 14px #00000015; }
+@media (max-width: 1100px) {
+  .peer-panel-open { padding-right: 0; }
+  .peer-panel-open > :not(.peer-conversation-panel) { visibility: hidden; }
+  .peer-conversation-panel { width: 100%; border-left: 0; }
+}
+@media (max-width: 640px) {
+  .chat-heading { flex-wrap: wrap; align-items: start; gap: 8px; }
+  .chat-heading-actions { width: 100%; }
+}
 .file-card-heading { display: flex; align-items: start; gap: 10px; }
 .file-card strong { overflow-wrap: anywhere; }
 .file-type { font-size: 10px; font-weight: 600; border: 1px solid var(--line); border-radius: 6px; padding: 6px; }

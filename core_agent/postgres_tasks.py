@@ -17,6 +17,7 @@ from .tasks import (
     _remote_expired, _remote_due, _remote_text, remote_timeout_result, _remote_file_binding, remote_result_projection,
 )
 from .workflow import SuspendedRun
+from .peer_conversations import merge_observation, OBSERVATION_TTL
 
 
 TERMINAL = {"completed", "failed", "canceled"}
@@ -148,6 +149,28 @@ class PostgresTaskScheduler:
                     values.append({"task_id": row["id"], "revision": row["revision"], **progress})
         return tuple(values)
 
+    def observe_remote(self, task_id, *, owner_id, tenant_id, visible):
+        if type(visible) is not bool:
+            raise CoreError("REQUEST_INVALID")
+        with self.database.transaction() as connection:
+            row = connection.execute("""SELECT * FROM core_background_tasks
+                WHERE id=%s AND tenant_id=%s AND owner_run_id=%s AND kind=%s FOR UPDATE""",
+                (task_id, tenant_id, owner_id, REMOTE_KIND)).fetchone()
+            if row is None:
+                raise CoreError("TASK_NOT_FOUND")
+            now = self._remote_now(connection)
+            _remote_contract(row["contract"], tenant_id, owner_id)
+            _remote_checkpoint(row["checkpoint"])
+            if visible and row["state"] not in TERMINAL and not _remote_expired(row["checkpoint"], now):
+                expires = now + OBSERVATION_TTL
+                checkpoint = copy.deepcopy(row["checkpoint"])
+                if checkpoint["remote_task_id"] is not None:
+                    checkpoint["next_poll_at"] = min(checkpoint["next_poll_at"] or now, now + 15, checkpoint["deadline"])
+                connection.execute("UPDATE core_background_tasks SET remote_observed_until=%s, checkpoint=%s WHERE id=%s AND tenant_id=%s",
+                                   (expires, Jsonb(checkpoint), task_id, tenant_id))
+                return expires
+            return row.get("remote_observed_until")
+
     def _remote_claim_locked(self, connection, claim, *, terminal=False):
         if self._closed or not isinstance(claim, RemoteTaskClaim) or not isinstance(claim.token, str) or not claim.token:
             raise CoreError("LEASE_LOST")
@@ -186,16 +209,17 @@ class PostgresTaskScheduler:
                 expired = True
             else:
                 result = {"contract": copy.deepcopy(row["contract"]), "checkpoint": copy.deepcopy(row["checkpoint"]),
-                          "cancel_requested": row["cancel_requested"], "now": now, "revision": row["revision"]}
+                          "cancel_requested": row["cancel_requested"], "now": now, "revision": row["revision"],
+                          "observed_until": row.get("remote_observed_until")}
         if expired:
             self._notify_remote(claim.task_id)
             raise CoreError("LEASE_LOST")
         return result
 
     def commit_remote_claim(self, claim, *, expected_revision, checkpoint, outcome=None, progress=None,
-                            prepared_file_batch=None):
+                            prepared_file_batch=None, conversation_observation=None):
         if prepared_file_batch is not None:
-            return self._commit_remote_files(claim, expected_revision, checkpoint, outcome, progress, prepared_file_batch)
+            return self._commit_remote_files(claim, expected_revision, checkpoint, outcome, progress, prepared_file_batch, conversation_observation)
         if isinstance(outcome, tuple) and len(outcome) > 1 and isinstance(outcome[1], dict) and "file_batch_id" in outcome[1]:
             raise CoreError("CHECKPOINT_INVALID")
         with self.database.transaction() as connection:
@@ -210,6 +234,12 @@ class PostgresTaskScheduler:
                     raise CoreError("SESSION_CONFLICT")
                 checkpoint = _advance_remote_checkpoint(row["checkpoint"], checkpoint, row["contract"], now, row["cancel_requested"], outcome)
                 progress = _remote_progress(progress, row["contract"], checkpoint, outcome)
+            if not _remote_expired(row["checkpoint"], now):
+                conversation = merge_observation(row.get("remote_conversation"), conversation_observation, now)
+                connection.execute("UPDATE core_background_tasks SET remote_conversation=%s WHERE id=%s AND tenant_id=%s",
+                                   (Jsonb(conversation), claim.task_id, claim.tenant_id))
+                if outcome is None and (row.get("remote_observed_until") or 0) > now and checkpoint["remote_task_id"]:
+                    checkpoint["next_poll_at"] = min(checkpoint["next_poll_at"] or now, now + 15, checkpoint["deadline"])
             if outcome is not None:
                 row = self._remote_finish_locked(connection, row, checkpoint, outcome, now)
             else:
@@ -221,7 +251,7 @@ class PostgresTaskScheduler:
             self._notify_remote(claim.task_id)
         return self._task(row)
 
-    def _commit_remote_files(self, claim, expected_revision, checkpoint, outcome, progress, batch):
+    def _commit_remote_files(self, claim, expected_revision, checkpoint, outcome, progress, batch, conversation_observation):
         service = getattr(self, "chat_file_service", None)
         if service is None or getattr(service.store, "database", None) is not self.database:
             raise CoreError("FILE_ADMISSION_TRANSACTION_REQUIRED")
@@ -264,6 +294,9 @@ class PostgresTaskScheduler:
                             raise CoreError("LEASE_LOST")
                         if fresh["cancel_requested"]:
                             raise CoreError("CANCEL_REQUESTED")
+                        conversation = merge_observation(fresh.get("remote_conversation"), conversation_observation, now)
+                        connection.execute("UPDATE core_background_tasks SET remote_conversation=%s WHERE id=%s AND tenant_id=%s",
+                                           (Jsonb(conversation), claim.task_id, claim.tenant_id))
                         row = self._remote_finish_locked(connection, fresh, updated,
                             ("completed", {**outcome[1], "file_batch_id": batch["batch_id"]}, None), now)
         self._notify_remote(claim.task_id)

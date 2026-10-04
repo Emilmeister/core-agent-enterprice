@@ -77,6 +77,9 @@ class RemoteEvent:
     parts: tuple[dict, ...]
     task_id: str | None = None
     context_id: str | None = None
+    messages: tuple[dict, ...] = ()
+    history_truncated: bool = False
+    public_messages_complete: bool = False
 
     @property
     def has_files(self):
@@ -241,7 +244,67 @@ def _task_event(payload, *, direct=False, expected_task_id=None, attachment_limi
         if any(part.WhichOneof("content") is None for part in parts):
             raise ValueError()
         normalized = tuple(MessageToDict(part) for part in parts)
-        return RemoteEvent(kind, state, _parts_text(normalized), final, normalized, task_id, context_id)
+        from .peer_conversations import MAX_MESSAGES, MAX_TEXT_BYTES, public_identity
+        messages, seen, used, truncated = [], set(), 0, False
+
+        def publish(container, identity):
+            nonlocal used, truncated
+            metadata = container.get("metadata", {})
+            if isinstance(metadata, dict) and (
+                any(metadata.get(key) is True for key in (
+                    "private", "review_private", "adk_thought", "reasoning", "thinking",
+                    "reasoning_replay", "provider_replay"))
+                or metadata.get("visibility") == "private"
+                or metadata.get("kind") in {"reasoning", "thinking", "review", "replay", "reasoning_replay", "provider_replay"}
+            ):
+                return
+            public_parts = []
+            for part in _parts(container):
+                metadata = part.get("metadata", {})
+                if isinstance(metadata, dict) and (
+                    any(metadata.get(key) for key in (
+                        "private", "reasoning", "thinking", "review_private", "adk_thought",
+                        "reasoning_replay", "provider_replay"))
+                    or metadata.get("visibility") == "private"
+                    or metadata.get("kind") in {"reasoning", "thinking", "review", "replay", "reasoning_replay", "provider_replay"}
+                ):
+                    continue
+                if isinstance(part.get("text"), str):
+                    public_parts.append(part)
+            text = _parts_text(public_parts)
+            if not text:
+                return
+            identifier = public_identity(identity, text)
+            if identifier in seen:
+                return
+            size = len(text.encode("utf-8"))
+            if len(messages) >= MAX_MESSAGES or used + size > MAX_TEXT_BYTES:
+                truncated = True
+                return
+            seen.add(identifier)
+            used += size
+            messages.append({"id": identifier, "text": text})
+
+        if kind == "task":
+            public_task = MessageToDict(task)
+            status_message = public_task.get("status", {}).get("message", {})
+            hidden_review_id = status_message.get("messageId") if state in {
+                "TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"} else None
+            for message in public_task.get("history", []):
+                if message.get("role") == "ROLE_AGENT" and (
+                    hidden_review_id is None or message.get("messageId") != hidden_review_id
+                ):
+                    publish(message, "message:" + message.get("messageId", ""))
+            if state not in {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"}:
+                if status_message.get("role") == "ROLE_AGENT":
+                    publish(status_message, "message:" + status_message.get("messageId", ""))
+            for artifact in public_task.get("artifacts", []):
+                publish(artifact, "artifact:" + artifact.get("artifactId", ""))
+        else:
+            public_message = MessageToDict(message)
+            publish(public_message, "message:" + public_message.get("messageId", ""))
+        return RemoteEvent(kind, state, _parts_text(normalized), final, normalized, task_id, context_id,
+                           tuple(messages), truncated, True)
     except (ParseError, ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError, CoreError):
         raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR") from None
 

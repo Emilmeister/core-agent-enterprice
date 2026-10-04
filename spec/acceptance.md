@@ -689,3 +689,18 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   revision; новая Task использует их, admitted Task/recovery/child сохраняют свой
   закреплённый профиль, модель и exact MCP ceiling. При выключении новая Task
   не получает сервер; default tool HITL и deny dispatch остаются обязательными.
+- ENT-AC-87: отправленное A2A-поручение имеет компактную canonical карточку,
+  публичная переписка/файлы — в правой панели. Настоящий peer transport и native
+  browser проверяют промежуточный ответ до завершения, обновление, отсутствие
+  дубликатов/reasoning/private review, сохранение при временной ошибке, независимую
+  прокрутку, Escape/focus return и мобильный экран. Owner API имеет pagination,
+  company/chat/root-child isolation и пассивные reads; observation heartbeat
+  даёт 15-секундный ceiling при более частых ранних фазах, TTL 45 секунд и не
+  закрывает интерес другой вкладки. PostgreSQL restart сохраняет сообщения,
+  pinned peer credentials и deadline без повторного Send. Закрытие не отменяет
+  операцию; terminal/timeout не вызывает новые remote Get. Quarantine/отказ и
+  integrity ошибки не открывают файлы; published файлы используют прежний
+  authenticated download. Исходящие selected файлы отображаются отдельно от
+  полученных, скачиваются из frozen operation snapshots, без unrelated файлов,
+  blob refs или private путей. Недоступная копия/неподтверждённая отправка явно
+  обозначаются. Legacy remote jobs не выдумывают прошлую переписку.

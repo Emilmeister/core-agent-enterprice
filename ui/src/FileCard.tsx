@@ -18,8 +18,9 @@ const otherTypes: Record<string, string> = {
   xlsx: "Таблица Excel", ppt: "Презентация", pptx: "Презентация", zip: "Архив ZIP",
 };
 
-export function FileCard({ api, contextId, taskId, file }: {
+export function FileCard({ api, contextId, taskId, file, downloadPath, available = true }: {
   api?: Api; contextId?: string; taskId?: string; file: AttachmentEntry | ResponseFileEntry;
+  downloadPath?: string; available?: boolean;
 }) {
   const responseFile = "file_id" in file;
   const name = responseFile ? file.name : file.actual_name;
@@ -46,23 +47,23 @@ export function FileCard({ api, contextId, taskId, file }: {
       for (const url of urls.current) URL.revokeObjectURL(url);
       urls.current.clear();
     };
-  }, [api, contextId, taskId, identity]);
+  }, [api, contextId, taskId, identity, downloadPath, available]);
 
   async function load(mode: "open" | "download") {
     if (mode === "open") {
       setOpened(true);
       if (!textPreview || preview) return;
     }
-    if (!api || !contextId || pending.current || !api.session.valid || (responseFile && !taskId)) return;
+    if (!available || !api || !contextId || pending.current || !api.session.valid || (responseFile && !taskId && !downloadPath)) return;
     const abort = new AbortController();
     pending.current = abort;
     const stopped = () => abort.signal.aborted || pending.current !== abort || !api.session.valid;
     setBusy(mode);
     setError("");
     try {
-      const path = responseFile
+      const path = downloadPath ?? (responseFile
         ? `/api/chats/${encodeURIComponent(contextId)}/tasks/${encodeURIComponent(taskId!)}/files/${encodeURIComponent(file.file_id)}`
-        : `/api/chats/${encodeURIComponent(contextId)}/files/content?${new URLSearchParams({ path: file.relative_path })}`;
+        : `/api/chats/${encodeURIComponent(contextId)}/files/content?${new URLSearchParams({ path: file.relative_path })}`);
       const response = await api.request(path, { signal: abort.signal });
       if (mode === "open") {
         if (!response.body) throw new Error("Missing file body");
@@ -106,7 +107,7 @@ export function FileCard({ api, contextId, taskId, file }: {
     }
   }
 
-  const unavailable = !api || !contextId || !api.session.valid || (responseFile && !taskId);
+  const unavailable = !available || !api || !contextId || !api.session.valid || (responseFile && !taskId && !downloadPath);
   return <li className="file-card">
     <div className="file-card-heading"><strong>{name}</strong><span className="muted">{fileType} · {formatFileSize(file.size_bytes)}</span></div>
     <div className="file-card-actions">
@@ -115,6 +116,7 @@ export function FileCard({ api, contextId, taskId, file }: {
       <button type="button" className="secondary" disabled={!!busy || unavailable}
         aria-label={`Скачать ${name}`} onClick={() => void load("download")}>{busy === "download" ? "Скачиваем…" : "Скачать"}</button>
     </div>
+    {!available && <p className="muted">Сохранённая копия файла недоступна.</p>}
     {opened && <div className="file-preview">
       <div className="file-preview-heading"><strong>Предпросмотр</strong><button type="button" className="text-button"
         aria-label={`Закрыть предпросмотр ${name}`} onClick={() => { pending.current?.abort(); pending.current = undefined; setBusy(null); setOpened(false); }}>Закрыть</button></div>

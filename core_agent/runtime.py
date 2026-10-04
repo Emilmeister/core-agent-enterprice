@@ -1317,6 +1317,10 @@ class CoreAgent:
             raise CoreError("CHECKPOINT_INVALID")
         contract = entry["contract"]
         keys = {"version", "contract"} | ({"arguments_digest"} if contract.get("version") == 2 else set())
+        if "request_provenance" in entry:
+            from .peer_conversations import validate_request_provenance
+            validate_request_provenance(entry["request_provenance"])
+            keys.add("request_provenance")
         if entry.keys() != keys:
             raise CoreError("CHECKPOINT_INVALID")
         if "arguments_digest" in keys:
@@ -1398,7 +1402,8 @@ class CoreAgent:
                 "owner_id", "context_id", "task_id", "run_id")},
                 attachment_limit_bytes=settings.attachment_limit_bytes, outgoing_files=list(files))
         _remote_contract(contract, record.tenant_id, record.run_id)
-        entry = {"version": 1, "contract": contract}
+        from .peer_conversations import freeze_request_provenance
+        entry = {"version": 1, "contract": contract, "request_provenance": freeze_request_provenance(snapshot)}
         if contract["version"] == 2:
             entry["arguments_digest"] = self._remote_arguments_digest(call)
         try:

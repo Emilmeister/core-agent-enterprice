@@ -11,6 +11,7 @@ from .config import MAX_SUBAGENT_DEPTH
 from .errors import CoreError
 from .mcp import mcp_tool_index
 from .workflow import SuspendedRun
+from .peer_conversations import initial_conversation, merge_observation, OBSERVATION_TTL
 
 
 REMOTE_TASK_PENDING = object()
@@ -313,6 +314,23 @@ class TaskScheduler:
                     values.append({"task_id": task_id, "revision": task.revision, **progress})
         return tuple(values)
 
+    def observe_remote(self, task_id, *, owner_id, tenant_id, visible):
+        if type(visible) is not bool:
+            raise CoreError("REQUEST_INVALID")
+        with self._lock:
+            self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
+            row = self._remote.get(task_id)
+            if row is None:
+                raise CoreError("TASK_NOT_FOUND")
+            now = self.clock()
+            if visible and self._tasks[task_id].state not in _REMOTE_TERMINAL and not _remote_expired(row["checkpoint"], now):
+                row["observed_until"] = now + OBSERVATION_TTL
+                checkpoint = row["checkpoint"]
+                if checkpoint["remote_task_id"] is not None:
+                    # Never invalidate the revision used by an outstanding compute claim.
+                    checkpoint["next_poll_at"] = min(checkpoint["next_poll_at"] or now, now + 15, checkpoint["deadline"])
+            return row.get("observed_until")
+
     def _remote_claim(self, claim, *, terminal=False):
         if self._closed or not isinstance(claim, RemoteTaskClaim) or not isinstance(claim.token, str) or not claim.token:
             raise CoreError("LEASE_LOST")
@@ -351,12 +369,13 @@ class TaskScheduler:
                 self._finish_remote_locked(row, task, ("failed", remote_timeout_result(row["contract"]), "REMOTE_OPERATION_TIMEOUT"))
                 raise CoreError("LEASE_LOST")
             return {"contract": copy.deepcopy(row["contract"]), "checkpoint": copy.deepcopy(row["checkpoint"]),
-                    "cancel_requested": row["cancel_requested"], "now": now, "revision": task.revision}
+                    "cancel_requested": row["cancel_requested"], "now": now, "revision": task.revision,
+                    "observed_until": row.get("observed_until")}
 
     def commit_remote_claim(self, claim, *, expected_revision, checkpoint, outcome=None, progress=None,
-                            prepared_file_batch=None):
+                            prepared_file_batch=None, conversation_observation=None):
         if prepared_file_batch is not None:
-            return self._commit_remote_files(claim, expected_revision, checkpoint, outcome, progress, prepared_file_batch)
+            return self._commit_remote_files(claim, expected_revision, checkpoint, outcome, progress, prepared_file_batch, conversation_observation)
         if isinstance(outcome, tuple) and len(outcome) > 1 and isinstance(outcome[1], dict) and "file_batch_id" in outcome[1]:
             raise CoreError("CHECKPOINT_INVALID")
         with self._lock:
@@ -371,7 +390,12 @@ class TaskScheduler:
                 raise CoreError("SESSION_CONFLICT")
             checkpoint = _advance_remote_checkpoint(row["checkpoint"], checkpoint, row["contract"], now, row["cancel_requested"], outcome)
             progress = _remote_progress(progress, row["contract"], checkpoint, outcome)
+            conversation = merge_observation(row.get("conversation"), conversation_observation, now)
+            if outcome is None and (row.get("observed_until") or 0) > now and checkpoint["remote_task_id"]:
+                checkpoint["next_poll_at"] = min(checkpoint["next_poll_at"] or now, now + 15, checkpoint["deadline"])
             row["checkpoint"] = checkpoint
+            row["conversation"] = conversation
+            row["updated_at"] = now
             if outcome is None:
                 if progress is not None:
                     task.result = progress
@@ -380,7 +404,7 @@ class TaskScheduler:
                 self._finish_remote_locked(row, task, outcome)
             return task
 
-    def _commit_remote_files(self, claim, expected_revision, checkpoint, outcome, progress, batch):
+    def _commit_remote_files(self, claim, expected_revision, checkpoint, outcome, progress, batch, conversation_observation):
         service = getattr(self, "chat_file_service", None)
         if service is None:
             raise CoreError("FILE_ADMISSION_TRANSACTION_REQUIRED")
@@ -424,6 +448,8 @@ class TaskScheduler:
                                 raise CoreError("LEASE_LOST")
                             if row["cancel_requested"]:
                                 raise CoreError("CANCEL_REQUESTED")
+                            row["conversation"] = merge_observation(row.get("conversation"), conversation_observation, self.clock())
+                            row["updated_at"] = self.clock()
                             row["checkpoint"] = updated
                             self._finish_remote_locked(row, task, ("completed", {
                                 **outcome[1], "file_batch_id": batch["batch_id"]}, None))
@@ -620,7 +646,8 @@ class TaskScheduler:
                 self._kinds[task.id] = kind
                 if kind == REMOTE_KIND:
                     self._remote[task.id] = {"contract": copy.deepcopy(contract), "checkpoint": _initial_remote_checkpoint(),
-                                             "token": None, "cancel_requested": False}
+                                             "token": None, "cancel_requested": False, "conversation": initial_conversation(),
+                                             "created_at": self.clock(), "updated_at": self.clock(), "observed_until": None}
                     self.mailbox(owner_id, tenant_id, remote=True)
                 if recoverable:
                     self._recovery[task.id] = (run, dict(contract or {}), tenant_id)

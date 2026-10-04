@@ -8,6 +8,8 @@ import type { AttachmentEntry, HistoryItem, HistoryPage, Interaction } from "./t
 import { ActionCard, actionState, historyEntries } from "./ActionCard";
 import type { HistoryEntry } from "./ActionCard";
 import { FileCard } from "./FileCard";
+import { PeerConversationCard, peerOperationId } from "./PeerConversations";
+import type { PeerConversation } from "./PeerConversations";
 export { ConversationFiles, FileCard } from "./FileCard";
 export { pendingAction } from "./ActionCard";
 
@@ -227,12 +229,16 @@ export function History({
   history,
   refresh,
   onOlder,
+  peerConversations = [],
+  onPeerOpen,
 }: {
   api: Api;
   contextId?: string;
   history: ReturnType<typeof useChatHistory>;
   refresh: () => Promise<void>;
   onOlder: () => void;
+  peerConversations?: PeerConversation[];
+  onPeerOpen?: (value: PeerConversation, trigger: HTMLButtonElement) => void;
 }) {
   const groups: { root: string | null; entries: HistoryEntry[] }[] = [];
   for (const entry of historyEntries(history.page.items)) {
@@ -288,16 +294,23 @@ export function History({
         const blocks: HistoryEntry[][] = [];
         for (const entry of entries) {
           const previous = blocks.at(-1);
-          if (entry.action && actionState(entry.action, terminal, waits).kind === "success"
+          if (entry.action && !peerOperationId(entry.action) && actionState(entry.action, terminal, waits).kind === "success"
             && previous?.at(-1)?.action
+            && !peerOperationId(previous.at(-1)!.action)
             && actionState(previous.at(-1)!.action!, terminal, waits).kind === "success") previous.push(entry);
           else blocks.push([entry]);
         }
         function renderEntry({ item, action }: HistoryEntry) {
+          const peer = onPeerOpen && peerConversations.find((value) => value.operation_id === peerOperationId(action));
           const review = item.review && !rendered.has(item.review.wait_id) ? reviews.get(item.review.wait_id) : undefined;
           if (review) rendered.add(review.wait_id);
           return <Fragment key={action?.key ?? item.id}>
-            {action ? <ActionCard action={action} terminal={terminal} waits={waits} />
+            {action && peer && onPeerOpen ? <div className="peer-conversation-action" data-history-id={item.id}>
+              <PeerConversationCard conversation={peer} onOpen={onPeerOpen} />
+              <details className="peer-action-details"><summary>Технические данные поручения</summary>
+                <ActionCard action={action} terminal={terminal} waits={waits} />
+              </details>
+            </div> : action ? <ActionCard action={action} terminal={terminal} waits={waits} />
               : <Entry api={api} contextId={contextId} item={item} />}
             {review && <InteractionCard key={review.wait_id} api={api} item={review} refresh={refresh} />}
           </Fragment>;

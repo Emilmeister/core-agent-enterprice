@@ -443,6 +443,87 @@ Progress и checkpoint коммитятся одной fenced/CAS transaction; p
 Terminal timeout/outcome заменяет working progress и выигрывает у позднего update.
 Foreign human-wait остаётся working: согласование выполняет remote owner.
 
+### OWNER-PEER. Исходящие разговоры в owner UI
+
+Owner-only `GET /api/chats/{context_id}/peer-conversations` возвращает bounded
+страницы операций компании в порядке created_at/id descending; `GET` детали
+читает только persisted public conversation и не обращается к peer. Операция
+доступна только после проверки canonical chat, originating WorkflowRecord,
+actual parent links и admitted root. Child caller_scope не получает root grants.
+External callers, foreign company/chat и неподтверждённая lineage не получают
+содержимое. Summary/detail содержат safe enum `error_code` либо null и
+`outcome_unknown` boolean из committed outcome: timeout/неизвестная мутация
+не изображаются обычным подтверждённым провалом. Raw diagnostics не выдаются. Credentials, URLs подключения, private owner prompts, detector/HITL
+material, reasoning/thinking/replay и metadata не входят в conversation.
+
+При каждом owner read действует existing passive history visibility verdict:
+current wait outcome/deadline и exact negative material identity проверяются
+без classifier, lease, review refresh или wait mutation. `material_status`
+принимает `available`, `pending_guardrail`, `rejected`, `timed_out`, без private
+review IDs. Negative исходного request/source либо selected attachment скрывает
+outgoing request/receipts/download и причинно зависящий incoming material.
+Direct remote-result/file refusal скрывает incoming text/snippet/files, сохраняя
+независимый allowed outgoing request. Проверка учитывает `file_sha256` и exact
+JSON text identity fully decoded UTF-8 file; unrelated reviews другой операции
+не создают dependency. Guardrail-only material/file APIs сохраняют собственные
+operator review permissions.
+
+Новый `remote_calls` entry MAY содержит immutable `request_provenance` v1:
+existing active context source references и material identities, без payload,
+text или metadata. Capture выполняется до Send на `_pin_remote_call`, bounded
+4096 sources/256 KiB и не усекается: превышение границы отклоняет admission до
+side effect. Owner read валидирует source run lineage и historical chat chain;
+source/result review links остаются раздельными. Legacy entry без этого поля
+использует только подтверждённый causal transcript cutoff и exact known
+initial/argument/file/result links, без реконструкции неизвестной причинности
+завершённого nested Python call. Новая optional форма совместима с прежними
+immutable remote contracts/checkpoints и не требует отдельного ledger/migration.
+
+Публичный outgoing request берётся только из закреплённого task после durable
+send intent. Summary/detail `request_delivery` различает `not_sent`, `unconfirmed`
+и `confirmed`: send intent без peer task ID остаётся неподтверждённой попыткой;
+подтверждение требует persisted remote task ID либо successful terminal immediate
+Message. Неизвестный результат отправки не объявляется доставленным.
+peer-published agent history/status/artifact text считается недоверенным owner
+material. Parser сохраняет только public text, stable message/artifact identity
+и порядок: повторные GetTask snapshots не дублируют entries. История bounded
+(200 entries, 256 KiB text); фактическое усечение отмечается history_truncated.
+Отсутствующую peer history нельзя выдумывать. Известный public text текущего
+snapshot MAY сохраняться при отсутствии history. Старые jobs читаются без
+изменения immutable contract/checkpoint и без реконструкции потерянной истории.
+Conversation и successful observation timestamp коммитятся атомарно с fenced
+checkpoint/outcome. Они не попадают в model material либо публичный A2A Task.
+
+Detail `files` используют existing safe owner AttachmentEntry только для принятого
+published batch после whole-batch integrity validation. Early unadmitted files,
+quarantine/excluded material, отсутствующие/истёкшие blobs и remote URLs не
+публикуются. Canonical final material guardrails и runtime publication barrier
+сохраняются; observation не разрешает files и не создаёт model turns.
+
+Detail `outgoing_files` содержит только selected frozen snapshots из immutable
+remote contract v2 после durable send intent. Entry использует existing public
+ResponseFileEntry: `file_id`, `name`, `media_type`, `size_bytes`, `sha256`; blob
+references, workspace paths и unrelated files не выдаются. Source task/run,
+company/owner/chat и actual lineage MUST совпадать с frozen grants. Отдельный
+`outgoing_files_status` принимает `none`, `available`, `unavailable`; у недоступного,
+истёкшего или нарушенного whole batch сохраняются safe исторические receipts,
+но download блокируется. Статус files не подтверждает доставку request.
+Owner-only `GET .../{operation_id}/outgoing-files/{file_id}` повторно проверяет
+тот же scope и integrity всего batch, возвращает только immutable bytes с
+attachment/no-store/nosniff headers. Wrong scope/file даёт 404, unavailable batch
+даёт 409 `ARTIFACT_INTEGRITY_FAILED`. Изменение/удаление исходного workspace file
+не меняет frozen attachment; contract v1 не реконструирует отсутствующие refs.
+
+`POST .../{operation_id}/observation` принимает ровно `{visible: boolean}`.
+Visible heartbeat задаёт bounded TTL45 seconds от authoritative server/DB clock;
+false не отменяет interest другого tab/owner. Пока interest действует, следующий
+existing GetTask планируется не позднее 15 секунд с учётом network latency,
+действующего claim и deadline. После истечения TTL возвращается adaptive
+10/30/300 (либо меньший pinned interval) график от первоначального send marker.
+Interest не продлевает operation deadline, не возобновляет terminal jobs,
+не разрешает новый Send/Cancel и не повторяет неизвестную mutation. Детали
+сохраняют исходные peer revision/connection после registry deletion и restart.
+
 ### LONG-03. Ожидание времени
 
 Новый инструмент `core_wait_until` ожидает до заданного момента времени

@@ -28,7 +28,7 @@ from .errors import CoreError
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -939,6 +939,13 @@ CREATE TRIGGER core_agent_setting_revision_immutable BEFORE UPDATE OR DELETE ON 
     FOR EACH ROW EXECUTE FUNCTION core_agent_setting_revision_immutable();
 """,
 
+    29: """
+ALTER TABLE core_background_tasks ADD COLUMN remote_conversation jsonb;
+ALTER TABLE core_background_tasks ADD COLUMN remote_observed_until double precision;
+ALTER TABLE core_background_tasks ADD CONSTRAINT core_background_public_conversation
+    CHECK(remote_conversation IS NULL OR
+          (jsonb_typeof(remote_conversation)='object' AND remote_conversation->>'version'='1'));
+""",
 
 }
 

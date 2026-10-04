@@ -146,6 +146,42 @@ class RemoteFileResultTests(AuthAppTestCase):
         self.agent.interaction_store.update_policy(self.tenant, name, policy.origin,
             mode="allow", guardrails_exempt=True, expected_revision=policy.revision, actor_id="alice")
 
+    async def test_peer_panel_current_negative_published_file_hides_incoming_only(self):
+        from tests.test_owner_history import OwnerHistoryTests
+        self.exempt()
+        record = await self.start()
+        self.assertEqual(record.state, "COMPLETED", record.error_code)
+        self.assertEqual(self.batch["state"], "published")
+        self.assertTrue(next(iter(record.snapshot["remote_calls"].values()))["request_provenance"]["sources"])
+        path = f"/api/chats/{record.context_id}/peer-conversations/{self.operation_id}"
+        initial = await self.http.get(path, headers=self.headers("owner-a"))
+        self.assertEqual(initial.status_code, 200, initial.text)
+        self.assertEqual(len(initial.json()["files"]), 2)
+        OwnerHistoryTests.review_material(self, record, {"material_kind": "file_sha256",
+            "material_digest": self.batch["manifest"]["entries"][0]["sha256"]}, source_kind="file_attachment")
+        response = await self.http.get(path, headers=self.headers("owner-a"))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["material_status"], "rejected")
+        self.assertEqual(response.json()["files"], [])
+        self.assertEqual([m["text"] for m in response.json()["messages"]], ["Ask peer"])
+        self.assertNotIn("Remote answer", response.text)
+        self.assertNotIn("report.txt", response.text)
+
+    async def test_peer_panel_pending_or_rejected_result_withholds_quarantine_text_and_files(self):
+        record = await self.start()
+        self.assertEqual(record.state, "WAITING_INPUT")
+        path = f"/api/chats/{record.context_id}/peer-conversations/{self.operation_id}"
+        response = await self.http.get(path, headers=self.headers("owner-a"))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["material_status"], "pending_guardrail")
+        self.assertEqual(response.json()["files"], [])
+        self.assertEqual([m["text"] for m in response.json()["messages"]], ["Ask peer"])
+        record, _ = await self.decide(record, "reject")
+        response = await self.http.get(path, headers=self.headers("owner-a"))
+        self.assertEqual(response.json()["material_status"], "rejected")
+        self.assertEqual(response.json()["files"], [])
+        self.assertEqual([m["text"] for m in response.json()["messages"]], ["Ask peer"])
+
     async def test_text_rejection_excludes_files_without_classifying_or_publishing_them(self):
         self.detector.suspicious_text = True
         record = await self.start()

@@ -11,11 +11,13 @@ import { actionLabel } from "./toolPresentation";
 import { WorkspaceFiles } from "./WorkspaceFiles";
 import { Markdown } from "./Markdown";
 import { chatStreamEvent, nextLiveAnswer } from "./chatStream";
+import { PeerConversationCard, PeerConversationPanel, peerOperationId, usePeerConversations } from "./PeerConversations";
+import type { PeerConversation } from "./PeerConversations";
+import { historyEntries } from "./ActionCard";
 import {
   remoteProgress,
   formatFileSize,
   fileReceipt,
-  remoteStates,
   terminal,
   textParts,
 } from "./types";
@@ -82,6 +84,9 @@ export function Chat({
       ? { api, id: row.latest_task_id } : undefined,
   );
   const [filesOpen, setFilesOpen] = useState(false);
+  const [peerSelection, setPeerSelection] = useState<string>();
+  const peerTrigger = useRef<HTMLButtonElement | null>(null);
+  const peerButton = useRef<HTMLButtonElement>(null);
   const [filesDirty, setFilesDirty] = useState(false);
   const [newMessages, setNewMessages] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -125,6 +130,20 @@ export function Chat({
   const stickToBottom = useRef(true);
   const contextId = row?.context_id ?? task?.contextId;
   const taskId = task?.id ?? row?.latest_task_id;
+  const peerHistory = usePeerConversations(api, contextId, task ? !terminal(task) : !!row?.active);
+  function openPeer(value: PeerConversation, trigger: HTMLButtonElement) {
+    if (filesDirty) return;
+    setFilesOpen(false);
+    peerTrigger.current = trigger;
+    setPeerSelection(value.operation_id);
+  }
+  function closePeer() {
+    setPeerSelection(undefined);
+    requestAnimationFrame(() => {
+      const trigger = peerTrigger.current;
+      if (trigger?.isConnected) trigger.focus(); else peerButton.current?.focus();
+    });
+  }
   useLayoutEffect(() => { liveHandoff.delete(api); }, [api]);
   useLayoutEffect(() => {
     const dialog = deleteDialog.current;
@@ -132,6 +151,8 @@ export function Chat({
     else if (!deleteConfirm && dialog?.open) dialog.close();
   }, [deleteConfirm]);
   const history = useChatHistory(api, contextId);
+  const linkedPeers = new Set(historyEntries(history.page.items).map((entry) => peerOperationId(entry.action)));
+  const unlinkedPeers = peerHistory.conversations.filter((value) => !linkedPeers.has(value.operation_id));
   const loadHistory = history.load;
   const liveText = liveTask.current?.api === api && liveTask.current.id === taskId
     && liveAnswer && liveAnswer.taskId === taskId && !liveAnswer.superseded
@@ -525,7 +546,7 @@ export function Chat({
     : task.status.state === "TASK_STATE_SUBMITTED" ? "Запрос принят" : "Готовит ответ";
   const fileCount = history.page.items.reduce((count, item) => count + (item.attachments?.length ?? 0) + (item.response_files?.length ?? 0), 0);
   return (
-    <section className="conversation" aria-label="Чат">
+    <section className={`conversation ${peerSelection ? "peer-panel-open" : ""}`} aria-label="Чат">
       <header className="chat-heading">
         <div className="chat-title">
           <h1>{row?.title || "Новый чат"}</h1>
@@ -542,11 +563,18 @@ export function Chat({
               className="secondary"
               aria-expanded={filesOpen}
               aria-controls="conversation-files-panel"
-              onClick={() => (filesOpen ? closeFiles() : setFilesOpen(true))}
+              onClick={() => {
+                if (filesOpen) closeFiles(); else { setPeerSelection(undefined); setFilesOpen(true); }
+              }}
             >
               Файлы <span className="file-count">{fileCount}{history.page.next_cursor ? "+" : ""}</span>
             </button>
           )}
+          {!!peerHistory.conversations.length && <button ref={peerButton} className="secondary peer-panel-toggle"
+            disabled={filesDirty} aria-expanded={!!peerSelection} aria-controls="peer-conversation-panel"
+            onClick={(event) => peerSelection ? closePeer() : openPeer(peerHistory.conversations[0], event.currentTarget)}>
+            Переписка агентов <span className="file-count">{peerHistory.conversations.length}</span>
+          </button>}
           {contextId && <details className="chat-menu" ref={titleMenu}>
             <summary aria-label="Действия с чатом">⋯</summary>
             <div className="chat-menu-actions">
@@ -560,6 +588,8 @@ export function Chat({
           </details>}
         </div>
       </header>
+      {peerSelection && contextId && <PeerConversationPanel api={api} contextId={contextId} selected={peerSelection}
+        conversations={peerHistory.conversations} onSelect={setPeerSelection} onClose={closePeer} />}
       {contextId && <dialog ref={deleteDialog} className="chat-delete-dialog" aria-labelledby="chat-delete-title" aria-describedby="chat-delete-description"
         onClose={() => titleMenu.current?.querySelector<HTMLElement>("summary")?.focus()}
         onCancel={(event) => { if (busy) event.preventDefault(); else setDeleteConfirm(false); }}>
@@ -613,12 +643,8 @@ export function Chat({
           }
         }}
       >
-        {remoteProgress(task).map((entry) => (
-          <p className="history-note" key={entry.task_id}>
-            <strong>{entry.agent_name}</strong> ·{" "}
-            {remoteStates[entry.remote_state]}
-          </p>
-        ))}
+        {unlinkedPeers.map((entry) => <PeerConversationCard key={entry.operation_id} conversation={entry} onOpen={openPeer} />)}
+        {peerHistory.error && <p className="muted peer-list-error" role="status">Не удалось обновить список обращений к агентам.</p>}
         {!task && !row && (
           <div className="welcome">
             <h2>Чем помочь?</h2>
@@ -630,6 +656,8 @@ export function Chat({
           api={api}
           contextId={contextId}
           history={history}
+          peerConversations={peerHistory.conversations}
+          onPeerOpen={openPeer}
           onOlder={() => {
             stickToBottom.current = false;
             if (thread.current) olderAnchor.current = { height: thread.current.scrollHeight, top: thread.current.scrollTop };

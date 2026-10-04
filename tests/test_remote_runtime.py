@@ -199,6 +199,11 @@ class RemoteRuntimeTests(AuthAppTestCase):
         await asyncio.to_thread(self.agent.resume_task, task["id"])
         self.assertEqual(self.sent.call_count, 1)
         self.assertEqual(len(self.agent.task_scheduler.list(owner_id=record.run_id, tenant_id=self.tenant)), 1)
+        pinned = next(iter(record.snapshot["remote_calls"].values()))
+        sources = pinned["request_provenance"]["sources"]
+        self.assertTrue(sources)
+        self.assertTrue(any(source.get("materials") for source in sources.values()))
+        self.assertNotIn("python_execution", record.snapshot)
 
     async def test_remote_wait_rejects_timeout_even_after_terminal_outcome(self):
         self.script(self.request(), ModelResponse(message="done"))

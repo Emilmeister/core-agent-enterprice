@@ -320,7 +320,24 @@ def _source_materials(admission, root, provenance, connection, chat):
     return materials
 
 
-def _final_dependency_reviews(admission, root, connection, chat):
+def _review_status(reviews):
+    """The passive current visibility verdict, shared by owner material readers."""
+    statuses = []
+    for review in reviews:
+        state = review["state"]
+        if review["outcome"] is not None:
+            state = {"allowed": "allowed", "timeout": "timed_out"}.get(review["outcome"].get("reason"), "rejected")
+        elif review["deadline"] is not None and review["deadline"] <= review["now"]:
+            state = "timed_out"
+        if not review["direct"] and state not in {"rejected", "timed_out"}:
+            continue
+        if state not in {"clear", "allowed"}:
+            statuses.append((state, review["wait_id"]))
+    return next((value for value in statuses if value[0] in {"rejected", "timed_out"}),
+                statuses[0] if statuses else None)
+
+
+def _final_dependency_reviews(admission, root, connection, chat, *, before_call_id=None):
     """Scan provenance in bounded pages, not full outputs or an additional transcript copy."""
     offset = 0
     while True:
@@ -330,11 +347,15 @@ def _final_dependency_reviews(admission, root, connection, chat):
             if imported is not None and (type(imported.get("version")) is not int or imported["version"] != 1):
                 raise CoreError("CHECKPOINT_INVALID")
             def originals():
+                if before_call_id:
+                    for key, source in (imported or {}).get("sources", {}).items():
+                        yield {"provenance": {"version": 1, "sources": {key: source}}}
                 for item in snapshot.get("context", {}).get("transcript", ()):
                     if not item["kind"].startswith("unprocessed_due_to_"):
                         yield item
-                for key, source in (imported or {}).get("sources", {}).items():
-                    yield {"provenance": {"version": 1, "sources": {key: source}}}
+                if not before_call_id:
+                    for key, source in (imported or {}).get("sources", {}).items():
+                        yield {"provenance": {"version": 1, "sources": {key: source}}}
             rows = list(islice(originals(), offset, offset + 100))
         else:
             rows = [row["item"] for row in connection.execute("""WITH r AS (
@@ -343,7 +364,9 @@ def _final_dependency_reviews(admission, root, connection, chat):
                 SELECT 0 AS phase,ordinal AS position,
                     CASE WHEN item->'provenance' IS NULL OR item->'provenance'='null'::jsonb THEN
                         jsonb_build_object('kind',item->'kind','content',item->'content')
-                    ELSE jsonb_build_object('kind',item->'kind','provenance',item->'provenance') END AS item
+                    ELSE jsonb_build_object('kind',item->'kind','provenance',item->'provenance') ||
+                        CASE WHEN %s::text IS NOT NULL AND item->>'kind' IN ('assistant_tool_calls','tool_result')
+                            THEN jsonb_build_object('content',item->'content') ELSE '{}'::jsonb END END AS item
                 FROM r,jsonb_array_elements(COALESCE(snapshot#>'{context,transcript}','[]'::jsonb))
                     WITH ORDINALITY AS t(item,ordinal)
                 WHERE item->>'kind' NOT LIKE 'unprocessed_due_to_%%'
@@ -352,12 +375,21 @@ def _final_dependency_reviews(admission, root, connection, chat):
                     'version',snapshot#>'{context_import,version}','sources',jsonb_build_object(key,value)))
                 FROM r,jsonb_each(COALESCE(snapshot#>'{context_import,sources}','{}'::jsonb))
                     WITH ORDINALITY AS s(key,value,ordinal)
-            ) SELECT item FROM dependencies ORDER BY phase,position LIMIT 100 OFFSET %s""",
-                (root["run_id"], root["tenant_id"], offset)).fetchall()]
+            ) SELECT item FROM dependencies
+                ORDER BY CASE WHEN %s::text IS NOT NULL THEN 1-phase ELSE phase END,position LIMIT 100 OFFSET %s""",
+                (root["run_id"], root["tenant_id"], before_call_id, before_call_id, offset)).fetchall()]
         if not rows:
             return
         materials, sources = [], []
+        stopped = False
         for item in rows:
+            if before_call_id and item.get("kind") in {"assistant_tool_calls", "tool_result"}:
+                value = json.loads(item["content"])
+                calls = value if isinstance(value, list) else value.get("tool_calls", ())
+                if (isinstance(value, dict) and value.get("tool_call_id") == before_call_id
+                        or any(call.get("id") == before_call_id for call in calls)):
+                    stopped = True
+                    break
             if item.get("provenance") is not None:
                 materials.extend(_source_materials(admission, root, item["provenance"], connection, chat))
             elif item.get("kind") in {"prompt", "user_message", "tool_result"}:
@@ -376,6 +408,8 @@ def _final_dependency_reviews(admission, root, connection, chat):
                 materials.append(_json_identity(payload))
         yield from _reviews(admission, root, sources, [m["review_id"] for m in materials if m.get("review_id")],
                             materials, [], connection)
+        if stopped:
+            return
         offset += len(rows)
 
 
@@ -435,19 +469,9 @@ def _project(admission, root, entry, connection, chat):
     reviews = _reviews(admission, root, sources, review_ids, materials, batches, connection)
     if terminal_result:
         reviews = chain(reviews, _final_dependency_reviews(admission, root, connection, chat))
-    statuses = []
-    for review in reviews:
-        state = review["state"]
-        if review["outcome"] is not None:
-            state = {"allowed": "allowed", "timeout": "timed_out"}.get(review["outcome"].get("reason"), "rejected")
-        elif review["deadline"] is not None and review["deadline"] <= review["now"]:
-            state = "timed_out"
-        if not review["direct"] and state not in {"rejected", "timed_out"}:
-            continue
-        if state not in {"clear", "allowed"}:
-            statuses.append((state, review["wait_id"]))
-    if statuses:
-        state, wait_id = next((value for value in statuses if value[0] in {"rejected", "timed_out"}), statuses[0])
+    blocked = _review_status(reviews)
+    if blocked:
+        state, wait_id = blocked
         result.update(kind="placeholder", status=state if state in {"rejected", "timed_out"} else "pending_guardrail",
                       text="[Material is unavailable pending owner review]" if state not in {"rejected", "timed_out"} else "[Material is unavailable]")
         if wait_id:

@@ -154,7 +154,7 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         backend["command"] = ["uv", "run", "--no-sync", "python", "/browser-fixture/server.py", "backend"]
         backend["envFrom"] = [{"configMapRef": {"name": "native"}}, {"secretRef": {"name": "server-config"}}]
         settings = {"CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled", "SESSION_STORAGE_TYPE": "postgres",
-                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec,core_response_files,core_cron_create,core_ask_owner,core_task_start,core_task_wait,core_python_exec", "CORE_AGENT_ALLOWED_SKILLS": "",
+                    "TASK_STORAGE_TYPE": "postgres", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_terminal_exec,core_response_files,core_cron_create,core_ask_owner,core_task_start,core_task_wait,core_python_exec,core_agent_send_message", "CORE_AGENT_ALLOWED_SKILLS": "",
                     "CHAT_WORKSPACE_ROOT": "/data/chats", "LOCAL_WORKSPACE_ROOT": "/data/scratch", "DURABLE_STORAGE_ROOT": "/data/durable",
                     "UV_CACHE_DIR": "/tmp/uv-cache", "PYTHONDONTWRITEBYTECODE": "1", "OTEL_SDK_DISABLED": "true"}
         backend["env"] = [{"name": name, "value": value} for name, value in settings.items()]
@@ -236,6 +236,16 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         self.assertIn("PASS public reply is visible while the actual provider is blocked", proof)
         self.assertIn("PASS page reload uses canonical history without restoring the transient prefix", proof)
         self.assertIn("PASS canonical final reply replaces preview once with safe Markdown and Python", proof)
+        self.assertIn("PASS owner profile is persisted independently", proof)
+        self.assertIn("PASS provider model selection preserves independently saved profile", proof)
+        self.assertIn("PASS provider model outage preserves current selection", proof)
+        self.assertIn("PASS MCP owner connection is persisted with write-only credentials", proof)
+        self.assertIn("PASS saving one MCP connection preserves and does not commit another draft", proof)
+        self.assertIn("PASS intermediate A2A updates are real and exclude private reasoning", proof)
+        self.assertIn("PASS outgoing peer file download preserves selected frozen bytes", proof)
+        self.assertIn("PASS peer final update preserves main and panel reading position without duplicate messages", proof)
+        self.assertIn("PASS peer file download retains original authenticated bytes", proof)
+        self.assertIn("PASS mobile peer panel avoids hidden chat controls and horizontal overflow", proof)
         self.assertIn("PASS actual owner policy persists independent access and material exemption for core_cron_create", proof)
         self.assertIn("PASS actual owner policy persists independent access and material exemption for core_terminal_exec", proof)
         self.assertIn("PASS owner UI runs same-chat cron despite model tool deny", proof)

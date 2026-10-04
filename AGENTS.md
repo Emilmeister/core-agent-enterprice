@@ -195,6 +195,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/admission.py` | Atomic root admission, stable-caller deduplication и busy guard чата до SDK execution |
 | `core_agent/interactions.py` | Company settings, per-origin tool policies, CAS и транзакционный запрет pending approvals |
 | `core_agent/agent_settings.py`, `core_agent/agent_settings_api.py` | Company profile/model/MCP settings, immutable encrypted revisions, fixed-provider model discovery и owner-only UI API |
+| `core_agent/peer_conversations.py` | Owner-only bounded public peer history, safe file projection, paginated chat/child ownership и expiring observation interest |
 | `core_agent/owner_api.py` | Owner-only settings, policy, HITL/guardrail decisions и приватные ответы на вопросы |
 | `core_agent/history.py` | Bounded owner-only проекция полной истории чата, stable cursors и текущие ограничения на материалы |
 | `core_agent/cron_expression.py` | Закреплённый croniter parser и ZoneInfo adapter: five-field dialect, bounded calendar search и gap/fold semantics |
@@ -670,6 +671,16 @@ run получает отдельные MCP session и negotiated version; пе�
   Сохранённый profile prompt не заменяет protected kernel или safety rules.
   Model ID admitted run применяется к основным turns, compaction и memory NER;
   embeddings и отдельная guardrails model остаются deployment configuration.
+- Owner-only `/api/chats/{context_id}/peer-conversations` показывает durable
+  публичные исходящие поручения, ответы и доступные файлы remote jobs, включая
+  child lineage. Private reasoning, replay и owner HITL не раскрываются. Чтение
+  не запускает модель или новое поручение. Открытая видимая панель каждые 15 секунд
+  продлевает observation TTL 45 секунд; scheduler ограничивает GetTask этим
+  интервалом, сохраняя ранние проверки каждые 10 секунд. Закрытие/скрытие прекращает
+  heartbeat, после expiry возвращается adaptive polling без изменения deadline,
+  pinned registry revision или claim fencing. Terminal job не опрашивается по сети.
+  Projection и frozen outgoing download проверяют текущие material decisions
+  и причинные зависимости, не запуская classifier или workflow.
 - Owner-only DELETE `/api/chats/{context_id}` архивирует неактивный чат для всех
   владельцев компании и атомарно отключает его расписания. Migration 26 добавляет
   монотонный tombstone; блокировки следуют порядку chat → schedule. Повторный DELETE
