@@ -260,6 +260,11 @@ try {
   await second.wait("[...document.querySelectorAll('button')].some(button=>button.textContent.trim()==='Добавить агента ＋')",'actual owner peer registry');
   await second.click('Добавить агента ＋');
   await second.wait("!!document.querySelector('.form-sheet input[pattern]')",'actual custom-header peer form');
+  await second.call('Emulation.setDeviceMetricsOverride',{width:1280,height:900,deviceScaleFactor:1,mobile:false});
+  check(await second.evaluate("(()=>{const name=document.querySelector('.form-sheet input[pattern]').getBoundingClientRect();const address=document.querySelector('.form-sheet input[type=url]').getBoundingClientRect();const help=document.getElementById('peer-name-help');return help.getBoundingClientRect().height>=2*parseFloat(getComputedStyle(help).fontSize)&&Math.abs(name.top-address.top)<1&&Math.abs(name.height-address.height)<1;})()"),'peer inputs keep aligned intrinsic height when name help wraps');
+  await second.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  check(await second.evaluate("(()=>{const name=document.querySelector('.form-sheet input[pattern]').getBoundingClientRect();const address=document.querySelector('.form-sheet input[type=url]').getBoundingClientRect();return address.top>=name.bottom&&Math.abs(name.height-address.height)<1&&document.documentElement.scrollWidth<=innerWidth;})()"),'mobile peer form stacks equal-height fields without overflow');
+  await second.call('Emulation.clearDeviceMetricsOverride');
   await second.field('.form-sheet input[pattern]','browser-disabled_peer');
   await second.click('Добавить агента ＋');
   await second.field('.form-sheet input[type=url]','https://peer.invalid/a2a');
@@ -548,6 +553,10 @@ try {
   await page.wait("document.querySelector('.thread').textContent.includes('Owner clarification received;')",'native known-failure response after owner answer');
   check(await page.evaluate("[...document.querySelectorAll('.action-error')].some(card=>card.textContent.includes('кодом 3')) && [...document.querySelectorAll('.interaction.resolved')].some(card=>card.textContent.includes('Заказ 42'))"),'known command failure remains visible and answered owner question is retained');
   check(await page.evaluate("(()=>{const card=[...document.querySelectorAll('.action-error')].find(card=>card.textContent.includes('Ожидание задачи'));return card && card.textContent.includes('Ошибка') && !card.closest('.execution-group');})()"),'actual failed background task stays visible despite successful status read');
+  await waitFor(()=>history.at(-1)?.some(item=>item.kind==='placeholder'&&item.status==='available'&&!item.review&&!item.outcome&&!item.attachments?.length&&!item.response_files?.length),'actual preserved internal history markers');
+  const internalMarkers=history.at(-1).filter(item=>item.kind==='placeholder'&&item.status==='available'&&!item.review&&!item.outcome&&!item.attachments?.length&&!item.response_files?.length).map(item=>item.id);
+  await page.wait(`(${JSON.stringify(internalMarkers)}).every(id=>!document.getElementById('history-'+id))`,'internal markers disappear only from presentation');
+  check(await page.evaluate("[...document.querySelectorAll('.history-status')].some(node=>node.textContent.includes('Материал отклонён'))&&!document.querySelector('.thread').textContent.includes('Служебная запись агента')"),'stored runtime markers stay hidden while rejected input and task errors remain visible');
   const previewCards='.thread .history-run:last-child .response-files';
   await page.wait("document.querySelectorAll('.thread .history-run:last-child .response-files li').length===6",'native selected preview proof files');
   for(const position of [1,2]){

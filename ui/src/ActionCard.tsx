@@ -41,6 +41,8 @@ export function historyEntries(items: HistoryItem[]): HistoryEntry[] {
     return action;
   }
   for (const item of [...items].reverse()) {
+    if (item.kind === "placeholder" && item.status === "available"
+      && !item.review && !item.outcome && !item.attachments?.length && !item.response_files?.length) continue;
     if ((item.kind !== "tool_call" && item.kind !== "tool_result") || item.status !== "available") {
       entries.push({ item });
       continue;

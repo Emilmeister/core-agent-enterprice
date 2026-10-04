@@ -195,11 +195,8 @@ function Entry({ api, contextId, item }: { api: Api; contextId?: string; item: H
     >
       <>
           {item.kind === "placeholder" && <div className="eyebrow">Статус сообщения</div>}
-          {item.kind === "placeholder" || item.status !== "available"
-            ? item.status === "available" && (
-                <p className="muted">Служебная запись агента</p>
-              )
-            : (item.display_text ?? item.text) && (item.kind === "user_message"
+          {item.kind !== "placeholder" && item.status === "available"
+            && (item.display_text ?? item.text) && (item.kind === "user_message"
               ? <p className="prose">{item.display_text ?? item.text}</p>
               : <Markdown text={item.text} />)}
       </>

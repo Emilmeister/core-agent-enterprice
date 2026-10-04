@@ -190,7 +190,12 @@ flowchart LR
         ModelResponse(tool_requests=(ToolRequest("browser-owner-question", "core_ask_owner", {"question": "Какой номер заказа использовать?"}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-python-syntax", "core_python_exec", {"code": preview_python}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-known-failure", "core_terminal_exec", {"argv": ["python3", "-c", preview_program]}),)),
-        ModelResponse(tool_requests=(ToolRequest("browser-background-failure", "core_task_start", {"tool": "core_terminal_exec", "arguments": {"argv": ["python3", "-c", "print('should not run')"], "cwd": "definitely-missing-browser-folder"}}),)),
+        ModelResponse(tool_requests=(
+            ToolRequest("browser-background-failure", "core_task_start", {"tool": "core_terminal_exec", "arguments": {"argv": ["python3", "-c", "print('should not run')"], "cwd": "definitely-missing-browser-folder"}}),
+            # The explicit wait acknowledges the first job. A separate optional
+            # job produces the real notification marker exercised by history UI.
+            ToolRequest("browser-background-notification", "core_task_start", {"tool": "core_terminal_exec", "required": False, "arguments": {"argv": ["python3", "-c", "print('should not run')"], "cwd": "another-missing-browser-folder"}}),
+        )),
         ModelResponse(tool_requests=(ToolRequest("browser-background-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-preview-files", "core_response_files", {"paths": ["preview-proof/" + name for name in preview_files]}),)),
         ModelResponse(message="Owner clarification received; the command failed with exit code 3."),
