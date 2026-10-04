@@ -17,7 +17,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .auth import AuthContextBuilder, Principal
-from .config import compile_effective_config
+from .config import AgentConfig, compile_effective_config
 from .errors import CoreError
 from .interactions import SETTINGS_KEYS, TIMEOUT_KEYS, interaction_digest, tool_origin
 from .mcp import mcp_tool_index
@@ -31,14 +31,22 @@ def require_owner(actor):
     return actor
 
 
-def policy_catalog(agent):
+def policy_catalog(agent, tenant_id=None):
     # MCP allowlists are exact remote names. Configuring policy does not assert
     # discovery success or add an absent tool to a model's catalog.
     declarations = agent.platform_mcp
-    allowed = agent.agent_config.tools["mcp"].get("allow_tools", {})
+    config, platform = agent.agent_config, agent.platform_config
+    store = getattr(agent, "agent_settings_store", None)
+    if store is not None and tenant_id is not None:
+        row = store.get(tenant_id)
+        raw, platform, declarations = store.configure(row, config.to_dict(), platform, declarations)
+        config = AgentConfig.from_dict(raw)
+    allowed = config.tools["mcp"].get("allow_tools", {})
     configured = {server: dict.fromkeys(names, {}) for server, names in allowed.items()}
+    if store is not None and tenant_id is not None:
+        configured.update(store.catalogs(tenant_id, declarations, agent.workflow_store))
     effective = compile_effective_config(
-        agent.platform_config, agent.agent_config, declarations, configured,
+        platform, config, declarations, configured,
     )
     index = mcp_tool_index(effective.mcp_tools)
     names = set(effective.model_tool_catalog)
@@ -474,7 +482,7 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
 
     def policies(actor, name, payload):
         require_owner(actor)
-        catalog = policy_catalog(agent)
+        catalog = policy_catalog(agent, actor.tenant)
         if payload is None:
             return {"tools": [public_settings(store.get_policy(actor.tenant, name, origin))
                               for name, origin in catalog.items()]}

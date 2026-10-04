@@ -4359,6 +4359,63 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(methods.count("initialize"), 2)
         self.assertEqual(methods.count("tools/call"), 1)
 
+    def test_owner_mcp_headers_are_isolated_and_reflected_credentials_preserve_schema(self):
+        from core_agent.mcp import StreamableHttpMcpConnector
+        received = []
+        class HeaderHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+            def do_POST(self):
+                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                received.append((self.path, self.headers.get("Authorization"), self.headers.get("X-Owner-Key")))
+                method = request.get("method")
+                if method == "initialize":
+                    result = {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "docs", "version": "1"}}
+                elif method == "tools/list":
+                    result = {"tools": [{"name": "read", "description": "owner-wire-secret", "inputSchema": {
+                        "type": "object", "properties": {"token": {"type": "string", "description": "owner-wire-secret"}}}}]}
+                else:
+                    result = {"content": [{"type": "text", "text": "owner-wire-secret"}]}
+                body = json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), HeaderHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connector = StreamableHttpMcpConnector(timeout=2, cold_start_timeout=0, headers={"Authorization": "Bearer deployment-wire-secret"})
+        catalog = connector.connect({"name": "owner", "transport": {"url": f"http://127.0.0.1:{server.server_port}/owner"},
+                                     "headers": {"X-Owner-Key": "owner-wire-secret"}})
+        self.assertEqual(catalog["read"]["properties"]["token"], {"type": "string", "description": "[REDACTED]"})
+        self.assertNotIn("owner-wire-secret", json.dumps(catalog))
+        result = connector.call("owner", "read", {})
+        self.assertNotIn("owner-wire-secret", json.dumps(result))
+        connector.connect({"name": "anonymous", "transport": {"url": f"http://127.0.0.1:{server.server_port}/anonymous"}, "headers": {}})
+        connector.connect({"name": "deployment", "transport": {"url": f"http://127.0.0.1:{server.server_port}/deployment"}})
+        from core_agent.agent_settings import AgentSettingsStore
+        from core_agent.workflow import InMemoryWorkflowStore
+        store = AgentSettingsStore(InMemoryWorkflowStore())
+        pinned = store.update("company", {"mcp_servers": [{"name": "owner", "url": f"http://127.0.0.1:{server.server_port}/owner",
+            "enabled": True, "header_name": "X-Owner-Key", "header_value": "owner-wire-secret"}]},
+            expected_revision=0, actor_id="owner")
+        store.update("company", {"mcp_servers": []}, expected_revision=1, actor_id="owner")
+        child_raw = agent_config().to_dict()
+        child_raw["tools"]["mcp"] = {"default": "deny", "allow_servers": ["owner"], "allow_tools": {"owner": ["read"]}}
+        for _purpose in ("child", "recovery"):
+            raw, allowed, declarations = store.configure(store.get("company", pinned["revision"]), child_raw,
+                platform(), (), profile=False, credentials=True)
+            run_connector = connector.for_run()
+            schema = run_connector.connect(declarations[0])
+            effective = compile_effective_config(allowed, AgentConfig.from_dict(raw), declarations, {"owner": schema})
+            self.assertEqual(effective.mcp_tools["owner"], frozenset({"read"}))
+            self.assertNotIn("owner-wire-secret", json.dumps(run_connector.call("owner", "read", {})))
+        self.assertTrue(all(auth is None and key == "owner-wire-secret" for path, auth, key in received if path == "/owner"))
+        self.assertTrue(all(auth is None and key is None for path, auth, key in received if path == "/anonymous"))
+        self.assertTrue(all(auth == "Bearer deployment-wire-secret" and key is None for path, auth, key in received if path == "/deployment"))
+
     def test_mcp_tool_call_uses_the_connector_owned_by_its_run(self):
         class ScopedConnector(InMemoryMcpConnector):
             def __init__(self, clones, *, template=False):
@@ -5637,10 +5694,15 @@ class SemanticRuntimeTests(unittest.TestCase):
                 agent, _, _ = self.semantic_agent(lambda call: self.fail('use actual HTTP adapter'), context_window=1000)
                 agent.output_reserve = 100
                 agent.model = model
+                from core_agent.agent_settings import AgentSettingsStore
+                agent.agent_settings_store = AgentSettingsStore(agent.workflow_store)
+                agent.agent_settings_store.update('default', {'model_id': 'owner-selected-summary'},
+                                                 expected_revision=0, actor_id='owner')
                 result = agent.run(run_request(), task_id='wire-' + api_format + expected_limit)
                 self.assertEqual(result.message, 'done')
                 self.assertEqual(len(model.bodies), 1)
                 wire = model.bodies[0]
+                self.assertEqual(wire['model'], 'owner-selected-summary')
                 record = agent.workflow_store.lookup_task('wire-' + api_format + expected_limit)
                 self.assertFalse(wire.get('stream', False))
                 self.assertNotIn('stream_options', wire)
@@ -5649,6 +5711,7 @@ class SemanticRuntimeTests(unittest.TestCase):
                 self.assertNotIn('tools', wire)
                 self.assertTrue(model.stream)
                 self.assertEqual(model.max_tokens, 256)
+                self.assertEqual(model.model, 'test')
                 self.assertEqual(model.extra_body, options)
 
     def test_recovered_summary_attempt_stops_when_new_window_cannot_fit_provider_request(self):

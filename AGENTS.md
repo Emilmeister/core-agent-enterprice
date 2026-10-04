@@ -194,6 +194,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/external_access.py` | Owner-session Keycloak Admin API: external service accounts, issuance metadata, single-display tokens, replacement и native revocation |
 | `core_agent/admission.py` | Atomic root admission, stable-caller deduplication и busy guard чата до SDK execution |
 | `core_agent/interactions.py` | Company settings, per-origin tool policies, CAS и транзакционный запрет pending approvals |
+| `core_agent/agent_settings.py`, `core_agent/agent_settings_api.py` | Company profile/model/MCP settings, immutable encrypted revisions, fixed-provider model discovery и owner-only UI API |
 | `core_agent/owner_api.py` | Owner-only settings, policy, HITL/guardrail decisions и приватные ответы на вопросы |
 | `core_agent/history.py` | Bounded owner-only проекция полной истории чата, stable cursors и текущие ограничения на материалы |
 | `core_agent/cron_expression.py` | Закреплённый croniter parser и ZoneInfo adapter: five-field dialect, bounded calendar search и gap/fold semantics |
@@ -658,6 +659,17 @@ run получает отдельные MCP session и negotiated version; пе�
   большие блоки остаются обычным текстом. HTML/SVG/Office не исполняются в origin агента.
   Настройки инструментов сохраняются явно по одному правилу, положительный
   checkbox проверок является инверсией `guardrails_exempt`.
+- Owner-only `/api/agent-settings` хранит общие для компании версии profile prompt,
+  модели и MCP-подключений. `null` наследует ENV; явное пустое значение очищает
+  профиль. Сохранение использует CAS и не отправляет чужие несохранённые формы.
+  Новые root/cron runs закрепляют immutable revision; recovery и child используют
+  принятые настройки и exact capability ceilings. Модель выбирается только из
+  списка deployment provider; UI не меняет provider URL или credentials.
+  MCP-секреты шифруются в исторических revisions, читаются только runtime и не
+  возвращаются в owner GET. Новое подключение не наследует auth другого сервера.
+  Сохранённый profile prompt не заменяет protected kernel или safety rules.
+  Model ID admitted run применяется к основным turns, compaction и memory NER;
+  embeddings и отдельная guardrails model остаются deployment configuration.
 - Owner-only DELETE `/api/chats/{context_id}` архивирует неактивный чат для всех
   владельцев компании и атомарно отключает его расписания. Migration 26 добавляет
   монотонный tombstone; блокировки следуют порядку chat → schedule. Повторный DELETE

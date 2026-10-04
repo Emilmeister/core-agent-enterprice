@@ -860,6 +860,23 @@ class LlmEntityExtractorTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIsNone(extractor.disabled_reason)
 
+    def test_permanent_rejection_is_confined_to_the_selected_model(self):
+        extractor = LlmEntityExtractor("https://gateway.test/v1", "default-model")
+        captured = []
+        def respond(_endpoint, payload, **_kwargs):
+            captured.append(payload["model"])
+            if payload["model"] == "rejected-model":
+                raise CoreError("MEMORY_PROVIDER_UNAVAILABLE", data={"status": 400})
+            return {"choices": [{"message": {"content": '{"entities":[]}'}}]}
+        with patch("core_agent.memory_providers._post_json", side_effect=respond):
+            for _ in range(2):
+                with self.assertRaises(CoreError):
+                    extractor.extract("text", model="rejected-model")
+            self.assertEqual(extractor.extract("text", model="accepted-model")["entities"], [])
+            self.assertEqual(extractor.extract("text")["entities"], [])
+        self.assertEqual(captured, ["rejected-model", "accepted-model", "default-model"])
+        self.assertEqual(extractor.model, "default-model")
+
     def test_a_response_that_is_not_the_promised_shape_is_rejected(self):
         """`strict` is a property of the gateway, not a guarantee to the caller."""
         extractor = LlmEntityExtractor("https://gateway.test/v1", "m")

@@ -429,6 +429,297 @@ class OwnerDecisionAPITests(AuthAppTestCase):
         self.assertEqual((await self.http.post(path, headers=self.headers("owner-a"), json=payload)).json(), response.json())
 
 
+class OwnerAgentConfigurationAPITests(AuthAppTestCase):
+    automatic_tools = False
+    push_encryption_key = "gLgFI-gLRDHqUBOd7HGWKfdBLZuYX-m3t_k78ohw0Aw="
+
+    async def test_profile_defaults_cas_and_owner_authority(self):
+        endpoint = "/api/agent-settings"
+        initial = await self.http.get(endpoint, headers=self.headers("owner-a"))
+        self.assertEqual(initial.status_code, 200, initial.text)
+        self.assertEqual(initial.json()["profile_prompt"], "")
+        self.assertEqual(initial.json()["model_id"], "auth-test-model")
+        self.assertTrue(initial.json()["inherits"]["profile_prompt"])
+        denied = await self.http.put(endpoint, headers=self.headers("external-a"),
+            json={"expected_revision": 0, "profile_prompt": "unauthorized"})
+        self.assertEqual(denied.status_code, 403)
+        changed = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 0, "profile_prompt": "Owner profile"})
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertEqual(changed.json()["revision"], 1)
+        other = await self.http.get(endpoint, headers=self.headers("owner-b"))
+        self.assertEqual(other.json(), changed.json())
+        stale = await self.http.put(endpoint, headers=self.headers("owner-b"),
+            json={"expected_revision": 0, "profile_prompt": "stale"})
+        self.assertEqual(stale.status_code, 409)
+        cleared = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 1, "profile_prompt": ""})
+        self.assertFalse(cleared.json()["inherits"]["profile_prompt"])
+        inherited = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 2, "profile_prompt": None})
+        self.assertTrue(inherited.json()["inherits"]["profile_prompt"])
+        invalid = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 3, "profile_prompt": "x" * 65537})
+        self.assertEqual(invalid.status_code, 400)
+
+    async def test_mcp_credentials_preserve_delete_and_pin_admission(self):
+        agent = self.app.state.core_agent
+        endpoint = "/api/agent-settings"
+        server = {"name": "owner_docs", "url": "https://docs.test/mcp", "enabled": True,
+                  "header_name": "Authorization", "header_value": "Bearer owner-secret-canary"}
+        result = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 0, "profile_prompt": "Pinned profile", "mcp_servers": [server]})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertNotIn("owner-secret-canary", result.text)
+        self.assertTrue(result.json()["mcp_servers"][0]["has_header_value"])
+        record, *_ = agent._new_workflow({"prompt": "inspect"}, task_id="pinned-config-task",
+            identity="owner", session_id="pinned-config-chat", tenant_id=self.tokens["owner-a"].get("tenant",
+                self.app.state.authenticator.settings.tenant), defer_initialization=True)
+        self.assertNotIn("owner-secret-canary", json.dumps(record.snapshot))
+        del server["header_value"]
+        server["enabled"] = False
+        changed = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 1, "profile_prompt": "Next profile", "mcp_servers": [server]})
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertTrue(changed.json()["mcp_servers"][0]["has_header_value"])
+        raw, _, platform, declarations, _ = agent._admission_inputs(record)
+        self.assertEqual(raw["agent"]["profile_prompt"], "Pinned profile")
+        self.assertIn("owner_docs", platform.allowed_mcp_servers)
+        self.assertEqual(declarations[0]["headers"], {"Authorization": "Bearer owner-secret-canary"})
+        from core_agent.config import compile_effective_config
+        discovered = {"owner_docs": {"read": {}, "write": {}}}
+        effective = compile_effective_config(platform, AgentConfig.from_dict(raw), declarations, discovered)
+        self.assertEqual(effective.mcp_tools["owner_docs"], frozenset({"read", "write"}))
+        child_raw = {**raw, "tools": {**raw["tools"], "mcp": {"default": "deny",
+            "allow_servers": ["owner_docs"], "allow_tools": {"owner_docs": ["read"]}}}}
+        child = agent._child_agent(child_raw, ())
+        self.addCleanup(child.close)
+        child_record, *_ = child._new_workflow({"prompt": "read only"}, task_id="pinned-settings-child",
+            identity=record.owner_id, session_id=record.context_id, tenant_id=record.tenant_id,
+            parent_run_id=record.run_id, defer_initialization=True)
+        child_raw, child_config, child_platform, child_mcp, _ = child._admission_inputs(child_record)
+        child_effective = compile_effective_config(child_platform, child_config, child_mcp, discovered)
+        self.assertEqual(child_effective.mcp_tools["owner_docs"], frozenset({"read"}))
+        self.assertEqual(child_raw["agent"]["profile_prompt"], "Pinned profile")
+        next_record, *_ = agent._new_workflow({"prompt": "new settings"}, task_id="disabled-config-task",
+            identity="owner", session_id="disabled-config-chat", tenant_id=record.tenant_id, defer_initialization=True)
+        self.assertEqual(agent._admission_inputs(next_record)[3], ())
+        changed_url = {**server, "url": "https://different.test/mcp"}
+        denied = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 2, "mcp_servers": [changed_url]})
+        self.assertEqual(denied.status_code, 400)
+        server["header_value"] = None
+        cleared = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 2, "mcp_servers": [server]})
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertFalse(cleared.json()["mcp_servers"][0]["has_header_value"])
+        removed = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 3, "mcp_servers": []})
+        self.assertEqual(removed.status_code, 200, removed.text)
+        self.assertEqual(agent._admission_inputs(record)[3][0]["headers"],
+                         {"Authorization": "Bearer owner-secret-canary"})
+
+    async def test_deployment_mcp_toggle_preserves_private_transport_and_recovery(self):
+        agent = self.app.state.core_agent
+        declaration = {"name": "legacy_docs", "required": False, "read_only_tools": ["search"],
+            "transport": {"type": "streamable_http", "url": "http://legacy-user:legacy-secret@legacy.test/mcp?key=legacy-key"}}
+        agent.platform_mcp = (declaration,)
+        agent.agent_settings_store._deployment_mcp = agent.platform_mcp
+        endpoint = "/api/agent-settings"
+        initial = await self.http.get(endpoint, headers=self.headers("owner-a"))
+        self.assertEqual(initial.status_code, 200, initial.text)
+        self.assertNotIn("legacy-secret", initial.text)
+        self.assertNotIn("legacy-key", initial.text)
+        server = initial.json()["mcp_servers"][0]
+        self.assertEqual(server["url"], "http://legacy.test/mcp")
+        server.pop("has_header_value")
+        disabled = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 0, "mcp_servers": [{**server, "enabled": False}]})
+        self.assertEqual(disabled.status_code, 200, disabled.text)
+        enabled = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 1, "mcp_servers": [server]})
+        self.assertEqual(enabled.status_code, 200, enabled.text)
+        self.assertNotIn("legacy-secret", enabled.text)
+        record, *_ = agent._new_workflow({"prompt": "inspect"}, task_id="legacy-mcp-task",
+            identity="owner", session_id="legacy-mcp-chat", tenant_id=self.app.state.authenticator.settings.tenant,
+            defer_initialization=True)
+        self.assertEqual(agent._admission_inputs(record)[3], (declaration,))
+        removed = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 2, "mcp_servers": []})
+        self.assertEqual(removed.status_code, 200, removed.text)
+        self.assertEqual(agent._admission_inputs(record)[3], (declaration,))
+        foreign = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 3, "mcp_servers": [{**server, "url": "http://different.test/mcp"}]})
+        self.assertEqual(foreign.status_code, 400, foreign.text)
+
+    async def test_memory_extraction_uses_each_admitted_model_without_shared_mutation(self):
+        from core_agent.memory import MemoryRegistry
+        from core_agent.memory_providers import LlmEntityExtractor
+        from core_agent.memory_store import InMemoryMemoryStore
+        agent = self.app.state.core_agent
+        extractor = LlmEntityExtractor("https://provider.test/v1", "deployment-model")
+        registry = MemoryRegistry(InMemoryMemoryStore(), entity_extractor=extractor)
+        agent.memory_registry = registry
+        self.addCleanup(registry.close)
+        tenant = self.app.state.authenticator.settings.tenant
+        calls = []
+        agent.agent_settings_store.update(tenant, {"model_id": "first-model"},
+            expected_revision=0, actor_id="owner")
+        first, *_ = agent._new_workflow({"prompt": "remember"}, task_id="first-memory-model",
+            identity="owner", session_id="memory-model-chat", tenant_id=tenant, defer_initialization=True)
+        agent.agent_settings_store.update(tenant, {"model_id": "second-model"},
+            expected_revision=1, actor_id="owner")
+        second, *_ = agent._new_workflow({"prompt": "remember"}, task_id="second-memory-model",
+            identity="owner", session_id="second-memory-chat", tenant_id=tenant, defer_initialization=True)
+        def respond(_endpoint, payload, **_kwargs):
+            calls.append(payload["model"])
+            return {"choices": [{"message": {"content": '{"entities":[]}'}}]}
+        with patch("core_agent.memory_providers._post_json", side_effect=respond):
+            agent._memory_create({"title": "New note", "body": "second"}, second.run_id)
+            agent._memory_create({"title": "Recovered note", "body": "first"}, first.run_id)
+        self.assertEqual(calls, ["second-model", "first-model"])
+        self.assertEqual(extractor.model, "deployment-model")
+        self.assertIs(registry.service(agent.agent_config.agent["name"], "owner", tenant_id=tenant).extractor, extractor)
+
+    async def test_invalid_provider_base_has_safe_error_and_preserves_selection(self):
+        from core_agent.model import CompatibleHttpModel
+        from core_agent.agent_settings_api import provider_models
+        agent = self.app.state.core_agent
+        agent.agent_settings_store.update(self.app.state.authenticator.settings.tenant,
+            {"model_id": "selected-before-outage"}, expected_revision=0, actor_id="owner")
+        agent.model = CompatibleHttpModel(api_format="openai", model="deployment-model",
+                                          base_url="https://provider.test/v1")
+        for endpoint in ("https://[private-provider-url/v1/chat/completions", "ftp://provider.test/v1/chat/completions"):
+            agent.model.endpoint = endpoint
+            with patch("core_agent.agent_settings_api.httpx.AsyncClient") as transport:
+                with self.assertRaises(CoreError) as caught:
+                    await provider_models(agent.model)
+                self.assertEqual(caught.exception.code, "MODEL_DISCOVERY_UNAVAILABLE")
+                transport.assert_not_called()
+            response = await self.http.get("/api/agent-settings/models", headers=self.headers("owner-a"))
+            self.assertEqual(response.status_code, 503, response.text)
+            self.assertEqual(response.json(), {"error": {"code": "MODEL_DISCOVERY_UNAVAILABLE"}})
+            saved = await self.http.get("/api/agent-settings", headers=self.headers("owner-a"))
+            self.assertEqual(saved.json()["model_id"], "selected-before-outage")
+
+    async def test_provider_models_are_fixed_bounded_sanitized_and_failure_preserves_selection(self):
+        from core_agent.model import CompatibleHttpModel
+        agent = self.app.state.core_agent
+        agent.model = CompatibleHttpModel(api_format="openai", model="initial", base_url="https://provider.test/v1",
+                                          api_key="provider-secret-canary")
+        requests = []
+        failing = False
+        def respond(request):
+            requests.append(request)
+            self.assertEqual(str(request.url), "https://provider.test/v1/models")
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.headers["Authorization"], "Bearer provider-secret-canary")
+            return httpx.Response(503 if failing else 200,
+                json={"data": [{"id": "z-model"}, {"id": "a-model"}, {"id": "a-model"},
+                               {"id": "Bearer provider-secret-canary"}, {"id": "unsafe\nmodel"}]})
+        real_client = httpx.AsyncClient
+        with patch("core_agent.agent_settings_api.httpx.AsyncClient",
+                   side_effect=lambda **kwargs: real_client(**{**kwargs, "transport": kwargs.get("transport") or httpx.MockTransport(respond)})):
+            models = await self.http.get("/api/agent-settings/models", headers=self.headers("owner-a"))
+            self.assertEqual(models.status_code, 200, models.text)
+            self.assertEqual(models.json()["models"], ["a-model", "z-model"])
+            result = await self.http.put("/api/agent-settings", headers=self.headers("owner-a"),
+                json={"expected_revision": 0, "model_id": "a-model"})
+            self.assertEqual(result.status_code, 200, result.text)
+            failing = True
+            failed = await self.http.put("/api/agent-settings", headers=self.headers("owner-a"),
+                json={"expected_revision": 1, "model_id": "z-model"})
+            self.assertEqual(failed.status_code, 503, failed.text)
+            self.assertNotIn("provider-secret-canary", failed.text)
+        current = await self.http.get("/api/agent-settings", headers=self.headers("owner-a"))
+        self.assertEqual(current.json()["model_id"], "a-model")
+        self.assertEqual(len(requests), 3)
+
+    async def test_new_roots_and_recovery_use_admitted_profile_and_model(self):
+        from core_agent.model import CompatibleHttpModel
+        agent = self.app.state.core_agent
+        tenant = self.app.state.authenticator.settings.tenant
+        agent.model = CompatibleHttpModel(api_format="openai", model="deployment-model", base_url="https://provider.test/v1")
+        store = agent.agent_settings_store
+        store.update(tenant, {"profile_prompt": "FIRST PROFILE", "model_id": "first-model"}, expected_revision=0, actor_id="owner")
+        calls = []
+        def generate(adapter, **kwargs):
+            calls.append((adapter.model, kwargs["instructions"]))
+            return ModelResponse(tool_requests=(ToolRequest("pin-call", "core_task_list", {}),)) if len(calls) == 1 else ModelResponse(message="verified")
+        with patch.object(CompatibleHttpModel, "generate", autospec=True, side_effect=generate):
+            waiting = await self.submit("owner-a", "settings-recovery-message", "settings-recovery-chat")
+            self.assertEqual(waiting["status"]["state"], "TASK_STATE_WORKING")
+            store.update(tenant, {"profile_prompt": "SECOND PROFILE", "model_id": "second-model"}, expected_revision=1, actor_id="owner")
+            actor = await self.app.state.authenticator.authenticate("owner-a")
+            record = agent.workflow_store.by_task(waiting["id"], tenant_id=tenant, owner_id=actor.owner_id)
+            wait = agent.workflow_store.get_wait(record.snapshot["wait_id"], tenant_id=tenant, owner_id=record.owner_id)
+            agent.workflow_store.resolve_wait(wait.wait_id, tenant_id=tenant,
+                outcome={"reason": "rejected"}, actor_id="owner")
+            agent._runtime_cache.clear()
+            resumed = await asyncio.to_thread(agent.resume_task, record.task_id)
+            self.assertEqual(resumed.message, "verified")
+            await self.submit("owner-a", "settings-next-message", "settings-next-chat")
+        self.assertEqual([model for model, _ in calls], ["first-model", "first-model", "second-model"])
+        self.assertTrue(all("FIRST PROFILE" in instructions and "SECOND PROFILE" not in instructions for _, instructions in calls[:2]))
+        self.assertIn("SECOND PROFILE", calls[2][1])
+        self.assertEqual(agent.model.model, "deployment-model")
+
+    async def test_model_discovery_bounds_redirects_and_anthropic_credentials(self):
+        from core_agent.agent_settings_api import provider_models
+        from core_agent.model import CompatibleHttpModel
+        model = CompatibleHttpModel(api_format="anthropic", model="initial", base_url="https://provider.test/v1", api_key="provider-secret-canary")
+        responses = [httpx.Response(307, headers={"Location": "https://foreign.test/models"}),
+                     httpx.Response(200, content=b"x" * 1048577),
+                     httpx.Response(200, json={"data": [{"id": "m"}] * 1001}),
+                     httpx.Response(200, json={"data": [{"id": "model-one"}, {"id": "model-two"}]})]
+        requests = []
+        def respond(request):
+            requests.append(request)
+            self.assertEqual(str(request.url), "https://provider.test/v1/models")
+            self.assertEqual(request.headers["x-api-key"], "provider-secret-canary")
+            self.assertEqual(request.headers["anthropic-version"], "2023-06-01")
+            self.assertNotIn("Authorization", request.headers)
+            return responses.pop(0)
+        real_client = httpx.AsyncClient
+        with patch("core_agent.agent_settings_api.httpx.AsyncClient",
+                   side_effect=lambda **kwargs: real_client(**{**kwargs, "transport": httpx.MockTransport(respond)})):
+            for _ in range(3):
+                with self.assertRaises(CoreError) as caught:
+                    await provider_models(model)
+                self.assertEqual(caught.exception.code, "MODEL_DISCOVERY_UNAVAILABLE")
+            self.assertEqual(await provider_models(model), ["model-one", "model-two"])
+        self.assertEqual(len(requests), 4)
+
+    async def test_configuration_isolation_validation_and_immutable_postgres_revision(self):
+        from core_agent.agent_settings import AgentSettingsStore
+        agent = self.app.state.core_agent
+        store = agent.agent_settings_store
+        tenant = self.app.state.authenticator.settings.tenant
+        row = store.update(tenant, {"profile_prompt": "PRIVATE COMPANY"}, expected_revision=0, actor_id="owner")
+        self.assertEqual(store.get(tenant + "-other")["revision"], 0)
+        self.assertEqual(store.get(tenant + "-other")["config"]["profile_prompt"], None)
+        server = {"name": "docs", "url": "https://docs.test/mcp", "enabled": True, "header_name": "Authorization"}
+        for malformed in ({**server, "url": "https://user:password@docs.test/mcp"},
+                          {**server, "url": "https://docs.test/mcp?secret=value"},
+                          {**server, "header_name": "Mcp-Session-Id"},
+                          {**server, "header_value": "private\r\nvalue"}, {**server, "enabled": 1}):
+            with self.assertRaises(CoreError) as caught:
+                store.update(tenant, {"mcp_servers": [malformed]}, expected_revision=1, actor_id="owner")
+            self.assertEqual(caught.exception.code, "SETTINGS_INVALID")
+        self.assertEqual(store.get(tenant)["revision"], 1)
+        if self.use_postgres:
+            from psycopg import Error
+            restored = AgentSettingsStore(agent.workflow_store, self.push_encryption_key, database=store.database)
+            self.assertEqual(restored.get(tenant)["config"], row["config"])
+            with self.assertRaises(Error), store.database.transaction() as connection:
+                connection.execute("UPDATE core_agent_setting_revisions SET actor_id='changed' WHERE tenant_id=%s", (tenant,))
+
+
+@unittest.skipUnless(TEST_DATABASE_URL, "TEST_DATABASE_URL is required")
+class PostgresOwnerAgentConfigurationAPITests(OwnerAgentConfigurationAPITests):
+    use_postgres = True
+
+
 @unittest.skipUnless(TEST_DATABASE_URL, "TEST_DATABASE_URL is required")
 class PostgresOwnerSettingsAPITests(OwnerSettingsAPITests):
     use_postgres = True

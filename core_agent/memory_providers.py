@@ -218,19 +218,23 @@ class LlmEntityExtractor:
         self.logger = logger or logging.getLogger("core_agent.runtime")
         self.version = f"llm-ner:{model}"
         self.disabled_reason = None
+        self._disabled_models = {}
 
-    def extract(self, text):
-        if self.disabled_reason:
-            raise CoreError("MEMORY_PROVIDER_UNAVAILABLE", self.disabled_reason)
-        response = self._request(text[:MAX_PROVIDER_TEXT])
+    def extract(self, text, *, model=None):
+        model = model or self.model
+        reason = self._disabled_models.get(model) or (self.disabled_reason if model == self.model else None)
+        if reason:
+            raise CoreError("MEMORY_PROVIDER_UNAVAILABLE", reason)
+        response = self._request(text[:MAX_PROVIDER_TEXT], model=model)
         return {"entities": self._ground(response, text), "relations": []}
 
-    def _request(self, text):
+    def _request(self, text, *, model=None):
+        model = model or self.model
         try:
             return _post_json(
                 self.endpoint,
                 {
-                    "model": self.model,
+                    "model": model,
                     "temperature": 0,
                     "messages": [
                         {"role": "system", "content": EXTRACTION_INSTRUCTION},
@@ -252,9 +256,12 @@ class LlmEntityExtractor:
                 408,
                 429,
             ):
-                self.disabled_reason = f"model gateway rejected extraction ({status})"
+                reason = f"model gateway rejected extraction ({status})"
+                self._disabled_models[model] = reason
+                if model == self.model:
+                    self.disabled_reason = reason
                 self.logger.warning(
-                    "memory entity extraction disabled: %s", self.disabled_reason
+                    "memory entity extraction disabled: %s", reason
                 )
             raise
 

@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from functools import wraps
 
 from .errors import CoreError
+from .memory_providers import LlmEntityExtractor
 from .memory_store import StoredDocument
 
 MAX_BODY_LINES = 200
@@ -379,7 +380,7 @@ class MemoryService:
 
     # ------------------------------------------------------------------ derived
 
-    def _derive(self, documents, *, stored=None, extract=True):
+    def _derive(self, documents, *, stored=None, extract=True, entity_model=None):
         """Entity index for the corpus, calling the model only where it must.
 
         Each cache entry carries whether the model produced it. That flag is the
@@ -401,7 +402,9 @@ class MemoryService:
                 elif extract and self.extractor is not None:
                     try:
                         extracted = self.extractor.extract(
-                            document.title + "\n" + document.body
+                            document.title + "\n" + document.body,
+                            **({"model": entity_model} if entity_model is not None
+                               and isinstance(self.extractor, LlmEntityExtractor) else {}),
                         )
                         derived = True
                     except Exception as error:
@@ -538,7 +541,7 @@ class MemoryService:
     # ------------------------------------------------------------------ mutation
 
     @_serialized
-    def create(self, *, title, body, namespace, kind="fact", tags=(), sources=()):
+    def create(self, *, title, body, namespace, kind="fact", tags=(), sources=(), entity_model=None):
         memory_id = f"mem_{uuid.uuid4().hex[:20]}"
         now = datetime.now(timezone.utc).isoformat()
         content = compose_document(
@@ -560,12 +563,12 @@ class MemoryService:
         paths = dict(self._paths)
         documents[document.id] = document
         paths[path] = document.id
-        entities, links = self._derive(documents)
+        entities, links = self._derive(documents, entity_model=entity_model)
         result = self._commit(documents, paths, entities, links)
         return document, result
 
     @_serialized
-    def update(self, memory_id, *, body, expected_revision, title=None, status=None, namespace=None):
+    def update(self, memory_id, *, body, expected_revision, title=None, status=None, namespace=None, entity_model=None):
         current = self.read(memory_id, namespace=namespace)
         self._require_revision(current, expected_revision)
         content = compose_document(
@@ -586,12 +589,12 @@ class MemoryService:
         self._require_identity(updated, current.id, current.namespace)
         documents = dict(self._documents)
         documents[memory_id] = updated
-        entities, links = self._derive(documents)
+        entities, links = self._derive(documents, entity_model=entity_model)
         result = self._commit(documents, dict(self._paths), entities, links)
         return updated, result
 
     @_serialized
-    def split(self, memory_id, *, overview, children, expected_revision, namespace=None):
+    def split(self, memory_id, *, overview, children, expected_revision, namespace=None, entity_model=None):
         current = self.read(memory_id, namespace=namespace)
         self._require_revision(current, expected_revision)
         if not children:
@@ -637,12 +640,12 @@ class MemoryService:
         for document in parsed:
             documents[document.id] = document
             paths[document.path] = document.id
-        entities, links = self._derive(documents)
+        entities, links = self._derive(documents, entity_model=entity_model)
         result = self._commit(documents, paths, entities, links)
         return tuple(document.id for document in parsed), result
 
     @_serialized
-    def delete(self, memory_id, *, reason, expected_revision, namespace=None):
+    def delete(self, memory_id, *, reason, expected_revision, namespace=None, entity_model=None):
         current = self.read(memory_id, namespace=namespace)
         self._require_revision(current, expected_revision)
         if not reason:
@@ -651,7 +654,7 @@ class MemoryService:
         paths = dict(self._paths)
         documents.pop(memory_id)
         paths.pop(current.path, None)
-        entities, links = self._derive(documents)
+        entities, links = self._derive(documents, entity_model=entity_model)
         return self._commit(documents, paths, entities, links)
 
     @staticmethod

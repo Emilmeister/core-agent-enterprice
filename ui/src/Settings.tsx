@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Api, ApiError, errorText } from "./api";
-import type { Settings as SettingsData, ToolPolicy } from "./types";
+import type { AgentSettings, McpConnection, Settings as SettingsData, ToolPolicy } from "./types";
 import { toolLabel } from "./toolPresentation";
 
 const modes: Record<ToolPolicy["mode"], string> = {
@@ -63,6 +63,7 @@ export function Settings({ api }: { api: Api }) {
       <h1>Настройки</h1>
       <p className="lede">Сроки ожидания и ограничения для новых операций.</p>
       <p className="muted">Настройки общие для всех владельцев и всех чатов этого агента.</p>
+      <AgentConfiguration api={api} />
       {error && (
         <p className="error" role="alert">
           {error}
@@ -74,7 +75,7 @@ export function Settings({ api }: { api: Api }) {
         </p>
       )}
       {values ? (
-        <form className="form-sheet" onSubmit={save}>
+        <form className="form-sheet runtime-settings" onSubmit={save}>
           <div className="form-grid">
             {Object.entries(labels).map(([key, label]) => (
               <label key={key}>
@@ -125,6 +126,175 @@ export function Settings({ api }: { api: Api }) {
       )}
     </section>
   );
+}
+
+function AgentConfiguration({ api }: { api: Api }) {
+  const [current, setCurrent] = useState<AgentSettings | null>(null);
+  const [profile, setProfile] = useState("");
+  const [model, setModel] = useState("");
+  const [models, setModels] = useState<string[]>([]);
+  const [servers, setServers] = useState<(McpConnection & { header_value?: string | null; original_name?: string })[]>([]);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [modelError, setModelError] = useState("");
+  const [notice, setNotice] = useState("");
+  async function loadModels(signal?: AbortSignal) {
+    setModelError("");
+    try {
+      const result = await api.json<{ models: string[] }>("/api/agent-settings/models", "GET", undefined, signal);
+      if (!signal?.aborted) setModels(result.models);
+    } catch (failure) {
+      if (!signal?.aborted) setModelError(errorText(failure));
+    }
+  }
+  useEffect(() => {
+    const controller = new AbortController();
+    void api.json<AgentSettings>("/api/agent-settings", "GET", undefined, controller.signal).then((result) => {
+      setCurrent(result);
+      setProfile(result.profile_prompt);
+      setModel(result.model_id);
+      setServers(result.mcp_servers.map((server) => ({ ...server, original_name: server.name })));
+    }).catch((failure) => {
+      if (!controller.signal.aborted) setError(errorText(failure));
+    });
+    void loadModels(controller.signal);
+    return () => controller.abort();
+  }, [api]);
+  async function save(section: string, values: Record<string, unknown>, mcpName?: string) {
+    if (!current || busy) return;
+    setBusy(section);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.json<AgentSettings>("/api/agent-settings", "PUT", {
+        expected_revision: current.revision, ...values,
+      });
+      setCurrent(result);
+      if (section === "profile") setProfile(result.profile_prompt);
+      if (section === "model") setModel(result.model_id);
+      if (section === "mcp") setServers((previous) => mcpName === undefined
+        ? result.mcp_servers.map((server) => ({ ...server, original_name: server.name }))
+        : previous.flatMap((server) => {
+          if (server.name !== mcpName && server.original_name !== mcpName) return [server];
+          const saved = result.mcp_servers.find((item) => item.name === mcpName);
+          return saved ? [{ ...saved, original_name: saved.name }] : [];
+        }));
+      setNotice("Настройки агента сохранены. Они применятся к новым задачам.");
+    } catch (failure) {
+      setError(errorText(failure));
+      if (failure instanceof ApiError && failure.status === 409) {
+        const result = await api.json<AgentSettings>("/api/agent-settings").catch(() => null);
+        if (result) setCurrent(result);
+      }
+    } finally {
+      setBusy("");
+    }
+  }
+  function updateServer(index: number, values: Partial<McpConnection & { header_value?: string | null }>) {
+    setServers((previous) => previous.map((server, position) => position === index ? { ...server, ...values } : server));
+  }
+  function connectionPayload(server: McpConnection & { header_value?: string | null }) {
+    return { name: server.name, url: server.url, enabled: server.enabled, header_name: server.header_name,
+      ...(server.header_value !== undefined ? { header_value: server.header_value } : {}) };
+  }
+  async function saveConnection(index: number) {
+    if (!current) return;
+    const server = servers[index];
+    if (!server.original_name && current.mcp_servers.some((item) => item.name === server.name)) {
+      setError("Подключение с таким именем уже существует. Выберите другое имя.");
+      return;
+    }
+    if (server.original_name && !current.mcp_servers.some((item) => item.name === server.original_name)) {
+      setError("Подключение уже удалено другим владельцем. Удалите его из формы и добавьте заново.");
+      return;
+    }
+    const connections = current.mcp_servers.map((item) => connectionPayload(item.name === server.original_name ? server : item));
+    if (!server.original_name) connections.push(connectionPayload(server));
+    await save("mcp", { mcp_servers: connections }, server.name);
+  }
+  async function removeConnection(index: number) {
+    if (!current) return;
+    const server = servers[index];
+    if (!server.original_name) {
+      setServers((previous) => previous.filter((_, position) => position !== index));
+      return;
+    }
+    if (!window.confirm(`Удалить MCP-подключение «${server.name}»?`)) return;
+    await save("mcp", { mcp_servers: current.mcp_servers.filter((item) => item.name !== server.original_name).map(connectionPayload) }, server.original_name);
+  }
+  if (!current) return error ? <p className="error" role="alert">{error}</p> : <p role="status">Загружаем профиль агента…</p>;
+  return <>
+    {error && <p className="error" role="alert">{error}</p>}
+    {notice && <p className="success" role="status">{notice}</p>}
+    <form className="form-sheet agent-profile-settings" onSubmit={(event) => { event.preventDefault(); void save("profile", { profile_prompt: profile }); }}>
+      <h2>Профиль агента</h2>
+      <label>Системный промпт / профиль
+        <textarea rows={8} disabled={!!busy} value={profile} onChange={(event) => setProfile(event.target.value)} />
+      </label>
+      <p className="muted">Роль, стиль и правила работы. Уже запущенные задачи сохраняют свой профиль.</p>
+      <div className="actions">
+        <button disabled={!!busy}>{busy === "profile" ? "Сохраняем…" : "Сохранить профиль"}</button>
+        <button type="button" className="secondary" disabled={!!busy || current.inherits.profile_prompt}
+          onClick={() => void save("profile", { profile_prompt: null })}>Использовать профиль развёртывания</button>
+      </div>
+    </form>
+    <form className="form-sheet agent-model-settings" onSubmit={(event) => { event.preventDefault(); void save("model", { model_id: model }); }}>
+      <h2>Модель</h2>
+      <label>Модель провайдера
+        <select value={model} disabled={!!busy} onChange={(event) => setModel(event.target.value)}>
+          {[...new Set([current.model_id, ...models])].sort().map((name) => <option key={name} value={name}>{name}</option>)}
+        </select>
+      </label>
+      {modelError && <p className="error" role="alert">{modelError} Текущая модель сохранена.</p>}
+      <div className="actions">
+        <button disabled={!!busy || !models.includes(model)}>{busy === "model" ? "Сохраняем…" : "Сохранить модель"}</button>
+        <button type="button" className="secondary" disabled={!!busy} onClick={() => void loadModels()}>Обновить список моделей</button>
+        <button type="button" className="secondary" disabled={!!busy || current.inherits.model_id}
+          onClick={() => void save("model", { model_id: null })}>Использовать модель развёртывания</button>
+      </div>
+    </form>
+    <section className="form-sheet agent-mcp-settings">
+      <h2>MCP-серверы</h2>
+      {servers.length === 0 && <p className="muted">Нет подключений.</p>}
+      {servers.map((server, index) => <form className="agent-mcp-connection" key={index}
+        onSubmit={(event) => { event.preventDefault(); void saveConnection(index); }}><fieldset disabled={!!busy}>
+        <legend>Подключение {index + 1}</legend>
+        <div className="form-grid">
+          <label>Имя MCP-сервера
+            <input value={server.name} pattern="[A-Za-z0-9_-]{1,64}" maxLength={64} required
+              disabled={!!server.original_name}
+              onChange={(event) => updateServer(index, { name: event.target.value })} />
+          </label>
+          <label>URL MCP-сервера
+            <input type="url" value={server.url} maxLength={4096} required onChange={(event) => updateServer(index, { url: event.target.value })} />
+          </label>
+          <label>Имя заголовка авторизации
+            <input value={server.header_name} maxLength={128} onChange={(event) => updateServer(index, { header_name: event.target.value })} />
+          </label>
+          <label>Значение заголовка авторизации
+            <input type="password" autoComplete="new-password" value={server.header_value ?? ""}
+              placeholder={server.has_header_value ? "Сохранённое значение" : "Не задано"}
+              onChange={(event) => updateServer(index, { header_value: event.target.value || undefined })} />
+          </label>
+          <label className="check"><input type="checkbox" checked={server.enabled}
+            onChange={(event) => updateServer(index, { enabled: event.target.checked })} />Подключён</label>
+          <label className="check"><input type="checkbox" checked={server.header_value === null}
+            onChange={(event) => updateServer(index, { header_value: event.target.checked ? null : undefined })} />Удалить сохранённый ключ</label>
+        </div>
+        <div className="actions">
+          <button disabled={!!busy}>{busy === "mcp" ? "Сохраняем…" : "Сохранить подключение"}</button>
+          <button type="button" className="secondary" onClick={() => void removeConnection(index)}>Удалить подключение</button>
+        </div>
+      </fieldset></form>)}
+      <p className="muted">Ключи принимаются только при сохранении. При изменении адреса или заголовка замените ключ либо отметьте его удаление. Новые инструменты требуют подтверждения владельца.</p>
+      <div className="actions">
+        <button type="button" className="secondary" disabled={!!busy || servers.length >= 32}
+          onClick={() => setServers((previous) => [...previous, { name: "", url: "", enabled: true, header_name: "Authorization", has_header_value: false }])}>Добавить MCP-сервер</button>
+        <button type="button" className="secondary" disabled={!!busy || current.inherits.mcp_servers}
+          onClick={() => void save("mcp", { mcp_servers: null })}>Использовать подключения развёртывания</button>
+      </div>
+    </section>
+  </>;
 }
 
 export function ToolPolicies({ api }: { api: Api }) {

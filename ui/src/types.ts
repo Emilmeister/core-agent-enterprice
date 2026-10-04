@@ -205,6 +205,20 @@ export interface ToolPolicy {
   guardrails_exempt: boolean;
   revision: number;
 }
+export interface McpConnection {
+  name: string;
+  url: string;
+  enabled: boolean;
+  header_name: string;
+  has_header_value: boolean;
+}
+export interface AgentSettings {
+  revision: number;
+  profile_prompt: string;
+  model_id: string;
+  mcp_servers: McpConnection[];
+  inherits: { profile_prompt: boolean; model_id: boolean; mcp_servers: boolean };
+}
 export interface Peer {
   id: string;
   name: string;

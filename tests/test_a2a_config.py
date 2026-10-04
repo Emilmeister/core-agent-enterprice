@@ -225,6 +225,19 @@ class RunRequestTests(unittest.TestCase):
         self.assertNotIn("decision", parsed.to_dict())
 
 class ConfigurationTests(unittest.TestCase):
+    def test_owner_mcp_discovery_requires_platform_feature_and_exact_child_subset(self):
+        raw = agent_config().to_dict()
+        raw["tools"]["mcp"]["owner_servers"] = ["repo"]
+        declarations = [{**item, "owner_configured": item["name"] == "repo"} for item in declared_mcp()]
+        effective = compile_effective_config(platform_config(), AgentConfig.from_dict(raw), declarations, DISCOVERED)
+        self.assertEqual(effective.mcp_tools["repo"], frozenset(DISCOVERED["repo"]) - {"delete_repository"})
+        narrowed = {**raw, "tools": {**raw["tools"], "mcp": {"default": "deny", "allow_servers": ["repo"],
+            "allow_tools": {"repo": ["search"]}}}}
+        self.assertEqual(compile_effective_config(platform_config(), AgentConfig.from_dict(narrowed), declarations,
+            DISCOVERED).mcp_tools["repo"], frozenset({"search"}))
+        disabled = platform_config(supported_features=platform_config().supported_features - {"mcp"})
+        self.assertEqual(compile_effective_config(disabled, AgentConfig.from_dict(raw), declarations, DISCOVERED).mcp_tools, {})
+
     def test_effective_config_is_intersection_with_deny_precedence(self):
         effective = compile_effective_config(
             platform_config(), agent_config(), declared_mcp(), DISCOVERED

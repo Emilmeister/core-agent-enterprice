@@ -54,6 +54,8 @@ from .material_reviews import MemoryMaterialReviewStore, PostgresMaterialReviewS
 from .chat_files import ChatFileService, MemoryChatFileStore, PostgresChatFileStore
 from .workspace_cleanup import WorkspaceCleanupService
 from .owner_api import owner_routes
+from .agent_settings import AgentSettingsStore
+from .agent_settings_api import agent_settings_routes
 from .external_access import ExternalAccess
 from .lifecycle import PostgresRetentionManager
 from .mcp import StreamableHttpMcpConnector
@@ -1580,6 +1582,9 @@ def create_app(
                                   response_files_enabled=auth_settings is not None,
                                   sandbox_launcher=sandbox_launcher,
                                   recovery_tenant_id=recovery_tenant_id)
+        if auth_settings:
+            agent.agent_settings_store = AgentSettingsStore(state["workflow"], push_key or None,
+                database=state["database"], deployment_mcp=agent.platform_mcp)
         if state["tasks"] is not None:
             state["tasks"].response_files_service = agent.response_files_service
         if state["database"] is not None:
@@ -1982,6 +1987,7 @@ def create_app(
             Mount("/a2a/owner", routes=routes),
             Mount("/a2a/external", routes=routes),
             Route("/api/identity", identity),
+            *agent_settings_routes(agent, agent.agent_settings_store),
             *owner_routes(agent, interaction_store, admission=admission, remote_registry=remote_registry_store,
                           cron_store=cron_store, on_cron_admitted=cron_handoff,
                           external_access=ExternalAccess(auth_settings, transport=auth_transport)),

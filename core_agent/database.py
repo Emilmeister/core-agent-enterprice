@@ -28,7 +28,7 @@ from .errors import CoreError
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -912,6 +912,34 @@ CREATE TRIGGER core_remote_agent_immutable_registration BEFORE UPDATE ON core_re
     FOR EACH ROW EXECUTE FUNCTION core_remote_agent_immutable_registration();
 """,
 
+    28: """
+CREATE TABLE core_agent_settings (
+    tenant_id text PRIMARY KEY,
+    revision bigint NOT NULL CHECK (revision >= 0)
+);
+CREATE TABLE core_agent_setting_revisions (
+    tenant_id text NOT NULL REFERENCES core_agent_settings(tenant_id),
+    revision bigint NOT NULL CHECK (revision > 0),
+    storage_version integer NOT NULL CHECK (storage_version = 1),
+    config jsonb NOT NULL,
+    encrypted_payload bytea,
+    actor_id text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY(tenant_id,revision)
+);
+ALTER TABLE core_agent_settings ADD CONSTRAINT core_agent_settings_current_revision
+    FOREIGN KEY(tenant_id,revision) REFERENCES core_agent_setting_revisions(tenant_id,revision)
+    DEFERRABLE INITIALLY DEFERRED;
+CREATE FUNCTION core_agent_setting_revision_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'immutable agent setting revision';
+END;
+$$;
+CREATE TRIGGER core_agent_setting_revision_immutable BEFORE UPDATE OR DELETE ON core_agent_setting_revisions
+    FOR EACH ROW EXECUTE FUNCTION core_agent_setting_revision_immutable();
+""",
+
+
 }
 
 
@@ -1062,6 +1090,8 @@ class PostgresDatabase:
             "core_runs": "SELECT, INSERT, UPDATE, DELETE",
             "core_waits": "SELECT, INSERT, UPDATE, DELETE",
             "core_owner_settings": "SELECT, INSERT, UPDATE",
+            "core_agent_settings": "SELECT, INSERT, UPDATE",
+            "core_agent_setting_revisions": "SELECT, INSERT",
             "core_remote_agents": "SELECT, INSERT, UPDATE",
             "core_remote_agent_revisions": "SELECT, INSERT",
             "core_tool_policies": "SELECT, INSERT, UPDATE",

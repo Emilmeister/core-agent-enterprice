@@ -236,10 +236,12 @@ def compile_effective_config(
                 raise CoreError("CAPABILITY_DISABLED")
             warnings.append(Warning("CAPABILITY_FILTERED", server))
             continue
-        if not gates.get("mcp", True):
+        if not gates.get("mcp", True) or "mcp" not in platform.supported_features:
             continue
         catalog = set(discovered.get(server, {}))
         explicit = set(mcp_policy.get("allow_tools", {}).get(server, []))
+        if declaration.get("owner_configured") and server in mcp_policy.get("owner_servers", ()):
+            explicit = catalog
         server_allowed = catalog & explicit
         server_allowed -= set(platform.denied_mcp_tools.get(server, set()))
         if server in set(mcp_policy.get("allow_servers", [])):

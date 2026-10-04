@@ -200,7 +200,7 @@ try {
     }
     const before=settingsWrites;
     await second.evaluate(`(()=>{const label=[...document.querySelectorAll('.form-grid label')].find(label=>label.textContent.includes('Общий размер вложений, байт'));const input=label.querySelector('input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(String(value))});input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
-    await delay(100);await second.evaluate("document.querySelector('form.form-sheet').requestSubmit()");
+    await delay(100);await second.evaluate("document.querySelector('form.runtime-settings').requestSubmit()");
     await waitFor(()=>settingsWrites>before,'actual settings write');
     await second.wait("document.querySelector('[role=status]')?.textContent.includes('Настройки сохранены')",'real settings CAS');
   }

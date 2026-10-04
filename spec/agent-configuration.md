@@ -411,6 +411,60 @@ Serving entrypoint MUST:
 
 ## Настройки владельцев
 
+### UI-02A. Профиль, модель и MCP
+
+`GET/PUT /api/agent-settings` доступны только verified company owners. Settings
+имеют company scope и одну CAS `revision`; PUT содержит `expected_revision` и
+только изменяемые секции. Concurrent stale write возвращает `SETTINGS_CONFLICT`
+без частичного сохранения. `profile_prompt` и `model_id` nullable: `null`
+наследует deployment default, пустой profile явно очищает профиль. Read
+возвращает effective значения и признаки наследования. Профиль ограничен
+65 536 UTF-8 bytes и не может менять safety, host/kernel или capability policy.
+
+`GET /api/agent-settings/models` выполняет только bounded read-only GET `models`
+на фиксированном deployment provider connection, без model inference. Response
+содержит отсортированные уникальные безопасные model IDs, максимум 1000 IDs,
+и current selection. Transport имеет предел 10 секунд и 1 MiB; credentials,
+provider URL и raw provider errors не выдаются. Model ID ограничен 256 ASCII
+characters `[A-Za-z0-9_.:/-]`. Изменение selection допускает только ID из текущего
+успешного списка; недоступность discovery возвращает `MODEL_DISCOVERY_UNAVAILABLE`
+и сохраняет прежнее значение. Provider route, credentials, context window,
+sampling и guardrails adapter остаются trusted deployment configuration.
+Основные model turns, semantic compaction и настроенный memory NER используют
+model ID admitted run; embedding provider и отдельный guardrails adapter
+сохраняют свои deployment connections. Token estimate остаётся локальным.
+
+MCP section содержит максимум 32 уникальных connections: стабильное имя
+`[A-Za-z0-9_-]{1,64}`, HTTPS URL до 4096 bytes (loopback HTTP разрешён), enabled
+и optional custom auth header. URL не содержит credentials, query или fragment.
+Transport-managed и hop-by-hop headers запрещены. Header value принимается
+только на запись: отсутствие поля сохраняет secret при неизменных URL/header,
+`null` удаляет его, непустое значение заменяет. Изменение URL/header требует
+явного нового secret либо удаления прежнего; deployment headers никогда не
+наследуются новой owner connection. Secret ограничен 16 KiB Latin-1 без control
+characters. Read содержит только header name и `has_header_value`; secret
+защищён Fernet envelope с tenant/revision/name/header binding и persistent
+`PUSH_NOTIFICATION_ENCRYPTION_KEY` в PostgreSQL. Ошибки, model context, audit
+и telemetry не содержат credentials. Deployment MCP defaults действуют до
+явного изменения MCP section владельцем; остальные секции их не заменяют.
+Read показывает deployment URL без userinfo/query/fragment. Сохранение прежнего
+имени и этого projected URL с пустым auth header сохраняет trusted deployment
+transport/headers при включении и отключении; это ссылка на существующее
+подключение. Новый URL не получает credentials другого подключения.
+
+Owner-managed MCP connection является trusted company configuration: её
+discovered tools доступны внутри platform feature ceiling, с default HITL
+и существующей per-tool policy. Discovery content не расширяет child allowlist.
+Disable/delete влияет на новые roots; прежние immutable revisions и credentials
+сохраняются для принятых Tasks. Новый owner/external/cron root атомарно закрепляет
+company revision, effective profile, model ID и MCP declarations до network.
+Follow-up, HITL/guardrail/time/task wait, delegated children и recovery сохраняют
+этот snapshot. Live tool-policy deny продолжает проверяться перед dispatch.
+Legacy snapshots без company revision читаются прежним путём без перезаписи.
+Schema migration создаёт current pointer и immutable version1 revision rows;
+serving role не изменяет/удаляет revisions. Откат после новых settings records
+требует совместимого reader либо согласованного восстановления БД.
+
 ### UI-02. Настройки
 
 В UI владельцы управляют политикой каждого инструмента, исключением инструмента

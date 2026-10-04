@@ -680,3 +680,12 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   не получает старый caller scope. External/foreign/owner-authority client
   не удаляется; native Keycloak и браузер доказывают реальный cascade,
   отмену подтверждения без DELETE и обновлённый список после успеха.
+
+- ENT-AC-86: owners редактируют profile prompt, выбирают модель текущего provider
+  и добавляют MCP URL/credentials, включают и отключают отдельные подключения.
+  Реальные owner HTTP и браузер проверяют отдельное сохранение, CAS, secret
+  withholding, недоступный provider list без потери текущего выбора и отказ
+  external caller. PostgreSQL restart сохраняет настройки и encrypted immutable
+  revision; новая Task использует их, admitted Task/recovery/child сохраняют свой
+  закреплённый профиль, модель и exact MCP ceiling. При выключении новая Task
+  не получает сервер; default tool HITL и deny dispatch остаются обязательными.

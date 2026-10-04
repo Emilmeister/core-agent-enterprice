@@ -39,6 +39,18 @@ def _cancel_error(cancel_event):
     return getattr(cancel_event, "error_code", "TASK_CANCELLED")
 
 
+def _credential_safe(value, headers):
+    secrets = tuple({secret for item in headers.values() if isinstance(item, str)
+                     for secret in (item, item.removeprefix("Bearer ")) if secret})
+    def clean(item):
+        if isinstance(item, dict):
+            return {redact(key, secrets): clean(content) for key, content in item.items()}
+        if isinstance(item, list):
+            return [clean(content) for content in item]
+        return redact(item, secrets) if isinstance(item, str) else item
+    return clean(value)
+
+
 def mcp_tool_name(server, tool):
     """The canonical name of one MCP tool, ready for any model API.
 
@@ -478,7 +490,7 @@ class StreamableHttpMcpConnector:
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
                 "Mcp-Method": method,
-                **self.headers,
+                **declaration.get("headers", self.headers),
             }
             if self.telemetry:
                 carrier = {}
@@ -591,6 +603,7 @@ class StreamableHttpMcpConnector:
         if notification:
             return None
         self._validate_envelope(value, payload["id"], method)
+        value = _credential_safe(value, declaration.get("headers", self.headers))
         if "error" in value:
             raise CoreError("MCP_PROTOCOL_ERROR", data=value["error"])
         return value["result"]

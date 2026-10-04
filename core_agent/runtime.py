@@ -344,6 +344,7 @@ class CoreAgent:
         self.workflow_store = workflow_store or InMemoryWorkflowStore()
         self.recovery_tenant_id = recovery_tenant_id
         self.interaction_store = interaction_store
+        self.agent_settings_store = None
         if (material_review_store is None) != (guardrail_classifier is None):
             raise CoreError("CONFIG_INVALID", "Material store and classifier must be configured together")
         self.material_review_store = material_review_store
@@ -861,6 +862,9 @@ class CoreAgent:
         if not narrow:
             return admitted
         current = self.platform_config
+        if snapshot.get("company_settings_revision") is not None:
+            current = replace(current, allowed_mcp_servers=current.allowed_mcp_servers | {
+                item["name"] for item in snapshot.get("admission", {}).get("mcp", ()) if item.get("owner_configured")})
         if "skill_contract_version" not in snapshot:
             legacy_features = (
                 snapshot.get("admission", {})
@@ -906,11 +910,25 @@ class CoreAgent:
         raw = copy.deepcopy(admission.get("agent_config", raw))
         if raw is None:
             raw = self.agent_config.to_dict()
+        declarations = tuple(copy.deepcopy(admission.get("mcp", self.platform_mcp)))
+        revision = record.snapshot.get("company_settings_revision")
+        if revision is not None:
+            if self.agent_settings_store is None:
+                raise CoreError("CHECKPOINT_INVALID")
+            settings = self.agent_settings_store.get(record.tenant_id, revision)
+            _, _, hydrated = self.agent_settings_store.configure(settings, raw, self.platform_config,
+                self.platform_mcp, profile=False, credentials=True)
+            headers = {item["name"]: item.get("headers") for item in hydrated}
+            for declaration in declarations:
+                if declaration.get("owner_configured"):
+                    if declaration["name"] not in headers or headers[declaration["name"]] is None:
+                        raise CoreError("CHECKPOINT_INVALID")
+                    declaration["headers"] = headers[declaration["name"]]
         return (
             raw,
             AgentConfig.from_dict(raw),
             self._admitted_platform(record.snapshot),
-            tuple(copy.deepcopy(admission.get("mcp", self.platform_mcp))),
+            declarations,
             tuple(
                 copy.deepcopy(admission.get("declared_skills", self.declared_skills))
             ),
@@ -935,7 +953,7 @@ class CoreAgent:
         connector = mcp_connector or self.mcp_connector
         if deadline is None and getattr(connector, "cold_start_timeout", 0) > 0:
             deadline = time.monotonic() + connector.cold_start_timeout
-        if raw["features"].get("mcp"):
+        if raw["features"].get("mcp", False) not in (False, "disabled") and "mcp" in platform_config.supported_features:
             for declaration in platform_mcp:
                 if declaration["name"] in platform_config.allowed_mcp_servers:
                     try:
@@ -1923,6 +1941,19 @@ class CoreAgent:
                 raise CoreError("CRON_INVALID")
             cron_origin = validate_origin(cron_origin, prompt=request.prompt)
         raw = self.agent_config.to_dict()
+        platform, declarations, settings_revision = self.platform_config, self.platform_mcp, None
+        if self.agent_settings_store is not None:
+            selected_tenant = tenant_id or "default"
+            if parent_run_id is not None:
+                parent = self.workflow_store.get(parent_run_id, tenant_id=selected_tenant, connection=connection)
+                settings_revision = parent.snapshot.get("company_settings_revision")
+                declarations = tuple(copy.deepcopy(parent.snapshot.get("admission", {}).get("mcp", declarations)))
+                platform = self._admitted_platform(parent.snapshot, narrow=False)
+            if parent_run_id is None or settings_revision is not None:
+                settings = self.agent_settings_store.get(selected_tenant, settings_revision, connection=connection)
+                settings_revision = settings["revision"]
+                raw, platform, declarations = self.agent_settings_store.configure(settings, raw, platform, declarations,
+                    profile=parent_run_id is None)
         budgets = raw.get("budgets", {})
         max_model_turns = min(
             budgets.get("model_turns", self.platform_config.max_model_turns),
@@ -1949,8 +1980,8 @@ class CoreAgent:
             "skill_contract_version": SKILL_CONTRACT_VERSION,
             "admission": {
                 "agent_config": copy.deepcopy(raw),
-                "platform_config": self._platform_snapshot(self.platform_config),
-                "mcp": copy.deepcopy(list(self.platform_mcp)),
+                "platform_config": self._platform_snapshot(platform),
+                "mcp": copy.deepcopy(list(declarations)),
                 "declared_skills": copy.deepcopy(list(self.declared_skills)),
             },
             "mcp_cold_start_expires_at": (
@@ -1976,6 +2007,8 @@ class CoreAgent:
         }
         if file_batch_id is not None:
             snapshot["file_batch_id"] = file_batch_id
+        if settings_revision is not None:
+            snapshot["company_settings_revision"] = settings_revision
         if cron_origin is not None:
             snapshot["cron_origin"] = copy.deepcopy(cron_origin)
         record = WorkflowRecord(
@@ -2461,7 +2494,7 @@ class CoreAgent:
                 self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
                 if snapshot["turns"] >= max_turns - 1:
                     raise self._budget_error("model_turns", max_turns, max_turns)
-                model = self.model
+                model = self._model_for_snapshot(snapshot)
                 if isinstance(model, CompatibleHttpModel):
                     model = copy.copy(model)
                     model.stream = False
@@ -3986,11 +4019,21 @@ class CoreAgent:
             return NULL_STREAM
         return self._task_streams.get(task_id) or NULL_STREAM
 
-    def _generate(self, *, before_retry=None, **call):
+    def _model_for_snapshot(self, snapshot):
+        if not isinstance(self.model, CompatibleHttpModel):
+            return self.model
+        route = snapshot.get("admission", {}).get("agent_config", {}).get("model", {}).get("route")
+        if route is None or route == getattr(self.model, "model", None):
+            return self.model
+        model = copy.copy(self.model)
+        model.model = route
+        return model
+
+    def _generate(self, *, before_retry=None, model=None, **call):
         """Retry a retryable provider failure REFLECT_AND_RETRY_MAX_RETRIES times."""
         for attempt in range(self.model_retries + 1):
             try:
-                return self.model.generate(**call)
+                return (model or self.model).generate(**call)
             except CoreError as error:
                 if attempt == self.model_retries or not getattr(
                     error, "retryable", False
@@ -4604,6 +4647,7 @@ class CoreAgent:
                         try:
                             response = (
                                 self._generate(
+                                    model=self._model_for_snapshot(snapshot),
                                     before_retry=reserve_retry,
                                     context=model_context,
                                     tools=model_tools,
@@ -6038,6 +6082,13 @@ class CoreAgent:
         scope = self._run_scopes.get(run_id, {})
         return ({"task_id": scope.get("task_id") or "", "event_revision": 0},)
 
+    def _memory_entity_model(self, run_id):
+        if self.agent_settings_store is None:
+            return None
+        scope = self._run_scopes.get(run_id, {})
+        record = self.workflow_store.get(run_id, tenant_id=scope.get("tenant_id") or "default")
+        return record.snapshot.get("admission", {}).get("agent_config", {}).get("model", {}).get("route")
+
     def _memory_search(self, arguments, run_id):
         service, namespace = self._memory(run_id, arguments.get("scope", "user"))
         response = service.search(
@@ -6091,6 +6142,7 @@ class CoreAgent:
             kind=arguments.get("kind") or "fact",
             tags=tuple(arguments.get("tags") or ()),
             sources=self._memory_sources(run_id),
+            entity_model=self._memory_entity_model(run_id),
         )
         return {
             "memory_id": document.id,
@@ -6108,6 +6160,7 @@ class CoreAgent:
             expected_revision=int(arguments["expected_revision"]),
             title=arguments.get("title"),
             status=arguments.get("status"),
+            entity_model=self._memory_entity_model(run_id),
         )
         return {
             "memory_id": document.id,
@@ -6124,6 +6177,7 @@ class CoreAgent:
             overview=arguments["overview"],
             children=arguments["children"],
             expected_revision=int(arguments["expected_revision"]),
+            entity_model=self._memory_entity_model(run_id),
         )
         return {
             "memory_ids": list(memory_ids),
@@ -6137,6 +6191,7 @@ class CoreAgent:
             namespace=namespace,
             reason=arguments["reason"],
             expected_revision=int(arguments["expected_revision"]),
+            entity_model=self._memory_entity_model(run_id),
         )
         return {
             "committed": result.committed,
@@ -6500,6 +6555,7 @@ class CoreAgent:
             budget_cancel_grace_seconds=self.budget_cancel_grace_seconds,
         )
         child.cron_store = getattr(self, "cron_store", None)
+        child.agent_settings_store = self.agent_settings_store
         return child
 
     def _scheduler_workflow_outcome(self, task_id, tenant_id, kind, contract):
