@@ -90,6 +90,9 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   chooses a counterparty by stable connection identity; all operations to that
   peer in the current chat share one chronological message/file/status history.
   Other peers have separate histories; new operations preserve the selection.
+  On desktop, drag the separator or use arrows/Home/End to resize within bounds
+  that preserve the main chat. Width stays within the open chat; mobile uses a
+  full-width overlay without a resize handle.
   Recreating a connection with the same name does not merge its old history.
   Visible active operations update every 15 seconds, with expiring observation
   interest; closing the panel restores adaptive backend polling. Main chat and
@@ -115,7 +118,10 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   uses strict security, disabled HTML labels and fixed text/edge limits. Its
   image context cannot execute scripts or access credentials; CSP allows blob
   only for images. Tool records and owner input remain plain text.
-  Tool calls/results join by Task/call ID into action cards; successful sequences
+  Tool calls/results join by Task/call ID into compact clickable action cards.
+  A native modal shows arguments, readable output and technical data, with
+  keyboard opening, Escape closing, restored focus and bounded scrolling.
+  Successful sequences
   collapse, while errors and owner requests stay visible. Original owner text
   remains separate from system attachment instructions. File cards and the
   incoming/generated file panel use authenticated scoped downloads and escaped,

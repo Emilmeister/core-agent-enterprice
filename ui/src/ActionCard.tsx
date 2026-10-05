@@ -1,3 +1,5 @@
+import { useId, useLayoutEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { actionLabel, actionPreview } from "./toolPresentation";
 import type { HistoryItem, Interaction } from "./types";
 import { CodeBlock } from "./Code";
@@ -148,43 +150,71 @@ export function actionState(action: HistoryAction, terminal?: HistoryItem, waits
   return { kind: "active", label: "Ожидает результата" };
 }
 
-export function ActionCard({ action, terminal, waits }: {
-  action: HistoryAction; terminal?: HistoryItem; waits?: Interaction[];
-}) {
+type ActionProps = { action: HistoryAction; terminal?: HistoryItem; waits?: Interaction[] };
+function title(action: HistoryAction): string {
+  const value = action.name ? actionLabel(action.name, action.args) : "Действие агента";
+  return value.length > 240 ? value.slice(0, 239) + "…" : value;
+}
+
+export function ActionCard({ action, terminal, waits, onOpen }: ActionProps & { onOpen: () => void }) {
+  const state = actionState(action, terminal, waits);
+  const label = title(action);
+  return <article className={`action-card action-${state.kind}`} data-action-key={action.key}
+    id={`history-${action.item.id}-${action.callId ?? "unstructured"}`} data-history-id={action.item.id}>
+    <button type="button" className="action-heading action-open" aria-haspopup="dialog"
+      aria-label={`Подробности: ${label}. ${state.label}`} onClick={onOpen}>
+      <strong>{label}</strong>
+      <span className={`action-status ${state.kind === "error" || state.kind === "unknown" ? "error" : "muted"}`}>{state.label}</span>
+      <span className="action-open-icon" aria-hidden="true">›</span>
+    </button>
+    {state.reason && <p className={state.kind === "error" ? "error" : "muted"}>{state.reason}</p>}
+  </article>;
+}
+
+// History owns selection so regrouping completed calls cannot close an open dialog.
+export function ActionDialog({ action, terminal, waits, onClose }: ActionProps & { onClose: () => void }) {
   const state = actionState(action, terminal, waits);
   const output = object(action.result?.output);
   const stdout = typeof output?.stdout === "string" ? output.stdout : undefined;
   const stderr = typeof output?.stderr === "string" ? output.stderr : undefined;
   const preview = action.name ? actionPreview(action.name, action.args) : [];
-  const pythonSource = action.name === "core_python_exec" && typeof object(action.args)?.code === "string"
-    ? object(action.args)!.code as string : undefined;
-  const compact = (text: string) => text.length > 240 ? text.slice(0, 239) + "…" : text;
+  const dialog = useRef<HTMLDialogElement>(null);
+  const titleId = useId();
+  useLayoutEffect(() => { dialog.current?.showModal(); }, []);
+  function close() {
+    dialog.current?.close();
+    onClose();
+  }
+  const compactLabel = title(action);
   const hasOutput = stdout !== undefined || stderr !== undefined || action.result?.output !== undefined;
-  return <article className={`action-card action-${state.kind}`} data-action-key={action.key}
-    id={`history-${action.item.id}-${action.callId ?? "unstructured"}`} data-history-id={action.item.id}>
-    <div className="action-heading"><strong>{action.name ? compact(actionLabel(action.name, action.args)) : "Действие агента"}</strong>
-      <span className={`action-status ${state.kind === "error" || state.kind === "unknown" ? "error" : "muted"}`}>{state.label}</span></div>
-    {preview.length > 0 && <dl className="action-preview">{preview.map((field, index) => <div key={`${field.label}:${index}`}>
-      <dt>{field.label}</dt><dd className="prose">{field.label === "Код Python"
-        ? <CodeBlock text={compact(field.value)} language="python" /> : compact(field.value)}</dd>
-    </div>)}</dl>}
-    {state.reason && <p className={state.kind === "error" ? "error" : "muted"}>{state.reason}</p>}
-    {hasOutput && <details className="action-output"><summary>Вывод действия</summary>
-      {stdout !== undefined || stderr !== undefined ? <>
-        {stdout && <><div className="eyebrow">stdout</div><pre>{stdout}</pre></>}
-        {stderr && <><div className="eyebrow">stderr</div><pre>{stderr}</pre></>}
-        {!stdout && !stderr && <p className="muted">Действие завершилось без текстового вывода.</p>}
-        {output?.truncated === true && <p className="muted">Вывод ограничен при выполнении действия.</p>}
-      </> : <pre>{typeof action.result?.output === "string" ? action.result.output : JSON.stringify(action.result?.output, null, 2)}</pre>}
-    </details>}
-    <details className="action-technical"><summary>Технические данные</summary><dl>
-      <dt>Инструмент</dt><dd>{action.name || "Неизвестен"}</dd>
-      {pythonSource !== undefined && <><dt>Код Python</dt><dd><CodeBlock text={pythonSource} language="python" /></dd></>}
-      <dt>Аргументы</dt><dd><pre>{action.args === undefined ? "Недоступны" : JSON.stringify(action.args, null, 2)}</pre></dd>
-      <dt>ID вызова</dt><dd>{action.callId ?? "Недоступен"}</dd><dt>ID задачи</dt><dd>{action.taskId ?? "Недоступен"}</dd>
-      {typeof output?.exit_code === "number" && <><dt>Exit code</dt><dd>{output.exit_code}</dd></>}
-      {action.result?.status && <><dt>Статус инструмента</dt><dd>{action.result.status}</dd></>}
-      {action.raw && <><dt>Сохранённая запись</dt><dd><pre>{action.raw}</pre></dd></>}
-    </dl></details>
-  </article>;
+  return createPortal(<dialog ref={dialog} className="action-dialog" aria-labelledby={titleId}
+      onCancel={(event) => { event.preventDefault(); event.stopPropagation(); close(); }}>
+      <header className="action-dialog-heading">
+        <div><h2 id={titleId}>{compactLabel}</h2><p className={state.kind === "error" || state.kind === "unknown" ? "error" : "muted"}>{state.label}</p></div>
+        <button type="button" className="text-button" autoFocus aria-label="Закрыть подробности действия" onClick={close}>×</button>
+      </header>
+      <div className="action-dialog-content" tabIndex={0} role="region" aria-label="Подробности действия">
+        {state.reason && <p className={state.kind === "error" ? "error" : "muted"}>{state.reason}</p>}
+        {preview.length > 0 && <dl className="action-preview">{preview.map((field, index) => <div key={`${field.label}:${index}`}>
+          <dt>{field.label}</dt><dd className="prose">{field.label === "Код Python"
+            ? <CodeBlock text={field.value} language="python" /> : field.value}</dd>
+        </div>)}</dl>}
+        {hasOutput && <section className="action-output"><h3>Вывод действия</h3>
+          {stdout !== undefined || stderr !== undefined ? <>
+            {stdout && <><div className="eyebrow">stdout</div><pre>{stdout}</pre></>}
+            {stderr && <><div className="eyebrow">stderr</div><pre>{stderr}</pre></>}
+            {!stdout && !stderr && <p className="muted">Действие завершилось без текстового вывода.</p>}
+            {output?.truncated === true && <p className="muted">Вывод ограничен при выполнении действия.</p>}
+          </> : <pre>{typeof action.result?.output === "string" ? action.result.output : JSON.stringify(action.result?.output, null, 2)}</pre>}
+        </section>}
+        <section className="action-technical"><h3>Технические данные</h3><dl>
+          <dt>Инструмент</dt><dd>{action.name || "Неизвестен"}</dd>
+          <dt>Аргументы</dt><dd><pre>{action.args === undefined ? "Недоступны" : JSON.stringify(action.args, null, 2)}</pre></dd>
+          <dt>ID вызова</dt><dd>{action.callId ?? "Недоступен"}</dd><dt>ID задачи</dt><dd>{action.taskId ?? "Недоступен"}</dd>
+          {typeof output?.exit_code === "number" && <><dt>Exit code</dt><dd>{output.exit_code}</dd></>}
+          {action.result?.status && <><dt>Статус инструмента</dt><dd>{action.result.status}</dd></>}
+          {action.raw && <><dt>Сохранённая запись</dt><dd><pre>{action.raw}</pre></dd></>}
+        </dl></section>
+      </div>
+    </dialog>, document.body);
 }

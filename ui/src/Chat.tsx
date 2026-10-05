@@ -4,6 +4,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type CSSProperties,
 } from "react";
 import { Api, ApiError, errorText } from "./api";
 import { Attachments, ConversationFiles, History, pendingAction, useChatHistory } from "./History";
@@ -85,6 +86,21 @@ export function Chat({
   );
   const [filesOpen, setFilesOpen] = useState(false);
   const [peerSelection, setPeerSelection] = useState<string>();
+  const [peerWidth, setPeerWidth] = useState(380);
+  const [peerMaxWidth, setPeerMaxWidth] = useState(380);
+  const conversation = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const element = conversation.current;
+    if (!element) return;
+    const observer = new ResizeObserver(() => {
+      if (window.matchMedia("(max-width: 1100px)").matches) return;
+      const max = Math.max(320, Math.floor(element.getBoundingClientRect().width - 360));
+      setPeerMaxWidth(max);
+      setPeerWidth((width) => Math.min(max, Math.max(320, width)));
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
   const peerTrigger = useRef<HTMLButtonElement | null>(null);
   const peerButton = useRef<HTMLButtonElement>(null);
   const [filesDirty, setFilesDirty] = useState(false);
@@ -546,7 +562,14 @@ export function Chat({
     : task.status.state === "TASK_STATE_SUBMITTED" ? "Запрос принят" : "Готовит ответ";
   const fileCount = history.page.items.reduce((count, item) => count + (item.attachments?.length ?? 0) + (item.response_files?.length ?? 0), 0);
   return (
-    <section className={`conversation ${peerSelection ? "peer-panel-open" : ""}`} aria-label="Чат">
+    <section ref={conversation} className={`conversation ${peerSelection ? "peer-panel-open" : ""}`} aria-label="Чат"
+      style={{ "--peer-width": `${peerWidth}px` } as CSSProperties}
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && peerSelection && !(event.target instanceof Element && event.target.closest("dialog"))) {
+          event.stopPropagation();
+          closePeer();
+        }
+      }}>
       <header className="chat-heading">
         <div className="chat-title">
           <h1>{row?.title || "Новый чат"}</h1>
@@ -589,7 +612,8 @@ export function Chat({
         </div>
       </header>
       {peerSelection && contextId && <PeerConversationPanel api={api} contextId={contextId} selected={peerSelection}
-        conversations={peerHistory.conversations} onSelect={setPeerSelection} onClose={closePeer} />}
+        conversations={peerHistory.conversations} onSelect={setPeerSelection} onClose={closePeer}
+        width={peerWidth} maxWidth={peerMaxWidth} onResize={(width) => setPeerWidth(Math.max(320, Math.min(peerMaxWidth, Math.round(width))))} />}
       {contextId && <dialog ref={deleteDialog} className="chat-delete-dialog" aria-labelledby="chat-delete-title" aria-describedby="chat-delete-description"
         onClose={() => titleMenu.current?.querySelector<HTMLElement>("summary")?.focus()}
         onCancel={(event) => { if (busy) event.preventDefault(); else setDeleteConfirm(false); }}>
@@ -632,14 +656,6 @@ export function Chat({
                 thread.current.clientHeight <
               100;
             if (stickToBottom.current) setNewMessages(false);
-          }
-        }}
-        onFocusCapture={(event) => {
-          const bounds = event.target.getBoundingClientRect();
-          const container = thread.current?.getBoundingClientRect();
-          if (container && (bounds.bottom > container.bottom || bounds.top < container.top)) {
-            stickToBottom.current = false;
-            event.target.scrollIntoView({ block: "nearest" });
           }
         }}
       >

@@ -1199,9 +1199,13 @@ main {
 .peer-card-footer button { padding: 6px 12px; min-height: 34px; font-size: 12px; }
 .peer-action-details { margin: 0 4px 16px; }
 .peer-action-details > summary { color: var(--muted); font-size: 12px; }
-.peer-panel-open { padding-right: 380px; }
+.peer-panel-open { padding-right: var(--peer-width, 380px); }
 .peer-panel-open .chat-heading { padding-inline: 20px; gap: 12px; flex-wrap: wrap; }
-.peer-conversation-panel { position: absolute; top: 0; bottom: 0; right: 0; width: 380px; display: flex; flex-direction: column; min-width: 0; background: #fff; border-left: 1px solid var(--line); z-index: 7; }
+.peer-conversation-panel { position: absolute; top: 0; bottom: 0; right: 0; width: var(--peer-width, 380px); display: flex; flex-direction: column; min-width: 0; background: #fff; border-left: 1px solid var(--line); z-index: 7; }
+.peer-resize-handle { position: absolute; inset-block: 0; left: -5px; width: 10px; z-index: 1; cursor: col-resize; touch-action: none; user-select: none; }
+.peer-resize-handle::after { content: ""; position: absolute; top: 50%; left: 3px; width: 3px; height: 40px; border-radius: 3px; background: var(--muted); }
+.peer-resize-handle:hover::after, .peer-resize-handle:focus-visible::after { background: #4777b8; }
+.peer-resize-handle:focus-visible { outline-offset: -2px; }
 .peer-panel-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; padding: 22px 18px 14px; }
 .peer-panel-heading h2 { font-size: 18px; letter-spacing: -.2px; }
 .peer-panel-heading .muted { font-size: 12px; margin-top: 4px; overflow-wrap: anywhere; }
@@ -1233,6 +1237,7 @@ main {
   .peer-panel-open { padding-right: 0; }
   .peer-panel-open > :not(.peer-conversation-panel) { visibility: hidden; }
   .peer-conversation-panel { width: 100%; border-left: 0; }
+  .peer-resize-handle { display: none; }
 }
 @media (max-width: 640px) {
   .chat-heading { flex-wrap: wrap; align-items: start; gap: 8px; }
@@ -1303,8 +1308,25 @@ main {
   .chat-title-form { padding: 12px 16px; }
 }
 
-.action-card { margin: 10px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: #fafafa; }
+.action-card { margin: 8px 0; padding: 0; border: 1px solid var(--line); border-radius: 12px; background: #fafafa; }
 .action-heading { display: flex; gap: 10px; justify-content: space-between; flex-wrap: wrap; font-size: 13px; align-items: baseline; }
+.action-open { width: 100%; padding: 10px 12px; border: 0; border-radius: inherit; background: transparent; color: var(--ink); text-align: left; font-weight: 400; }
+.action-open:hover:not(:disabled) { background: var(--soft); }
+.action-open strong { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.action-open-icon { color: var(--muted); font-size: 18px; line-height: 1; }
+.action-card > p { padding: 0 12px 10px; font-size: 12px; }
+.action-dialog { width: calc(100% - 32px); max-width: 780px; max-height: calc(100dvh - 48px); padding: 0; border: 1px solid var(--line); border-radius: 16px; color: var(--ink); background: #fff; overflow: hidden; }
+.action-dialog[open] { display: flex; flex-direction: column; }
+.action-dialog::backdrop { background: #0005; }
+.action-dialog-heading { display: flex; flex-shrink: 0; align-items: start; justify-content: space-between; gap: 14px; padding: 18px 20px; border-bottom: 1px solid var(--line); }
+.action-dialog-heading h2 { font-size: 18px; overflow-wrap: anywhere; }
+.action-dialog-heading p { font-size: 12px; margin-top: 6px; }
+.action-dialog-heading button { flex-shrink: 0; font-size: 24px; line-height: 1; }
+.action-dialog-content { padding: 18px 20px; min-height: 0; overflow: auto; overscroll-behavior: contain; scroll-padding: 8px; }
+.action-dialog-content > section { margin-top: 20px; }
+.action-dialog-content h3 { font-size: 14px; margin-bottom: 10px; }
+.action-dialog-content pre { max-height: none; }
+.action-dialog-content .action-preview pre { margin: 0; }
 .action-status { flex-shrink: 0; font-size: 12px; }
 .action-heading .error { margin: 0; padding: 3px 7px; }
 .action-card details { margin: 8px 0 0; }

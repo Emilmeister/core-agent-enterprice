@@ -397,8 +397,24 @@ try {
   await page.click('Новые сообщения ↓');
   await page.wait("(()=>{const t=document.querySelector('.thread');return t.scrollHeight-t.scrollTop-t.clientHeight<100;})()",'explicit latest-message jump');
   check(await page.evaluate("(()=>{const keys=[...document.querySelectorAll('[data-action-key]')].map(card=>card.dataset.actionKey);return keys.length===4&&new Set(keys).size===4&&!!document.querySelector('.execution-group')&&!document.querySelector('.thread').textContent.includes('Вызов инструмента');})()"),'one correlated card per Task/call and consecutive successful execution group');
-  await page.evaluate("document.querySelector('.execution-group').open=true;document.querySelector('.action-output').open=true");
+  await page.evaluate("document.querySelector('.execution-group').open=true");
+  check(await page.evaluate("[...document.querySelectorAll('.action-card')].every(card=>card.querySelector(':scope > button')&&!card.querySelector('.action-preview,.action-output,.action-technical'))"),'compact action cards keep output and technical data outside the chat');
+  const actionScroll=await page.evaluate("document.querySelector('.thread').scrollTop");
+  await page.evaluate("document.querySelector('.action-card > button').click()");
+  await page.wait("!!document.querySelector('.action-dialog[open]')",'action details modal');
   check(await page.evaluate("document.querySelector('.action-output pre')?.textContent.includes('browser-native-root-verified') && document.querySelector('.action-technical')?.textContent.includes('ID вызова')"),'real terminal output preserves readable newlines and technical data remains disclosed separately');
+  check(await page.evaluate("document.activeElement.closest('.action-dialog')!==null&&document.querySelector('.action-dialog').getBoundingClientRect().height<=innerHeight-30"),'action modal has contained focus and bounded height');
+  await page.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  await page.call('Input.dispatchKeyEvent',{type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+  try { await page.wait("!document.querySelector('.action-dialog')",'Escape completes native modal close event'); }
+  catch(error) { throw new Error(error.message+' '+JSON.stringify(await page.evaluate("({open:document.querySelector('.action-dialog')?.open,active:document.activeElement.className,asset:document.querySelector('script[type=module]')?.getAttribute('src')})"))); }
+  const closedAction=await page.evaluate("({active:document.activeElement.className,top:document.querySelector('.thread').scrollTop})");
+  if(!await page.evaluate(`document.activeElement.matches('.action-card > button')&&document.querySelector('.thread').scrollTop===${actionScroll}`)) throw new Error('action modal close state '+JSON.stringify({before:actionScroll,after:closedAction}));
+  console.log('PASS action modal Escape returns focus without moving chat');
+  await page.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,text:'\r'});
+  await page.call('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13});
+  await page.wait("!!document.querySelector('.action-dialog[open]')",'keyboard opens action details');
+  await page.click('×','.action-dialog button');
   async function readableAnswer(){
     check(await page.evaluate("(()=>{const steps=document.querySelector('.execution-steps');return steps.getBoundingClientRect().height<=Math.min(innerHeight*.48,480)+1&&getComputedStyle(steps).overflowY==='auto'&&steps.tabIndex===0;})()"),'expanded execution remains a bounded keyboard-accessible region');
     await page.evaluate("(()=>{const thread=document.querySelector('.thread');thread.scrollTop=thread.scrollHeight;})()");
@@ -412,6 +428,9 @@ try {
   await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   await readableAnswer();
   check(await page.evaluate("document.documentElement.scrollWidth<=innerWidth && document.querySelector('.thread').clientHeight>100"),'actual mobile viewport keeps bounded readable history without horizontal overflow');
+  await page.evaluate("document.querySelector('.action-card > button').click()");
+  check(await page.evaluate("(()=>{const d=document.querySelector('.action-dialog'),r=d.getBoundingClientRect(),b=d.querySelector('.action-dialog-content');return d.open&&r.left>=0&&r.right<=innerWidth&&r.bottom<=innerHeight&&b.clientHeight>0&&getComputedStyle(b).overflowY==='auto';})()"),'mobile action modal confines details to a scrollable viewport');
+  await page.click('×','.action-dialog button');
   await page.evaluate("document.querySelector('.composer textarea').focus()");
   await page.call('Input.dispatchKeyEvent',{type:'keyDown',key:'Tab',code:'Tab',windowsVirtualKeyCode:9});
   await page.call('Input.dispatchKeyEvent',{type:'keyUp',key:'Tab',code:'Tab',windowsVirtualKeyCode:9});
@@ -581,7 +600,9 @@ try {
   await page.click('Открыть',previewCards+' li:nth-child(5) button');
   await page.wait("!!document.querySelector('.file-preview .hljs-keyword')",'Python preview authenticated read is complete');
   check(await page.evaluate(`document.querySelector('.file-preview code')?.textContent===${JSON.stringify("value = 7\nif value:\n    print('python highlight verified')\n")} && !!document.querySelector('.file-preview .hljs-keyword') && getComputedStyle(document.querySelector('.file-preview pre')).whiteSpace==='pre'`),'Python file preview preserves exact indentation with syntax highlighting');
-  check(await page.evaluate("!!document.querySelector('.action-card .action-preview .hljs-keyword')"),'Python action parameters have syntax highlighting');
+  await page.evaluate("(()=>{const card=[...document.querySelectorAll('.action-card')].find(card=>card.querySelector('.action-heading strong')?.textContent.includes('Python'));const group=card.closest('.execution-group');if(group)group.open=true;card.querySelector('button').click();})()");
+  check(await page.evaluate("!!document.querySelector('.action-dialog .action-preview .hljs-keyword')"),'Python action parameters have syntax highlighting');
+  await page.click('×','.action-dialog button');
   await page.click('Закрыть',previewCards+' li:nth-child(5) .file-preview button');
   await page.click('Открыть',previewCards+' li:nth-child(6) button');
   await page.wait("document.querySelector('.file-preview pre')?.textContent.includes('preview line')",'long native file preview');
@@ -800,12 +821,28 @@ try {
   await page.click('Скачать','.peer-outgoing .file-card button');
   check((await downloaded({name:'report.txt'})).equals(await readFile(config.files[0])),'outgoing peer file download preserves selected frozen bytes');
   check(await page.evaluate("(()=>{const thread=document.querySelector('.thread'),panel=document.querySelector('.peer-conversation-panel');return thread.getBoundingClientRect().right<=panel.getBoundingClientRect().left+1&&thread.clientHeight>100;})()"),'desktop peer panel leaves the main chat visible');
+  const resize=await page.evaluate("(()=>{const panel=document.querySelector('.peer-conversation-panel'),r=panel.querySelector('[role=separator]').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,width:panel.getBoundingClientRect().width};})()");
+  await page.call('Input.dispatchMouseEvent',{type:'mousePressed',x:resize.x,y:resize.y,button:'left',buttons:1,clickCount:1});
+  await page.call('Input.dispatchMouseEvent',{type:'mouseMoved',x:resize.x-70,y:resize.y,button:'left',buttons:1});
+  await page.call('Input.dispatchMouseEvent',{type:'mouseReleased',x:resize.x-70,y:resize.y,button:'left',buttons:0,clickCount:1});
+  check(await page.evaluate(`document.querySelector('.peer-conversation-panel').getBoundingClientRect().width>=${resize.width+60}&&document.querySelector('.thread').getBoundingClientRect().width>=359`),'peer separator pointer drag expands the panel while preserving chat space');
+  await page.evaluate("document.querySelector('.peer-conversation-panel [role=separator]').focus()");
+  for(const key of ['Home','ArrowLeft','End']) {
+    await page.call('Input.dispatchKeyEvent',{type:'keyDown',key,code:key});
+    check(await page.evaluate(`(()=>{const p=document.querySelector('.peer-conversation-panel'),h=p.querySelector('[role=separator]');return Math.abs(p.getBoundingClientRect().width-Number(h.getAttribute('aria-valuenow')))<1&&Number(h.getAttribute('aria-valuenow'))${key==='Home'?'===Number(h.getAttribute("aria-valuemin"))':key==='End'?'===Number(h.getAttribute("aria-valuemax"))':'>Number(h.getAttribute("aria-valuemin"))'}&&document.querySelector('.thread').getBoundingClientRect().width>=359;})()`),'peer separator '+key+' applies accessible width limits');
+  }
+  const peerWidth=await page.evaluate("document.querySelector('.peer-conversation-panel').getBoundingClientRect().width");
   await page.wait("document.querySelector('.peer-messages')?.textContent.includes('Проверяю данные для поручения.')",'public peer progress arrives before task completion');
   const workingPeer=await page.evaluate(`(async()=>{const response=await fetch('/api/browser-peer-fixture',{headers:{Authorization:${JSON.stringify(bearer)}},credentials:'omit'});return response.json();})()`);
   check(!workingPeer.finished&&workingPeer.sends===1&&workingPeer.gets>0&&!await page.evaluate("document.querySelector('.peer-conversation-panel').textContent.includes('private-peer-reasoning')"),'intermediate A2A updates are real and exclude private reasoning');
   const mainScroll=await page.evaluate("(()=>{const thread=document.querySelector('.thread');thread.scrollTop=0;thread.dispatchEvent(new Event('scroll',{bubbles:true}));const panel=document.querySelector('.peer-messages');panel.scrollTop=0;panel.dispatchEvent(new Event('scroll',{bubbles:true}));return thread.scrollTop;})()");
+  await page.evaluate("(()=>{const card=[...document.querySelectorAll('.action-card')].find(card=>card.querySelector('.action-heading strong')?.textContent.includes('Ожидание задачи'));card.querySelector('button').click();})()");
+  await page.wait("!!document.querySelector('.action-dialog[open]')",'open waiting action details before peer completion');
   await fixtureCommand({finish:true});
   await page.wait("[...document.querySelectorAll('.peer-message .markdown strong')].some(node=>node.textContent==='Проверка завершена.')&&document.querySelector('.peer-files')?.textContent.includes('peer-report.txt')",'persisted final peer response and authenticated file');
+  await page.wait("document.querySelector('.action-dialog[open] .action-dialog-heading')?.textContent.includes('Дочерняя задача завершена')",'waiting action modal updates from canonical tool result');
+  check(await page.evaluate("document.activeElement.closest('.action-dialog')!==null&&!!document.querySelector('.action-dialog .action-output')"),'open action modal survives live completion and preserves focus');
+  await page.click('×','.action-dialog button');
   check(await page.evaluate(`document.querySelector('.thread').scrollTop===${mainScroll}&&!!document.querySelector('.peer-new-messages')&&new Set([...document.querySelectorAll('[data-peer-message]')].map(node=>node.dataset.peerMessage)).size===document.querySelectorAll('[data-peer-message]').length`),'peer final update preserves main and panel reading position without duplicate messages');
   await page.click('Новые сообщения ↓','.peer-new-messages');
   await page.click('Скачать','.peer-files button');
@@ -815,11 +852,13 @@ try {
   await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   await page.evaluate("document.querySelector('.peer-panel-toggle').click()");
   check(await page.evaluate("document.documentElement.scrollWidth<=innerWidth&&getComputedStyle(document.querySelector('.thread')).visibility==='hidden'&&document.querySelector('.peer-conversation-panel').getBoundingClientRect().width<=innerWidth"),'mobile peer panel avoids hidden chat controls and horizontal overflow');
+  check(await page.evaluate("getComputedStyle(document.querySelector('.peer-conversation-panel [role=separator]')).display==='none'"),'mobile peer overlay hides the resize separator');
   await page.click('×','.peer-panel-heading button');
-  await page.call('Emulation.clearDeviceMetricsOverride');
+  await page.call('Emulation.setDeviceMetricsOverride',{width:1440,height:960,deviceScaleFactor:1,mobile:false});
   await page.wait("document.querySelector('.thread').textContent.includes('Ответ внешнего агента и отчёт получены.')",'first peer root completed');
   await page.evaluate("document.querySelector('.peer-panel-toggle').click()");
   await page.wait("document.querySelector('.peer-agent-select select')?.options.length===1&&!!document.querySelector('.peer-outgoing')",'counterparty selector before second task');
+  check(await page.evaluate(`Math.abs(document.querySelector('.peer-conversation-panel').getBoundingClientRect().width-${peerWidth})<1`),'peer panel retains desktop width after closing and mobile overlay');
   const chosenPeer=await page.evaluate("document.querySelector('.peer-agent-select select').value");
   await page.field('.composer textarea','Native second operation for the same counterparty');
   await page.click('Отправить ↑');
@@ -836,6 +875,11 @@ try {
   check(!await page.evaluate("document.querySelector('.peer-messages').textContent.includes('Второе поручение тому же контрагенту.')"),'counterparty selector exposes only the chosen peer conversation');
   await page.field('.peer-agent-select select',chosenPeer);
   await page.wait("document.querySelectorAll('.peer-outgoing').length===2",'original counterparty complete history returns');
+  check(await page.evaluate(`Math.abs(document.querySelector('.peer-conversation-panel').getBoundingClientRect().width-${peerWidth})<1`),'peer panel retains width while switching counterparties');
+  await page.call('Emulation.setDeviceMetricsOverride',{width:1150,height:900,deviceScaleFactor:1,mobile:false});
+  await page.wait("(()=>{const p=document.querySelector('.peer-conversation-panel'),c=document.querySelector('.conversation');return Math.abs(p.getBoundingClientRect().width-Math.max(320,Math.floor(c.getBoundingClientRect().width-360)))<1&&document.querySelector('.thread').getBoundingClientRect().width>=359;})()",'window resize clamps the expanded peer panel');
+  check(await page.evaluate("document.documentElement.scrollWidth<=innerWidth"),'narrower desktop clamps peer width without horizontal overflow');
+  await page.call('Emulation.setDeviceMetricsOverride',{width:1440,height:960,deviceScaleFactor:1,mobile:false});
   await page.click('×','.peer-panel-heading button');
   }
   const revokedBearer=bearer;

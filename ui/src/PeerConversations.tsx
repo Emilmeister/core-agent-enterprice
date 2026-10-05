@@ -133,10 +133,12 @@ const summaryKey = (row: PeerConversation) => JSON.stringify([
 ]);
 type CachedDetail = { summary: string; materialStatus: PeerConversation["material_status"]; value: PeerConversationDetail };
 
-export function PeerConversationPanel({ api, contextId, selected, conversations, onSelect, onClose }: {
+export function PeerConversationPanel({ api, contextId, selected, conversations, onSelect, onClose, width, maxWidth, onResize }: {
   api: Api; contextId: string; selected: string; conversations: PeerConversation[];
   onSelect: (id: string) => void; onClose: () => void;
+  width: number; maxWidth: number; onResize: (width: number) => void;
 }) {
+  const resizeStart = useRef<{ x: number; width: number } | null>(null);
   const [details, setDetails] = useState<Record<string, CachedDetail>>({});
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -243,6 +245,29 @@ export function PeerConversationPanel({ api, contextId, selected, conversations,
   const sameNames = peers.filter((row) => row.peer_name === selectedName).length > 1;
   return <aside className="peer-conversation-panel" id="peer-conversation-panel" aria-label="Переписка агентов"
     onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); onClose(); } }}>
+    <div className="peer-resize-handle" role="separator" tabIndex={0} aria-orientation="vertical"
+      aria-label="Ширина переписки" aria-controls="peer-conversation-panel"
+      aria-valuemin={320} aria-valuemax={maxWidth} aria-valuenow={width} aria-valuetext={`${width} пикселей`}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        event.currentTarget.setPointerCapture(event.pointerId);
+        resizeStart.current = { x: event.clientX, width };
+      }}
+      onPointerMove={(event) => {
+        if (resizeStart.current && event.currentTarget.hasPointerCapture(event.pointerId))
+          onResize(resizeStart.current.width + resizeStart.current.x - event.clientX);
+      }}
+      onPointerUp={(event) => {
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        resizeStart.current = null;
+      }}
+      onPointerCancel={() => { resizeStart.current = null; }}
+      onLostPointerCapture={() => { resizeStart.current = null; }}
+      onKeyDown={(event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        onResize(event.key === "Home" ? 320 : event.key === "End" ? maxWidth : width + (event.key === "ArrowLeft" ? 24 : -24));
+      }} />
     <header className="peer-panel-heading">
       <div><h2>Переписка</h2><p className="muted">{selectedName}</p></div>
       <button ref={closeButton} type="button" className="text-button" aria-label="Закрыть переписку агентов" onClick={onClose}>×</button>

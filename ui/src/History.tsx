@@ -5,7 +5,7 @@ import { scheduleTime } from "./Schedules";
 import { InteractionCard } from "./Interactions";
 import { mergeHistoryPage } from "./types";
 import type { AttachmentEntry, HistoryItem, HistoryPage, Interaction } from "./types";
-import { ActionCard, actionState, historyEntries } from "./ActionCard";
+import { ActionCard, ActionDialog, actionState, historyEntries } from "./ActionCard";
 import type { HistoryEntry } from "./ActionCard";
 import { FileCard } from "./FileCard";
 import { PeerConversationCard, peerOperationId } from "./PeerConversations";
@@ -246,6 +246,15 @@ export function History({
     if (previous && previous.root === entry.item.task_id) previous.entries.push(entry);
     else groups.push({ root: entry.item.task_id, entries: [entry] });
   }
+  const [selectedAction, setSelectedAction] = useState<string>();
+  const selected = groups.flatMap((group) => group.entries).find((entry) => entry.action?.key === selectedAction)?.action;
+  useEffect(() => { if (selectedAction && !selected) setSelectedAction(undefined); }, [selectedAction, selected]);
+  function closeAction() {
+    setSelectedAction(undefined);
+    const card = document.querySelector<HTMLElement>(`[data-action-key="${CSS.escape(selectedAction ?? "")}"] > button`);
+    const group = card?.closest<HTMLDetailsElement>("details:not([open])");
+    (group?.querySelector<HTMLElement>("summary") ?? card)?.focus({ preventScroll: true });
+  }
   const reviews = new Map(
     Object.values(history.waits)
       .flat()
@@ -259,6 +268,9 @@ export function History({
   const rendered = new Set<string>();
   return (
     <>
+      {selected && <ActionDialog action={selected}
+        terminal={history.page.items.find((item) => item.task_id === selected.taskId && item.outcome)}
+        waits={selected.taskId ? history.waits[selected.taskId] ?? [] : []} onClose={closeAction} />}
       {history.page.next_cursor && (
         <div className="history-pagination">
             <button
@@ -308,9 +320,9 @@ export function History({
             {action && peer && onPeerOpen ? <div className="peer-conversation-action" data-history-id={item.id}>
               <PeerConversationCard conversation={peer} onOpen={onPeerOpen} />
               <details className="peer-action-details"><summary>Технические данные поручения</summary>
-                <ActionCard action={action} terminal={terminal} waits={waits} />
+                <ActionCard action={action} terminal={terminal} waits={waits} onOpen={() => setSelectedAction(action.key)} />
               </details>
-            </div> : action ? <ActionCard action={action} terminal={terminal} waits={waits} />
+            </div> : action ? <ActionCard action={action} terminal={terminal} waits={waits} onOpen={() => setSelectedAction(action.key)} />
               : <Entry api={api} contextId={contextId} item={item} />}
             {review && <InteractionCard key={review.wait_id} api={api} item={review} refresh={refresh} />}
           </Fragment>;
