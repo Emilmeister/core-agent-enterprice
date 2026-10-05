@@ -769,16 +769,18 @@ try {
   check(deletedMcp.body.mcp_servers.length===0,'confirmed MCP deletion affects only the selected connection');
   await second.click('Агенты','.nav-item');
   await second.wait("!document.querySelector('.page [role=status]')&&!!document.querySelector('.peer')",'actual peer registry is ready');
-  await second.click('Добавить агента ＋');
-  await second.field('.form-sheet input[pattern]','browser-peer');
-  await second.field('.form-sheet input[type=url]','http://127.0.0.1:8001/a2a/');
-  await second.field('.form-sheet textarea','Native public peer');
-  await second.field('.form-sheet select','replace');
-  await second.wait("!!document.querySelector('.form-sheet input[type=password]')",'controlled peer credentials editor');
-  await second.field('.form-sheet input[type=password]','Bearer browser-peer-credential');
-  const peer=await ownerAction(second,'/api/remote-agents','POST',()=>second.click('Сохранить подключение','.form-sheet button'));
-  check(peer.body.name==='browser-peer','controlled native peer is admitted through real owner registry');
-  await second.wait("!document.querySelector('.form-sheet')",'controlled peer connection is saved');
+  for (const peerName of ['browser-peer','browser-peer-two']) {
+    await second.click('Добавить агента ＋');
+    await second.field('.form-sheet input[pattern]',peerName);
+    await second.field('.form-sheet input[type=url]','http://127.0.0.1:8001/a2a/');
+    await second.field('.form-sheet textarea','Native public peer');
+    await second.field('.form-sheet select','replace');
+    await second.wait("!!document.querySelector('.form-sheet input[type=password]')",'controlled peer credentials editor');
+    await second.field('.form-sheet input[type=password]','Bearer browser-peer-credential');
+    const peer=await ownerAction(second,'/api/remote-agents','POST',()=>second.click('Сохранить подключение','.form-sheet button'));
+    check(peer.body.name===peerName,'controlled native peer is admitted through real owner registry');
+    await second.wait("!document.querySelector('.form-sheet')",'controlled peer connection is saved');
+  }
   await second.click('Инструменты','.nav-item');
   await second.wait(configuredPolicyCatalog,'tool catalog before controlled peer task');
   await setPolicy('core_agent_send_message','allow',false);
@@ -815,6 +817,26 @@ try {
   check(await page.evaluate("document.documentElement.scrollWidth<=innerWidth&&getComputedStyle(document.querySelector('.thread')).visibility==='hidden'&&document.querySelector('.peer-conversation-panel').getBoundingClientRect().width<=innerWidth"),'mobile peer panel avoids hidden chat controls and horizontal overflow');
   await page.click('×','.peer-panel-heading button');
   await page.call('Emulation.clearDeviceMetricsOverride');
+  await page.wait("document.querySelector('.thread').textContent.includes('Ответ внешнего агента и отчёт получены.')",'first peer root completed');
+  await page.evaluate("document.querySelector('.peer-panel-toggle').click()");
+  await page.wait("document.querySelector('.peer-agent-select select')?.options.length===1&&!!document.querySelector('.peer-outgoing')",'counterparty selector before second task');
+  const chosenPeer=await page.evaluate("document.querySelector('.peer-agent-select select').value");
+  await page.field('.composer textarea','Native second operation for the same counterparty');
+  await page.click('Отправить ↑');
+  await page.wait("document.querySelector('.thread').textContent.includes('Второе поручение выполнено.')&&document.querySelector('.peer-messages')?.textContent.includes('Второе поручение тому же контрагенту.')&&document.querySelector('.peer-messages')?.textContent.includes('Ответ по поручению 2.')",'two actual operations in one counterparty conversation');
+  check(await page.evaluate(`document.querySelector('.peer-agent-select select').value===${JSON.stringify(chosenPeer)}&&document.querySelector('.peer-agent-select select').options.length===1&&document.querySelectorAll('.peer-outgoing').length===2&&document.querySelector('.peer-messages').textContent.includes('Подготовь краткий отчёт по поручению.')&&new Set([...document.querySelectorAll('[data-peer-message]')].map(node=>node.dataset.peerMessage)).size===document.querySelectorAll('[data-peer-message]').length`),'same counterparty retains selection and combines distinct A2A tasks without message collisions');
+  check(await page.evaluate("(()=>{const messages=[...document.querySelectorAll('[data-peer-message]')];return messages.every((node,index)=>!index||Date.parse(messages[index-1].querySelector('time').dateTime)<=Date.parse(node.querySelector('time').dateTime))&&document.querySelectorAll('.peer-files').length===2;})()"),'combined counterparty messages are chronological and retain per-operation files');
+  await page.field('.composer textarea','Native operation for a different counterparty');
+  await page.click('Отправить ↑');
+  await page.wait("document.querySelector('.thread').textContent.includes('Другой контрагент ответил.')&&document.querySelector('.peer-agent-select select')?.options.length===2",'second counterparty appears without switching selection');
+  check(await page.evaluate(`document.querySelector('.peer-agent-select select').value===${JSON.stringify(chosenPeer)}&&!document.querySelector('.peer-messages').textContent.includes('Отдельное поручение другому контрагенту.')&&document.querySelector('.peer-panel-toggle .file-count').textContent==='2'`),'new counterparty does not replace the selected conversation or leak its messages');
+  const otherPeer=await page.evaluate("[...document.querySelector('.peer-agent-select select').options].find(option=>option.textContent.trim()==='browser-peer-two').value");
+  await page.field('.peer-agent-select select',otherPeer);
+  await page.wait("document.querySelector('.peer-messages')?.textContent.includes('Отдельное поручение другому контрагенту.')&&document.querySelector('.peer-messages')?.textContent.includes('Ответ по поручению 3.')",'selected other counterparty history');
+  check(!await page.evaluate("document.querySelector('.peer-messages').textContent.includes('Второе поручение тому же контрагенту.')"),'counterparty selector exposes only the chosen peer conversation');
+  await page.field('.peer-agent-select select',chosenPeer);
+  await page.wait("document.querySelectorAll('.peer-outgoing').length===2",'original counterparty complete history returns');
+  await page.click('×','.peer-panel-heading button');
   }
   const revokedBearer=bearer;
   const exitRequests=[];

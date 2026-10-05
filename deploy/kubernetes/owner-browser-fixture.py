@@ -81,7 +81,7 @@ print({marker!r})
         return ModelResponse(tool_requests=(ToolRequest(marker, "core_terminal_exec", {"argv": ["python3", "-P", "-c", code]}),))
 
     peer_release = threading.Event()
-    peer_state = {"sends": 0, "gets": 0, "message": None, "models_available": True}
+    peer_state = {"sends": 0, "gets": 0, "message": None, "tasks": {}, "models_available": True}
     peer_url = "http://127.0.0.1:8001/a2a/"
 
     class PublicPeer(BaseHTTPRequestHandler):
@@ -114,20 +114,24 @@ print({marker!r})
             if method == "SendMessage":
                 peer_state["sends"] += 1
                 peer_state["message"] = payload["params"]["message"]
+                task_id = "browser-public-peer-task-" + str(peer_state["sends"])
+                peer_state["tasks"][task_id] = peer_state["sends"]
             else:
                 assert method == "GetTask", "Unexpected remote mutation"
                 peer_state["gets"] += 1
+                task_id = payload["params"]["id"]
+            task_number = peer_state["tasks"][task_id]
             messages = [{"messageId": "peer-accepted", "role": "ROLE_AGENT", "parts": [{"text": "Поручение принято."}]}]
             if peer_state["gets"]:
                 messages.append({"messageId": "peer-progress", "role": "ROLE_AGENT", "parts": [
                     {"text": "Проверяю данные для поручения.\n\n" + "\n".join(f"- Пункт проверки {index}" for index in range(55))},
                     {"text": "private-peer-reasoning", "metadata": {"kind": "reasoning"}}]})
-            task = {"id": "browser-public-peer-task", "contextId": "browser-public-peer-context",
+            task = {"id": task_id, "contextId": "browser-public-peer-context",
                     "status": {"state": "TASK_STATE_COMPLETED" if peer_release.is_set() else "TASK_STATE_WORKING"},
                     "history": messages}
             if peer_release.is_set():
                 task["artifacts"] = [{"artifactId": "peer-result", "parts": [
-                    {"text": "**Проверка завершена.** Отчёт подготовлен."},
+                    {"text": "**Проверка завершена.** Отчёт подготовлен." + (f" Ответ по поручению {task_number}." if task_number > 1 else "")},
                     {"filename": "peer-report.txt", "mediaType": "text/plain", "raw": base64.b64encode(b"Native peer report\n").decode()}]}]
             self.send_json({"jsonrpc": "2.0", "id": payload["id"], "result": {"task": task} if method == "SendMessage" else task})
 
@@ -192,9 +196,10 @@ print({marker!r})
                 response = ModelResponse(tool_requests=(ToolRequest("browser-peer-send", "core_agent_send_message", {
                     "agent_name": "browser-peer", "task": "Подготовь краткий отчёт по поручению.",
                     "files": [folder + "/report.txt"]}),))
-            if response.tool_requests and response.tool_requests[0].id in {"browser-background-wait", "browser-peer-wait"}:
+            if response.tool_requests and response.tool_requests[0].id in {"browser-background-wait", "browser-peer-wait", "browser-peer-wait-two", "browser-other-peer-wait"}:
                 waiting = response.tool_requests[0].id
-                source = "browser-peer-send" if waiting == "browser-peer-wait" else "browser-background-failure"
+                source = {"browser-peer-wait": "browser-peer-send", "browser-peer-wait-two": "browser-peer-send-two",
+                          "browser-other-peer-wait": "browser-other-peer-send"}.get(waiting, "browser-background-failure")
                 admitted = next(json.loads(message["content"]) for message in messages
                                 if message.get("tool_call_id") == source)
                 assert admitted["status"] == "succeeded"
@@ -276,6 +281,14 @@ flowchart LR
             "agent_name": "browser-peer", "task": "Подготовь краткий отчёт по поручению."}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-peer-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
         ModelResponse(message="Ответ внешнего агента и отчёт получены."),
+        ModelResponse(tool_requests=(ToolRequest("browser-peer-send-two", "core_agent_send_message", {
+            "agent_name": "browser-peer", "task": "Второе поручение тому же контрагенту."}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-peer-wait-two", "core_task_wait", {"task_id": "from-actual-admission"}),)),
+        ModelResponse(message="Второе поручение выполнено."),
+        ModelResponse(tool_requests=(ToolRequest("browser-other-peer-send", "core_agent_send_message", {
+            "agent_name": "browser-peer-two", "task": "Отдельное поручение другому контрагенту."}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-other-peer-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
+        ModelResponse(message="Другой контрагент ответил."),
     ])
     model.model = "owner-browser-fixture"
     app = create_app(model=model, guardrail_classifier=GuardrailClassifier(ClearModel()))

@@ -673,7 +673,9 @@ run получает отдельные MCP session и negotiated version; пе�
   embeddings и отдельная guardrails model остаются deployment configuration.
 - Owner-only `/api/chats/{context_id}/peer-conversations` показывает durable
   публичные исходящие поручения, ответы и доступные файлы remote jobs, включая
-  child lineage. Private reasoning, replay и owner HITL не раскрываются. Чтение
+  child lineage. Панель выбирает контрагента по frozen `peer_id` и объединяет его
+  операции текущего чата в хронологическую ленту, не меняя A2A lifecycle.
+  Private reasoning, replay и owner HITL не раскрываются. Чтение
   не запускает модель или новое поручение. Открытая видимая панель каждые 15 секунд
   продлевает observation TTL 45 секунд; scheduler ограничивает GetTask этим
   интервалом, сохраняя ранние проверки каждые 10 секунд. Закрытие/скрытие прекращает

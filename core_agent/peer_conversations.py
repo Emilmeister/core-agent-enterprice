@@ -380,7 +380,7 @@ def read_conversations(agent, admission, binding, *, limit=50, after=None, opera
                         delivery = "confirmed" if (checkpoint["remote_task_id"] or
                             row["state"] == "completed" and not row.get("error_code") and
                             (row["result"] or {}).get("remote_outcome") != "unknown") else "unconfirmed"
-                    value = {"operation_id": row["id"], "peer_name": contract["peer_name"],
+                    value = {"operation_id": row["id"], "peer_id": contract["peer_id"], "peer_name": contract["peer_name"],
                         "root_task_id": root.task_id, "state": row["state"],
                         "request_delivery": delivery,
                         "material_status": (status[0] if status[0] in {"rejected", "timed_out"} else "pending_guardrail") if status else "available",

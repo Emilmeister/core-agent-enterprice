@@ -447,7 +447,11 @@ Foreign human-wait остаётся working: согласование выпол
 
 Owner-only `GET /api/chats/{context_id}/peer-conversations` возвращает bounded
 страницы операций компании в порядке created_at/id descending; `GET` детали
-читает только persisted public conversation и не обращается к peer. Операция
+читает только persisted public conversation и не обращается к peer. Summary и
+detail содержат стабильный `peer_id` из frozen contract, отдельно от отображаемого
+`peer_name`: UI группирует операции одного контрагента, не смешивая заново
+созданные подключения с тем же именем. Поле является additive owner API change;
+persisted contracts и A2A task lifecycle не изменяются. Операция
 доступна только после проверки canonical chat, originating WorkflowRecord,
 actual parent links и admitted root. Child caller_scope не получает root grants.
 External callers, foreign company/chat и неподтверждённая lineage не получают

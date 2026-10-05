@@ -135,7 +135,7 @@ export function Chat({
     if (filesDirty) return;
     setFilesOpen(false);
     peerTrigger.current = trigger;
-    setPeerSelection(value.operation_id);
+    setPeerSelection(value.peer_id);
   }
   function closePeer() {
     setPeerSelection(undefined);
@@ -573,7 +573,7 @@ export function Chat({
           {!!peerHistory.conversations.length && <button ref={peerButton} className="secondary peer-panel-toggle"
             disabled={filesDirty} aria-expanded={!!peerSelection} aria-controls="peer-conversation-panel"
             onClick={(event) => peerSelection ? closePeer() : openPeer(peerHistory.conversations[0], event.currentTarget)}>
-            Переписка агентов <span className="file-count">{peerHistory.conversations.length}</span>
+            Переписка агентов <span className="file-count">{new Set(peerHistory.conversations.map((row) => row.peer_id)).size}</span>
           </button>}
           {contextId && <details className="chat-menu" ref={titleMenu}>
             <summary aria-label="Действия с чатом">⋯</summary>

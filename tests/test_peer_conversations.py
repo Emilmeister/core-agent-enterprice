@@ -465,9 +465,11 @@ class PeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         summary = response.json()["conversations"][0]
         self.assertEqual((summary["operation_id"], summary["root_task_id"]), (self.operation, self.source.task_id))
+        self.assertEqual(summary["peer_id"], "peer")
         detail = await self.http.get(self.path + "/" + self.operation, headers=self.headers("owner-b"))
         self.assertEqual(detail.status_code, 200, detail.text)
         self.assertEqual([m["text"] for m in detail.json()["messages"]], ["Public outgoing request", "Public reply"])
+        self.assertEqual(detail.json()["peer_id"], "peer")
         self.assertEqual(detail.json()["files"], [])
         self.assertEqual(detail.headers["cache-control"], "no-store")
         self.assertNotIn(self.source.request["prompt"], detail.text)
@@ -479,6 +481,22 @@ class PeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
         foreign = await self.http.get("/api/chats/another-chat/peer-conversations/" + self.operation,
                                       headers=self.headers("owner-a"))
         self.assertEqual(foreign.status_code, 404, foreign.text)
+
+    async def test_recreated_same_name_has_distinct_public_peer_identity(self):
+        await self.prepare()
+        original = self.source.snapshot["remote_calls"]["1:peer-send"]["contract"]
+        contract = {**original, "peer_id": "peer-recreated", "message_id": uuid.uuid4().hex}
+        recreated = self.scheduler.start_remote(contract, owner_id=self.source.run_id,
+                                               tenant_id=self.tenant, task_id=uuid.uuid4().hex)
+        for thread in tuple(self.scheduler._threads):
+            thread.join(3)
+        response = await self.http.get(self.path, headers=self.headers("owner-b"))
+        rows = {row["operation_id"]: row for row in response.json()["conversations"]}
+        self.assertEqual(rows[recreated.id]["peer_name"], rows[self.operation]["peer_name"])
+        self.assertNotEqual(rows[recreated.id]["peer_id"], rows[self.operation]["peer_id"])
+        detail = await self.http.get(self.path + "/" + recreated.id, headers=self.headers("owner-b"))
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["peer_id"], "peer-recreated")
 
     async def test_selected_outgoing_files_use_frozen_scoped_snapshot_downloads(self):
         await self.prepare()
@@ -620,6 +638,7 @@ class PeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
         second = await self.http.get(self.path, params={"limit": 1, "cursor": page["next_cursor"]},
                                      headers=self.headers("owner-a"))
         self.assertEqual(second.json()["conversations"][0]["operation_id"], self.operation)
+        self.assertEqual(page["conversations"][0]["peer_id"], second.json()["conversations"][0]["peer_id"])
         self.assertIsNone(second.json()["next_cursor"])
         original = self.agent.workflow_store._records[child.run_id]
         self.agent.workflow_store._records[child.run_id] = replace(original, parent_run_id="missing-parent")
@@ -693,6 +712,7 @@ class PostgresPeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
             connection.execute("DELETE FROM core_background_tasks WHERE tenant_id=%s", (self.tenant,))
 
     test_owner_detail_is_passive_public_and_bound_to_admitted_chat = PeerConversationAPITests.test_owner_detail_is_passive_public_and_bound_to_admitted_chat
+    test_recreated_same_name_has_distinct_public_peer_identity = PeerConversationAPITests.test_recreated_same_name_has_distinct_public_peer_identity
     test_observation_requires_owner_and_visible_boolean = PeerConversationAPITests.test_observation_requires_owner_and_visible_boolean
     test_legacy_empty_conversation_never_reconstructs_missing_peer_history = PeerConversationAPITests.test_legacy_empty_conversation_never_reconstructs_missing_peer_history
     test_failure_summary_distinguishes_unknown_outcome_without_raw_errors = PeerConversationAPITests.test_failure_summary_distinguishes_unknown_outcome_without_raw_errors

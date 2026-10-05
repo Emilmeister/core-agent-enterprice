@@ -1207,8 +1207,8 @@ main {
 .peer-panel-heading .muted { font-size: 12px; margin-top: 4px; overflow-wrap: anywhere; }
 .chat-heading-actions { flex-wrap: wrap; justify-content: flex-end; }
 .peer-panel-heading button { min-width: 34px; font-size: 24px; line-height: 1; }
-.peer-operation-select { padding: 0 18px 12px; font-size: 12px; }
-.peer-operation-select select { font-size: 12px; min-height: 36px; padding: 8px; }
+.peer-agent-select { padding: 0 18px 12px; font-size: 12px; }
+.peer-agent-select select { font-size: 12px; min-height: 36px; padding: 8px; }
 .peer-panel-status { padding: 0 18px 12px; font-size: 12px; color: var(--muted); }
 .peer-messages { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 14px 18px 22px; scroll-padding-block: 16px; border-block: 1px solid var(--line); }
 .peer-message { margin-bottom: 16px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; overflow-wrap: anywhere; }
@@ -1220,6 +1220,8 @@ main {
 .peer-message .markdown { font-size: 13px; }
 .peer-message pre { max-height: 280px; font-size: 11px; }
 .peer-message .markdown table { display: block; overflow-x: auto; }
+.peer-operation-outcome { margin: 4px 0 20px; }
+.peer-operation-status { color: var(--muted); font-size: 11px; }
 .peer-files h3 { font-size: 13px; margin: 18px 0 8px; }
 .peer-availability-note { font-size: 11px; line-height: 1.6; }
 .peer-panel-footer { padding: 12px 18px; }
