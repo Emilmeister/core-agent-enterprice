@@ -657,6 +657,9 @@ main {
   background: #fff;
 }
 .composer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
   background: #fafafa;
   border: 1px solid #e2e2e2;
   border-radius: 28px;
@@ -666,7 +669,7 @@ main {
 }
 .composer textarea {
   border: 0;
-  border-radius: 8px;
+  border-radius: 0;
   resize: none;
   padding: 3px 4px;
   background: transparent;
@@ -676,6 +679,10 @@ main {
   line-height: 1.5;
 }
 .composer textarea:focus-visible {
+  outline: none;
+}
+.composer:has(textarea:focus-visible) {
+  outline: 3px solid #4777b8;
   outline-offset: 2px;
 }
 .composer-actions {
