@@ -1,7 +1,7 @@
 # Owner SPA
 
-React/TypeScript/Vite source for the existing Core Agent service. This is a
-foundation, not a completed enterprise UI release.
+React/TypeScript/Vite owner interface served by the existing agent backend.
+Release readiness is tracked in `spec/implementation-status.md`.
 
 ## Build and dependency evidence
 
@@ -81,6 +81,24 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   Tool rules use a compact searchable/filterable list and explicit per-rule
   saves. The positive checks checkbox maps to `!guardrails_exempt`; execution
   mode remains independent. There is no technical mode or batch-save mechanism.
+- Company agent settings edit the system profile and select a model from the
+  configured provider's inventory. MCP connections can be added by URL with a
+  custom authorization header, enabled, disabled or deleted; each connection
+  saves separately. Credentials are write-only. New tasks use the saved revision;
+  admitted tasks, children and recovery keep their pinned configuration.
+- Outbound public A2A conversations open beside the main chat. The selector
+  chooses a counterparty by stable connection identity; all operations to that
+  peer in the current chat share one chronological message/file/status history.
+  Other peers have separate histories; new operations preserve the selection.
+  Recreating a connection with the same name does not merge its old history.
+  Visible active operations update every 15 seconds, with expiring observation
+  interest; closing the panel restores adaptive backend polling. Main chat and
+  panel scroll independently. Private reasoning and owner exchanges are excluded.
+- Agent access lists native Keycloak service accounts. Owners issue, replace,
+  revoke or permanently delete credentials using their own authorized session.
+  Issued tokens appear once and are cleared when the dialog closes. Permanent
+  deletion removes the identity, while existing task/file data remains available
+  to owners. This screen requires the documented realm-management permissions.
 - Live public replies arrive as scoped cumulative A2A snapshots and render as
   provisional plain text until canonical history supplies the final answer.
   Partial frames do not fetch history individually. Live text is enabled only

@@ -156,6 +156,11 @@ criterion должны войти в тот же завершённый change. 
   и копию test blobs, сохраняя encryption key вне dump. Это proof отката до новых
   application writes, а не разрешение восстановить старый backup поверх новых данных.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
+  Keycloak подключается отдельно через `KEYCLOAK_*`; встроенного Keycloak service
+  здесь нет. Agent environment явно передаёт поддержанные model/guardrails,
+  runtime/compaction, memory и telemetry настройки из `.env.example`.
+  Compose фиксирует container port 8000, bind host 0.0.0.0 и disjoint storage roots;
+  `PORT` меняет опубликованный host port, а не внутренний listening port.
   Agent использует native OCI seccomp profile (`SANDBOX_OCI_ARCH=amd64|arm64`),
   `systempaths=unconfined` для nested proc mount, `/dev/net/tun`, read-only root,
   dropped capabilities и конечные CPU/memory/PID limits. Native CI запускает
@@ -1166,6 +1171,7 @@ Local stack:
 ```bash
 cp .env.example .env
 # Заполнить локальные database/model credentials; файл не коммитить.
+# Также задать sandbox CIDRs/native architecture и Fernet key по README.
 docker compose config --quiet
 docker compose up --build -d
 docker compose logs -f agent
