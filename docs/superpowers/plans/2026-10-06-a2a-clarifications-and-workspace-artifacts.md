@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `executing-plans` to implement this plan task-by-task after user approval. Steps use checkbox syntax. Keep changes in a permanent repository or worktree; use existing unittest, PostgreSQL and native browser gates.
 
-**Статус:** реализация и автоматические проверки завершены. Остались merge в `main` и обновление двух кластеров.
+**Статус:** реализовано, проверено, включено в `main` и развёрнуто на двух кластерах.
 
 **Goal:** Наш агент отвечает на публичные уточнения внешнего агента в рамках исходной A2A-задачи; входящие A2A-файлы и содержимое полученных артефактов сохраняются в каталоге `a2a/` workspace чата и не загружаются автоматически в контекст модели.
 
@@ -221,9 +221,9 @@ assert "json-value-canary" in explicit_read_tool_result
 - [x] Использовать существующую конфигурацию тестов. До запуска проверить все требуемые зависимости одной проверкой; не печатать секреты и не читать shell alias с proxy credentials.
 - [x] Обновить implementation status только по прошедшим автоматическим проверкам. Обновить README и стабильные факты AGENTS для нового reply contract, каталога и projection; plan checklist отмечать по фактическому выполнению.
 - [x] Проверить diff, scope, compatibility, security и recovery. Сохранять проверенные логические slices отдельными reviewable commits; spec входит до или вместе с первым implementation slice.
-- [ ] После всех проверок актуализировать локальную `main`. Не затрагивать существующую `.idea/` и пользовательские файлы; не выполнять remote git push без отдельного запроса.
-- [ ] Собрать и опубликовать один immutable amd64 image; проверить пользователя `agent` и source/UI hashes. Через существующий deploy runner обновить оба развёртывания: `https://37.44.196.209/ui/` и `https://37.44.197.46/ui/`.
-- [ ] Проверить фактический digest, ready replicas, migration outcome, HTTPS readiness и новые UI assets на обоих кластерах. Между production агентами не создавать соединения или задачи автоматически: ручной путь остаётся пользователю.
+- [x] После всех проверок актуализировать локальную `main`. Не затрагивать существующую `.idea/` и пользовательские файлы; не выполнять remote git push без отдельного запроса.
+- [x] Собрать и опубликовать один immutable amd64 image; проверить пользователя `agent` и source/UI hashes. Через существующий deploy runner обновить оба развёртывания: `https://37.44.196.209/ui/` и `https://37.44.197.46/ui/`.
+- [x] Проверить фактический digest, ready replicas, migration outcome, HTTPS readiness и новые UI assets на обоих кластерах. Между production агентами не создавать соединения или задачи автоматически: ручной путь остаётся пользователю.
 
 ## 4. Проверяемый результат
 
@@ -238,3 +238,11 @@ assert "json-value-canary" in explicit_read_tool_result
 ## 5. Согласование и начало работы
 
 Поведение согласовано пользователем. Нормативные требования и автоматические доказательства находятся в `spec/`; отметки этапа 8 отражают фактически выполненные действия.
+
+## 6. Итоговые доказательства
+
+Общий unittest suite с реальными PostgreSQL/Keycloak: 1910 tests, exit 0, три environment-specific skips; обязательные native browser и Linux sandbox выполнены отдельно без skips. Native browser: exit 0; Linux sandbox: 12 tests, exit 0, aggregate Pod `pids.max=512`. Ruff, TypeScript, UI build, package build и spec quality/hash lock прошли.
+
+Оба развёртывания — `https://37.44.196.209/ui/` и `https://37.44.197.46/ui/` — используют `core-agent-enterprice.cr.cloud.ru/core-agent@sha256:a397a0ace928afdb6971ca5b7ad84b69ce77102d9aa8f8951d6237fa3765b8f3`. Проверены ready replicas 1/1, successful migration Job, точные 121 source/UI hashes внутри каждого Pod, HTTPS readiness, фактические HTML/JS/CSS и unauthenticated identity401. Новых production peer connections и задач не создавали.
+
+При обновлении использованы существующие deploy helpers и Terraform plan guard. После успешных migration Jobs потерянное HTTP/2 соединение ожидания устранено продолжением app layer через HTTPS/HTTP1; проверка TLS оставалась включённой. Локальные журналы и receipts сохраняются в ignored `.local-evidence/a2a-clarifications/`, credentials не входят в Git.
