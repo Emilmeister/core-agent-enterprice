@@ -1266,11 +1266,12 @@ def reconcile_remote_progress(task, *, state, tasks, previous=None):
     if state not in {"COMPLETED", "FAILED", "ABORTED", "CANCELLED", "REJECTED"}:
         for row in tasks:
             result = row["result"]
-            if (not isinstance(result, dict) or result.keys() != {"agent_name", "remote_state"}
+            if (not isinstance(result, dict) or not {"agent_name", "remote_state"} <= result.keys()
                     or not isinstance(result["agent_name"], str)
                     or not isinstance(result["remote_state"], str) or result["remote_state"] not in REMOTE_PROGRESS_STATES):
                 continue
-            entry = {"task_id": row["id"], "revision": row["revision"], **result}
+            entry = {"task_id": row["id"], "revision": row["revision"],
+                     "agent_name": result["agent_name"], "remote_state": result["remote_state"]}
             old = prior.get(row["id"])
             if (old and old["agent_name"] == result["agent_name"] and old["remote_state"] == result["remote_state"]
                     and type(old["revision"]) in (int, float) and 0 < old["revision"] <= row["revision"]
@@ -1345,13 +1346,20 @@ def reconcile_workflow_task(task, *, run_id, state, result=None, error_code=None
             return True
         return False
     prior_version = dict(task.metadata).get("core_agent_workflow_version", 0)
-    if artifact is None and not authoritative and version is not None and isinstance(prior_version, (int, float)) and version <= prior_version:
-        return False
-    if version is None and state not in terminal and task.status.state == states[state]:
+    marker = {"version": 1, "kind": "owner"} if state == "WAITING_INPUT" else None
+    marker_changed = MessageToDict(task.metadata).get("core_agent_wait") != marker
+    if artifact is None and not authoritative and version is not None and isinstance(prior_version, (int, float)):
+        if version < prior_version or version == prior_version and not marker_changed:
+            return False
+    if version is None and state not in terminal and task.status.state == states[state] and not marker_changed:
         return False
     task.status.state = states[state]
     task.status.timestamp.GetCurrentTime()
     task.status.ClearField("message")
+    if marker is not None:
+        task.metadata["core_agent_wait"] = marker
+    elif "core_agent_wait" in task.metadata:
+        del task.metadata["core_agent_wait"]
     if version is not None:
         task.metadata["core_agent_workflow_version"] = version
     if state not in terminal:

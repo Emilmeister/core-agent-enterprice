@@ -240,12 +240,17 @@ Runtime использует A2A 1.0 `SendMessage`/`SendStreamingMessage`, об�
 Вызов отправляет одну сфокусированную задачу и возвращает локальный durable handle. При создании remote Task root task/context IDs не подставляются как remote IDs; полученные remote IDs сохраняются с handle. Вложения проходят общий лимит/transport rules. Сбой до dispatch возвращается structured tool result; неизвестный outcome возможной remote мутации требует reconciliation, а не повторного `SendMessage`. Обрыв SSE требует проверки существующего remote task через GetTask, не повторной отправки задания.
 
 Schema `core_agent_send_message` содержит обязательные непустые `agent_name`
-и `task`, а также optional `files`: ordered array уникальных непустых относительных
+и `task`, optional непустые `task_id`/`input_id` только парой, а также optional
+`files`: ordered array уникальных непустых относительных
 путей существующих regular files текущего workspace. Неизвестные поля отклоняются.
 Модель явно выбирает вложения для каждого вызова. Отсутствие `files` или `[]`
 означает отправку без файлов: содержимое workspace, недавно созданные файлы,
 входящие attachments и выбор `core_response_files` автоматически не добавляются.
-Результат —обычный локальный task snapshot с `task_id`.
+Без пары полей создаётся новое поручение; с парой принимается ответ на текущий
+публичный вопрос исходной операции по LONG-05. `task_id` обозначает локальный
+handle, `input_id` выдаёт backend; remote IDs/URL модель не выбирает.
+Результат сохраняет тот же локальный `task_id` и различает durable queued reply
+и подтверждённую отправку; принятие в очередь не объявляется доставкой.
 Accepted operation закрепляет peer revision до owner approval/dispatch, чтобы
 registry update не подменил согласуемого адресата. Имена/credentials/remote IDs
 выводятся из trusted binding; prompt не задаёт URL или header. Immediate terminal
@@ -273,7 +278,8 @@ task/run IDs и workspace чата, не получает root/remote grants. Re
 
 Remote response ограничен encoded transport ceiling независимо от decoded
 company limit. Strict UTF-8/JSON и canonical base64 проверяются до SDK allocation;
-сумма decoded files и весь набор проверяются до relay. `input-required` и
+сумма materialized files/manifest и весь набор проверяются до relay.
+Публичный вопрос в `input-required` обрабатывается по LONG-05; owner wait и
 `auth-required` продолжают ожидание с теми же remote IDs и не публикуют ранние
 attachments. Только полный completed Task/Message может принять файлы в private
 quarantine. Claim/deadline/cancel и привязка к canonical source/root проверяются
@@ -282,7 +288,74 @@ quarantine. Claim/deadline/cancel и привязка к canonical source/root �
 guardrails для полного text/file batch. Root public Task для child выводится из
 канонической ancestry; shadow public Tasks и ослабление existing FK запрещены.
 
-Прогресс разрешённой операции показывается в текущем чате и соответствующей публичной проекции; окончательный result доставляется через существующий task lifecycle. Remote `input-required`/`auth-required` не считаются финальным ответом: чужое HITL разрешает владелец удалённого агента. Детали LONG-01–04 ниже.
+Прогресс разрешённой операции показывается в текущем чате и соответствующей публичной проекции; окончательный result доставляется через существующий task lifecycle. Remote `input-required`/`auth-required` не считаются финальным ответом. Публичное уточнение к caller отличается от чужого HITL: чужое HITL разрешает владелец удалённого агента. Детали LONG-01–05 ниже.
+
+### LONG-05. Публичное уточнение и ответ в исходную remote Task
+
+Это target contract; его готовность определяется ENT-AC-88–94 и release gates,
+а не наличием этого раздела. Валидный `input-required` с непустым public agent
+`status.message` без owner-wait marker означает вопрос вызывающему агенту.
+Question text проходит existing untrusted-material guardrails до model delivery.
+Private/reasoning/replay Parts и owner wait не становятся вопросом к модели;
+без публичного вопроса продолжается ожидание. `auth-required` не разрешает
+автоматическую отправку credentials или foreign authorization.
+
+Backend атомарно сохраняет question identity, scoped `input_id`, public text,
+delivery state и checkpoint до уведомления. Повторный snapshot одного вопроса
+не создаёт повторную доставку; другой question identity получает отдельный
+`input_id`, даже при одинаковом тексте. Нельзя выдумывать отсутствующую peer
+history/identity. В sleeping `core_task_wait` возвращается промежуточный результат
+с прежним `task_id`, `remote_state: TASK_STATE_INPUT_REQUIRED`, `input_id` и
+`question`; операция остаётся non-terminal. При независимой работе вопрос
+доставляется на safe boundary после текущего model/tool call, без interrupt и
+изменения EffectiveConfig. Nested Python использует existing durable continuation:
+пробуждение не разрешает повторить prefix или исполнить остановленный remainder.
+
+Агент отвечает из доступного контекста либо использует private `core_ask_owner`.
+Наружу отправляется только явно выбранный ответ, не owner transcript/summary.
+`core_agent_send_message` в режиме ответа требует оба `task_id` и `input_id`;
+ровно одно поле, чужой handle, иной адресат, устаревший input, отсутствие вопроса,
+terminal/cancel/expired состояние дают structured error до мутации. Backend
+проверяет tenant/owning run, caller scope, pinned peer/revision и current tool
+policy. Reply отдельно проходит guardrails и HITL, если требуется; selected files
+snapshot-ятся до approval. External follow-up не является owner approval.
+
+Reply admission закрепляет immutable answer/file digest и unique message ID
+в исходной операции до dispatch. Send intent durable предшествует одному
+разрешённому Send через pinned binding/credentials с исходными remote task/context
+IDs. Новый local handle или remote Task не создаётся. Повтор того же workflow
+call возвращает прежний queued/confirmed receipt; неоднозначная отправка получает
+`SIDE_EFFECT_UNKNOWN` и требует reconciliation, без автоматического Send retry.
+Доказанная pre-dispatch ошибка допускает исправляемый tool result. Reconciliation
+MAY использовать read-only GetTask до исходного deadline, не выдавая unknown за
+подтверждённую доставку.
+
+Ответ не меняет initial send age, абсолютный deadline, закреплённые settings,
+model/tool/shared budgets или polling 10/30/300 и active-panel ceiling 15 секунд.
+Срок продолжает действовать во время `core_ask_owner`/reply HITL. Cancel/deadline
+fence выигрывает у late question/reply/result; reply не открывает истёкшую операцию.
+Следующий новый вопрос повторяет тот же цикл в существующих budgets. Restart
+до/после доставки, reply admission, intent/confirmation и private owner wait
+восстанавливает continuation без повторного вопроса или blind mutation.
+
+Новые операции используют immutable remote contract v3 и checkpoint v2.
+Contract v3 сохраняет все v2 source/outgoing-file grants и pinned connection;
+checkpoint v2 сохраняет baseline send/cancel/deadline/remote-ID fields, добавляя
+durable question/delivery и reply intent/outcome state. Новая запись не делает
+credentials публичными. Readers MUST поддерживать contracts v1/v2 и checkpoint
+v1 без переписывания immutable contracts/manifests, продления deadline,
+реконструкции старых вложений/вопросов или повторной мутации. Fenced рабочий step
+MAY записать checkpoint v2, сохраняя baseline markers/IDs/deadline и проверяемую
+revision; массовый upgrade не создаёт question/delivery/Send. Unsupported/
+malformed versions fail closed.
+Обновление использует existing fenced claim/CAS/outbox, а не второй lifecycle.
+
+Artifact ID/name и ordered typed Parts сохраняются по FILE-05. Содержимое Artifact
+не склеивается с Message text и не добавляется автоматически в tool results,
+mailbox, summary или model context; сообщения и вопросы остаются public text.
+Owner peer panel показывает question/reply/state и artifact file cards с теми же
+visibility, integrity, scope и unavailable semantics. Это не открывает private
+owner waits и не подтверждает foreign HITL.
 
 ## TerminalSession сабагента
 
@@ -324,6 +397,8 @@ Child MAY перейти в `input-required`, но запрос маршрути
 - Отправка задачи внешнему агенту может вернуть идентификаторы и позволить
   нашему агенту продолжить независимую работу.
 - Ожидание сохраняет состояние и освобождает worker, не держит активный model call.
+  Новый публичный вопрос может разрешить текущий wait промежуточным результатом
+  по LONG-05, не завершая remote operation.
 - Во время ожидания не расходуется бюджет model turns/tool calls на polling.
 - Родительская A2A Task остаётся нетерминальной, при ожидании внешнего агента —
   `working`.
@@ -438,8 +513,9 @@ Shutdown/lease loss сохраняют recoverable operation, не изобра�
 progress result `{agent_name, remote_state}`. `remote_state` принадлежит ровно
 `TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, `TASK_STATE_INPUT_REQUIRED` или
 `TASK_STATE_AUTH_REQUIRED`. Это metadata, а не peer text или окончательный ответ.
-Progress и checkpoint коммитятся одной fenced/CAS transaction; progress не
+Progress и checkpoint коммитятся одной fenced/CAS transaction; обычный progress не
 создаёт terminal notification, не разрешает wait и не расходует model/tool budget.
+Отдельный durable public input request по LONG-05 может пробудить агента.
 Terminal timeout/outcome заменяет working progress и выигрывает у позднего update.
 Foreign human-wait остаётся working: согласование выполняет remote owner.
 
@@ -488,7 +564,7 @@ send intent. Summary/detail `request_delivery` различает `not_sent`, `u
 и `confirmed`: send intent без peer task ID остаётся неподтверждённой попыткой;
 подтверждение требует persisted remote task ID либо successful terminal immediate
 Message. Неизвестный результат отправки не объявляется доставленным.
-peer-published agent history/status/artifact text считается недоверенным owner
+peer-published agent history/status text считается недоверенным owner
 material. Parser сохраняет только public text, stable message/artifact identity
 и порядок: повторные GetTask snapshots не дублируют entries. История bounded
 (200 entries, 256 KiB text); фактическое усечение отмечается history_truncated.

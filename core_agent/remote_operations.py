@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import json
+from dataclasses import replace
 
 from .errors import CoreError, ExecutionNotStarted
 from .remote_agents import RemoteAgentCard, RemoteAgentConnection, _trusted_headers, _validate_response_files
@@ -10,6 +11,7 @@ from .security import redact
 from .peer_conversations import public_identity
 from .tasks import REMOTE_PROGRESS_STATES, REMOTE_TASK_PENDING
 from .workspace import WorkspaceBinding
+from .remote_artifacts import prepare_remote_artifacts
 
 
 class RemoteA2AExecutor:
@@ -25,7 +27,7 @@ class RemoteA2AExecutor:
             self._step(claim)
         except Exception as error:
             code = error.code if isinstance(error, CoreError) else "REMOTE_AGENT_UNAVAILABLE"
-            if code not in {"LEASE_LOST", "WORKER_STOPPED"}:
+            if code not in {"LEASE_LOST", "WORKER_STOPPED", "SESSION_CONFLICT"}:
                 try:
                     current = self.scheduler.read_remote_claim(claim)
                     if code == "CANCEL_REQUESTED" and not current["checkpoint"]["send_started"]:
@@ -76,15 +78,16 @@ class RemoteA2AExecutor:
             # Identifiers cannot be redacted or rewritten: reject before durable storage or URL construction.
             raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR")
 
-    def _outgoing_files(self, contract):
-        if contract["version"] != 2 or not contract["outgoing_files"]:
+    def _outgoing_files(self, contract, refs=None):
+        refs = contract.get("outgoing_files", []) if refs is None else refs
+        if contract["version"] < 2 or not refs:
             return ()
         if self.response_files_service is None:
             raise CoreError("ARTIFACT_INTEGRITY_FAILED")
         scope = contract["caller_scope"]
         loaded = self.response_files_service.load(
             WorkspaceBinding(contract["tenant_id"], scope["owner_id"], scope["context_id"]),
-            contract["outgoing_files"], task_id=scope["task_id"], run_id=scope["run_id"],
+            refs, task_id=scope["task_id"], run_id=scope["run_id"],
             limit_bytes=contract["attachment_limit_bytes"],
         )
         return tuple({"name": ref["name"], "media_type": ref["media_type"], "raw": content}
@@ -99,6 +102,9 @@ class RemoteA2AExecutor:
                                  limit=contract["attachment_limit_bytes"])
         normalized = {"kind": event.kind, "state": event.state, "text": event.text, "final": event.final,
                       "task_id": event.task_id, "context_id": event.context_id, "parts": list(event.parts)}
+        if contract["version"] == 3:
+            normalized.update(artifacts=list(event.artifacts), messages=list(event.public_messages),
+                              message_parts=list(event.message_parts), message_id=event.message_id)
         try:
             encoded = json.dumps(normalized, sort_keys=True, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
         except (TypeError, ValueError, UnicodeError):
@@ -118,7 +124,8 @@ class RemoteA2AExecutor:
         if reflected(normalized):
             raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR")
         files, safe_parts = [], []
-        for part in event.parts:
+        typed_parts = list(event.message_parts) + [part for artifact in event.artifacts for part in artifact.get("parts", ())]
+        for part in typed_parts if contract["version"] == 3 else event.parts:
             metadata = {key: value for key, value in part.items() if key != "raw"}
             safe_parts.append(metadata)
             if "raw" in part:
@@ -127,10 +134,18 @@ class RemoteA2AExecutor:
                     raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR")
                 files.append({"raw": content, "name": part.get("filename", ""),
                               "media_type": part.get("mediaType", "application/octet-stream"), "metadata": metadata})
-        stage = service.prepare(files, tenant_id=claim.tenant_id, actor_id=contract["caller_scope"]["owner_id"],
-            message_id=claim.task_id, request_digest=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
-            source="remote", request_metadata={**normalized, "parts": safe_parts},
-            limit_bytes=contract["attachment_limit_bytes"])
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        if contract["version"] == 3:
+            stage = prepare_remote_artifacts(service, event, tenant_id=claim.tenant_id,
+                actor_id=contract["caller_scope"]["owner_id"], message_id=claim.task_id,
+                request_digest=digest, operation_id=claim.task_id, limit_bytes=contract["attachment_limit_bytes"])
+            if stage is None:
+                raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR")
+        else:
+            stage = service.prepare(files, tenant_id=claim.tenant_id, actor_id=contract["caller_scope"]["owner_id"],
+                message_id=claim.task_id, request_digest=digest,
+                source="remote", request_metadata={**normalized, "parts": safe_parts},
+                limit_bytes=contract["attachment_limit_bytes"])
         prepared = {key: stage[key] for key in ("batch_id", "lease_token", "actor_id", "message_id", "request_digest")}
         try:
             return self._commit(claim, current, checkpoint, ("completed", result, None), prepared_file_batch=prepared, conversation_observation=conversation_observation)
@@ -147,6 +162,9 @@ class RemoteA2AExecutor:
             self._finish(claim, current, "canceled", {"reason": "not_dispatched"})
             return
         if (checkpoint["send_started"] and checkpoint["remote_task_id"] is None or checkpoint["cancel_started"]):
+            self._unknown(claim, current)
+            return
+        if checkpoint.get("reply") and checkpoint["reply"]["status"] == "started":
             self._unknown(claim, current)
             return
 
@@ -167,8 +185,19 @@ class RemoteA2AExecutor:
                 return
             method = "send_task"
             arguments = {"task": current["contract"]["task"], "message_id": current["contract"]["message_id"]}
-            if current["contract"]["version"] == 2:
+            if current["contract"]["version"] >= 2:
                 arguments["files"] = files
+        elif checkpoint.get("reply") and checkpoint["reply"]["status"] == "queued" and not current["cancel_requested"]:
+            reply = checkpoint["reply"]
+            files = self._outgoing_files(current["contract"], reply["outgoing_files"])
+            self._commit(claim, current, {**checkpoint, "reply": {**reply, "status": "started"}})
+            current = self.scheduler.read_remote_claim(claim)
+            if current["cancel_requested"]:
+                self._unknown(claim, current)
+                return
+            method = "send_task"
+            arguments = {"task": reply["task"], "message_id": reply["message_id"], "files": files,
+                         "task_id": checkpoint["remote_task_id"], "context_id": checkpoint["remote_context_id"]}
         else:
             method = "get_task"
             arguments = {"task_id": checkpoint["remote_task_id"]}
@@ -177,7 +206,7 @@ class RemoteA2AExecutor:
                 current = self.scheduler.read_remote_claim(claim)
                 method = "cancel_task"
 
-        if current["contract"]["version"] == 2:
+        if current["contract"]["version"] >= 2:
             arguments["attachment_limit_bytes"] = current["contract"]["attachment_limit_bytes"]
 
         timeout = min(30.0, current["checkpoint"]["deadline"] - current["now"])
@@ -198,8 +227,11 @@ class RemoteA2AExecutor:
             return
 
         current = self.scheduler.read_remote_claim(claim)
+        if method == "get_task" and current["checkpoint"].get("reply") != checkpoint.get("reply"):
+            # A concurrent safe-boundary reply admission wins over this obsolete read.
+            return
         checkpoint = current["checkpoint"]
-        self._check_identifiers((event.task_id, event.context_id), headers)
+        self._check_identifiers((event.task_id, event.context_id, event.message_id), headers)
         if event.task_id is not None:
             for key, value in (("remote_task_id", event.task_id), ("remote_context_id", event.context_id)):
                 if checkpoint[key] is not None and checkpoint[key] != value:
@@ -207,32 +239,62 @@ class RemoteA2AExecutor:
                                  "REMOTE_AGENT_PROTOCOL_ERROR")
                     return
                 checkpoint[key] = value
-        early_files = (current["contract"]["version"] == 2 and event.kind == "task"
+        version = current["contract"]["version"]
+        if version == 3 and not event.public_messages_complete:
+            # Compatibility for custom in-process adapters predating the typed parser.
+            messages = event.public_messages or event.messages
+            if not messages and not event.artifacts and event.text and event.state not in {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"}:
+                messages = ({"id": public_identity("snapshot", event.text), "text": event.text},)
+            event = replace(event, public_messages=messages,
+                            message_parts=event.message_parts or (() if event.artifacts else event.parts))
+        early_files = (version >= 2 and event.kind == "task"
                        and not event.final and event.state in REMOTE_PROGRESS_STATES)
-        completed_files = (current["contract"]["version"] == 2 and event.final
+        completed_files = (version >= 2 and event.final
                            and (event.kind == "message" or event.kind == "task" and event.state == "TASK_STATE_COMPLETED"))
-        if event.has_files and not early_files and not completed_files:
+        public_parts = list(event.message_parts) + [part for artifact in event.artifacts for part in artifact.get("parts", ())]
+        has_files = any("raw" in part or "url" in part for part in public_parts) if version == 3 else event.has_files
+        if has_files and not early_files and not completed_files:
             self._commit(claim, current, checkpoint, ("failed", {
                 "agent_name": current["contract"]["peer_name"], "reason": "files_unsupported",
             }, "REMOTE_FILES_UNSUPPORTED"))
             return
-        if any("text" not in part and not ((early_files or completed_files) and "raw" in part) for part in event.parts):
+        if version != 3 and any("text" not in part and not ((early_files or completed_files) and "raw" in part) for part in event.parts):
             self._commit(claim, current, checkpoint, ("failed", {
                 "agent_name": current["contract"]["peer_name"], "reason": "parts_unsupported",
             }, "REMOTE_PARTS_UNSUPPORTED"))
             return
 
-        published = list(event.messages)
-        if not event.public_messages_complete and not published and event.text and event.state not in {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"}:
+        published = list(event.public_messages if version == 3 else event.messages)
+        if version != 3 and not event.public_messages_complete and not published and event.text and event.state not in {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"}:
             # Legacy adapters supply only the current public snapshot, never reconstructed history.
             published = [{"id": public_identity("snapshot", event.text), "text": event.text}]
         safe_messages = []
         for message in published:
             text = redact(message["text"], known_secrets=self._secrets(headers))
-            safe_messages.append({"id": public_identity(message["id"], text), "text": text})
+            safe_messages.append({"id": public_identity(message.get("id", "snapshot"), text), "text": text})
+        if version == 3:
+            reply = checkpoint["reply"]
+            if reply and reply["status"] == "started" and method == "send_task":
+                checkpoint["reply"] = {**reply, "status": "confirmed"}
+                checkpoint["answered_inputs"] = [*checkpoint["answered_inputs"], reply["input_id"]]
+                checkpoint["input_request"] = None
+                safe_messages.append({"id": public_identity("outgoing:" + reply["message_id"], reply["task"]),
+                    "text": redact(reply["task"], known_secrets=self._secrets(headers)), "direction": "outgoing",
+                    "request_provenance": reply["request_provenance"]})
+            pending = event.input_request
+            if pending and not event.owner_wait and pending["input_id"] not in checkpoint["answered_inputs"]:
+                text = redact(pending["question"], known_secrets=self._secrets(headers))
+                pending = {"input_id": pending["input_id"], "question": text}
+                if checkpoint["input_request"] is not None and checkpoint["input_request"] != pending:
+                    raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR")
+                checkpoint["input_request"] = pending
+                identity = (public_identity("message:" + event.message_id, event.input_request["question"])
+                            if event.message_id else "input:" + pending["input_id"])
+                safe_messages.append({"id": public_identity(identity, text), "text": text})
         observation = {"messages": safe_messages, "history_truncated": event.history_truncated}
         result = {"agent_name": current["contract"]["peer_name"], "remote_state": event.state,
-                  "text": redact(event.text, known_secrets=self._secrets(headers))}
+                  "text": redact("\n".join(message["text"] for message in event.public_messages)
+                                 if version == 3 else event.text, known_secrets=self._secrets(headers))}
         terminal = {
             "TASK_STATE_COMPLETED": ("completed", None),
             "TASK_STATE_FAILED": ("failed", "REMOTE_TASK_FAILED"),
@@ -242,11 +304,13 @@ class RemoteA2AExecutor:
         if event.kind == "message":
             terminal = ("completed", None)
         if terminal is not None:
-            if completed_files and event.has_files:
+            typed_material = version == 3 and (any(artifact.get("parts") for artifact in event.artifacts)
+                or any("data" in part or "raw" in part for part in event.message_parts))
+            if completed_files and (has_files or typed_material):
                 try:
                     self._accept_files(claim, current, checkpoint, event, result, headers, observation)
                 except CoreError as error:
-                    if error.code in {"LEASE_LOST", "WORKER_STOPPED"}:
+                    if error.code in {"LEASE_LOST", "WORKER_STOPPED", "SESSION_CONFLICT"}:
                         raise
                     state = "canceled" if error.code == "CANCEL_REQUESTED" else "failed"
                     self._commit(claim, current, checkpoint, (state, {
@@ -258,7 +322,12 @@ class RemoteA2AExecutor:
             # A non-terminal cancel response has not confirmed the mutation. Do not repeat it.
             self._unknown(claim, current)
         else:
-            self._poll_later(claim, current, checkpoint, progress={"agent_name": current["contract"]["peer_name"], "remote_state": event.state}, conversation_observation=observation)
+            progress = {"agent_name": current["contract"]["peer_name"], "remote_state": event.state}
+            if version == 3 and checkpoint["input_request"] and (not checkpoint["reply"] or checkpoint["reply"]["status"] == "confirmed"):
+                progress.update(checkpoint["input_request"])
+            elif version == 3 and event.owner_wait:
+                progress["owner_wait"] = True
+            self._poll_later(claim, current, checkpoint, progress=progress, conversation_observation=observation)
 
     def _poll_later(self, claim, current, checkpoint=None, progress=None, conversation_observation=None):
         checkpoint = current["checkpoint"] if checkpoint is None else checkpoint

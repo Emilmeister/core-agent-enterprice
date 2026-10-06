@@ -142,13 +142,25 @@ manifest фиксируются одним workflow transition. Child выбир
 
 ### `core_agent_send_message`
 
+`agent_name` и `task` обязательны и непусты. Optional `task_id`/`input_id`
+передаются только вместе: оба отсутствуют для нового поручения, оба присутствуют
+для ответа на текущий public input request по
+[LONG-05](tasks-and-delegation.md#long-05-публичное-уточнение-и-ответ-в-исходную-remote-task).
+`task_id` — scoped local operation handle, `input_id` — backend-issued текущий
+вопрос. Remote IDs, URL и headers модель не задаёт. Reply сохраняет handle,
+pinned peer, deadline и budgets; schema, policy, guardrails и отдельный HITL
+проверяются вновь. Foreign/stale/terminal/cancel/expired inputs не отправляются.
+Receipt отличает durable queued reply от confirmed dispatch; unknown outcome
+не повторяет Send автоматически. После ответа `core_task_wait` использует тот
+же handle и может получить следующий вопрос либо terminal outcome.
+
 Optional `files` задаёт выбранные моделью относительные workspace paths только
 для этого вызова. Отсутствие поля и `[]` означают отсутствие вложений; никакой
 автоматической отправки файлов workspace или pending final selection нет.
 Весь набор сохраняется до HITL, общий decoded limit проверяется до отправки;
 ошибка сохраняет исходники и возвращается модели без создания remote handle.
 
-Отправляет одну задачу доверенному внешнему агенту из реестра владельцев и возвращает локальный operation handle без ожидания завершения. `core_task_wait` durable ожидает этот handle; remote IDs, deadlines, прогресс и auth описаны в [Удалённых A2A-агентах](tasks-and-delegation.md#удалённые-a2a-агенты). Входящий credential не проксируется; server использует secret-header configuration конкретного адресата. Ответ удалённого агента недоверенный, вызов не запускается через `core_task_start`.
+При первоначальной отправке создаёт одну задачу доверенному внешнему агенту из реестра владельцев и возвращает локальный operation handle без ожидания завершения. `core_task_wait` durable ожидает этот handle и пробуждается на public clarification; remote IDs, deadlines, прогресс и auth описаны в [Удалённых A2A-агентах](tasks-and-delegation.md#удалённые-a2a-агенты). Входящий credential не проксируется; server использует secret-header configuration конкретного адресата. Ответ удалённого агента недоверенный, вызов не запускается через `core_task_start`. Task get/list/wait и mailbox дают только artifact metadata/paths по FILE-05; выбранное содержимое модель читает явно через разрешённый Python/terminal.
 
 ### `core_wait_until`
 

@@ -15,6 +15,8 @@ from .tasks import (
     BackgroundTask, Notification, RemoteTaskClaim, REMOTE_KIND, _remote_progress,
     _remote_contract, _remote_checkpoint, _initial_remote_checkpoint, _advance_remote_checkpoint,
     _remote_expired, _remote_due, _remote_text, remote_timeout_result, _remote_file_binding, remote_result_projection,
+    _remote_cancelled_outcome, _remote_reply_status,
+    _pending_remote_input, _queue_remote_reply, _new_remote_input,
 )
 from .workflow import SuspendedRun
 from .peer_conversations import merge_observation, OBSERVATION_TTL
@@ -146,8 +148,53 @@ class PostgresTaskScheduler:
                     continue
                 progress = _remote_progress(row["result"], row["contract"], row["checkpoint"], None)
                 if progress is not None:
-                    values.append({"task_id": row["id"], "revision": row["revision"], **progress})
+                    values.append({"task_id": row["id"], "revision": row["revision"],
+                                   "agent_name": progress["agent_name"], "remote_state": progress["remote_state"]})
         return tuple(values)
+
+    def remote_input(self, task_id, *, owner_id, tenant_id):
+        with self.database.transaction() as connection:
+            row = connection.execute("""SELECT * FROM core_background_tasks
+                WHERE id=%s AND tenant_id=%s AND owner_run_id=%s AND kind=%s""",
+                (task_id, tenant_id, owner_id, REMOTE_KIND)).fetchone()
+            if row is None:
+                raise CoreError("TASK_NOT_FOUND")
+            return _pending_remote_input(row["contract"], row["checkpoint"], row["state"],
+                                         row["cancel_requested"], self._remote_now(connection))
+
+    def remote_reply_status(self, task_id, input_id, *, owner_id, tenant_id):
+        with self.database.transaction() as connection:
+            row = connection.execute("""SELECT * FROM core_background_tasks
+                WHERE id=%s AND tenant_id=%s AND owner_run_id=%s AND kind=%s""",
+                (task_id, tenant_id, owner_id, REMOTE_KIND)).fetchone()
+            if row is None:
+                raise CoreError("TASK_NOT_FOUND")
+            _remote_checkpoint(row["checkpoint"], row["contract"])
+            return _remote_reply_status(row["checkpoint"], input_id, row["state"], row["cancel_requested"], self._remote_now(connection))
+
+    def queue_remote_reply(self, task_id, reply, *, owner_id, tenant_id, admission=None):
+        with self.database.transaction() as connection:
+            row = connection.execute("""SELECT * FROM core_background_tasks
+                WHERE id=%s AND tenant_id=%s AND owner_run_id=%s AND kind=%s FOR UPDATE""",
+                (task_id, tenant_id, owner_id, REMOTE_KIND)).fetchone()
+            if row is None:
+                raise CoreError("TASK_NOT_FOUND")
+            now = self._remote_now(connection)
+            checkpoint, changed = _queue_remote_reply(row["contract"], row["checkpoint"], row["state"],
+                                                     row["cancel_requested"], now, reply)
+            if admission is not None:
+                admission(connection)
+                now = self._remote_now(connection)
+                checkpoint, changed = _queue_remote_reply(row["contract"], row["checkpoint"], row["state"],
+                                                         row["cancel_requested"], now, reply)
+            if changed:
+                result = {key: value for key, value in (row["result"] or {}).items() if key not in {"input_id", "question"}}
+                row = connection.execute("""UPDATE core_background_tasks SET checkpoint=%s, result=%s,
+                    revision=revision+1, updated_at=%s WHERE id=%s AND tenant_id=%s RETURNING *""",
+                    (Jsonb(checkpoint), Jsonb(result), now, task_id, tenant_id)).fetchone()
+        if changed:
+            self._notify_remote(task_id)
+        return self._task(row)
 
     def observe_remote(self, task_id, *, owner_id, tenant_id, visible):
         if type(visible) is not bool:
@@ -180,7 +227,7 @@ class PostgresTaskScheduler:
         if row is None:
             raise CoreError("TASK_NOT_FOUND")
         _remote_contract(row["contract"], claim.tenant_id, claim.owner_id)
-        _remote_checkpoint(row["checkpoint"])
+        _remote_checkpoint(row["checkpoint"], row["contract"])
         now = self._remote_now(connection)
         if terminal and row["state"] in TERMINAL:
             return row, now
@@ -232,8 +279,16 @@ class PostgresTaskScheduler:
             else:
                 if type(expected_revision) is not int or row["revision"] != expected_revision:
                     raise CoreError("SESSION_CONFLICT")
+                if row["contract"]["version"] == 3 and row["cancel_requested"]:
+                    conversation_observation, progress = None, None
+                    reply = checkpoint.get("reply")
+                    pending = row["checkpoint"]["input_request"]
+                    checkpoint = {**checkpoint, "input_request": None if reply and reply["status"] == "confirmed"
+                                  and (pending is None or reply["input_id"] == pending["input_id"]) else pending}
+                outcome = _remote_cancelled_outcome(row["contract"], outcome, row["cancel_requested"])
                 checkpoint = _advance_remote_checkpoint(row["checkpoint"], checkpoint, row["contract"], now, row["cancel_requested"], outcome)
                 progress = _remote_progress(progress, row["contract"], checkpoint, outcome)
+            new_input = outcome is None and _new_remote_input(row["checkpoint"], checkpoint)
             if not _remote_expired(row["checkpoint"], now):
                 conversation = merge_observation(row.get("remote_conversation"), conversation_observation, now)
                 connection.execute("UPDATE core_background_tasks SET remote_conversation=%s WHERE id=%s AND tenant_id=%s",
@@ -247,7 +302,10 @@ class PostgresTaskScheduler:
                                             WHERE id = %s AND tenant_id = %s RETURNING *""",
                                          (Jsonb(checkpoint), Jsonb(progress if progress is not None else row["result"]) if progress is not None or row["result"] is not None else None,
                                           now, claim.task_id, claim.tenant_id)).fetchone()
-        if outcome is not None:
+                if new_input:
+                    self._deliver_notification(connection, row, "task.input-required", row["revision"],
+                        {"task_id": row["id"], "input_id": checkpoint["input_request"]["input_id"]}, now)
+        if outcome is not None or new_input:
             self._notify_remote(claim.task_id)
         return self._task(row)
 
@@ -412,7 +470,7 @@ class PostgresTaskScheduler:
                     bool(mutating),
                     now,
                     now,
-                    Jsonb(_initial_remote_checkpoint()) if kind == REMOTE_KIND else None,
+                    Jsonb(_initial_remote_checkpoint(contract)) if kind == REMOTE_KIND else None,
                 ),
             )
             if admission is not None:
@@ -762,8 +820,12 @@ class PostgresTaskScheduler:
                 tenant_id,
             ),
         )
+        self._deliver_notification(connection, row, f"task.{state}", revision, payload, now)
+        return {**row, "state": state, "result": _value(result), "error_code": error_code, "revision": revision,
+                "claim_owner": None, "claim_token": None, "claim_expires_at": None}
+
+    def _deliver_notification(self, connection, row, kind, revision, payload, now):
         notification_id = str(uuid.uuid4())
-        kind = f"task.{state}"
         connection.execute(
             """INSERT INTO core_notifications
                (id, owner_run_id, tenant_id, task_id, kind, revision,
@@ -774,8 +836,8 @@ class PostgresTaskScheduler:
             (
                 notification_id,
                 row["owner_run_id"],
-                tenant_id,
-                task_id,
+                row["tenant_id"],
+                row["id"],
                 kind,
                 revision,
                 Jsonb(payload),
@@ -791,8 +853,8 @@ class PostgresTaskScheduler:
                             event_type, sequence) DO NOTHING""",
             (
                 notification_id,
-                tenant_id,
-                task_id,
+                row["tenant_id"],
+                row["id"],
                 kind,
                 revision,
                 Jsonb(payload),
@@ -800,8 +862,6 @@ class PostgresTaskScheduler:
                 now,
             ),
         )
-        return {**row, "state": state, "result": _value(result), "error_code": error_code, "revision": revision,
-                "claim_owner": None, "claim_token": None, "claim_expires_at": None}
 
     def get(self, task_id, *, owner_id=None, tenant_id="default"):
         with self.database.pool.connection() as connection:

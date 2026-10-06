@@ -306,6 +306,10 @@ class WorkspaceCleanupTests(AuthAppTestCase):
         batch.mkdir(parents=True)
         (batch / ".manifest.json").write_text("control")
         files.append({"path": f"attachments/{batch.name}/.manifest.json", "identity_token": "v2:" + "0" * 64})
+        a2a = self.folder / "a2a" / "local-operation"
+        a2a.mkdir(parents=True)
+        (a2a / ".manifest.json").write_text("control")
+        files.append({"path": "a2a/local-operation/.manifest.json", "identity_token": "v2:" + "0" * 64})
         result = await self.delete(files)
         statuses = {item["path"]: item for item in result["results"]}
         self.assertEqual(statuses["allowed"]["status"], "deleted")
@@ -313,6 +317,7 @@ class WorkspaceCleanupTests(AuthAppTestCase):
             self.assertEqual(statuses[path]["reason"], "unsafe_file")
         self.assertEqual(statuses[files[-1]["path"]]["reason"], "protected_file")
         self.assertTrue((batch / ".manifest.json").exists())
+        self.assertTrue((a2a / ".manifest.json").exists())
         files = self.selection("good", "error")
         original = self.service._hash
         def denied(parent, name):
@@ -325,6 +330,17 @@ class WorkspaceCleanupTests(AuthAppTestCase):
         self.assertEqual(result["workspace_revision"], 2)
         self.assertNotIn("private absolute", str(result))
         self.assertTrue((self.folder / "error").exists())
+
+    async def test_public_a2a_artifact_and_manifest_cleanup_persist_after_restart(self):
+        paths = ("a2a/local-operation/artifact-001-part-001.json", "a2a/local-operation/manifest.json")
+        selected = self.selection(*paths)
+        result = await self.delete(selected, "a2a-cleanup")
+        self.assertEqual(result["totals"]["deleted"], 2)
+        self.restart()
+        self.service.recover(tenant_id=self.binding.tenant_id)
+        self.assertTrue(all(not (self.folder / path).exists() for path in paths))
+        repeated = await self.delete(selected, "a2a-cleanup")
+        self.assertEqual(repeated, result)
 
     async def test_revision_invalidates_prior_cursor_and_tokens(self):
         files = self.selection("a", "b", "c")

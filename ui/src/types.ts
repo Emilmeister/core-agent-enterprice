@@ -27,6 +27,20 @@ export interface ResponseFileEntry {
   size_bytes: number;
   sha256: string;
 }
+export interface PeerArtifact {
+  index: number;
+  artifact_id: string;
+  name: string;
+  parts: {
+    index: number;
+    type: "text" | "data" | "file";
+    name: string;
+    media_type: string;
+    relative_path: string;
+    size_bytes: number;
+    sha256: string;
+  }[];
+}
 export interface FileReceipt {
   schema_version: 1;
   batch_id: string;

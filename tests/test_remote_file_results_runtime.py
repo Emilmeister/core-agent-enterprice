@@ -6,11 +6,13 @@ import json
 import threading
 import unittest
 import uuid
+from dataclasses import replace
 from unittest.mock import patch
 
 from core_agent.runtime import _MaterialSuspended
 from core_agent.tools import ToolCall
 from core_agent.errors import CoreError
+from core_agent.execution import ExecutionResult
 from core_agent.guardrails import GuardrailClassifier
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.remote_agents import RemoteAgentCard, RemoteAgentConnection, RemoteEvent
@@ -40,10 +42,11 @@ class Detector:
 
 class RemoteFileResultTests(AuthAppTestCase):
     durable_blobs = True
+    remote_contract_version = 2
 
     async def asyncSetUp(self):
         with patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
-            await super().asyncSetUp()
+            await AuthAppTestCase.asyncSetUp(self)
         self.agent = self.app.state.core_agent
         self.tenant = self.app.state.authenticator.settings.tenant
         self.app.state.remote_registry_store.create(self.tenant, {
@@ -65,7 +68,10 @@ class RemoteFileResultTests(AuthAppTestCase):
         original = self.agent.task_scheduler.start_remote
 
         def settled(*args, **kwargs):
-            task = original(*args, **kwargs)
+            # Keep existing v2 acceptance/recovery coverage of already admitted
+            # batches; new typed receipts have separate v3 cases below.
+            contract = {**args[0], "version": self.remote_contract_version}
+            task = original(contract, *args[1:], **kwargs)
             self.operation_id = task.id
             self.operation_owner = kwargs["owner_id"]
             if self.settle:
@@ -97,7 +103,8 @@ class RemoteFileResultTests(AuthAppTestCase):
         self.binding = WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id)
         operation = self.agent.task_scheduler.list(owner_id=record.run_id, tenant_id=record.tenant_id)[0]
         self.batch = self.agent.chat_file_service.store.get(operation.result["file_batch_id"], record.tenant_id)
-        self.target = self.agent.chat_file_service.workspaces.workspace(self.binding) / "attachments" / self.batch["batch_id"]
+        destination = self.batch["manifest"].get("destination", {"directory": "attachments", "id": self.batch["batch_id"]})
+        self.target = self.agent.chat_file_service.workspaces.workspace(self.binding) / destination["directory"] / destination["id"]
         return record
 
     async def decide(self, record, decision):
@@ -600,6 +607,63 @@ class RemoteFileResultTests(AuthAppTestCase):
         self.assertEqual(self.sent.call_count, 1)
         self.assertIn("MATERIAL_REJECTED", self.model.calls[-1].context)
         self.assertNotIn("Remote answer", self.model.calls[-1].context)
+
+
+class RemoteArtifactResultTests(AuthAppTestCase):
+    """New v3 results preserve structure without automatically loading content."""
+    durable_blobs = True
+    remote_contract_version = 3
+    asyncSetUp = RemoteFileResultTests.asyncSetUp
+    asyncTearDown = RemoteFileResultTests.asyncTearDown
+    start = RemoteFileResultTests.start
+    exempt = RemoteFileResultTests.exempt
+
+    async def test_typed_artifact_canaries_only_appear_after_explicit_file_read(self):
+        self.exempt()
+        self.response = replace(RemoteEvent("task", "TASK_STATE_COMPLETED", "artifact-content-canary", True,
+            ({"text": "artifact-content-canary"},), "artifact-task", "artifact-context"),
+            artifacts=({"artifactId": "structured", "name": "Analysis", "parts": (
+                {"text": "artifact-content-canary"}, {"data": {"marker": "json-value-canary"}})},),
+            public_messages_complete=True)
+        record = await self.start()
+        self.assertEqual(record.state, "COMPLETED", record.error_code)
+        self.assertEqual(self.target.parent.name, "a2a")
+        self.assertEqual(self.target.name, self.operation_id)
+        contexts = json.dumps([call.messages for call in self.model.calls])
+        self.assertNotIn("artifact-content-canary", contexts)
+        self.assertNotIn("json-value-canary", contexts)
+        self.assertIn("/workspace/a2a/", contexts)
+        self.assertEqual((self.target / "artifact-001-part-001.txt").read_text(), "artifact-content-canary")
+        data_path = self.target / "artifact-001-part-002.json"
+        self.assertEqual(json.loads(data_path.read_text()), {"marker": "json-value-canary"})
+        manifest = json.loads((self.target / "manifest.json").read_text())
+        self.assertEqual([part["type"] for part in manifest["artifacts"][0]["parts"]], ["text", "data"])
+        self.assertEqual(manifest["artifacts"][0]["artifact_id"], "structured")
+        self.agent._run_scopes[record.run_id] = {"tenant_id": record.tenant_id}
+        for output in (self.agent._task_get({"task_id": self.operation_id}, record.run_id),
+                       self.agent._task_list({}, record.run_id),
+                       self.agent._task_wait({"task_id": self.operation_id}, record.run_id)):
+            self.assertNotIn("artifact-content-canary", json.dumps(output))
+            self.assertNotIn("json-value-canary", json.dumps(output))
+        self.exempt("core_python_exec")
+        self.model._responses = [ModelResponse(tool_requests=(ToolRequest("read", "core_python_exec", {
+            "code": f"print(open('/workspace/a2a/{self.operation_id}/artifact-001-part-002.json').read())"}),)),
+            ModelResponse(message="read verified")]
+        def read_selected(_manager, **kwargs):
+            self.assertIn(f"/workspace/a2a/{self.operation_id}/artifact-001-part-002.json", kwargs["code"])
+            return ExecutionResult(0, data_path.read_text(), "", (), ())
+        before = len(self.model.calls)
+        with patch("core_agent.runtime.execute_python", side_effect=read_selected):
+            answer = await self.submit("owner-a", uuid.uuid4().hex, record.context_id)
+        self.assertEqual(answer["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertNotIn("json-value-canary", self.model.calls[before].context)
+        self.assertIn("json-value-canary", self.model.calls[-1].context)
+        self.assertEqual(self.sent.call_count, 1)
+
+
+@unittest.skipUnless(TEST_DATABASE_URL, "TEST_DATABASE_URL is required")
+class PostgresRemoteArtifactResultTests(RemoteArtifactResultTests):
+    use_postgres = True
 
 
 @unittest.skipUnless(TEST_DATABASE_URL, "TEST_DATABASE_URL is required")

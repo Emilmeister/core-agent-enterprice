@@ -422,6 +422,18 @@ class PostgresAuthBoundaryTests(AuthBoundaryTests):
 class UIBootstrapTests(AuthAppTestCase):
     ui_client_id = "agent-browser"
 
+    async def test_browser_origin_requires_introspected_client_id_and_owner_role(self):
+        from core_agent.auth import AuthSettings, KeycloakAuthenticator
+        auth = KeycloakAuthenticator(AuthSettings.from_environment(os.environ.get), transport=httpx.MockTransport(self.introspect))
+        self.tokens["owner-a"]["client_id"] = self.ui_client_id
+        self.assertTrue(getattr(await auth.authenticate("owner-a"), "is_browser", False))
+        self.tokens["owner-a"]["client_id"] = "other-client"
+        self.assertFalse(getattr(await auth.authenticate("owner-a"), "is_browser", False))
+        self.tokens["owner-a"].pop("client_id")
+        self.assertFalse(getattr(await auth.authenticate("owner-a"), "is_browser", False))
+        self.tokens["external-a"]["client_id"] = self.ui_client_id
+        self.assertFalse(getattr(await auth.authenticate("external-a"), "is_browser", False))
+
     async def test_public_config_exposes_only_browser_identity_and_keeps_private_routes_closed(self):
         response = await self.http.get("/ui/config")
         self.assertEqual(response.status_code, 200, response.text)

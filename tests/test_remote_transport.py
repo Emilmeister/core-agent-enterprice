@@ -30,6 +30,106 @@ class RemoteTransportTests(unittest.TestCase):
             return io.BytesIO(json.dumps(response).encode())
         return respond
 
+    def test_public_input_question_has_stable_identity_and_owner_wait_is_suppressed(self):
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            questions = []
+            for message_id in ("question-1", "question-1", "question-2"):
+                payload = {"task": task_payload("TASK_STATE_INPUT_REQUIRED", status={
+                    "state": "TASK_STATE_INPUT_REQUIRED", "message": {
+                        "messageId": message_id, "role": "ROLE_AGENT", "parts": [{"text": "Which city?"}]}})}
+                with patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)):
+                    event = self.connection(binding).send_task(task="Weather", message_id="m")
+                question = getattr(event, "input_request", None)
+                self.assertIsNotNone(question)
+                self.assertEqual(question["question"], "Which city?")
+                self.assertFalse(event.final)
+                questions.append(question["input_id"])
+            self.assertEqual(questions[0], questions[1])
+            self.assertNotEqual(questions[0], questions[2])
+            for metadata in ({"core_agent_wait": {"version": 1, "kind": "owner"}}, {"private": True}, {"reasoning": True}):
+                payload["task"]["metadata"] = metadata
+                if "core_agent_wait" not in metadata:
+                    payload["task"]["status"]["message"]["metadata"] = metadata
+                with patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)):
+                    event = self.connection(binding).send_task(task="Weather", message_id="m")
+                self.assertIsNone(event.input_request)
+
+    def test_typed_artifacts_preserve_order_and_are_separate_from_public_messages(self):
+        payload = {"task": task_payload("TASK_STATE_COMPLETED", status={"state": "TASK_STATE_COMPLETED",
+            "message": {"messageId": "answer", "role": "ROLE_AGENT", "parts": [{"text": "Done"}]}}, artifacts=[
+                {"artifactId": "../remote-id", "name": "Report", "parts": [
+                    {"text": "artifact-canary", "mediaType": "text/markdown"},
+                    {"data": {"canary": "json-value"}}, {"raw": "", "filename": "empty.txt"}]},
+                {"artifactId": "hidden", "metadata": {"reasoning": True}, "parts": [{"text": "hidden-canary"}]}])}
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            with patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)):
+                event = self.connection(binding).send_task(task="Task", message_id="m")
+            artifacts = getattr(event, "artifacts", ())
+            self.assertEqual(len(artifacts), 1)
+            self.assertEqual((artifacts[0]["artifactId"], artifacts[0]["name"]), ("../remote-id", "Report"))
+            self.assertEqual([next(key for key in ("text", "data", "raw") if key in part)
+                              for part in artifacts[0]["parts"]], ["text", "data", "raw"])
+            self.assertEqual([message["text"] for message in event.public_messages], ["Done"])
+            self.assertNotIn("artifact-canary", repr(event.public_messages))
+            self.assertIn("artifact-canary", event.text)  # Existing contracts retain their original projection.
+
+    def test_immediate_json_message_preserves_public_typed_parts_without_artifact_identity(self):
+        payload = {"message": {"messageId": "direct", "role": "ROLE_AGENT", "parts": [
+            {"text": "Ready"}, {"data": {"result": "data-canary"}},
+            {"text": "private-canary", "metadata": {"private": True}}]}}
+        with patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)):
+            event = self.connection().send_task(task="Task", message_id="m")
+        self.assertEqual(getattr(event, "message_id", None), "direct")
+        self.assertEqual(len(event.message_parts), 2)
+        self.assertEqual(event.artifacts, ())
+        self.assertEqual([message["text"] for message in event.public_messages], ["Ready"])
+
+    def test_private_task_and_empty_or_private_question_do_not_publish_v3_content(self):
+        for task_metadata, parts in (({}, [{"text": "  "}]), ({}, [{"text": "private", "metadata": {"reasoning": True}}]),
+                                     ({"private": True}, [{"text": "private"}])):
+            payload = {"task": task_payload("TASK_STATE_INPUT_REQUIRED", metadata=task_metadata,
+                history=[{"messageId": "old", "role": "ROLE_AGENT", "parts": [{"text": "history-canary"}]}],
+                status={"state": "TASK_STATE_INPUT_REQUIRED", "message": {"messageId": "question", "role": "ROLE_AGENT", "parts": parts}},
+                artifacts=[{"artifactId": "artifact", "parts": [{"data": {"value": "artifact-canary"}}]}])}
+            with patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)):
+                event = self.connection().send_task(task="Task", message_id="m")
+            self.assertIsNone(event.input_request)
+            if task_metadata:
+                self.assertEqual(event.public_messages, ())
+                self.assertEqual(event.message_parts, ())
+                self.assertEqual(event.artifacts, ())
+
+    def test_send_continuation_keeps_remote_ids_and_rejects_mismatching_response(self):
+        import inspect
+        self.assertIn("task_id", inspect.signature(RemoteAgentConnection.send_task).parameters)
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            payload = {"task": task_payload("TASK_STATE_WORKING")}
+            with patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(payload)) as opened:
+                event = self.connection(binding).send_task(task="For Kazan", message_id="reply-1",
+                    task_id="remote-task", context_id="remote-context")
+                body = json.loads(opened.call_args.args[0].data)
+                message = (body["params"] if binding == "JSONRPC" else body)["message"]
+                self.assertEqual((message["taskId"], message["contextId"], message["messageId"]),
+                                 ("remote-task", "remote-context", "reply-1"))
+                self.assertEqual(event.task_id, "remote-task")
+                self.assertEqual(opened.call_count, 1)
+            for wrong in ({"task": task_payload(id="another-task")},
+                          {"task": task_payload(contextId="another-context")},
+                          {"message": {"role": "ROLE_AGENT", "messageId": "reply", "contextId": "another-context", "parts": [{"text": "Wrong"}]}}):
+                with patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply(wrong)) as opened:
+                    with self.assertRaises(CoreError) as error:
+                        self.connection(binding).send_task(task="For Kazan", message_id="reply-1",
+                            task_id="remote-task", context_id="remote-context")
+                    self.assertEqual(error.exception.code, "REMOTE_AGENT_PROTOCOL_ERROR")
+                    self.assertNotIsInstance(error.exception, ExecutionNotStarted)
+                    self.assertEqual(opened.call_count, 1)
+            for ids in ({"task_id": ""}, {"task_id": "invalid\0id"}, {"context_id": "invalid\nid"}):
+                with patch("core_agent.remote_agents._OPENER.open") as opened:
+                    with self.assertRaises(ExecutionNotStarted) as error:
+                        self.connection(binding).send_task(task="For Kazan", message_id="reply-1", **ids)
+                    self.assertEqual(error.exception.code, "INVALID_REQUEST")
+                    opened.assert_not_called()
+
     def test_both_bindings_send_once_nonblocking_with_only_private_peer_headers(self):
         for binding in ("JSONRPC", "HTTP+JSON"):
             with self.subTest(binding=binding), patch("core_agent.remote_agents._OPENER.open", side_effect=self.reply({"task": task_payload()})) as opened:
@@ -384,6 +484,7 @@ class RemoteTransportTests(unittest.TestCase):
                 params = body["params"] if rpc else body
                 method = body["method"] if rpc else ("SendMessage" if self.path.endswith("/message:send") else "CancelTask")
                 if method == "SendMessage":
+                    self.server.messages.append(params["message"])
                     self.server.parts = params["message"]["parts"][1:]
                     result = {"task": self.task()}
                 else:
@@ -397,10 +498,17 @@ class RemoteTransportTests(unittest.TestCase):
         files = [{"name": "binary.bin", "media_type": "application/octet-stream", "raw": b"\x00\xff"},
                  {"name": "empty.txt", "media_type": "text/plain", "raw": b""}]
         for binding in ("JSONRPC", "HTTP+JSON"):
+            server.messages = []
             connection = RemoteAgentConnection(RemoteAgentCard("peer", "Peer", f"http://127.0.0.1:{server.server_port}/", False, (), binding))
             with self.subTest(binding=binding):
                 sent = connection.send_task(task="Read explicit files", message_id="m", files=files, attachment_limit_bytes=2)
                 fetched = connection.get_task(task_id=sent.task_id, attachment_limit_bytes=2)
+                reply = connection.send_task(task="Additional answer", message_id="reply", files=files, attachment_limit_bytes=2,
+                    task_id=sent.task_id, context_id=sent.context_id)
+                self.assertEqual((reply.task_id, reply.context_id), (sent.task_id, sent.context_id))
+                self.assertEqual(len(server.messages), 2)
+                self.assertNotIn("taskId", server.messages[0])
+                self.assertEqual((server.messages[1]["taskId"], server.messages[1]["contextId"]), (sent.task_id, sent.context_id))
                 cancelled = connection.cancel_task(task_id=sent.task_id, attachment_limit_bytes=2)
                 self.assertEqual([sent.state, fetched.state, cancelled.state], ["TASK_STATE_COMPLETED", "TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"])
                 for event in (sent, fetched, cancelled):

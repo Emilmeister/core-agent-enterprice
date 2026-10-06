@@ -17,12 +17,30 @@ from core_agent.database import PostgresDatabase
 from core_agent.postgres_tasks import PostgresTaskScheduler
 from core_agent.remote_operations import RemoteA2AExecutor
 from tests import test_remote_inbound_files as inbound_tests
-from core_agent.peer_conversations import _files
+from core_agent.peer_conversations import _artifact_receipts, _files
 from core_agent.errors import CoreError
 from tests import test_owner_history as history_tests
 
 
 class PeerConversationOperationTests(unittest.TestCase):
+    def test_public_reply_observations_are_strict_bounded_and_backward_compatible(self):
+        from core_agent.peer_conversations import merge_observation, public_identity
+        incoming = {"id": public_identity("question", "Which city?"), "text": "Which city?"}
+        provenance = {"version": 1, "sources": {"run:1": {"run_id": "run", "sequence": 1,
+            "materials": [{"material_kind": "json", "material_digest": "a" * 64}]}}}
+        reply = {"id": public_identity("outgoing:reply", "Paris"), "text": "Paris",
+                 "direction": "outgoing", "request_provenance": provenance}
+        observation = {"messages": [incoming, reply], "history_truncated": False}
+        saved = merge_observation(None, observation, 1000)
+        self.assertEqual([value["direction"] for value in saved["messages"]], ["incoming", "outgoing"])
+        self.assertEqual(saved["messages"][1]["request_provenance"], provenance)
+        self.assertEqual(merge_observation(saved, observation, 1001)["messages"], saved["messages"])
+        for invalid in ({**reply, "direction": "private"}, {**incoming, "request_provenance": provenance},
+                        {**reply, "reasoning": "private"}, {**reply, "request_provenance": {"version": 1,
+                            "sources": {"run:1": {"run_id": "run", "payload": "private"}}}}):
+            with self.assertRaises(CoreError):
+                merge_observation(None, {"messages": [invalid], "history_truncated": False}, 1000)
+
     def test_request_provenance_rejects_private_metadata_and_unbounded_capture(self):
         from core_agent.peer_conversations import freeze_request_provenance, validate_request_provenance
         identity = {"material_kind": "json", "material_digest": "a" * 64}
@@ -196,6 +214,32 @@ class PeerConversationFileTests(unittest.TestCase):
     settle = inbound_tests.RemoteInboundContract.settle
     start = inbound_tests.RemoteInboundContract.start
 
+    def test_typed_artifact_receipts_preserve_order_without_content_or_unvalidated_paths(self):
+        from core_agent.remote_artifacts import prepare_remote_artifacts
+        event = replace(self.event(parts=[]), public_messages_complete=True, artifacts=(
+            {"artifactId": "original-id", "name": "Report", "parts": [
+                {"data": {"content": "private-json-canary"}},
+                {"text": "private-artifact-canary", "mediaType": "text/markdown"}]},))
+        stage = prepare_remote_artifacts(self.service, event, tenant_id=self.tenant,
+            actor_id=self.person, message_id="typed-result", request_digest="a" * 64,
+            operation_id="local-operation", limit_bytes=10000)
+        binding_args = {key: stage[key] for key in ("actor_id", "message_id", "request_digest", "lease_token")}
+        self.service.bind(stage["batch_id"], self.binding, task_id=self.source.task_id,
+            run_id=self.source.run_id, **binding_args)
+        self.service.record_decision(stage["batch_id"], self.binding, decision_ref="trusted-test-allow", allow=True)
+        self.service.publish(stage["batch_id"], self.binding)
+        agent, row = SimpleNamespace(chat_file_service=self.service), {"result": {"file_batch_id": stage["batch_id"]}}
+        files = _files(agent, self.binding, row, self.source, None)
+        artifacts, path = _artifact_receipts(agent, self.binding, row, files, None)
+        self.assertEqual((artifacts[0]["artifact_id"], artifacts[0]["name"]), ("original-id", "Report"))
+        self.assertEqual([part["type"] for part in artifacts[0]["parts"]], ["data", "text"])
+        self.assertEqual(path, "a2a/local-operation/manifest.json")
+        self.assertNotIn("canary", json.dumps(artifacts))
+        self.assertEqual(_artifact_receipts(agent, self.binding, row, [], None), ([], None))
+        with self.assertRaises(CoreError):
+            _artifact_receipts(agent, self.binding, row, files[1:], None)
+
+
     def test_files_require_full_admission_publication_scope_and_whole_batch_integrity(self):
         self.responses = [self.event()]
         task = self.start()
@@ -236,6 +280,118 @@ class PeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
     submit = AuthAppTestCase.submit
     review_material = history_tests.OwnerHistoryTests.review_material
     digest = staticmethod(history_tests.OwnerHistoryTests.digest)
+
+    def replace_conversation(self, conversation):
+        if self.use_postgres:
+            from psycopg.types.json import Jsonb
+            with self.app.state.database.transaction() as connection:
+                connection.execute("UPDATE core_background_tasks SET remote_conversation=%s WHERE id=%s",
+                                   (Jsonb(conversation), self.operation))
+        else:
+            self.scheduler._remote[self.operation]["conversation"] = conversation
+
+    async def test_confirmed_reply_files_and_later_denial_preserve_initial_request(self):
+        from core_agent.peer_conversations import initial_conversation, merge_observation, public_identity
+        from core_agent.workspace import WorkspaceBinding
+        await self.prepare()
+        service, initial_refs, contract, checkpoint = self.prepare_request_files()
+        contract = {**contract, "version": 3}
+        checkpoint = {**checkpoint, "version": 2, "input_request": None, "answered_inputs": ["a" * 64]}
+        self.replace_remote(contract=contract)
+        binding = WorkspaceBinding(self.tenant, self.source.owner_id, self.source.context_id)
+        (service.workspaces.workspace(binding) / "reply.txt").write_bytes(b"reply attachment")
+        refs = service.prepare(binding, ["reply.txt"], task_id=self.source.task_id,
+                               run_id=self.source.run_id, limit_bytes=64)
+        identity = {"material_kind": "json", "material_digest": self.digest("reply prerequisite")}
+        provenance = {"version": 1, "sources": {self.source.run_id + ":2": {
+            "run_id": self.source.run_id, "sequence": 2, "materials": [identity]}}}
+        reply = {"input_id": "a" * 64, "message_id": "reply", "task": "Paris",
+                 "outgoing_files": list(refs), "status": "confirmed", "request_provenance": provenance}
+        self.replace_remote(checkpoint={**checkpoint, "reply": reply})
+        conversation = merge_observation(initial_conversation(), {"messages": [
+            {"id": public_identity("question", "Which city?"), "text": "Which city?"},
+            {"id": public_identity("outgoing:reply", "Paris"), "text": "Paris", "direction": "outgoing",
+             "request_provenance": provenance}], "history_truncated": False}, 1000)
+        self.replace_conversation(conversation)
+        path = self.path + "/" + self.operation
+        detail = await self.http.get(path, headers=self.headers("owner-a"))
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertNotIn("request_provenance", detail.text)
+        self.assertEqual(detail.json()["reply_delivery"], "confirmed")
+        self.assertEqual([m["direction"] for m in detail.json()["messages"]], ["outgoing", "incoming", "outgoing"])
+        self.assertEqual(detail.json()["messages"][-1]["outgoing_files"][0]["file_id"], refs[0]["file_id"])
+        downloaded = await self.http.get(path + "/outgoing-files/" + refs[0]["file_id"], headers=self.headers("owner-a"))
+        self.assertEqual(downloaded.content, b"reply attachment")
+        self.replace_remote(checkpoint={**checkpoint, "input_request": {"input_id": "a" * 64, "question": "Which city?"},
+            "answered_inputs": [], "reply": {**reply, "status": "started"}})
+        unconfirmed = await self.http.get(path, headers=self.headers("owner-a"))
+        self.assertEqual(unconfirmed.json()["reply_delivery"], "unconfirmed")
+        self.assertEqual(unconfirmed.json()["messages"][-1]["outgoing_files"], [])
+        self.assertEqual((await self.http.get(path + "/outgoing-files/" + refs[0]["file_id"],
+            headers=self.headers("owner-a"))).status_code, 404)
+        self.replace_remote(checkpoint={**checkpoint, "reply": reply})
+        self.review_material(self.source, identity)
+        denied = await self.http.get(path, headers=self.headers("owner-a"))
+        self.assertEqual([m["text"] for m in denied.json()["messages"]], ["Public outgoing request", "Which city?"])
+        self.assertEqual(denied.json()["outgoing_files"][0]["file_id"], initial_refs[0]["file_id"])
+        self.assertEqual((await self.http.get(path + "/outgoing-files/" + refs[0]["file_id"],
+            headers=self.headers("owner-a"))).status_code, 404)
+        self.assertEqual((await self.http.get(path + "/outgoing-files/" + initial_refs[0]["file_id"],
+            headers=self.headers("owner-a"))).status_code, 200)
+
+    async def test_historical_reply_grants_do_not_repeat_initial_files_or_leak_denied_descendants(self):
+        from core_agent.peer_conversations import initial_conversation, merge_observation, public_identity
+        from core_agent.workspace import WorkspaceBinding
+        await self.prepare()
+        service, initial_refs, contract, checkpoint = self.prepare_request_files()
+        contract = {**contract, "version": 3}
+        checkpoint = {**checkpoint, "version": 2, "input_request": None, "answered_inputs": ["a" * 64, "b" * 64]}
+        self.replace_remote(contract=contract)
+        binding = WorkspaceBinding(self.tenant, self.source.owner_id, self.source.context_id)
+        (service.workspaces.workspace(binding) / "historical.txt").write_bytes(b"historical reply file")
+        refs = service.prepare(binding, ["historical.txt"], task_id=self.source.task_id,
+            run_id=self.source.run_id, limit_bytes=64)
+        prerequisite = {"material_kind": "json", "material_digest": self.digest("historical prerequisite")}
+        provenance = {"version": 1, "sources": {"source:2": {"run_id": self.source.run_id,
+            "sequence": 2, "materials": [prerequisite]}}}
+        first = {"input_id": "a" * 64, "message_id": "first-reply", "task": "First answer",
+            "outgoing_files": list(refs), "request_provenance": provenance}
+        second = {"input_id": "b" * 64, "message_id": "second-reply", "task": "Second answer",
+            "outgoing_files": [], "request_provenance": {"version": 1, "sources": {}}}
+        snapshot = copy.deepcopy(self.source.snapshot)
+        for order, reply in enumerate((first, second), 2):
+            snapshot["remote_calls"][f"1:reply-{order}"] = {"version": 1, "contract": contract,
+                "arguments_digest": "a" * 64, "operation_id": self.operation, "reply": reply,
+                "request_provenance": reply["request_provenance"]}
+        self.replace_snapshot(snapshot)
+        self.replace_remote(checkpoint={**checkpoint, "reply": {**second, "status": "confirmed"}})
+        conversation = initial_conversation()
+        for index, message in enumerate((
+            {"id": public_identity("question", "First question"), "text": "First question"},
+            {"id": public_identity("outgoing:first-reply", "First answer"), "text": "First answer",
+                "direction": "outgoing", "request_provenance": provenance},
+            {"id": public_identity("question", "Second question"), "text": "Second question"},
+            {"id": public_identity("outgoing:second-reply", "Second answer"), "text": "Second answer",
+                "direction": "outgoing", "request_provenance": second["request_provenance"]},
+            {"id": public_identity("result", "Final answer"), "text": "Final answer"})):
+            conversation = merge_observation(conversation, {"messages": [message], "history_truncated": False}, 1000 + index)
+        self.replace_conversation(conversation)
+        path = self.path + "/" + self.operation
+        response = await self.http.get(path, headers=self.headers("owner-a"))
+        self.assertEqual(response.status_code, 200, response.text)
+        detail = response.json()
+        self.assertEqual(detail["messages"][0]["outgoing_files"], list(service.receipts(initial_refs)))
+        self.assertEqual(detail["messages"][2]["outgoing_files"], list(service.receipts(refs)))
+        self.assertEqual(detail["messages"][4]["outgoing_files"], [])
+        self.assertNotIn("request_provenance", json.dumps(detail))
+        self.assertEqual((await self.http.get(path + "/outgoing-files/" + refs[0]["file_id"],
+            headers=self.headers("owner-b"))).content, b"historical reply file")
+        self.review_material(self.source, prerequisite)
+        denied = (await self.http.get(path, headers=self.headers("owner-a"))).json()
+        self.assertEqual([message["text"] for message in denied["messages"]], ["Public outgoing request", "First question"])
+        self.assertEqual((await self.http.get(path + "/outgoing-files/" + refs[0]["file_id"],
+            headers=self.headers("owner-a"))).status_code, 404)
+
 
     def replace_snapshot(self, snapshot):
         if self.use_postgres:
@@ -356,6 +512,49 @@ class PeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
         summary = (await self.http.get(self.path, headers=self.headers("owner-a"))).json()["conversations"][0]
         self.assertEqual((summary["last_message"], summary["message_count"]), ("", 1))
 
+    async def test_historical_question_denial_survives_result_and_context_changes(self):
+        from core_agent.peer_conversations import initial_conversation, merge_observation, public_identity
+
+        await self.prepare()
+        service, refs, contract, checkpoint = self.prepare_request_files()
+        contract = {**contract, "version": 3}
+        question = {"input_id": "a" * 64, "question": "Denied public question"}
+        checkpoint = {**checkpoint, "version": 2, "input_request": question, "reply": None, "answered_inputs": []}
+        self.replace_remote(contract=contract, checkpoint=checkpoint)
+        result = {"agent_name": "delivery", "remote_state": "TASK_STATE_INPUT_REQUIRED", **question}
+        review = self.review_material(self.source, {"material_kind": "json", "material_digest": self.digest(result)},
+                                      source_kind="tool_result")
+        snapshot = copy.deepcopy(self.source.snapshot)
+        snapshot.setdefault("context_materials", {})["remote_input:" + self.operation + ":" + question["input_id"]] = {
+            "identity": {"material_kind": "json", "material_digest": self.digest(result), "review_id": review["review_id"]},
+            "allowed": False,
+        }
+        snapshot["context"]["active"] = []
+        snapshot["context"]["transcript"] = []
+        snapshot["remote_calls"]["1:peer-send"].pop("request_provenance", None)
+        self.replace_snapshot(snapshot)
+        self.replace_conversation(merge_observation(initial_conversation(), {"messages": [
+            {"id": public_identity("question", question["question"]), "text": question["question"]}],
+            "history_truncated": False}, 1000))
+        # The live scheduler result and its pending question no longer retain the review identity.
+        self.replace_remote(checkpoint={**checkpoint, "input_request": None, "answered_inputs": [question["input_id"]]})
+        final = {"agent_name": "delivery", "remote_state": "TASK_STATE_COMPLETED", "text": "done"}
+        if self.use_postgres:
+            from psycopg.types.json import Jsonb
+            with self.app.state.database.transaction() as connection:
+                connection.execute("UPDATE core_background_tasks SET state='completed', result=%s WHERE id=%s AND tenant_id=%s",
+                                   (Jsonb(final), self.operation, self.tenant))
+        else:
+            task = self.scheduler._tasks[self.operation]
+            task.state, task.result = "completed", final
+        detail = await self.http.get(self.path + "/" + self.operation, headers=self.headers("owner-a"))
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["material_status"], "rejected")
+        self.assertEqual([message["text"] for message in detail.json()["messages"]], ["Public outgoing request"])
+        self.assertEqual(detail.json()["outgoing_files"], list(service.receipts(refs)))
+        summary = (await self.http.get(self.path, headers=self.headers("owner-a"))).json()["conversations"][0]
+        self.assertEqual((summary["last_message"], summary["message_count"]), ("", 1))
+
     async def test_current_remote_result_review_is_causal_and_pending_alias_is_visible(self):
         import json
         await self.prepare()
@@ -395,7 +594,7 @@ class PeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
         if contract is not None and "remote_calls" in self.source.snapshot:
             snapshot = copy.deepcopy(self.source.snapshot)
             entry = {"version": 1, "contract": contract}
-            if contract["version"] == 2:
+            if contract["version"] >= 2:
                 entry["arguments_digest"] = "0" * 64
             snapshot["remote_calls"]["1:peer-send"] = entry
             self.replace_snapshot(snapshot)
@@ -699,6 +898,9 @@ class PostgresPeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
     replace_remote = PeerConversationAPITests.replace_remote
     prepare_request_files = PeerConversationAPITests.prepare_request_files
     replace_snapshot = PeerConversationAPITests.replace_snapshot
+    replace_conversation = PeerConversationAPITests.replace_conversation
+    test_confirmed_reply_files_and_later_denial_preserve_initial_request = PeerConversationAPITests.test_confirmed_reply_files_and_later_denial_preserve_initial_request
+    test_historical_reply_grants_do_not_repeat_initial_files_or_leak_denied_descendants = PeerConversationAPITests.test_historical_reply_grants_do_not_repeat_initial_files_or_leak_denied_descendants
     review_material = PeerConversationAPITests.review_material
     digest = staticmethod(PeerConversationAPITests.digest)
     async def prepare(self, context_id=None):
@@ -722,6 +924,7 @@ class PostgresPeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
     test_later_source_denial_blocks_derived_requests_files_and_download = PeerConversationAPITests.test_later_source_denial_blocks_derived_requests_files_and_download
     test_later_selected_file_text_alias_blocks_whole_outgoing_payload = PeerConversationAPITests.test_later_selected_file_text_alias_blocks_whole_outgoing_payload
     test_exact_peer_text_denial_preserves_independent_outgoing_request = PeerConversationAPITests.test_exact_peer_text_denial_preserves_independent_outgoing_request
+    test_historical_question_denial_survives_result_and_context_changes = PeerConversationAPITests.test_historical_question_denial_survives_result_and_context_changes
     test_current_remote_result_review_is_causal_and_pending_alias_is_visible = PeerConversationAPITests.test_current_remote_result_review_is_causal_and_pending_alias_is_visible
     test_frozen_request_dependencies_ignore_later_unrelated_denials = PeerConversationAPITests.test_frozen_request_dependencies_ignore_later_unrelated_denials
     test_legacy_request_cutoff_excludes_later_unrelated_results = PeerConversationAPITests.test_legacy_request_cutoff_excludes_later_unrelated_results

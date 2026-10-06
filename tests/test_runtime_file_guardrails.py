@@ -40,7 +40,7 @@ class RuntimeFileGuardrailTests(unittest.TestCase):
         sleeping = agent.resume_task("task")
         self.assertIsInstance(sleeping, SuspendedRun)
         self.assertEqual(model.calls, ())
-        target = service.workspaces.workspace(binding) / "attachments" / batch["batch_id"]
+        target = service.workspaces.workspace(binding) / "a2a" / batch["batch_id"]
         self.assertFalse(target.exists())
         record = agent.workflow_store.lookup_task("task")
         self.assertNotIn("report.txt", json.dumps(record.snapshot))
@@ -57,7 +57,7 @@ class RuntimeFileGuardrailTests(unittest.TestCase):
         self.assertEqual((target / "report.txt").read_bytes(), b"private file text")
         self.assertIn("report.txt", model.calls[-1].context)
         self.assertNotIn("private file text", model.calls[-1].context)
-        self.assertIn("/workspace/attachments/", model.calls[-1].context)
+        self.assertIn("/workspace/a2a/", model.calls[-1].context)
         self.assertEqual(detector.generate.call_count, 2)
 
     def test_reject_excludes_entire_batch_and_continues_with_safe_notice(self):
@@ -69,7 +69,7 @@ class RuntimeFileGuardrailTests(unittest.TestCase):
         self.resolve(agent, sleeping, "rejected")
         self.assertEqual(agent.resume_task("task").message, "done")
         self.assertEqual(service.store.get(batch["batch_id"], "company")["state"], "excluded")
-        self.assertFalse((service.workspaces.workspace(binding) / "attachments" / batch["batch_id"]).exists())
+        self.assertFalse((service.workspaces.workspace(binding) / "a2a" / batch["batch_id"]).exists())
         self.assertIn("MATERIAL_REJECTED", model.calls[-1].context)
         self.assertIn(batch["batch_id"], model.calls[-1].context)
         self.assertNotIn("good.txt", model.calls[-1].context)
@@ -100,7 +100,7 @@ class RuntimeFileGuardrailTests(unittest.TestCase):
             agent.resume_task("task")
         self.assertEqual(caught.exception.code, "ARTIFACT_INTEGRITY_FAILED")
         self.assertEqual(model.calls, ())
-        self.assertFalse((service.workspaces.workspace(binding) / "attachments" / batch["batch_id"]).exists())
+        self.assertFalse((service.workspaces.workspace(binding) / "a2a" / batch["batch_id"]).exists())
 
     def test_publication_crash_recovers_same_bytes_without_detector_replay(self):
         from core_agent import chat_files
@@ -116,7 +116,7 @@ class RuntimeFileGuardrailTests(unittest.TestCase):
         self.assertEqual(model.calls, ())
         self.assertEqual(agent.resume_task("task").message, "done")
         self.assertEqual(detector.generate.call_count, 3)
-        target = service.workspaces.workspace(binding) / "attachments" / batch["batch_id"]
+        target = service.workspaces.workspace(binding) / "a2a" / batch["batch_id"]
         self.assertEqual((target / "report.txt").read_bytes(), b"private file text")
 
     def test_lease_loss_after_classification_prevents_any_publication(self):
@@ -128,7 +128,7 @@ class RuntimeFileGuardrailTests(unittest.TestCase):
         with patch.object(service, "record_decision", side_effect=expire), self.assertRaises(CoreError) as caught:
             agent.resume_task("task")
         self.assertEqual(caught.exception.code, "LEASE_LOST")
-        self.assertFalse((service.workspaces.workspace(binding) / "attachments" / batch["batch_id"]).exists())
+        self.assertFalse((service.workspaces.workspace(binding) / "a2a" / batch["batch_id"]).exists())
         self.assertEqual(service.store.get(batch["batch_id"], "company")["state"], "accepted_quarantine")
         self.assertEqual(model.calls, ())
 

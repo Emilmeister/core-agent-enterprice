@@ -81,7 +81,8 @@ print({marker!r})
         return ModelResponse(tool_requests=(ToolRequest(marker, "core_terminal_exec", {"argv": ["python3", "-P", "-c", code]}),))
 
     peer_release = threading.Event()
-    peer_state = {"sends": 0, "gets": 0, "message": None, "tasks": {}, "models_available": True}
+    peer_state = {"sends": 0, "gets": 0, "message": None, "tasks": {}, "models_available": True,
+                  "question": False, "clarification_task": None, "answer": None, "clarification_finish": False}
     peer_url = "http://127.0.0.1:8001/a2a/"
 
     class PublicPeer(BaseHTTPRequestHandler):
@@ -114,25 +115,50 @@ print({marker!r})
             if method == "SendMessage":
                 peer_state["sends"] += 1
                 peer_state["message"] = payload["params"]["message"]
-                task_id = "browser-public-peer-task-" + str(peer_state["sends"])
-                peer_state["tasks"][task_id] = peer_state["sends"]
+                message = peer_state["message"]
+                if message.get("taskId"):
+                    task_id = message["taskId"]
+                    assert task_id == peer_state["clarification_task"], "reply created another remote Task"
+                    assert message["contextId"] == "browser-public-peer-context", "reply changed remote context"
+                    assert peer_state["answer"] is None, "confirmed answer was sent twice"
+                    peer_state["answer"] = "\n".join(part["text"] for part in message["parts"] if "text" in part)
+                    assert peer_state["answer"] == "Казань", "private owner question was sent to peer"
+                else:
+                    task_id = "browser-public-peer-task-" + str(peer_state["sends"])
+                    peer_state["tasks"][task_id] = peer_state["sends"]
+                    if any(part.get("text") == "Native caller clarification proof" for part in message["parts"]):
+                        peer_state["clarification_task"] = task_id
             else:
                 assert method == "GetTask", "Unexpected remote mutation"
                 peer_state["gets"] += 1
                 task_id = payload["params"]["id"]
             task_number = peer_state["tasks"][task_id]
+            clarification = task_id == peer_state["clarification_task"]
             messages = [{"messageId": "peer-accepted", "role": "ROLE_AGENT", "parts": [{"text": "Поручение принято."}]}]
             if peer_state["gets"]:
                 messages.append({"messageId": "peer-progress", "role": "ROLE_AGENT", "parts": [
                     {"text": "Проверяю данные для поручения.\n\n" + "\n".join(f"- Пункт проверки {index}" for index in range(55))},
                     {"text": "private-peer-reasoning", "metadata": {"kind": "reasoning"}}]})
+            finished = peer_state["clarification_finish"] if clarification else peer_release.is_set()
             task = {"id": task_id, "contextId": "browser-public-peer-context",
-                    "status": {"state": "TASK_STATE_COMPLETED" if peer_release.is_set() else "TASK_STATE_WORKING"},
+                    "status": {"state": "TASK_STATE_COMPLETED" if finished else "TASK_STATE_WORKING"},
                     "history": messages}
-            if peer_release.is_set():
-                task["artifacts"] = [{"artifactId": "peer-result", "parts": [
-                    {"text": "**Проверка завершена.** Отчёт подготовлен." + (f" Ответ по поручению {task_number}." if task_number > 1 else "")},
+            if clarification and peer_state["question"]:
+                question = {"messageId": "caller-city-question", "role": "ROLE_AGENT", "parts": [{"text": "Для какого города подготовить отчёт?"}]}
+                messages.append(question)
+                if peer_state["answer"] is None:
+                    task["status"] = {"state": "TASK_STATE_INPUT_REQUIRED", "message": question}
+                else:
+                    messages.append({"messageId": "caller-answer-accepted", "role": "ROLE_AGENT",
+                                     "parts": [{"text": "Уточнение принято."}]})
+            if finished:
+                messages.append({"messageId": "peer-completed", "role": "ROLE_AGENT", "parts": [
+                    {"text": "Ответ по поручению " + str(task_number) + "."}]})
+                task["artifacts"] = [{"artifactId": "peer-result", "name": "Отчёт", "parts": [
+                    {"text": "**Проверка завершена.** Отчёт подготовлен. artifact-content-canary", "mediaType": "text/markdown"},
                     {"filename": "peer-report.txt", "mediaType": "text/plain", "raw": base64.b64encode(b"Native peer report\n").decode()}]}]
+                if clarification:
+                    task["artifacts"][0]["parts"].append({"data": {"city": "Казань", "value": "json-value-canary"}})
             self.send_json({"jsonrpc": "2.0", "id": payload["id"], "result": {"task": task} if method == "SendMessage" else task})
 
     peer_server = ThreadingHTTPServer(("127.0.0.1", 8001), PublicPeer)
@@ -189,6 +215,7 @@ print({marker!r})
             if index == 5:
                 assert "Native file reads completed." in context, "manual cron lost original chat history"
             response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
+            assert "artifact-content-canary" not in context and "json-value-canary" not in context, "Artifact contents entered model context automatically"
             if index == 15:
                 attached = next(message["content"] for message in reversed(messages)
                                 if message.get("role") == "user" and "Attached files: " in message.get("content", ""))
@@ -196,15 +223,26 @@ print({marker!r})
                 response = ModelResponse(tool_requests=(ToolRequest("browser-peer-send", "core_agent_send_message", {
                     "agent_name": "browser-peer", "task": "Подготовь краткий отчёт по поручению.",
                     "files": [folder + "/report.txt"]}),))
-            if response.tool_requests and response.tool_requests[0].id in {"browser-background-wait", "browser-peer-wait", "browser-peer-wait-two", "browser-other-peer-wait"}:
+            if response.tool_requests and response.tool_requests[0].id in {"browser-background-wait", "browser-peer-wait", "browser-peer-wait-two", "browser-other-peer-wait", "browser-clarification-wait", "browser-clarification-wait-final"}:
                 waiting = response.tool_requests[0].id
                 source = {"browser-peer-wait": "browser-peer-send", "browser-peer-wait-two": "browser-peer-send-two",
-                          "browser-other-peer-wait": "browser-other-peer-send"}.get(waiting, "browser-background-failure")
+                          "browser-other-peer-wait": "browser-other-peer-send", "browser-clarification-wait": "browser-clarification-send",
+                          "browser-clarification-wait-final": "browser-clarification-reply"}.get(waiting, "browser-background-failure")
                 admitted = next(json.loads(message["content"]) for message in messages
                                 if message.get("tool_call_id") == source)
                 assert admitted["status"] == "succeeded"
                 response = ModelResponse(tool_requests=(ToolRequest(waiting, "core_task_wait",
                     {"task_id": admitted["output"]["task_id"]}),))
+            if response.tool_requests and response.tool_requests[0].id == "browser-clarification-reply":
+                question = next(json.loads(message["content"])["output"] for message in messages
+                    if message.get("tool_call_id") == "browser-clarification-wait")
+                assert question["question"] == "Для какого города подготовить отчёт?"
+                answer = next(json.loads(message["content"])["output"] for message in messages
+                    if message.get("tool_call_id") == "browser-clarification-owner")
+                assert answer["answer"] == "Казань"
+                response = ModelResponse(tool_requests=(ToolRequest("browser-clarification-reply", "core_agent_send_message", {
+                    "agent_name": "browser-peer", "task_id": question["task_id"], "input_id": question["input_id"],
+                    "task": answer["answer"]}),))
             return response
 
     preview_python = "value = 7\nif value:\n    print('python highlight verified')\n"
@@ -289,6 +327,13 @@ flowchart LR
             "agent_name": "browser-peer-two", "task": "Отдельное поручение другому контрагенту."}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-other-peer-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
         ModelResponse(message="Другой контрагент ответил."),
+        ModelResponse(tool_requests=(ToolRequest("browser-clarification-send", "core_agent_send_message", {
+            "agent_name": "browser-peer", "task": "Native caller clarification proof"}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-clarification-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-clarification-owner", "core_ask_owner", {"question": "Private native owner city: какой город использовать?"}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-clarification-reply", "core_agent_send_message", {"agent_name": "browser-peer", "task": "from-private-owner"}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-clarification-wait-final", "core_task_wait", {"task_id": "from-actual-admission"}),)),
+        ModelResponse(message="Уточнение и структурированные артефакты получены."),
     ])
     model.model = "owner-browser-fixture"
     app = create_app(model=model, guardrail_classifier=GuardrailClassifier(ClearModel()))
@@ -308,7 +353,11 @@ flowchart LR
                 peer_release.set()
             if "models_available" in payload:
                 peer_state["models_available"] = payload["models_available"]
+            for key in ("question", "clarification_finish"):
+                if key in payload:
+                    peer_state[key] = payload[key]
         return JSONResponse({"sends": peer_state["sends"], "gets": peer_state["gets"], "finished": peer_release.is_set(),
+                             "clarification_task": peer_state["clarification_task"], "answer": peer_state["answer"],
                              "now": time.time()}, headers={"Cache-Control": "no-store"})
     app.routes.append(Route("/api/browser-peer-fixture", peer_fixture, methods=["GET", "POST"]))
     assert isinstance(app.state.core_agent.tool_runtime.environment_manager.backend.launcher, SandboxLauncher)

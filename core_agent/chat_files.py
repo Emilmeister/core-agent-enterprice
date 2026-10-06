@@ -369,8 +369,28 @@ def _manifest(fd, manifest):
     os.fsync(fd)
 
 
+def _destination(manifest):
+    """Persisted backend destination; absence retains the legacy batch path."""
+    destination = manifest.get("destination")
+    if destination is None:
+        return "attachments", manifest["batch_id"]
+    if (not isinstance(destination, dict) or destination.keys() != {"version", "directory", "id"}
+            or type(destination["version"]) is not int or destination["version"] != 1
+            or destination["directory"] != "a2a" or not isinstance(destination["id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", destination["id"])):
+        raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+    return destination["directory"], destination["id"]
+
+
 def _verify(fd, manifest):
     try:
+        if "destination" in manifest:
+            directory, identifier = _destination(manifest)
+            for entry in manifest["entries"]:
+                name = entry["actual_name"]
+                if (not isinstance(name, str) or not name or "/" in name or "\\" in name or name in {".", ".."}
+                        or entry["relative_path"] != f"{directory}/{identifier}/{name}"):
+                    raise CoreError("ARTIFACT_INTEGRITY_FAILED")
         expected_names = {".manifest.json", *(entry["actual_name"] for entry in manifest["entries"])}
         with os.scandir(fd) as entries:
             for entry in entries:
@@ -457,7 +477,7 @@ class ChatFileService:
         self.store.check_lease(records[-1], lease_token, connection=connection)
 
     @contextmanager
-    def _attachments(self, binding):
+    def _attachments(self, binding, manifest=None):
         path = self.workspaces.workspace(binding)
         descriptor = os.dup(self.root)
         try:
@@ -466,7 +486,7 @@ class ChatFileService:
                 child = os.open(component, _DIRECTORY, dir_fd=descriptor)
                 os.close(descriptor)
                 descriptor = child
-            child = _mkdir(descriptor, "attachments")
+            child = _mkdir(descriptor, _destination(manifest)[0] if manifest is not None else "attachments")
             os.close(descriptor)
             descriptor = child
             yield descriptor
@@ -483,7 +503,7 @@ class ChatFileService:
             raise CoreError("FILE_UPLOAD_LEASE_LOST")
 
     def prepare(self, files, *, tenant_id, actor_id, message_id, request_digest, source,
-                request_metadata=None, limit_bytes=None):
+                request_metadata=None, limit_bytes=None, destination_id=None, artifact_manifest=None):
         """Accept transport data containing exactly raw or base64 file content.
 
         Names, source, and metadata remain untrusted and are included in the
@@ -498,6 +518,12 @@ class ChatFileService:
         limit_bytes = self.limit_bytes if limit_bytes is None else limit_bytes
         if type(limit_bytes) is not int or limit_bytes < 1:
             raise CoreError("CONFIG_INVALID")
+        if destination_id is not None and (
+                not isinstance(destination_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", destination_id)):
+            raise CoreError("INVALID_FILE_INPUT")
+        if artifact_manifest is not None and (not isinstance(artifact_manifest, dict)
+                or artifact_manifest.keys() != {"artifacts", "messages", "manifest_path"}):
+            raise CoreError("INVALID_FILE_INPUT")
         batch_id, token, now = uuid.uuid4().hex, uuid.uuid4().hex, self.clock()
         row = dict(batch_id=batch_id, schema_version=1, tenant_id=tenant_id, actor_id=actor_id,
                    message_id=message_id, request_digest=request_digest, created_at=now,
@@ -510,6 +536,11 @@ class ChatFileService:
         try:
             manifest = dict(schema_version=1, batch_id=batch_id, tenant_id=tenant_id, created_at=now,
                             source=source, metadata=copy.deepcopy(request_metadata or {}), entries=[], total_bytes=0)
+            if source == "a2a" or destination_id is not None:
+                manifest["destination"] = {"version": 1, "directory": "a2a", "id": destination_id or batch_id}
+            if artifact_manifest is not None:
+                manifest.update(copy.deepcopy(artifact_manifest))
+            destination, identifier = _destination(manifest)
             with self.store.locked(batch_id, tenant_id) as (current, _):
                 self._lease(current, token)
                 directory = _mkdir(self.uploads, batch_id)
@@ -554,7 +585,7 @@ class ChatFileService:
                 actual = _safe_name(original, index, occupied)
                 _write(directory, actual, content, lambda: self.renew(batch_id, tenant_id, token))
                 manifest["entries"].append(dict(index=index, original_name=original, actual_name=actual,
-                    relative_path=f"attachments/{batch_id}/{actual}", media_type=media,
+                    relative_path=f"{destination}/{identifier}/{actual}", media_type=media,
                     size_bytes=len(content), sha256=hashlib.sha256(content).hexdigest(),
                     metadata=copy.deepcopy(file.get("metadata", {}))))
             _manifest(directory, manifest)
@@ -622,27 +653,30 @@ class ChatFileService:
             raise CoreError("INVALID_FILE_INPUT")
         with self.caller_scope(binding, run_id=run_id, task_id=task_id,
                 connection=connection, accept_input=sequence is not None) as (source, root, conn):
-            occupied = self.store.reserved(binding, connection=conn)
-            with self._attachments(binding) as attachments:
-                occupied.update(os.listdir(attachments))
             with self.store.locked(batch_id, binding.tenant_id, connection=conn) as (row, _):
                 self._lease(row, lease_token)
                 if (row["actor_id"], row["message_id"], row["request_digest"]) != (actor_id, message_id, request_digest):
                     raise CoreError("FILE_BATCH_NOT_FOUND")
                 if not row["manifest"]:
                     raise CoreError("FILE_BATCH_NOT_PREPARED")
+                directory_kind, _ = _destination(row["manifest"])
+                occupied = self.store.reserved(binding, connection=conn) if directory_kind == "attachments" else set()
+                with self._attachments(binding, row["manifest"]) as attachments:
+                    if directory_kind == "attachments":
+                        occupied.update(os.listdir(attachments))
                 try:
                     with self._private(batch_id) as (_, directory):
                         _verify(directory, row["manifest"])
-                        # Two passes avoid overwriting a sibling matching a suffix.
-                        entries = row["manifest"]["entries"]
-                        for entry in entries:
-                            os.rename(entry["actual_name"], f".input-{entry['index']}", src_dir_fd=directory, dst_dir_fd=directory)
-                        for entry in entries:
-                            actual = _safe_name(entry["original_name"], entry["index"], occupied)
-                            os.rename(f".input-{entry['index']}", actual, src_dir_fd=directory, dst_dir_fd=directory)
-                            entry.update(actual_name=actual, relative_path=f"attachments/{batch_id}/{actual}")
-                        _manifest(directory, row["manifest"])
+                        if directory_kind == "attachments":
+                            # Two passes avoid overwriting a sibling matching a suffix.
+                            entries = row["manifest"]["entries"]
+                            for entry in entries:
+                                os.rename(entry["actual_name"], f".input-{entry['index']}", src_dir_fd=directory, dst_dir_fd=directory)
+                            for entry in entries:
+                                actual = _safe_name(entry["original_name"], entry["index"], occupied)
+                                os.rename(f".input-{entry['index']}", actual, src_dir_fd=directory, dst_dir_fd=directory)
+                                entry.update(actual_name=actual, relative_path=f"attachments/{batch_id}/{actual}")
+                            _manifest(directory, row["manifest"])
                 except (CoreError, OSError) as error:
                     # The row is still unaccepted and locked. The admission caller
                     # records rejection after its outer transaction has rolled back.
@@ -667,8 +701,8 @@ class ChatFileService:
         try:
             with ExitStack() as stack:
                 if row["state"] == "published":
-                    attachments = stack.enter_context(self._attachments(binding))
-                    directory = os.open(batch_id, _DIRECTORY, dir_fd=attachments)
+                    attachments = stack.enter_context(self._attachments(binding, row["manifest"]))
+                    directory = os.open(_destination(row["manifest"])[1], _DIRECTORY, dir_fd=attachments)
                     stack.callback(os.close, directory)
                 else:
                     try:
@@ -678,8 +712,8 @@ class ChatFileService:
                         # transaction. Read the exact target; never copy it back.
                         if row["state"] != "accepted_ready" or error.code != "ARTIFACT_INTEGRITY_FAILED":
                             raise
-                        attachments = stack.enter_context(self._attachments(binding))
-                        directory = os.open(batch_id, _DIRECTORY, dir_fd=attachments)
+                        attachments = stack.enter_context(self._attachments(binding, row["manifest"]))
+                        directory = os.open(_destination(row["manifest"])[1], _DIRECTORY, dir_fd=attachments)
                         stack.callback(os.close, directory)
                 _verify(directory, row["manifest"])
                 yield row, directory
@@ -759,9 +793,10 @@ class ChatFileService:
                     # retract that verified directory before committing exclusion.
                     with self._accepted_files(batch_id, binding, run_id=source.run_id,
                             task_id=source.task_id, connection=conn) as (_, directory):
-                        with self._attachments(binding) as attachments:
+                        with self._attachments(binding, row["manifest"]) as attachments:
+                            target_name = _destination(row["manifest"])[1]
                             try:
-                                target = os.stat(batch_id, dir_fd=attachments, follow_symlinks=False)
+                                target = os.stat(target_name, dir_fd=attachments, follow_symlinks=False)
                             except FileNotFoundError:
                                 target = None
                             if target is not None:
@@ -770,7 +805,7 @@ class ChatFileService:
                                         (target.st_dev, target.st_ino) != (opened.st_dev, opened.st_ino)):
                                     raise CoreError("FILE_PUBLICATION_CONFLICT")
                                 self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
-                                _rename(attachments, batch_id, self.quarantine, batch_id)
+                                _rename(attachments, target_name, self.quarantine, batch_id)
                                 moved = os.stat(batch_id, dir_fd=self.quarantine, follow_symlinks=False)
                                 if (moved.st_dev, moved.st_ino) != (opened.st_dev, opened.st_ino):
                                     raise CoreError("FILE_PUBLICATION_CONFLICT")
@@ -813,16 +848,17 @@ class ChatFileService:
                         raise CoreError("FILE_BATCH_NOT_FOUND")
                     if row["state"] not in {"accepted_ready", "published"}:
                         raise CoreError("FILE_BATCH_NOT_READY")
-                    with self._attachments(binding) as attachments:
+                    with self._attachments(binding, row["manifest"]) as attachments:
+                        target_name = _destination(row["manifest"])[1]
                         try:
-                            target = os.open(batch_id, _DIRECTORY, dir_fd=attachments)
+                            target = os.open(target_name, _DIRECTORY, dir_fd=attachments)
                         except FileNotFoundError:
                             with self._private(batch_id) as (parent, directory):
                                 _verify(directory, row["manifest"])
                                 self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
-                                _rename(parent, batch_id, attachments, batch_id)
+                                _rename(parent, batch_id, attachments, target_name)
                                 os.fsync(parent)
-                            target = os.open(batch_id, _DIRECTORY, dir_fd=attachments)
+                            target = os.open(target_name, _DIRECTORY, dir_fd=attachments)
                         try:
                             # Recovery target is authoritative only when the private
                             # source vanished through the single atomic rename.

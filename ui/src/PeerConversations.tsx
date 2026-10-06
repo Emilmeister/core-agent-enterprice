@@ -3,7 +3,7 @@ import { Api, errorText } from "./api";
 import { FileCard } from "./FileCard";
 import { Markdown } from "./Markdown";
 import { remoteStates } from "./types";
-import type { AttachmentEntry, ResponseFileEntry } from "./types";
+import type { AttachmentEntry, PeerArtifact, ResponseFileEntry } from "./types";
 import type { HistoryAction } from "./ActionCard";
 
 export interface PeerConversation {
@@ -25,10 +25,18 @@ export interface PeerConversation {
   outcome_unknown: boolean;
   request_delivery: "not_sent" | "unconfirmed" | "confirmed";
   material_status: "available" | "pending_guardrail" | "rejected" | "timed_out";
+  waiting_reason?: "caller" | "owner" | null;
+  reply_delivery?: "queued" | "unconfirmed" | "confirmed" | null;
 }
 interface PeerConversationDetail extends PeerConversation {
-  messages: { id: string; direction: "outgoing" | "incoming"; text: string; created_at: number }[];
+  messages: { id: string; direction: "outgoing" | "incoming"; text: string; created_at: number;
+    request_delivery?: "not_sent" | "unconfirmed" | "confirmed";
+    outgoing_files?: ResponseFileEntry[];
+    outgoing_files_status?: "none" | "available" | "unavailable";
+  }[];
   files: AttachmentEntry[];
+  artifacts?: PeerArtifact[];
+  manifest_path?: string | null;
   outgoing_files: ResponseFileEntry[];
   outgoing_files_status: "none" | "available" | "unavailable";
   history_truncated: boolean;
@@ -54,6 +62,10 @@ const materialLabels = {
 function status(value: PeerConversation): string {
   if (value.outcome_unknown) return "Не удалось подтвердить отправку поручения";
   if (value.error_code === "REMOTE_OPERATION_TIMEOUT") return "Время ожидания ответа истекло";
+  if (peerActive(value) && value.reply_delivery === "queued") return "Ответ принят";
+  if (peerActive(value) && value.reply_delivery === "unconfirmed") return "Подтверждаем отправку ответа";
+  if (peerActive(value) && value.waiting_reason === "caller") return "Нужно уточнение";
+  if (peerActive(value) && value.waiting_reason === "owner") return "Ожидает владельца внешнего агента";
   return peerActive(value) && value.remote_state
     ? remoteStates[value.remote_state] ?? stateLabels[value.state] ?? "Ожидаем ответ"
     : stateLabels[value.state] ?? "Состояние неизвестно";
@@ -193,7 +205,8 @@ export function PeerConversationPanel({ api, contextId, selected, conversations,
               const old = cache.current[row.operation_id]?.value;
               const changed = JSON.stringify(old?.messages) !== JSON.stringify(value.messages)
                 || JSON.stringify(old?.files) !== JSON.stringify(value.files)
-                || JSON.stringify(old?.outgoing_files) !== JSON.stringify(value.outgoing_files);
+                || JSON.stringify(old?.outgoing_files) !== JSON.stringify(value.outgoing_files)
+                || JSON.stringify(old?.artifacts) !== JSON.stringify(value.artifacts);
               cache.current = { ...cache.current, [row.operation_id]: { summary: summaryKey(row), materialStatus: row.material_status, value } };
               setDetails(cache.current);
               if (changed && !bottom.current && !olderAnchor.current) setNewMessages(true);
@@ -300,14 +313,16 @@ export function PeerConversationPanel({ api, contextId, selected, conversations,
       {entries.map(({ key, detail, message }) => message ? <article className={`peer-message peer-${message.direction}`}
         key={key} data-peer-message={key} data-peer-operation={detail.operation_id}>
         <div className="peer-message-heading"><strong>{message.direction === "outgoing"
-          ? detail.request_delivery === "confirmed" ? "Поручение" : detail.request_delivery === "unconfirmed" ? "Отправка не подтверждена" : "Готовим поручение"
+          ? (message.request_delivery ?? detail.request_delivery) === "confirmed"
+            ? message.id === detail.messages[0]?.id ? "Поручение" : "Ответ передан"
+            : (message.request_delivery ?? detail.request_delivery) === "unconfirmed" ? "Отправка не подтверждена" : "Готовим поручение"
           : detail.peer_name}</strong>
           <time dateTime={new Date(message.created_at * 1000).toISOString()}>{new Date(message.created_at * 1000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</time>
         </div>
         <Markdown text={message.text} />
-        {message.direction === "outgoing" && !!detail.outgoing_files.length && <ul className="message-attachments">
-          {detail.outgoing_files.map((file) => <FileCard key={file.file_id} api={api} contextId={contextId} file={file}
-            available={detail.outgoing_files_status === "available"}
+        {message.direction === "outgoing" && !!(message.outgoing_files ?? detail.outgoing_files).length && <ul className="message-attachments">
+          {(message.outgoing_files ?? detail.outgoing_files).map((file) => <FileCard key={file.file_id} api={api} contextId={contextId} file={file}
+            available={(message.outgoing_files_status ?? detail.outgoing_files_status) === "available"}
             downloadPath={`${path(contextId, detail.operation_id)}/outgoing-files/${encodeURIComponent(file.file_id)}`} />)}
         </ul>}
       </article> : <section className="peer-operation-outcome" key={key} data-peer-operation={detail.operation_id}>
@@ -315,7 +330,17 @@ export function PeerConversationPanel({ api, contextId, selected, conversations,
         {detail.material_status !== "available" && <p className="history-note" role="status">{materialLabels[detail.material_status]}</p>}
         {detail.history_truncated && <p className="history-note">Показана доступная часть переписки по поручению.</p>}
         {!!detail.files.length && <section className="peer-files" aria-label="Файлы от внешнего агента"><h3>Файлы</h3>
-          <ul className="message-attachments">{detail.files.map((file) => <FileCard key={file.relative_path} api={api} contextId={contextId} file={file} />)}</ul>
+          {(detail.artifacts ?? []).map((artifact) => <section className="peer-artifact" key={artifact.index}
+            data-peer-artifact={artifact.index} aria-label={artifact.name || `Артефакт ${artifact.index + 1}`}>
+            <h4>{artifact.name || `Артефакт ${artifact.index + 1}`}</h4>
+            <ul className="message-attachments">{artifact.parts.map((part) => {
+              const file = detail.files.find((entry) => entry.relative_path === part.relative_path);
+              return file ? <FileCard key={part.index} api={api} contextId={contextId} file={file} /> : null;
+            })}</ul>
+          </section>)}
+          <ul className="message-attachments">{detail.files.filter((file) => !(detail.artifacts ?? []).some(
+            (artifact) => artifact.parts.some((part) => part.relative_path === file.relative_path)))
+            .map((file) => <FileCard key={file.relative_path} api={api} contextId={contextId} file={file} />)}</ul>
         </section>}
       </section>)}
       {!loading && !available.some((row) => row.messages.length) && <p className="muted">Внешний агент ещё не опубликовал сообщения.</p>}

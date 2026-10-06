@@ -332,6 +332,19 @@ class WaitStoreTests(unittest.TestCase):
             reconcile_workflow_task(task, run_id="run", state="WAITING_TASK", version=6)
         )
 
+    def test_owner_wait_marker_is_canonical_private_and_removed_after_resume(self):
+        from google.protobuf.json_format import MessageToDict
+        task = a2a_pb2.Task(id="task", context_id="context")
+        task.metadata["core_agent_workflow_version"] = 4
+        task.status.state = a2a_pb2.TASK_STATE_WORKING
+        self.assertTrue(reconcile_workflow_task(task, run_id="run", state="WAITING_INPUT", version=4))
+        self.assertEqual(MessageToDict(task.metadata)["core_agent_wait"], {"version": 1, "kind": "owner"})
+        self.assertFalse(task.status.HasField("message"))
+        self.assertFalse(reconcile_workflow_task(task, run_id="run", state="RUNNING", version=3))
+        self.assertIn("core_agent_wait", task.metadata)
+        self.assertTrue(reconcile_workflow_task(task, run_id="run", state="RUNNING", version=5))
+        self.assertNotIn("core_agent_wait", task.metadata)
+
     def test_sdk_save_cannot_restore_stale_terminal_or_input_required_state(self):
         for incoming_version in (1, 2):
             for stale_state in (a2a_pb2.TASK_STATE_FAILED, a2a_pb2.TASK_STATE_INPUT_REQUIRED):

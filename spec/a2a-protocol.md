@@ -182,10 +182,43 @@ Follow-up не пересобирает admission ceiling и не пополня
 
 ## Artifacts и Messages
 
+- Receiver MUST сохранять Artifact ID/name, ordered typed Parts и их связь,
+  не склеивая text Artifact с Message text. Complete successful remote artifacts
+  материализуются по [FILE-05](artifacts.md#file-05-typed-a2a-artifacts-в-workspace);
+  промежуточные chunks не разрешают раннюю публикацию files. Raw FileParts
+  initiating inbound Message также используют `a2a/`; UI uploads остаются в
+  `attachments/`. Public Messages/questions продолжают быть сообщениями.
 - Итоговые и промежуточные результаты задачи публикуются как Artifacts с content parts, media type, digest и provenance.
 - Messages используются для общения, progress summary и remote input request.
 - Partial artifact updates идемпотентны и имеют stable artifact ID/version.
 - Secret, hidden reasoning и raw sensitive tool output MUST NOT попадать в Message или Artifact без явной data policy. Provider-visible reasoning MAY появляться только как помеченная часть промежуточного status Message при включённом streaming и MUST отсутствовать в терминальном кадре и Artifact.
+
+### Публичное уточнение и private owner wait
+
+`input-required` не является terminal outcome. Непустой public agent
+`status.message` стороннего peer без owner-wait marker может быть вопросом к
+caller по LONG-05. Private/reasoning Parts, пустой вопрос и `auth-required` не
+дают модели вопрос/credentials или права разрешить чужой HITL.
+
+Наш backend строит из реального owner input/HITL/guardrail wait только safe
+public metadata:
+
+```json
+{"core_agent_wait":{"version":1,"kind":"owner"}}
+```
+
+Маркер не содержит вопрос, ответ, arguments, review/call/wait IDs или owner
+authority. Он одинаково присутствует в Task Get/List, status streams/subscriptions
+и push projection, включая сохранённые legacy waits после recovery; plaintext
+owner conversation не публикуется. Model text/client metadata не создаёт такой
+trusted wait. Получив marker, peer продолжает ждать владельца удалённого агента.
+
+Ответ на public question использует standard SendMessage/SendStreamingMessage
+с исходными remote task/context IDs и отдельным unique message ID, через тот
+же pinned JSONRPC или HTTP+JSON binding. Он не создаёт новую Task/context,
+не заменяет local/root IDs на wire IDs и не продлевает remote deadline.
+Admission/send-intent/unknown-outcome/dedup/recovery задаёт LONG-05; обе bindings
+имеют одинаковые policy, file, scope и private-owner guarantees.
 
 ## Streaming прогресса выполнения
 

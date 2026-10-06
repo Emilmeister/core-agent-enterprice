@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `executing-plans` to implement this plan task-by-task after user approval. Steps use checkbox syntax. Keep changes in a permanent repository or worktree; use existing unittest, PostgreSQL and native browser gates.
 
-**Статус:** для согласования. Изменения поведения, кода и нормативной спецификации ещё не выполнены.
+**Статус:** реализация и автоматические проверки завершены. Остались merge в `main` и обновление двух кластеров.
 
 **Goal:** Наш агент отвечает на публичные уточнения внешнего агента в рамках исходной A2A-задачи; входящие A2A-файлы и содержимое полученных артефактов сохраняются в каталоге `a2a/` workspace чата и не загружаются автоматически в контекст модели.
 
@@ -67,11 +67,9 @@
 ```text
 /workspace/a2a/<local-operation-id>/
     manifest.json
-    artifact-001/
-        part-001.md
-        part-002.json
-    artifact-002/
-        diagram.png
+    artifact-001-part-001.md
+    artifact-001-part-002.json
+    artifact-002-part-001.png
 ```
 
 - Под `a2a/` сохраняются все файловые вложения, полученные через A2A: самостоятельные FileParts в Message, файловые части Artifact и файлы во входящем обращении к нашему A2A endpoint. Upload через UI сохраняет существующее расположение в `attachments/`.
@@ -121,33 +119,33 @@
 
 ### Этап 1. Нормативный контракт и compatibility
 
-- [ ] После согласования обновить требования перечисленных spec-документов и добавить acceptance для обоих изменений. Прежнее утверждение «любой remote input-required только ожидает владельца» заменить указанным различением.
-- [ ] В требованиях определить формы public question, safe wait marker, reply arguments и artifact receipts; привести JSON-примеры из раздела 1.
-- [ ] Зафиксировать новый remote contract v3 и checkpoint v2 для новых операций. Сохранить строгие readers прежних contract v1/v2 и checkpoint v1; не переписывать их автоматически.
-- [ ] Новые операции получают новое поведение; старые принятые операции и завершённые результаты сохраняют прежнюю семантику. Старые результаты не материализуются повторно при обычном чтении.
-- [ ] Использовать существующие JSON-поля для checkpoint/reply/artifact metadata. Если изменения persisted batch требуют SQL, добавить одну явную additive migration через `core_agent/database.py`; сохранить defaults старых batch и порядок migration job перед новым agent image.
-- [ ] Обновить frozen spec hashes, сохранив проверку точных bytes. Не помечать реализацию готовой до прохождения CI proof.
+- [x] После согласования обновить требования перечисленных spec-документов и добавить acceptance для обоих изменений. Прежнее утверждение «любой remote input-required только ожидает владельца» заменить указанным различением.
+- [x] В требованиях определить формы public question, safe wait marker, reply arguments и artifact receipts; привести JSON-примеры из раздела 1.
+- [x] Зафиксировать новый remote contract v3 и checkpoint v2 для новых операций. Сохранить строгие readers прежних contract v1/v2 и checkpoint v1; не переписывать их автоматически.
+- [x] Новые операции получают новое поведение; старые принятые операции и завершённые результаты сохраняют прежнюю семантику. Старые результаты не материализуются повторно при обычном чтении.
+- [x] Использовать существующие JSON-поля для checkpoint/reply/artifact metadata. Если изменения persisted batch требуют SQL, добавить одну явную additive migration через `core_agent/database.py`; сохранить defaults старых batch и порядок migration job перед новым agent image.
+- [x] Обновить frozen spec hashes, сохранив проверку точных bytes. Не помечать реализацию готовой до прохождения CI proof.
 
 Проверка: `uv run python -m unittest tests.test_spec_quality tests.test_spec_lock -v` — exit 0.
 
 ### Этап 2. Парсинг вопросов и typed artifacts
 
-- [ ] Добавить случаи в `tests/test_remote_transport.py`, `tests/test_peer_conversations.py`: public question, owner marker, пустой вопрос, private/reasoning, одинаковый текст с разными message IDs, mixed Artifact, JSON-only Task и Message.
-- [ ] Запустить новые случаи до изменения parser и подтвердить отсутствие нужного поведения.
-- [ ] Расширить `RemoteEvent` дополнительными полями с defaults, не сломав существующие positional callers. Сохранять идентичность контейнера и порядок Parts; не склеивать Artifact text в публичный Message.
-- [ ] Сохранить strict JSON/base64, конечные числа, transport limits, фильтрацию private metadata и редактирование отражённых секретов.
-- [ ] Проверить обе bindings и отсутствие изменения terminality: `input-required` не является завершением, окончание Artifact chunk не завершает Task.
+- [x] Добавить случаи в `tests/test_remote_transport.py`, `tests/test_peer_conversations.py`: public question, owner marker, пустой вопрос, private/reasoning, одинаковый текст с разными message IDs, mixed Artifact, JSON-only Task и Message.
+- [x] Запустить новые случаи до изменения parser и подтвердить отсутствие нужного поведения.
+- [x] Расширить `RemoteEvent` дополнительными полями с defaults, не сломав существующие positional callers. Сохранять идентичность контейнера и порядок Parts; не склеивать Artifact text в публичный Message.
+- [x] Сохранить strict JSON/base64, конечные числа, transport limits, фильтрацию private metadata и редактирование отражённых секретов.
+- [x] Проверить обе bindings и отсутствие изменения terminality: `input-required` не является завершением, окончание Artifact chunk не завершает Task.
 
 Проверка: `uv run python -m unittest tests.test_remote_transport tests.test_peer_conversations -v` — новые случаи PASS; PostgreSQL cases должны выполняться с реальным `TEST_DATABASE_URL`.
 
 ### Этап 3. Durable доставка уточнения модели
 
-- [ ] Расширить `tests/test_remote_operations.py`, `tests/test_remote_runtime.py`, `tests/test_python_waits.py`: вопрос при sleep и при независимой работе, повторный snapshot, несколько операций/контрагентов, новый вопрос с прежним текстом, current-call boundary.
-- [ ] Сохранить вопрос, его идентификатор и признак доставки атомарно с remote checkpoint и уведомлением. Использовать существующие claims/leases и mailbox; stale worker не создаёт вторую доставку.
-- [ ] На текущем `core_task_wait` возвращать промежуточный tool result с `task_id`, `input_id`, `question` и `remote_state`. Remote operation остаётся нетерминальной; terminal wait после ответа использует тот же handle.
-- [ ] Вопрос вне текущего wait доставлять как отдельное событие от внешнего агента на safe boundary. Он не становится командой владельца и не меняет EffectiveConfig.
-- [ ] Проверить новое ожидание через nested Python: доставка вопроса не позволяет продолжить remainder скрипта до завершения предусмотренной continuation.
-- [ ] Проверить restart до доставки, после доставки и во время `core_ask_owner`; каждое состояние восстанавливает ожидаемое продолжение без повторного вопроса модели.
+- [x] Расширить `tests/test_remote_operations.py`, `tests/test_remote_runtime.py`, `tests/test_python_waits.py`: вопрос при sleep и при независимой работе, повторный snapshot, несколько операций/контрагентов, новый вопрос с прежним текстом, current-call boundary.
+- [x] Сохранить вопрос, его идентификатор и признак доставки атомарно с remote checkpoint и уведомлением. Использовать существующие claims/leases и mailbox; stale worker не создаёт вторую доставку.
+- [x] На текущем `core_task_wait` возвращать промежуточный tool result с `task_id`, `input_id`, `question` и `remote_state`. Remote operation остаётся нетерминальной; terminal wait после ответа использует тот же handle.
+- [x] Вопрос вне текущего wait доставлять как отдельное событие от внешнего агента на safe boundary. Он не становится командой владельца и не меняет EffectiveConfig.
+- [x] Проверить новое ожидание через nested Python: доставка вопроса не позволяет продолжить remainder скрипта до завершения предусмотренной continuation.
+- [x] Проверить restart до доставки, после доставки и во время `core_ask_owner`; каждое состояние восстанавливает ожидаемое продолжение без повторного вопроса модели.
 
 Наблюдаемый критерий в runtime-проверке:
 
@@ -163,37 +161,37 @@ assert operation.state not in {"completed", "failed", "canceled"}
 
 ### Этап 4. Ответ в исходную внешнюю Task
 
-- [ ] Добавить проверки продолжения и schema в existing remote/runtime suites: только одна из пары полей, чужой handle, неверный адресат, устаревший вопрос, отсутствие pending question, terminal/cancel/expired, tool deny, owner approval.
-- [ ] Расширить schema `core_agent_send_message` и закрепление вызова до HITL. Reply сохраняет исходного адресата/revision и отдельный immutable digest ответа/вложений.
-- [ ] Атомарно принять ответ в существующую remote operation. Перед сетевой мутацией сохранить уникальный message ID и send intent. Worker отправляет Message с исходными remote IDs через тот же pinned connection.
-- [ ] Отдельно сохранять `queued`, `confirmed` и неизвестный исход ответа. Повторное применение того же workflow tool call возвращает прежний admission; не отправляет второй Message.
-- [ ] При доказанной pre-dispatch ошибке вернуть исправляемую tool error. При неизвестном side effect вернуть `SIDE_EFFECT_UNKNOWN`, сохранить контекст для сверки и не переслать автоматически.
-- [ ] После ответа продолжить polling с исходным deadline. При следующем уточнении повторить цикл; model/tool budgets ограничивают число ответов.
-- [ ] Протестировать реальные JSONRPC/HTTP+JSON requests на контролируемом test peer и восстановление через новый PostgreSQL pool. Не отправлять эти проверки реальным подключённым агентам.
+- [x] Добавить проверки продолжения и schema в existing remote/runtime suites: только одна из пары полей, чужой handle, неверный адресат, устаревший вопрос, отсутствие pending question, terminal/cancel/expired, tool deny, owner approval.
+- [x] Расширить schema `core_agent_send_message` и закрепление вызова до HITL. Reply сохраняет исходного адресата/revision и отдельный immutable digest ответа/вложений.
+- [x] Атомарно принять ответ в существующую remote operation. Перед сетевой мутацией сохранить уникальный message ID и send intent. Worker отправляет Message с исходными remote IDs через тот же pinned connection.
+- [x] Отдельно сохранять `queued`, `confirmed` и неизвестный исход ответа. Повторное применение того же workflow tool call возвращает прежний admission; не отправляет второй Message.
+- [x] При доказанной pre-dispatch ошибке вернуть исправляемую tool error. При неизвестном side effect вернуть `SIDE_EFFECT_UNKNOWN`, сохранить контекст для сверки и не переслать автоматически.
+- [x] После ответа продолжить polling с исходным deadline. При следующем уточнении повторить цикл; model/tool budgets ограничивают число ответов.
+- [x] Протестировать реальные JSONRPC/HTTP+JSON requests на контролируемом test peer и восстановление через новый PostgreSQL pool. Не отправлять эти проверки реальным подключённым агентам.
 
 Проверка: повторить remote transport/operation/runtime suites и `tests.test_interactions`; ожидается один первоначальный Send и один подтверждённый Send на каждый принятый ответ, без повторов после restart.
 
 ### Этап 5. Материализация артефактов через файловый pipeline
 
-- [ ] Расширить `tests/test_remote_inbound_files.py`, `tests/test_remote_file_results_runtime.py`, `tests/test_workspace_files.py`: text-only Artifact, JSON-only, mixed parts, самостоятельный FilePart в Message, исходное входящее A2A-вложение, совпадающие/опасные имена, empty files, несколько артефактов, aggregate limits.
-- [ ] Преобразовать разрешённые Artifact parts в staged files и manifest. JSON сериализовать детерминированно с `allow_nan=False`; фиксировать точные UTF-8 bytes и SHA-256.
-- [ ] Расширить existing `ChatFileService` внутренним backend-owned назначением каталога. Старые batches и uploads из UI продолжают публиковаться в `attachments/`; новые remote results используют `a2a/<local-operation-id>/`, входящие A2A-вложения — `a2a/<local-batch-id>/`. Назначение выводится из authenticated transport/source и не принимается от модели/внешнего клиента.
-- [ ] Обновить A2A admission callers и prompt attachment descriptors: файлы входящего поручения доступны в новом каталоге до первого model turn после проверок, а в модель передаются только имена/тип/размер/путь. Существующие Task scope, incoming aggregate limit и запрет доступа к соседним чатам сохраняются.
-- [ ] Атомарно связать terminal result, артефакты и batch с canonical task/run/chat. Сохранить current source lineage, cancel/deadline recheck и single-rename recovery.
-- [ ] Провести содержимое всех созданных файлов и manifest через whole-batch material review до publication. Частичное разрешение не открывает остальную часть результата.
-- [ ] Проверить отказ, detector outage/timeout, публикационный сбой, потерю claim и restart после rename до commit. Проверить отсутствие повторного Send и новых копий файлов.
-- [ ] Обновить cleanup и integrity callers для нового каталога; повторное чтение не восстанавливает удалённый файл скрыто.
+- [x] Расширить `tests/test_remote_inbound_files.py`, `tests/test_remote_file_results_runtime.py`, `tests/test_workspace_files.py`: text-only Artifact, JSON-only, mixed parts, самостоятельный FilePart в Message, исходное входящее A2A-вложение, совпадающие/опасные имена, empty files, несколько артефактов, aggregate limits.
+- [x] Преобразовать разрешённые Artifact parts в staged files и manifest. JSON сериализовать детерминированно с `allow_nan=False`; фиксировать точные UTF-8 bytes и SHA-256.
+- [x] Расширить existing `ChatFileService` внутренним backend-owned назначением каталога. Старые batches и uploads из UI продолжают публиковаться в `attachments/`; новые remote results используют `a2a/<local-operation-id>/`, входящие A2A-вложения — `a2a/<local-batch-id>/`. Назначение выводится из authenticated transport/source и не принимается от модели/внешнего клиента.
+- [x] Обновить A2A admission callers и prompt attachment descriptors: файлы входящего поручения доступны в новом каталоге до первого model turn после проверок, а в модель передаются только имена/тип/размер/путь. Существующие Task scope, incoming aggregate limit и запрет доступа к соседним чатам сохраняются.
+- [x] Атомарно связать terminal result, артефакты и batch с canonical task/run/chat. Сохранить current source lineage, cancel/deadline recheck и single-rename recovery.
+- [x] Провести содержимое всех созданных файлов и manifest через whole-batch material review до publication. Частичное разрешение не открывает остальную часть результата.
+- [x] Проверить отказ, detector outage/timeout, публикационный сбой, потерю claim и restart после rename до commit. Проверить отсутствие повторного Send и новых копий файлов.
+- [x] Обновить cleanup и integrity callers для нового каталога; повторное чтение не восстанавливает удалённый файл скрыто.
 
 Проверка: `uv run python -m unittest tests.test_remote_inbound_files tests.test_remote_file_results_runtime tests.test_workspace_files tests.test_workspace_cleanup tests.test_workspace_cleanup_api -v` — exit 0 с PostgreSQL.
 
 ### Этап 6. File-only model projection
 
-- [ ] Расширить existing runtime/material tests уникальными canary-значениями в текстовом Artifact и JSON. Проверять фактические model messages, а не только отдельный serializer.
-- [ ] Обновить `remote_result_projection`, `_remote_result_batches` и всех их callers: полученные артефакты возвращаются как receipts/paths. В terminal `text` остаются только разрешённые публичные Messages, без Artifact content.
-- [ ] Проверить прямые `core_task_wait/get/list`, mailbox notifications, nested Python и восстановленные tool outcomes. Ни один из этих путей не загружает Artifact text/data в контекст автоматически.
-- [ ] Добавить контрольный сценарий: модель выбирает конкретный `.json`, Python читает его в sandbox; модель получает содержимое только после этого разрешённого вызова.
-- [ ] Сохранить guardrails и visibility после чтения. Отклонённый batch не открывается через файл, owner download, другой handle или иной projection.
-- [ ] Проверить явный выбор этого файла для исходящей A2A-задачи и отсутствие автоматических исходящих вложений.
+- [x] Расширить existing runtime/material tests уникальными canary-значениями в текстовом Artifact и JSON. Проверять фактические model messages, а не только отдельный serializer.
+- [x] Обновить `remote_result_projection`, `_remote_result_batches` и всех их callers: полученные артефакты возвращаются как receipts/paths. В terminal `text` остаются только разрешённые публичные Messages, без Artifact content.
+- [x] Проверить прямые `core_task_wait/get/list`, mailbox notifications, nested Python и восстановленные tool outcomes. Ни один из этих путей не загружает Artifact text/data в контекст автоматически.
+- [x] Добавить контрольный сценарий: модель выбирает конкретный `.json`, Python читает его в sandbox; модель получает содержимое только после этого разрешённого вызова.
+- [x] Сохранить guardrails и visibility после чтения. Отклонённый batch не открывается через файл, owner download, другой handle или иной projection.
+- [x] Проверить явный выбор этого файла для исходящей A2A-задачи и отсутствие автоматических исходящих вложений.
 
 Критерий проверки с canary:
 
@@ -208,21 +206,21 @@ assert "json-value-canary" in explicit_read_tool_result
 
 ### Этап 7. Owner UI и безопасная публичная проекция
 
-- [ ] В `tests/test_peer_conversations.py` и `tests/test_enterprise_release_boundaries.py` проверить публичный вопрос/ответ, owner wait marker, private owner conversation, artifact receipts, скачивание и изоляцию.
-- [ ] Обновить peer detail/owner history: одна переписка на контрагента содержит уточнения, ответы и карточки артефактов с сохранённым порядком. Polling не создаёт визуальные дубликаты.
-- [ ] Отображать текстовые/JSON артефакты как файлы, открываемые существующим предпросмотром. Краткий статус различает «Нужно уточнение», «Ожидает владельца внешнего агента», «Ответ принят», «Отправка не подтверждена».
-- [ ] Сохранить текущие resize панели, выбор контрагента, scroll position, модальные детали действий и accessibility. Не возвращать dropdown отдельных A2A-задач.
-- [ ] Расширить существующий `tests/owner_ui_files_browser.mjs` контролируемым peer fixture: вопрос → ответ → повторное ожидание → JSON/text Artifact → открытие файла. Проверить режим owner question и отсутствие содержимого в основном tool result.
-- [ ] Проверить owner-only API и внешнюю проекцию после restart: внешнему инициатору не доступны вопросы/ответы владельцев, исходные artifact receipts чужой операции или workspace paths нашего чата.
+- [x] В `tests/test_peer_conversations.py` и `tests/test_enterprise_release_boundaries.py` проверить публичный вопрос/ответ, owner wait marker, private owner conversation, artifact receipts, скачивание и изоляцию.
+- [x] Обновить peer detail/owner history: одна переписка на контрагента содержит уточнения, ответы и карточки артефактов с сохранённым порядком. Polling не создаёт визуальные дубликаты.
+- [x] Отображать текстовые/JSON артефакты как файлы, открываемые существующим предпросмотром. Краткий статус различает «Нужно уточнение», «Ожидает владельца внешнего агента», «Ответ принят», «Отправка не подтверждена».
+- [x] Сохранить текущие resize панели, выбор контрагента, scroll position, модальные детали действий и accessibility. Не возвращать dropdown отдельных A2A-задач.
+- [x] Расширить существующий `tests/owner_ui_files_browser.mjs` контролируемым peer fixture: вопрос → ответ → повторное ожидание → JSON/text Artifact → открытие файла. Проверить режим owner question и отсутствие содержимого в основном tool result.
+- [x] Проверить owner-only API и внешнюю проекцию после restart: внешнему инициатору не доступны вопросы/ответы владельцев, исходные artifact receipts чужой операции или workspace paths нашего чата.
 
 Проверки из каталога `ui`: `npm run typecheck`, `npm run build` — exit 0. Existing native browser gate: `CORE_AGENT_REQUIRE_BROWSER_TESTS=1 uv run python -m unittest tests.test_owner_ui_files_browser -v` с обязательными fixtures из CI — PASS без skip.
 
 ### Этап 8. Итоговые проверки, main и два кластера
 
-- [ ] Выполнить применимые release gates существующим способом: `uv run ruff check core_agent tests`; `uv run python -m unittest discover -s tests -v` с реальными PostgreSQL/Keycloak; `uv build --no-sources`; TypeScript/build; spec quality/hash lock; обязательный native Linux/browser gate.
-- [ ] Использовать существующую конфигурацию тестов. До запуска проверить все требуемые зависимости одной проверкой; не печатать секреты и не читать shell alias с proxy credentials.
-- [ ] Обновить implementation status только по прошедшим автоматическим проверкам. Обновить README и стабильные факты AGENTS для нового reply contract, каталога и projection; plan checklist отмечать по фактическому выполнению.
-- [ ] Проверить diff, scope, compatibility, security и recovery. Сохранять проверенные логические slices отдельными reviewable commits; spec входит до или вместе с первым implementation slice.
+- [x] Выполнить применимые release gates существующим способом: `uv run ruff check core_agent tests`; `uv run python -m unittest discover -s tests -v` с реальными PostgreSQL/Keycloak; `uv build --no-sources`; TypeScript/build; spec quality/hash lock; обязательный native Linux/browser gate.
+- [x] Использовать существующую конфигурацию тестов. До запуска проверить все требуемые зависимости одной проверкой; не печатать секреты и не читать shell alias с proxy credentials.
+- [x] Обновить implementation status только по прошедшим автоматическим проверкам. Обновить README и стабильные факты AGENTS для нового reply contract, каталога и projection; plan checklist отмечать по фактическому выполнению.
+- [x] Проверить diff, scope, compatibility, security и recovery. Сохранять проверенные логические slices отдельными reviewable commits; spec входит до или вместе с первым implementation slice.
 - [ ] После всех проверок актуализировать локальную `main`. Не затрагивать существующую `.idea/` и пользовательские файлы; не выполнять remote git push без отдельного запроса.
 - [ ] Собрать и опубликовать один immutable amd64 image; проверить пользователя `agent` и source/UI hashes. Через существующий deploy runner обновить оба развёртывания: `https://37.44.196.209/ui/` и `https://37.44.197.46/ui/`.
 - [ ] Проверить фактический digest, ready replicas, migration outcome, HTTPS readiness и новые UI assets на обоих кластерах. Между production агентами не создавать соединения или задачи автоматически: ручной путь остаётся пользователю.
@@ -239,4 +237,4 @@ assert "json-value-canary" in explicit_read_tool_result
 
 ## 5. Согласование и начало работы
 
-Согласуется поведение из раздела 1 и последовательность этапов. После явного согласования начать с нормативного контракта и первых regression cases; текущий документ сам по себе не заявляет runtime capabilities реализованными.
+Поведение согласовано пользователем. Нормативные требования и автоматические доказательства находятся в `spec/`; отметки этапа 8 отражают фактически выполненные действия.

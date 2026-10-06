@@ -105,6 +105,8 @@ class ChatWorkspaces:
 
     @staticmethod
     def _control(parts):
+        if len(parts) == 3 and parts[0] == "a2a":
+            return parts[2] == ".manifest.json" or parts[2].startswith(".manifest-")
         if len(parts) != 3 or parts[0] != "attachments":
             return False
         try:

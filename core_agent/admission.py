@@ -153,7 +153,8 @@ def prepare_files(agent, message, context, digest):
         raise CoreError("CONTENT_TYPE_NOT_SUPPORTED")
     return agent.chat_file_service.prepare(files, tenant_id=context.tenant,
         actor_id=context.state["principal"].actor_id, message_id=message.message_id,
-        request_digest=digest, source="a2a", request_metadata=MessageToDict(message.metadata),
+        request_digest=digest, source="upload" if context.state["principal"].is_owner
+        and context.state["principal"].is_browser else "a2a", request_metadata=MessageToDict(message.metadata),
         limit_bytes=agent.interaction_store.get_settings(context.tenant).attachment_limit_bytes)
 
 

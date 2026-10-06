@@ -232,6 +232,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/artifacts.py`, `core_agent/audit.py` | Tenant-scoped transport artifacts и append-only audit adapters |
 | `core_agent/remote_agents.py` | Legacy ENV registry/SSE, bounded pinned peer discovery и A2A1.0 JSONRPC/HTTP+JSON Send/Get/Cancel adapter |
 | `core_agent/remote_operations.py` | Один bounded Send/Get/Cancel step под scheduler claim, pinned credentials, deadline и reconciliation |
+| `core_agent/remote_artifacts.py` | Typed A2A Artifact/Message parts → quarantine files и reviewed manifest; model-facing receipts без automatic contents |
 | `core_agent/streaming.py` | Stream chunk merge, snapshot buffer и ADK metadata keys |
 | `core_agent/durability.py`, `core_agent/lifecycle.py` | Events, checkpoints, leases, recovery и retention |
 | `core_agent/mcp.py` | MCP discovery/calls, canonical tool naming и Streamable HTTP connector |
@@ -292,6 +293,9 @@ Target spec может описывать больше текущего runtime.
   по company из authenticated principal при каждом чтении; allow/HITL видимы.
   Introspection выполняется один раз на HTTP request без кэша; уже открытый
   ответ не проверяется заново. Incoming credentials не передаются remote agents.
+  Owner browser uploads определяются только подтверждённым introspection
+  `client_id`, совпадающим с `KEYCLOAK_UI_CLIENT_ID`: они сохраняют `attachments/`;
+  остальные новые A2A-вложения используют `a2a/`. Message metadata не выбирает каталог.
 - Company scope задаётся deployment config и не меняется SDK tenant metadata.
   Автоматические recovery, timeout, cleanup, A2A projection и push ограничены
   `auth_settings.tenant` до выборки рабочих записей, locks/claims и side effects.
@@ -837,6 +841,14 @@ run получает отдельные MCP session и negotiated version; пе�
   Parent snapshot wrapper остаётся v1, entry v2 дополнительно закрепляет digest
   исходных аргументов: recovery не читает изменённые workspace paths заново.
   Unknown versions/fields/scope и изменённые arguments отклоняются.
+  Новые enterprise operations используют contract v3 с теми же source grants
+  и checkpoint v2: public input, queued/started/confirmed reply и bounded список
+  отвеченных questions. `core_agent_send_message` принимает paired local
+  `task_id`/`input_id` для ответа в исходную Task; адресат, scope и deadline
+  сохраняются. Parent entry хранит original contract, operation ID, immutable
+  reply refs/provenance и digest аргументов. Вопрос проходит material gates;
+  wait пробуждается один раз, active run получает IDs-only notification на safe
+  boundary. Private owner wait проецируется только safe metadata marker.
   Local rows имеют null checkpoint. Миграции выполняет database entrypoint,
   а не serving process.
 - Send/Cancel marker сохраняется до network; один worker выполняет один bounded
@@ -874,7 +886,13 @@ run получает отдельные MCP session и negotiated version; пе�
   остальные decision references неизменяемы.
   Reflected credentials в metadata/raw files отклоняются до stage, проверяя
   UTF-8 и фактические Latin-1 header bytes; содержимое файлов не переписывается.
-  Data Parts отклоняются. Ошибка network/parser после возможного
+  В legacy v1/v2 Data Parts отклоняются. В v3 успешные terminal Artifact text,
+  data и files материализуются под `a2a/<local-operation-id>/` вместе с manifest;
+  модель получает receipts/paths, public Messages остаются текстом. Все bytes,
+  включая manifest, учитываются в aggregate limit и проходят whole-batch review.
+  Incoming A2A batches используют `a2a/<batch-id>/`, UI uploads и legacy batches
+  остаются в `attachments/`. Назначение backend-owned; старые rows не переносятся.
+  Ошибка network/parser после возможного
   Send/Cancel сохраняет unknown outcome; только доказанная локальная ошибка
   до dispatch возвращается как известный отказ без blind retry.
 - TaskStore проецирует `core_agent_remote_progress` из scoped working operations

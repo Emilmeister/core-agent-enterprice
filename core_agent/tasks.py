@@ -11,7 +11,7 @@ from .config import MAX_SUBAGENT_DEPTH
 from .errors import CoreError
 from .mcp import mcp_tool_index
 from .workflow import SuspendedRun
-from .peer_conversations import initial_conversation, merge_observation, OBSERVATION_TTL
+from .peer_conversations import initial_conversation, merge_observation, OBSERVATION_TTL, validate_request_provenance
 
 
 REMOTE_TASK_PENDING = object()
@@ -47,9 +47,9 @@ def _remote_contract(contract, tenant_id, owner_id):
     required = {"version", "tenant_id", "owner_id", "peer_id", "peer_revision", "peer_name", "url", "binding",
                 "message_id", "task", "timeout_seconds", "poll_interval_seconds"}
     if (not isinstance(contract, dict) or type(contract.get("version")) is not int
-            or contract["version"] not in {1, 2}):
+            or contract["version"] not in {1, 2, 3}):
         raise CoreError("CHECKPOINT_INVALID")
-    if contract["version"] == 2:
+    if contract["version"] >= 2:
         required |= {"caller_scope", "attachment_limit_bytes", "outgoing_files"}
     if (not required <= contract.keys() <= required | {"_trace_parent"}
             or contract["tenant_id"] != tenant_id or contract["owner_id"] != owner_id):
@@ -62,7 +62,7 @@ def _remote_contract(contract, tenant_id, owner_id):
             raise CoreError("CHECKPOINT_INVALID")
     if not isinstance(contract["binding"], str) or contract["binding"] not in {"JSONRPC", "HTTP+JSON"}:
         raise CoreError("CHECKPOINT_INVALID")
-    if contract["version"] == 2:
+    if contract["version"] >= 2:
         from .response_files import ResponseFileService
         from .workspace import WorkspaceBinding
 
@@ -97,14 +97,52 @@ def _remote_contract(contract, tenant_id, owner_id):
         raise CoreError("CHECKPOINT_INVALID") from None
 
 
-def _initial_remote_checkpoint():
-    return {"version": 1, "send_started": False, "deadline": None, "remote_task_id": None,
-            "remote_context_id": None, "next_poll_at": None, "cancel_started": False}
+def _initial_remote_checkpoint(contract=None):
+    checkpoint = {"version": 1, "send_started": False, "deadline": None, "remote_task_id": None,
+                  "remote_context_id": None, "next_poll_at": None, "cancel_started": False}
+    if contract is not None and contract["version"] == 3:
+        checkpoint.update(version=2, input_request=None, reply=None, answered_inputs=[])
+    return checkpoint
 
 
-def _remote_checkpoint(checkpoint):
-    if (not isinstance(checkpoint, dict) or checkpoint.keys() != _initial_remote_checkpoint().keys()
-            or type(checkpoint["version"]) is not int or checkpoint["version"] != 1
+def _remote_input_id(value):
+    if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        raise CoreError("CHECKPOINT_INVALID")
+
+
+def _remote_reply(reply, contract=None):
+    keys = {"input_id", "message_id", "task", "outgoing_files", "request_provenance", "status"}
+    if (not isinstance(reply, dict) or reply.keys() != keys
+            or reply.get("status") not in {"queued", "started", "confirmed"}):
+        raise CoreError("CHECKPOINT_INVALID")
+    _remote_input_id(reply["input_id"])
+    for key in ("message_id", "task"):
+        _remote_text(reply[key])
+    if len(reply["message_id"].encode("utf-8")) > 4096 or len(reply["task"].encode("utf-8")) > 256 * 1024:
+        raise CoreError("CHECKPOINT_INVALID")
+    validate_request_provenance(reply["request_provenance"])
+    if not isinstance(reply["outgoing_files"], list):
+        raise CoreError("CHECKPOINT_INVALID")
+    if contract is not None:
+        if contract["version"] != 3:
+            raise CoreError("CHECKPOINT_INVALID")
+        _remote_contract({**contract, "outgoing_files": reply["outgoing_files"]}, contract["tenant_id"], contract["owner_id"])
+
+
+def validate_remote_reply(reply, contract):
+    _remote_contract(contract, contract.get("tenant_id") if isinstance(contract, dict) else None,
+                     contract.get("owner_id") if isinstance(contract, dict) else None)
+    if not isinstance(reply, dict) or "status" in reply:
+        raise CoreError("CHECKPOINT_INVALID")
+    _remote_reply({**reply, "status": "queued"}, contract)
+    return copy.deepcopy(reply)
+
+
+def _remote_checkpoint(checkpoint, contract=None):
+    baseline = _initial_remote_checkpoint()
+    if (not isinstance(checkpoint, dict) or type(checkpoint.get("version")) is not int
+            or checkpoint["version"] not in {1, 2}
+            or checkpoint.keys() != baseline.keys() | ({"input_request", "reply", "answered_inputs"} if checkpoint["version"] == 2 else set())
             or type(checkpoint["send_started"]) is not bool or type(checkpoint["cancel_started"]) is not bool):
         raise CoreError("CHECKPOINT_INVALID")
     for key in ("deadline", "next_poll_at"):
@@ -120,33 +158,138 @@ def _remote_checkpoint(checkpoint):
     for key in ("remote_task_id", "remote_context_id"):
         if checkpoint[key] is not None:
             _remote_text(checkpoint[key])
-    if (not checkpoint["send_started"] and checkpoint != _initial_remote_checkpoint()
+    if (not checkpoint["send_started"] and any(checkpoint[key] != value for key, value in baseline.items() if key != "version")
             or checkpoint["send_started"] and checkpoint["deadline"] is None
             or checkpoint["cancel_started"] and checkpoint["remote_task_id"] is None):
         raise CoreError("CHECKPOINT_INVALID")
+    if checkpoint["version"] == 2:
+        if contract is not None and contract["version"] != 3:
+            raise CoreError("CHECKPOINT_INVALID")
+        pending, reply, answered = checkpoint["input_request"], checkpoint["reply"], checkpoint["answered_inputs"]
+        if not isinstance(answered, list) or len(answered) > 200:
+            raise CoreError("CHECKPOINT_INVALID")
+        for identity in answered:
+            _remote_input_id(identity)
+        if len(set(answered)) != len(answered):
+            raise CoreError("CHECKPOINT_INVALID")
+        if pending is not None:
+            if not isinstance(pending, dict) or pending.keys() != {"input_id", "question"}:
+                raise CoreError("CHECKPOINT_INVALID")
+            _remote_input_id(pending["input_id"])
+            _remote_text(pending["question"])
+            if len(pending["question"].encode("utf-8")) > 16384 or pending["input_id"] in answered:
+                raise CoreError("CHECKPOINT_INVALID")
+        if reply is not None:
+            _remote_reply(reply, contract)
+            if (reply["status"] == "confirmed" and reply["input_id"] not in answered
+                    or reply["status"] != "confirmed" and (pending is None or reply["input_id"] != pending["input_id"])
+                    or reply["status"] != "confirmed" and reply["input_id"] in answered):
+                raise CoreError("CHECKPOINT_INVALID")
+        if (pending is not None or reply is not None or answered) and (not checkpoint["send_started"] or checkpoint["remote_task_id"] is None):
+            raise CoreError("CHECKPOINT_INVALID")
 
 
 def _advance_remote_checkpoint(old, new, contract, now, cancel_requested, outcome):
-    _remote_checkpoint(old)
+    _remote_checkpoint(old, contract)
     new = copy.deepcopy(new)
-    if (isinstance(new, dict) and new.get("send_started") is True and not old["send_started"]):
+    if isinstance(new, dict) and new.get("send_started") is True and not old["send_started"]:
         if cancel_requested:
             raise CoreError("CANCEL_REQUESTED")
         if new.get("deadline") is not None:
             raise CoreError("CHECKPOINT_INVALID")
         new["deadline"] = now + contract["timeout_seconds"]
-    _remote_checkpoint(new)
-    if (old["send_started"] and not new["send_started"] or old["cancel_started"] and not new["cancel_started"]
+    _remote_checkpoint(new, contract)
+    if (new["version"] < old["version"] or new["version"] == 2 and contract["version"] != 3
+            or old["send_started"] and not new["send_started"] or old["cancel_started"] and not new["cancel_started"]
             or old["deadline"] is not None and new["deadline"] != old["deadline"]
             or any(old[key] is not None and new[key] != old[key] for key in ("remote_task_id", "remote_context_id"))
             or new["cancel_started"] and not old["cancel_started"] and not cancel_requested):
         raise CoreError("CHECKPOINT_INVALID")
+    if new["version"] == 2:
+        old_answered = old.get("answered_inputs", [])
+        old_reply, new_reply = old.get("reply"), new["reply"]
+        if new["answered_inputs"][:len(old_answered)] != old_answered:
+            raise CoreError("CHECKPOINT_INVALID")
+        added = new["answered_inputs"][len(old_answered):]
+        if added and (len(added) != 1 or new_reply is None or new_reply["status"] != "confirmed"
+                      or added != [new_reply["input_id"]]):
+            raise CoreError("CHECKPOINT_INVALID")
+        if old_reply is not None:
+            if new_reply is None or any(new_reply[key] != old_reply[key] for key in old_reply if key != "status"):
+                raise CoreError("CHECKPOINT_INVALID")
+            allowed = {"queued": {"queued", "started"}, "started": {"started", "confirmed"}, "confirmed": {"confirmed"}}
+            if new_reply["status"] not in allowed[old_reply["status"]]:
+                raise CoreError("CHECKPOINT_INVALID")
+        elif new_reply is not None:
+            # Reply admission is handled separately under the operation lock.
+            raise CoreError("CHECKPOINT_INVALID")
+        old_input = old.get("input_request")
+        if old_input is not None and old_input != new["input_request"]:
+            if new_reply is None or new_reply["status"] != "confirmed" or new_reply["input_id"] != old_input["input_id"]:
+                raise CoreError("CHECKPOINT_INVALID")
+        if new_reply is not None:
+            _remote_reply(new_reply, contract)
     if outcome is not None:
         if (not isinstance(outcome, tuple) or len(outcome) != 3 or not isinstance(outcome[0], str) or outcome[0] not in _REMOTE_TERMINAL
                 or outcome[2] is not None and not isinstance(outcome[2], str)):
             raise CoreError("CHECKPOINT_INVALID")
         new["next_poll_at"] = None
     return new
+
+
+def _pending_remote_input(contract, checkpoint, state, cancel_requested, now):
+    _remote_contract(contract, contract["tenant_id"], contract["owner_id"])
+    _remote_checkpoint(checkpoint, contract)
+    if (contract["version"] != 3 or checkpoint["version"] != 2 or state != "working"
+            or cancel_requested or _remote_expired(checkpoint, now) or checkpoint["cancel_started"]):
+        return None
+    pending, reply = checkpoint["input_request"], checkpoint["reply"]
+    if pending is None or reply is not None and reply["status"] != "confirmed":
+        return None
+    return {**copy.deepcopy(pending), "contract": copy.deepcopy(contract)}
+
+
+def _remote_reply_status(checkpoint, input_id, state, cancel_requested, now):
+    _remote_input_id(input_id)
+    if input_id in checkpoint.get("answered_inputs", ()):
+        return "confirmed"
+    reply = checkpoint.get("reply")
+    if reply is None or reply["input_id"] != input_id:
+        return None
+    if reply["status"] == "queued" and state == "working" and not cancel_requested and not _remote_expired(checkpoint, now):
+        return "queued"
+    return "unconfirmed"
+
+
+def _queue_remote_reply(contract, checkpoint, state, cancel_requested, now, reply):
+    _remote_contract(contract, contract["tenant_id"], contract["owner_id"])
+    _remote_checkpoint(checkpoint, contract)
+    if not isinstance(reply, dict) or "status" in reply:
+        raise CoreError("CHECKPOINT_INVALID")
+    queued = {**copy.deepcopy(reply), "status": "queued"}
+    _remote_reply(queued, contract)
+    previous = checkpoint.get("reply")
+    if previous is not None and previous["message_id"] == queued["message_id"]:
+        if {**previous, "status": "queued"} != queued:
+            raise CoreError("MESSAGE_ID_CONFLICT")
+        return copy.deepcopy(checkpoint), False
+    if state != "working":
+        raise CoreError("INVALID_TASK_STATE")
+    if cancel_requested or checkpoint["cancel_started"]:
+        raise CoreError("CANCEL_REQUESTED")
+    if _remote_expired(checkpoint, now):
+        raise CoreError("REMOTE_OPERATION_TIMEOUT")
+    pending = _pending_remote_input(contract, checkpoint, state, cancel_requested, now)
+    if pending is None or pending["input_id"] != queued["input_id"]:
+        raise CoreError("REMOTE_INPUT_STALE")
+    new = {**copy.deepcopy(checkpoint), "reply": queued, "next_poll_at": now}
+    _remote_checkpoint(new, contract)
+    return new, True
+
+
+def _new_remote_input(old, new):
+    pending = new.get("input_request")
+    return pending is not None and old.get("input_request") != pending
 
 
 def _remote_expired(checkpoint, now):
@@ -160,10 +303,18 @@ def _remote_due(checkpoint, now, cancel_requested):
 def _remote_progress(progress, contract, checkpoint, outcome):
     if progress is None:
         return None
-    if (not isinstance(progress, dict) or progress.keys() != {"agent_name", "remote_state"}
+    required = {"agent_name", "remote_state"}
+    extra = {"input_id", "question", "owner_wait"} if contract["version"] == 3 else set()
+    question = {"input_id", "question"}
+    if (not isinstance(progress, dict) or not required <= progress.keys() <= required | extra
+            or bool(question & progress.keys()) and not question <= progress.keys()
+            or "owner_wait" in progress and (progress["owner_wait"] is not True or bool(question & progress.keys()))
             or progress["agent_name"] != contract["peer_name"]
             or not isinstance(progress["remote_state"], str) or progress["remote_state"] not in REMOTE_PROGRESS_STATES
             or checkpoint["remote_task_id"] is None or outcome is not None):
+        raise CoreError("CHECKPOINT_INVALID")
+    if "input_id" in progress and (checkpoint.get("input_request") != {key: progress[key] for key in question}
+            or progress["remote_state"] != "TASK_STATE_INPUT_REQUIRED"):
         raise CoreError("CHECKPOINT_INVALID")
     return copy.deepcopy(progress)
 
@@ -175,12 +326,19 @@ def remote_result_projection(result):
     return copy.deepcopy(result)
 
 
+def _remote_cancelled_outcome(contract, outcome, cancel_requested):
+    if contract["version"] == 3 and cancel_requested and outcome is not None and outcome[0] == "completed":
+        return ("canceled", {"agent_name": contract["peer_name"], "reason": "caller_cancelled",
+                             "remote_outcome": "completed"}, None)
+    return outcome
+
+
 def _remote_file_binding(contract, batch, outcome, task_id):
     from .workspace import WorkspaceBinding
 
     if (not isinstance(batch, dict) or batch.keys() != {
             "batch_id", "lease_token", "actor_id", "message_id", "request_digest"}
-            or contract["version"] != 2 or not isinstance(outcome, tuple) or len(outcome) != 3
+            or contract["version"] not in {2, 3} or not isinstance(outcome, tuple) or len(outcome) != 3
             or outcome[0] != "completed" or outcome[2] is not None
             or not isinstance(outcome[1], dict) or outcome[1].keys() != {"agent_name", "remote_state", "text"}
             or outcome[1]["agent_name"] != contract["peer_name"]
@@ -311,8 +469,53 @@ class TaskScheduler:
                     continue
                 progress = _remote_progress(task.result, contract, checkpoint, None)
                 if progress is not None:
-                    values.append({"task_id": task_id, "revision": task.revision, **progress})
+                    values.append({"task_id": task_id, "revision": task.revision,
+                                   "agent_name": progress["agent_name"], "remote_state": progress["remote_state"]})
         return tuple(values)
+
+    def remote_input(self, task_id, *, owner_id, tenant_id):
+        with self._lock:
+            task = self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
+            row = self._remote.get(task_id)
+            if row is None:
+                raise CoreError("TASK_NOT_FOUND")
+            return _pending_remote_input(row["contract"], row["checkpoint"], task.state,
+                                         row["cancel_requested"], self.clock())
+
+    def remote_reply_status(self, task_id, input_id, *, owner_id, tenant_id):
+        with self._lock:
+            task = self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
+            row = self._remote.get(task_id)
+            if row is None:
+                raise CoreError("TASK_NOT_FOUND")
+            _remote_checkpoint(row["checkpoint"], row["contract"])
+            return _remote_reply_status(row["checkpoint"], input_id, task.state, row["cancel_requested"], self.clock())
+
+    def queue_remote_reply(self, task_id, reply, *, owner_id, tenant_id, admission=None):
+        with self._lock:
+            task = self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
+            row = self._remote.get(task_id)
+            if row is None:
+                raise CoreError("TASK_NOT_FOUND")
+            now = self.clock()
+            checkpoint, changed = _queue_remote_reply(row["contract"], row["checkpoint"], task.state,
+                                                     row["cancel_requested"], now, reply)
+            if admission is not None:
+                admission(None)
+            if changed:
+                now = self.clock()
+                if _remote_expired(row["checkpoint"], now):
+                    # The memory workflow callback has already committed its receipt;
+                    # publish the original timeout instead of admitting a late Send.
+                    row["checkpoint"] = checkpoint
+                    self._finish_remote_locked(row, task, ("failed", remote_timeout_result(row["contract"]), "REMOTE_OPERATION_TIMEOUT"))
+                    return task
+                row["checkpoint"], row["updated_at"] = checkpoint, now
+                task.result = {key: value for key, value in (task.result or {}).items() if key not in {"input_id", "question"}}
+                task.revision += 1
+                with task.condition:
+                    task.condition.notify_all()
+            return task
 
     def observe_remote(self, task_id, *, owner_id, tenant_id, visible):
         if type(visible) is not bool:
@@ -339,7 +542,7 @@ class TaskScheduler:
             raise CoreError("TASK_NOT_FOUND")
         task = self._tasks[claim.task_id]
         _remote_contract(row["contract"], claim.tenant_id, claim.owner_id)
-        _remote_checkpoint(row["checkpoint"])
+        _remote_checkpoint(row["checkpoint"], row["contract"])
         if terminal and task.state in _REMOTE_TERMINAL:
             return row, task
         if task.state != "working" or row["token"] != claim.token:
@@ -388,11 +591,19 @@ class TaskScheduler:
                 return task
             if type(expected_revision) is not int or task.revision != expected_revision:
                 raise CoreError("SESSION_CONFLICT")
+            if row["contract"]["version"] == 3 and row["cancel_requested"]:
+                conversation_observation, progress = None, None
+                reply = checkpoint.get("reply")
+                pending = row["checkpoint"]["input_request"]
+                checkpoint = {**checkpoint, "input_request": None if reply and reply["status"] == "confirmed"
+                              and (pending is None or reply["input_id"] == pending["input_id"]) else pending}
+            outcome = _remote_cancelled_outcome(row["contract"], outcome, row["cancel_requested"])
             checkpoint = _advance_remote_checkpoint(row["checkpoint"], checkpoint, row["contract"], now, row["cancel_requested"], outcome)
             progress = _remote_progress(progress, row["contract"], checkpoint, outcome)
             conversation = merge_observation(row.get("conversation"), conversation_observation, now)
             if outcome is None and (row.get("observed_until") or 0) > now and checkpoint["remote_task_id"]:
                 checkpoint["next_poll_at"] = min(checkpoint["next_poll_at"] or now, now + 15, checkpoint["deadline"])
+            new_input = _new_remote_input(row["checkpoint"], checkpoint)
             row["checkpoint"] = checkpoint
             row["conversation"] = conversation
             row["updated_at"] = now
@@ -400,6 +611,13 @@ class TaskScheduler:
                 if progress is not None:
                     task.result = progress
                 task.revision += 1
+                if new_input:
+                    self.mailbox(task.owner_id, row["contract"]["tenant_id"], remote=True).deliver(Notification(
+                        str(uuid.uuid4()), task.owner_id, task.id, "task.input-required", task.revision,
+                        {"task_id": task.id, "input_id": checkpoint["input_request"]["input_id"]},
+                    ))
+                    with task.condition:
+                        task.condition.notify_all()
             else:
                 self._finish_remote_locked(row, task, outcome)
             return task
@@ -645,7 +863,7 @@ class TaskScheduler:
                 self._tasks[task.id] = task
                 self._kinds[task.id] = kind
                 if kind == REMOTE_KIND:
-                    self._remote[task.id] = {"contract": copy.deepcopy(contract), "checkpoint": _initial_remote_checkpoint(),
+                    self._remote[task.id] = {"contract": copy.deepcopy(contract), "checkpoint": _initial_remote_checkpoint(contract),
                                              "token": None, "cancel_requested": False, "conversation": initial_conversation(),
                                              "created_at": self.clock(), "updated_at": self.clock(), "observed_until": None}
                     self.mailbox(owner_id, tenant_id, remote=True)

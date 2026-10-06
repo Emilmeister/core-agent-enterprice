@@ -190,6 +190,33 @@ metadata. Нельзя раскрывать внутреннюю перепис�
 Конкретные имя инструмента и API-схема определяются при технической проработке
 контракта; поведение запроса информации согласовано.
 
+### INPUT-02. Публичные вопросы внешнего агента
+
+Remote `input-required` с public question к caller MUST сохраняться вместе с
+question identity/input ID и delivery state до wake/outbox. Ожидающий
+`core_task_wait` получает non-terminal question result с тем же handle; занятый
+агент получает вопрос на safe boundary после текущего model/tool call. Duplicate
+snapshot не доставляет вопрос повторно, новый вопрос получает новый input ID.
+Guardrails рассматривает question как недоверенный материал; hidden/private
+Parts и owner-wait marker не становятся model input. Foreign HITL/auth не
+разрешаются нашим runtime.
+
+Агент отвечает из доступного контекста либо вызывает private `core_ask_owner`.
+Только явно выбранный reply проходит schema/current tool policy/HITL/guardrails
+и durable admission в исходную remote Task по LONG-05. Selected attachments
+frozen до approval; source handle/peer/input проверяются вновь до side effect.
+Reply send intent/unique message ID и unknown outcome переживают restart;
+recovery не повторяет mutating Send без доказанной pre-dispatch причины.
+Первоначальный deadline, send age, config и shared budgets сохраняются, включая
+время private owner wait; terminal/cancel/expiry не разрешает поздний reply.
+Nested Python использует existing saved continuation без prefix/remainder replay.
+
+В наших публичных Task/status projection owner input/HITL/guardrails обозначается
+safe `core_agent_wait` v1 kind owner по A2A protocol. Private conversation остаётся
+недоступной внешнему caller после recovery. Typed Artifact contents по FILE-05
+не добавляются runtime-ом в model transcript/mailbox/summary автоматически:
+в контексте только safe metadata/paths до явного чтения выбранного файла.
+
 ## Фоновые задачи и делегирование
 
 Long-running tool, indexing job и сабагент запускаются как неблокирующие Tasks. Parent получает handle, продолжает другую работу или durable-переходит в `WAITING_TASK`. Completion notification возобновляет loop и добавляется в контекст на safe boundary. Delegation MUST передавать явные allowlists tools/MCP/skills; детали определены в [Фоновых задачах и делегировании](tasks-and-delegation.md).

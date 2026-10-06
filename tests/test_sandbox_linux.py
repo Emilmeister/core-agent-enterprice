@@ -19,6 +19,7 @@ import socket
 import subprocess
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 import urllib.request
@@ -129,8 +130,19 @@ class SandboxLinuxTests(unittest.TestCase):
                 ModelResponse(message='completed'),
             ])
             model.model = 'native-sandbox-test'
-            with self.subTest(tool=tool), patch.dict(os.environ, environment, clear=True):
-                app = create_app(model=model, guardrail_classifier=GuardrailClassifier(ClearGuardrailModel()))
+            classifier = GuardrailClassifier(ClearGuardrailModel())
+            classify = classifier.classify
+            classifier_lock = threading.Lock()
+
+            def available_classifier(*args, **kwargs):
+                # Keep actual reviews while avoiding detector_busy owner waits
+                # when parent-result and child-arguments reviews overlap.
+                with classifier_lock:
+                    return classify(*args, **kwargs)
+
+            with self.subTest(tool=tool), patch.dict(os.environ, environment, clear=True), \
+                    patch.object(classifier, 'classify', side_effect=available_classifier):
+                app = create_app(model=model, guardrail_classifier=classifier)
                 try:
                     agent = app.state.core_agent
                     manager = agent.tool_runtime.environment_manager

@@ -80,6 +80,12 @@ class RemoteEvent:
     messages: tuple[dict, ...] = ()
     history_truncated: bool = False
     public_messages_complete: bool = False
+    artifacts: tuple[dict, ...] = ()
+    public_messages: tuple[dict, ...] = ()
+    message_parts: tuple[dict, ...] = ()
+    message_id: str | None = None
+    input_request: dict | None = None
+    owner_wait: bool = False
 
     @property
     def has_files(self):
@@ -209,7 +215,7 @@ def _validate_response_files(payload, *, direct, limit):
         raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR") from None
 
 
-def _task_event(payload, *, direct=False, expected_task_id=None, attachment_limit_bytes=None):
+def _task_event(payload, *, direct=False, expected_task_id=None, expected_context_id=None, attachment_limit_bytes=None):
     """Validate the installed SDK's 1.0 shape without publishing parser diagnostics."""
     _validate_response_files(payload, direct=direct, limit=attachment_limit_bytes)
     try:
@@ -239,39 +245,30 @@ def _task_event(payload, *, direct=False, expected_task_id=None, attachment_limi
                 if identifier:
                     _trusted_text(identifier, code="REMOTE_AGENT_PROTOCOL_ERROR")
             task_id, context_id, kind, state, final = message.task_id or None, message.context_id or None, "message", None, True
+            if task_id is not None and expected_task_id is not None and task_id != expected_task_id:
+                raise ValueError()
         else:
+            raise ValueError()
+        if context_id is not None and expected_context_id is not None and context_id != expected_context_id:
             raise ValueError()
         if any(part.WhichOneof("content") is None for part in parts):
             raise ValueError()
         normalized = tuple(MessageToDict(part) for part in parts)
         from .peer_conversations import MAX_MESSAGES, MAX_TEXT_BYTES, public_identity
         messages, seen, used, truncated = [], set(), 0, False
+        artifacts, public_messages, message_parts = (), (), ()
+        message_id, input_request, owner_wait = None, None, False
 
-        def publish(container, identity):
+        def publish(container, identity, *, legacy=False):
             nonlocal used, truncated
-            metadata = container.get("metadata", {})
-            if isinstance(metadata, dict) and (
-                any(metadata.get(key) is True for key in (
-                    "private", "review_private", "adk_thought", "reasoning", "thinking",
-                    "reasoning_replay", "provider_replay"))
-                or metadata.get("visibility") == "private"
-                or metadata.get("kind") in {"reasoning", "thinking", "review", "replay", "reasoning_replay", "provider_replay"}
-            ):
-                return
-            public_parts = []
-            for part in _parts(container):
-                metadata = part.get("metadata", {})
-                if isinstance(metadata, dict) and (
-                    any(metadata.get(key) for key in (
-                        "private", "reasoning", "thinking", "review_private", "adk_thought",
-                        "reasoning_replay", "provider_replay"))
-                    or metadata.get("visibility") == "private"
-                    or metadata.get("kind") in {"reasoning", "thinking", "review", "replay", "reasoning_replay", "provider_replay"}
-                ):
-                    continue
-                if isinstance(part.get("text"), str):
-                    public_parts.append(part)
-            text = _parts_text(public_parts)
+            if legacy:
+                metadata = container.get("metadata", {})
+                if isinstance(metadata, dict):
+                    # Preserve admitted v1/v2 public text: descriptive metadata was
+                    # discarded, while explicit private/reasoning flags remain hidden.
+                    container = {**container, "metadata": {key: value for key, value in metadata.items()
+                        if key in {"visibility", "kind"} or value is True}}
+            text = _parts_text(_public_parts(container))
             if not text:
                 return
             identifier = public_identity(identity, text)
@@ -288,6 +285,18 @@ def _task_event(payload, *, direct=False, expected_task_id=None, attachment_limi
         if kind == "task":
             public_task = MessageToDict(task)
             status_message = public_task.get("status", {}).get("message", {})
+            marker = public_task.get("metadata", {}).get("core_agent_wait", {})
+            owner_wait = isinstance(marker, dict) and marker.get("kind") == "owner"
+            message_id = status_message.get("messageId") or None
+            if not _private_material(public_task):
+                artifacts = tuple({**artifact, "parts": list(_public_parts(artifact))}
+                    for artifact in public_task.get("artifacts", []) if not _private_material(artifact))
+                if status_message.get("role") == "ROLE_AGENT":
+                    message_parts = _public_parts(status_message)
+                    question = _parts_text(message_parts)
+                    if state == "TASK_STATE_INPUT_REQUIRED" and not owner_wait and question.strip():
+                        identity = "input:" + task_id + ":" + (message_id or str(public_task.get("status", {}).get("timestamp", "")))
+                        input_request = {"input_id": public_identity(identity, question), "question": question}
             hidden_review_id = status_message.get("messageId") if state in {
                 "TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"} else None
             for message in public_task.get("history", []):
@@ -298,13 +307,27 @@ def _task_event(payload, *, direct=False, expected_task_id=None, attachment_limi
             if state not in {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"}:
                 if status_message.get("role") == "ROLE_AGENT":
                     publish(status_message, "message:" + status_message.get("messageId", ""))
+            public_messages = () if _private_material(public_task) else tuple(messages)
+            messages, seen, used = [], set(), 0
+            for message in public_task.get("history", []):
+                if message.get("role") == "ROLE_AGENT" and (
+                    hidden_review_id is None or message.get("messageId") != hidden_review_id
+                ):
+                    publish(message, "message:" + message.get("messageId", ""), legacy=True)
+            if state not in {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"}:
+                if status_message.get("role") == "ROLE_AGENT":
+                    publish(status_message, "message:" + status_message.get("messageId", ""), legacy=True)
             for artifact in public_task.get("artifacts", []):
-                publish(artifact, "artifact:" + artifact.get("artifactId", ""))
+                publish(artifact, "artifact:" + artifact.get("artifactId", ""), legacy=True)
         else:
             public_message = MessageToDict(message)
+            message_id = public_message.get("messageId")
+            message_parts = _public_parts(public_message)
             publish(public_message, "message:" + public_message.get("messageId", ""))
+            public_messages = tuple(messages)
         return RemoteEvent(kind, state, _parts_text(normalized), final, normalized, task_id, context_id,
-                           tuple(messages), truncated, True)
+                           tuple(messages), truncated, True, artifacts, public_messages, message_parts,
+                           message_id, input_request, owner_wait)
     except (ParseError, ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError, CoreError):
         raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR") from None
 
@@ -449,6 +472,19 @@ def _parts(container):
     if not isinstance(parts, list):
         return ()
     return tuple(part for part in parts if isinstance(part, Mapping))
+
+
+def _private_material(container):
+    metadata = container.get("metadata", {})
+    return isinstance(metadata, dict) and (
+        any(metadata.get(key) for key in ("private", "review_private", "adk_thought", "reasoning",
+            "thinking", "reasoning_replay", "provider_replay"))
+        or metadata.get("visibility") == "private"
+        or metadata.get("kind") in {"reasoning", "thinking", "review", "replay", "reasoning_replay", "provider_replay"})
+
+
+def _public_parts(container):
+    return () if _private_material(container) else tuple(part for part in _parts(container) if not _private_material(part))
 
 
 def _parts_text(parts):
@@ -652,22 +688,33 @@ class RemoteAgentConnection:
                 result = result["result"]
         except (ValueError, TypeError, KeyError, RecursionError):
             raise CoreError("REMOTE_AGENT_PROTOCOL_ERROR") from None
-        return _task_event(result, direct=method != "SendMessage", expected_task_id=params.get("id"),
+        message = params.get("message", {})
+        return _task_event(result, direct=method != "SendMessage", expected_task_id=params.get("id") or message.get("taskId"),
+                           expected_context_id=message.get("contextId"),
                            attachment_limit_bytes=attachment_limit_bytes)
 
-    def send_task(self, *, task, message_id, headers=None, timeout=None, files=(), attachment_limit_bytes=None):
-        """Send one new task nonblocking; no caller task/context or inherited auth."""
+    def send_task(self, *, task, message_id, headers=None, timeout=None, files=(), attachment_limit_bytes=None,
+                  task_id=None, context_id=None):
+        """Send nonblocking; only the durable operation supplies remote IDs."""
         try:
             _require_text(task, "INVALID_REQUEST", "task must be non-empty text")
             task.encode("utf-8")
             _trusted_text(message_id, code="INVALID_REQUEST")
+            for identifier in (task_id, context_id):
+                if identifier is not None:
+                    _trusted_text(identifier, code="INVALID_REQUEST")
             parts = [{"text": task}, *_outgoing_parts(files, _attachment_limit(attachment_limit_bytes))]
         except CoreError as error:
             raise ExecutionNotStarted(error.code, data=error.data) from None
         except UnicodeError:
             raise ExecutionNotStarted("INVALID_REQUEST") from None
+        message = {"role": "ROLE_USER", "messageId": message_id, "parts": parts}
+        if task_id is not None:
+            message["taskId"] = task_id
+        if context_id is not None:
+            message["contextId"] = context_id
         return self._task_request("SendMessage", {
-            "message": {"role": "ROLE_USER", "messageId": message_id, "parts": parts},
+            "message": message,
             "configuration": {"returnImmediately": True},
         }, headers=headers, timeout=timeout, request_id=message_id, attachment_limit_bytes=attachment_limit_bytes)
 

@@ -34,9 +34,50 @@ Session/tenant/auth/trace/task delivery принадлежат A2A context и tr
 Transport передаёт сохранённые bytes только выбранного набора через standard raw
 Parts; URLs и локальные IDs/пути не дают внешнему агенту доступ к workspace.
 
-UI и A2A принимают вложения вне RunRequest и атомарно сохраняют их в постоянной папке чата по [Файлам и transport artifacts](artifacts.md). Модель получает фактические безопасные имена, размер, media type и путь `/workspace`, а не inline bytes или system instruction. Сообщение только с файлами допустимо: adapter формирует непустой prompt из описания вложений.
+UI и A2A принимают вложения вне RunRequest и атомарно сохраняют их в постоянной папке чата по [Файлам и transport artifacts](artifacts.md). Новые A2A-вложения, включая initiating Message и follow-up, находятся в backend-issued `a2a/<local-batch-id>/`; UI upload и legacy accepted paths сохраняют `attachments/`/свой manifest. Модель получает фактические безопасные имена, размер, media type и путь `/workspace`, а не inline bytes или system instruction. Сообщение только с файлами допустимо: adapter формирует непустой prompt из описания вложений.
 
 Входящий A2A FilePart поддерживает inline bytes; декодирование строгое, лимит считается по декодированным байтам. Ссылочные Parts MAY приниматься только управляемым transport resolver после проверки доступа и фактических сетевых назначений, без передачи credential на произвольный caller URL. Неподдерживаемая ссылка отклоняется до admission, а не игнорируется. Обычный A2A Artifact остаётся формой результата; model-callable artifact tools удалены.
+
+### Продолжение public A2A input request
+
+Public `input-required` question к caller и private ожидание владельца различаются
+по [A2A projection](a2a-protocol.md#публичное-уточнение-и-private-owner-wait).
+Наш owner input/HITL/guardrails показывает только backend-generated metadata
+`core_agent_wait: {version: 1, kind: "owner"}` и безопасный status, без внутренних
+вопросов, ответов, аргументов или review IDs. Get/List, streams и push сохраняют
+одну policy после restart; marker не выдаёт approval authority.
+
+`core_agent_send_message` MAY продолжить текущую remote operation optional парой
+`task_id`/`input_id`. Оба отсутствуют в initial Send, оба обязательны в reply:
+
+```json
+{"agent_name":"weather-agent","task_id":"local-operation-1","input_id":"local-input-1","task":"Для Казани","files":[]}
+```
+
+Backend-issued local IDs проверяются в tenant/owning-run scope. Wrong peer,
+foreign/stale input, terminal/cancel/expired state и половина пары отклоняются
+до Send. Reply проходит current policy/guardrails/HITL, отправляется с исходными
+remote IDs/pinned credentials и сохраняет handle/deadline/budgets. Queued receipt
+не равен confirmed delivery. Unknown side effect даёт `SIDE_EFFECT_UNKNOWN`,
+без blind mutating retry. Public question сохраняется до однократного wake/safe
+boundary delivery; private `core_ask_owner` не раскрывает всю owner переписку.
+В полном объёме действует [LONG-05](tasks-and-delegation.md#long-05-публичное-уточнение-и-ответ-в-исходную-remote-task).
+
+### Полученные typed Artifacts
+
+Artifact ID/name и ordered text/data/file Parts сохраняются versioned manifest
+и файлами под `a2a/<local-operation-id>/` по [FILE-05](artifacts.md#file-05-typed-a2a-artifacts-в-workspace).
+Text/JSON-only Artifact также является файловым материалом; его contents не
+попадают автоматически в tool result/mailbox/summary `text`. Public Message и
+question остаются text. Model получает только safe metadata/paths и читает
+нужный файл явно. Complete terminal success, whole-batch guardrails, current
+negative-material decisions, original deadline/claim/cancel и scoped downloads
+предшествуют выдаче; intermediate/failed/expired content не публикуется.
+Unknown/unsupported Parts, invalid JSON, oversized aggregate и URL FileParts
+не игнорируются и не скачиваются автоматически. Legacy jobs/paths читаются без
+фабрикации typed history или перемещения файлов. Owner peer cards используют
+эти же boundaries для question/reply и artifact files; недоступный файл не
+объявляется доступным через сохранённый receipt.
 
 ## `mcp`
 
@@ -460,7 +501,13 @@ operation ID имеет not-found semantics. Список и содержимо�
 причинные зависимости проверяются при каждом чтении, включая frozen snapshots
 исходящих файлов. Публичный `material_status` сообщает только
 `available|pending_guardrail|rejected|timed_out`, без приватных review IDs или
-отклонённых bytes. Ожидание обозначается «Обработка поручения»; первоначальное
+отклонённых bytes. Деталь операции добавляет `waiting_reason: caller|owner|null`
+и `reply_delivery: queued|unconfirmed|confirmed|null`, выведенные из сохранённого
+input/reply и безопасного owner-wait marker. Сообщение исходящего ответа имеет
+собственные file receipts; файлы первоначального поручения не повторяются у
+каждого ответа. Historical grants берутся только из immutable accepted reply
+и подтверждённой observation, никогда из текущего workspace. Provenance и
+review identities остаются приватными. Ожидание обозначается «Обработка поручения»; первоначальное
 поручение не скрывается из-за более позднего несвязанного решения.
 
 #### Содержимое диалога

@@ -79,6 +79,7 @@ class Principal:
     tenant: str
     is_owner: bool
     is_external: bool
+    is_browser: bool = False
 
     @property
     def owner_id(self):
@@ -194,7 +195,8 @@ class KeycloakAuthenticator:
         external = settings.external_role in roles
         owner = settings.owner_role in roles and not external
         actor_id = hashlib.sha256((settings.issuer + "\0" + subject).encode()).hexdigest()
-        principal = Principal(actor_id, settings.tenant, owner, external)
+        principal = Principal(actor_id, settings.tenant, owner, external,
+                              bool(owner and settings.ui_client_id and claims.get("client_id") == settings.ui_client_id))
         return (principal, claims) if include_claims else principal
 
 

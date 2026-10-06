@@ -22,7 +22,7 @@ from core_agent.postgres_tasks import PostgresTaskScheduler
 from core_agent.remote_agents import RemoteAgentConnection, RemoteEvent
 from core_agent.remote_registry import InMemoryRemoteRegistry, PostgresRemoteRegistry
 from core_agent.response_files import ResponseFileService
-from core_agent.tasks import REMOTE_TASK_PENDING, TaskScheduler, _remote_contract, remote_timeout_result
+from core_agent.tasks import REMOTE_TASK_PENDING, TaskScheduler, _remote_contract, _advance_remote_checkpoint, remote_timeout_result
 from core_agent.workflow import InMemoryWorkflowStore, WorkflowRecord
 from core_agent.workspace import ChatWorkspaces, WorkspaceBinding
 
@@ -136,7 +136,7 @@ class RemoteOperationTests(unittest.TestCase):
                     with self.assertRaises(CoreError) as error:
                         _remote_contract({**self.contract, "outgoing_files": forged}, self.tenant, self.owner)
                     self.assertEqual(error.exception.code, "CHECKPOINT_INVALID")
-                for changes in ({"version": 3}, {"version": True}, {"attachment_limit_bytes": True},
+                for changes in ({"version": 4}, {"version": True}, {"attachment_limit_bytes": True},
                         {"attachment_limit_bytes": 4}, {"attachment_limit_bytes": 2},
                         {"outgoing_files": tuple(refs)}, {"outgoing_files": None},
                         {"caller_scope": {**self.contract["caller_scope"], "root_run_id": "grant"}}):
@@ -150,6 +150,197 @@ class RemoteOperationTests(unittest.TestCase):
             with self.assertRaises(CoreError) as error:
                 _remote_contract({**self.contract, **changes}, self.tenant, self.owner)
             self.assertEqual(error.exception.code, "CHECKPOINT_INVALID")
+        self.assertEqual(self.calls, [])
+
+    def test_v3_public_question_reply_preserves_task_deadline_and_deduplicates(self):
+        self.outbound_files()
+        self.contract.update(version=3, outgoing_files=[])
+        question = {"input_id": "a" * 64, "question": "Which city?"}
+        self.responses.append(replace(self.event("INPUT_REQUIRED"), input_request=question))
+        task = self.start()
+        self.assertEqual(task.state, "working")
+        pending = self.scheduler.remote_input(task.id, owner_id=self.owner, tenant_id=self.tenant)
+        self.assertEqual(pending["input_id"], question["input_id"])
+        self.assertEqual(pending["question"], question["question"])
+        reply = {"input_id": question["input_id"], "message_id": str(uuid.uuid4()), "task": "Kazan",
+                 "outgoing_files": [], "request_provenance": {"version": 1, "sources": {}}}
+        self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant)
+        self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant)
+        self.responses.append(self.event("WORKING"))
+        self.recover(0)
+        self.assertEqual([item[0] for item in self.calls], ["Send", "Send"])
+        self.assertEqual(self.calls[-1][2]["task_id"], "remote-task")
+        self.assertEqual(self.calls[-1][2]["context_id"], "remote-context")
+        self.assertEqual(self.calls[-1][2]["task"], "Kazan")
+        self.assertIsNone(self.scheduler.remote_input(task.id, owner_id=self.owner, tenant_id=self.tenant))
+        self.responses.append(replace(self.event("INPUT_REQUIRED"), input_request=question))
+        self.recover()
+        self.assertIsNone(self.scheduler.remote_input(task.id, owner_id=self.owner, tenant_id=self.tenant))
+        self.responses.append(self.event("COMPLETED"))
+        self.recover()
+        self.assertEqual(task.state, "completed")
+        self.assertEqual(len([item for item in self.calls if item[0] == "Send"]), 2)
+
+    def test_v3_reply_rejects_wrong_owner_stale_input_and_final_deadline(self):
+        self.outbound_files()
+        self.contract.update(version=3, outgoing_files=[])
+        question = {"input_id": "a" * 64, "question": "Which city?"}
+        self.responses.append(replace(self.event("INPUT_REQUIRED"), input_request=question))
+        task = self.start()
+        reply = {"input_id": "b" * 64, "message_id": str(uuid.uuid4()), "task": "Kazan",
+                 "outgoing_files": [], "request_provenance": {"version": 1, "sources": {}}}
+        for owner, tenant in (("other", self.tenant), (self.owner, "other")):
+            with self.assertRaises(CoreError):
+                self.scheduler.queue_remote_reply(task.id, reply, owner_id=owner, tenant_id=tenant)
+        with self.assertRaises(CoreError) as stale:
+            self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant)
+        self.assertEqual(stale.exception.code, "REMOTE_INPUT_STALE")
+        self.now += 31
+        with self.assertRaises(CoreError):
+            self.scheduler.queue_remote_reply(task.id, {**reply, "input_id": "a" * 64}, owner_id=self.owner, tenant_id=self.tenant)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_v3_cancel_during_reply_does_not_commit_late_text(self):
+        self.outbound_files()
+        self.contract.update(version=3, outgoing_files=[])
+        self.responses.append(replace(self.event("INPUT_REQUIRED"), input_request={"input_id": "a" * 64, "question": "City?"}))
+        task = self.start()
+        self.scheduler.queue_remote_reply(task.id, {"input_id": "a" * 64, "message_id": uuid.uuid4().hex,
+            "task": "Kazan", "outgoing_files": [], "request_provenance": {"version": 1, "sources": {}}},
+            owner_id=self.owner, tenant_id=self.tenant)
+        def late_result():
+            self.scheduler.cancel(task.id, owner_id=self.owner, tenant_id=self.tenant)
+            return self.event("COMPLETED", text="late-result-canary")
+        self.responses.append(late_result)
+        self.recover(0)
+        self.assertEqual(task.state, "canceled")
+        self.assertNotIn("late-result-canary", json.dumps(task.result))
+
+    def test_v3_memory_admission_crossing_deadline_finishes_without_send(self):
+        self.outbound_files()
+        self.contract.update(version=3, outgoing_files=[])
+        self.responses.append(replace(self.event("INPUT_REQUIRED"), input_request={"input_id": "a" * 64, "question": "City?"}))
+        task = self.start()
+        def admitted(_connection):
+            self.now += 31
+        saved = self.scheduler.queue_remote_reply(task.id, {"input_id": "a" * 64, "message_id": uuid.uuid4().hex,
+            "task": "Kazan", "outgoing_files": [], "request_provenance": {"version": 1, "sources": {}}},
+            owner_id=self.owner, tenant_id=self.tenant, admission=admitted)
+        self.assertEqual((saved.state, getattr(saved.error, "code", None)), ("failed", "REMOTE_OPERATION_TIMEOUT"))
+        self.recover(0)
+        self.assertEqual(len(self.calls), 1)
+
+    def manual_question_operation(self):
+        self.outbound_files()
+        self.contract.update(version=3, outgoing_files=[])
+        self.claims = []
+        def question(claim, cancel):
+            self.claims.append(claim)
+            current = self.scheduler.read_remote_claim(claim)
+            if not current["checkpoint"]["send_started"]:
+                self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
+                    checkpoint={**current["checkpoint"], "send_started": True})
+                current = self.scheduler.read_remote_claim(claim)
+                pending = {"input_id": "a" * 64, "question": "Which city?"}
+                self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
+                    checkpoint={**current["checkpoint"], "remote_task_id": "remote-task",
+                        "remote_context_id": "remote-context", "input_request": pending,
+                        "next_poll_at": current["now"] + 5},
+                    progress={"agent_name": self.peer["name"], "remote_state": "TASK_STATE_INPUT_REQUIRED", **pending})
+            return REMOTE_TASK_PENDING
+        self.scheduler._handlers["remote_a2a"] = question
+        task = self.start()
+        return task, {"input_id": "a" * 64, "message_id": str(uuid.uuid4()), "task": "Kazan",
+                      "outgoing_files": [], "request_provenance": {"version": 1, "sources": {}}}
+
+    def test_v3_scheduler_atomic_reply_admission_safe_notifications_and_scope(self):
+        task, reply = self.manual_question_operation()
+        notifications = self.scheduler.mailbox(self.owner, self.tenant).poll()
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual((notifications[0].kind, notifications[0].payload),
+            ("task.input-required", {"task_id": task.id, "input_id": "a" * 64}))
+        self.assertNotIn("Which city", repr(notifications))
+        self.assertEqual(set(self.scheduler.remote_progress(owner_id=self.owner, tenant_id=self.tenant)[0]),
+            {"task_id", "revision", "agent_name", "remote_state"})
+        before = self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant).revision
+        def reject(connection):
+            raise CoreError("SESSION_CONFLICT")
+        with self.assertRaises(CoreError):
+            self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant, admission=reject)
+        self.assertEqual(self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant).revision, before)
+        self.assertIsNotNone(self.scheduler.remote_input(task.id, owner_id=self.owner, tenant_id=self.tenant))
+        self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant)
+        first = self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant).revision
+        self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant)
+        self.assertEqual(self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant).revision, first)
+        self.assertIsNone(self.scheduler.remote_input(task.id, owner_id=self.owner, tenant_id=self.tenant))
+        self.assertNotIn("question", self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant).result)
+        for changes, code in (({"task": "Moscow"}, "MESSAGE_ID_CONFLICT"),
+                               ({"message_id": str(uuid.uuid4())}, "REMOTE_INPUT_STALE"),
+                               ({"status": "started"}, "CHECKPOINT_INVALID")):
+            with self.assertRaises(CoreError) as error:
+                self.scheduler.queue_remote_reply(task.id, {**reply, **changes}, owner_id=self.owner, tenant_id=self.tenant)
+            self.assertEqual(error.exception.code, code)
+        for owner, tenant in (("foreign", self.tenant), (self.owner, "foreign")):
+            with self.assertRaises(CoreError) as error:
+                self.scheduler.remote_input(task.id, owner_id=owner, tenant_id=tenant)
+            self.assertEqual(error.exception.code, "TASK_NOT_FOUND")
+
+    def test_v3_scheduler_checkpoint_transitions_reject_mutation_and_deliver_new_question_once(self):
+        task, reply = self.manual_question_operation()
+        self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant)
+        def advance(claim, cancel):
+            current = self.scheduler.read_remote_claim(claim)
+            old = current["checkpoint"]
+            bad = {**old, "reply": {**old["reply"], "status": "confirmed"}, "input_request": None,
+                   "answered_inputs": [reply["input_id"]]}
+            with self.assertRaises(CoreError):
+                _advance_remote_checkpoint(old, bad, current["contract"], current["now"], False, None)
+            for changes in ({"deadline": old["deadline"] + 1},
+                            {"reply": {**old["reply"], "task": "changed"}},
+                            {"input_request": {"input_id": "b" * 64, "question": "Which city?"}}):
+                with self.assertRaises(CoreError):
+                    _advance_remote_checkpoint(old, {**old, **changes}, current["contract"], current["now"], False, None)
+            self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
+                checkpoint={**old, "reply": {**old["reply"], "status": "started"}})
+            current = self.scheduler.read_remote_claim(claim)
+            self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
+                checkpoint={**current["checkpoint"], "reply": {**current["checkpoint"]["reply"], "status": "confirmed"},
+                    "input_request": None, "answered_inputs": [reply["input_id"]]})
+            current = self.scheduler.read_remote_claim(claim)
+            pending = {"input_id": "b" * 64, "question": "Which city?"}
+            new = {**current["checkpoint"], "input_request": pending, "next_poll_at": current["now"] + 5}
+            progress = {"agent_name": self.peer["name"], "remote_state": "TASK_STATE_INPUT_REQUIRED", **pending}
+            self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"], checkpoint=new, progress=progress)
+            current = self.scheduler.read_remote_claim(claim)
+            self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"], checkpoint=current["checkpoint"], progress=progress)
+            return REMOTE_TASK_PENDING
+        self.scheduler._handlers["remote_a2a"] = advance
+        self.scheduler.recover(tenant_id=self.tenant)
+        self.settle()
+        current = self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant)
+        self.assertEqual(current.state, "working", getattr(current.error, "code", None))
+        self.assertEqual(len(self.scheduler.mailbox(self.owner, self.tenant).poll()), 2)
+        self.assertEqual(self.scheduler.remote_input(task.id, owner_id=self.owner, tenant_id=self.tenant)["input_id"], "b" * 64)
+        self.scheduler.queue_remote_reply(task.id, {**reply, "input_id": "b" * 64, "message_id": str(uuid.uuid4())},
+            owner_id=self.owner, tenant_id=self.tenant)
+
+    def test_v3_scheduler_reply_cancel_deadline_and_reference_validation(self):
+        task, reply = self.manual_question_operation()
+        _, refs, _, _ = self.outbound_files()
+        malformed = ({"input_id": "bad"}, {"outgoing_files": [{**refs[0], "tenant_id": "foreign"}]},
+                     {"request_provenance": {"version": 3, "sources": {}}}, {"task": ""})
+        # Restore the original ownership; outbound_files produced a different source run.
+        owner = task.owner_id
+        for changes in malformed:
+            with self.assertRaises(CoreError) as error:
+                self.scheduler.queue_remote_reply(task.id, {**reply, **changes}, owner_id=owner, tenant_id=self.tenant)
+            self.assertEqual(error.exception.code, "CHECKPOINT_INVALID")
+        self.scheduler.cancel(task.id, owner_id=owner, tenant_id=self.tenant)
+        with self.assertRaises(CoreError) as error:
+            self.scheduler.queue_remote_reply(task.id, reply, owner_id=owner, tenant_id=self.tenant)
+        self.assertEqual(error.exception.code, "CANCEL_REQUESTED")
+        self.assertIsNone(self.scheduler.remote_input(task.id, owner_id=owner, tenant_id=self.tenant))
         self.assertEqual(self.calls, [])
 
     def test_v2_send_and_recovery_use_frozen_source_files_and_pinned_limit(self):
@@ -666,6 +857,10 @@ class PostgresRemoteOutboundTests(unittest.TestCase):
     settle = RemoteOperationTests.settle
     outbound_files = RemoteOperationTests.outbound_files
 
+    manual_question_operation = RemoteOperationTests.manual_question_operation
+    test_v3_scheduler_atomic_reply_admission_safe_notifications_and_scope = RemoteOperationTests.test_v3_scheduler_atomic_reply_admission_safe_notifications_and_scope
+    test_v3_scheduler_checkpoint_transitions_reject_mutation_and_deliver_new_question_once = RemoteOperationTests.test_v3_scheduler_checkpoint_transitions_reject_mutation_and_deliver_new_question_once
+
     def setUp(self):
         RemoteOperationTests.setUp(self)
         self.database = PostgresDatabase(os.environ["TEST_DATABASE_URL"], min_size=0, max_size=1)
@@ -688,6 +883,127 @@ class PostgresRemoteOutboundTests(unittest.TestCase):
         self.task_ids.append(task.id)
         self.settle()
         return self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant)
+
+    def test_v3_reply_deadline_after_admission_rolls_back_whole_transaction(self):
+        task, reply = self.manual_question_operation()
+        with self.database.transaction() as connection:
+            before = connection.execute("""UPDATE core_background_tasks SET checkpoint=jsonb_set(checkpoint,
+                '{deadline}', to_jsonb(EXTRACT(EPOCH FROM clock_timestamp())::double precision + 0.15))
+                WHERE id=%s RETURNING revision,checkpoint,remote_observed_until""", (task.id,)).fetchone()
+        def too_late(connection):
+            self.assertIsNotNone(connection)
+            connection.execute("UPDATE core_background_tasks SET remote_observed_until=123 WHERE id=%s", (task.id,))
+            connection.execute("SELECT pg_sleep(0.2)")
+        with self.assertRaises(CoreError) as error:
+            self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant, admission=too_late)
+        self.assertEqual(error.exception.code, "REMOTE_OPERATION_TIMEOUT")
+        with self.database.pool.connection() as connection:
+            after = connection.execute("SELECT revision,checkpoint,remote_observed_until FROM core_background_tasks WHERE id=%s", (task.id,)).fetchone()
+        self.assertEqual(after, before)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.scheduler.expire_remote(tenant_id=self.tenant), 1)
+        expired = self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant)
+        self.assertEqual((expired.state, expired.error.code), ("failed", "REMOTE_OPERATION_TIMEOUT"))
+
+    def test_native_v3_question_reply_wire_and_new_pool_recovery_preserve_original_task(self):
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            with self.subTest(binding=binding):
+                _, refs, service, _ = self.outbound_files()
+                self.blob_ids.extend(ref["blob_id"] for ref in refs)
+                received = []
+                test = self
+                class Peer(BaseHTTPRequestHandler):
+                    def log_message(self, *_args):
+                        pass
+
+                    def respond(self, payload=None):
+                        method = (payload or {}).get("method") or ("GetTask" if self.command == "GET" else "SendMessage")
+                        body = payload.get("params", payload) if payload else None
+                        received.append((method, body))
+                        sends = sum(item[0] == "SendMessage" for item in received)
+                        with test.database.pool.connection() as connection:
+                            row = connection.execute("SELECT checkpoint FROM core_background_tasks WHERE id=%s", (operation_id,)).fetchone()
+                        if method == "SendMessage":
+                            assert row["checkpoint"]["send_started"]
+                            if sends == 2:
+                                assert row["checkpoint"]["reply"]["status"] == "started"
+                            remote = {"id": "native-task", "contextId": "native-context",
+                                "status": {"state": "TASK_STATE_INPUT_REQUIRED" if sends == 1 else "TASK_STATE_WORKING"}}
+                            if sends == 1:
+                                remote["status"]["message"] = {"messageId": "question-1", "role": "ROLE_AGENT", "parts": [{"text": "Which city?"}]}
+                            result = {"task": remote}
+                        else:
+                            result = {"id": "native-task", "contextId": "native-context", "status": {
+                                "state": "TASK_STATE_COMPLETED", "message": {
+                                    "messageId": "answer", "role": "ROLE_AGENT", "parts": [{"text": "Delivered"}]}}}
+                        if binding == "JSONRPC":
+                            result = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
+                        encoded = json.dumps(result).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(encoded)))
+                        self.end_headers()
+                        self.wfile.write(encoded)
+
+                    def do_POST(self):
+                        self.respond(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+
+                    def do_GET(self):
+                        self.respond()
+                server = ThreadingHTTPServer(("127.0.0.1", 0), Peer)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                self.addCleanup(thread.join, 2)
+                self.addCleanup(server.server_close)
+                self.addCleanup(server.shutdown)
+                updated = self.registry.update(self.tenant, self.peer["id"],
+                    {"url": "http://127.0.0.1:%s/a2a" % server.server_port,
+                     "description": "Delivery", "enabled": True, "header_name": "Authorization", "header_value": "Bearer private-key"},
+                    expected_revision=self.peer["revision"], actor_id="owner")
+                self.peer = updated
+                self.contract.update(version=3, outgoing_files=[], peer_revision=updated["revision"], url=updated["url"], binding=binding)
+                operation_id = str(uuid.uuid4())
+                self.task_ids.append(operation_id)
+                with patch("core_agent.remote_operations.RemoteAgentConnection", RemoteAgentConnection):
+                    task = self.scheduler.start_remote(self.contract, owner_id=self.owner, tenant_id=self.tenant, task_id=operation_id)
+                    self.settle()
+                    pending = self.scheduler.remote_input(task.id, owner_id=self.owner, tenant_id=self.tenant)
+                    self.assertIsNotNone(pending)
+                    self.assertEqual(pending["question"], "Which city?")
+                    with self.database.pool.connection() as connection:
+                        original = connection.execute("SELECT checkpoint FROM core_background_tasks WHERE id=%s", (task.id,)).fetchone()["checkpoint"]
+                    reply = {"input_id": pending["input_id"], "message_id": str(uuid.uuid4()), "task": "Kazan",
+                             "outgoing_files": [], "request_provenance": {"version": 1, "sources": {}}}
+                    self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant)
+                    self.scheduler.close()
+                    restarted = PostgresDatabase(os.environ["TEST_DATABASE_URL"], min_size=0, max_size=1)
+                    self.addCleanup(restarted.close)
+                    self.scheduler = PostgresTaskScheduler(restarted)
+                    self.addCleanup(self.scheduler.close)
+                    self.scheduler.register("remote_a2a", RemoteA2AExecutor(self.scheduler, self.registry, service))
+                    self.assertEqual(self.scheduler.recover(tenant_id=self.tenant), 1)
+                    self.settle()
+                    self.scheduler.queue_remote_reply(task.id, reply, owner_id=self.owner, tenant_id=self.tenant)
+                    with restarted.transaction() as connection:
+                        confirmed = connection.execute("SELECT checkpoint FROM core_background_tasks WHERE id=%s", (task.id,)).fetchone()["checkpoint"]
+                        self.assertEqual(confirmed["reply"]["status"], "confirmed")
+                        self.assertEqual(confirmed["deadline"], original["deadline"])
+                        connection.execute("""UPDATE core_background_tasks SET checkpoint=jsonb_set(checkpoint, '{next_poll_at}',
+                            to_jsonb(EXTRACT(EPOCH FROM clock_timestamp())::double precision - 1)) WHERE id=%s""", (task.id,))
+                    self.scheduler.close()
+                    self.scheduler = PostgresTaskScheduler(restarted)
+                    self.addCleanup(self.scheduler.close)
+                    self.scheduler.register("remote_a2a", RemoteA2AExecutor(self.scheduler, self.registry, service))
+                    self.assertEqual(self.scheduler.recover(tenant_id=self.tenant), 1)
+                    self.settle()
+                    terminal = self.scheduler.get(task.id, owner_id=self.owner, tenant_id=self.tenant)
+                    self.assertEqual((terminal.state, terminal.result["text"]), ("completed", "Delivered"), getattr(terminal.error, "code", None))
+                self.assertEqual([item[0] for item in received], ["SendMessage", "SendMessage", "GetTask"])
+                messages = [body["message"] for method, body in received if method == "SendMessage"]
+                self.assertNotIn("taskId", messages[0])
+                self.assertEqual((messages[1]["taskId"], messages[1]["contextId"], messages[1]["messageId"]),
+                                 ("native-task", "native-context", reply["message_id"]))
+                self.assertEqual(messages[1]["parts"], [{"text": "Kazan"}])
 
     def test_adaptive_polling_recovers_saved_age_through_new_database_pool(self):
         self.contract.update(timeout_seconds=86400, poll_interval_seconds=300)

@@ -3,6 +3,7 @@ import asyncio
 import copy
 import json
 import threading
+from dataclasses import replace
 from contextvars import copy_context
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -296,3 +297,269 @@ class RemoteRuntimeTests(AuthAppTestCase):
         self.assertEqual(waits.json()["interactions"][0]["kind"], "guardrail")
         self.assertEqual(len(model.calls), 1)
         self.assertEqual(self.sent.call_count, 1)
+
+    async def test_public_question_owner_answer_replies_to_original_operation(self):
+        from core_agent.owner_api import interaction_digest
+        question = "Which city should receive the parcel?"
+        self.sent.side_effect = [replace(RemoteEvent("task", "TASK_STATE_INPUT_REQUIRED", question, False,
+            ({"text": question},), "peer-task", "peer-context"),
+            public_messages=({"text": question},), input_request={"input_id": "a" * 64, "question": question}),
+            replace(RemoteEvent("task", "TASK_STATE_COMPLETED", "Delivered to Kazan", True,
+                ({"text": "Delivered to Kazan"},), "peer-task", "peer-context"),
+                public_messages=({"text": "Delivered to Kazan"},))]
+        model = self.script(self.request(),
+            ModelResponse(tool_requests=(ToolRequest("owner", "core_ask_owner", {"question": question}),)),
+            ModelResponse(message="reply placeholder"), ModelResponse(message="wait placeholder"), ModelResponse(message="done"))
+        original = model.generate
+        original_start = self.agent.task_scheduler.start_remote
+        def settle_start(*args, **kwargs):
+            task = original_start(*args, **kwargs)
+            with self.agent.task_scheduler._lock:
+                workers = tuple(self.agent.task_scheduler._threads)
+            for worker in workers:
+                worker.join(3)
+            return self.agent.task_scheduler.get(task.id, owner_id=kwargs["owner_id"], tenant_id=kwargs["tenant_id"])
+        self.agent.task_scheduler.start_remote = settle_start
+        handles = []
+        def next_call(**kwargs):
+            if len(model.calls) == 3:
+                self.agent.task_scheduler.recover()
+            with self.agent.task_scheduler._lock:
+                workers = tuple(self.agent.task_scheduler._threads)
+            for worker in workers:
+                worker.join(3)
+            if len(model.calls) == 1:
+                handles.extend(self.agent.task_scheduler._remote)
+            elif len(model.calls) == 2:
+                model._responses[0] = ModelResponse(tool_requests=(ToolRequest("reply", "core_agent_send_message",
+                    {"agent_name": "delivery", "task": "Kazan", "task_id": handles[0], "input_id": "a" * 64}),))
+            elif len(model.calls) == 3:
+                model._responses[0] = ModelResponse(tool_requests=(ToolRequest("wait-final", "core_task_wait", {"task_id": handles[0]}),))
+            return original(**kwargs)
+        model.generate = next_call
+        task = await self.submit("external-a", "public-question", "public-question-chat")
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(record.state, "WAITING_INPUT", record.error_code)
+        self.assertIn(question, model.calls[1].context)
+        self.assertEqual(self.sent.call_count, 1)
+        operation = self.agent.task_scheduler.get(handles[0], owner_id=record.run_id, tenant_id=self.tenant)
+        deadline = self.agent.task_scheduler._remote[operation.id]["checkpoint"]["deadline"]
+        self.assertEqual(operation.state, "working", str(operation.error))
+        wait = self.agent.workflow_store.get_wait(record.snapshot["wait_id"], tenant_id=self.tenant)
+        self.assertEqual(wait.kind, "owner_question")
+        policy = self.agent.interaction_store.get_policy(self.tenant, "core_agent_send_message", "builtin:core_agent_send_message")
+        self.agent.interaction_store.update_policy(self.tenant, "core_agent_send_message", policy.origin,
+            mode="require_hitl", guardrails_exempt=False, expected_revision=policy.revision, actor_id="alice")
+        response = await self.http.post(f"/api/questions/{wait.wait_id}/answer", headers=self.headers("owner-a"),
+            json={"answer": "Kazan", "subject_digest": interaction_digest(wait)})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.registry.delete(self.tenant, self.peer["id"], expected_revision=1, actor_id="alice")
+        await asyncio.to_thread(self.agent.resume_task, task["id"])
+        approval_record = self.agent.workflow_store.lookup_task(task["id"])
+        approval = self.agent.workflow_store.get_wait(approval_record.snapshot["wait_id"], tenant_id=self.tenant)
+        self.assertEqual(approval.kind, "tool_approval")
+        self.assertEqual(approval.subject["remote_binding"]["task"], "Kazan")
+        self.assertEqual(approval.subject["remote_binding"]["operation_id"], handles[0])
+        self.assertEqual(approval.subject["remote_binding"]["peer_revision"], 1)
+        self.assertEqual(self.sent.call_count, 1)
+        allowed = await self.http.post(f"/api/hitl/{approval.wait_id}/decision", headers=self.headers("owner-a"),
+            json={"decision": "allow", "subject_digest": interaction_digest(approval)})
+        self.assertEqual(allowed.status_code, 200, allowed.text)
+        await asyncio.to_thread(self.agent.resume_task, task["id"])
+        final = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(final.state, "COMPLETED", final.error_code)
+        self.assertEqual(len(self.agent.task_scheduler.list(owner_id=record.run_id, tenant_id=self.tenant)), 1)
+        self.assertEqual(self.sent.call_count, 2)
+        self.assertEqual(self.sent.call_args.kwargs["task"], "Kazan")
+        self.assertEqual(self.sent.call_args.kwargs["task_id"], "peer-task")
+        self.assertEqual(self.sent.call_args.kwargs["context_id"], "peer-context")
+        self.assertEqual(self.agent.task_scheduler._remote[operation.id]["checkpoint"]["deadline"], deadline)
+        self.assertEqual(final.snapshot["remote_inputs_seen"], [[handles[0], "a" * 64]])
+        self.assertIn("Delivered to Kazan", model.calls[-1].context)
+        self.assertNotIn("core_ask_owner", json.dumps(task))
+        replay = copy.deepcopy(final.snapshot)
+        replay["tool_calls"] = replay["remote_admission"]["attempt"]
+        receipt = self.agent._start_remote_operation((final, replay, ToolCall("reply", "core_agent_send_message",
+            {"agent_name": "delivery", "task": "Kazan", "task_id": handles[0], "input_id": "a" * 64}), None))
+        self.assertEqual(receipt["task_id"], handles[0])
+        self.assertEqual(receipt["input_id"], "a" * 64)
+        self.assertEqual(receipt["reply_delivery"], "confirmed")
+        self.assertEqual(self.sent.call_count, 2)
+
+    async def test_late_public_question_wakes_wait_once_without_replaying_snapshot(self):
+        now = [1_800_000_000.0]
+        self.agent.task_scheduler.clock = lambda: now[0]
+        self.sent.return_value = RemoteEvent("task", "TASK_STATE_WORKING", "", False, (), "remote-task", "remote-chat")
+        model = self.script(self.request(), ModelResponse(message="wait placeholder"), ModelResponse(message="wait again"))
+        original = model.generate
+        handles = []
+        def next_call(**kwargs):
+            if len(model.calls) == 1:
+                with self.agent.task_scheduler._lock:
+                    workers = tuple(self.agent.task_scheduler._threads)
+                for worker in workers:
+                    worker.join(3)
+                handles.extend(self.agent.task_scheduler._remote)
+                model._responses[0] = ModelResponse(tool_requests=(ToolRequest("wait", "core_task_wait", {"task_id": handles[0]}),))
+            return original(**kwargs)
+        model.generate = next_call
+        task = await self.submit("owner-a", "late-question", "late-question-chat")
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(record.state, "WAITING_TASK")
+        first_wait = record.snapshot["wait_id"]
+        question = replace(RemoteEvent("task", "TASK_STATE_INPUT_REQUIRED", "Which order?", False, (), "remote-task", "remote-chat"),
+            input_request={"input_id": "b" * 64, "question": "Which order?"})
+        with patch.object(RemoteAgentConnection, "get_task", return_value=question), patch.object(
+                self.agent, "_launch_recovery", return_value=False):
+            now[0] += 11
+            self.agent.task_scheduler.recover()
+            with self.agent.task_scheduler._lock:
+                workers = tuple(self.agent.task_scheduler._threads)
+            for worker in workers:
+                worker.join(3)
+            await asyncio.to_thread(self.agent._recover_workflows_once)
+            wait = self.agent.workflow_store.get_wait(first_wait, tenant_id=self.tenant)
+            self.assertEqual(wait.outcome["result"]["question"], "Which order?")
+            self.assertEqual(wait.outcome["result"]["input_id"], "b" * 64)
+            self.assertEqual(wait.outcome["result"]["state"], "working")
+            model._responses[0] = ModelResponse(tool_requests=(ToolRequest("wait-again", "core_task_wait", {"task_id": handles[0]}),))
+            await asyncio.to_thread(self.agent.resume_task, task["id"])
+            current = self.agent.workflow_store.lookup_task(task["id"])
+            self.assertEqual(current.state, "WAITING_TASK")
+            self.assertEqual(current.snapshot["remote_inputs_seen"], [[handles[0], "b" * 64]])
+            self.assertIn("Which order?", model.calls[-1].context)
+            now[0] += 11
+            self.agent.task_scheduler.recover()
+            with self.agent.task_scheduler._lock:
+                workers = tuple(self.agent.task_scheduler._threads)
+            for worker in workers:
+                worker.join(3)
+            await asyncio.to_thread(self.agent._recover_workflows_once)
+            repeated = self.agent.workflow_store.get_wait(current.snapshot["wait_id"], tenant_id=self.tenant)
+            self.assertIsNone(repeated.outcome)
+            self.assertEqual(len(model.calls), 3)
+        await asyncio.to_thread(self.agent.cancel_task, task["id"])
+
+    async def test_public_question_nested_python_wait_stops_remainder(self):
+        now = [1_800_000_000.0]
+        self.agent.task_scheduler.clock = lambda: now[0]
+        self.sent.return_value = RemoteEvent("task", "TASK_STATE_WORKING", "", False, (), "remote-task", "remote-chat")
+        prefix, remainder, stopped = [], [], []
+        def execute(manager, **kwargs):
+            prefix.append("prefix")
+            result = ExecutionResult(-9, "prefix output", "", (), (), status="failed", cleanup="sandbox_terminated")
+            session = SimpleNamespace(cancel=lambda _: stopped.append("stopped"), wait=lambda *_: result)
+            kwargs["on_start"](session, SimpleNamespace(id="process"))
+            with self.agent.task_scheduler._lock:
+                handle = next(iter(self.agent.task_scheduler._remote))
+            now[0] += 11
+            self.agent.task_scheduler.recover()
+            with self.agent.task_scheduler._lock:
+                workers = tuple(self.agent.task_scheduler._threads)
+            for worker in workers:
+                worker.join(3)
+            def nested():
+                try:
+                    kwargs["dispatch"]("core_task_wait", {"task_id": handle}, "stable-question-wait")
+                    remainder.append("ran")
+                except PythonContinuationStopped:
+                    pass
+            thread = threading.Thread(target=copy_context().run, args=(nested,))
+            thread.start()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            return result
+        model = self.script(self.request(),
+            ModelResponse(tool_requests=(ToolRequest("python", "core_python_exec", {"code": "pass"}),)),
+            ModelResponse(tool_requests=(ToolRequest("owner", "core_ask_owner", {"question": "Which order?"}),)))
+        event = replace(RemoteEvent("task", "TASK_STATE_INPUT_REQUIRED", "Which order?", False, (), "remote-task", "remote-chat"),
+            input_request={"input_id": "c" * 64, "question": "Which order?"})
+        with patch("core_agent.runtime.execute_python", side_effect=execute), patch.object(
+                RemoteAgentConnection, "get_task", return_value=event):
+            task = await self.submit("owner-a", "python-question", "python-question-chat")
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(record.state, "WAITING_INPUT", record.error_code)
+        self.assertEqual((prefix, remainder, stopped), (["prefix"], [], ["stopped"]))
+        self.assertIn("PYTHON_CONTINUATION_INTERRUPTED", model.calls[-1].context)
+        self.assertIn("Which order?", model.calls[-1].context)
+        self.assertEqual(record.snapshot["remote_inputs_seen"], [[next(iter(self.agent.task_scheduler._remote)), "c" * 64]])
+        await asyncio.to_thread(self.agent.cancel_task, task["id"])
+
+    async def test_nested_task_get_question_is_not_delivered_again_by_mailbox(self):
+        now = [1_800_000_000.0]
+        self.agent.task_scheduler.clock = lambda: now[0]
+        self.sent.return_value = RemoteEvent("task", "TASK_STATE_WORKING", "", False, (), "remote-task", "remote-chat")
+        def execute(manager, **kwargs):
+            with self.agent.task_scheduler._lock:
+                handle = next(iter(self.agent.task_scheduler._remote))
+            now[0] += 11
+            self.agent.task_scheduler.recover()
+            with self.agent.task_scheduler._lock:
+                workers = tuple(self.agent.task_scheduler._threads)
+            for worker in workers:
+                worker.join(3)
+            answer = kwargs["dispatch"]("core_task_get", {"task_id": handle}, "read-public-question")
+            self.assertEqual(answer["result"]["question"], "Which order?")
+            return ExecutionResult(0, json.dumps(answer), "", (), ())
+        model = self.script(self.request(),
+            ModelResponse(tool_requests=(ToolRequest("python", "core_python_exec", {"code": "pass"}),)),
+            ModelResponse(tool_requests=(ToolRequest("owner", "core_ask_owner", {"question": "Which order?"}),)))
+        event = replace(RemoteEvent("task", "TASK_STATE_INPUT_REQUIRED", "Which order?", False, (), "remote-task", "remote-chat"),
+            input_request={"input_id": "d" * 64, "question": "Which order?"})
+        with patch("core_agent.runtime.execute_python", side_effect=execute), patch.object(
+                RemoteAgentConnection, "get_task", return_value=event):
+            task = await self.submit("owner-a", "python-get-question", "python-get-question-chat")
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(record.state, "WAITING_INPUT", record.error_code)
+        notifications = [json.loads(item["content"]) for item in record.snapshot["context"]["transcript"]
+            if item["kind"] == "task_notification"]
+        self.assertFalse(any(item["task_notification"].get("public_input") for item in notifications))
+        self.assertEqual(record.snapshot["remote_inputs_seen"], [[next(iter(self.agent.task_scheduler._remote)), "d" * 64]])
+        self.assertIn("Which order?", model.calls[-1].context)
+        await asyncio.to_thread(self.agent.cancel_task, task["id"])
+
+    async def test_rejected_public_question_is_not_repeated_by_wait_or_mailbox(self):
+        from core_agent.guardrails import GuardrailClassifier
+        from core_agent.owner_api import interaction_digest
+        class Detector:
+            def count_tokens(self, text):
+                return len(text)
+            def generate(self, **kwargs):
+                return ModelResponse(message=json.dumps({"verdict": "suspicious" if "question-canary" in kwargs["context"] else "clear"}), finish_reason="stop")
+        self.agent.guardrail_classifier = GuardrailClassifier(Detector())
+        self.sent.return_value = replace(RemoteEvent("task", "TASK_STATE_INPUT_REQUIRED", "question-canary", False,
+            (), "remote-task", "remote-chat"), input_request={"input_id": "e" * 64, "question": "question-canary"})
+        original_start = self.agent.task_scheduler.start_remote
+        def settled(*args, **kwargs):
+            task = original_start(*args, **kwargs)
+            with self.agent.task_scheduler._lock:
+                workers = tuple(self.agent.task_scheduler._threads)
+            for worker in workers:
+                worker.join(3)
+            return self.agent.task_scheduler.get(task.id, owner_id=kwargs["owner_id"], tenant_id=kwargs["tenant_id"])
+        self.agent.task_scheduler.start_remote = settled
+        model = self.script(self.request(), ModelResponse(message="wait placeholder"))
+        generate = model.generate
+        def next_call(**kwargs):
+            if len(model.calls) == 1:
+                handle = next(iter(self.agent.task_scheduler._remote))
+                model._responses[0] = ModelResponse(tool_requests=(ToolRequest("wait", "core_task_wait", {"task_id": handle}),))
+            return generate(**kwargs)
+        model.generate = next_call
+        task = await self.submit("owner-a", "rejected-question", "rejected-question-chat")
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(record.state, "WAITING_INPUT", record.error_code)
+        self.assertEqual(len(model.calls), 1)
+        wait = self.agent.workflow_store.get_wait(record.snapshot["wait_id"], tenant_id=self.tenant)
+        self.assertEqual(wait.kind, "guardrail")
+        response = await self.http.post(f"/api/guardrails/{wait.wait_id}/decision", headers=self.headers("owner-a"),
+            json={"decision": "reject", "subject_digest": interaction_digest(wait)})
+        self.assertEqual(response.status_code, 200, response.text)
+        await asyncio.to_thread(self.agent.resume_task, task["id"])
+        current = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(current.state, "WAITING_TASK", current.error_code)
+        self.assertNotIn("question-canary", model.calls[-1].context)
+        self.assertIn("MATERIAL_REJECTED", model.calls[-1].context)
+        self.assertEqual(current.snapshot["remote_inputs_seen"], [[next(iter(self.agent.task_scheduler._remote)), "e" * 64]])
+        self.assertEqual(len(model.calls), 2)
+        await asyncio.to_thread(self.agent.cancel_task, task["id"])

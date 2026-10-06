@@ -94,11 +94,16 @@ def merge_observation(saved, observation, now):
     used = sum(len(message["text"].encode("utf-8")) for message in messages)
     changed = False
     for message in observation["messages"]:
-        if (not isinstance(message, dict) or message.keys() != {"id", "text"}
+        if (not isinstance(message, dict) or not {"id", "text"} <= message.keys() <= {
+                "id", "text", "direction", "request_provenance"}
                 or not isinstance(message["id"], str) or len(message["id"]) != 64
                 or any(char not in "0123456789abcdef" for char in message["id"])
-                or not isinstance(message["text"], str)):
+                or not isinstance(message["text"], str)
+                or message.get("direction", "incoming") not in {"incoming", "outgoing"}
+                or ("request_provenance" in message and message.get("direction") != "outgoing")):
             raise CoreError("CHECKPOINT_INVALID")
+        if "request_provenance" in message:
+            validate_request_provenance(message["request_provenance"])
         if message["id"] in identities or not message["text"]:
             continue
         try:
@@ -108,7 +113,7 @@ def merge_observation(saved, observation, now):
         if len(messages) >= MAX_MESSAGES or used + size > MAX_TEXT_BYTES:
             saved["history_truncated"] = True
             continue
-        messages.append({**message, "direction": "incoming", "created_at": now})
+        messages.append({**copy.deepcopy(message), "direction": message.get("direction", "incoming"), "created_at": now})
         identities.add(message["id"])
         used += size
         changed = True
@@ -130,7 +135,7 @@ def _authorized_root(admission, binding, row, connection):
         source_task = contract.get("caller_scope", {}).get("task_id")
         records = _caller_records(admission.agent.workflow_store, binding, row["owner_run_id"],
                                    source_task, connection=connection)
-        if contract["version"] == 2 and contract["caller_scope"] != {
+        if contract["version"] >= 2 and contract["caller_scope"] != {
                 key: getattr(records[-1], key) for key in ("owner_id", "context_id", "task_id", "run_id")}:
             raise CoreError("TASK_NOT_FOUND")
         _root(admission, records[0].run_id, binding.tenant_id,
@@ -256,6 +261,9 @@ def _visibility(agent, admission, binding, row, source, connection, outgoing_fil
             materials.extend(_source_materials(admission, dependency_scope,
                 {"version": 1, "sources": {key: value}}, connection, chat))
     incoming_sources = ["result:" + sender] if sender else []
+    # Question reviews outlive the current scheduler result and compacted context.
+    incoming_sources.extend(source_id for source_id in source.snapshot.get("context_materials", {})
+                            if source_id.startswith("remote_input:" + row["id"] + ":"))
     # Legacy jobs use only a surviving causal marker; later unrelated reviews grant no new dependency.
     cutoff = None
     for item in source.snapshot.get("context", {}).get("transcript", ()):
@@ -269,7 +277,8 @@ def _visibility(agent, admission, binding, row, source, connection, outgoing_fil
             continue
         outputs = value.get("output")
         outputs = outputs if isinstance(outputs, list) else [outputs]
-        if any(isinstance(output, dict) and output.get("task_id") == row["id"] for output in outputs):
+        if (any(isinstance(output, dict) and output.get("task_id") == row["id"] for output in outputs)
+                and (value.get("tool_name") != "core_agent_send_message" or value["tool_call_id"] == sender)):
             incoming_sources.extend(["result:" + value["tool_call_id"], "arguments:" + value["tool_call_id"]])
             if value.get("tool_name") == "core_agent_send_message":
                 sender = sender or value["tool_call_id"]
@@ -281,7 +290,8 @@ def _visibility(agent, admission, binding, row, source, connection, outgoing_fil
     result = row["result"] or {}
     incoming_materials = list(incoming_materials)
     incoming_materials.extend(_json_identity(message["text"]) for message in
-                              (row.get("remote_conversation") or initial_conversation())["messages"])
+                              (row.get("remote_conversation") or initial_conversation())["messages"]
+                              if message.get("direction", "incoming") == "incoming")
     incoming_materials.append(_json_identity(remote_result_projection(result)))
     if isinstance(result.get("text"), str):
         incoming_materials.append(_json_identity(result["text"]))
@@ -290,13 +300,15 @@ def _visibility(agent, admission, binding, row, source, connection, outgoing_fil
     return _review_status(request_reviews), incoming
 
 
-def _outgoing_files(agent, binding, row, source, connection):
+def _outgoing_files(agent, binding, row, source, connection, reply=None):
     from .response_files import ResponseFileService
 
     contract = row["contract"]
-    if not row["checkpoint"]["send_started"] or contract["version"] != 2 or not contract["outgoing_files"]:
+    refs = reply["outgoing_files"] if reply is not None else contract.get("outgoing_files", [])
+    if (not row["checkpoint"]["send_started"] or contract["version"] < 2 or not refs
+            or reply is not None and reply.get("status") != "confirmed"):
         return [], ()
-    refs = ResponseFileService.validate_refs(binding, contract["outgoing_files"],
+    refs = ResponseFileService.validate_refs(binding, refs,
         task_id=source.task_id, run_id=source.run_id, limit_bytes=contract["attachment_limit_bytes"])
     receipts = list(ResponseFileService.receipts(refs))
     if agent.response_files_service is None:
@@ -309,6 +321,94 @@ def _outgoing_files(agent, binding, row, source, connection):
         if error.code == "ARTIFACT_INTEGRITY_FAILED":
             return receipts, None
         raise
+
+
+def _replies(row, source):
+    """Frozen reply grants are confirmed by the atomically saved observation."""
+    values = {}
+    for key, entry in source.snapshot.get("remote_calls", {}).items():
+        if entry.get("operation_id") == row["id"] and entry.get("reply"):
+            reply = entry["reply"]
+            identity = public_identity("outgoing:" + reply["message_id"], reply["task"])
+            values[identity] = (reply, key.split(":", 1)[1])
+    latest = row["checkpoint"].get("reply")
+    if latest:
+        identity = public_identity("outgoing:" + latest["message_id"], latest["task"])
+        values[identity] = (latest, values.get(identity, ({}, None))[1])
+    observed = {message["id"] for message in (row.get("remote_conversation") or initial_conversation())["messages"]
+                if message.get("direction") == "outgoing"}
+    return {identity: ({**reply, "status": reply.get("status", "confirmed" if identity in observed else "queued")}, sender)
+            for identity, (reply, sender) in values.items()}
+
+
+def _reply_status(agent, admission, binding, source, connection, reply, sender, files, loaded):
+    from .chat_files import _caller_records
+    from .history import _json_identity, _reviews, _review_status, _source_materials
+
+    if agent.material_review_store is None:
+        return None
+    materials = [_json_identity(reply["task"])]
+    if loaded is not None:
+        materials.extend(_file_identity(entry, content) for entry, content in loaded)
+    else:
+        materials.extend(_file_identity(entry) for entry in files)
+    provenance = reply["request_provenance"]
+    validate_request_provenance(provenance)
+    records = _caller_records(agent.workflow_store, binding, source.run_id, source.task_id, connection=connection)
+    lineage = {record.run_id: record for record in records}
+    chat = {"owner_id": binding.owner_id, "context_id": binding.context_id}
+    for key, value in provenance["sources"].items():
+        materials.extend(_source_materials(admission, _scope_record(lineage.get(value["run_id"], records[0])),
+            {"version": 1, "sources": {key: value}}, connection, chat))
+    return _review_status(_reviews(admission, _scope_record(source), ["arguments:" + sender] if sender else [],
+        [value["review_id"] for value in materials if value.get("review_id")], materials, [], connection))
+
+
+def _project_messages(agent, admission, binding, row, source, connection, request_status, incoming_status):
+    replies = _replies(row, source)
+    messages, statuses, blocked = [], [], bool(request_status)
+    for message in (row.get("remote_conversation") or initial_conversation())["messages"]:
+        outgoing = message.get("direction", "incoming") == "outgoing"
+        if not outgoing:
+            if not blocked and not incoming_status:
+                messages.append({key: message[key] for key in ("id", "direction", "text", "created_at")})
+            continue
+        grant = replies.get(message["id"])
+        receipts, loaded = _outgoing_files(agent, binding, row, source, connection, grant[0]) if grant else ([], ())
+        reply = grant[0] if grant else {"task": message["text"], "request_provenance": message.get(
+            "request_provenance", {"version": 1, "sources": {}})}
+        status = _reply_status(agent, admission, binding, source, connection, reply,
+            grant[1] if grant else None, receipts, loaded)
+        if status:
+            statuses.append(status)
+            blocked = True  # Following peer messages causally depend on this reply.
+        if blocked:
+            continue
+        messages.append({key: message[key] for key in ("id", "direction", "text", "created_at")} | {
+            "request_delivery": "confirmed" if grant and grant[0]["status"] == "confirmed" else "unconfirmed",
+            "outgoing_files": receipts,
+            "outgoing_files_status": "unavailable" if loaded is None else "available" if loaded else "none"})
+    return messages, statuses, blocked
+
+
+def _artifact_receipts(agent, binding, row, files, connection):
+    if not files:
+        return [], None
+    batch = agent.chat_file_service.store.get(row["result"]["file_batch_id"], binding.tenant_id, connection=connection)
+    manifest = batch["manifest"]
+    indexed = {entry["relative_path"]: entry for entry in files}
+    artifacts = []
+    for artifact in manifest.get("artifacts", ()):
+        parts = []
+        for part in artifact["parts"]:
+            entry = indexed.get(part["relative_path"])
+            if entry is None or (entry["sha256"], entry["size_bytes"]) != (part["sha256"], part["size_bytes"]):
+                raise CoreError("CHECKPOINT_INVALID")
+            parts.append({key: part[key] for key in ("index", "type", "name", "media_type", "relative_path", "size_bytes", "sha256")})
+        artifacts.append({"index": artifact["index"], "artifact_id": artifact["artifact_id"],
+                          "name": artifact["name"], "parts": parts})
+    path = manifest.get("manifest_path")
+    return artifacts, path if path in indexed else None
 
 
 def read_outgoing_file(agent, admission, binding, operation_id, file_id):
@@ -324,14 +424,23 @@ def read_outgoing_file(agent, admission, binding, operation_id, file_id):
             row = rows[0]
             _root, source = _authorized_root(admission, binding, row, connection)
             receipts, loaded = _outgoing_files(agent, binding, row, source, connection)
-            request_status, _incoming = _visibility(agent, admission, binding, row, source, connection, receipts, loaded, [])
-            if request_status:
-                raise CoreError("FILE_NOT_FOUND")
-            if not any(entry["file_id"] == file_id for entry in receipts):
-                raise CoreError("FILE_NOT_FOUND")
-            if loaded is None:
-                raise CoreError("ARTIFACT_INTEGRITY_FAILED")
-            return next((entry, content) for entry, content in loaded if entry["file_id"] == file_id)
+            request_status, incoming = _visibility(agent, admission, binding, row, source, connection, receipts, loaded, [])
+            visible, _, _ = _project_messages(agent, admission, binding, row, source, connection, request_status, incoming)
+            visible_replies = {message["id"] for message in visible if message["direction"] == "outgoing"}
+            payloads = [(receipts, loaded, request_status)]
+            for identity, (reply, sender) in _replies(row, source).items():
+                if identity not in visible_replies:
+                    continue
+                reply_files, reply_loaded = _outgoing_files(agent, binding, row, source, connection, reply)
+                payloads.append((reply_files, reply_loaded, request_status or _reply_status(
+                    agent, admission, binding, source, connection, reply, sender, reply_files, reply_loaded)))
+            for files, contents, status in payloads:
+                if status or not any(entry["file_id"] == file_id for entry in files):
+                    continue
+                if contents is None:
+                    raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+                return next((entry, content) for entry, content in contents if entry["file_id"] == file_id)
+            raise CoreError("FILE_NOT_FOUND")
 
 
 def read_conversations(agent, admission, binding, *, limit=50, after=None, operation_id=None):
@@ -361,7 +470,6 @@ def read_conversations(agent, admission, binding, *, limit=50, after=None, opera
                             continue
                         raise
                     conversation = row.get("remote_conversation") or initial_conversation()
-                    messages = conversation["messages"]
                     checkpoint, contract = row["checkpoint"], row["contract"]
                     incoming_materials = []
                     files = _files(agent, binding, row, source, connection, incoming_materials)
@@ -370,9 +478,12 @@ def read_conversations(agent, admission, binding, *, limit=50, after=None, opera
                         connection, outgoing_files, loaded, incoming_materials)
                     if request_status:
                         outgoing_files, loaded = [], ()
-                    if request_status or incoming_status:
-                        messages, files = [], []
-                    statuses = [status for status in (request_status, incoming_status) if status]
+                    messages, reply_statuses, reply_blocked = _project_messages(agent, admission, binding, row, source,
+                        connection, request_status, incoming_status)
+                    if request_status or incoming_status or reply_blocked:
+                        files = []
+                    artifacts, manifest_path = _artifact_receipts(agent, binding, row, files, connection)
+                    statuses = [status for status in (request_status, incoming_status, *reply_statuses) if status]
                     status = next((status for status in statuses if status[0] in {"rejected", "timed_out"}),
                                   statuses[0] if statuses else None)
                     delivery = "not_sent"
@@ -387,6 +498,10 @@ def read_conversations(agent, admission, binding, *, limit=50, after=None, opera
                         "error_code": row.get("error_code") if row.get("error_code") in SAFE_REMOTE_ERRORS else None,
                         "outcome_unknown": (row["result"] or {}).get("remote_outcome") == "unknown",
                         "remote_state": (row["result"] or {}).get("remote_state"),
+                        "reply_delivery": {"queued": "queued", "started": "unconfirmed", "confirmed": "confirmed"}.get(
+                            (checkpoint.get("reply") or {}).get("status")),
+                        "waiting_reason": "caller" if checkpoint.get("input_request") else "owner" if
+                            (row["result"] or {}).get("owner_wait") else None,
                         "created_at": row["created_at"], "updated_at": row["updated_at"],
                         "revision": row["revision"], "message_count": len(messages) + bool(checkpoint["send_started"] and not request_status),
                         "last_message": messages[-1]["text"][:240] if messages else "",
@@ -402,7 +517,9 @@ def read_conversations(agent, admission, binding, *, limit=50, after=None, opera
                             request = encoded[:MAX_TEXT_BYTES].decode("utf-8", "ignore")
                         if checkpoint["send_started"] and not request_status:
                             outgoing = [{"id": public_identity("outgoing:" + contract["message_id"], request),
-                                         "direction": "outgoing", "text": request, "created_at": row["created_at"]}]
+                                         "direction": "outgoing", "text": request, "created_at": row["created_at"],
+                                         "request_delivery": delivery, "outgoing_files": outgoing_files,
+                                         "outgoing_files_status": "unavailable" if loaded is None else "available" if loaded else "none"}]
                         detail_messages = outgoing + copy.deepcopy(messages)
                         used, kept, truncated = 0, [], conversation["history_truncated"] or truncated_request
                         for message in detail_messages:
@@ -413,6 +530,7 @@ def read_conversations(agent, admission, binding, *, limit=50, after=None, opera
                             used += size
                             kept.append(message)
                         value.update(messages=kept, files=files, history_truncated=truncated,
+                                     artifacts=artifacts, manifest_path=manifest_path,
                                      outgoing_files=outgoing_files,
                                      outgoing_files_status="unavailable" if loaded is None else "available" if loaded else "none",
                                      observation_expires_at=row.get("remote_observed_until"))

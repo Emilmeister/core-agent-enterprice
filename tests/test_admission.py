@@ -255,7 +255,9 @@ class AuthAdmissionTests(AuthAppTestCase):
         owner_receipt = owner_task["metadata"]["file_receipt"]
         owner_batch = agent.chat_file_service.store.get(owner_receipt["batch_id"], context.tenant)
         self.assertEqual(owner_batch["owner_id"], context.user.user_name)
-        self.assertEqual(owner_receipt["entries"][0]["actual_name"], "report_3.txt")
+        self.assertEqual(owner_receipt["entries"][0]["actual_name"], "report.txt")
+        self.assertEqual(owner_receipt["entries"][0]["relative_path"],
+                         f"a2a/{owner_receipt['batch_id']}/report.txt")
 
     async def test_file_followups_all_bindings_ack_original_receipts_while_model_is_blocked(self):
         started, release = self.block_model()

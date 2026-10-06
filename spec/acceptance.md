@@ -715,3 +715,55 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   полученных, скачиваются из frozen operation snapshots, без unrelated файлов,
   blob refs или private путей. Недоступная копия/неподтверждённая отправка явно
   обозначаются. Legacy remote jobs не выдумывают прошлую переписку.
+
+- ENT-AC-88: public `input-required` без owner marker сохраняет question identity,
+  backend input ID и delivery до уведомления. Sleeping wait просыпается с прежним
+  handle и non-terminal question; busy model/tool не прерывается, delivery идёт
+  на safe boundary. Повторный snapshot/restart не создаёт второй вопрос; новая
+  identity с тем же текстом доставляется отдельно. Guardrails предшествует модели;
+  private/reasoning/пустой вопрос и auth wait не становятся question/credentials.
+- ENT-AC-89: backend строит `core_agent_wait` v1 kind owner только из реального
+  owner input/HITL/guardrails. Get/List, streams, push и recovery legacy waits
+  показывают один safe marker без private вопросов/ответов/arguments/IDs.
+  Получающий агент продолжает ждать и не разрешает foreign HITL/auth. Внешний
+  follow-up не закрывает owner question/approval; targeted HTTP proofs проверяют
+  отсутствие private content во всех публичных проекциях.
+- ENT-AC-90: reply `core_agent_send_message` требует пару local `task_id`/`input_id`,
+  проверяет scope/peer/current input/state/policy, отдельный HITL и frozen files.
+  Half-pair, foreign/stale/wrong-peer/terminal/cancel/expired ответы не отправляются.
+  JSONRPC и HTTP+JSON используют первоначальные remote IDs/pinned credentials,
+  прежний local handle/deadline/send age/budgets. Durable queued и confirmed
+  различаются; replay admitted call не создаёт второй Send, unknown требует
+  reconciliation. Real PostgreSQL restart до/после question delivery, reply
+  admission/intent/confirmation и private owner wait не повторяет мутацию либо
+  nested Python prefix/remainder. Contracts v1/v2, checkpoint v1 и новые v3/v2
+  совместимы; неизвестная/повреждённая версия fail closed.
+- ENT-AC-91: text-only, JSON-only, mixed/empty-file и multiple typed Artifacts
+  сохраняют artifact ID/name и ordered part identity в versioned manifest.
+  Public text/data/file Parts становятся точными UTF-8/JSON/binary файлами под
+  `a2a/<local-operation-id>/`; public Messages/questions остаются text. Structured
+  immediate Message сохраняет Message origin без fabricated Artifact ID.
+  Task get/list/wait, mailbox и summary содержат safe metadata/paths, без
+  автоматического Artifact content; явное scoped чтение возвращает нужные bytes.
+- ENT-AC-92: initiating inbound A2A Message attachments, follow-ups и standalone
+  FileParts используют backend-owned `a2a/<local-batch-id>/`; UI upload остаётся
+  в `attachments/`. Destination/имена не берутся из client/model remote path/ID.
+  Inbound task attachments публикуются после admission/guardrails до model turn;
+  remote result только после complete terminal success. Обе bindings, memory/PG,
+  restart и legacy manifests/paths проверяют исходную chat/owner/source/root
+  привязку, nofollow/collision safety и отсутствие скрытого перемещения старых files.
+- ENT-AC-93: aggregate attachment limit учитывает binary/text/JSON/manifest bytes,
+  encoded ceiling, bounded count/depth. Oversized/invalid/unsupported/URL Parts
+  дают явную ошибку без partial publication/тихой потери. Whole-batch guards,
+  claim/deadline/cancel и later exact file/text denials закрывают rejected/private
+  content в tool results, workspace, peer panel и scoped preview/download;
+  dedicated owner review сохраняет свои permissions. Recovery использует один
+  принятый batch и не materialize-ит/передаёт отклонённый материал повторно.
+- ENT-AC-94: real peer/native owner UI доказывают public question → guarded reply
+  либо private `core_ask_owner` → ожидание той же Task → typed Artifact cards.
+  Внутренняя owner переписка не видна peer; messages и file cards не смешиваются.
+  Text/JSON file открывается existing scoped preview/download, новая отправка
+  выбирает его только явно. Cleanup удаляет выбранные `a2a/` files и показывает
+  receipts недоступными без recovery resurrection; unrelated UI attachments
+  сохраняются. Adaptive polling/visible-panel cap, ordering/dedup, selected-peer
+  timeline, keyboard/focus и current negative-material visibility сохраняются.

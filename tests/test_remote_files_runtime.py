@@ -107,7 +107,7 @@ class RemoteFilesRuntimeTests(AuthAppTestCase):
         self.assertNotIn("task_id", wire)
         self.assertEqual([ref["name"] for ref in record.result["outgoing_files"]], ["final.txt"])
         contract = next(iter(record.snapshot["remote_calls"].values()))["contract"]
-        self.assertEqual(contract["version"], 2)
+        self.assertEqual(contract["version"], 3)
         self.assertEqual(contract["caller_scope"], {key: getattr(record, key) for key in (
             "owner_id", "context_id", "task_id", "run_id")})
         self.assertEqual(contract["owner_id"], record.run_id)

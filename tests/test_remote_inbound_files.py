@@ -17,7 +17,7 @@ from core_agent.chat_files import ChatFileService, MemoryChatFileStore, Postgres
 from core_agent.database import PostgresDatabase
 from core_agent.errors import CoreError
 from core_agent.postgres_tasks import PostgresTaskScheduler
-from core_agent.remote_agents import RemoteEvent
+from core_agent.remote_agents import RemoteEvent, _task_event
 from core_agent.remote_operations import RemoteA2AExecutor
 from core_agent.remote_registry import InMemoryRemoteRegistry
 from core_agent.tasks import REMOTE_TASK_PENDING, TaskScheduler
@@ -85,6 +85,94 @@ class RemoteInboundContract:
             kind == "message" or state in {"COMPLETED", "FAILED", "CANCELED", "REJECTED"}, tuple(parts),
             "peer-task" if kind == "task" else None, "peer-chat" if kind == "task" else None)
 
+    def test_v3_typed_artifact_contents_stay_in_quarantine_files(self):
+        artifact = {"artifactId": "../foreign-id", "name": "Report", "parts": [
+            {"text": "artifact-content-canary", "mediaType": "text/markdown"},
+            {"data": {"value": "json-value-canary"}},
+            {"raw": "AP+A", "filename": "../binary.bin"}]}
+        event = replace(self.event(parts=[]), text="artifact-content-canary",
+            artifacts=(artifact,), public_messages=({"id": "a" * 64, "text": "Public answer"},),
+            public_messages_complete=True)
+        self.responses.append(event)
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.assertEqual(task.state, "completed", getattr(task.error, "code", None))
+        self.assertEqual(task.result["text"], "Public answer")
+        batch = self.store.get(task.result["file_batch_id"], self.tenant)
+        self.assertEqual(batch["state"], "accepted_quarantine")
+        manifest = batch["manifest"]
+        self.assertEqual(manifest["destination"]["id"], task.id)
+        self.assertEqual(manifest["artifacts"][0]["artifact_id"], "../foreign-id")
+        self.assertEqual([part["type"] for part in manifest["artifacts"][0]["parts"]], ["text", "data", "file"])
+        self.assertEqual(manifest["manifest_path"], f"a2a/{task.id}/manifest.json")
+        self.assertNotIn("artifact-content-canary", json.dumps(task.result))
+        self.assertNotIn("json-value-canary", json.dumps(task.result))
+        content = self.service.owner_download(batch["batch_id"], self.binding, 1,
+            task_id=self.source.task_id, run_id=self.source.run_id)["content"]
+        self.assertEqual(json.loads(content), {"value": "json-value-canary"})
+        self.assertFalse((self.workspaces.workspace(self.binding) / "a2a" / task.id).exists())
+
+    def test_v3_reflected_credential_in_artifact_data_is_never_staged(self):
+        event = replace(self.event(parts=[]), artifacts=({"artifactId": "report", "parts": [
+            {"data": {"secret": "PRIVATE-credential"}}]},), public_messages_complete=True)
+        self.responses.append(event)
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.assertEqual(task.state, "failed")
+        self.assertEqual(task.error.code, "REMOTE_AGENT_PROTOCOL_ERROR")
+        self.assertEqual(self.batches(), [])
+
+    def test_v3_intermediate_artifact_never_materializes(self):
+        event = replace(self.event("WORKING", parts=[]), artifacts=({"artifactId": "report", "parts": [
+            {"data": {"value": "early-canary"}}]},), public_messages_complete=True)
+        self.responses.append(event)
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.assertEqual(task.state, "working", getattr(task.error, "code", None))
+        self.assertEqual(self.batches(), [])
+        self.assertNotIn("early-canary", json.dumps(task.result))
+
+    def test_v3_reflected_message_id_never_becomes_a_manifest(self):
+        self.responses.append(_task_event({"message": {"messageId": "PRIVATE-credential", "role": "ROLE_AGENT",
+            "parts": [{"data": {"ok": True}}]}}))
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.assertEqual((task.state, getattr(task.error, "code", None)), ("failed", "SIDE_EFFECT_UNKNOWN"))
+        self.assertEqual(self.batches(), [])
+
+    def test_v3_private_only_artifact_does_not_hide_public_answer(self):
+        self.responses.append(_task_event({"task": {"id": "peer-task", "contextId": "peer-chat",
+            "status": {"state": "TASK_STATE_COMPLETED", "message": {"messageId": "answer",
+                "role": "ROLE_AGENT", "parts": [{"text": "Public answer"}]}},
+            "artifacts": [{"artifactId": "private", "parts": [{"raw": "eA==", "metadata": {"private": True}}]}]}}))
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.assertEqual((task.state, task.result.get("text")), ("completed", "Public answer"))
+        self.assertEqual(self.batches(), [])
+
+    def test_v3_cancel_after_second_question_preserves_first_reply_and_dispatches_cancel(self):
+        first = {"input_id": "a" * 64, "question": "City?"}
+        second = {"input_id": "b" * 64, "question": "Street?"}
+        self.responses.append(replace(self.event("INPUT_REQUIRED", parts=[]),
+            input_request=first, public_messages_complete=True))
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.scheduler.queue_remote_reply(task.id, {"input_id": first["input_id"], "message_id": uuid.uuid4().hex,
+            "task": "Kazan", "outgoing_files": [], "request_provenance": {"version": 1, "sources": {}}},
+            owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.responses.append(replace(self.event("INPUT_REQUIRED", parts=[]),
+            input_request=second, public_messages_complete=True))
+        self.scheduler.recover(tenant_id=self.tenant)
+        self.settle()
+        self.assertEqual(self.scheduler.remote_input(task.id, owner_id=self.source.run_id,
+            tenant_id=self.tenant)["input_id"], second["input_id"])
+        self.scheduler.cancel(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.responses.append(replace(self.event("CANCELED", parts=[]), public_messages_complete=True))
+        self.scheduler.recover(tenant_id=self.tenant)
+        self.settle()
+        saved = self.scheduler.get(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.assertEqual(saved.state, "canceled")
+        self.assertEqual([method for method, _arguments in self.calls], ["Send", "Send", "Cancel"])
+        self.assertEqual(self.calls[-1][1]["task_id"], "peer-task")
+        self.assertEqual(self.scheduler.remote_reply_status(task.id, first["input_id"],
+            owner_id=self.source.run_id, tenant_id=self.tenant), "confirmed")
+        self.assertIsNone(self.scheduler.remote_input(task.id, owner_id=self.source.run_id, tenant_id=self.tenant))
+        self.assertEqual(self.batches(), [])
+
     def settle(self):
         with self.scheduler._lock:
             threads = tuple(self.scheduler._threads)
@@ -140,6 +228,48 @@ class RemoteInboundContract:
             checkpoint=current["checkpoint"], outcome=("completed", {
                 "agent_name": "delivery", "remote_state": "TASK_STATE_COMPLETED", "text": "done"}, None),
             prepared_file_batch=prepared, **changes)
+
+    def test_v3_atomic_cancel_fence_discards_late_terminal_text(self):
+        task, claim, _current, prepared, release = self.hold_claim(version=3)
+        self.scheduler.cancel(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        current = self.scheduler.read_remote_claim(claim)
+        saved = self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
+            checkpoint=current["checkpoint"], outcome=("completed", {"agent_name": "delivery",
+                "remote_state": "TASK_STATE_COMPLETED", "text": "late-text-canary"}, None),
+            conversation_observation={"messages": [{"id": "a" * 64, "text": "late-text-canary"}], "history_truncated": False})
+        self.assertEqual(saved.state, "canceled")
+        self.assertNotIn("late-text-canary", json.dumps(saved.result))
+        self.assertNotIn("late-text-canary", json.dumps(self.saved_conversation(task.id)))
+        self.reject_stage(prepared)
+        release.set()
+        self.settle()
+
+    def saved_conversation(self, task_id):
+        if hasattr(self, "database"):
+            with self.database.pool.connection() as connection:
+                return connection.execute("SELECT remote_conversation FROM core_background_tasks WHERE id=%s AND tenant_id=%s",
+                                          (task_id, self.tenant)).fetchone()["remote_conversation"]
+        return self.scheduler._remote[task_id]["conversation"]
+
+    def test_v3_atomic_cancel_fence_discards_late_question(self):
+        task, claim, current, prepared, release = self.hold_claim(version=3)
+        self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
+            checkpoint={**current["checkpoint"], "remote_task_id": "peer-task", "remote_context_id": "peer-chat"})
+        self.scheduler.cancel(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        current = self.scheduler.read_remote_claim(claim)
+        pending = {"input_id": "a" * 64, "question": "late-question-canary"}
+        saved = self.scheduler.commit_remote_claim(claim, expected_revision=current["revision"],
+            checkpoint={**current["checkpoint"], "input_request": pending},
+            progress={"agent_name": "delivery", "remote_state": "TASK_STATE_INPUT_REQUIRED", **pending},
+            conversation_observation={"messages": [{"id": "a" * 64, "text": pending["question"]}], "history_truncated": False})
+        self.assertNotIn(pending["question"], json.dumps(saved.result))
+        self.assertNotIn(pending["question"], json.dumps(self.saved_conversation(task.id)))
+        self.assertIsNone(self.scheduler.read_remote_claim(claim)["checkpoint"]["input_request"])
+        notifications = self.scheduler.mailbox(self.source.run_id, self.tenant).poll()
+        self.assertFalse(any(item.kind == "task.input-required" for item in notifications))
+        self.reject_stage(prepared)
+        release.set()
+        self.settle()
 
     def reject_stage(self, prepared):
         self.service.reject(prepared["batch_id"], self.tenant, prepared["lease_token"])

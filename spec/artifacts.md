@@ -11,6 +11,10 @@
 ### FILE-02. Приём вложений
 
 - UI и A2A принимают файлы и сохраняют их в папке нужного чата.
+- Новые A2A-вложения, включая FileParts исходного inbound Message и follow-up,
+  публикуются под backend-owned `a2a/`; UI upload остаётся в `attachments/`.
+  Прежние принятые batches сохраняют свои manifest/path без перемещения или
+  реконструкции после upgrade. Подробности Artifact materialization — FILE-05.
 - Подозрительный файл до решения guardrails изолируется от исполняющей среды;
   при отказе его содержимое не становится доступным агенту по GUARD-02.
 - Лимит применяется к сумме размеров вложений одного сообщения.
@@ -148,6 +152,66 @@ result принимаются атомарно с fenced terminal operation outc
 Внутренний child сохраняет свой source run, а public Task FK выводится через
 проверенную root ancestry. Human-wait progress и failed/expired outcomes не
 публикуют attachments. Полный контракт —в [Удалённых A2A-агентах](tasks-and-delegation.md).
+
+### FILE-05. Typed A2A artifacts в workspace
+
+Полученный Artifact сохраняет исходный разрешённый `artifactId`, name, порядок
+артефактов и Parts и различие text/data/file; его текст не становится Message.
+Каждая public text Part материализуется в точные UTF-8 bytes: `text/markdown`
+получает `.md`, прочий текст `.txt`. Data Part — детерминированный UTF-8 JSON
+с `allow_nan=False`, file Part — проверенные decoded bytes. Structured Part
+immediate Message также сохраняется файлом с Message origin/identity, без
+выдуманного Artifact ID. Public Messages, progress и вопросы остаются text.
+Reasoning/private/replay и скрытая metadata не материализуются и не публикуются;
+credential filtering и guardrails применяются до любой доступной проекции.
+
+Remote results используют `/workspace/a2a/<local-operation-id>/` с backend-owned
+`manifest.json` и отдельными artifact/part файлами. FileParts исходного inbound
+A2A Message/follow-up используют `/workspace/a2a/<local-batch-id>/`. Directory
+selection берётся только из authenticated transport/source; client/model не
+передаёт destination. Remote IDs/names не становятся filesystem paths. Safe
+names, collision handling, nofollow и whole-batch integrity сохраняются; не
+перезаписывается чужой набор или существующий файл.
+
+Browser UI также использует owner A2A transport. Его uploads сохраняют
+`attachments/`, только если подтверждённый introspection `client_id` совпадает
+с deployment `KEYCLOAK_UI_CLIENT_ID` и principal является владельцем.
+Другие owner/external A2A-клиенты используют `a2a/`; Message metadata или
+переданный заголовок не выбирают каталог. Отсутствующий/иной client ID не даёт
+browser-origin semantics. Уже принятый manifest и повторный receipt неизменны.
+
+Versioned manifest сохраняет artifact/Message origin, исходные разрешённые IDs
+и name, ordered typed part entries, safe local path, media type, actual size и
+SHA-256. Payload находится в отдельных файлах, не в model-callable artifact
+service. Старые manifests и `attachments/` читаются по прежнему контракту;
+новая форма не выдумывает typed identity для старых плоских результатов.
+
+Text-only, JSON-only, mixed и empty-file результаты проходят тот же private
+staging/admission/guardrails/atomic publication, что binary FileParts. Для
+materialized remote result sum limit
+использует закреплённый `attachment_limit_bytes` и включает binary bytes,
+UTF-8 text, JSON и generated manifest; encoded transport ceiling независим.
+Artifact/part counts и JSON depth конечны и bounded; oversized/invalid result
+даёт явную ошибку до публикации всего набора, без silent part loss. URL FileParts
+не скачиваются автоматически и отклоняются existing unsupported-file contract.
+
+Remote result публикуется только после complete successful terminal Task/Message
+и проверки current claim/cancel/deadline/canonical source/root scope. Partial
+Artifact chunks, human waits, failed/canceled/expired outcomes не открывают files.
+Inbound initiating attachments публикуются после их обычных admission/guardrails
+до выполнения поручения, а не ждут terminal состояния нашей Task.
+Refusal/timeout одной части закрывает entire remote result; later exact negative
+decisions нельзя обойти alternate filename, receipt, preview/download или reread.
+Обычный dedicated owner review сохраняет отдельные private permissions.
+
+Model tool results, task get/list/wait и mailbox содержат status и safe artifact/
+part metadata/paths, но не содержимое text/data Parts в `text`, summary или
+служебной подсказке. Модель явно читает нужный файл через разрешённые tools;
+повторный GetTask/restart не materialize-ит batch повторно и не возвращает
+исключённые bytes в context. Owner UI использует existing scoped file open,
+preview/download cards. Files участвуют в cleanup; удалённый/недоступный файл
+не объявляется скачиваемым и не восстанавливается молча из старого receipt.
+Incoming artifact files не выбираются для нового Send/final response автоматически.
 
 ### FILE-04. Очистка workspace через UI
 

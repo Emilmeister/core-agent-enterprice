@@ -29,6 +29,7 @@ from .context import (
     ContextState,
     StructuredSummarizer,
 )
+from .chat_files import _destination
 from .errors import CoreError, ExecutionNotStarted
 from .interactions import tool_origin
 from .skills import (
@@ -1260,12 +1261,20 @@ class CoreAgent:
                 catalog["core_delegate"]["input_schema"] = schema
         if self.remote_registry is not None and "core_agent_send_message" in catalog:
             peers = self._remote_peers(tenant_id)
+            for entry in (snapshot or {}).get("remote_calls", {}).values():
+                contract = self._remote_entry_contract(entry)
+                if contract["version"] == 3:
+                    peers.setdefault(contract["peer_name"], {"name": contract["peer_name"],
+                        "description": "Previously accepted remote operation; replies use its original binding."})
             if not peers:
                 catalog.pop("core_agent_send_message")
             else:
                 catalog["core_agent_send_message"]["description"] = (
                     "Send one focused task to a trusted remote agent; returns a durable local task handle. "
                     "Use core_task_wait without timeout for its result. "
+                    "A public question returns input_id and question; answer from context or use core_ask_owner. "
+                    "Reply with task_id and input_id together using the same agent_name and the selected answer in task. "
+                    "Then wait on the same handle. Received artifact contents stay in workspace files; read only selected paths explicitly. "
                     + ("Choose attachments explicitly with files: relative workspace paths. "
                        "Omit files or use [] to send none; workspace and final-response files are never added automatically. "
                        if "files" in catalog["core_agent_send_message"]["input_schema"].get("properties", {}) else "")
@@ -1316,7 +1325,16 @@ class CoreAgent:
                 or type(entry.get("version")) is not int or entry["version"] != 1):
             raise CoreError("CHECKPOINT_INVALID")
         contract = entry["contract"]
-        keys = {"version", "contract"} | ({"arguments_digest"} if contract.get("version") == 2 else set())
+        keys = {"version", "contract"} | ({"arguments_digest"} if contract.get("version") in {2, 3} else set())
+        if "operation_id" in entry or "reply" in entry:
+            from .tasks import validate_remote_reply
+            if (contract.get("version") != 3 or not isinstance(entry.get("operation_id"), str)
+                    or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", entry["operation_id"]) is None):
+                raise CoreError("CHECKPOINT_INVALID")
+            validate_remote_reply(entry.get("reply"), contract)
+            if entry.get("request_provenance") != entry["reply"]["request_provenance"]:
+                raise CoreError("CHECKPOINT_INVALID")
+            keys |= {"operation_id", "reply"}
         if "request_provenance" in entry:
             from .peer_conversations import validate_request_provenance
             validate_request_provenance(entry["request_provenance"])
@@ -1339,9 +1357,13 @@ class CoreAgent:
         if entry is None:
             return None
         contract = CoreAgent._remote_entry_contract(entry)
-        if not isinstance(contract, dict) or contract.get("task") != call.arguments.get("task") or contract.get("peer_name") != call.arguments.get("agent_name"):
+        task_text = entry["reply"]["task"] if "reply" in entry else contract.get("task")
+        if task_text != call.arguments.get("task") or contract.get("peer_name") != call.arguments.get("agent_name"):
             raise CoreError("CHECKPOINT_INVALID")
-        if contract.get("version") == 2 and entry["arguments_digest"] != CoreAgent._remote_arguments_digest(call):
+        if contract.get("version") in {2, 3} and entry["arguments_digest"] != CoreAgent._remote_arguments_digest(call):
+            raise CoreError("CHECKPOINT_INVALID")
+        if "reply" in entry and (entry["operation_id"] != call.arguments.get("task_id")
+                or entry["reply"]["input_id"] != call.arguments.get("input_id")):
             raise CoreError("CHECKPOINT_INVALID")
         return copy.deepcopy(contract)
 
@@ -1356,7 +1378,7 @@ class CoreAgent:
                 raise CoreError("CHECKPOINT_INVALID")
             contract = CoreAgent._remote_entry_contract(entry)
             _remote_contract(contract, record.tenant_id, record.run_id)
-            if contract["version"] == 2 and contract["caller_scope"] != {
+            if contract["version"] in {2, 3} and contract["caller_scope"] != {
                 key: getattr(record, key) for key in ("owner_id", "context_id", "task_id", "run_id")
             }:
                 raise CoreError("CHECKPOINT_INVALID")
@@ -1368,19 +1390,29 @@ class CoreAgent:
                 or not isinstance(previous["source_id"], str) or not previous["source_id"]
                 or not isinstance(previous["task_id"], str) or not previous["task_id"]):
             raise CoreError("CHECKPOINT_INVALID")
+        seen = record.snapshot.get("remote_inputs_seen", [])
+        if (not isinstance(seen, list) or len(seen) > 2000 or any(
+                not isinstance(item, list) or len(item) != 2 or not isinstance(item[0], str)
+                or not item[0] or not isinstance(item[1], str) or re.fullmatch(r"[0-9a-f]{64}", item[1]) is None
+                for item in seen) or len({tuple(item) for item in seen}) != len(seen)):
+            raise CoreError("CHECKPOINT_INVALID")
 
     def _pin_remote_call(self, record, snapshot, call, *, lease_token, attempt=None):
         attempt = snapshot["tool_calls"] if attempt is None else attempt
         contract = self._remote_binding(snapshot, call, attempt=attempt)
         if contract is not None:
             _remote_contract(contract, record.tenant_id, record.run_id)
-            if contract["version"] == 2 and contract["caller_scope"] != {
+            if contract["version"] in {2, 3} and contract["caller_scope"] != {
                 key: getattr(record, key) for key in ("owner_id", "context_id", "task_id", "run_id")
             }:
                 raise CoreError("CHECKPOINT_INVALID")
             return record, snapshot
         if self.interaction_store.get_policy(record.tenant_id, call.name, tool_origin(call.name)).mode == "deny":
             raise CoreError("POLICY_DENIED")
+        if ("task_id" in call.arguments) != ("input_id" in call.arguments):
+            raise ExecutionNotStarted("TOOL_ARGUMENT_INVALID", "task_id and input_id must be provided together")
+        if "task_id" in call.arguments:
+            return self._pin_remote_reply(record, snapshot, call, lease_token=lease_token, attempt=attempt)
         peer = self._remote_peers(record.tenant_id).get(call.arguments["agent_name"])
         if peer is None:
             raise CoreError("TOOL_UNAVAILABLE", "Registered remote agent is unavailable")
@@ -1398,13 +1430,13 @@ class CoreAgent:
                 )
             except CoreError as error:
                 raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
-            contract.update(version=2, caller_scope={key: getattr(record, key) for key in (
+            contract.update(version=3, caller_scope={key: getattr(record, key) for key in (
                 "owner_id", "context_id", "task_id", "run_id")},
                 attachment_limit_bytes=settings.attachment_limit_bytes, outgoing_files=list(files))
         _remote_contract(contract, record.tenant_id, record.run_id)
         from .peer_conversations import freeze_request_provenance
         entry = {"version": 1, "contract": contract, "request_provenance": freeze_request_provenance(snapshot)}
-        if contract["version"] == 2:
+        if contract["version"] in {2, 3}:
             entry["arguments_digest"] = self._remote_arguments_digest(call)
         try:
             with self.remote_registry.pin_current(record.tenant_id, peer["id"], peer["revision"]) as connection:
@@ -1416,6 +1448,37 @@ class CoreAgent:
             if error.code in {"REMOTE_AGENT_NOT_FOUND", "REMOTE_AGENT_CONFLICT"}:
                 raise ExecutionNotStarted("TOOL_UNAVAILABLE", "Registered remote agent changed before admission") from None
             raise
+        return record, copy.deepcopy(record.snapshot)
+
+    def _pin_remote_reply(self, record, snapshot, call, *, lease_token, attempt):
+        from .peer_conversations import freeze_request_provenance
+        from .tasks import validate_remote_reply
+        try:
+            pending = self.task_scheduler.remote_input(call.arguments["task_id"],
+                owner_id=record.run_id, tenant_id=record.tenant_id)
+            if pending is None or pending["input_id"] != call.arguments["input_id"]:
+                raise CoreError("REMOTE_INPUT_STALE")
+            contract = pending["contract"]
+            if contract["peer_name"] != call.arguments["agent_name"]:
+                raise CoreError("TOOL_ARGUMENT_INVALID", "Reply agent must match the original operation")
+            if contract["caller_scope"] != {key: getattr(record, key) for key in (
+                    "owner_id", "context_id", "task_id", "run_id")}:
+                raise CoreError("TASK_NOT_FOUND")
+            files = self.response_files_service.prepare(
+                WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id), call.arguments.get("files", []),
+                task_id=record.task_id, run_id=record.run_id, limit_bytes=contract["attachment_limit_bytes"])
+            reply = validate_remote_reply({"input_id": pending["input_id"],
+                "message_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"remote-reply:{record.run_id}:{attempt}:{call.id}")),
+                "task": call.arguments["task"], "outgoing_files": list(files),
+                "request_provenance": freeze_request_provenance(snapshot)}, contract)
+        except CoreError as error:
+            raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+        snapshot.setdefault("remote_calls", {})[f"{attempt}:{call.id}"] = {
+            "version": 1, "contract": contract, "arguments_digest": self._remote_arguments_digest(call),
+            "request_provenance": reply["request_provenance"], "operation_id": call.arguments["task_id"], "reply": reply}
+        record = self._record_transition(record, state=record.state, snapshot=snapshot,
+            event_kind="remote.reply.pinned", event_data={"tool_call_id": call.id,
+                "task_id": call.arguments["task_id"], "input_id": pending["input_id"]}, lease_token=lease_token)
         return record, copy.deepcopy(record.snapshot)
 
     def _safe_telemetry(self, value):
@@ -2793,10 +2856,11 @@ class CoreAgent:
         )
         snapshot["context"] = self._context_to_dict(context)
 
-    def _append_context_item(self, snapshot, kind, text):
+    def _append_context_item(self, snapshot, kind, text, *, material_source_ids=()):
         context = self._context_from_dict(snapshot["context"])
         item = ContextItem(kind, text, self.token_counter(text),
-                           provenance=self._context_provenance(snapshot, context.sequence_range[1] + 1))
+                           provenance=self._context_provenance(snapshot, context.sequence_range[1] + 1,
+                               material_source_ids=material_source_ids))
         context = ContextState(
             context.active + (item,),
             context.transcript + (item,),
@@ -2917,6 +2981,22 @@ class CoreAgent:
         for notification in notifications:
             key = (notification.task_id, notification.kind, notification.revision)
             if key not in seen:
+                pending = snapshot.get("pending_call") or {}
+                reserved_wait = (pending.get("name") == "core_task_wait"
+                    and pending.get("arguments", {}).get("task_id") == notification.task_id)
+                input_result = None if reserved_wait else self._remote_question(record, snapshot, notification.task_id)
+                material_sources = ()
+                if input_result is not None:
+                    source_id = "remote_input:" + notification.task_id + ":" + input_result["input_id"]
+                    payload = {"tool_name": "core_task_get", "output": input_result}
+                    decision = self._guard_material(record, snapshot, source_id=source_id,
+                        source_kind="tool_result", payload=payload,
+                        continuation={"version": 1, "phase": "input", "sequence": 0}, lease_token=lease_token,
+                        exempt=self._material_exempt(record, ToolCall(source_id, "core_task_get", {"task_id": notification.task_id})))
+                    material_sources = (source_id,)
+                    self._mark_remote_question(snapshot, input_result)
+                    input_result = (input_result if decision is None else
+                        {"task_id": notification.task_id, **json.loads(self._material_refusal(decision, "tool_result"))})
                 content = json.dumps(
                     {
                         "task_notification": {
@@ -2924,12 +3004,13 @@ class CoreAgent:
                             "kind": notification.kind,
                             "revision": notification.revision,
                             **({"payload": self._value(notification.payload)} if self.material_review_store is None else {}),
+                            **({"public_input": input_result} if input_result is not None else {}),
                         }
                     },
                     sort_keys=True,
                     default=str,
                 )
-                self._append_context_item(snapshot, "task_notification", content)
+                self._append_context_item(snapshot, "task_notification", content, material_source_ids=material_sources)
                 seen.add(key)
                 consumed.append(notification)
         snapshot["task_notification_revisions"] = [list(item) for item in sorted(seen)]
@@ -3162,6 +3243,12 @@ class CoreAgent:
             elif (payload.get("tool_name") in {"core_task_get", "core_task_wait", "core_delegate"}
                   and isinstance(material, dict) and material.get("result") is not None):
                 material = material["result"]
+            if payload.get("tool_name") in {"core_agent_send_message", "core_task_get", "core_task_wait"} and isinstance(material, dict):
+                candidate = material.get("result", material)
+                if (isinstance(candidate, dict) and candidate.get("remote_state") == "TASK_STATE_INPUT_REQUIRED"
+                        and isinstance(candidate.get("input_id"), str) and isinstance(candidate.get("question"), str)):
+                    text_digest = hashlib.sha256(json.dumps(candidate["question"], ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
         material_digest = material_digest or hashlib.sha256(json.dumps(material, ensure_ascii=False,
             sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
         identity = {"material_digest": material_digest, "material_kind": material_kind,
@@ -3195,7 +3282,8 @@ class CoreAgent:
                 deadline=self.workflow_store.current_time() + classifier.timeout_seconds,
                 max_calls=classifier.max_calls, max_input_tokens=classifier.max_input_tokens,
                 completed_result_ref={"material_digest": material_digest,
-                    **({"material_kind": material_kind, "text_digest": text_digest} if material_kind != "json" else {})},
+                    **({"material_kind": material_kind, "text_digest": text_digest} if material_kind != "json" else
+                       {"text_digest": text_digest} if text_digest is not None else {})},
                 lease_token=lease_token,
             )
             review_id = reviews[material_key] = review["review_id"]
@@ -3296,7 +3384,7 @@ class CoreAgent:
                 event_kind="file.delivery.pending", event_data=pending["file_delivery_pending"], lease_token=lease_token)
             raise _MaterialSuspended(SuspendedRun(current.run_id, current.task_id, "", current.version)) from error
         snapshot.pop("file_delivery_pending", None)
-        return "Attached files: " + json.dumps([entry["actual_name"] for entry in manifest["entries"]], ensure_ascii=False) + "; folder: /workspace/attachments/" + batch_id
+        return "Attached files: " + json.dumps([entry["actual_name"] for entry in manifest["entries"]], ensure_ascii=False) + "; folder: /workspace/" + "/".join(_destination(manifest))
 
     def _remote_result_batches(self, record, payload):
         """Freeze receipts from owned scheduler state; peer/model fields grant nothing."""
@@ -3324,9 +3412,13 @@ class CoreAgent:
                 run_id=record.run_id, task_id=record.task_id)
             output["result"] = self._value(remote_result_projection(result))
             output["result"]["files"] = [{key: entry[key] for key in
-                ("index", "actual_name", "relative_path", "size_bytes", "sha256")}
+                ("index", "actual_name", "relative_path", "media_type", "size_bytes", "sha256")}
                 for entry in material["manifest"]["entries"]]
-            output["result"]["folder"] = "/workspace/attachments/" + batch_id
+            output["result"]["folder"] = "/workspace/" + "/".join(_destination(material["manifest"]))
+            if "manifest_path" in material["manifest"]:
+                output["result"]["manifest_path"] = "/workspace/" + material["manifest"]["manifest_path"]
+                output["result"]["artifacts"] = copy.deepcopy(material["manifest"]["artifacts"])
+                output["result"]["messages"] = copy.deepcopy(material["manifest"]["messages"])
             batches.append((batch_id, output))
         return candidate, batches
 
@@ -3416,6 +3508,8 @@ class CoreAgent:
         if self.material_review_store is not None and call.name != RESPONSE_BEGIN_TOOL.name:
             completed = snapshot.get("pending_completed_result")
             if completed is None:
+                if call.name in {"core_agent_send_message", "core_task_get", "core_task_list", "core_task_wait"}:
+                    self._mark_remote_question(snapshot, outcome.output if isinstance(outcome, ToolResult) else outcome)
                 completed = {"call": {"id": call.id, "name": call.name, "arguments": call.arguments},
                              "outcome": self._remote_result_batches(record, json.loads(
                                  self._result_text(call.id, outcome, call.name)))[0]}
@@ -3442,6 +3536,8 @@ class CoreAgent:
             snapshot.pop("pending_completed_result", None)
         notification_call = call
         notification_output = outcome.output if isinstance(outcome, ToolResult) else outcome
+        if call.name in {"core_agent_send_message", "core_task_get", "core_task_list", "core_task_wait"}:
+            self._mark_remote_question(snapshot, notification_output)
         frame = snapshot.get("python_execution")
         if frame and call.name == "core_python_exec":
             sources = snapshot.setdefault("result_file_sources", {})
@@ -3659,6 +3755,13 @@ class CoreAgent:
                 raise CoreError("TOOL_ARGUMENT_INVALID", "timeout must be a finite nonnegative number")
             if task.state in {"completed", "failed", "canceled"} or timeout == 0:
                 return self._task_snapshot(task)
+            question = self._remote_question(record, snapshot if not prepare_only else record.snapshot, task.id)
+            if question is not None:
+                if prepare_only:
+                    # A question is a model decision boundary. Stop nested
+                    # Python before lifting the exact call, even if ready now.
+                    return "task", {"task_id": task.id}, None
+                return question
             kind, subject = "task", {"task_id": task.id}
             deadline = now + timeout if timeout is not None else None
         if prepare_only:
@@ -3680,12 +3783,20 @@ class CoreAgent:
         if call.name == "core_agent_send_message" and snapshot is not None:
             binding = CoreAgent._remote_binding(snapshot, call)
             if binding is not None:
-                if binding["version"] == 2:
-                    receipts = ResponseFileService.receipts(binding.pop("outgoing_files"))
+                entry = snapshot["remote_calls"][f"{snapshot['tool_calls']}:{call.id}"]
+                if binding["version"] in {2, 3}:
+                    files = entry["reply"]["outgoing_files"] if "reply" in entry else binding["outgoing_files"]
+                    receipts = ResponseFileService.receipts(files)
+                    binding.pop("outgoing_files")
                     binding.pop("caller_scope")
                     binding["files"] = list(receipts)
                     binding["selection_digest"] = hashlib.sha256(json.dumps(receipts,
                         sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+                if "reply" in entry:
+                    binding["task"] = entry["reply"]["task"]
+                    binding["message_id"] = entry["reply"]["message_id"]
+                    binding["operation_id"] = entry["operation_id"]
+                    binding["input_id"] = entry["reply"]["input_id"]
                 subject["remote_binding"] = binding
         return subject
 
@@ -5183,6 +5294,38 @@ class CoreAgent:
             "revision": task.revision,
         }
 
+    def _remote_question(self, record, snapshot, task_id):
+        if not self.task_scheduler.is_remote(task_id, owner_id=record.run_id, tenant_id=record.tenant_id):
+            return None
+        pending = self.task_scheduler.remote_input(task_id, owner_id=record.run_id, tenant_id=record.tenant_id)
+        if pending is None or [task_id, pending["input_id"]] in snapshot.get("remote_inputs_seen", []):
+            return None
+        task = self.task_scheduler.get(task_id, owner_id=record.run_id, tenant_id=record.tenant_id)
+        if task.state != "working":
+            return None
+        result = {"agent_name": pending["contract"]["peer_name"], "remote_state": "TASK_STATE_INPUT_REQUIRED",
+            "input_id": pending["input_id"], "question": pending["question"]}
+        return {**self._task_snapshot(task), "result": result, "input_id": pending["input_id"], "question": pending["question"],
+            "remote_state": "TASK_STATE_INPUT_REQUIRED"}
+
+    @staticmethod
+    def _mark_remote_question(snapshot, output):
+        outputs = output if isinstance(output, list) else [output]
+        for value in outputs:
+            if not isinstance(value, dict) or not isinstance(value.get("task_id"), str):
+                continue
+            result = value.get("result")
+            input_id = value.get("input_id") or (result.get("input_id") if isinstance(result, dict) else None)
+            question = value.get("question") or (result.get("question") if isinstance(result, dict) else None)
+            if not question or not isinstance(input_id, str) or re.fullmatch(r"[0-9a-f]{64}", input_id) is None:
+                continue
+            seen = snapshot.setdefault("remote_inputs_seen", [])
+            key = [value["task_id"], input_id]
+            if key not in seen:
+                if len(seen) >= 2000:
+                    raise CoreError("REMOTE_INPUT_LIMIT")
+                seen.append(key)
+
     def _require_automatic_tool(self, name, tenant_id, *, mcp_target=None):
         if self.interaction_store is None:
             return
@@ -5527,6 +5670,8 @@ class CoreAgent:
             return
         snapshot = copy.deepcopy(context["snapshot"])
         self._apply_response_files(snapshot, call, not isinstance(outcome, ToolResult) or outcome.status == "succeeded")
+        if call.name in {"core_agent_send_message", "core_task_get", "core_task_list", "core_task_wait"}:
+            self._mark_remote_question(snapshot, outcome.output if isinstance(outcome, ToolResult) else outcome)
         frame = snapshot.get("python_execution")
         if frame is None:
             return
@@ -5586,6 +5731,8 @@ class CoreAgent:
         if stage == "tool_result":
             self._apply_response_files(snapshot, call, payload.get("status") == "succeeded")
             payload, batches = self._remote_result_batches(context["record"], payload)
+            if call.name in {"core_agent_send_message", "core_task_get", "core_task_list", "core_task_wait"}:
+                self._mark_remote_question(snapshot, payload["output"])
             snapshot["pending_completed_result"] = {"call": frame["nested_call"], "outcome": payload}
             snapshot["nested_dispatch"]["state"] = "result_saved"
             updated = self._record_transition(context["record"], state="EXECUTING", snapshot=snapshot,
@@ -6267,7 +6414,18 @@ class CoreAgent:
     def _start_remote_operation(self, wait_context):
         parent, snapshot, call, lease_token = wait_context
         attempt = snapshot["tool_calls"]
-        identifier = str(uuid.uuid5(uuid.NAMESPACE_URL, f"remote:{parent.run_id}:{attempt}:{call.id}"))
+        entry = snapshot.get("remote_calls", {}).get(f"{attempt}:{call.id}", {})
+        identifier = (entry["operation_id"] if "reply" in entry else
+            str(uuid.uuid5(uuid.NAMESPACE_URL, f"remote:{parent.run_id}:{attempt}:{call.id}")))
+        def receipt(task):
+            result = self._task_snapshot(task)
+            if "reply" in entry:
+                delivery = self.task_scheduler.remote_reply_status(identifier, entry["reply"]["input_id"],
+                    owner_id=parent.run_id, tenant_id=parent.tenant_id)
+                if delivery is None:
+                    raise CoreError("CHECKPOINT_INVALID")
+                result.update(reply_delivery=delivery, input_id=entry["reply"]["input_id"])
+            return result
         previous = snapshot.get("remote_admission")
         if previous is not None:
             if (not isinstance(previous, dict) or previous.keys() != {"version", "source_id", "attempt", "task_id"}
@@ -6276,7 +6434,7 @@ class CoreAgent:
             if previous["source_id"] == call.id and previous["attempt"] == attempt:
                 if previous["task_id"] != identifier:
                     raise CoreError("CHECKPOINT_INVALID")
-                return self._task_snapshot(self.task_scheduler.get(identifier, owner_id=parent.run_id, tenant_id=parent.tenant_id))
+                return receipt(self.task_scheduler.get(identifier, owner_id=parent.run_id, tenant_id=parent.tenant_id))
         contract = self._remote_binding(snapshot, call)
         _remote_contract(contract, parent.tenant_id, parent.run_id)
         admitted = False
@@ -6292,8 +6450,17 @@ class CoreAgent:
                 event_data={"task_id": identifier}, lease_token=lease_token, connection=connection)
             admitted = True
         try:
-            task = self.task_scheduler.start_remote(contract, owner_id=parent.run_id, tenant_id=parent.tenant_id,
-                task_id=identifier, required=True, admission=admit)
+            if "reply" in entry:
+                try:
+                    task = self.task_scheduler.queue_remote_reply(identifier, entry["reply"],
+                        owner_id=parent.run_id, tenant_id=parent.tenant_id, admission=admit)
+                except CoreError as error:
+                    if not admitted:
+                        raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+                    raise
+            else:
+                task = self.task_scheduler.start_remote(contract, owner_id=parent.run_id, tenant_id=parent.tenant_id,
+                    task_id=identifier, required=True, admission=admit)
         except Exception:
             if not admitted:
                 raise
@@ -6301,7 +6468,7 @@ class CoreAgent:
             if current.snapshot.get("remote_admission", {}).get("task_id") != identifier:
                 raise
             task = self.task_scheduler.get(identifier, owner_id=parent.run_id, tenant_id=parent.tenant_id)
-        return self._task_snapshot(task)
+        return receipt(task)
 
     def _relay_remote_stream(self, connection, call, stream):
         """Republish the child's progress into this task and keep its final text."""
@@ -7134,6 +7301,12 @@ class CoreAgent:
             task = self.task_scheduler.get(wait.subject["task_id"], owner_id=wait.run_id, tenant_id=wait.tenant_id)
             if task.state in {"completed", "failed", "canceled"}:
                 self.workflow_store.resolve_wait(wait.wait_id, tenant_id=wait.tenant_id, outcome={"reason": "task", "result": self._task_snapshot(task)})
+            else:
+                record = self.workflow_store.get(wait.run_id, tenant_id=wait.tenant_id, owner_id=wait.owner_id)
+                question = self._remote_question(record, record.snapshot, task.id)
+                if question is not None:
+                    self.workflow_store.resolve_wait(wait.wait_id, tenant_id=wait.tenant_id,
+                        outcome={"reason": "task", "result": question})
         recovered = []
         for candidate in self.workflow_store.recoverable(
             states=RECOVERABLE_WORKFLOW_STATES,

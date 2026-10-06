@@ -7,6 +7,7 @@ import unittest
 
 import httpx
 from unittest.mock import patch
+from dataclasses import replace
 
 from a2a.types import ListTasksRequest, Message, Part, Role, TaskState
 from a2a.utils.errors import InvalidParamsError, TaskNotFoundError
@@ -58,7 +59,7 @@ class FileAdmissionContract:
     def target(self, batch):
         service = self.agent.chat_file_service
         binding = WorkspaceBinding(batch["tenant_id"], batch["owner_id"], batch["context_id"])
-        return service.workspaces.workspace(binding) / "attachments" / batch["batch_id"]
+        return service.workspaces.workspace(binding) / "a2a" / batch["batch_id"]
 
     async def release(self, admitted):
         await asyncio.to_thread(self.agent.workflow_store.release_lease, admitted.run_id,
@@ -91,7 +92,26 @@ class FileAdmissionContract:
         self.assertEqual(result.terminal_state, "completed")
         self.assertTrue(self.target(batch).is_dir())
         self.assertEqual((self.target(batch) / "report.txt").read_bytes(), b"report")
-        self.assertIn("/workspace/attachments/" + batch["batch_id"], self.model.calls[-1].context)
+        self.assertIn("/workspace/a2a/" + batch["batch_id"], self.model.calls[-1].context)
+
+    async def test_browser_uploads_keep_attachments_while_message_metadata_cannot_select_folder(self):
+        context = self.context("owner-a")
+        context.state["principal"] = replace(context.state["principal"], is_browser=True)
+        admitted = await self.handler.admission_handler(self.message("browser-files"), context)
+        batch = self.batch(admitted)
+        self.assertEqual(batch["manifest"]["source"], "upload")
+        self.assertNotIn("destination", batch["manifest"])
+        followup = self.message("browser-followup", task_id=admitted.task.id)
+        receipt = await asyncio.to_thread(self.handler.followup_handler,
+            CoreAgentExecutor._from_sdk_message(followup, context_id=admitted.task.context_id), admitted.task,
+            context, original_message=followup)
+        repeated = self.agent.chat_file_service.store.get(receipt["provenance"]["file_batch_id"], context.tenant)
+        self.assertEqual(repeated["manifest"]["entries"][0]["actual_name"], "report_2.txt")
+        self.assertNotIn("destination", repeated["manifest"])
+        external = self.message("external-files", context_id="external-chat")
+        external.metadata.update({"source": "upload", "client_id": "agent-browser"})
+        other = await self.admit(external)
+        self.assertEqual(self.batch(other)["manifest"]["destination"]["directory"], "a2a")
 
     async def test_duplicate_does_not_restage_and_changed_input_conflicts(self):
         first = await self.admit()
@@ -279,7 +299,7 @@ class FileAdmissionContract:
                 self.assertFalse(await asyncio.to_thread(cancelled.wait, 0.05))
                 self.assertEqual(len(os.listdir(service.uploads)), 2)
                 binding = WorkspaceBinding(self.context().tenant, self.context().user.user_name, "chat")
-                self.assertEqual(os.listdir(service.workspaces.workspace(binding) / "attachments"), [])
+                self.assertEqual(os.listdir(service.workspaces.workspace(binding) / "a2a"), [])
             finally:
                 release.set()
             receipt, _ = await asyncio.gather(incoming, cancellation)
@@ -326,7 +346,7 @@ class FileAdmissionContract:
         await self.release(first)
         await asyncio.to_thread(self.agent.resume_task, first.task.id)
         self.assertTrue(self.target(self.batch(first)).exists())
-        self.assertIn("attachments", self.model.calls[-1].context)
+        self.assertIn("/workspace/a2a/", self.model.calls[-1].context)
 
     async def test_concurrent_root_dedup_and_busy_share_one_batch(self):
         admitted = await asyncio.gather(self.admit(), self.admit(), self.admit(self.message("busy")))
