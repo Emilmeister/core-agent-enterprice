@@ -156,8 +156,13 @@ criterion должны войти в тот же завершённый change. 
   и копию test blobs, сохраняя encryption key вне dump. Это proof отката до новых
   application writes, а не разрешение восстановить старый backup поверх новых данных.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
-  Keycloak подключается отдельно через `KEYCLOAK_*`; встроенного Keycloak service
-  здесь нет. Agent environment явно передаёт поддержанные model/guardrails,
+  Профиль `local-ui` добавляет development Keycloak и initial realm import из
+  private `deploy/local/core-agent-realm.json`; этот каталог исключён из Git и
+  Docker build context. Keycloak использует `network_mode: service:agent`,
+  поэтому loopback issuer доступен браузеру и серверу, а порты 8000/8085
+  публикуются агентом только на loopback. Сам агент остаётся независимым для
+  native CI `run --no-deps`. Без профиля Keycloak подключается отдельно через
+  `KEYCLOAK_*`. Agent environment явно передаёт поддержанные model/guardrails,
   runtime/compaction, memory и telemetry настройки из `.env.example`.
   Compose фиксирует container port 8000, bind host 0.0.0.0 и disjoint storage roots;
   `PORT` меняет опубликованный host port, а не внутренний listening port.

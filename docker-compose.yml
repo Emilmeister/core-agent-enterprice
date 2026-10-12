@@ -23,7 +23,7 @@ services:
       PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
       PHOENIX_TELEMETRY_ENABLED: "false"
     ports:
-      - "${PHOENIX_PORT:-6006}:6006"
+      - "127.0.0.1:${PHOENIX_PORT:-6006}:6006"
     depends_on:
       database:
         condition: service_healthy
@@ -52,6 +52,61 @@ services:
       database:
         condition: service_healthy
     restart: "no"
+
+  keycloak-init:
+    profiles: [local-ui]
+    image: pgvector/pgvector:pg17@sha256:7ae6051efd0e60444282c27c7e141af07f322ce033300e727a49c3dd11075e38
+    user: "0:0"
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        psql -v ON_ERROR_STOP=1 -c 'CREATE SCHEMA IF NOT EXISTS keycloak;'
+        mkdir -p /realm/import
+        cp /bootstrap/core-agent-realm.json /realm/import/core-agent-realm.json
+        chown -R 1000:0 /realm
+        chmod 700 /realm/import
+        chmod 600 /realm/import/core-agent-realm.json
+    environment:
+      PGHOST: database
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./deploy/local/core-agent-realm.json:/bootstrap/core-agent-realm.json:ro
+      - keycloak-data:/realm
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: "no"
+
+  keycloak:
+    profiles: [local-ui]
+    image: quay.io/keycloak/keycloak:26.8.0
+    command: ["start-dev", "--import-realm"]
+    network_mode: service:agent
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${LOCAL_KEYCLOAK_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${LOCAL_KEYCLOAK_ADMIN_PASSWORD:-}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://database:5432/${POSTGRES_DB}
+      KC_DB_USERNAME: ${POSTGRES_USER}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      KC_DB_SCHEMA: keycloak
+      KC_HTTP_PORT: "8085"
+      KC_HOSTNAME: http://localhost:8085
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - keycloak-data:/opt/keycloak/data
+    depends_on:
+      database:
+        condition: service_healthy
+      keycloak-init:
+        condition: service_completed_successfully
+      agent:
+        condition: service_started
+    mem_limit: 1g
+    cpus: 1
+    restart: unless-stopped
 
   agent:
     build: .
@@ -197,7 +252,8 @@ services:
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://phoenix:6006/v1/traces}
       OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-true}
     ports:
-      - "${PORT:-8000}:8000"
+      - "127.0.0.1:${PORT:-8000}:8000"
+      - "127.0.0.1:8085:8085"
     volumes:
       - agent-data:/data
     depends_on:
@@ -223,3 +279,4 @@ services:
 volumes:
   postgres-data:
   agent-data:
+  keycloak-data:

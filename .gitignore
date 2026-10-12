@@ -2,6 +2,7 @@
 .enterprise-work/
 .cache/
 .local-evidence/
+deploy/local/
 dist/
 core_agent/ui_dist/
 __pycache__/

@@ -569,7 +569,7 @@ cp .env.example .env
 # На Apple Silicon/native ARM задайте SANDBOX_OCI_ARCH=arm64; default — amd64.
 # Замените PUSH_NOTIFICATION_ENCRYPTION_KEY действующим Fernet-ключом (ниже).
 docker compose config --quiet
-docker compose up --build -d
+docker compose up -d
 docker compose ps
 ```
 
@@ -609,11 +609,35 @@ uv run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_
 `postgres-data` и `agent-data`; `MEMORY_STORAGE_TYPE=postgres` включает также
 постоянную память вместо development default `in-memory`.
 
-Compose не поднимает Keycloak. Для UI подключите настроенный Keycloak через
-`KEYCLOAK_*` и `CORE_AGENT_TENANT_ID`, включая public `KEYCLOAK_UI_CLIENT_ID`.
-Issuer должен быть доступен и браузеру, и контейнеру; `localhost` внутри
-контейнера обозначает сам контейнер. Внешний issuer использует HTTPS.
-Без этого доступны только development A2A-маршруты; `/ui/` требует browser client.
+Все службы описаны в одном `docker-compose.yml`; настройки читаются из `.env`.
+`docker compose up -d` собирает отсутствующие образы и запускает службы.
+После изменения исходников пересоберите образы через `docker compose up --build -d`.
+
+Для локального UI задайте `COMPOSE_PROFILES=local-ui`. Этот development-профиль
+добавляет Keycloak и одноразовую инициализацию его схемы и realm. Подготовьте
+приватный импорт `deploy/local/core-agent-realm.json`: confidential client
+`core-agent-api`, public PKCE client `core-agent-ui`, роль `agent-owner` для
+владельца и audience `core-agent-api`. Секрет client и начальные пароли должны
+совпадать с `.env`; браузерный client должен разрешать origin
+`http://localhost:<PORT>` и callback `http://localhost:<PORT>/ui/`.
+Файл импорта и `.env` не коммитятся и не входят
+в Docker build context. Импорт существующего realm при перезапуске пропускается;
+пароли существующих пользователей меняются через Keycloak.
+
+В `.env` для этого профиля укажите `CORE_AGENT_ENVIRONMENT=development`,
+`KEYCLOAK_ISSUER_URL=http://localhost:8085/realms/core-agent`,
+`KEYCLOAK_CLIENT_ID=core-agent-api`, `KEYCLOAK_UI_CLIENT_ID=core-agent-ui`,
+`KEYCLOAK_AUDIENCE=core-agent-api`, `KEYCLOAK_CLIENT_SECRET`,
+`CORE_AGENT_TENANT_ID`, `LOCAL_KEYCLOAK_ADMIN_PASSWORD` и
+`AGENT_URL=http://localhost:<PORT>`. Keycloak доступен на <http://localhost:8085>.
+Он использует сетевое пространство агента, поэтому один и тот же loopback
+issuer доступен браузеру и серверу. Оба опубликованных порта принадлежат
+контейнеру агента. Порты агента, Keycloak и Phoenix открыты только на loopback.
+
+Без `local-ui` подключите внешний Keycloak через `KEYCLOAK_*` и
+`CORE_AGENT_TENANT_ID`; его HTTPS issuer должен быть доступен и браузеру, и
+контейнеру. Без auth configuration доступны только development A2A-маршруты;
+`/ui/` требует browser client.
 
 Compose читает `.env` для подстановки и явно передаёт настройки контейнеру;
 произвольная переменная из файла не становится container ENV автоматически.

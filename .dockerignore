@@ -4,6 +4,7 @@
 .local-evidence
 .env
 .env.*
+deploy/local
 kubeconfig
 __pycache__
 *.py[cod]
