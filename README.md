@@ -562,7 +562,7 @@ curl -sS http://localhost:8000/message:send \
 
 ### Docker Compose
 
-Краткая инструкция для настроенного локального запуска: [LOCAL.md](LOCAL.md).
+Инструкция первого запуска на macOS: [LOCAL.md](LOCAL.md).
 
 ```bash
 cp .env.example .env
@@ -616,21 +616,18 @@ uv run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_
 После изменения исходников пересоберите образы через `docker compose up --build -d`.
 
 Для локального UI задайте `COMPOSE_PROFILES=local-ui`. Этот development-профиль
-добавляет Keycloak и одноразовую инициализацию его схемы и realm. Подготовьте
-приватный импорт `deploy/local/core-agent-realm.json`: confidential client
-`core-agent-api`, public PKCE client `core-agent-ui`, роль `agent-owner` для
-владельца и audience `core-agent-api`. Секрет client и начальные пароли должны
-совпадать с `.env`; браузерный client должен разрешать origin
-`http://localhost:<PORT>` и callback `http://localhost:<PORT>/ui/`.
-Файл импорта и `.env` не коммитятся и не входят
-в Docker build context. Импорт существующего realm при перезапуске пропускается;
-пароли существующих пользователей меняются через Keycloak.
+добавляет Keycloak. `keycloak-init` автоматически создаёт схему и файл импорта
+realm из `.env`: confidential API client, public PKCE client, роли и владельца.
+Файл с начальными секретами хранится в volume `keycloak-data` с правами `0600`;
+подготавливать приватный JSON вручную не требуется. Импорт существующего realm
+при перезапуске пропускается; пароли существующих пользователей меняются через
+Keycloak. `.env` не коммитится и не входит в Docker build context.
 
 В `.env` для этого профиля укажите `CORE_AGENT_ENVIRONMENT=development`,
 `KEYCLOAK_ISSUER_URL=http://localhost:8085/realms/core-agent`,
 `KEYCLOAK_CLIENT_ID=core-agent-api`, `KEYCLOAK_UI_CLIENT_ID=core-agent-ui`,
 `KEYCLOAK_AUDIENCE=core-agent-api`, `KEYCLOAK_CLIENT_SECRET`,
-`CORE_AGENT_TENANT_ID`, `LOCAL_KEYCLOAK_ADMIN_PASSWORD` и
+`CORE_AGENT_TENANT_ID`, `LOCAL_OWNER_PASSWORD`, `LOCAL_KEYCLOAK_ADMIN_PASSWORD` и
 `AGENT_URL=http://localhost:<PORT>`. Keycloak доступен на <http://localhost:8085>.
 Он использует сетевое пространство агента, поэтому один и тот же loopback
 issuer доступен браузеру и серверу. Оба опубликованных порта принадлежат

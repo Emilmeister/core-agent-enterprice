@@ -156,9 +156,10 @@ criterion должны войти в тот же завершённый change. 
   и копию test blobs, сохраняя encryption key вне dump. Это proof отката до новых
   application writes, а не разрешение восстановить старый backup поверх новых данных.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
-  Профиль `local-ui` добавляет development Keycloak и initial realm import из
-  private `deploy/local/core-agent-realm.json`; этот каталог исключён из Git и
-  Docker build context. Keycloak использует `network_mode: service:agent`,
+  Профиль `local-ui` добавляет development Keycloak; `keycloak-init` запускает
+  `deploy/local-keycloak.py`, создавая initial realm import из `.env` в private
+  volume `keycloak-data` с правами `0600`. При повторном запуске существующие
+  credentials сохраняются. Keycloak использует `network_mode: service:agent`,
   поэтому loopback issuer доступен браузеру и серверу, а порты 8000/8085
   публикуются агентом только на loopback. Сам агент остаётся независимым для
   native CI `run --no-deps`. Без профиля Keycloak подключается отдельно через
@@ -179,7 +180,7 @@ criterion должны войти в тот же завершённый change. 
   контрольные суммы для образа.
 - `.env.example` — поддерживаемый шаблон локальной конфигурации; `.env` никогда
   не коммитится.
-- `LOCAL.md` — краткая инструкция запуска подготовленного локального Compose,
+- `LOCAL.md` — краткая инструкция первого запуска Compose на чистой macOS,
   адреса UI/Keycloak/Phoenix, вход, состояние, остановка и пересборка.
 
 Package entrypoints из `pyproject.toml`:

@@ -55,24 +55,24 @@ services:
 
   keycloak-init:
     profiles: [local-ui]
-    image: pgvector/pgvector:pg17@sha256:7ae6051efd0e60444282c27c7e141af07f322ce033300e727a49c3dd11075e38
+    build: .
     user: "0:0"
-    entrypoint: ["/bin/bash", "-ec"]
-    command:
-      - |
-        psql -v ON_ERROR_STOP=1 -c 'CREATE SCHEMA IF NOT EXISTS keycloak;'
-        mkdir -p /realm/import
-        cp /bootstrap/core-agent-realm.json /realm/import/core-agent-realm.json
-        chown -R 1000:0 /realm
-        chmod 700 /realm/import
-        chmod 600 /realm/import/core-agent-realm.json
+    entrypoint: ["python", "/bootstrap/local-keycloak.py"]
     environment:
-      PGHOST: database
-      PGDATABASE: ${POSTGRES_DB}
-      PGUSER: ${POSTGRES_USER}
-      PGPASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
+      KEYCLOAK_ISSUER_URL: ${KEYCLOAK_ISSUER_URL:-}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
+      KEYCLOAK_UI_CLIENT_ID: ${KEYCLOAK_UI_CLIENT_ID:-}
+      KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-}
+      KEYCLOAK_OWNER_ROLE: ${KEYCLOAK_OWNER_ROLE:-agent-owner}
+      KEYCLOAK_EXTERNAL_ROLE: ${KEYCLOAK_EXTERNAL_ROLE:-agent-external}
+      LOCAL_OWNER_USERNAME: ${LOCAL_OWNER_USERNAME:-owner}
+      LOCAL_OWNER_PASSWORD: ${LOCAL_OWNER_PASSWORD:-}
+      LOCAL_KEYCLOAK_ADMIN_PASSWORD: ${LOCAL_KEYCLOAK_ADMIN_PASSWORD:-}
+      AGENT_URL: ${AGENT_URL:-}
     volumes:
-      - ./deploy/local/core-agent-realm.json:/bootstrap/core-agent-realm.json:ro
+      - ./deploy/local-keycloak.py:/bootstrap/local-keycloak.py:ro
       - keycloak-data:/realm
     depends_on:
       database:
