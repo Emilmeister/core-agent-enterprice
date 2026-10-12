@@ -562,6 +562,8 @@ curl -sS http://localhost:8000/message:send \
 
 ### Docker Compose
 
+Краткая инструкция для настроенного локального запуска: [LOCAL.md](LOCAL.md).
+
 ```bash
 cp .env.example .env
 # Заполните POSTGRES_PASSWORD и LLM_API_FORMAT/LLM_API_BASE/LLM_MODEL/LLM_API_KEY.
