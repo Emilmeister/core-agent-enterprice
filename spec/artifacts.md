@@ -230,9 +230,15 @@ service. Старые manifests и `attachments/` читаются по преж
 
 Text-only, JSON-only, mixed и empty-file результаты проходят тот же private
 staging/admission/guardrails/atomic publication, что binary FileParts. Для
-materialized remote result sum limit
-использует закреплённый `attachment_limit_bytes` и включает binary bytes,
-UTF-8 text, JSON и generated manifest; encoded transport ceiling независим.
+materialized remote result sum limit использует закреплённый
+`attachment_limit_bytes`. Для marked immutable cumulative batches он считает
+все принятые published payload bytes Task: binary bytes, UTF-8 text и canonical
+JSON; exact repeated Artifact не расходует лимит повторно. Generated private
+manifests считаются отдельно и остаются bounded через конечные Artifact/Part
+counts, validated metadata и encoded transport ceiling; они не уменьшают
+доступный payload limit. Generic legacy terminal intake сохраняет прежний
+accounting: binary bytes, UTF-8 text, JSON **и generated manifest** входят в
+aggregate limit. Encoded transport ceiling независим в обоих случаях.
 Artifact/part counts и JSON depth конечны и bounded; oversized/invalid result
 даёт явную ошибку до публикации всего набора, без silent part loss. URL FileParts
 не скачиваются автоматически и отклоняются existing unsupported-file contract.

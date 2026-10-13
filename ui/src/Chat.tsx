@@ -21,6 +21,7 @@ import {
   fileReceipt,
   terminal,
   textParts,
+  publicHistoryItems,
 } from "./types";
 import type { ChatRow, FileReceipt, LiveAnswerSnapshot, Message, Part, Settings, Task } from "./types";
 
@@ -174,6 +175,7 @@ export function Chat({
     && liveAnswer && liveAnswer.taskId === taskId && !liveAnswer.superseded
     && (!terminal(task) || task?.status.state === "TASK_STATE_COMPLETED")
     && !history.page.items.some((item) => item.task_id === taskId && (item.outcome
+      || item.public_message?.text === liveAnswer.text
       || (item.kind === "agent_message" && item.status === "available" && item.text === liveAnswer.text)))
     ? liveAnswer.text : "";
   useLayoutEffect(() => {
@@ -560,7 +562,9 @@ export function Chat({
     : task.status.state === "TASK_STATE_INPUT_REQUIRED" ? "Ожидает вашего ответа"
     : task.status.state === "TASK_STATE_AUTH_REQUIRED" ? "Требуется авторизация"
     : task.status.state === "TASK_STATE_SUBMITTED" ? "Запрос принят" : "Готовит ответ";
-  const fileCount = history.page.items.reduce((count, item) => count + (item.attachments?.length ?? 0) + (item.response_files?.length ?? 0), 0);
+  const fileCount = publicHistoryItems(history.page.items).reduce((count, item) => count
+    + (item.attachments?.length ?? 0) + (item.response_files?.length ?? 0)
+    + (item.response_artifacts ?? []).reduce((total, artifact) => total + artifact.parts.length, 0), 0);
   return (
     <section ref={conversation} className={`conversation ${peerSelection ? "peer-panel-open" : ""}`} aria-label="Чат"
       style={{ "--peer-width": `${peerWidth}px` } as CSSProperties}
@@ -670,6 +674,7 @@ export function Chat({
         {row?.latest_task_id && !task && !error && <p role="status">Загружаем задачу…</p>}
         <History
           api={api}
+          task={task}
           contextId={contextId}
           history={history}
           peerConversations={peerHistory.conversations}

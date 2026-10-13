@@ -260,7 +260,7 @@ class A2ADurableTimerTests(AuthAppTestCase):
             ModelResponse(message="awake"),
         ])
 
-    async def test_a2a_timer_returns_working_and_recovery_publishes_final_artifact(self):
+    async def test_a2a_timer_returns_working_and_recovery_publishes_final_message(self):
         task = await asyncio.wait_for(self.submit("external-a", "timer-message", "timer-chat"), 5)
         self.assertEqual(task["status"]["state"], "TASK_STATE_WORKING")
         self.assertFalse(task.get("artifacts"))
@@ -271,7 +271,8 @@ class A2ADurableTimerTests(AuthAppTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         completed = response.json()
         self.assertEqual(completed["status"]["state"], "TASK_STATE_COMPLETED")
-        self.assertEqual(completed["artifacts"][0]["parts"][0]["text"], "awake")
+        self.assertFalse(completed.get("artifacts"))
+        self.assertEqual(completed["status"]["message"]["parts"][0]["text"], "awake")
         denied = await self.http.get("/a2a/external/tasks/" + task["id"], headers=self.headers("external-b"))
         self.assertEqual(denied.status_code, 404)
 

@@ -141,8 +141,9 @@ def validate_remote_reply(reply, contract):
 def _remote_checkpoint(checkpoint, contract=None):
     baseline = _initial_remote_checkpoint()
     if (not isinstance(checkpoint, dict) or type(checkpoint.get("version")) is not int
-            or checkpoint["version"] not in {1, 2}
-            or checkpoint.keys() != baseline.keys() | ({"input_request", "reply", "answered_inputs"} if checkpoint["version"] == 2 else set())
+            or checkpoint["version"] not in {1, 2, 3}
+            or checkpoint.keys() != baseline.keys() | ({"input_request", "reply", "answered_inputs"} if checkpoint["version"] >= 2 else set())
+                | ({"received_artifacts", "file_batch_ids"} if checkpoint["version"] == 3 else set())
             or type(checkpoint["send_started"]) is not bool or type(checkpoint["cancel_started"]) is not bool):
         raise CoreError("CHECKPOINT_INVALID")
     for key in ("deadline", "next_poll_at"):
@@ -162,7 +163,7 @@ def _remote_checkpoint(checkpoint, contract=None):
             or checkpoint["send_started"] and checkpoint["deadline"] is None
             or checkpoint["cancel_started"] and checkpoint["remote_task_id"] is None):
         raise CoreError("CHECKPOINT_INVALID")
-    if checkpoint["version"] == 2:
+    if checkpoint["version"] >= 2:
         if contract is not None and contract["version"] != 3:
             raise CoreError("CHECKPOINT_INVALID")
         pending, reply, answered = checkpoint["input_request"], checkpoint["reply"], checkpoint["answered_inputs"]
@@ -187,9 +188,31 @@ def _remote_checkpoint(checkpoint, contract=None):
                 raise CoreError("CHECKPOINT_INVALID")
         if (pending is not None or reply is not None or answered) and (not checkpoint["send_started"] or checkpoint["remote_task_id"] is None):
             raise CoreError("CHECKPOINT_INVALID")
+    if checkpoint["version"] == 3:
+        receipts, batches = checkpoint["received_artifacts"], checkpoint["file_batch_ids"]
+        if not isinstance(receipts, list) or len(receipts) > 64 or not isinstance(batches, list) or len(batches) > 65:
+            raise CoreError("CHECKPOINT_INVALID")
+        seen, size, parts = set(), 0, 0
+        for receipt in receipts:
+            if not isinstance(receipt, dict) or receipt.keys() != {"artifact_id", "digest", "size_bytes", "part_count"}:
+                raise CoreError("CHECKPOINT_INVALID")
+            _remote_text(receipt["artifact_id"])
+            _remote_input_id(receipt["digest"])
+            if (receipt["artifact_id"] in seen or type(receipt["size_bytes"]) is not int or receipt["size_bytes"] < 0
+                    or type(receipt["part_count"]) is not int or not 1 <= receipt["part_count"] <= 256):
+                raise CoreError("CHECKPOINT_INVALID")
+            seen.add(receipt["artifact_id"])
+            size += receipt["size_bytes"]
+            parts += receipt["part_count"]
+        if parts > 256 or contract is not None and size > contract["attachment_limit_bytes"]:
+            raise CoreError("CHECKPOINT_INVALID")
+        for batch in batches:
+            _remote_text(batch)
+        if len(set(batches)) != len(batches) or not checkpoint["send_started"] or checkpoint["remote_task_id"] is None:
+            raise CoreError("CHECKPOINT_INVALID")
 
 
-def _advance_remote_checkpoint(old, new, contract, now, cancel_requested, outcome):
+def _advance_remote_checkpoint(old, new, contract, now, cancel_requested, outcome, *, file_batch_id=None):
     _remote_checkpoint(old, contract)
     new = copy.deepcopy(new)
     if isinstance(new, dict) and new.get("send_started") is True and not old["send_started"]:
@@ -199,13 +222,13 @@ def _advance_remote_checkpoint(old, new, contract, now, cancel_requested, outcom
             raise CoreError("CHECKPOINT_INVALID")
         new["deadline"] = now + contract["timeout_seconds"]
     _remote_checkpoint(new, contract)
-    if (new["version"] < old["version"] or new["version"] == 2 and contract["version"] != 3
+    if (new["version"] < old["version"] or new["version"] >= 2 and contract["version"] != 3
             or old["send_started"] and not new["send_started"] or old["cancel_started"] and not new["cancel_started"]
             or old["deadline"] is not None and new["deadline"] != old["deadline"]
             or any(old[key] is not None and new[key] != old[key] for key in ("remote_task_id", "remote_context_id"))
             or new["cancel_started"] and not old["cancel_started"] and not cancel_requested):
         raise CoreError("CHECKPOINT_INVALID")
-    if new["version"] == 2:
+    if new["version"] >= 2:
         old_answered = old.get("answered_inputs", [])
         old_reply, new_reply = old.get("reply"), new["reply"]
         if new["answered_inputs"][:len(old_answered)] != old_answered:
@@ -229,6 +252,17 @@ def _advance_remote_checkpoint(old, new, contract, now, cancel_requested, outcom
                 raise CoreError("CHECKPOINT_INVALID")
         if new_reply is not None:
             _remote_reply(new_reply, contract)
+    if new["version"] == 3:
+        previous = old.get("received_artifacts", [])
+        old_batches = old.get("file_batch_ids", [])
+        if (new["received_artifacts"][:len(previous)] != previous or new["file_batch_ids"] != old_batches
+                or file_batch_id is None and new["received_artifacts"] != previous):
+            raise CoreError("CHECKPOINT_INVALID")
+        if file_batch_id is not None:
+            if file_batch_id in old_batches:
+                raise CoreError("CHECKPOINT_INVALID")
+            new["file_batch_ids"].append(file_batch_id)
+            _remote_checkpoint(new, contract)
     if outcome is not None:
         if (not isinstance(outcome, tuple) or len(outcome) != 3 or not isinstance(outcome[0], str) or outcome[0] not in _REMOTE_TERMINAL
                 or outcome[2] is not None and not isinstance(outcome[2], str)):
@@ -240,7 +274,7 @@ def _advance_remote_checkpoint(old, new, contract, now, cancel_requested, outcom
 def _pending_remote_input(contract, checkpoint, state, cancel_requested, now):
     _remote_contract(contract, contract["tenant_id"], contract["owner_id"])
     _remote_checkpoint(checkpoint, contract)
-    if (contract["version"] != 3 or checkpoint["version"] != 2 or state != "working"
+    if (contract["version"] != 3 or checkpoint["version"] < 2 or state != "working"
             or cancel_requested or _remote_expired(checkpoint, now) or checkpoint["cancel_started"]):
         return None
     pending, reply = checkpoint["input_request"], checkpoint["reply"]
@@ -322,7 +356,7 @@ def _remote_progress(progress, contract, checkpoint, outcome):
 def remote_result_projection(result):
     """The accepted batch is an internal publication capability, never mailbox data."""
     if isinstance(result, dict):
-        return {key: copy.deepcopy(value) for key, value in result.items() if key != "file_batch_id"}
+        return {key: copy.deepcopy(value) for key, value in result.items() if key not in {"file_batch_id", "file_batch_ids"}}
     return copy.deepcopy(result)
 
 
@@ -333,12 +367,15 @@ def _remote_cancelled_outcome(contract, outcome, cancel_requested):
     return outcome
 
 
-def _remote_file_binding(contract, batch, outcome, task_id):
+def _remote_file_binding(contract, batch, outcome, task_id, checkpoint=None):
     from .workspace import WorkspaceBinding
 
+    early = contract["version"] == 3 and checkpoint is not None and checkpoint.get("version") == 3
     if (not isinstance(batch, dict) or batch.keys() != {
             "batch_id", "lease_token", "actor_id", "message_id", "request_digest"}
-            or contract["version"] not in {2, 3} or not isinstance(outcome, tuple) or len(outcome) != 3
+            or contract["version"] not in {2, 3}):
+        raise CoreError("CHECKPOINT_INVALID")
+    if (not early or outcome is not None) and (not isinstance(outcome, tuple) or len(outcome) != 3
             or outcome[0] != "completed" or outcome[2] is not None
             or not isinstance(outcome[1], dict) or outcome[1].keys() != {"agent_name", "remote_state", "text"}
             or outcome[1]["agent_name"] != contract["peer_name"]
@@ -348,9 +385,22 @@ def _remote_file_binding(contract, batch, outcome, task_id):
     for value in batch.values():
         _remote_text(value)
     scope = contract["caller_scope"]
-    if batch["actor_id"] != scope["owner_id"] or batch["message_id"] != task_id:
+    message_id = task_id + ":artifact:" + batch["request_digest"] if early else task_id
+    if batch["actor_id"] != scope["owner_id"] or batch["message_id"] != message_id:
         raise CoreError("FILE_BATCH_NOT_FOUND")
     return WorkspaceBinding(contract["tenant_id"], scope["owner_id"], scope["context_id"])
+
+
+def remote_file_batch_ids(result):
+    if not isinstance(result, dict):
+        return []
+    return list(result.get("file_batch_ids", [])) or ([result["file_batch_id"]] if result.get("file_batch_id") else [])
+
+
+def _remote_result_batches(result, checkpoint):
+    if checkpoint.get("file_batch_ids"):
+        return {**(result or {}), "file_batch_ids": list(checkpoint["file_batch_ids"])}
+    return result
 
 
 @dataclass(frozen=True)
@@ -551,6 +601,7 @@ class TaskScheduler:
 
     def _finish_remote_locked(self, row, task, outcome):
         state, result, error_code = outcome
+        result = _remote_result_batches(result, row["checkpoint"])
         row["checkpoint"]["next_poll_at"] = None
         row["token"] = None
         task.state, task.result, task.error = state, copy.deepcopy(result), CoreError(error_code) if error_code else None
@@ -579,7 +630,7 @@ class TaskScheduler:
                             prepared_file_batch=None, conversation_observation=None):
         if prepared_file_batch is not None:
             return self._commit_remote_files(claim, expected_revision, checkpoint, outcome, progress, prepared_file_batch, conversation_observation)
-        if isinstance(outcome, tuple) and len(outcome) > 1 and isinstance(outcome[1], dict) and "file_batch_id" in outcome[1]:
+        if isinstance(outcome, tuple) and len(outcome) > 1 and isinstance(outcome[1], dict) and {"file_batch_id", "file_batch_ids"} & outcome[1].keys():
             raise CoreError("CHECKPOINT_INVALID")
         with self._lock:
             row, task = self._remote_claim(claim, terminal=True)
@@ -609,7 +660,7 @@ class TaskScheduler:
             row["updated_at"] = now
             if outcome is None:
                 if progress is not None:
-                    task.result = progress
+                    task.result = _remote_result_batches(progress, checkpoint)
                 task.revision += 1
                 if new_input:
                     self.mailbox(task.owner_id, row["contract"]["tenant_id"], remote=True).deliver(Notification(
@@ -629,7 +680,7 @@ class TaskScheduler:
         with self._lock:
             row, _ = self._remote_claim(claim, terminal=True)
             contract = copy.deepcopy(row["contract"])
-        binding = _remote_file_binding(contract, batch, outcome, claim.task_id)
+        binding = _remote_file_binding(contract, batch, outcome, claim.task_id, checkpoint)
         scope = contract["caller_scope"]
         with service.caller_scope(binding, task_id=scope["task_id"], run_id=scope["run_id"]):
             with self._lock, service.store.lock:
@@ -643,7 +694,8 @@ class TaskScheduler:
                     return task
                 if row["cancel_requested"] or row["checkpoint"]["cancel_started"]:
                     raise CoreError("CANCEL_REQUESTED")
-                updated = _advance_remote_checkpoint(row["checkpoint"], checkpoint, contract, self.clock(), False, outcome)
+                updated = _advance_remote_checkpoint(row["checkpoint"], checkpoint, contract, self.clock(), False, outcome,
+                    file_batch_id=batch["batch_id"] if checkpoint["version"] == 3 else None)
                 _remote_progress(progress, contract, updated, outcome)
                 if not updated["send_started"]:
                     raise CoreError("CHECKPOINT_INVALID")
@@ -669,8 +721,17 @@ class TaskScheduler:
                             row["conversation"] = merge_observation(row.get("conversation"), conversation_observation, self.clock())
                             row["updated_at"] = self.clock()
                             row["checkpoint"] = updated
-                            self._finish_remote_locked(row, task, ("completed", {
-                                **outcome[1], "file_batch_id": batch["batch_id"]}, None))
+                            if outcome is None:
+                                task.result = _remote_result_batches(progress, updated)
+                                task.revision += 1
+                                if _new_remote_input(before_row["checkpoint"], updated):
+                                    mailbox.deliver(Notification(str(uuid.uuid4()), task.owner_id, task.id,
+                                        "task.input-required", task.revision,
+                                        {"task_id": task.id, "input_id": updated["input_request"]["input_id"]}))
+                                    task.condition.notify_all()
+                            else:
+                                self._finish_remote_locked(row, task, ("completed", {
+                                    **outcome[1], **({} if updated["version"] == 3 else {"file_batch_id": batch["batch_id"]})}, None))
                     except BaseException:
                         service.store.rows[batch["batch_id"]] = before_batch
                         row.clear()

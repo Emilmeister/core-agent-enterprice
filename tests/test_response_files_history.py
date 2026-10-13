@@ -54,6 +54,15 @@ class ResponseFilesHistoryTests(AuthAppTestCase):
         refs = agent.response_files_service.prepare(binding, ["report.pdf", "empty.txt"],
             task_id=record.task_id, run_id=record.run_id, limit_bytes=3)
         result = {**record.result, "outgoing_files": refs, "provider_replay": "PRIVATE_FULL_RESULT"}
+        # This fixture exercises retained legacy selections, whose absent marker is v1.
+        snapshot = copy.deepcopy(record.snapshot)
+        for key in ("output_contract_version", "published_artifacts", "public_messages"):
+            snapshot.pop(key, None)
+        result.pop("output_contract_version", None)
+        record = replace(record, snapshot=snapshot)
+        if self.use_postgres:
+            with agent.workflow_store.database.transaction() as connection:
+                connection.execute("UPDATE core_runs SET snapshot=%s WHERE run_id=%s", (Jsonb(snapshot), record.run_id))
         self.update_result(record, result)
         return agent, record, binding, refs, result
 

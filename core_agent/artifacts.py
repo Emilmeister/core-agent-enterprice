@@ -41,7 +41,7 @@ class InMemoryArtifactStore:
         self._content[key] = content
         return artifact
 
-    def get(self, tenant_id, artifact_id):
+    def get(self, tenant_id, artifact_id, *, connection=None):
         try:
             return self._metadata[(tenant_id, artifact_id)], self._content[
                 (tenant_id, artifact_id)

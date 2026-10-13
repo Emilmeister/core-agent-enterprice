@@ -18,10 +18,12 @@ from psycopg.rows import dict_row
 from psycopg.sql import SQL, Identifier
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
-from google.protobuf.json_format import MessageToDict
+from google.protobuf.json_format import MessageToDict, ParseDict, ParseError
+import json
+from google.protobuf.struct_pb2 import Struct, Value
 
 from .audit import AuditRecord
-from .a2a import workflow_result_artifact
+from .a2a import output_contract_version, workflow_public_output, workflow_result_artifact
 from .auth import ScopeUser, is_company_owner
 from .durability import Event
 from .errors import CoreError
@@ -1307,18 +1309,100 @@ def _project_result_artifact(task, artifact, *, replace_all=False):
     else:
         del projected.parts[:]
         projected.metadata.Clear()
+    if artifact.name is not None:
+        projected.name = artifact.name
+    projected.parts.extend(public_artifact_parts(artifact))
+    metadata = {"digest": artifact.digest, "size": artifact.size, "provenance": artifact.provenance}
+    marker = artifact.provenance.get("core_agent_artifact")
+    if marker is not None:
+        metadata["core_agent_artifact"] = marker
+    else:
+        metadata["recovered"] = True  # Preserve the legacy v1 projection.
+    projected.metadata.update(metadata)
+
+
+def public_artifact_parts(artifact):
+    parts = []
     for part in artifact.parts:
+        media_type = part.media_type or artifact.media_type
         if part.kind == "file":
-            projected.parts.add(raw=part.data["bytes"], filename=part.data["filename"], media_type=part.data["media_type"])
+            value = a2a_pb2.Part(raw=part.data["bytes"], filename=part.data["filename"],
+                                  media_type=part.data["media_type"] or "application/octet-stream")
+        elif part.kind == "text":
+            value = a2a_pb2.Part(text=part.data, media_type=media_type)
+        elif part.kind == "data":
+            try:
+                json.dumps(part.data, allow_nan=False).encode("utf-8")
+                native = ParseDict(part.data, Value())
+                if MessageToDict(native) != part.data:
+                    raise ValueError()
+                value = a2a_pb2.Part(data=native, media_type=part.media_type or "application/json")
+            except (TypeError, ValueError, UnicodeError, ParseError, RecursionError):
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
         else:
-            projected.parts.add(text=part.data, media_type="text/plain")
-    projected.metadata.update({"digest": artifact.digest, "size": artifact.size,
-        "recovered": True, "provenance": artifact.provenance})
+            raise CoreError("CONTENT_TYPE_NOT_SUPPORTED")
+        parts.append(value)
+    return parts
+
+
+def public_sdk_message(message):
+    if any(part.kind != "text" or not isinstance(part.data, str) for part in message.parts):
+        raise CoreError("CHECKPOINT_INVALID")
+    parts = [a2a_pb2.Part(text=part.data, media_type=part.media_type or "text/plain") for part in message.parts]
+    return a2a_pb2.Message(message_id=message.message_id, task_id=message.task_id or "", context_id=message.context_id or "",
+                          role=a2a_pb2.ROLE_AGENT, parts=parts, metadata=ParseDict(message.metadata, Struct()))
+
+
+def _project_public_output(task, output, *, version, owner_wait=False):
+    before = task.SerializeToString(deterministic=True)
+    states = {"submitted": a2a_pb2.TASK_STATE_SUBMITTED, "working": a2a_pb2.TASK_STATE_WORKING,
+        "input-required": a2a_pb2.TASK_STATE_INPUT_REQUIRED, "auth-required": a2a_pb2.TASK_STATE_AUTH_REQUIRED,
+        "completed": a2a_pb2.TASK_STATE_COMPLETED, "failed": a2a_pb2.TASK_STATE_FAILED,
+        "canceled": a2a_pb2.TASK_STATE_CANCELED, "rejected": a2a_pb2.TASK_STATE_REJECTED}
+    task.status.state = states[output.state.value]
+    task.status.ClearField("message")
+    if output.message is not None:
+        task.status.message.CopyFrom(public_sdk_message(output.message))
+    public = {item.message_id: public_sdk_message(item) for item in output.history}
+    history, seen = [], set()
+    for message in task.history:
+        if message.role != a2a_pb2.ROLE_USER:
+            message = public.get(message.message_id)
+            if message is None:
+                continue
+        if message.message_id not in seen:
+            seen.add(message.message_id)
+            history.append(message)
+    history.extend(message for identifier, message in public.items() if identifier not in seen)
+    del task.history[:]
+    task.history.extend(history)
+    del task.artifacts[:]
+    for artifact in output.artifacts:
+        _project_result_artifact(task, artifact)
+    if owner_wait:
+        task.metadata["core_agent_wait"] = {"version": 1, "kind": "owner"}
+    elif "core_agent_wait" in task.metadata:
+        del task.metadata["core_agent_wait"]
+    if before == task.SerializeToString(deterministic=True):
+        return False
+    if version is not None:
+        task.metadata["core_agent_workflow_version"] = version
+    task.status.timestamp.GetCurrentTime()
+    return True
 
 
 def reconcile_workflow_task(task, *, run_id, state, result=None, error_code=None, version=None, authoritative=False,
                             record=None, response_files_service=None, connection=None):
     """Project canonical waiting/terminal state without exposing private waits."""
+    if record is not None and output_contract_version(record) == 2:
+        values = record if isinstance(record, dict) else vars(record)
+        if (values["task_id"], values["context_id"], values["run_id"]) != (task.id, task.context_id, run_id):
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        prior_version = dict(task.metadata).get("core_agent_workflow_version", 0)
+        if version is not None and isinstance(prior_version, (int, float)) and version < prior_version:
+            return False
+        return _project_public_output(task, workflow_public_output(record, response_files_service, connection=connection),
+                                      version=version, owner_wait=state == "WAITING_INPUT")
     terminal = {
         "COMPLETED": a2a_pb2.TASK_STATE_COMPLETED,
         "FAILED": a2a_pb2.TASK_STATE_FAILED,
@@ -1413,7 +1497,7 @@ class PostgresTaskStore(TaskStore):
               AND state = 'working'
               AND (checkpoint->>'deadline' IS NULL
                    OR (checkpoint->>'deadline')::double precision > extract(epoch FROM clock_timestamp()))
-            ORDER BY id FOR SHARE""", (tenant, run["run_id"])).fetchall()
+            ORDER BY id""", (tenant, run["run_id"])).fetchall()
 
     def _write_projection(self, connection, task, *, owner, tenant, enqueue_notification=None):
         connection.execute("""UPDATE core_a2a_tasks SET state = %s, status_timestamp = %s,
@@ -1424,16 +1508,43 @@ class PostgresTaskStore(TaskStore):
         if notify is not None:
             notify(task.id, task, owner=owner, tenant=tenant, connection=connection)
 
+    def reconcile_run(self, record, connection=None):
+        """Project after the caller's fenced workflow write, in the same transaction."""
+        values = record if isinstance(record, dict) else vars(record)
+        with (self.database.transaction() if connection is None else nullcontext(connection)) as connection:
+            row = connection.execute("""SELECT payload FROM core_a2a_tasks
+                WHERE task_id = %s AND tenant = %s AND owner = %s FOR UPDATE""",
+                (values["task_id"], values["tenant_id"], values["owner_id"])).fetchone()
+            if row is None:
+                return None  # Internal child tasks have no public A2A mapping.
+            task = a2a_pb2.Task.FromString(bytes(row["payload"]))
+            changed = reconcile_workflow_task(task, run_id=values["run_id"], state=values["state"],
+                result=values.get("result"), error_code=values.get("error_code"), version=values["version"],
+                record=record, response_files_service=self.response_files_service, connection=connection)
+            if changed:
+                self._write_projection(connection, task, owner=values["owner_id"], tenant=values["tenant_id"])
+            return changed
+
     def _project_progress(self, connection, row):
         """Read projection preserves the established explicit terminal-reconciliation boundary."""
         task = a2a_pb2.Task.FromString(bytes(row["payload"]))
-        if task.status.state in (a2a_pb2.TASK_STATE_FAILED, a2a_pb2.TASK_STATE_CANCELED, a2a_pb2.TASK_STATE_REJECTED):
-            return task
+        # MVCC avoids reversing the workflow observer's run -> task lock order.
         run = connection.execute("""SELECT run_id, task_id, tenant_id, owner_id, context_id,
             state, version, result, error_code, snapshot FROM core_runs
-            WHERE task_id = %s AND tenant_id = %s AND owner_id = %s FOR SHARE""",
+            WHERE task_id = %s AND tenant_id = %s AND owner_id = %s""",
             (task.id, row["tenant"], row["owner"])).fetchone()
         if run is None:
+            return task
+        if output_contract_version(run) == 2:
+            changed = reconcile_workflow_task(task, run_id=run["run_id"], state=run["state"],
+                result=run["result"], error_code=run["error_code"], version=run["version"], record=run,
+                response_files_service=self.response_files_service, connection=connection)
+            changed = reconcile_remote_progress(task, state=run["state"],
+                tasks=self._remote_rows(connection, run, row["tenant"])) or changed
+            if changed:
+                self._write_projection(connection, task, owner=row["owner"], tenant=row["tenant"])
+            return task
+        if task.status.state in (a2a_pb2.TASK_STATE_FAILED, a2a_pb2.TASK_STATE_CANCELED, a2a_pb2.TASK_STATE_REJECTED):
             return task
         if run["state"] == "COMPLETED" and _has_response_files(run["result"]):
             reconcile_workflow_task(task, run_id=run["run_id"], state=run["state"], result=run["result"],
@@ -1470,7 +1581,8 @@ class PostgresTaskStore(TaskStore):
                    WHERE task.state NOT IN (%s, %s, %s, %s)
                      AND (run.state IN ('COMPLETED','FAILED','ABORTED','CANCELLED','REJECTED',
                                         'WAITING_TASK','WAITING_INPUT')
-                          OR run.state IN ('RUNNING','MODEL_RESPONDED','EXECUTING') AND run.snapshot ? 'remote_calls')
+                          OR run.state IN ('RUNNING','MODEL_RESPONDED','EXECUTING') AND run.snapshot ? 'remote_calls'
+                          OR run.snapshot->>'output_contract_version' = '2')
                    """ + tenant_filter + " FOR UPDATE OF task",
                 (
                     int(a2a_pb2.TASK_STATE_COMPLETED),
@@ -1482,7 +1594,7 @@ class PostgresTaskStore(TaskStore):
             for row in rows:
                 # The task lock may have waited; reread canonical state afterwards.
                 run = connection.execute(
-                    "SELECT run_id, task_id, tenant_id, owner_id, context_id, state, version, result, error_code, snapshot FROM core_runs WHERE run_id = %s FOR SHARE",
+                    "SELECT run_id, task_id, tenant_id, owner_id, context_id, state, version, result, error_code, snapshot FROM core_runs WHERE run_id = %s",
                     (row["run_id"],),
                 ).fetchone()
                 task = a2a_pb2.Task.FromString(bytes(row["payload"]))
@@ -1499,7 +1611,7 @@ class PostgresTaskStore(TaskStore):
                 reconciled += 1
         return reconciled
 
-    def _save(self, task, context, *, connection=None):
+    def _save(self, task, context, *, connection=None, trusted_admission=False):
         # The SDK keeps its aggregate and may append further Artifact chunks.
         persisted = a2a_pb2.Task()
         persisted.CopyFrom(task)
@@ -1530,9 +1642,26 @@ class PostgresTaskStore(TaskStore):
                 )
                 run = connection.execute(
                     """SELECT run_id, task_id, tenant_id, owner_id, context_id, state, version, result, error_code, snapshot FROM core_runs
-                       WHERE task_id = %s AND owner_id = %s AND tenant_id = %s FOR SHARE""",
+                       WHERE task_id = %s AND owner_id = %s AND tenant_id = %s""",
                     (task.id, owner, tenant),
                 ).fetchone()
+                if run and output_contract_version(run) == 2:
+                    if trusted_admission:
+                        for name in ("file_batch_id", "file_receipt"):
+                            if name in task.metadata:
+                                stored.metadata[name] = MessageToDict(task.metadata.fields[name])
+                    # SDK previews/chunks cannot replace committed public output.
+                    identifiers = {message.message_id for message in stored.history}
+                    stored.history.extend(message for message in task.history
+                        if message.role == a2a_pb2.ROLE_USER and message.message_id not in identifiers)
+                    changed = reconcile_workflow_task(stored, run_id=run["run_id"], state=run["state"],
+                        result=run["result"], error_code=run["error_code"], version=run["version"], record=run,
+                        response_files_service=self.response_files_service, connection=connection)
+                    changed = reconcile_remote_progress(stored, state=run["state"],
+                        tasks=self._remote_rows(connection, run, tenant)) or changed
+                    if changed or stored.SerializeToString() != bytes(previous["payload"]):
+                        self._write_projection(connection, stored, owner=owner, tenant=tenant)
+                    return
                 incoming_version = dict(task.metadata).get("core_agent_workflow_version", 0)
                 if run and (stored_terminal or run["state"] == "COMPLETED" and _has_response_files(run["result"])
                             or not isinstance(incoming_version, (int, float)) or incoming_version < run["version"]):

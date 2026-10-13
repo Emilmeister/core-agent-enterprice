@@ -194,23 +194,29 @@ def _file_identity(entry, content=None):
     return identity
 
 
-def _files(agent, binding, row, source, connection, materials=None):
+def _files(agent, binding, row, source, connection, materials=None, pending=None):
+    from .tasks import remote_file_batch_ids
     service = agent.chat_file_service
-    batch_id = (row["result"] or {}).get("file_batch_id")
-    if service is None or not batch_id:
+    batch_ids = remote_file_batch_ids(row["result"])
+    if service is None or not batch_ids:
         return []
+    files = []
     try:
-        batch = service.store.get(batch_id, binding.tenant_id, connection=connection)
-        if batch["state"] != "published":
-            return []
-        with service._accepted_files(batch_id, binding, run_id=source.run_id,
-                                     task_id=source.task_id, connection=connection) as (batch, directory):
-            if materials is not None:
-                materials.extend(_file_identity(entry, service._read_entry(directory, entry))
-                                 for entry in batch["manifest"]["entries"])
-            return [{key: entry[key] for key in (
-                "index", "actual_name", "relative_path", "size_bytes", "sha256")}
-                for entry in batch["manifest"]["entries"]]
+        for batch_id in batch_ids:
+            batch = service.store.get(batch_id, binding.tenant_id, connection=connection)
+            if batch["state"] != "published":
+                if pending is not None and batch["state"] in {"accepted_quarantine", "accepted_ready"}:
+                    pending.append(batch_id)
+                continue
+            with service._accepted_files(batch_id, binding, run_id=source.run_id,
+                                         task_id=source.task_id, connection=connection) as (batch, directory):
+                if materials is not None:
+                    materials.extend(_file_identity(entry, service._read_entry(directory, entry))
+                                     for entry in batch["manifest"]["entries"])
+                files.extend({key: entry[key] for key in (
+                    "index", "actual_name", "relative_path", "size_bytes", "sha256")}
+                    for entry in batch["manifest"]["entries"])
+        return files
     except CoreError as error:
         if error.code in {"FILE_BATCH_NOT_FOUND", "FILE_NOT_FOUND", "TASK_NOT_FOUND"}:
             return []
@@ -225,7 +231,7 @@ def _scope_record(record):
 def _visibility(agent, admission, binding, row, source, connection, outgoing_files, loaded, incoming_materials):
     from .chat_files import _caller_records
     from .history import _final_dependency_reviews, _json_identity, _reviews, _review_status, _source_materials
-    from .tasks import remote_result_projection
+    from .tasks import remote_result_projection, remote_file_batch_ids
 
     if agent.material_review_store is None:
         return None, None
@@ -296,7 +302,7 @@ def _visibility(agent, admission, binding, row, source, connection, outgoing_fil
     if isinstance(result.get("text"), str):
         incoming_materials.append(_json_identity(result["text"]))
     incoming = _review_status(_reviews(admission, scope, incoming_sources, [], incoming_materials,
-        [result["file_batch_id"]] if result.get("file_batch_id") else [], connection))
+        remote_file_batch_ids(result), connection))
     return _review_status(request_reviews), incoming
 
 
@@ -392,23 +398,28 @@ def _project_messages(agent, admission, binding, row, source, connection, reques
 
 
 def _artifact_receipts(agent, binding, row, files, connection):
+    from .tasks import remote_file_batch_ids
     if not files:
         return [], None
-    batch = agent.chat_file_service.store.get(row["result"]["file_batch_id"], binding.tenant_id, connection=connection)
-    manifest = batch["manifest"]
     indexed = {entry["relative_path"]: entry for entry in files}
-    artifacts = []
-    for artifact in manifest.get("artifacts", ()):
-        parts = []
-        for part in artifact["parts"]:
-            entry = indexed.get(part["relative_path"])
-            if entry is None or (entry["sha256"], entry["size_bytes"]) != (part["sha256"], part["size_bytes"]):
-                raise CoreError("CHECKPOINT_INVALID")
-            parts.append({key: part[key] for key in ("index", "type", "name", "media_type", "relative_path", "size_bytes", "sha256")})
-        artifacts.append({"index": artifact["index"], "artifact_id": artifact["artifact_id"],
-                          "name": artifact["name"], "parts": parts})
-    path = manifest.get("manifest_path")
-    return artifacts, path if path in indexed else None
+    artifacts, path = [], None
+    for batch_id in remote_file_batch_ids(row["result"]):
+        batch = agent.chat_file_service.store.get(batch_id, binding.tenant_id, connection=connection)
+        if batch["state"] != "published":
+            continue
+        manifest = batch["manifest"]
+        for artifact in manifest.get("artifacts", ()):
+            parts = []
+            for part in artifact["parts"]:
+                entry = indexed.get(part["relative_path"])
+                if entry is None or (entry["sha256"], entry["size_bytes"]) != (part["sha256"], part["size_bytes"]):
+                    raise CoreError("CHECKPOINT_INVALID")
+                parts.append({key: part[key] for key in ("index", "type", "name", "media_type", "relative_path", "size_bytes", "sha256")})
+            artifacts.append({"index": len(artifacts), "artifact_id": artifact["artifact_id"],
+                              "name": artifact["name"], "parts": parts})
+        if path is None and manifest.get("manifest_path") in indexed:
+            path = manifest["manifest_path"]
+    return artifacts, path
 
 
 def read_outgoing_file(agent, admission, binding, operation_id, file_id):
@@ -471,8 +482,8 @@ def read_conversations(agent, admission, binding, *, limit=50, after=None, opera
                         raise
                     conversation = row.get("remote_conversation") or initial_conversation()
                     checkpoint, contract = row["checkpoint"], row["contract"]
-                    incoming_materials = []
-                    files = _files(agent, binding, row, source, connection, incoming_materials)
+                    incoming_materials, pending_files = [], []
+                    files = _files(agent, binding, row, source, connection, incoming_materials, pending_files)
                     outgoing_files, loaded = _outgoing_files(agent, binding, row, source, connection)
                     request_status, incoming_status = _visibility(agent, admission, binding, row, source,
                         connection, outgoing_files, loaded, incoming_materials)
@@ -494,7 +505,8 @@ def read_conversations(agent, admission, binding, *, limit=50, after=None, opera
                     value = {"operation_id": row["id"], "peer_id": contract["peer_id"], "peer_name": contract["peer_name"],
                         "root_task_id": root.task_id, "state": row["state"],
                         "request_delivery": delivery,
-                        "material_status": (status[0] if status[0] in {"rejected", "timed_out"} else "pending_guardrail") if status else "available",
+                        "material_status": (status[0] if status[0] in {"rejected", "timed_out"} else "pending_guardrail") if status else
+                            "pending_guardrail" if pending_files else "available",
                         "error_code": row.get("error_code") if row.get("error_code") in SAFE_REMOTE_ERRORS else None,
                         "outcome_unknown": (row["result"] or {}).get("remote_outcome") == "unknown",
                         "remote_state": (row["result"] or {}).get("remote_state"),

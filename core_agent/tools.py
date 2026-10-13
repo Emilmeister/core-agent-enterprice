@@ -49,6 +49,43 @@ RESPONSE_BEGIN_TOOL = ToolDefinition(
 )
 
 
+RESPONSE_ARTIFACTS_TOOL = ToolDefinition(
+    "core_response_artifacts",
+    "Attach explicitly chosen immutable artifacts to this Task immediately and continue working. "
+    "Use typed text/data/file Parts; file paths must be relative to the current workspace. "
+    "Every successful call appends artifacts. Published artifacts cannot be replaced or removed. "
+    "Send ordinary replies as messages; do not create an artifact for every answer.",
+    {"type": "object", "properties": {
+        "artifacts": {"type": "array", "minItems": 1, "maxItems": 64, "items": {
+            "type": "object", "properties": {
+                "name": {"type": "string", "maxLength": 256},
+                "parts": {"type": "array", "minItems": 1, "maxItems": 256, "items": {
+                    "type": "object", "properties": {
+                        "type": {"type": "string", "enum": ["text", "data", "file"]},
+                        "text": {"type": "string"},
+                        "media_type": {"type": "string", "maxLength": 256},
+                        "data": {"type": "object", "additionalProperties": True},
+                        "path": {"type": "string", "minLength": 1},
+                    }, "required": ["type"], "additionalProperties": False,
+                }},
+            }, "required": ["parts"], "additionalProperties": False,
+        }},
+    }, "required": ["artifacts"], "additionalProperties": False},
+    mutating=True, risk_tags=frozenset({"filesystem_read", "external_write"}),
+)
+
+MESSAGE_SEND_TOOL = ToolDefinition(
+    "core_message_send",
+    "Send a public progress message to the current Task recipient and continue working. "
+    "This does not finish the Task or wait for a reply. Write the ordinary final answer "
+    "when work is complete. Never include hidden reasoning or private owner correspondence.",
+    {"type": "object", "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 16384},
+    }, "required": ["text"], "additionalProperties": False},
+    mutating=True, risk_tags=frozenset({"external_write"}),
+)
+
+
 @dataclass(frozen=True)
 class ToolCall:
     id: str

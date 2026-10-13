@@ -10,6 +10,7 @@ import uuid
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from a2a.types import Task, TaskState, TaskStatus
 
@@ -17,7 +18,7 @@ from core_agent.chat_files import ChatFileService, MemoryChatFileStore, Postgres
 from core_agent.database import PostgresDatabase
 from core_agent.errors import CoreError
 from core_agent.postgres_tasks import PostgresTaskScheduler
-from core_agent.remote_agents import RemoteEvent, _task_event
+from core_agent.remote_agents import RemoteAgentConnection, RemoteEvent, _task_event
 from core_agent.remote_operations import RemoteA2AExecutor
 from core_agent.remote_registry import InMemoryRemoteRegistry
 from core_agent.tasks import REMOTE_TASK_PENDING, TaskScheduler
@@ -128,6 +129,212 @@ class RemoteInboundContract:
         self.assertEqual(task.state, "working", getattr(task.error, "code", None))
         self.assertEqual(self.batches(), [])
         self.assertNotIn("early-canary", json.dumps(task.result))
+
+    def marked_snapshot(self, artifacts, state="WORKING", text="Working message"):
+        return _task_event({"task": {"id": "peer-task", "contextId": "peer-chat",
+            "status": {"state": "TASK_STATE_" + state, "message": {"messageId": "public-" + state,
+                "role": "ROLE_AGENT", "parts": [{"text": text}]}},
+            "artifacts": [{"artifactId": identity, "name": "Report", "parts": [{"text": content}],
+                "metadata": {"core_agent_artifact": {"version": 1, "complete": True, "immutable": True}}}
+                for identity, content in artifacts]}})
+
+    def poll_snapshot(self, event):
+        if event is not None:
+            self.responses.append(event)
+        self.now += 5
+        if hasattr(self, "database"):
+            with self.database.transaction() as connection:
+                connection.execute("""UPDATE core_background_tasks
+                    SET checkpoint=jsonb_set(checkpoint,'{next_poll_at}',
+                        to_jsonb(EXTRACT(EPOCH FROM clock_timestamp())::double precision-1))
+                    WHERE tenant_id=%s AND state='working'""", (self.tenant,))
+        self.scheduler.recover(tenant_id=self.tenant)
+        self.settle()
+
+    def test_v3_complete_marked_working_artifact_enters_quarantine_without_completion(self):
+        self.responses.append(self.marked_snapshot([("report", "early-content-canary")]))
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.assertEqual(task.state, "working", getattr(task.error, "code", None))
+        self.assertEqual(len(task.result.get("file_batch_ids", [])), 1)
+        batch = self.store.get(task.result["file_batch_ids"][0], self.tenant)
+        self.assertEqual(batch["state"], "accepted_quarantine")
+        self.assertNotIn("early-content-canary", json.dumps(task.result))
+        self.assertEqual(batch["manifest"]["artifacts"][0]["artifact_id"], "report")
+
+    def test_v3_marked_snapshots_append_once_keep_stable_paths_and_survive_failure(self):
+        first = self.marked_snapshot([("first", "first-content")])
+        self.responses.append(first)
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.assertEqual(len(task.result.get("file_batch_ids", [])), 1)
+        first_batch = self.store.get(task.result["file_batch_ids"][0], self.tenant)
+        first_path = first_batch["manifest"]["artifacts"][0]["parts"][0]["relative_path"]
+        self.poll_snapshot(first)
+        self.assertEqual(len(self.batches()), 1)
+        self.poll_snapshot(self.marked_snapshot([("first", "first-content"), ("second", "second-content")]))
+        task = self.scheduler.get(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.assertEqual(len(task.result["file_batch_ids"]), 2)
+        ids = list(task.result["file_batch_ids"])
+        self.assertEqual(self.store.get(ids[0], self.tenant)["manifest"]["artifacts"][0]["parts"][0]["relative_path"], first_path)
+        self.assertNotEqual(self.store.get(ids[0], self.tenant)["manifest"]["destination"],
+                            self.store.get(ids[1], self.tenant)["manifest"]["destination"])
+        self.poll_snapshot(self.marked_snapshot([("first", "first-content"), ("second", "second-content")], "FAILED"))
+        task = self.scheduler.get(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.assertEqual(task.state, "failed")
+        self.assertEqual(task.result["file_batch_ids"], ids)
+        self.assertEqual(len(self.batches()), 2)
+
+    def test_v3_changed_published_artifact_is_rejected_and_previous_receipt_retained(self):
+        self.responses.append(self.marked_snapshot([("report", "original")]))
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.assertEqual(len(task.result.get("file_batch_ids", [])), 1)
+        ids = list(task.result["file_batch_ids"])
+        self.poll_snapshot(self.marked_snapshot([("report", "changed")]))
+        task = self.scheduler.get(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.assertEqual((task.state, task.error.code), ("failed", "REMOTE_AGENT_PROTOCOL_ERROR"))
+        self.assertEqual(task.result["file_batch_ids"], ids)
+        self.assertEqual(len(self.batches()), 1)
+
+    def test_v3_marked_artifact_payload_limit_is_cumulative_without_manifest_overhead(self):
+        self.responses.append(self.marked_snapshot([("first", "123")]))
+        task = self.start(version=3, attachment_limit_bytes=4)
+        self.assertEqual(task.state, "working", getattr(task.error, "code", None))
+        self.assertEqual(len(task.result.get("file_batch_ids", [])), 1)
+        self.poll_snapshot(self.marked_snapshot([("first", "123"), ("second", "45")]))
+        task = self.scheduler.get(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.assertEqual((task.state, task.error.code), ("failed", "ATTACHMENTS_TOO_LARGE"))
+        self.assertEqual(len(task.result["file_batch_ids"]), 1)
+        self.assertEqual(len(self.batches()), 1)
+
+    def test_v3_partial_marker_does_not_authorize_early_intake(self):
+        for changes in ({"complete": False}, {"immutable": False}, {"version": 2}):
+            event = self.marked_snapshot([("report", "private-canary")])
+            artifact = {**event.artifacts[0], "metadata": {"core_agent_artifact": {
+                "version": 1, "complete": True, "immutable": True, **changes}}}
+            self.responses.append(replace(event, artifacts=(artifact,)))
+            task = self.start(version=3, attachment_limit_bytes=10000)
+            self.assertEqual(task.state, "working")
+            self.assertEqual(self.batches(), [])
+
+    def test_v3_marked_batch_part_and_artifact_caps_reject_whole_batch(self):
+        for oversized in ("artifacts", "parts"):
+            event = self.marked_snapshot([("report", "content")])
+            if oversized == "artifacts":
+                event = replace(event, artifacts=tuple({**event.artifacts[0], "artifactId": "a" + str(index)}
+                                                       for index in range(65)))
+            else:
+                event = replace(event, artifacts=({**event.artifacts[0], "parts": [{"text": "x"}] * 257},))
+            self.responses.append(event)
+            task = self.start(version=3, attachment_limit_bytes=10000)
+            self.assertEqual((task.state, task.error.code), ("failed", "REMOTE_AGENT_RESPONSE_TOO_LARGE"))
+            self.assertEqual(self.batches(), [])
+
+    def test_v3_marked_batch_cancellation_keeps_earlier_receipt_and_mailbox_hides_capabilities(self):
+        first = self.marked_snapshot([("first", "original")])
+        self.responses.append(first)
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        ids = list(task.result["file_batch_ids"])
+        self.scheduler.cancel(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.poll_snapshot(self.marked_snapshot([("first", "original")], "CANCELED", "Canceled"))
+        task = self.scheduler.get(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.assertEqual(task.state, "canceled")
+        self.assertEqual(task.result["file_batch_ids"], ids)
+        notifications = self.scheduler.mailbox(self.source.run_id, self.tenant).poll()
+        self.assertNotIn("file_batch_ids", str(notifications))
+        self.assertNotIn(ids[0], str(notifications))
+
+    def test_v3_marked_artifact_text_preserves_declared_text_subtype(self):
+        event = self.marked_snapshot([("report", "a,b")])
+        event = replace(event, artifacts=({**event.artifacts[0], "parts": [
+            {"text": "a,b", "mediaType": "text/csv"}]},))
+        self.responses.append(event)
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        batch = self.store.get(task.result["file_batch_ids"][0], self.tenant)
+        self.assertEqual(batch["manifest"]["artifacts"][0]["parts"][0]["media_type"], "text/csv")
+
+    def test_v3_wire_json_numbers_keep_exact_canonical_payload_size(self):
+        event = _task_event({"task": {"id": "peer-task", "contextId": "peer-chat",
+            "status": {"state": "TASK_STATE_WORKING"}, "artifacts": [{"artifactId": "numbers",
+                "parts": [{"data": {"n": 1}}], "metadata": {"core_agent_artifact": {
+                    "version": 1, "complete": True, "immutable": True}}}]}})
+        self.assertIs(type(event.artifacts[0]["parts"][0]["data"]["n"]), int)
+        self.responses.append(event)
+        task = self.start(version=3, attachment_limit_bytes=7)
+        self.assertEqual(task.state, "working", getattr(task.error, "code", None))
+        batch = self.store.get(task.result["file_batch_ids"][0], self.tenant)
+        self.assertEqual(batch["manifest"]["artifacts"][0]["parts"][0]["size_bytes"], 7)
+
+    def test_marked_early_artifact_preserves_existing_caller_clarification_notification(self):
+        self.responses.append(self.marked_snapshot([("report", "content")], "INPUT_REQUIRED", "Which city?"))
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.assertEqual(task.state, "working")
+        pending = self.scheduler.remote_input(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.assertEqual(pending["question"], "Which city?")
+        notifications = self.scheduler.mailbox(self.source.run_id, self.tenant).poll()
+        self.assertEqual([notification.kind for notification in notifications], ["task.input-required"])
+        self.assertEqual(notifications[0].payload["input_id"], pending["input_id"])
+        self.assertNotIn("file_batch_ids", str(notifications))
+
+    def test_actual_peer_both_bindings_publish_early_artifacts_then_final_message(self):
+        for binding in ("HTTP+JSON", "JSONRPC"):
+            with self.subTest(binding=binding):
+                snapshots = []
+                for state, entries in (("WORKING", [("first", "first-content")]),
+                        ("WORKING", [("first", "first-content"), ("second", "second-content")]),
+                        ("COMPLETED", [("first", "first-content"), ("second", "second-content")])):
+                    snapshots.append({"id": "native-task", "contextId": "native-chat", "status": {
+                        "state": "TASK_STATE_" + state, "message": {"messageId": "message-" + state,
+                            "role": "ROLE_AGENT", "parts": [{"text": "Final reply" if state == "COMPLETED" else "Progress reply"}]}},
+                        "artifacts": [{"artifactId": identity, "parts": [{"text": content}], "metadata": {
+                            "core_agent_artifact": {"version": 1, "complete": True, "immutable": True}}}
+                            for identity, content in entries]})
+                requests = []
+                class Peer(BaseHTTPRequestHandler):
+                    def log_message(self, *_args):
+                        pass
+
+                    def respond(self, request=None):
+                        method = (request or {}).get("method") or ("GetTask" if self.command == "GET" else "SendMessage")
+                        requests.append(method)
+                        remote = snapshots.pop(0)
+                        result = {"task": remote} if method == "SendMessage" else remote
+                        if binding == "JSONRPC":
+                            result = {"jsonrpc": "2.0", "id": request["id"], "result": result}
+                        encoded = json.dumps(result).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(encoded)))
+                        self.end_headers()
+                        self.wfile.write(encoded)
+
+                    def do_POST(self):
+                        self.respond(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+
+                    def do_GET(self):
+                        self.respond()
+                server = ThreadingHTTPServer(("127.0.0.1", 0), Peer)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                self.addCleanup(thread.join, 2)
+                self.addCleanup(server.server_close)
+                self.addCleanup(server.shutdown)
+                peer = self.registry.create(self.tenant, {"name": "native-" + binding.lower().replace("+", "-"), "description": "Fixture",
+                    "url": "http://127.0.0.1:%s/a2a" % server.server_port, "enabled": True,
+                    "header_name": "Authorization", "header_value": "Bearer PRIVATE-credential"}, actor_id=self.person)
+                with patch("core_agent.remote_operations.RemoteAgentConnection", RemoteAgentConnection):
+                    task = self.start(version=3, binding=binding, attachment_limit_bytes=10000,
+                        peer_id=peer["id"], peer_revision=peer["revision"], peer_name=peer["name"], url=peer["url"])
+                    self.assertEqual(task.state, "working", getattr(task.error, "code", None))
+                    self.assertEqual(len(task.result.get("file_batch_ids", [])), 1)
+                    self.poll_snapshot(None)
+                    task = self.scheduler.get(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+                    self.assertEqual((task.state, len(task.result["file_batch_ids"])), ("working", 2))
+                    ids = list(task.result["file_batch_ids"])
+                    self.poll_snapshot(None)
+                    task = self.scheduler.get(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+                    self.assertEqual((task.state, task.result["text"]), ("completed", "Final reply"))
+                    self.assertEqual(task.result["file_batch_ids"], ids)
+                    self.assertTrue(all(self.store.get(batch_id, self.tenant)["state"] == "accepted_quarantine" for batch_id in ids))
+                self.assertEqual(requests, ["SendMessage", "GetTask", "GetTask"])
 
     def test_v3_reflected_message_id_never_becomes_a_manifest(self):
         self.responses.append(_task_event({"message": {"messageId": "PRIVATE-credential", "role": "ROLE_AGENT",

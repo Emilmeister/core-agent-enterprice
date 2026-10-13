@@ -183,12 +183,38 @@ async def final_response_file(agent, admission, actor, request):
 
     def read():
         def load(row, connection=None):
-            files = row["files"] or ()
+            from .history import _root, published_artifacts, published_file_source
+
+            chat = {"owner_id": row["owner_id"], "context_id": context_id}
+            root = _root(admission, row["run_id"], actor.tenant, chat, connection)
+            binding = WorkspaceBinding(actor.tenant, row["owner_id"], context_id)
+            if root["output_contract_version"] == 2:
+                manifests = published_artifacts(admission, root, connection)
+                files = [part["ref"] for manifest in manifests for part in manifest["parts"]]
+                if not any(entry["file_id"] == file_id for entry in files):
+                    raise CoreError("FILE_NOT_FOUND")
+                source = published_file_source(admission, root, file_id, connection, chat)
+                if source is None or source["status"] != "available":
+                    raise CoreError("FILE_NOT_FOUND")
+                from .response_artifacts import ResponseArtifactService, _json_bytes
+
+                artifacts = ResponseArtifactService(agent.response_files_service).load(binding, manifests,
+                    task_id=task_id, run_id=row["run_id"], limit_bytes=files[0]["limit_bytes"], connection=connection)
+                for manifest, artifact in zip(manifests, artifacts):
+                    for entry, part in zip(manifest["parts"], artifact.parts):
+                        if entry["ref"]["file_id"] == file_id:
+                            content = (part.data.encode("utf-8") if part.kind == "text" else
+                                       _json_bytes(part.data) if part.kind == "data" else part.data["bytes"])
+                            return entry["ref"], content
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+            else:
+                files = row["files"] or ()
+                if row["state"] != "COMPLETED":
+                    raise CoreError("FILE_NOT_FOUND")
             if not isinstance(files, (list, tuple)) or not all(isinstance(entry, dict) for entry in files):
                 raise CoreError("ARTIFACT_INTEGRITY_FAILED")
-            if row["state"] != "COMPLETED" or not any(entry.get("file_id") == file_id for entry in files):
+            if not any(entry.get("file_id") == file_id for entry in files):
                 raise CoreError("FILE_NOT_FOUND")
-            binding = WorkspaceBinding(actor.tenant, row["owner_id"], context_id)
             loaded = agent.response_files_service.load(binding, files, task_id=task_id,
                 run_id=row["run_id"], limit_bytes=files[0].get("limit_bytes"), connection=connection)
             return next((entry, content) for entry, content in loaded if entry["file_id"] == file_id)

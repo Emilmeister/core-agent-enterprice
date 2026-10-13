@@ -17,6 +17,19 @@ from tests.test_auth import AuthAppTestCase, TEST_DATABASE_URL
 
 class ResponseFilesRuntimeTests(AuthAppTestCase):
     durable_blobs = True
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        store = self.app.state.core_agent.workflow_store
+        create = store.create
+        def legacy_admission(record, *args, **kwargs):
+            if record.parent_run_id is None:
+                record = replace(record, snapshot={**record.snapshot, "output_contract_version": 1})
+            return create(record, *args, **kwargs)
+        pinned = patch.object(store, "create", side_effect=legacy_admission)
+        pinned.start()
+        self.addCleanup(pinned.stop)
+
     def set_limit(self, agent, value):
         tenant = self.app.state.authenticator.settings.tenant
         settings = agent.interaction_store.get_settings(tenant)

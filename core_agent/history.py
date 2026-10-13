@@ -48,6 +48,7 @@ def _root(admission, run_id, tenant, chat, connection):
         value = {name: getattr(record, name) for name in (
             "run_id", "task_id", "tenant_id", "owner_id", "context_id", "parent_run_id", "state", "result", "error_code")}
         value.update(previous=snapshot.get("previous_root_run_id"),
+            output_contract_version=snapshot.get("output_contract_version", 1),
             file_batch_id=snapshot.get("file_batch_id"),
             initial_checked=snapshot.get("initial_material_checked", False),
             start=snapshot.get("context", {}).get("sequence_range", [1, 0])[0], admitted=admitted,
@@ -59,6 +60,7 @@ def _root(admission, run_id, tenant, chat, connection):
             r.parent_run_id,r.state,r.error_code,
             r.snapshot->>'file_batch_id' AS file_batch_id,
             r.snapshot->>'previous_root_run_id' AS previous,
+            COALESCE(r.snapshot->'output_contract_version','1'::jsonb) AS output_contract_version,
             r.request->>'prompt' AS original_prompt,r.snapshot->'cron_origin' AS cron_origin,
             (SELECT m.display_text FROM core_root_messages m WHERE m.tenant_id=r.tenant_id
                 AND m.task_id=r.task_id AND m.owner_id=r.owner_id AND m.context_id=r.context_id LIMIT 1) AS display_text,
@@ -71,6 +73,8 @@ def _root(admission, run_id, tenant, chat, connection):
     if (value is None or not value["admitted"] or value["parent_run_id"] is not None
             or (value["tenant_id"], value["owner_id"], value["context_id"]) != (tenant, chat["owner_id"], chat["context_id"])
             or value["previous"] is not None and (not isinstance(value["previous"], str) or not value["previous"])):
+        raise CoreError("CHECKPOINT_INVALID")
+    if type(value["output_contract_version"]) is not int or value["output_contract_version"] not in {1, 2}:
         raise CoreError("CHECKPOINT_INVALID")
     return value
 
@@ -413,12 +417,125 @@ def _final_dependency_reviews(admission, root, connection, chat, *, before_call_
         offset += len(rows)
 
 
+def published_artifacts(admission, root, connection=None):
+    """Validate every scoped pointer before projecting metadata or granting a read."""
+    from .response_artifacts import ResponseArtifactService
+
+    if connection is None:
+        manifests = admission.agent.workflow_store._records[root["run_id"]].snapshot.get("published_artifacts", [])
+    else:
+        manifests = connection.execute("""SELECT COALESCE(snapshot->'published_artifacts','[]'::jsonb) AS artifacts
+            FROM core_runs WHERE run_id=%s AND tenant_id=%s""", (root["run_id"], root["tenant_id"])).fetchone()["artifacts"]
+    try:
+        if not manifests:
+            if manifests != [] and manifests != ():
+                raise ValueError()
+            return ()
+        service = ResponseArtifactService(admission.agent.response_files_service)
+        binding = WorkspaceBinding(root["tenant_id"], root["owner_id"], root["context_id"])
+        service._validate(binding, manifests, task_id=root["task_id"], run_id=root["run_id"],
+                          limit_bytes=manifests[0]["parts"][0]["ref"]["limit_bytes"])
+    except (CoreError, ValueError, TypeError, KeyError, IndexError, AttributeError):
+        raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
+    return manifests
+
+
+def _published_materials(admission, root, connection):
+    """Hash exact typed snapshots once per history read; retain only identities."""
+    from .peer_conversations import _file_identity
+    from .response_artifacts import ResponseArtifactService, _json_bytes
+
+    if "_published_materials" in root:
+        return root["_published_materials"]
+    manifests = published_artifacts(admission, root, connection)
+    identities = {}
+    if manifests:
+        service = ResponseArtifactService(admission.agent.response_files_service)
+        binding = WorkspaceBinding(root["tenant_id"], root["owner_id"], root["context_id"])
+        artifacts = service.load(binding, manifests, task_id=root["task_id"], run_id=root["run_id"],
+            limit_bytes=manifests[0]["parts"][0]["ref"]["limit_bytes"], connection=connection)
+        for manifest, artifact in zip(manifests, artifacts):
+            materials = []
+            for entry, part in zip(manifest["parts"], artifact.parts):
+                content = (part.data.encode("utf-8") if part.kind == "text" else
+                           _json_bytes(part.data) if part.kind == "data" else part.data["bytes"])
+                materials.append(_file_identity(entry["ref"], content))
+                if part.kind == "data":
+                    materials.append(_json_identity(part.data))
+            identities[manifest["artifact_id"]] = materials
+    root["_published_materials"] = identities
+    return identities
+
+
+def _public_message(admission, root, message_id, connection):
+    if not isinstance(message_id, str):
+        return None
+    if connection is None:
+        entries = admission.agent.workflow_store._records[root["run_id"]].snapshot.get("public_messages", [])
+        if not isinstance(entries, list):
+            raise CoreError("CHECKPOINT_INVALID")
+        matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("message_id") == message_id]
+    else:
+        matches = [row["entry"] for row in connection.execute("""SELECT entry FROM core_runs r,
+            jsonb_array_elements(COALESCE(r.snapshot->'public_messages','[]'::jsonb)) AS entry
+            WHERE r.run_id=%s AND r.tenant_id=%s AND entry->>'message_id'=%s LIMIT 2""",
+            (root["run_id"], root["tenant_id"], message_id)).fetchall()]
+    if not matches:
+        return None
+    if (len(matches) != 1 or set(matches[0]) != {"message_id", "text"}
+            or not isinstance(matches[0].get("text"), str)):
+        raise CoreError("CHECKPOINT_INVALID")
+    return {"message_id": message_id, "text": matches[0]["text"]}
+
+
+def _publication_receipts(admission, root, value, connection):
+    from .response_artifacts import ResponseArtifactService
+
+    output = value.get("output")
+    receipts = output.get("artifacts") if isinstance(output, dict) else None
+    if (value.get("status") != "succeeded" or value.get("tool_name") not in {"core_response_artifacts", "core_response_files"}
+            or not isinstance(receipts, (list, tuple)) or not receipts):
+        return ()
+    ids = [item.get("artifact_id") if isinstance(item, dict) else None for item in receipts]
+    if any(not isinstance(identifier, str) for identifier in ids):
+        return ()
+    manifests = published_artifacts(admission, root, connection)
+    selected = [manifest for manifest in manifests if manifest["artifact_id"] in ids]
+    if len(selected) != len(ids) or len(set(ids)) != len(ids):
+        return ()  # A tool payload cannot publish a pointer absent from the committed snapshot.
+    return ResponseArtifactService.receipts(selected)
+
+
+def published_file_source(admission, root, file_id, connection, chat):
+    """The current decision for the accepted publisher also gates explicit downloads."""
+    before = None
+    while True:
+        rows = _entries(admission, root, connection, before=before, limit=100)
+        if not rows:
+            return None
+        for entry in rows:
+            item = entry["item"] or {}
+            if item.get("kind") != "tool_result":
+                continue
+            try:
+                value = json.loads(item["content"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            receipts = _publication_receipts(admission, root, value, connection)
+            if any(part["file_id"] == file_id for artifact in receipts for part in artifact["parts"]):
+                return _project(admission, root, entry, connection, chat)
+        before = rows[-1]["position"]
+
+
 def _project(admission, root, entry, connection, chat):
     position, item, message = entry["position"], entry["item"], entry["input"]
     identity = root["task_id"] + ("/result" if position[0] == 2 else
         "/input/" + str(message["sequence"]) if message else "/transcript/" + str(position[1]))
     result = {"id": identity, "task_id": root["task_id"], "kind": "placeholder", "text": "", "status": "available"}
     terminal_result = position[0] == 2
+    public_message, artifact_receipts, publisher_call = None, (), None
     sources, review_ids, materials, batches = [], [], [], []
     if terminal_result:
         if connection is None:
@@ -438,6 +555,10 @@ def _project(admission, root, entry, connection, chat):
             result["outcome"]["error_code"] = root["error_code"]
         if final.get("message") is not None:
             materials.append(_json_identity(final["message"]))
+        if root["output_contract_version"] == 2:
+            suffix = {"COMPLETED": "final", "FAILED": "failed", "ABORTED": "aborted", "REJECTED": "rejected"}.get(root["state"])
+            if suffix:
+                result["public_message_id"] = root["task_id"] + ":" + suffix
     if message:
         sources.append("input:" + message["message_id"])
         if message["provenance"].get("file_batch_id"):
@@ -457,6 +578,19 @@ def _project(admission, root, entry, connection, chat):
         try:
             value = json.loads(item["content"])
             sources.extend(["result:" + value["tool_call_id"], "arguments:" + value["tool_call_id"]])
+            if root["output_contract_version"] == 2 and value.get("status") == "succeeded":
+                output = value.get("output")
+                if value.get("tool_name") == "core_message_send" and isinstance(output, dict):
+                    message_id = output.get("message_id")
+                    if message_id == root["task_id"] + ":message:" + value["tool_call_id"]:
+                        public_message = _public_message(admission, root, message_id, connection)
+                        if public_message:
+                            result["public_message_id"] = public_message["message_id"]
+                            publisher_call = value["tool_call_id"]
+                            materials.append(_json_identity(public_message["text"]))
+                artifact_receipts = _publication_receipts(admission, root, value, connection)
+                if artifact_receipts:
+                    publisher_call = value["tool_call_id"]
         except (ValueError, KeyError, TypeError):
             pass
     elif kind == "assistant_tool_calls":
@@ -469,7 +603,14 @@ def _project(admission, root, entry, connection, chat):
     reviews = _reviews(admission, root, sources, review_ids, materials, batches, connection)
     if terminal_result:
         reviews = chain(reviews, _final_dependency_reviews(admission, root, connection, chat))
+    elif publisher_call:
+        reviews = chain(reviews, _final_dependency_reviews(admission, root, connection, chat, before_call_id=publisher_call))
     blocked = _review_status(reviews)
+    if not blocked and root["output_contract_version"] == 2 and (artifact_receipts or terminal_result):
+        selected = {receipt["artifact_id"] for receipt in artifact_receipts} if not terminal_result else None
+        published_materials = [material for identifier, identities in _published_materials(admission, root, connection).items()
+            if selected is None or identifier in selected for material in identities]
+        blocked = _review_status(_reviews(admission, root, [], [], published_materials, [], connection))
     if blocked:
         state, wait_id = blocked
         result.update(kind="placeholder", status=state if state in {"rejected", "timed_out"} else "pending_guardrail",
@@ -502,7 +643,19 @@ def _project(admission, root, entry, connection, chat):
                 result.setdefault("attachments", []).extend({key: entry[key] for key in (
                     "index", "actual_name", "relative_path", "size_bytes", "sha256")}
                     for entry in batch["manifest"]["entries"])
-    if terminal_result and root["state"] == "COMPLETED" and result["status"] == "available":
+    if result["status"] == "available":
+        if public_message:
+            result["public_message"] = public_message
+        if artifact_receipts:
+            result["response_artifacts"] = list(artifact_receipts)
+        if terminal_result and root["output_contract_version"] == 2:
+            from .response_artifacts import ResponseArtifactService
+
+            manifests = published_artifacts(admission, root, connection)
+            if manifests:
+                result["response_artifacts"] = list(ResponseArtifactService.receipts(manifests))
+    if (terminal_result and root["output_contract_version"] == 1
+            and root["state"] == "COMPLETED" and result["status"] == "available"):
         files = final.get("outgoing_files", ())
         if not isinstance(files, (tuple, list)) or not all(isinstance(ref, dict) for ref in files):
             raise CoreError("ARTIFACT_INTEGRITY_FAILED")

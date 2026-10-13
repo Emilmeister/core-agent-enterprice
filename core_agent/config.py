@@ -205,6 +205,8 @@ def compile_effective_config(
         "core_task_": "background_tasks",
         "core_delegate": "delegation",
         "core_ask_owner": "human_input",
+        "core_message_send": "public_messages",
+        "core_response_artifacts": "response_files",
         "core_agent_": "remote_agents",
         "core_memory_": "memory",
     }
@@ -264,8 +266,10 @@ def compile_effective_config(
     if "core_python_exec" not in allowed:
         policies.discard("python")
     policies.discard("artifacts")
-    if "core_response_files" in allowed:
+    if allowed & {"core_response_files", "core_response_artifacts"}:
         policies.add("response_files")
+    if "core_message_send" in allowed:
+        policies.add("public_messages")
     if "core_agent_send_message" not in allowed:
         policies.discard("remote_agents")
 

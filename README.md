@@ -77,7 +77,8 @@ HTTP+JSON. Карточка агента доступна по `/.well-known/age
 | Выполнение | `core_terminal_exec`, `core_python_exec` |
 | Фоновые задачи | `core_task_start`, `core_task_get`, `core_task_list`, `core_task_wait`, `core_task_cancel` |
 | Делегирование | `core_delegate` |
-| Файлы ответа | `core_response_files` |
+| Публичные ответы | `core_message_send` |
+| Артефакты ответа | `core_response_artifacts`, `core_response_files` |
 | Ожидание, вопросы владельцу и расписание | `core_wait_until`, `core_ask_owner`, `core_cron_create` |
 | Память | `core_memory_search`, `core_memory_read`, `core_memory_create`, `core_memory_update`, `core_memory_split`, `core_memory_delete` |
 | Удалённые агенты | `core_agent_send_message` |
@@ -118,12 +119,21 @@ A2A-вложения — в `a2a/<batch-id>/`, результаты внешни
 содержимое она читает выбранным вызовом Python или терминала. Старые сохранённые
 операции и batches продолжают использовать прежний формат и расположение.
 
-`core_response_files` принимает `{paths: ["relative/path"]}` и выбирает весь
-набор файлов следующего финального ответа из chat workspace. `[]` очищает
-выбор. Сохранённый immutable набор передаётся как standard raw FileParts
-результирующего A2A Artifact и доступен владельцу для скачивания; изменение
-исходного workspace-файла не меняет уже выбранные bytes. Tool доступен только
-при настроенных trusted workspace и transport storage.
+В новых задачах финальный ответ передаётся как Message. Для публичного
+промежуточного ответа модель вызывает `core_message_send`; задача продолжает
+работу. Такие Messages сохраняются в Task history и доступны после restart.
+
+Модель прикрепляет артефакты вызовом `core_response_artifacts`: каждый выбранный
+Artifact может содержать text, JSON object и файлы по относительным workspace
+paths. После разрешения HITL и проверки результата инструмента набор сразу
+добавляется к Task, независимо от её завершения. Сохранённые bytes неизменяемы;
+повторный вызов добавляет новый набор. Общий лимит Parts действует на всю Task.
+
+`core_response_files` принимает `{paths: ["relative/path"]}` как file-only alias.
+В новой задаче он сразу добавляет Artifact; `[]` ничего не меняет. Оба инструмента
+требуют trusted workspace и transport storage. Ранее принятые задачи сохраняют
+прежний контракт: финальный текст в Artifact, замена выбора файлов и очистка
+через `[]`. Обновление не переписывает их результаты.
 
 Прежние `core_artifact_save`, `core_artifact_load`, `core_artifact_list` и их
 алиасы через точки больше не поддерживаются. При обновлении удалите их из

@@ -30,6 +30,7 @@ from .context import (
     StructuredSummarizer,
 )
 from .chat_files import _destination
+from .a2a import output_contract_version, workflow_public_output
 from .errors import CoreError, ExecutionNotStarted
 from .interactions import tool_origin
 from .skills import (
@@ -48,8 +49,9 @@ from .remote_operations import RemoteA2AExecutor
 from .response_files import ResponseFileService
 from .security import redact
 from .streaming import NullStreamPublisher
-from .tasks import DelegationContract, _remote_contract, remote_result_projection
-from .tools import CRON_CREATE_TOOL, RESPONSE_FILES_TOOL, RESPONSE_BEGIN_TOOL, ToolCall, ToolDefinition, ToolResult
+from .tasks import DelegationContract, _remote_contract, remote_file_batch_ids, remote_result_projection
+from .tools import (CRON_CREATE_TOOL, MESSAGE_SEND_TOOL, RESPONSE_ARTIFACTS_TOOL, RESPONSE_FILES_TOOL,
+                    RESPONSE_BEGIN_TOOL, ToolCall, ToolDefinition, ToolResult)
 from .workflow import InMemoryWorkflowStore, SuspendedRun, WorkflowRecord, TERMINAL_STATES
 from .workspace import WorkspaceBinding
 
@@ -74,6 +76,12 @@ BUDGET_FOLLOWUP_MESSAGE = (
     "Budget exhausted; this task is incomplete. A follow-up message arrived during "
     "finalization and was recorded but could not be processed within the budget. "
     "Completed durable work remains recorded, and no missing result was invented."
+)
+LEGACY_RESPONSE_FILES_INSTRUCTION = (
+    "RESPONSE FILES: Use core_response_files with relative workspace paths to select "
+    "the complete file set for your final answer. It freezes the bytes, replaces your "
+    "previous selection, and sends no message. [] clears the set. Then answer normally. "
+    "A failed selection preserves the previous set; reduce files after an aggregate-limit error."
 )
 SKILL_CONTRACT_VERSION = 3
 
@@ -413,8 +421,8 @@ class CoreAgent:
         self.remote_registry = remote_registry
         self.send_message_api_key = send_message_api_key
         registered = self.tool_runtime.registry.names()
-        for definition in (*_skill_tool_definitions(), CRON_CREATE_TOOL,
-                           *((RESPONSE_FILES_TOOL,) if response_files_service is not None else ())):
+        for definition in (*_skill_tool_definitions(), CRON_CREATE_TOOL, MESSAGE_SEND_TOOL,
+                           *((RESPONSE_FILES_TOOL, RESPONSE_ARTIFACTS_TOOL) if response_files_service is not None else ())):
             if definition.name not in registered:
                 self.tool_runtime.registry.register(definition)
         self.tool_runtime.handlers.update(
@@ -429,6 +437,8 @@ class CoreAgent:
                 "core_agent_send_message": self._send_message,
                 "core_cron_create": self._cron_create,
                 "core_response_files": self._response_files,
+                "core_response_artifacts": self._response_artifacts,
+                "core_message_send": self._message_send,
                 "core_memory_search": self._memory_search,
                 "core_memory_read": self._memory_read,
                 "core_memory_create": self._memory_create,
@@ -1209,6 +1219,13 @@ class CoreAgent:
                         "description": definition.description,
                         "input_schema": schema,
                     }
+        if (snapshot or {}).get("output_contract_version", 1) != 2:
+            catalog.pop("core_response_artifacts", None)
+            catalog.pop("core_message_send", None)
+        elif "core_response_files" in catalog:
+            catalog["core_response_files"]["description"] = (
+                "Publish explicitly selected files as one immutable Artifact batch and continue working. "
+                "Selections append; [] makes no change. Write ordinary replies as Messages.")
         available_skills = sorted(
             {
                 skill["name"]
@@ -1859,6 +1876,7 @@ class CoreAgent:
         connection=None,
         _terminal_committing=False,
     ):
+        prior_public = (record.snapshot.get("published_artifacts", []), record.snapshot.get("public_messages", []))
         if state in TERMINAL_STATES and not _terminal_committing:
             if connection is not None:
                 raise CoreError("INVALID_TASK_STATE", "Terminal cleanup cannot run inside a database transaction")
@@ -1976,6 +1994,14 @@ class CoreAgent:
         )
         if state in TERMINAL_STATES and self.reply_hub is not None:
             self.reply_hub.discard(record.tenant_id, record.task_id)
+        if (connection is None and output_contract_version(updated) == 2
+                and prior_public != (updated.snapshot.get("published_artifacts", []), updated.snapshot.get("public_messages", []))):
+            try:
+                self._stream(updated).public_output(workflow_public_output(updated, self.response_files_service))
+            except Exception as error:
+                # Durable output remains available through Get/recovery after stream loss.
+                self._log("public_output.delivery_failed", run_id=updated.run_id, task_id=updated.task_id,
+                          error_code=getattr(error, "code", None) or type(error).__name__)
         return updated
 
     def _new_workflow(
@@ -2043,6 +2069,10 @@ class CoreAgent:
         )
         snapshot = {
             "initializing": True,
+            "output_contract_version": (output_contract_version(self.workflow_store.get(parent_run_id,
+                tenant_id=tenant_id, owner_id=owner_id, connection=connection)) if parent_run_id is not None else 2),
+            "published_artifacts": [],
+            "public_messages": [],
             "context_run_id": run_id,
             "previous_root_run_id": previous_root_run_id,
             "skill_contract_version": SKILL_CONTRACT_VERSION,
@@ -2472,9 +2502,19 @@ class CoreAgent:
             if skill["name"] in effective.skills
         )
         capabilities = set(effective.enabled_capability_policies)
-        if model_tools is not None and "core_response_files" not in model_tools:
-            capabilities.discard("response_files")
-        return self.kernel_compiler.compile(
+        version = snapshot.get("output_contract_version", 1)
+        compiler = self.kernel_compiler
+        if version == 1:
+            compiler = copy.copy(compiler)
+            compiler.capability_policies = {**compiler.capability_policies,
+                                           "response_files": LEGACY_RESPONSE_FILES_INSTRUCTION}
+            capabilities.discard("public_messages")
+        if model_tools is not None:
+            if not {"core_response_files", "core_response_artifacts"}.intersection(model_tools):
+                capabilities.discard("response_files")
+            if "core_message_send" not in model_tools:
+                capabilities.discard("public_messages")
+        return compiler.compile(
             enabled_capabilities=capabilities,
             agent_profile=raw["agent"].get("profile_prompt", ""),
             user_prompt="",
@@ -2482,6 +2522,7 @@ class CoreAgent:
             response_phase=(snapshot.get("response_phase", "work")
                             if self.reply_hub is not None and self._model_streams_deltas and self.depth == 0
                             and snapshot.get("response_root", True) else None),
+            output_contract_version=version,
         )
 
     @staticmethod
@@ -2665,6 +2706,8 @@ class CoreAgent:
         return mcp_tool_index(effective.mcp_tools).get(name)
 
     def _definition(self, call, effective, discovered, record):
+        if call.name in {"core_response_artifacts", "core_message_send"} and output_contract_version(record) != 2:
+            raise ExecutionNotStarted("CAPABILITY_DISABLED")
         if call.name == RESPONSE_BEGIN_TOOL.name:
             pending = record.snapshot.get("pending_call")
             if (self.reply_hub is None or not self._model_streams_deltas or self.depth != 0
@@ -3396,30 +3439,40 @@ class CoreAgent:
         batches = []
         binding = WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id)
         for output in outputs:
-            if (not isinstance(output, dict) or not isinstance(output.get("task_id"), str)
-                    or output.get("state") != "completed"):
+            if not isinstance(output, dict) or not isinstance(output.get("task_id"), str):
                 continue
             if not self.task_scheduler.is_remote(output["task_id"], owner_id=record.run_id, tenant_id=record.tenant_id):
                 continue
             task = self.task_scheduler.get(output["task_id"], owner_id=record.run_id, tenant_id=record.tenant_id)
             result = task.result
-            if not isinstance(result, dict) or not result.get("file_batch_id"):
+            batch_ids = remote_file_batch_ids(result)
+            if not batch_ids or output.get("state") != "completed" and not result.get("file_batch_ids"):
                 continue
             if self.chat_file_service is None:
                 raise CoreError("MATERIAL_REVIEW_REQUIRED")
-            batch_id = result["file_batch_id"]
-            material = self.chat_file_service.review_material(batch_id, binding,
-                run_id=record.run_id, task_id=record.task_id)
             output["result"] = self._value(remote_result_projection(result))
-            output["result"]["files"] = [{key: entry[key] for key in
-                ("index", "actual_name", "relative_path", "media_type", "size_bytes", "sha256")}
-                for entry in material["manifest"]["entries"]]
-            output["result"]["folder"] = "/workspace/" + "/".join(_destination(material["manifest"]))
-            if "manifest_path" in material["manifest"]:
-                output["result"]["manifest_path"] = "/workspace/" + material["manifest"]["manifest_path"]
-                output["result"]["artifacts"] = copy.deepcopy(material["manifest"]["artifacts"])
-                output["result"]["messages"] = copy.deepcopy(material["manifest"]["messages"])
-            batches.append((batch_id, output))
+            files, folders, paths, artifacts, messages = [], [], [], [], []
+            for batch_id in batch_ids:
+                material = self.chat_file_service.review_material(batch_id, binding,
+                    run_id=record.run_id, task_id=record.task_id)
+                manifest = material["manifest"]
+                files.extend({key: entry[key] for key in
+                    ("index", "actual_name", "relative_path", "media_type", "size_bytes", "sha256")}
+                    for entry in manifest["entries"])
+                folders.append("/workspace/" + "/".join(_destination(manifest)))
+                if "manifest_path" in manifest:
+                    paths.append("/workspace/" + manifest["manifest_path"])
+                    artifacts.extend(copy.deepcopy(manifest["artifacts"]))
+                    messages.extend(copy.deepcopy(manifest["messages"]))
+                batches.append((batch_id, output))
+            output["result"].update(files=files)
+            if len(folders) == 1:
+                output["result"]["folder"] = folders[0]
+            else:
+                output["result"]["folders"] = folders
+            if paths:
+                output["result"].update(artifacts=artifacts, messages=messages)
+                output["result"]["manifest_path" if len(paths) == 1 else "manifest_paths"] = paths[0] if len(paths) == 1 else paths
         return candidate, batches
 
     def _guard_remote_results(self, record, snapshot, call, payload, batches, *, decision,
@@ -3534,6 +3587,7 @@ class CoreAgent:
                 outcome = ToolResult(call.id, "failed", json.loads(self._material_refusal(decision, source_kind)),
                                      "MATERIAL_TIMEOUT" if decision == "timed_out" else "MATERIAL_REJECTED")
             snapshot.pop("pending_completed_result", None)
+        self._apply_public_outputs(snapshot, call, not isinstance(outcome, ToolResult) or outcome.status == "succeeded")
         notification_call = call
         notification_output = outcome.output if isinstance(outcome, ToolResult) else outcome
         if call.name in {"core_agent_send_message", "core_task_get", "core_task_list", "core_task_wait"}:
@@ -5127,6 +5181,7 @@ class CoreAgent:
                         )
                     result = {
                         "message": response["message"],
+                        **({"output_contract_version": 2} if output_contract_version(record) == 2 else {}),
                         **({"outgoing_files": copy.deepcopy(snapshot["outgoing_files"])}
                            if snapshot.get("outgoing_files") else {}),
                         "complete": exhausted is None,
@@ -5387,6 +5442,8 @@ class CoreAgent:
         snapshot = {
             "admission": {"agent_config": raw, "platform_config": self._platform_snapshot(platform),
                           "mcp": [], "declared_skills": []},
+            "output_contract_version": output_contract_version(parent),
+            "published_artifacts": [], "public_messages": [],
             "initializing": False, "skill_contract_version": SKILL_CONTRACT_VERSION,
             "skill_catalog": [], "skills": [], "mcp_catalogs": {},
             "effective_config_digest": effective.digest,
@@ -5569,11 +5626,90 @@ class CoreAgent:
         if succeeded:
             snapshot["outgoing_files"] = prepared["files"]
 
+    @staticmethod
+    def _apply_public_outputs(snapshot, call, succeeded):
+        prepared = snapshot.pop("prepared_public_output", None)
+        if prepared is None:
+            return
+        if (snapshot.get("output_contract_version") != 2 or prepared.get("call_id") != call.id
+                or call.name not in {"core_response_artifacts", "core_response_files", "core_message_send"}):
+            raise CoreError("CHECKPOINT_INVALID")
+        if not succeeded:
+            return
+        for artifact in prepared.get("artifacts", []):
+            published = snapshot.setdefault("published_artifacts", [])
+            previous = next((item for item in published if item["artifact_id"] == artifact["artifact_id"]), None)
+            if previous is not None and previous != artifact:
+                raise CoreError("CHECKPOINT_INVALID")
+            if previous is None:
+                published.append(artifact)
+        if "message" in prepared:
+            message = {key: prepared["message"][key] for key in ("message_id", "text")}
+            published = snapshot.setdefault("public_messages", [])
+            previous = next((item for item in published if item["message_id"] == message["message_id"]), None)
+            if previous is not None and previous != message:
+                raise CoreError("CHECKPOINT_INVALID")
+            if previous is None:
+                published.append(message)
+
+    @staticmethod
+    def _publication_call_id(snapshot):
+        nested = snapshot.get("nested_dispatch", {})
+        return nested["call_id"] if nested.get("state") == "executing" else snapshot["pending_call"]["id"]
+
+    def _response_artifacts(self, arguments, run_id):
+        from .response_artifacts import ResponseArtifactService
+
+        context = self._current_dispatch(run_id)
+        if self.response_files_service is None or context is None:
+            raise ExecutionNotStarted("CAPABILITY_DISABLED")
+        record, snapshot = context["record"], context["snapshot"]
+        if output_contract_version(record) != 2:
+            raise ExecutionNotStarted("CAPABILITY_DISABLED")
+        call_id = self._publication_call_id(snapshot)
+        limit = (self.interaction_store.get_settings(record.tenant_id).attachment_limit_bytes
+                 if self.interaction_store is not None else 25_000_000)
+        published = snapshot.get("published_artifacts", [])
+        if published:
+            limit = published[0]["parts"][0]["ref"]["limit_bytes"]
+        service = ResponseArtifactService(self.response_files_service)
+        try:
+            artifacts = service.prepare(WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id),
+                arguments["artifacts"], task_id=record.task_id, run_id=record.run_id,
+                publication_id=call_id, limit_bytes=limit, published=published)
+        except CoreError as error:
+            raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+        snapshot["prepared_public_output"] = {"call_id": call_id, "artifacts": list(artifacts)}
+        return {"artifacts": list(service.receipts(artifacts))}
+
+    def _message_send(self, arguments, run_id):
+        context = self._current_dispatch(run_id)
+        if context is None or output_contract_version(context["record"]) != 2:
+            raise ExecutionNotStarted("CAPABILITY_DISABLED")
+        record, snapshot = context["record"], context["snapshot"]
+        text = arguments["text"]
+        if not isinstance(text, str) or not text:
+            raise ExecutionNotStarted("TOOL_ARGUMENT_INVALID")
+        try:
+            text.encode("utf-8")
+        except UnicodeError:
+            raise ExecutionNotStarted("TOOL_ARGUMENT_INVALID") from None
+        call_id = self._publication_call_id(snapshot)
+        identifier = f"{record.task_id}:message:{call_id}"
+        snapshot["prepared_public_output"] = {"call_id": call_id,
+            "message": {"message_id": identifier, "text": text, "created_at": self.workflow_store.current_time()}}
+        return {"message_id": identifier}
+
     def _response_files(self, arguments, run_id):
         context = self._current_dispatch(run_id)
         if self.response_files_service is None or context is None:
             raise ExecutionNotStarted("CAPABILITY_DISABLED")
         record, snapshot = context["record"], context["snapshot"]
+        if output_contract_version(record) == 2:
+            if not arguments["paths"]:
+                return {"artifacts": []}
+            return self._response_artifacts({"artifacts": [{"parts": [
+                {"type": "file", "path": path} for path in arguments["paths"]]}]}, run_id)
         nested = snapshot.get("nested_dispatch", {})
         call_id = (nested["call_id"] if nested.get("state") == "executing"
                    and nested.get("subject", {}).get("tool_name") == "core_response_files"
@@ -5670,6 +5806,7 @@ class CoreAgent:
             return
         snapshot = copy.deepcopy(context["snapshot"])
         self._apply_response_files(snapshot, call, not isinstance(outcome, ToolResult) or outcome.status == "succeeded")
+        self._apply_public_outputs(snapshot, call, not isinstance(outcome, ToolResult) or outcome.status == "succeeded")
         if call.name in {"core_agent_send_message", "core_task_get", "core_task_list", "core_task_wait"}:
             self._mark_remote_question(snapshot, outcome.output if isinstance(outcome, ToolResult) else outcome)
         frame = snapshot.get("python_execution")

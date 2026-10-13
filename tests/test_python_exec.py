@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from unittest.mock import patch
 
 from tests.app_support import create_app
@@ -15,6 +16,18 @@ from tests.test_auth import AuthAppTestCase, TEST_DATABASE_URL
 
 class PythonResponseFileTests(AuthAppTestCase):
     durable_blobs = True
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        store = self.app.state.core_agent.workflow_store
+        create = store.create
+        def legacy_admission(record, *args, **kwargs):
+            if record.parent_run_id is None:
+                record = replace(record, snapshot={**record.snapshot, "output_contract_version": 1})
+            return create(record, *args, **kwargs)
+        pinned = patch.object(store, "create", side_effect=legacy_admission)
+        pinned.start()
+        self.addCleanup(pinned.stop)
 
     async def execute(self, code):
         self.model._responses = [ModelResponse(tool_requests=(ToolRequest("python-files", "core_python_exec", {"code": code}),)),

@@ -62,7 +62,7 @@ let peerPostAttempts=0,peerDeleteAttempts=0;
 let rejectNextAccessDelete=false,rejectNextPeerDelete=false;
 const peerSecret='Browser-private-peer-secret-739',schedulePrompt='Browser manual cron in the original chat';
 const configuredBuiltinTools=['core_terminal_exec','core_response_files','core_cron_create','core_ask_owner',
-  'core_task_start','core_task_wait','core_python_exec','core_agent_send_message'].sort();
+  'core_response_artifacts','core_message_send','core_task_start','core_task_wait','core_python_exec','core_agent_send_message'].sort();
 const configuredPolicyCatalog=`JSON.stringify([...document.querySelectorAll('form.policy:not([hidden])')].map(form=>form.dataset.toolName).sort())===${JSON.stringify(JSON.stringify(configuredBuiltinTools))}`;
 function observeOwnerAPI(tab){
   const pending=new Map();
@@ -458,14 +458,14 @@ try {
   await page.wait("document.querySelectorAll('.message .message-attachments:not(.response-files) li').length===3",'published attachment history after reload');
   const outcomes=history.at(-1).filter(item=>item.kind==='tool_result').map(item=>JSON.parse(item.text));
   check(['browser-native-root-verified','browser-native-followup-verified'].every(marker=>outcomes.some(result=>result.tool_call_id===marker&&result.status==='succeeded'&&result.output.exit_code===0&&result.output.stdout.trim()===marker))&&await page.evaluate("document.querySelector('.thread').textContent.includes('report_3.txt')"),'actual native file reads and persisted attachment history');
-  check(outcomes.some(result=>result.tool_call_id==='browser-native-output-selected'&&result.status==='succeeded'&&result.output.files.length===2)&&outcomes.some(result=>result.tool_call_id==='browser-native-output-deleted'&&result.status==='succeeded'&&result.output.exit_code===0&&result.output.stdout.trim()==='browser-native-output-deleted'),'actual native files are selected then changed and deleted before final response');
+  check(outcomes.some(result=>result.tool_call_id==='browser-native-output-selected'&&result.status==='succeeded'&&result.output.artifacts.length===1&&result.output.artifacts[0].parts.length===2&&result.output.artifacts[0].parts.every(part=>part.type==='file'))&&outcomes.some(result=>result.tool_call_id==='browser-native-output-deleted'&&result.status==='succeeded'&&result.output.exit_code===0&&result.output.stdout.trim()==='browser-native-output-deleted'),'actual native files are selected then changed and deleted before final response');
   const entries=history.at(-1).flatMap(item=>item.attachments??[]);
   check(entries.length===3&&new Set(entries.map(entry=>entry.actual_name)).size===3,'published typed history has exact safe attachment names');
   const latest=tasks.at(-1);
   check(latest.metadata.file_receipt.entries.length===2&&!latest.metadata.accepted_file_receipt,'transient follow-up receipt never replaces persisted root metadata');
   await page.wait("document.querySelectorAll('.response-files li').length===2",'actual final response file controls');
-  const output=history.at(-1).find(item=>item.kind==='result'&&item.status==='available').response_files;
-  check(output.length===2&&output.map(file=>file.name).join(',')==='report-output.txt,empty.txt'&&output.every(file=>Object.keys(file).sort().join(',')==='file_id,media_type,name,sha256,size_bytes'),'ordered public response receipts render in matching final message');
+  const output=history.at(-1).find(item=>item.kind==='result'&&item.status==='available').response_artifacts.flatMap(artifact=>artifact.parts);
+  check(output.length===2&&output.map(file=>file.name).join(',')==='report-output.txt,empty.txt'&&output.every(file=>file.type==='file'&&Object.keys(file).sort().join(',')==='file_id,media_type,name,sha256,size_bytes,type'),'ordered public response receipts render in matching final message');
   await page.call('Browser.setDownloadBehavior',{behavior:'allow',downloadPath:config.downloads});
   pauseDownload=true;
   await page.call('Fetch.enable',{patterns:[{urlPattern:config.origin+'/api/chats/*/tasks/*/files/*',requestStage:'Response'}]});
@@ -908,6 +908,40 @@ try {
   check(!await page.evaluate("document.querySelector('.thread').textContent.includes('artifact-content-canary')"),'explicit peer preview does not inject artifact content into main chat');
   await page.click('×','.peer-panel-heading button');
   }
+  await second.click('Инструменты','.nav-item');
+  await second.wait(configuredPolicyCatalog,'public-output tool policy catalog');
+  await setPolicy('core_message_send','allow',true);
+  await setPolicy('core_response_artifacts','allow',true);
+  await page.field('.composer textarea','Native durable public output proof');
+  await page.click('Отправить ↑');
+  const progressVisible="[...document.querySelectorAll('.message .markdown p')].filter(node=>node.textContent==='Native durable public progress.').length===1";
+  const mixedVisible="document.querySelector('.response-artifacts h4')?.textContent==='Native mixed artifact'&&document.querySelectorAll('.response-artifacts .file-card').length===3";
+  await page.wait(progressVisible+'&&'+mixedVisible,'durable progress and mixed artifact before final response');
+  await waitFor(()=>tasks.at(-1)?.status.state==='TASK_STATE_WORKING'&&tasks.at(-1)?.artifacts?.some(artifact=>artifact.name==='Native mixed artifact'),'actual canonical working Task includes explicit mixed artifact');
+  const publishedTask=tasks.at(-1),publishedArtifact=publishedTask.artifacts.find(artifact=>artifact.name==='Native mixed artifact');
+  check(await page.evaluate(`(async()=>{const response=await fetch('/api/browser-public-fixture',{headers:{Authorization:${JSON.stringify(bearer)}},cache:'no-store',credentials:'omit'});return response.status===200&&(await response.json()).waiting;})()`)
+    &&publishedArtifact.parts.length===3&&publishedArtifact.parts[0].text==='**Native mixed text canary**'
+    &&publishedArtifact.parts[1].data.city==='Казань'&&typeof publishedArtifact.parts[2].raw==='string',
+    'durable public Message and mixed Artifact stay visible during the subsequent working turn');
+  check(!await page.evaluate("document.querySelector('.thread').textContent.includes('Native mixed text canary')||document.querySelector('.thread').textContent.includes('native-mixed-json-canary')"),'typed artifact text and data stay outside automatic reply projection');
+  await page.click('Открыть','.response-artifacts button[aria-label="Открыть part-2.json"]');
+  await page.wait("[...document.querySelectorAll('.response-artifacts .file-preview pre')].some(node=>JSON.parse(node.textContent).city==='Казань'&&JSON.parse(node.textContent).count===1)",'explicit mixed JSON preview');
+  await page.click('Скачать','.response-artifacts button[aria-label="Скачать native-public.bin"]');
+  check((await downloaded({name:'native-public.bin'})).equals(Buffer.from('Native typed artifact bytes\n')),
+    'typed Artifact requires explicit preview and preserves JSON and file bytes');
+  await page.call('Page.reload');
+  await page.wait("!!document.querySelector('.chat-link')",'durable public-output chat after reload');
+  await page.evaluate("document.querySelector('.chat-link').click()");
+  await page.wait(progressVisible+'&&'+mixedVisible,'working publication restored from current guarded history');
+  check(!await page.evaluate("document.querySelector('.thread').textContent.includes('Native mixed text canary')||document.querySelector('.thread').textContent.includes('native-mixed-json-canary')"),
+    'working publication survives browser reload without duplicate Messages or Artifacts');
+  check(await page.evaluate(`(async()=>{const response=await fetch('/api/browser-public-fixture',{method:'POST',headers:{Authorization:${JSON.stringify(bearer)}},credentials:'omit'});return response.status===200;})()`),'authenticated native fixture releases the subsequent model turn');
+  await page.wait("[...document.querySelectorAll('.message .markdown p')].filter(node=>node.textContent==='Native public flow completed.').length===1",'ordinary final Message follows explicit Artifact');
+  await waitFor(()=>tasks.at(-1)?.id===publishedTask.id&&tasks.at(-1)?.status.state==='TASK_STATE_COMPLETED','canonical final public-output Task');
+  const publishedFinal=tasks.at(-1);
+  check(publishedFinal.status.message.parts[0].text==='Native public flow completed.'&&publishedFinal.artifacts.length===1
+    &&publishedFinal.artifacts[0].artifactId===publishedArtifact.artifactId&&await page.evaluate(progressVisible+'&&'+mixedVisible),
+    'final Message follows the mixed Artifact without creating another Artifact');
   const revokedBearer=bearer;
   const exitRequests=[];
   page.on('Network.requestWillBeSent',({request})=>{

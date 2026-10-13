@@ -259,6 +259,19 @@ def _task_event(payload, *, direct=False, expected_task_id=None, expected_contex
         artifacts, public_messages, message_parts = (), (), ()
         message_id, input_request, owner_wait = None, None, False
 
+        def preserve_wire_data(container, source):
+            # Struct validates the A2A schema but stores every number as double.
+            # Receipt digests and byte limits follow the validated wire JSON.
+            if not isinstance(source, Mapping):
+                return
+            for part, wire_part in zip(container.get("parts", []), source.get("parts", [])):
+                if "data" in part:
+                    part["data"] = wire_part["data"]
+
+        def typed_public_parts(container):
+            metadata = container.get("metadata", {})
+            return () if isinstance(metadata, dict) and metadata.get("partial") is True else _public_parts(container)
+
         def publish(container, identity, *, legacy=False):
             nonlocal used, truncated
             if legacy:
@@ -268,7 +281,7 @@ def _task_event(payload, *, direct=False, expected_task_id=None, expected_contex
                     # discarded, while explicit private/reasoning flags remain hidden.
                     container = {**container, "metadata": {key: value for key, value in metadata.items()
                         if key in {"visibility", "kind"} or value is True}}
-            text = _parts_text(_public_parts(container))
+            text = _parts_text(_public_parts(container) if legacy else typed_public_parts(container))
             if not text:
                 return
             identifier = public_identity(identity, text)
@@ -284,15 +297,22 @@ def _task_event(payload, *, direct=False, expected_task_id=None, expected_contex
 
         if kind == "task":
             public_task = MessageToDict(task)
+            wire_task = payload if direct else payload["task"]
+            preserve_wire_data(public_task.get("status", {}).get("message", {}),
+                               wire_task.get("status", {}).get("message", {}))
+            for artifact, wire_artifact in zip(public_task.get("artifacts", []), wire_task.get("artifacts", [])):
+                preserve_wire_data(artifact, wire_artifact)
+            for message, wire_message in zip(public_task.get("history", []), wire_task.get("history", [])):
+                preserve_wire_data(message, wire_message)
             status_message = public_task.get("status", {}).get("message", {})
             marker = public_task.get("metadata", {}).get("core_agent_wait", {})
             owner_wait = isinstance(marker, dict) and marker.get("kind") == "owner"
             message_id = status_message.get("messageId") or None
             if not _private_material(public_task):
-                artifacts = tuple({**artifact, "parts": list(_public_parts(artifact))}
+                artifacts = tuple({**artifact, "parts": list(typed_public_parts(artifact))}
                     for artifact in public_task.get("artifacts", []) if not _private_material(artifact))
                 if status_message.get("role") == "ROLE_AGENT":
-                    message_parts = _public_parts(status_message)
+                    message_parts = typed_public_parts(status_message)
                     question = _parts_text(message_parts)
                     if state == "TASK_STATE_INPUT_REQUIRED" and not owner_wait and question.strip():
                         identity = "input:" + task_id + ":" + (message_id or str(public_task.get("status", {}).get("timestamp", "")))
@@ -321,8 +341,9 @@ def _task_event(payload, *, direct=False, expected_task_id=None, expected_contex
                 publish(artifact, "artifact:" + artifact.get("artifactId", ""), legacy=True)
         else:
             public_message = MessageToDict(message)
+            preserve_wire_data(public_message, payload["message"])
             message_id = public_message.get("messageId")
-            message_parts = _public_parts(public_message)
+            message_parts = typed_public_parts(public_message)
             publish(public_message, "message:" + public_message.get("messageId", ""))
             public_messages = tuple(messages)
         return RemoteEvent(kind, state, _parts_text(normalized), final, normalized, task_id, context_id,

@@ -173,9 +173,19 @@ print({marker!r})
             self.reply_release = threading.Event()
             self.reply_finished = threading.Event()
             self.reply_waiting = threading.Event()
+            self.public_waiting = threading.Event()
+            self.public_release = threading.Event()
 
         def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
             index = len(self.calls)
+            if index == 33:
+                response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
+                self.public_waiting.set()
+                try:
+                    assert self.public_release.wait(120), "browser did not release the subsequent public model turn"
+                finally:
+                    self.public_waiting.clear()
+                return response
             if index == 15:
                 assert self.model == "browser-model-two", "new root did not use owner model selection"
                 assert "Native owner profile proof" in str(instructions), "new root did not use owner profile"
@@ -207,8 +217,10 @@ print({marker!r})
                               if message.get("role") == "tool" and message.get("tool_call_id") == marker)
                 assert result["status"] == "succeeded"
                 if marker == "browser-native-output-selected":
-                    assert [file["name"] for file in result["output"]["files"]] == ["report-output.txt", "empty.txt"]
-                    assert result["output"]["files"][1]["size_bytes"] == 0
+                    parts = result["output"]["artifacts"][0]["parts"]
+                    assert [file["name"] for file in parts] == ["report-output.txt", "empty.txt"]
+                    assert all(part["type"] == "file" for part in parts)
+                    assert parts[1]["size_bytes"] == 0
                 else:
                     assert result["output"]["exit_code"] == 0
                     assert result["output"]["stdout"].strip() == marker, "actual native file operation did not succeed"
@@ -334,6 +346,17 @@ flowchart LR
         ModelResponse(tool_requests=(ToolRequest("browser-clarification-reply", "core_agent_send_message", {"agent_name": "browser-peer", "task": "from-private-owner"}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-clarification-wait-final", "core_task_wait", {"task_id": "from-actual-admission"}),)),
         ModelResponse(message="Уточнение и структурированные артефакты получены."),
+        ModelResponse(tool_requests=(ToolRequest("browser-public-source", "core_terminal_exec", {
+            "argv": ["python3", "-P", "-c", "from pathlib import Path\n"
+                     "Path('/workspace/native-public.bin').write_bytes(b'Native typed artifact bytes\\n')"]}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-public-message", "core_message_send", {
+            "text": "Native durable public progress."}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-public-mixed", "core_response_artifacts", {
+            "artifacts": [{"name": "Native mixed artifact", "parts": [
+                {"type": "text", "text": "**Native mixed text canary**", "media_type": "text/markdown"},
+                {"type": "data", "data": {"city": "Казань", "count": 1, "value": "native-mixed-json-canary"}},
+                {"type": "file", "path": "native-public.bin"}]}]}),)),
+        ModelResponse(message="Native public flow completed."),
     ])
     model.model = "owner-browser-fixture"
     app = create_app(model=model, guardrail_classifier=GuardrailClassifier(ClearModel()))
@@ -346,6 +369,12 @@ flowchart LR
                             headers={"Cache-Control": "no-store"})
 
     app.routes.append(Route("/api/browser-reply-fixture", reply_fixture, methods=["GET", "POST"]))
+    async def public_fixture(request):
+        if request.method == "POST":
+            model.public_release.set()
+        return JSONResponse({"waiting": model.public_waiting.is_set()}, headers={"Cache-Control": "no-store"})
+
+    app.routes.append(Route("/api/browser-public-fixture", public_fixture, methods=["GET", "POST"]))
     async def peer_fixture(request):
         if request.method == "POST":
             payload = await request.json()

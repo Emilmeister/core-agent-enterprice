@@ -162,7 +162,14 @@ class ExternalAccessTests(AuthAppTestCase):
         ])
         task = await self.submit(first['access_token'], 'before-deletion', 'external-history')
         record = agent.workflow_store.lookup_task(task['id'])
-        file_id = record.result['outgoing_files'][0]['file_id']
+        artifacts = record.snapshot['published_artifacts']
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual([part['type'] for part in artifacts[0]['parts']], ['file'])
+        file_id = artifacts[0]['parts'][0]['ref']['file_id']
+        self.assertEqual(task['status']['message']['messageId'], task['id'] + ':final')
+        self.assertEqual(task['status']['message']['parts'][0]['text'], 'File ready')
+        self.assertEqual([artifact['artifactId'] for artifact in task['artifacts']],
+                         [artifact['artifact_id'] for artifact in artifacts])
         identifier = first['account']['id']
         response = await self.http.delete('/api/external-access/' + identifier + '/account',
             headers=self.headers('owner-b'))

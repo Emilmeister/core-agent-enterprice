@@ -825,7 +825,7 @@ class PostgresRootAdmission:
                 cron_origin=cron_origin,
             )
             if batch is not None and admitted.run_id is not None:
-                self.task_store._save(task, context, connection=connection)
+                self.task_store._save(task, context, connection=connection, trusted_admission=True)
             connection.execute(
                 """INSERT INTO core_root_messages
                    (tenant_id, actor_id, message_id, request_digest, owner_id, context_id, task_id, display_text)

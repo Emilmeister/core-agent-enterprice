@@ -192,6 +192,11 @@ jobs:
           enable-cache: true
       - run: uv python install 3.12
       - run: uv sync --frozen
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
       - run: uv run core-agent-db migrate
       - run: uv run ruff check core_agent tests
       - name: Start isolated Keycloak for authentication integration
@@ -210,11 +215,6 @@ jobs:
       - name: Remove isolated Keycloak
         if: always()
         run: docker rm -f core-agent-keycloak-test
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
       - name: Build owner UI
         working-directory: ui
         run: |

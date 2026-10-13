@@ -460,14 +460,16 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.025)
                 task = await client.get_task(GetTaskRequest(id=task.id))
         self.assertEqual(TaskState.Name(task.status.state), "TASK_STATE_COMPLETED")
+        self.assertEqual(task.status.message.message_id, task.id + ":final")
+        self.assertEqual(task.status.message.role, Role.ROLE_AGENT)
+        self.assertFalse(task.artifacts)
         return task
 
     async def _send(self, prompt):
         task = await self._send_task(prompt)
         return "\n".join(
             part.text
-            for artifact in task.artifacts
-            for part in artifact.parts
+            for part in task.status.message.parts
             if part.text
         )
 
@@ -478,7 +480,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_a2a_result_exposes_local_and_shared_budget_metadata(self):
         task = await self._send_task("TERMINAL_METADATA_E2E")
-        provenance = task.artifacts[0].metadata["provenance"]
+        provenance = task.status.message.metadata["provenance"]
         self.assertTrue(provenance["complete"])
         self.assertEqual(provenance["completion_reason"], "completed")
         self.assertEqual(provenance["usage"], {"model_turns": 2.0, "tool_calls": 1.0})
@@ -498,7 +500,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             app = create_app(model=model, base_url="http://agent.test")
         try:
             task = await self._send_task("BUDGET_PARTIAL_E2E", app=app)
-            provenance = task.artifacts[0].metadata["provenance"]
+            provenance = task.status.message.metadata["provenance"]
         finally:
             app.state.close()
         self.assertFalse(provenance["complete"])
@@ -559,9 +561,11 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 task = await client.get_task(GetTaskRequest(id=submitted.id))
         self.assertEqual(TaskState.Name(task.status.state), "TASK_STATE_COMPLETED")
         self.assertEqual(
-            [part.text for artifact in task.artifacts for part in artifact.parts],
+            [part.text for part in task.status.message.parts],
             ["live-steering-ok"],
         )
+        self.assertEqual(task.status.message.message_id, submitted.id + ":final")
+        self.assertFalse(task.artifacts)
 
     async def test_a2a_followup_and_cancel_work_during_mcp_cold_start(self):
         started = threading.Event()
@@ -905,7 +909,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].status.state, TaskState.TASK_STATE_COMPLETED)
         persisted = await handler.task_store.get(submitted.id, context)
         self.assertEqual(
-            persisted.artifacts[0].parts[0].text, "completed before attach"
+            persisted.status.message.parts[0].text, "completed before attach"
         )
 
     async def test_active_subscription_observes_terminal_from_recovery_worker(self):
@@ -1042,7 +1046,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
             release.set()
 
         self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
-        self.assertEqual(terminal.artifacts[0].parts[0].text, "already completed")
+        self.assertEqual(terminal.status.message.parts[0].text, "already completed")
 
     async def test_late_cancel_during_publication_preserves_completed_result(self):
         def complete(*_args):
@@ -1090,7 +1094,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
         self.assertEqual(persisted.status.state, TaskState.TASK_STATE_COMPLETED)
-        self.assertEqual(terminal.artifacts[0].parts[0].text, "durable result")
+        self.assertEqual(terminal.status.message.parts[0].text, "durable result")
 
     async def test_cancel_of_idle_task_does_not_leak_publication_state(self):
         app = build_starlette_app(
@@ -1140,7 +1144,7 @@ class CoreAgentEndToEndTests(unittest.IsolatedAsyncioTestCase):
         terminal = await handler.on_cancel_task(CancelTaskRequest(id=task.id), context)
 
         self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
-        self.assertEqual(terminal.artifacts[0].parts[0].text, "durable result")
+        self.assertEqual(terminal.status.message.parts[0].text, "durable result")
 
     async def test_background_task_starts_and_passively_waits_for_terminal_result(self):
         self.assertEqual(await self._send("BACKGROUND_E2E"), "background-e2e-ok")

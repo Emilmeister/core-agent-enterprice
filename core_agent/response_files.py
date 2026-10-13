@@ -73,7 +73,14 @@ class ResponseFileService:
             raise CoreError("INVALID_FILE_PATH") from None
 
     def prepare(self, binding, paths, *, task_id, run_id, limit_bytes):
-        scope = self._scope(binding, task_id, run_id, limit_bytes)
+        self._scope(binding, task_id, run_id, limit_bytes)
+        captured = self._capture(binding, paths, limit_bytes)
+        return self.prepare_contents(binding,
+            [(name, content, mimetypes.guess_type(name)[0] or "application/octet-stream")
+             for name, content in captured], task_id=task_id, run_id=run_id, limit_bytes=limit_bytes)
+
+    def _capture(self, binding, paths, limit_bytes, *, used_bytes=0):
+        """Capture the complete workspace set before granting any blob reference."""
         if not isinstance(paths, (list, tuple)):
             raise CoreError("INVALID_FILE_PATH")
         parts = [self._parts(path) for path in paths]
@@ -95,7 +102,7 @@ class ResponseFileService:
                     if identity[4] != size:
                         raise CoreError("FILE_CHANGED")
                     sources.append((path, components[-1], stream, identity))
-                self._check_limit(sum(item[3][4] for item in sources), limit_bytes)
+                self._check_limit(used_bytes + sum(item[3][4] for item in sources), limit_bytes)
                 for path, name, stream, identity in sources:
                     content = stream.read(identity[4] + 1)
                     if len(content) != identity[4] or _identity(stream) != identity:
@@ -114,11 +121,21 @@ class ResponseFileService:
                         raise CoreError("FILE_CHANGED") from None
         except OSError:
             raise CoreError("FILE_READ_FAILED") from None
+        return tuple(captured)
 
+    def prepare_contents(self, binding, contents, *, task_id, run_id, limit_bytes):
+        """Trusted typed-output factory; never exposed as a model-callable tool."""
+        scope = self._scope(binding, task_id, run_id, limit_bytes)
+        captured = []
+        for name, content, media_type in contents:
+            if (not isinstance(content, bytes) or not isinstance(media_type, str) or not media_type
+                    or len(ChatWorkspaces.path_parts(name)) != 1):
+                raise CoreError("INVALID_FILE_INPUT")
+            captured.append((name, content, media_type))
+        self._check_limit(sum(len(content) for _, content, _ in captured), limit_bytes)
         refs = []
-        for name, content in captured:
+        for name, content, media_type in captured:
             file_id = uuid.uuid4().hex
-            media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
             try:
                 blob = self.artifact_store.put(binding.tenant_id, content, media_type=media_type,
                     provenance={**scope, "kind": "response_file", "file_id": file_id})

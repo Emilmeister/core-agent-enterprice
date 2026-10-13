@@ -23,6 +23,16 @@ from tests import test_owner_history as history_tests
 
 
 class PeerConversationOperationTests(unittest.TestCase):
+    def test_typed_peer_messages_ignore_transient_preview_and_keep_canonical_identity(self):
+        event = _task_event({"task": {"id": "peer", "contextId": "chat",
+            "status": {"state": "TASK_STATE_WORKING", "message": {"messageId": "preview", "role": "ROLE_AGENT",
+                "parts": [{"text": "preview-canary"}], "metadata": {"partial": True,
+                    "core_agent_stream": {"version": 1, "generation": 1, "sequence": 1}}}},
+            "history": [{"messageId": "working", "role": "ROLE_AGENT", "parts": [{"text": "Canonical progress"}]}]}})
+        self.assertEqual([message["text"] for message in event.public_messages], ["Canonical progress"])
+        self.assertEqual(event.message_parts, ())
+        self.assertIn("preview-canary", [message["text"] for message in event.messages])
+
     def test_public_reply_observations_are_strict_bounded_and_backward_compatible(self):
         from core_agent.peer_conversations import merge_observation, public_identity
         incoming = {"id": public_identity("question", "Which city?"), "text": "Which city?"}
@@ -213,6 +223,27 @@ class PeerConversationFileTests(unittest.TestCase):
     event = inbound_tests.RemoteInboundContract.event
     settle = inbound_tests.RemoteInboundContract.settle
     start = inbound_tests.RemoteInboundContract.start
+    marked_snapshot = inbound_tests.RemoteInboundContract.marked_snapshot
+    poll_snapshot = inbound_tests.RemoteInboundContract.poll_snapshot
+
+    def test_early_artifact_batches_project_all_reviewed_receipts_without_replacing_paths(self):
+        self.responses.append(self.marked_snapshot([("first", "first-canary")]))
+        task = self.start(version=3, attachment_limit_bytes=10000)
+        self.poll_snapshot(self.marked_snapshot([("first", "first-canary"), ("second", "second-canary")]))
+        task = self.scheduler.get(task.id, owner_id=self.source.run_id, tenant_id=self.tenant)
+        self.assertEqual(len(task.result.get("file_batch_ids", [])), 2)
+        agent, row = SimpleNamespace(chat_file_service=self.service), {"result": task.result}
+        self.assertEqual(_files(agent, self.binding, row, self.source, None), [])
+        for batch_id in task.result["file_batch_ids"]:
+            self.service.record_decision(batch_id, self.binding, decision_ref="trusted-test-allow", allow=True)
+            self.service.publish(batch_id, self.binding)
+        files = _files(agent, self.binding, row, self.source, None)
+        self.assertEqual(len(files), 4)
+        artifacts, path = _artifact_receipts(agent, self.binding, row, files, None)
+        self.assertEqual([artifact["artifact_id"] for artifact in artifacts], ["first", "second"])
+        self.assertEqual([artifact["index"] for artifact in artifacts], [0, 1])
+        self.assertNotIn("canary", json.dumps(artifacts))
+        self.assertTrue(path.endswith("/manifest.json"))
 
     def test_typed_artifact_receipts_preserve_order_without_content_or_unvalidated_paths(self):
         from core_agent.remote_artifacts import prepare_remote_artifacts
@@ -280,6 +311,36 @@ class PeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
     submit = AuthAppTestCase.submit
     review_material = history_tests.OwnerHistoryTests.review_material
     digest = staticmethod(history_tests.OwnerHistoryTests.digest)
+
+    async def test_working_quarantine_receipt_is_pending_without_exposing_material(self):
+        from core_agent.remote_artifacts import prepare_remote_artifacts
+        from core_agent.workspace import WorkspaceBinding
+        from core_agent.remote_agents import RemoteEvent
+        await self.prepare()
+        service = self.agent.chat_file_service
+        if self.use_postgres:
+            with self.app.state.database.transaction() as connection:
+                connection.execute("UPDATE core_runs SET state='RUNNING' WHERE run_id=%s AND tenant_id=%s",
+                                   (self.source.run_id, self.tenant))
+        else:
+            self.agent.workflow_store._records[self.source.run_id] = replace(self.source, state="RUNNING")
+        binding = WorkspaceBinding(self.tenant, self.source.owner_id, self.source.context_id)
+        event = RemoteEvent("task", "TASK_STATE_WORKING", "", False, (), "remote-task", "remote-context",
+            artifacts=({"artifactId": "report", "name": "private-name-canary", "parts": [{"text": "private-content-canary"}],
+                "metadata": {"core_agent_artifact": {"version": 1, "complete": True, "immutable": True}}},))
+        stage = prepare_remote_artifacts(service, event, tenant_id=self.tenant, actor_id=self.source.owner_id,
+            message_id="receipt", request_digest="a" * 64, operation_id=self.operation,
+            destination_id="a" * 64, limit_bytes=10000)
+        service.bind(stage["batch_id"], binding, task_id=self.source.task_id, run_id=self.source.run_id,
+            **{key: stage[key] for key in ("actor_id", "message_id", "request_digest", "lease_token")})
+        self.replace_remote(result={"agent_name": "delivery", "remote_state": "TASK_STATE_WORKING",
+                                    "file_batch_ids": [stage["batch_id"]]})
+        detail = await self.http.get(self.path + "/" + self.operation, headers=self.headers("owner-a"))
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["material_status"], "pending_guardrail")
+        self.assertEqual(detail.json()["files"], [])
+        self.assertEqual(detail.json()["artifacts"], [])
+        self.assertNotIn("canary", detail.text)
 
     def replace_conversation(self, conversation):
         if self.use_postgres:
@@ -579,11 +640,11 @@ class PeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
         detail = await self.http.get(path, headers=self.headers("owner-a"))
         self.assertEqual([m["direction"] for m in detail.json()["messages"]], ["outgoing"])
 
-    def replace_remote(self, *, contract=None, checkpoint=None):
+    def replace_remote(self, *, contract=None, checkpoint=None, result=None):
         if self.use_postgres:
             from psycopg.types.json import Jsonb
             with self.app.state.database.transaction() as connection:
-                for column, value in (("contract", contract), ("checkpoint", checkpoint)):
+                for column, value in (("contract", contract), ("checkpoint", checkpoint), ("result", result)):
                     if value is not None:
                         connection.execute("UPDATE core_background_tasks SET " + column + "=%s WHERE id=%s",
                                            (Jsonb(value), self.operation))
@@ -591,6 +652,8 @@ class PeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
             for key, value in (("contract", contract), ("checkpoint", checkpoint)):
                 if value is not None:
                     self.scheduler._remote[self.operation][key] = value
+            if result is not None:
+                self.scheduler._tasks[self.operation].result = result
         if contract is not None and "remote_calls" in self.source.snapshot:
             snapshot = copy.deepcopy(self.source.snapshot)
             entry = {"version": 1, "contract": contract}

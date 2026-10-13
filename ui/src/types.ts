@@ -27,6 +27,35 @@ export interface ResponseFileEntry {
   size_bytes: number;
   sha256: string;
 }
+export interface ResponseArtifact {
+  artifact_id: string;
+  name: string;
+  parts: (ResponseFileEntry & { type: "text" | "data" | "file" })[];
+}
+
+// Copy only public receipt fields; a malformed batch never yields a partial card.
+export function responseArtifacts(value: unknown): ResponseArtifact[] {
+  if (!Array.isArray(value) || value.length > 64) return [];
+  const result: ResponseArtifact[] = [];
+  let parts = 0;
+  for (const artifact of value) {
+    if (!artifact || typeof artifact !== "object" || typeof artifact.artifact_id !== "string"
+      || !artifact.artifact_id || typeof artifact.name !== "string" || artifact.name.length > 256
+      || !Array.isArray(artifact.parts) || !artifact.parts.length) return [];
+    const entries: ResponseArtifact["parts"] = [];
+    for (const part of artifact.parts) {
+      if (++parts > 256 || !part || typeof part !== "object" || !["text", "data", "file"].includes(part.type)
+        || typeof part.file_id !== "string" || !part.file_id || typeof part.name !== "string"
+        || typeof part.media_type !== "string" || !part.media_type || part.media_type.length > 256
+        || !Number.isSafeInteger(part.size_bytes) || part.size_bytes < 0
+        || typeof part.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(part.sha256)) return [];
+      entries.push({ type: part.type, file_id: part.file_id, name: part.name, media_type: part.media_type,
+        size_bytes: part.size_bytes, sha256: part.sha256 });
+    }
+    result.push({ artifact_id: artifact.artifact_id, name: artifact.name, parts: entries });
+  }
+  return result;
+}
 export interface PeerArtifact {
   index: number;
   artifact_id: string;
@@ -100,6 +129,9 @@ export interface HistoryItem {
   review?: { wait_id: string };
   attachments?: AttachmentEntry[];
   response_files?: ResponseFileEntry[];
+  response_artifacts?: ResponseArtifact[];
+  public_message_id?: string;
+  public_message?: { message_id: string; text: string };
   outcome?: {
     state: string;
     complete?: boolean;
@@ -137,6 +169,7 @@ export function mergeHistoryPage(
 }
 export interface Part {
   text?: string;
+  data?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   raw?: string;
   url?: string;
@@ -156,7 +189,7 @@ export interface Task {
   contextId: string;
   status: { state: string; message?: Message };
   history?: Message[];
-  artifacts?: { artifactId: string; parts: Part[] }[];
+  artifacts?: { artifactId: string; name?: string; parts: Part[]; metadata?: Record<string, unknown> }[];
   metadata?: Record<string, unknown>;
 }
 export interface LiveAnswerSnapshot {
@@ -258,6 +291,42 @@ export const textParts = (parts: Part[]) =>
     )
     .map((p) => p.text)
     .join("\n");
+
+// A canonical Task never grants visibility ahead of the current owner-history decision.
+export function publicMessageText(item: HistoryItem, task?: Task): string {
+  if (item.status !== "available") return "";
+  const message = task?.status.message;
+  if (task?.id === item.task_id && item.public_message_id && message?.messageId === item.public_message_id
+    && ["ROLE_AGENT", "agent"].includes(message.role) && message.metadata?.partial !== true
+    && Array.isArray(message.parts)) return textParts(message.parts);
+  return item.text;
+}
+
+// Keep server pagination untouched and insert approved payloads beside their action.
+export function publicHistoryItems(items: HistoryItem[]): HistoryItem[] {
+  const rows: HistoryItem[] = [];
+  const artifacts = new Set<string>();
+  const messages = new Set<string>();
+  for (const item of [...items].reverse()) {
+    const { public_message, response_artifacts, ...ordinary } = item;
+    const receipts = item.status === "available" ? responseArtifacts(response_artifacts).filter(artifact => {
+      const key = JSON.stringify([item.task_id, artifact.artifact_id]);
+      if (artifacts.has(key)) return false;
+      artifacts.add(key);
+      return true;
+    }) : [];
+    rows.push(ordinary);
+    if (item.status === "available" && public_message && typeof public_message.message_id === "string"
+      && typeof public_message.text === "string" && !messages.has(public_message.message_id)) {
+      messages.add(public_message.message_id);
+      rows.push({ id: item.id + "/message", task_id: item.task_id, kind: "agent_message", status: "available",
+        text: public_message.text, public_message_id: public_message.message_id });
+    }
+    if (receipts.length) rows.push({ id: item.id + "/artifacts", task_id: item.task_id,
+      kind: "result", status: "available", text: "", response_artifacts: receipts });
+  }
+  return rows.reverse();
+}
 export const states: Record<string, string> = {
   TASK_STATE_SUBMITTED: "Принята",
   TASK_STATE_WORKING: "В работе",

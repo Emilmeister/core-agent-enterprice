@@ -510,6 +510,12 @@ class PostgresEnterpriseReleaseBoundaryTests(EnterpriseReleaseBoundaryTests):
             self.assertEqual(response.status_code, 200, response.text)
             self.assertIn("public final release proof", response.text)
             self.assertIn(base64.b64encode(public_bytes).decode(), response.text)
+            if route == "/a2a/external/tasks/" + record.task_id:
+                task = response.json()
+                self.assertEqual(task["status"]["message"]["messageId"], record.task_id + ":final")
+                self.assertEqual(task["status"]["message"]["parts"][0]["text"], "public final release proof")
+                self.assertEqual(len(task["artifacts"]), 1)
+                self.assertTrue(all("raw" in part for part in task["artifacts"][0]["parts"]))
             for marker in private:
                 self.assertNotIn(marker, response.text)
         with patch("core_agent.push.socket.getaddrinfo", return_value=dns):
@@ -520,8 +526,11 @@ class PostgresEnterpriseReleaseBoundaryTests(EnterpriseReleaseBoundaryTests):
             self.assertNotIn(marker, json.dumps(self.push_payloads))
         completed = self.agent.workflow_store.lookup_task(record.task_id)
         self.assertEqual(completed.state, "COMPLETED", completed.error_code)
-        self.assertEqual([ref["name"] for ref in completed.result["outgoing_files"]], ["public.txt"])
-        receipt = completed.result["outgoing_files"][0]
+        artifacts = completed.snapshot["published_artifacts"]
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual([part["type"] for part in artifacts[0]["parts"]], ["file"])
+        self.assertEqual([part["ref"]["name"] for part in artifacts[0]["parts"]], ["public.txt"])
+        receipt = artifacts[0]["parts"][0]["ref"]
         path = f"/api/chats/{record.context_id}/tasks/{record.task_id}/files/{receipt['file_id']}"
         owned = await self.http.get(path, headers=self.headers("owner-b"))
         self.assertEqual(owned.status_code, 200, owned.text)

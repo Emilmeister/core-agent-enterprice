@@ -6,6 +6,7 @@ import threading
 import unittest
 import uuid
 from contextvars import copy_context
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -27,6 +28,15 @@ class RemoteFilesRuntimeTests(AuthAppTestCase):
         with patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
             await super().asyncSetUp()
         self.agent = self.app.state.core_agent
+        store = self.agent.workflow_store
+        create = store.create
+        def legacy_admission(record, *args, **kwargs):
+            if record.parent_run_id is None:
+                record = replace(record, snapshot={**record.snapshot, "output_contract_version": 1})
+            return create(record, *args, **kwargs)
+        pinned = patch.object(store, "create", side_effect=legacy_admission)
+        pinned.start()
+        self.addCleanup(pinned.stop)
         self.tenant = self.app.state.authenticator.settings.tenant
         self.app.state.remote_registry_store.create(self.tenant, {
             "name": "delivery", "url": "https://peer.example/a2a", "description": "Delivery",

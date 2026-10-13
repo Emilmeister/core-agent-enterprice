@@ -618,6 +618,7 @@ class InMemoryWorkflowStore(_ExecutionLifecycle):
                         "limit": budget[1],
                     },
                 )
+            previous_budget = budget[2:4]
             budget[2] = next_model_turns
             budget[3] += consume_tool_calls
             if include_shared_budget and result is not None:
@@ -646,6 +647,13 @@ class InMemoryWorkflowStore(_ExecutionLifecycle):
                     "error_code": error_code,
                 }
             )
+            observer = getattr(self, "public_output_observer", None)
+            if observer is not None and record.snapshot.get("output_contract_version", 1) == 2:
+                try:
+                    observer(record, connection=None)
+                except BaseException:
+                    budget[2:4] = previous_budget
+                    raise
             self._records[run_id] = record
             if wait is not None and snapshot.get("wait_id") != wait.wait_id:
                 now = self.clock()
@@ -1919,6 +1927,9 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             raise CoreError(
                 "LEASE_LOST" if lease_token is not None else "SESSION_CONFLICT"
             )
+        observer = getattr(self, "public_output_observer", None)
+        if observer is not None and next_record.snapshot.get("output_contract_version", 1) == 2:
+            observer(next_record, connection=connection)
         return next_record
 
     def enter_approval(

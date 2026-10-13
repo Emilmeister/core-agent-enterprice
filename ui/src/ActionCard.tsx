@@ -2,6 +2,7 @@ import { useId, useLayoutEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { actionLabel, actionPreview } from "./toolPresentation";
 import type { HistoryItem, Interaction } from "./types";
+import { publicHistoryItems } from "./types";
 import { CodeBlock } from "./Code";
 
 type ToolResult = { status?: string; output?: unknown; error_code?: string };
@@ -42,9 +43,10 @@ export function historyEntries(items: HistoryItem[]): HistoryEntry[] {
     }
     return action;
   }
-  for (const item of [...items].reverse()) {
+  for (const item of publicHistoryItems(items).reverse()) {
     if (item.kind === "placeholder" && item.status === "available"
-      && !item.review && !item.outcome && !item.attachments?.length && !item.response_files?.length) continue;
+      && !item.review && !item.outcome && !item.attachments?.length && !item.response_files?.length
+      && !item.response_artifacts?.length) continue;
     if ((item.kind !== "tool_call" && item.kind !== "tool_result") || item.status !== "available") {
       entries.push({ item });
       continue;

@@ -58,6 +58,7 @@ def map_core_state(state):
 class Part:
     kind: str
     data: object
+    media_type: str | None = None
 
     @classmethod
     def text(cls, value):
@@ -127,6 +128,7 @@ class Artifact:
     media_type: str = "text/plain"
     _chunks: tuple[str, ...] = field(default_factory=tuple, repr=False)
     _last: bool = field(default=False, repr=False)
+    name: str | None = None
 
     @classmethod
     def text(cls, value, provenance=None):
@@ -148,6 +150,8 @@ class Artifact:
             if not isinstance(content, bytes):
                 raise CoreError("ARTIFACT_INTEGRITY_FAILED")
             return content
+        if part.kind == "data" and part.media_type is not None:
+            return json.dumps(part.data, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
         return str(part.data).encode()
 
     def append(self, part, *, chunk_id, sequence, last_chunk):
@@ -201,6 +205,87 @@ def workflow_result_artifact(record, response_files_service=None, *, connection=
     identity = (json.dumps({"message": message, "outgoingFiles": receipts}, sort_keys=True,
         separators=(",", ":")).encode() if receipts else message.encode())
     return Artifact("sha256:" + hashlib.sha256(identity).hexdigest(), parts, 1, provenance)
+
+
+@dataclass(frozen=True)
+class PublishedOutput:
+    message: Message | None
+    artifacts: tuple[Artifact, ...]
+    history: tuple[Message, ...] = ()
+    state: TaskState = TaskState.COMPLETED
+    provenance: dict = field(default_factory=dict)
+
+
+def output_contract_version(record):
+    values = record if isinstance(record, dict) else vars(record)
+    version = (values.get("snapshot") or {}).get("output_contract_version", 1)
+    result_version = (values.get("result") or {}).get("output_contract_version", version)
+    if type(version) is not int or version not in {1, 2} or type(result_version) is not int or result_version != version:
+        raise CoreError("CHECKPOINT_INVALID")
+    return version
+
+
+def workflow_public_output(record, response_files_service=None, *, connection=None):
+    """Project only committed public output, including before Task completion."""
+    from .workspace import WorkspaceBinding
+
+    if output_contract_version(record) != 2:
+        raise CoreError("CHECKPOINT_INVALID")
+    values = record if isinstance(record, dict) else vars(record)
+    snapshot, result = values["snapshot"], values.get("result") or {}
+    entries, manifests = snapshot.get("public_messages", []), snapshot.get("published_artifacts", [])
+    if not isinstance(entries, list) or not isinstance(manifests, list):
+        raise CoreError("CHECKPOINT_INVALID")
+    provenance = {"run_id": values["run_id"], "task_id": values["task_id"],
+        **{key: result[key] for key in ("complete", "completion_reason", "usage", "shared_budget",
+            "exhausted_dimension", "pending_tasks") if key in result}}
+    history, identifiers = [], set()
+
+    def message(identifier, text, *, final=False):
+        if (not isinstance(identifier, str) or not identifier or not isinstance(text, str)
+                or "\0" in identifier or identifier in identifiers):
+            raise CoreError("CHECKPOINT_INVALID")
+        try:
+            identifier.encode("utf-8")
+            text.encode("utf-8")
+        except UnicodeError:
+            raise CoreError("CHECKPOINT_INVALID") from None
+        identifiers.add(identifier)
+        return Message("agent", (Part.text(text),), metadata={"provenance": provenance} if final else {},
+            context_id=values["context_id"], message_id=identifier, task_id=values["task_id"])
+
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.keys() != {"message_id", "text"}:
+            raise CoreError("CHECKPOINT_INVALID")
+        history.append(message(entry["message_id"], entry["text"]))
+    state = values["state"]
+    latest = history[-1] if history else None
+    if state == "COMPLETED":
+        text = result.get("message")
+        if not isinstance(text, str):
+            raise CoreError("CHECKPOINT_INVALID")
+        latest = message(values["task_id"] + ":final", text, final=True)
+        history.append(latest)
+    elif state in {"FAILED", "ABORTED", "REJECTED"}:
+        reason = values.get("error_code") or {"FAILED": "TASK_FAILED", "ABORTED": "SIDE_EFFECT_UNKNOWN", "REJECTED": "POLICY_DENIED"}[state]
+        latest = message(values["task_id"] + ":" + state.lower(), reason)
+        history.append(latest)
+    elif state in {"WAITING_INPUT", "CANCELLED"}:
+        latest = None
+    artifacts = ()
+    if manifests:
+        if response_files_service is None:
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        from .response_artifacts import ResponseArtifactService
+        try:
+            limit = manifests[0]["parts"][0]["ref"]["limit_bytes"]
+        except (KeyError, IndexError, TypeError):
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
+        artifacts = tuple(ResponseArtifactService(response_files_service).load(
+            WorkspaceBinding(values["tenant_id"], values["owner_id"], values["context_id"]), manifests,
+            task_id=values["task_id"], run_id=values["run_id"], limit_bytes=limit, connection=connection))
+    public_state = TaskState.WORKING if state == "WAITING_INPUT" else _STATE_MAP.get(state, TaskState.WORKING)
+    return PublishedOutput(latest, artifacts, tuple(history), public_state, provenance)
 
 
 @dataclass(frozen=True)

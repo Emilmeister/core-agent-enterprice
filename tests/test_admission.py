@@ -34,6 +34,14 @@ class BorrowedAdmissionValidationTests(unittest.TestCase):
 
 
 class AuthAdmissionTests(AuthAppTestCase):
+    def assert_completed_output(self, task, message_id):
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertFalse(task.get("artifacts"))
+        self.assertEqual([message["role"] for message in task["history"]], ["ROLE_USER", "ROLE_AGENT"])
+        self.assertEqual(task["history"][0]["messageId"], message_id)
+        self.assertEqual(task["status"]["message"]["messageId"], task["id"] + ":final")
+        self.assertEqual(task["history"][1], task["status"]["message"])
+
     async def asyncTearDown(self):
         if hasattr(self, "release"):
             self.release.set()
@@ -353,7 +361,10 @@ class AuthAdmissionTests(AuthAppTestCase):
         self.assertEqual(response.status_code, 400, response.text)
         repeated = await self.send("recover", "recover-chat")
         task = repeated.json()["task"]
-        self.assertEqual(task["status"]["state"], "TASK_STATE_SUBMITTED")
+        self.assertEqual(task["status"]["state"], "TASK_STATE_WORKING")
+        record = self.app.state.core_agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(record.state, "RUNNING")
+        self.assertTrue(record.snapshot["initializing"])
         self.assertEqual(len(task["history"]), 1)
         self.assertEqual(task["history"][0]["taskId"], task["id"])
         self.assertEqual(len(self.model.calls), 0)
@@ -393,12 +404,12 @@ class AuthAdmissionTests(AuthAppTestCase):
         self.assertEqual(fetched.status_code, 200, fetched.text)
         task = fetched.json()
         self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
-        self.assertEqual(task["artifacts"][0]["parts"][0]["text"], "verified")
-        provenance = task["artifacts"][0]["metadata"]["provenance"]
+        self.assertEqual(task["status"]["message"]["parts"][0]["text"], "verified")
+        provenance = task["status"]["message"]["metadata"]["provenance"]
         self.assertEqual(provenance["run_id"], record.run_id)
         self.assertEqual(provenance["shared_budget"], record.result["shared_budget"])
         self.assertEqual(provenance["completion_reason"], record.result["completion_reason"])
-        self.assertEqual(len(task["history"]), 1)
+        self.assert_completed_output(task, "projection")
         duplicate = await self.send("projection", "projection-chat")
         self.assertEqual(duplicate.json()["task"], task)
         subscription = await self.http.post(f"/a2a/external/tasks/{task_id}:subscribe", headers=self.headers("external-a"))
@@ -557,7 +568,7 @@ class AuthAdmissionTests(AuthAppTestCase):
         self.assertEqual(repeated.status_code, 200, repeated.text)
         self.assertEqual(first.json()["task"]["id"], repeated.json()["task"]["id"])
         self.assertEqual(len(self.model.calls), 1)
-        self.assertEqual(len(repeated.json()["task"]["history"]), 1)
+        self.assert_completed_output(repeated.json()["task"], "same")
 
     async def test_changed_message_or_context_conflicts(self):
         first = await self.send("same", "chat")
@@ -906,7 +917,7 @@ class PostgresAuthAdmissionTests(AuthAdmissionTests):
                     break
                 await asyncio.sleep(0.01)
         self.assertEqual(self.app.state.core_agent.workflow_store.lookup_task(task["id"]).run_id, accepted[0].run_id)
-        self.assertEqual(len(recovered.json()["history"]), 1)
+        self.assert_completed_output(recovered.json(), "shutdown")
         self.assertEqual(len(self.model.calls), 1)
 
     async def test_completed_and_busy_duplicates_survive_restart(self):
@@ -921,7 +932,11 @@ class PostgresAuthAdmissionTests(AuthAdmissionTests):
             response = await self.send(message_id, "restart", token="external-a-replaced")
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["task"]["id"], expected["id"])
-            self.assertEqual(len(response.json()["task"]["history"]), 1)
+            if message_id == "first":
+                self.assert_completed_output(response.json()["task"], message_id)
+            else:
+                self.assertEqual([entry["messageId"] for entry in response.json()["task"]["history"]], [message_id])
+                self.assertEqual(response.json()["task"]["status"]["state"], "TASK_STATE_FAILED")
         self.assertEqual(len(self.model.calls), 1)
 
     async def test_failure_inside_admission_rolls_back_all_writes_and_local_scope(self):
@@ -968,8 +983,7 @@ class PostgresAuthAdmissionTests(AuthAdmissionTests):
                 await asyncio.sleep(0.02)
         record = self.app.state.core_agent.workflow_store.lookup_task(accepted.task.id)
         self.assertEqual(record.run_id, original.run_id)
-        self.assertEqual(len(task["history"]), 1)
-        self.assertEqual(task["history"][0]["messageId"], "crash")
+        self.assert_completed_output(task, "crash")
         repeated = await self.send("crash", "crash-chat")
         self.assertEqual(repeated.json()["task"]["id"], accepted.task.id)
         self.assertEqual(len(self.model.calls), 1)

@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
-import { formatFileSize } from "./types";
+import { formatFileSize, publicHistoryItems } from "./types";
 import { Markdown } from "./Markdown";
 import { CodeBlock } from "./Code";
 import type { AttachmentEntry, HistoryItem, ResponseFileEntry } from "./types";
@@ -18,9 +18,9 @@ const otherTypes: Record<string, string> = {
   xlsx: "Таблица Excel", ppt: "Презентация", pptx: "Презентация", zip: "Архив ZIP",
 };
 
-export function FileCard({ api, contextId, taskId, file, downloadPath, available = true }: {
+export function FileCard({ api, contextId, taskId, file, downloadPath, available = true, partLabel }: {
   api?: Api; contextId?: string; taskId?: string; file: AttachmentEntry | ResponseFileEntry;
-  downloadPath?: string; available?: boolean;
+  downloadPath?: string; available?: boolean; partLabel?: string;
 }) {
   const responseFile = "file_id" in file;
   const name = responseFile ? file.name : file.actual_name;
@@ -109,7 +109,7 @@ export function FileCard({ api, contextId, taskId, file, downloadPath, available
 
   const unavailable = !available || !api || !contextId || !api.session.valid || (responseFile && !taskId && !downloadPath);
   return <li className="file-card">
-    <div className="file-card-heading"><strong>{name}</strong><span className="muted">{fileType} · {formatFileSize(file.size_bytes)}</span></div>
+    <div className="file-card-heading"><strong>{name}</strong><span className="muted">{partLabel ?? fileType} · {formatFileSize(file.size_bytes)}</span></div>
     <div className="file-card-actions">
       <button type="button" className="secondary" disabled={!!busy || unavailable}
         aria-label={`Открыть ${name}`} onClick={() => void load("open")}>{busy === "open" ? "Открываем…" : "Открыть"}</button>
@@ -143,17 +143,19 @@ export function ConversationFiles({ api, contextId, items, onJump }: {
   api: Api; contextId: string; items: HistoryItem[]; onJump: (id: string) => void;
 }) {
   const attached = items.filter((item) => item.status === "available" && item.attachments?.length);
-  const created = items.filter((item) => item.kind === "result" && item.status === "available"
-    && item.outcome?.state === "COMPLETED" && item.task_id && item.response_files?.length);
+  const created = publicHistoryItems(items).filter((item) => item.status === "available" && item.task_id
+    && (item.response_artifacts?.length || item.kind === "result" && item.outcome?.state === "COMPLETED" && item.response_files?.length));
+  const files = (item: HistoryItem) => [...(item.response_files ?? []),
+    ...(item.response_artifacts ?? []).flatMap(artifact => artifact.parts)];
   return <div className="conversation-files">
     {([{ title: "Прикреплённые", rows: attached, output: false }, { title: "Созданные агентом", rows: created, output: true }] as const).map(({ title, rows, output }) => {
-      const count = rows.reduce((total, item) => total + (output ? item.response_files?.length ?? 0 : item.attachments?.length ?? 0), 0);
+      const count = rows.reduce((total, item) => total + (output ? files(item).length : item.attachments?.length ?? 0), 0);
       return <section key={title} aria-label={title}>
         <h3>{title} <span className="muted">{count}</span></h3>
         {!count && <p className="muted">В загруженной истории файлов нет.</p>}
         {rows.map((item) => <div className="conversation-file-source" key={item.id}>
           <ul className={`message-attachments ${output ? "response-files" : ""}`}>
-            {(output ? item.response_files! : item.attachments!).map((file) => <FileCard key={"file_id" in file ? file.file_id : file.index}
+            {(output ? files(item) : item.attachments!).map((file) => <FileCard key={"file_id" in file ? file.file_id : file.index}
               api={api} contextId={contextId} taskId={item.task_id ?? undefined} file={file} />)}
           </ul>
           <button type="button" className="text-button" onClick={() => onJump(item.id)}>К исходному сообщению</button>

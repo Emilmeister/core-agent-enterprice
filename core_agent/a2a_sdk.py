@@ -60,11 +60,14 @@ from .a2a import (
     Artifact,
     Message,
     Part,
+    PublishedOutput,
+    output_contract_version,
     parse_run_request,
 )
-from .auth import OWNER_SCOPE, ScopeUser, is_company_owner
+from .auth import AuthenticatedCallContext, OWNER_SCOPE, ScopeUser, is_company_owner
 from .a2a_input import input_error_response, protect_sdk_logs, read_input, request_limit
-from .database import REMOTE_PROGRESS_KEY, _has_response_files, reconcile_remote_progress, reconcile_workflow_task
+from .database import (REMOTE_PROGRESS_KEY, _has_response_files, public_artifact_parts, public_sdk_message,
+                       reconcile_remote_progress, reconcile_workflow_task)
 from .errors import CoreError
 from .workflow import SuspendedRun
 from .streaming import (
@@ -208,6 +211,33 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
             self._impl.tasks.setdefault(key, {})[task.id] = copied
         self._owners[(context.tenant, task.id)] = owner
 
+    def reconcile_run(self, record, connection=None):
+        """Trusted workflow observer; caller holds the canonical workflow lock."""
+        values = record if isinstance(record, dict) else vars(record)
+        tenant, task_id = values["tenant_id"], values["task_id"]
+        scope_tenant = tenant
+        owner = self._owners.get((tenant, task_id))
+        if owner is None and tenant == "default":
+            scope_tenant = None
+            owner = self._owners.get((None, task_id))
+        if owner is None:
+            return None  # Internal child tasks have no public A2A mapping.
+        if owner != values["owner_id"] and not (owner == "anonymous" and values["owner_id"] == self.legacy_identity):
+            raise CoreError("TASK_NOT_FOUND")
+        context = AuthenticatedCallContext(tenant=scope_tenant, user=ScopeUser(owner))
+        key = self._impl.owner_resolver(context)
+        stored = self._impl.tasks.get(key, {}).get(task_id)
+        if stored is None:
+            raise CoreError("TASK_NOT_FOUND")
+        task = SdkTask()
+        task.CopyFrom(stored)
+        changed = reconcile_workflow_task(task, run_id=values["run_id"], state=values["state"],
+            result=values.get("result"), error_code=values.get("error_code"), version=values["version"],
+            record=record, response_files_service=self.response_files_service)
+        if changed:
+            self._save_admission(task, context)
+        return changed
+
     async def save(self, task, context):
         persisted = SdkTask()
         persisted.CopyFrom(task)
@@ -233,7 +263,7 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
                         with self.workflow_store._lock:
                             record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
                             revision = dict(task.metadata).get("core_agent_workflow_version", 0)
-                            if (current_terminal or record.state == "COMPLETED" and _has_response_files(record.result)
+                            if (output_contract_version(record) == 2 or current_terminal or record.state == "COMPLETED" and _has_response_files(record.result)
                                     or not isinstance(revision, (int, float)) or revision < record.version):
                                 reconcile_workflow_task(
                                     current if current_terminal else task,
@@ -253,6 +283,10 @@ class ScopedMemoryTaskStore(InMemoryTaskStore):
     async def _get_reconciled(self, task_id, context, owner):
         owner_context = self._as_owner(context, owner)
         task = await super().get(task_id, owner_context)
+        if task is not None:
+            copied = SdkTask()
+            copied.CopyFrom(task)
+            task = copied
         if task is None or self.workflow_store is None:
             return task
         try:
@@ -512,6 +546,41 @@ def _struct_value(value):
     return wrapper
 
 
+async def _publish_public_output(updater, output, *, finish=False):
+    """Encode the complete committed batch before emitting its first frame."""
+    artifacts = [(artifact, public_artifact_parts(artifact)) for artifact in output.artifacts]
+    message = public_sdk_message(output.message) if output.message is not None else None
+    published = getattr(updater, "_core_public_artifacts", {})
+    for artifact, parts in artifacts:
+        signature = (artifact.name, tuple(part.SerializeToString(deterministic=True) for part in parts))
+        if artifact.id in published and published[artifact.id] != signature:
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+    if finish and getattr(updater, "_core_public_complete", False):
+        return
+    messages = getattr(updater, "_core_public_messages", set())
+    if not finish and message is not None and message.message_id not in messages:
+        await updater.update_status(SdkTaskState.TASK_STATE_WORKING, message=message)
+        messages.add(message.message_id)
+    for artifact, parts in artifacts:
+        if artifact.id in published:
+            continue
+        metadata = {"digest": artifact.digest, "size": artifact.size, "provenance": artifact.provenance}
+        if "core_agent_artifact" in artifact.provenance:
+            metadata["core_agent_artifact"] = artifact.provenance["core_agent_artifact"]
+        await updater.add_artifact(parts, artifact_id=artifact.id, name=artifact.name, metadata=metadata,
+                                   last_chunk=True)
+        published[artifact.id] = (artifact.name, tuple(part.SerializeToString(deterministic=True) for part in parts))
+    updater._core_public_artifacts = published
+    updater._core_public_messages = messages
+    if finish:
+        if output.state.value == "completed":
+            await updater.complete(message=message)
+        else:
+            state = getattr(SdkTaskState, "TASK_STATE_" + output.state.value.upper())
+            await updater.update_status(state, message=message)
+        updater._core_public_complete = True
+
+
 class TaskStreamPublisher:
     """Publish runtime progress from the worker thread onto the A2A event queue.
 
@@ -545,11 +614,18 @@ class TaskStreamPublisher:
             self.closed = True
 
     def _publish(self, parts, *, partial=False, metadata=None):
+        if not parts and getattr(self.updater, "_core_public_messages", None):
+            return
         metadata = metadata or ({PARTIAL_KEY: True} if partial else None)
         message = self.updater.new_agent_message(parts, metadata=metadata)
         self._submit(
             self.updater.update_status(SdkTaskState.TASK_STATE_WORKING, message=message)
         )
+
+    def public_output(self, output):
+        if not isinstance(output, PublishedOutput):
+            raise CoreError("CHECKPOINT_INVALID")
+        self._submit(_publish_public_output(self.updater, output))
 
     @staticmethod
     def _text_parts(response, reasoning):
@@ -763,6 +839,10 @@ class CoreAgentExecutor(AgentExecutor):
         if isinstance(artifact, SuspendedRun):
             await updater.start_work()
             return
+        if isinstance(artifact, PublishedOutput):
+            await _publish_public_output(updater, artifact,
+                finish=artifact.state.value in {"completed", "failed", "canceled", "rejected"})
+            return
         if not isinstance(artifact, Artifact):
             artifact = Artifact.text(str(artifact))
         final_text = "\n".join(part.data for part in artifact.parts if part.kind == "text")
@@ -908,6 +988,11 @@ class CoreRequestHandler(DefaultRequestHandler):
         self.admission_handler = admission_handler
         self.admission_cleanup = admission_cleanup
         self.reply_hub = reply_hub
+
+    @staticmethod
+    def _public_output_identity(task):
+        return (task.status.message.SerializeToString(deterministic=True),
+                tuple(artifact.SerializeToString(deterministic=True) for artifact in task.artifacts))
 
     @staticmethod
     def _public_reply_event(task_id, context_id, preview):
@@ -1105,6 +1190,7 @@ class CoreRequestHandler(DefaultRequestHandler):
             next_live = asyncio.create_task(anext(live_stream))
             await asyncio.sleep(0)
         previous = task.SerializeToString(deterministic=True)
+        previous_public = self._public_output_identity(task)
         previous_progress = json_format.MessageToDict(task.metadata).get(REMOTE_PROGRESS_KEY)
         previous_reply = None
         try:
@@ -1148,6 +1234,7 @@ class CoreRequestHandler(DefaultRequestHandler):
                                 next_live = asyncio.create_task(anext(live_stream))
                             if isinstance(event, SdkTask):
                                 previous_progress = json_format.MessageToDict(event.metadata).get(REMOTE_PROGRESS_KEY)
+                                previous_public = self._public_output_identity(event)
                             if isinstance(event, SdkTaskStatusUpdateEvent):
                                 marker = json_format.MessageToDict(event.status.message.metadata).get(PUBLIC_REPLY_KEY)
                                 if marker and marker.get("version") == 1:
@@ -1174,7 +1261,10 @@ class CoreRequestHandler(DefaultRequestHandler):
                 progress = json_format.MessageToDict(task.metadata).get(REMOTE_PROGRESS_KEY)
                 progress_changed = progress != previous_progress
                 previous_progress = progress
-                if next_live is None or task.status.state in A2A_TERMINAL_STATES or progress_changed:
+                public = self._public_output_identity(task)
+                public_changed = public != previous_public
+                previous_public = public
+                if next_live is None or task.status.state in A2A_TERMINAL_STATES or progress_changed or public_changed:
                     yield task
                     if task.status.state in A2A_TERMINAL_STATES:
                         return

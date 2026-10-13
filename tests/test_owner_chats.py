@@ -43,8 +43,15 @@ class OwnerChatAPITests(AuthAppTestCase):
         ])
         task = await self.submit("external-a", "published", "archive-chat")
         record = agent.workflow_store.lookup_task(task["id"])
-        files = record.result["outgoing_files"]
+        artifacts = record.snapshot["published_artifacts"]
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual([part["type"] for part in artifacts[0]["parts"]], ["file"])
+        files = [part["ref"] for artifact in artifacts for part in artifact["parts"]]
         self.assertEqual(len(files), 1)
+        self.assertEqual(task["status"]["message"]["messageId"], task["id"] + ":final")
+        self.assertEqual(task["status"]["message"]["parts"][0]["text"], "File ready")
+        self.assertEqual([artifact["artifactId"] for artifact in task["artifacts"]],
+                         [artifact["artifact_id"] for artifact in artifacts])
         path = f"/api/chats/archive-chat/tasks/{task['id']}/files/{files[0]['file_id']}"
         original_task = await self.http.get(f"/a2a/external/tasks/{task['id']}", headers=self.headers("external-a"))
         original_history = await self.http.get("/api/chats/archive-chat/history", headers=self.headers("owner-a"))

@@ -219,7 +219,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/guardrails.py` | Ограниченный classifier без tools, отдельный context и deployment-configured model adapter |
 | `core_agent/material_reviews.py` | Private material decisions, detector budget и атомарная связь с guardrail waits |
 | `core_agent/chat_files.py` | Private file batches, scoped extraction/download, runtime publication barrier, bounded orphan sweep и atomic raw FilePart admission |
-| `core_agent/response_files.py` | Immutable snapshots выбранных файлов результата, scoped manifest и whole-batch integrity validation |
+| `core_agent/response_files.py`, `core_agent/response_artifacts.py` | Scoped immutable snapshots выбранных text/data/file Parts, task-wide limits и whole-batch integrity validation |
 | `core_agent/runtime.py` | Agent loop, workflow continuation, recovery, tool handlers и delegation |
 | `core_agent/config.py` | RunRequest, Platform/Agent/EffectiveConfig и capability intersection |
 | `core_agent/a2a.py` | Внутренние A2A contract types и Task representation |
@@ -362,7 +362,7 @@ Target spec может описывать больше текущего runtime.
   follow-up атомарно переносятся в transcript как
   `unprocessed_due_to_failure|cancel` вместе с terminal transition. Они не
   остаются unread и не доставляются модели после recovery.
-- Terminal A2A Artifact различает полное и budget-exhausted завершение через
+- Terminal A2A output различает полное и budget-exhausted завершение через
   `complete`, `completion_reason`, local `usage`, root `shared_budget` и при
   необходимости `exhausted_dimension`/`pending_tasks`; live и recovery path
   публикуют одинаковую provenance shape.
@@ -402,7 +402,9 @@ Target spec может описывать больше текущего runtime.
   будит текущий таймер, повтор сообщения не будит следующую generation;
 - `core_ask_owner` — private вопрос владельцам при подключённом owner plane;
 - `core_delegate`;
-- `core_response_files` при подключённом enterprise owner plane;
+- `core_message_send` — публичный промежуточный Message без завершения Task;
+- `core_response_artifacts` и compatibility alias `core_response_files` при
+  подключённых trusted workspace и transport storage;
 - `core_memory_search`, `core_memory_read`, `core_memory_create`,
   `core_memory_update`, `core_memory_split`, `core_memory_delete`;
 - `core_agent_send_message`;
@@ -420,7 +422,7 @@ Target spec может описывать больше текущего runtime.
 
 Три named artifact tools и исключительно их S3/MongoDB adapters удалены.
 Входящие enterprise файлы проходят atomic ChatFileService admission/guardrails,
-а `core_response_files` выбирает frozen набор файлов для итогового ответа.
+а `core_response_artifacts` явно публикует immutable text/data/file Parts.
 Legacy/test transport без ChatFileService явно отклоняет вложения. Transport
 A2A Artifacts, offload и workspace snapshots используют прежние независимые
 stores. Retired artifact tool/env settings отклоняются с names-only upgrade
@@ -431,8 +433,14 @@ diagnostic; новые примеры оставляют builtin allowlist пу�
 в authenticated deployment создаёт durable local handle для доверенного peer
 из company registry. `core_task_wait` ждёт его сохранённый outcome без нового
 timeout. Legacy direct/test runtime без registry сохраняет ENV adapter отдельно.
-Обычный model/child text result по-прежнему
-публикуется A2A adapter-ом как Task Artifact без дополнительного tool call.
+Новые roots закрепляют output contract v2; child наследует версию parent.
+Обычный финальный текст публикуется как durable Message, без автоматического
+Artifact. Отсутствующая версия сохраняет прежний v1 контракт принятых runs.
+`core_message_send` добавляет рабочий Message; `core_response_artifacts`
+прикрепляет выбранные Parts сразу после успешного guarded tool result.
+Workflow transition, canonical Task и outbox фиксируются одной транзакцией;
+stream не является источником истины. Published Artifacts не отзываются при
+последующей ошибке или отмене. `core_ask_owner` остаётся приватным.
 
 `core_terminal_write`, `core_fs_apply_patch` и `core.input.request` описаны в
 части target spec, но сейчас не зарегистрированы как model-callable built-ins.
@@ -778,16 +786,18 @@ run получает отдельные MCP session и negotiated version; пе�
 - Доступные owner history messages после file publication содержат только
   actual name/path/size/digest из scoped batch. Quarantine/excluded names не
   раскрываются через history; bytes и исходная metadata остаются в private store.
-- `core_response_files` принимает полный список относительных workspace paths,
-  замещает предыдущий выбор или очищает его через `[]`. Ошибка сохраняет прежний
-  набор. Snapshot и receipt фиксируются одним durable переходом, включая Python
-  broker; bytes сохраняются в transport store, не в workflow JSON/model context.
-  Новые выборы используют текущий company limit, принятый набор закрепляет его.
-  Final A2A Artifact выдаёт typed raw Parts; live/GetTask/subscription/recovery
-  проверяют весь canonical manifest и blobs до выдачи. Terminal Message не
-  дублирует файлы. Owner final history содержит только safe `response_files`
-  receipts, без blob IDs/raw bytes; download по chat/Task/file ID снова проверяет
-  текущие права и integrity всего набора и не читает изменённый workspace source.
+- `core_response_artifacts` принимает непустой ordered batch typed text/data/file
+  Parts. Каждая публикация добавляет immutable Artifacts; task-wide byte limit
+  закрепляется первым batch. Все Parts валидируются и snapshot-ятся до dispatch,
+  а публикация происходит после HITL и проверки tool result, включая Python
+  broker и recovery. Bytes хранятся в transport store, не в workflow JSON.
+  В v2 `core_response_files` немедленно добавляет file-only Artifact; `[]` —
+  no-op. В v1 сохраняются замена/очистка выбора для финального результата.
+  Live/GetTask/subscription/recovery проверяют весь canonical manifest и blobs
+  до выдачи. Owner history разделяет публичные Messages и safe Artifact receipts,
+  без blob IDs/raw bytes. Download по chat/Task/file ID доступен и во время
+  работы, снова проверяет текущие права и integrity всего набора и не читает
+  изменённый workspace source. Частично повреждённый набор не выдаётся.
 - File guardrail download `/api/guardrails/{wait_id}/file` получает точный
   sealed reference из сохранённого review, возвращает только owner-scoped
   проверенные bytes как attachment и остаётся доступен для owner history.
@@ -828,7 +838,7 @@ run получает отдельные MCP session и negotiated version; пе�
   model-turn generation и sequence. Passive Subscribe выдаёт persisted Task
   раньше preview и не запускает работу. Retry/follow-up сбрасывает preview;
   process restart сохраняет phase/usage, но не обещает сохранять черновик.
-  Final Artifact/history остаются авторитетными; public preview не попадает в
+  Canonical Task Messages/Artifacts и history остаются авторитетными; preview не попадает в
   историю, push и внутренний reasoning stream. UI показывает незавершённый
   текст безопасным plain text и не запрашивает историю на каждый фрагмент.
   Live UI включается только после send admission в текущем открытом чате;
@@ -881,7 +891,7 @@ run получает отдельные MCP session и negotiated version; пе�
   writer lease; historical sealed reads допускают terminal ancestors.
   Quarantine bind, terminal result и notification/outbox commit-ятся атомарно
   под claim/deadline/revision/cancel fences на одной borrowed connection.
-  Private `file_batch_id` исключается из remote mailbox/outbox и model task
+  Private `file_batch_id`/`file_batch_ids` исключаются из remote mailbox/outbox и model task
   snapshots. Text и каждый файл проходят guardrails до whole-batch publication;
   отказ исключает весь result, task list может сохранить отдельно разрешённые
   результаты. Вложенный Python останавливается перед ожиданием, recovery не
@@ -894,8 +904,12 @@ run получает отдельные MCP session и negotiated version; пе�
   остальные decision references неизменяемы.
   Reflected credentials в metadata/raw files отклоняются до stage, проверяя
   UTF-8 и фактические Latin-1 header bytes; содержимое файлов не переписывается.
-  В legacy v1/v2 Data Parts отклоняются. В v3 успешные terminal Artifact text,
-  data и files материализуются под `a2a/<local-operation-id>/` вместе с manifest;
+  В legacy v1/v2 Data Parts отклоняются. В v3 complete immutable Artifacts с
+  marker `core_agent_artifact` v1 принимаются до terminal state, дедуплицируются
+  по ID/digest и сохраняют ordered quarantine batches через restart. Сам ранний
+  Artifact не завершает ожидание Task; `input-required` продолжает будить parent.
+  Unmarked/partial сторонние Artifacts сохраняют terminal fallback. Text/data/file
+  Parts материализуются под `a2a/<local-operation-id>/` вместе с manifest;
   модель получает receipts/paths, public Messages остаются текстом. Все bytes,
   включая manifest, учитываются в aggregate limit и проходят whole-batch review.
   Incoming A2A batches используют `a2a/<batch-id>/`, UI uploads и legacy batches

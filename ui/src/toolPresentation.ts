@@ -13,6 +13,8 @@ const labels: Record<string, string> = {
   core_cron_create: "Создание расписания",
   core_response_begin: "Подготовка ответа",
   core_response_files: "Выбор файлов для ответа",
+  core_response_artifacts: "Публикация материалов",
+  core_message_send: "Сообщение в чат",
   core_memory_search: "Поиск в памяти",
   core_memory_read: "Чтение записи памяти",
   core_memory_create: "Создание записи памяти",
@@ -43,8 +45,6 @@ export function actionLabel(name: string, args: unknown): string {
     return `Фоновая задача: ${toolLabel(values.tool)}`;
   if (name === "core_memory_create" && typeof values.title === "string")
     return `Новая запись: ${values.title}`;
-  if (name === "core_response_files" && Array.isArray(values.paths) && !values.paths.length)
-    return "Очистка выбранных файлов ответа";
   return toolLabel(name);
 }
 

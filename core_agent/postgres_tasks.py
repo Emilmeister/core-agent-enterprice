@@ -16,7 +16,7 @@ from .tasks import (
     _remote_contract, _remote_checkpoint, _initial_remote_checkpoint, _advance_remote_checkpoint,
     _remote_expired, _remote_due, _remote_text, remote_timeout_result, _remote_file_binding, remote_result_projection,
     _remote_cancelled_outcome, _remote_reply_status,
-    _pending_remote_input, _queue_remote_reply, _new_remote_input,
+    _pending_remote_input, _queue_remote_reply, _new_remote_input, _remote_result_batches,
 )
 from .workflow import SuspendedRun
 from .peer_conversations import merge_observation, OBSERVATION_TTL
@@ -238,6 +238,7 @@ class PostgresTaskScheduler:
 
     def _remote_finish_locked(self, connection, row, checkpoint, outcome, now):
         checkpoint = {**checkpoint, "next_poll_at": None}
+        outcome = (outcome[0], _remote_result_batches(outcome[1], checkpoint), outcome[2])
         connection.execute("UPDATE core_background_tasks SET checkpoint = %s WHERE id = %s AND tenant_id = %s",
                            (Jsonb(checkpoint), row["id"], row["tenant_id"]))
         return self._finish_locked(connection, {**row, "checkpoint": checkpoint}, *outcome, now)
@@ -267,7 +268,7 @@ class PostgresTaskScheduler:
                             prepared_file_batch=None, conversation_observation=None):
         if prepared_file_batch is not None:
             return self._commit_remote_files(claim, expected_revision, checkpoint, outcome, progress, prepared_file_batch, conversation_observation)
-        if isinstance(outcome, tuple) and len(outcome) > 1 and isinstance(outcome[1], dict) and "file_batch_id" in outcome[1]:
+        if isinstance(outcome, tuple) and len(outcome) > 1 and isinstance(outcome[1], dict) and {"file_batch_id", "file_batch_ids"} & outcome[1].keys():
             raise CoreError("CHECKPOINT_INVALID")
         with self.database.transaction() as connection:
             row, now = self._remote_claim_locked(connection, claim, terminal=True)
@@ -300,7 +301,7 @@ class PostgresTaskScheduler:
             else:
                 row = connection.execute("""UPDATE core_background_tasks SET checkpoint = %s, result = %s, revision = revision + 1, updated_at = %s
                                             WHERE id = %s AND tenant_id = %s RETURNING *""",
-                                         (Jsonb(checkpoint), Jsonb(progress if progress is not None else row["result"]) if progress is not None or row["result"] is not None else None,
+                                         (Jsonb(checkpoint), Jsonb(_remote_result_batches(progress if progress is not None else row["result"], checkpoint)) if progress is not None or row["result"] is not None else None,
                                           now, claim.task_id, claim.tenant_id)).fetchone()
                 if new_input:
                     self._deliver_notification(connection, row, "task.input-required", row["revision"],
@@ -315,6 +316,7 @@ class PostgresTaskScheduler:
             raise CoreError("FILE_ADMISSION_TRANSACTION_REQUIRED")
         if not isinstance(claim, RemoteTaskClaim):
             raise CoreError("LEASE_LOST")
+        new_input = False
         with self.database.transaction() as connection:
             initial = connection.execute("""SELECT contract FROM core_background_tasks
                 WHERE id=%s AND tenant_id=%s AND owner_run_id=%s AND kind=%s""",
@@ -323,7 +325,7 @@ class PostgresTaskScheduler:
                 raise CoreError("TASK_NOT_FOUND")
             contract = initial["contract"]
             _remote_contract(contract, claim.tenant_id, claim.owner_id)
-            binding = _remote_file_binding(contract, batch, outcome, claim.task_id)
+            binding = _remote_file_binding(contract, batch, outcome, claim.task_id, checkpoint)
             scope = contract["caller_scope"]
             with service.caller_scope(binding, task_id=scope["task_id"], run_id=scope["run_id"], connection=connection):
                 row, now = self._remote_claim_locked(connection, claim, terminal=True)
@@ -337,7 +339,8 @@ class PostgresTaskScheduler:
                 else:
                     if row["cancel_requested"] or row["checkpoint"]["cancel_started"]:
                         raise CoreError("CANCEL_REQUESTED")
-                    updated = _advance_remote_checkpoint(row["checkpoint"], checkpoint, contract, now, False, outcome)
+                    updated = _advance_remote_checkpoint(row["checkpoint"], checkpoint, contract, now, False, outcome,
+                        file_batch_id=batch["batch_id"] if checkpoint["version"] == 3 else None)
                     _remote_progress(progress, contract, updated, outcome)
                     if not updated["send_started"]:
                         raise CoreError("CHECKPOINT_INVALID")
@@ -355,9 +358,21 @@ class PostgresTaskScheduler:
                         conversation = merge_observation(fresh.get("remote_conversation"), conversation_observation, now)
                         connection.execute("UPDATE core_background_tasks SET remote_conversation=%s WHERE id=%s AND tenant_id=%s",
                                            (Jsonb(conversation), claim.task_id, claim.tenant_id))
-                        row = self._remote_finish_locked(connection, fresh, updated,
-                            ("completed", {**outcome[1], "file_batch_id": batch["batch_id"]}, None), now)
-        self._notify_remote(claim.task_id)
+                        if outcome is None:
+                            new_input = _new_remote_input(fresh["checkpoint"], updated)
+                            row = connection.execute("""UPDATE core_background_tasks
+                                SET checkpoint=%s, result=%s, revision=revision+1, updated_at=%s
+                                WHERE id=%s AND tenant_id=%s RETURNING *""",
+                                (Jsonb(updated), Jsonb(_remote_result_batches(progress, updated)),
+                                 now, claim.task_id, claim.tenant_id)).fetchone()
+                            if new_input:
+                                self._deliver_notification(connection, row, "task.input-required", row["revision"],
+                                    {"task_id": row["id"], "input_id": updated["input_request"]["input_id"]}, now)
+                        else:
+                            row = self._remote_finish_locked(connection, fresh, updated,
+                                ("completed", {**outcome[1], **({} if updated["version"] == 3 else {"file_batch_id": batch["batch_id"]})}, None), now)
+        if row["state"] in TERMINAL or new_input:
+            self._notify_remote(claim.task_id)
         return self._task(row)
 
     def expire_remote(self, limit=100, *, tenant_id=None):

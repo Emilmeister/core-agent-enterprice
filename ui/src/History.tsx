@@ -3,11 +3,12 @@ import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
 import { scheduleTime } from "./Schedules";
 import { InteractionCard } from "./Interactions";
-import { mergeHistoryPage } from "./types";
-import type { AttachmentEntry, HistoryItem, HistoryPage, Interaction } from "./types";
+import { mergeHistoryPage, publicMessageText } from "./types";
+import type { AttachmentEntry, HistoryItem, HistoryPage, Interaction, Task } from "./types";
 import { ActionCard, ActionDialog, actionState, historyEntries } from "./ActionCard";
 import type { HistoryEntry } from "./ActionCard";
 import { FileCard } from "./FileCard";
+import { ArtifactCards } from "./ArtifactCards";
 import { PeerConversationCard, peerOperationId } from "./PeerConversations";
 import type { PeerConversation } from "./PeerConversations";
 export { ConversationFiles, FileCard } from "./FileCard";
@@ -212,6 +213,8 @@ function Entry({ api, contextId, item }: { api: Api; contextId?: string; item: H
           {item.response_files.map((file) => <FileCard key={`${contextId}:${item.task_id}:${file.file_id}`}
             api={api} contextId={contextId} taskId={item.task_id!} file={file} />)}
         </ul> : null}
+      {item.status === "available" && contextId && item.task_id && item.response_artifacts?.length
+        ? <ArtifactCards api={api} contextId={contextId} taskId={item.task_id} artifacts={item.response_artifacts} /> : null}
       {item.outcome && (
         <p className="muted history-status">
           {outcomes[item.outcome.state] ?? "Задача завершена"}
@@ -227,6 +230,7 @@ export function History({
   api,
   contextId,
   history,
+  task,
   refresh,
   onOlder,
   peerConversations = [],
@@ -235,6 +239,7 @@ export function History({
   api: Api;
   contextId?: string;
   history: ReturnType<typeof useChatHistory>;
+  task?: Task;
   refresh: () => Promise<void>;
   onOlder: () => void;
   peerConversations?: PeerConversation[];
@@ -323,7 +328,8 @@ export function History({
                 <ActionCard action={action} terminal={terminal} waits={waits} onOpen={() => setSelectedAction(action.key)} />
               </details>
             </div> : action ? <ActionCard action={action} terminal={terminal} waits={waits} onOpen={() => setSelectedAction(action.key)} />
-              : <Entry api={api} contextId={contextId} item={item} />}
+              : <Entry api={api} contextId={contextId} item={item.status === "available"
+                  ? { ...item, text: publicMessageText(item, task) } : item} />}
             {review && <InteractionCard key={review.wait_id} api={api} item={review} refresh={refresh} />}
           </Fragment>;
         }

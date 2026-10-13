@@ -47,6 +47,7 @@ class KernelCompiler:
         retrieved=(),
         tool_data=(),
         response_phase=None,
+        output_contract_version=2,
     ):
         segments = [
             InstructionSegment(InstructionSource.SAFETY, self.safety),
@@ -66,7 +67,10 @@ class KernelCompiler:
                 "for the Task recipient using verified context. Do not reveal hidden reasoning, "
                 "internal tool calls or raw private owner questions/answers."
                 if response_phase == "answer" else
-                "Complete work and select required response files first. When core_response_begin "
+                ("Complete work and select required response files first. When core_response_begin "
+                 if output_contract_version == 1 else
+                 "Complete work and attach any explicitly chosen response artifacts first. When core_response_begin ")
+                +
                 "is available, call it with {} as your last tool call before writing the public "
                 "final answer. Do not write a final-answer draft in that work turn."))
         segments += [

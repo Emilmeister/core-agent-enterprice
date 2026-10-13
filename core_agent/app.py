@@ -738,6 +738,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         "core_task_wait",
         "core_wait_until",
         "core_ask_owner",
+        "core_message_send",
         "core_cron_create",
         "core_task_cancel",
         "core_delegate",
@@ -758,6 +759,8 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
     if response_files_enabled:
         builtin_tools_without_terminal.add("core_response_files")
         all_builtin_tools.add("core_response_files")
+        builtin_tools_without_terminal.add("core_response_artifacts")
+        all_builtin_tools.add("core_response_artifacts")
     builtin_tools_by_mode = {
         "with_terminal": builtin_tools_without_terminal
         | {"core_terminal_exec", "core_python_exec", "core_task_start"},
@@ -1367,10 +1370,17 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "chat workspace and permitted public network destinations."
             ),
             "response_files": (
-                "RESPONSE FILES: Use core_response_files with relative workspace paths to select "
-                "the complete file set for your final answer. It freezes the bytes, replaces your "
-                "previous selection, and sends no message. [] clears the set. Then answer normally. "
-                "A failed selection preserves the previous set; reduce files after an aggregate-limit error."
+                "RESPONSE ARTIFACTS: Use core_response_artifacts only when a separate text, JSON "
+                "or file result is useful. Successful calls immediately append immutable artifacts "
+                "to this Task. File Parts use relative workspace paths. core_response_files is "
+                "the file-only compatibility tool. Never claim attachment unless the tool succeeded. "
+                "Published artifacts cannot be replaced or removed. Ordinary final replies are Messages."
+            ),
+            "public_messages": (
+                "PUBLIC MESSAGES: Use core_message_send for useful public progress updates while "
+                "working. It does not finish the Task or wait for a reply. Once work is complete, "
+                "write the normal final answer. Keep hidden reasoning, internal tool details and "
+                "private owner correspondence out of public messages and artifacts."
             ),
             "remote_agents": (
                 "REMOTE AGENTS: core_agent_send_message returns a durable local handle for one task sent to another "
@@ -1702,6 +1712,13 @@ def create_app(
     def result_artifact(result, context):
         if isinstance(result, SuspendedRun):
             return result
+        record = agent.workflow_store.get(result.run_id, tenant_id=context.tenant or "default")
+        if record.snapshot.get("output_contract_version", 1) == 2:
+            from .a2a import workflow_public_output
+
+            if record.task_id != context.task_id or record.context_id != context.context_id:
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+            return workflow_public_output(record, agent.response_files_service)
         if getattr(result, "outgoing_files", ()):
             record = agent.workflow_store.get(
                 result.run_id, tenant_id=context.tenant or "default"
@@ -1896,6 +1913,7 @@ def create_app(
         legacy_identity=default_user,
     )
     task_store.response_files_service = agent.response_files_service
+    agent.workflow_store.public_output_observer = task_store.reconcile_run
     admission = None
     if auth_settings:
         if state["database"] and state["tasks"] is None:

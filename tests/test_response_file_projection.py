@@ -36,6 +36,18 @@ class TypedArtifactTests(unittest.TestCase):
 class ResponseFileProjectionTests(AuthAppTestCase):
     durable_blobs = True
 
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        store = self.app.state.core_agent.workflow_store
+        create = store.create
+        def legacy_admission(record, *args, **kwargs):
+            if record.parent_run_id is None:
+                record = replace(record, snapshot={**record.snapshot, "output_contract_version": 1})
+            return create(record, *args, **kwargs)
+        pinned = patch.object(store, "create", side_effect=legacy_admission)
+        pinned.start()
+        self.addCleanup(pinned.stop)
+
     async def files_result(self, *, text="Files ready"):
         seed = await self.submit("external-a", uuid.uuid4().hex, "projection")
         agent = self.app.state.core_agent
@@ -287,7 +299,7 @@ class ResponseFileProjectionTests(AuthAppTestCase):
                     (int(sdk_task.status.state), sdk_task.SerializeToString(), task["id"], record.tenant_id))
             store.database.pool.resize(1, 1)
             store.database.pool.timeout = 2
-            self.assertEqual(await asyncio.to_thread(store.reconcile_from_workflows), 1)
+            self.assertEqual(await asyncio.to_thread(store.reconcile_from_workflows, tenant_id=record.tenant_id), 1)
         else:
             for rows in store._impl.tasks.values():
                 if task["id"] in rows:

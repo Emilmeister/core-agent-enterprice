@@ -168,3 +168,6 @@ class NullStreamPublisher:
 
     def flush(self):
         return None
+
+    def public_output(self, output):
+        return None

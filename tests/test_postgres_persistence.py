@@ -736,8 +736,10 @@ class PostgresRestartTests(unittest.TestCase):
                 )
                 self.assertEqual(task.status.state, TaskState.TASK_STATE_COMPLETED)
                 self.assertEqual(
-                    task.artifacts[0].parts[0].text, persisted.result["message"]
+                    task.status.message.parts[0].text, persisted.result["message"]
                 )
+                self.assertFalse(task.artifacts)
+                self.assertEqual(task.status.message.message_id, record.task_id + ":final")
                 self.assertEqual(len(deliveries), 1)
                 self.assertEqual(deliveries[0]["state"], "pending")
                 self.assertEqual(deliveries[0]["attempts"], 0)
