@@ -118,11 +118,83 @@ policy/approval и generic second opinion без самостоятельног�
 
 `core_artifact_save`, `core_artifact_load`, `core_artifact_list` удалены из model catalog, registry, schemas и handlers. Их прежние allowlist names отклоняются с диагностикой конфигурации, stale calls не выполняются. Файлы доступны через workspace чата и проверенный UI/A2A transport по [Файлам](artifacts.md).
 
-Обычный model/child text result публикуется adapter-ом как стандартный A2A Task Artifact без дополнительного model turn или tool call.
+Обычный model/child text result output contract v2 публикуется как canonical agent Message без дополнительного model turn либо artifact tool call. Legacy accepted runs сохраняют прежний A2A Task Artifact; child result не становится root attachment автоматически.
+
+### `core_message_send`
+
+Tool публикуется в каталоге только для pinned output contract v2; child
+наследует version parent snapshot, а legacy version-less root остаётся v1.
+
+Схема — ровно `{text: string}`, непустой публичный текст адресату текущей Task.
+Успех сохраняет agent Message со stable server-owned ID, текущими Task/context
+IDs и точным разрешённым text в canonical history/`status.message` до receipt
+и publication. Task остаётся `working`; tool не завершает её, не создаёт
+Artifact и не открывает public input wait. Scope/IDs не выбираются arguments.
+
+Capability intersection, current policy/HITL, material guardrails, обычные
+local/shared tool budgets, audit и child allowlists сохраняются. Повтор того же
+accepted call возвращает прежнюю identity без второго сообщения или charge;
+два отдельных calls с одинаковым текстом не склеиваются. Private owner question,
+ответ, hidden reasoning, secrets и raw internal tool output не являются public
+reply. Owner input по-прежнему использует private `core_ask_owner`; нового
+ask-caller tool нет.
+
+### `core_response_artifacts`
+
+Tool публикуется только для pinned v2; legacy rendering не меняется после upgrade.
+
+V2 модель явно выбирает полный batch: ровно
+`{artifacts: [{name?, parts: [...]}]}`. `artifacts` и каждый `parts` непусты;
+неизвестные fields отклоняются. Optional `name` — string до 256 символов,
+default `""`. Каждый Part имеет явный discriminator и только поля своего типа:
+
+- `{type: "text", text: string, media_type?: string}`: точный UTF-8 text,
+  valid `text/*` media subtype, default `text/plain`;
+- `{type: "data", data: object}`: native JSON object с finite JSON values.
+  Scalar/array root, NaN/infinity и непредставимый объект отклоняются; произвольный
+  JSON иной формы MAY быть явно выбран regular file;
+- `{type: "file", path: string}`: непустой относительный путь regular file
+  текущего chat workspace. Absolute paths, URLs, traversal, symlinks, hardlinks
+  и special files запрещены; публикуются frozen bytes с safe filename/media type,
+  а не path.
+
+Tool доступен только при trusted scoped workspace и immutable transport storage.
+Весь новый batch валидируется, безопасно snapshot-ится, проверяется current
+policy/HITL/guardrails и целостностью до атомарного commit. На первую успешную
+публикацию Task закрепляет текущий company `attachment_limit_bytes`, default
+25 МБ; cumulative сумма UTF-8 text, canonical JSON data и raw file bytes всех
+Artifacts этой Task MUST оставаться в пределах pin. Retry того же call не
+начисляет bytes/counts повторно. Максимумы Task — 64 Artifacts и 256 Parts.
+`MAX_RESPONSE_SIZE` остаётся независимым platform ceiling одного blob.
+Превышение aggregate/parts/count либо ошибка одной части не публикует никакую
+часть нового batch, не меняет ранее published набор и сохраняет source files.
+
+Успех немедленно атомарно append-ит полный immutable batch к Task, до возврата
+ordered server-owned Artifact/Part receipts; завершения Task ждать не нужно.
+Receipt/IDs и frozen manifest связаны с одним accepted call и воспроизводятся
+при recovery. Каждый published Artifact получает exact metadata marker
+`core_agent_artifact: {version: 1, complete: true, immutable: true}`; его
+Artifact update содержит полный ordered набор Parts, не append-дельту.
+Подробные transport/receiver гарантии задаёт FILE-05. Последующие calls только
+append; replace, remove и clear опубликованных Artifacts запрещены. Failure,
+cancel и budget exhaustion сохраняют прежде опубликованные данные.
+Обычные budgets, schema/data policy, HITL, guardrails, audit и child scope
+сохраняются и при Python broker. Child selection не прикрепляет файлы к root
+автоматически. Модель SHOULD предпочитать этот typed tool совместимому file alias.
 
 ### `core_response_files`
 
-Выбирает весь набор файлов следующего финального ответа, не отправляя сообщение.
+Output contract v2 сохраняет tool как compatibility alias explicit file
+publication: ровно `{paths: string[]}`. Непустой ordered набор публикует один
+новый file-only Artifact batch немедленно по тем же snapshot/aggregate/guardrail/
+scope/idempotency правилам `core_response_artifacts`. `[]` — no-op, не remove
+или clear уже published результата. Повторные разные calls append-ят новые
+Artifacts; pending replacement selection у v2 отсутствует. Типовый выбор
+модели — typed tool, а не два независимых механизма выбора.
+
+Следующие replacement/final-delivery правила применяются только к legacy
+accepted runs. Выбирает весь набор файлов следующего финального ответа,
+не отправляя сообщение.
 Схема — ровно `{paths: string[]}`: уникальные непустые относительные пути обычных
 файлов текущего chat workspace. Absolute paths, URLs, traversal, symlinks,
 hardlinks и special files запрещены. `[]` очищает выбор. Два успешных вызова
@@ -400,4 +472,4 @@ timeout — linked tool result `OWNER_ANSWER_TIMEOUT`. Отказ/timeout approv
 
 ### Служебный переход к публичному ответу
 
-`core_response_begin` — условный model-only control tool основного запуска с закрытой пустой object schema, без side effects и пользовательских аргументов. Он отсутствует в operator capability allowlist, Agent Card и `core_delegate.tools`; его reserved canonical name не может быть заменён MCP tool. Модель вызывает его после завершения работы, необходимых approvals/guardrails и выбора response files, вместо генерации final draft в рабочем turn. Следующий обычный model turn имеет tools-free catalog и формирует предназначенный Task recipient публичный ответ. Вызов расходует обычный tool budget, следующий model call — обычный model budget. Прямой/nested dispatch и child run не меняют фазу. Семантика durable boundary и fallback определена в [runtime](runtime.md), transport preview — в [A2A](a2a-protocol.md).
+`core_response_begin` — условный model-only control tool основного запуска с закрытой пустой object schema, без side effects и пользовательских аргументов. Он отсутствует в operator capability allowlist, Agent Card и `core_delegate.tools`; его reserved canonical name не может быть заменён MCP tool. Модель вызывает его после завершения работы, необходимых approvals/guardrails и явной публикации нужных v2 Artifacts (legacy — выбора response files), вместо генерации final draft в рабочем turn. Следующий обычный model turn имеет tools-free catalog и формирует предназначенный Task recipient публичный ответ. Вызов расходует обычный tool budget, следующий model call — обычный model budget. Прямой/nested dispatch и child run не меняют фазу. Семантика durable boundary и fallback определена в [runtime](runtime.md), transport preview — в [A2A](a2a-protocol.md).

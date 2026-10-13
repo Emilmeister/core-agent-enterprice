@@ -109,6 +109,20 @@ Deployment передаёт конфигурацию переменными ок
 
 Переменные, не перечисленные здесь, документированы в своих разделах: `CORE_AGENT_*` — runtime modes, budgets и tool allowlist ниже по этому документу; `DATABASE_*` и `PUSH_NOTIFICATION_ENCRYPTION_KEY` — production persistence выше и [A2A protocol](a2a-protocol.md); остальные `MEMORY_*` — [Память агента](memory-service.md).
 
+### Выходной контракт запуска
+
+Trusted admission закрепляет output contract v2 только для новых root runs.
+Child наследует output version snapshot родителя; legacy root без version
+и его children/continuations остаются v1. Rendering tool catalog и recovery
+следуют этому pin, а не текущей версии deployment.
+Deployment upgrade, follow-up, profile/model update и recovery не меняют
+пин уже принятого run. Legacy version-less accepted records сохраняют прежние
+Artifact/file-selection semantics. Этот version не является RunRequest field
+или caller-selected Message metadata. Policy/capability filters сохраняются
+для `core_message_send` и `core_response_artifacts`, а также для legacy
+`core_response_files`; содержание и совместимость определяет
+[Выходной контракт Task](public-contract.md#выходной-контракт-task).
+
 ### Identity и Agent Card
 
 Production enterprise authentication требует complete configuration ниже.

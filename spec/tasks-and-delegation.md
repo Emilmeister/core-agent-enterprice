@@ -245,7 +245,7 @@ Schema `core_agent_send_message` содержит обязательные не�
 путей существующих regular files текущего workspace. Неизвестные поля отклоняются.
 Модель явно выбирает вложения для каждого вызова. Отсутствие `files` или `[]`
 означает отправку без файлов: содержимое workspace, недавно созданные файлы,
-входящие attachments и выбор `core_response_files` автоматически не добавляются.
+входящие attachments, published Artifacts и legacy выбор `core_response_files` автоматически не добавляются.
 Без пары полей создаётся новое поручение; с парой принимается ответ на текущий
 публичный вопрос исходной операции по LONG-05. `task_id` обозначает локальный
 handle, `input_id` выдаёт backend; remote IDs/URL модель не выбирает.
@@ -350,9 +350,22 @@ revision; массовый upgrade не создаёт question/delivery/Send. U
 malformed versions fail closed.
 Обновление использует existing fenced claim/CAS/outbox, а не второй lifecycle.
 
-Artifact ID/name и ordered typed Parts сохраняются по FILE-05. Содержимое Artifact
-не склеивается с Message text и не добавляется автоматически в tool results,
-mailbox, summary или model context; сообщения и вопросы остаются public text.
+Artifact ID/name и ordered typed Parts сохраняются по FILE-05. Output contract
+v2 допускает approved early Artifact до terminal peer только с complete immutable
+marker и всем набором Parts; generic third-party outputs сохраняют прежний
+terminal-success fallback. Receiver применяет quarantine/review/publication
+barrier и current claim/cancel/deadline/scope до открытия paths либо content.
+Повторные Get/stream/push/recovery с тем же ID/content не materialize-ят Artifact
+повторно; mutation объявленного immutable Artifact fail closed, а поздний
+failure/cancel не удаляет ранее independently published Artifact.
+
+Содержимое Artifact не склеивается с Message text и не добавляется автоматически
+в tool results, mailbox, summary или model context; explicit reads проходят
+current material policy. Обычные public working/final Messages v2 сохраняют
+stable identity и chronological порядок; финальный Message берётся из canonical
+`Task.status.message` даже при отсутствии history. Completed без Artifacts
+является допустимым conversational result по согласованному v2 delivery contract.
+Public clarification по LONG-05 и private `core_ask_owner` неизменны.
 Owner peer panel показывает question/reply/state и artifact file cards с теми же
 visibility, integrity, scope и unavailable semantics. Это не открывает private
 owner waits и не подтверждает foreign HITL.
@@ -577,8 +590,9 @@ checkpoint/outcome. Они не попадают в model material либо пу
 Detail `files` используют existing safe owner AttachmentEntry только для принятого
 published batch после whole-batch integrity validation. Early unadmitted files,
 quarantine/excluded material, отсутствующие/истёкшие blobs и remote URLs не
-публикуются. Canonical final material guardrails и runtime publication barrier
-сохраняются; observation не разрешает files и не создаёт model turns.
+публикуются. Canonical material guardrails и runtime publication barrier сохраняются
+как для complete early Artifact, так и для terminal fallback; observation
+не разрешает files либо новый Message без reviews и не создаёт model turns.
 
 Detail `outgoing_files` содержит только selected frozen snapshots из immutable
 remote contract v2 после durable send intent. Entry использует existing public

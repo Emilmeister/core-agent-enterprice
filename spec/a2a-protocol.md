@@ -77,14 +77,24 @@ A2A несёт единственный логический вход:
 - `prompt` — content A2A `Message.parts`;
 - session — A2A `contextId`;
 - запуск/фоновая работа — A2A `Task`;
-- результат — A2A `Artifact`;
-- пользовательское объяснение или запрос данных — A2A `Message`.
+- обычный публичный ответ v2 — A2A `Message`;
+- явно выбранный отдельный typed результат — A2A `Artifact`;
+- прежние accepted runs/results сохраняют legacy output contract.
 
 Core Agent MUST NOT требовать собственного расширения протокола для обычного запуска. Любой стандартный A2A-клиент является валидным клиентом: отсутствие расширений в запросе не является ошибкой.
 
 MCP-серверы и skills задаются конфигурацией развёртывания и описаны в [Публичном контракте](public-contract.md). Прежнее расширение `urn:core-agent:run-capabilities:v1` удалено вместе с требованием его объявлять; правила обратной совместимости определены там же.
 
 Agent Card MAY объявлять optional informational extensions, не влияющие на приём запроса. Такое расширение MUST NOT быть required и MUST NOT блокировать клиента, который о нём не знает.
+
+Output contract v2 закрепляется trusted admission для нового root run; child
+наследует parent snapshot version, absent legacy version означает v1. Это не новая
+wire version A2A и не caller-selected metadata. Версия, durable Messages,
+explicit append-only Artifacts и legacy preservation определены в
+[Выходном контракте Task](public-contract.md#выходной-контракт-task).
+SHOULD-предпочтение Artifacts из A2A 1.0 §3.7 не объявляется MUST:
+delivery contract Core Agent явно гарантирует persisted replies и предупреждает
+Artifact-only клиентов об отсутствии обычного final text в Artifacts.
 
 ## Task mapping
 
@@ -94,7 +104,7 @@ Agent Card MAY объявлять optional informational extensions, не вли
 | `RUNNING`, `WAITING_TASK`, `PAUSED`, `RECOVERING` | `TASK_STATE_WORKING` | точная причина доступна в безопасном status metadata |
 | `WAITING_INPUT` | `TASK_STATE_INPUT_REQUIRED` | ожидаются бизнес-данные; owner-only вопрос требует владельца, внешний caller видит безопасный факт ожидания |
 | `WAITING_AUTH` | `TASK_STATE_AUTH_REQUIRED` | требуется credential/auth flow |
-| `COMPLETED` | `TASK_STATE_COMPLETED` | результаты представлены Artifacts; `completion_reason=budget_exhausted` и `complete=false` явно помечают честный неполный результат |
+| `COMPLETED` | `TASK_STATE_COMPLETED` | v2 final reply в stable `status.message`, только явно выбранные Artifacts; legacy outputs неизменны. `completion_reason=budget_exhausted` и `complete=false` явно помечают честный неполный результат |
 | `FAILED`, `ABORTED` | `TASK_STATE_FAILED` | error metadata различает обычную ошибку и unsafe continuation |
 | `CANCELLED` | `TASK_STATE_CANCELED` | отмена подтверждена runtime |
 | `REJECTED` | `TASK_STATE_REJECTED` | policy отказала до выполнения |
@@ -104,15 +114,19 @@ Agent Card MAY объявлять optional informational extensions, не вли
 Internal state не добавляет новые A2A terminal states. Client, понимающий только стандартный A2A, остаётся корректным.
 
 Budget exhaustion не добавляет отдельного A2A state и не отображается в
-`failed`: Task завершила разрешённую работу и публикует partial Artifact со
-stable metadata `completion_reason: "budget_exhausted"`, `complete: false` и
-exhausted dimension. Текст Artifact MUST явно говорить, что objective выполнен
-не полностью. Полное завершение использует `completion_reason: "completed"` и
-`complete: true`.
+`failed`: Task завершила разрешённую работу и публикует final Message v2
+(legacy — partial Artifact) со stable completion metadata
+`completion_reason: "budget_exhausted"`, `complete: false` и exhausted dimension.
+Его текст MUST явно говорить, что objective выполнен не полностью. Полное
+завершение использует `completion_reason: "completed"` и `complete: true`.
+Budget exhaustion не создаёт Artifact без explicit selection.
 
-Artifact metadata и при live completion, и при recovery имеет одинаковую форму:
-top-level `digest`/`size` и вложенный `provenance` с completion fields, локальным
-`usage`, общим `shared_budget` и optional `pending_tasks`.
+Final Message v2 имеет ту же completion provenance при live completion и
+recovery: completion fields, локальный `usage`, общий `shared_budget` и optional
+`pending_tasks`. Ранее опубликованные immutable Artifacts сохраняют собственные
+IDs, typed Parts, digest/size и source provenance; более поздний terminal outcome
+не переписывает их. Legacy Artifact metadata сохраняет прежний top-level
+`digest`/`size` и вложенный `provenance` без преобразования старого результата.
 
 ## Операции
 
@@ -183,14 +197,25 @@ Follow-up не пересобирает admission ceiling и не пополня
 ## Artifacts и Messages
 
 - Receiver MUST сохранять Artifact ID/name, ordered typed Parts и их связь,
-  не склеивая text Artifact с Message text. Complete successful remote artifacts
-  материализуются по [FILE-05](artifacts.md#file-05-typed-a2a-artifacts-в-workspace);
-  промежуточные chunks не разрешают раннюю публикацию files. Raw FileParts
+  не склеивая text Artifact с Message text. Complete immutable early Artifact
+  с `metadata.core_agent_artifact: {version: 1, complete: true, immutable: true}`
+  либо generic terminal-success result материализуются по
+  [FILE-05](artifacts.md#file-05-typed-a2a-artifacts-в-workspace); partial chunks
+  и один lastChunk без полного marker не разрешают раннюю публикацию files. Raw FileParts
   initiating inbound Message также используют `a2a/`; UI uploads остаются в
   `attachments/`. Public Messages/questions продолжают быть сообщениями.
-- Итоговые и промежуточные результаты задачи публикуются как Artifacts с content parts, media type, digest и provenance.
-- Messages используются для общения, progress summary и remote input request.
-- Partial artifact updates идемпотентны и имеют stable artifact ID/version.
+- V2 обычные final/intermediate replies публикуются как durable Messages, а
+  Artifacts — только model-explicit immutable selections. Полный batch
+  публикуется немедленно и append-only, пока Task MAY продолжать работу.
+- Public working Message не означает `input-required`; новый ask-caller tool
+  не вводится. Existing peer clarification и private owner wait различаются.
+- Final Message сохраняется в `Task.status.message` и history до terminal
+  publication со stable identity и Parts; `historyLength=0` не удаляет его.
+  Каждый committed intermediate reply сохраняется один раз. Get/List,
+  stream/subscription, push и recovery используют canonical записи.
+- V2 Artifact update содержит complete immutable Parts; partial chunk не
+  разрешает early file publication. Generic/legacy chunk assembly сохраняется
+  до подтверждённого terminal success по FILE-05.
 - Secret, hidden reasoning и raw sensitive tool output MUST NOT попадать в Message или Artifact без явной data policy. Provider-visible reasoning MAY появляться только как помеченная часть промежуточного status Message при включённом streaming и MUST отсутствовать в терминальном кадре и Artifact.
 
 ### Публичное уточнение и private owner wait
@@ -240,10 +265,15 @@ Streaming показывает вызывающей стороне ход вып
 
 Один streaming-вызов MUST давать ровно такую последовательность `StreamResponse`:
 
-1. один кадр `task` с начальным состоянием;
-2. ноль или больше кадров `statusUpdate` со `state: "TASK_STATE_WORKING"`;
-3. ноль или больше кадров `artifactUpdate` с чанками результата;
-4. ровно один терминальный кадр `statusUpdate` с терминальным `state`.
+1. один кадр `task` с persisted начальным состоянием;
+2. ноль или больше нетерминальных `statusUpdate` с public Messages и
+   `artifactUpdate` с explicit complete Artifacts в canonical publication order;
+   эти два вида MAY чередоваться, Artifact не завершает Task;
+3. ровно один терминальный `statusUpdate`; успешный v2 outcome содержит тот же
+   canonical final `status.message`, что GetTask и push.
+
+Legacy runs сохраняют прежние output/chunk semantics. Artifact-only final
+response не подменяет v2 final Message, а Message не заменяет durable Task.
 
 В A2A 1.0 нет поля `final`: признаком конца потока является терминальное состояние. Терминальный кадр MUST быть последним, ни один промежуточный кадр MUST NOT нести терминальное состояние.
 
@@ -326,7 +356,7 @@ Owner и external A2A endpoints используют один A2A lifecycle и �
 
 Ожидание remote операции или таймера остаётся `working`; ожидание owner input/HITL/guardrails обозначается безопасным нетерминальным статусом, а конкретное решение принимает отдельный owner endpoint. Внешний caller видит факт ожидания владельца и предназначенный ему итог, но не внутренний вопрос/ответ. Это единая projection policy для history, Get/List, streams, push, file Parts, Artifacts и metadata, в том числе после recovery; raw transcript/summary не публикуется для обхода ограничения.
 
-Исходящие файлы используют стандартные A2A FileParts/Artifact parts или авторизованные transport references; общий лимит применяется до публикации всего набора, scope проверяется при каждом download. Байты не передаются через RunRequest и не требуют artifact tools. Потоковый прогресс и function args/results проходят ту же visibility policy до публикации; существующий ADK format не разрешает раскрыть внутренние owner данные.
+Исходящие файлы используют стандартные A2A FileParts/Artifact parts или авторизованные transport references; общий лимит применяется до публикации всего набора, scope проверяется при каждом download. Байты не передаются через RunRequest; v2 explicit publication использует `core_response_artifacts`, а named artifact CRUD service не требуется. Потоковый прогресс и function args/results проходят ту же visibility policy до публикации; существующий ADK format не разрешает раскрыть внутренние owner данные.
 
 ## Публичный live preview ответа
 
@@ -334,4 +364,4 @@ Owner и external A2A endpoints используют один A2A lifecycle и �
 
 Preview MUST NOT содержать hidden reasoning, work draft, arguments/results инструментов или raw owner question/answer. External caller получает только предназначенный ему публичный ответ через прежний authenticated Task scope. Fresh Subscribe MUST сначала выдать persisted Task, затем доступный preview и durable изменения; первый terminal event закрывает stream. Initial SendStreamingMessage и passive Subscribe MUST поддерживать этот preview, включая direct workflow recovery, cron и продолжение durable waits. Subscribe не запускает workflow.
 
-Preview является transient transport state: один bounded hub live serving process с ключом `(tenant,task)`, максимум 64 Task и 256KiB UTF-8 публичного префикса на Task. Eviction, process restart или обращение к другому serving process MAY потерять preview; durable Get/history/push и immutable terminal artifacts остаются authoritative, не сохраняют partial progress и содержат полный итог. Медленный subscriber получает последний cumulative snapshot, а не неограниченный backlog токенов. Legacy plain final answer без control signal сохраняет buffered совместимость; runtime MUST NOT повторно генерировать готовый draft или изображать streaming задержанным replay.
+Preview является transient transport state: один bounded hub live serving process с ключом `(tenant,task)`, максимум 64 Task и 256KiB UTF-8 публичного префикса на Task. Eviction, process restart или обращение к другому serving process MAY потерять preview; durable Get/history/push, canonical final Message v2 и уже published immutable Artifacts остаются authoritative, не сохраняют partial progress и содержат полный итог; legacy final Artifacts неизменны. Медленный subscriber получает последний cumulative snapshot, а не неограниченный backlog токенов. Legacy plain final answer без control signal сохраняет buffered совместимость; runtime MUST NOT повторно генерировать готовый draft или изображать streaming задержанным replay.

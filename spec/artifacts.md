@@ -2,7 +2,7 @@
 
 ## Назначение и границы
 
-Постоянные файлы принадлежат чату и хранятся под `CHAT_WORKSPACE_ROOT`; процессы видят только свой `/workspace`. A2A Artifact остаётся стандартным представлением результата Task. Transport blobs, bounded-output offload и immutable workspace snapshots сохраняют самостоятельное назначение, digest/integrity и provenance; они не являются удаляемым model-callable artifact service.
+Постоянные файлы принадлежат чату и хранятся под `CHAT_WORKSPACE_ROOT`; процессы видят только свой `/workspace`. В output contract v2 обычные replies являются Messages; A2A Artifact представляет только явно выбранный отдельный typed результат. Legacy accepted runs/results сохраняют прежний контракт. Transport blobs, bounded-output offload и immutable workspace snapshots сохраняют самостоятельное назначение, digest/integrity и provenance; они не являются удаляемым model-callable artifact service.
 
 Сохранённый transport blob имеет непрозрачный ID, tenant/chat/caller scope, media type, фактический размер, SHA-256 digest и source/task provenance. При чтении проверяются доступ, размер и digest; повреждённый объект не выдаётся. Ссылки на скачивание проверяют права на каждом новом HTTP-запросе и не открывают общий filesystem сервера. Snapshots имеют проверяемый commit manifest и не восстанавливают вручную удалённые файлы поверх новой revision workspace.
 
@@ -117,6 +117,48 @@ guardrails по уже принятому материалу обрабатыв�
 - A2A использует FileParts/Artifact parts по [Публичному контракту](public-contract.md);
   transport reference не открывает чужие данные.
 
+### Typed explicit publication v2
+
+Новый output contract закрепляется при admission; обычный final text не создаёт
+Artifact. `core_response_artifacts` публикует immutable typed batch немедленно
+после whole-batch validation/guardrails/HITL и durable commit, пока Task
+остаётся `working`. Artifact/Part IDs, names, ordering, content, actual sizes,
+digest и trusted tenant/chat/owner/Task/run lineage сохраняются в scoped
+immutable manifest. Snapshot чтение файлов не даёт доступа к соседнему чату
+либо platform credentials; paths не становятся публичными references.
+После commit workspace mutation/removal не меняет опубликованный content.
+
+Первая успешная публикация закрепляет Task-wide company
+`attachment_limit_bytes`: суммарные UTF-8 text, canonical JSON object и raw file
+bytes всех последующих Artifacts учитываются относительно этого pin, default
+25 МБ. Task имеет не более 64 Artifacts и 256 ordered Parts.
+`MAX_RESPONSE_SIZE` ограничивает один blob отдельно. Late company-limit change
+не расширяет и не инвалидирует прежний Task pin. Empty files допустимы;
+base64 overhead не увеличивает сумму actual content bytes.
+Ошибка, corrupt snapshot или oversized batch не публикует его частично и
+не повреждает прежние Artifacts.
+
+Новый успешный call только append-ит полный batch. Уже published Artifact
+не заменяется, не удаляется и не очищается tool-ом, finalization, failure,
+cancel или последующим явным выбором. Retry/recovery accepted call использует
+те же IDs/receipts; две разные calls не выводятся из совпадения текста или
+bytes. V2 `core_response_files` — file-only compatibility alias: непустой
+`paths` append-ит один Artifact немедленно, `[]` ничего не меняет.
+Наличие файла, text reply, tool result или child result не является выбором.
+
+GetTask, history/stream/push, UI и scoped download показывают один committed
+immutable batch; public bytes не дублируются в обычном final Message.
+Перед каждым новым download проверяются текущие права и целостность whole batch.
+Earlier Artifacts остаются в failed/canceled Task; неapproved/uncommitted
+batch после terminal outcome не публикуется. Immutable transport blobs
+сохраняются независимо от retired named artifact CRUD service; новая
+S3/Mongo инфраструктура не требуется.
+
+### Legacy file selection
+
+Следующие pending selection/final-frame правила относятся к legacy accepted
+runs/results. Они сохраняются без переформатирования при upgrade и recovery.
+
 `core_response_files` сохраняет immutable snapshots выбранных workspace файлов
 в transport storage. Manifest version 1 закрепляет trusted tenant/chat/owner,
 Task/run и ordered references; file ID или digest не даёт права читать blob.
@@ -195,12 +237,31 @@ Artifact/part counts и JSON depth конечны и bounded; oversized/invalid 
 даёт явную ошибку до публикации всего набора, без silent part loss. URL FileParts
 не скачиваются автоматически и отклоняются existing unsupported-file contract.
 
-Remote result публикуется только после complete successful terminal Task/Message
-и проверки current claim/cancel/deadline/canonical source/root scope. Partial
-Artifact chunks, human waits, failed/canceled/expired outcomes не открывают files.
+Generic third-party/legacy remote result публикуется после complete successful
+terminal Task/Message и current claim/cancel/deadline/canonical source/root scope.
+Для peer, использующего согласованный immutable early-publication contract,
+отдельный Artifact MAY приниматься до terminal Task только с exact marker
+`metadata.core_agent_artifact: {version: 1, complete: true, immutable: true}`.
+Receiver MUST иметь весь ordered набор его typed Parts: incomplete chunk,
+append-дельта, один `lastChunk`, отсутствие/неполная/неизвестная marker version
+не разрешают early content publication. Generic terminal fallback остаётся
+доступен без Core Agent marker; обычный A2A peer не обязан вводить extension.
+
+Early Artifact проходит те же bounded whole-batch parsing, private quarantine,
+current guards/deadline/claim/cancel/scope, material reviews и integrity до
+доступности model paths/workspace/peer cards. Marker не даёт data/owner authority
+и не разрешает пропуск review. Пока batch не approved/published, никакие text,
+data, file bytes либо доступные paths не выдаются через Message, summary,
+tool result, mailbox или preview/download. Identity/content одного immutable
+Artifact закрепляется: exact repeated snapshot/recovery не создаёт копии,
+поздняя append/replace mutation того же ID отклоняется без изменения accepted
+content. После completion receiver сохраняет ранее accepted Artifacts; failed/
+canceled peer не делает их исчезнувшими, но не открывает новые unpublished
+chunks либо rejected материал. Current negative-material decisions сохраняются.
 Inbound initiating attachments публикуются после их обычных admission/guardrails
 до выполнения поручения, а не ждут terminal состояния нашей Task.
-Refusal/timeout одной части закрывает entire remote result; later exact negative
+Refusal/timeout одной части закрывает соответствующий atomic incoming batch;
+ранее независимо published Artifacts не переписываются. Later exact negative
 decisions нельзя обойти alternate filename, receipt, preview/download или reread.
 Обычный dedicated owner review сохраняет отдельные private permissions.
 

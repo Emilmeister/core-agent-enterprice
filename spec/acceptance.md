@@ -117,7 +117,7 @@
 - [ ] При restart `cancel_requested` recoverable Task согласует durable child state один раз, а non-recoverable mutating Task получает reconciliation error вместо ложного `canceled` outcome; cancel между scan и claim либо сразу после claim не обходит reconciliation и не стирает её ошибку.
 - [ ] Cancelled child атомарно возвращает неиспользованный finalization reserve; начатый finalizer остаётся учтённым как provider call.
 - [ ] Budget finalization ждёт owned Tasks только bounded grace; некооперативная Task остаётся durable/cancel-requested, а partial result возвращается и перечисляет её в `pending_tasks` без выдуманного outcome.
-- [ ] Persisted result различает local `usage` и общий `shared_budget`; live и crash-recovered A2A Artifacts публикуют их в одинаковой provenance metadata.
+- [ ] Persisted result различает local `usage` и общий `shared_budget`; live и crash-recovered final Messages v2 (legacy — A2A Artifacts) публикуют их в одинаковой completion provenance metadata.
 
 ## Context и compaction
 
@@ -403,7 +403,7 @@
 | ENT-AC-21 | Наступило сохранённое время пробуждения после restart | Продолжение запускается для проверки события, событие не объявляется свершившимся автоматически |
 | ENT-AC-21a | Timer или local task wait сохранён; worker/сервис перезапущен до либо после resolve | Workflow lease, scheduler claim и execution thread освобождены; outcome применяется один раз к исходному call без повторного model/tool charge; новый follow-up будит только timer, duplicate не будит следующую generation |
 | ENT-AC-21b | Joined child приостановлен; родитель перезапущен либо отменён | Child admission и parent wait атомарны; восстановление использует прежний child ID, required child остаётся nonterminal во время ожидания; cancel закрывает family waits и не теряет принятый inbox |
-| ENT-AC-21c | Старый SDK Task snapshot или очередной Artifact chunk приходит после более нового workflow transition | Canonical state не понижается, private устаревший status message не возвращается; SDK chunk aggregate не изменяется reconciliation-ом и финальный Artifact не дублируется |
+| ENT-AC-21c | Старый SDK Task snapshot или очередной Artifact chunk приходит после более нового workflow transition | Canonical state не понижается, private устаревший status message не возвращается; SDK chunk aggregate не изменяется reconciliation-ом и canonical final Message v2/legacy Artifact не дублируется |
 | ENT-AC-22 | Наступил cron tick при активном предыдущем запуске | Нет нового выполнения и очереди; в чате виден immutable пропуск со stable cursor, включая пустой чат до первой Task; чтение не запускает модель |
 | ENT-AC-23 | Инструмент создания cron запрещён | Модель его не видит; владелец всё ещё управляет расписаниями через UI |
 | ENT-AC-24 | Следующий cron-запуск начинается после нескольких compaction | Модель получает актуальные решения и подтверждённые результаты прежних запусков |
@@ -446,7 +446,7 @@
 | ENT-AC-61 | В чате есть активная задача, включая ожидание, либо запуск задачи конкурирует с очисткой workspace | Просмотр и фильтрация доступны; UI и сервер блокируют удаление при активной задаче без создания/очереди intent; после завершения нужен новый ручной запрос. Cleanup и root admission используют canonical chat lock. Незавершённый принятый cleanup блокирует новую Task до admission, включая после сбоя; existing duplicate receipt неизменен. Очистка не пересекается с исполнением задачи; GET receipt не возобновляет мутацию |
 | ENT-AC-62 | Через UI или A2A поступает файл с занятым именем, в том числе несколько таких вложений одновременно; owner перечитывает историю после публикации | Существующие файлы сохранены; новые получают разные свободные имена с суффиксами без перезаписи при гонке; UI, результат приёма и контекст агента содержат фактические имена. История сохраняет scoped actual name/path/size/digest initial и follow-up файлов; pending/excluded имена остаются только в owner review |
 | ENT-AC-63 | В сообщении UI или A2A одно из нескольких вложений не загрузилось, не сохранилось либо превышен общий лимит, в том числе после загрузки первых файлов | Всё сообщение отклонено с причиной; текст и частичные вложения не передаются агенту и не публикуются в workspace, включая после restart; существующие файлы и активная задача сохранены |
-| ENT-AC-64 | Агент готовит исходящее сообщение UI или A2A с файлами, каждый из которых меньше лимита, но сумма больше него | Отправка отклоняется до частичной публикации; агент получает ошибку с размерами и может уменьшить набор, исходные файлы сохранены; используется общий с входящими вложениями лимит, default 25 МБ. Выбор core_response_files заменяет весь набор, [] очищает, ошибочный новый выбор сохраняет прежний; receipt/manifest атомарны. Live/GetTask/SSE/recovery выдают те же frozen ordered snapshots после изменения originals, включая budget-partial result; corrupt batch не выдаётся частично. Owner download повторно проверяет Task/chat scope, одинаковые bytes/известный ID другого чата не открывают файл |
+| ENT-AC-64 | Агент готовит исходящее сообщение UI или A2A с файлами, каждый из которых меньше лимита, но сумма больше него | Отправка отклоняется до частичной публикации; агент получает ошибку с размерами и может уменьшить набор, исходные файлы сохранены; используется общий с входящими вложениями лимит, default 25 МБ. Для legacy runs core_response_files заменяет весь набор и [] очищает; для v2 он append-ит file-only Artifact немедленно, [] no-op. Ошибочный новый batch сохраняет прежний; receipt/manifest атомарны. Live/GetTask/SSE/recovery выдают те же frozen ordered snapshots после изменения originals, включая budget-partial result; corrupt batch не выдаётся частично. Owner download повторно проверяет Task/chat scope, одинаковые bytes/известный ID другого чата не открывают файл |
 | ENT-AC-65 | История чата стареет, контекст суммаризируется, владелец очищает выбранные файлы workspace | Полная история сообщений остаётся доступной с прежними правами; автоматического удаления по возрасту нет, очистка затрагивает только выбранные файлы. Owner history API страницы включают все canonical roots, local transcript и каждый final result один раз; provider replay/hidden reasoning исключены. Принятое unread уточнение видно сразу, delivery/rejection не меняет ID и не дублирует entry. Guard material выводится placeholder с scoped review, без raw fallback. Cursor сохраняет позицию после новых roots, append, доставки и compaction; invalid/foreign cursor, child или unmapped legacy run не открывают данные. Reads не вызывают модель/tools/classifier, не меняют waits/budget; external/dual-role403, другая company404. Legacy snapshots без новой provenance читаются детерминированно без потери transcript |
 | ENT-AC-66 | Caller повторяет создание с тем же messageId, в том числе одновременно, после restart или замены токена; отдельно повторяет его с изменённым содержимым | При том же содержимом возвращается одна и та же Task без повторного выполнения и копий файлов; изменённое содержимое даёт конфликт; текущие права и scope проверяются |
 | ENT-AC-67 | Авторизованный HTTP-ответ остаётся открытым дольше срока токена; затем приходит новый запрос по тому же TCP-соединению или новая подписка | Внутри открытого ответа повторной авторизации и закрытия по истечению токена нет; новый HTTP-запрос проходит новую проверку и с недействительным токеном отклоняется; Task не отменяется |
@@ -749,7 +749,7 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   FileParts используют backend-owned `a2a/<local-batch-id>/`; UI upload остаётся
   в `attachments/`. Destination/имена не берутся из client/model remote path/ID.
   Inbound task attachments публикуются после admission/guardrails до model turn;
-  remote result только после complete terminal success. Обе bindings, memory/PG,
+  remote result — после complete immutable early marker либо generic terminal success, без открытых partial chunks. Обе bindings, memory/PG,
   restart и legacy manifests/paths проверяют исходную chat/owner/source/root
   привязку, nofollow/collision safety и отсутствие скрытого перемещения старых files.
 - ENT-AC-93: aggregate attachment limit учитывает binary/text/JSON/manifest bytes,
@@ -767,3 +767,73 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   receipts недоступными без recovery resurrection; unrelated UI attachments
   сохраняются. Adaptive polling/visible-panel cap, ordering/dedup, selected-peer
   timeline, keyboard/focus и current negative-material visibility сохраняются.
+
+## Messages и явные Artifacts output contract v2
+
+Следующие критерии — обязательства нового контракта, а не утверждение
+implemented. Automated proofs MUST входить в обычные applicable gates до
+обновления implementation-status; legacy proofs не заменяют v2 cases.
+
+- [ ] ENT-AC-95: новая root Task закрепляет output contract v2 до dispatch;
+  children наследуют parent snapshot version, accepted version-less root и его
+  новые children/continuations остаются v1, включая catalog rendering/recovery.
+  Ordinary tools-free final text становится одним durable `ROLE_AGENT` Message
+  в `Task.status.message` и history; `Task.artifacts` пуст без explicit selection.
+  Server-owned Message/Task/context IDs, Parts и completion metadata совпадают
+  в live/Get/List/Subscribe/push и после PostgreSQL restart; `historyLength=0`
+  убирает history, сохраняя final status Message. Detached stream не отменяет Task.
+- [ ] ENT-AC-96: `core_message_send({text})` публикует public Message до receipt
+  и оставляет Task working. Crash до/после commit и accepted-call replay дают
+  соответственно ноль/один history Message и один charge, без второго ID.
+  Два distinct calls с одинаковым текстом дают два сообщения. Transient previews,
+  superseded token generations и repeated polling не становятся duplicate replies.
+- [ ] ENT-AC-97: `core_response_artifacts` выбирает text/data-object/file Parts
+  в заданном порядке, с optional bounded name и valid text media type. File bytes
+  snapshot-ятся до receipt; workspace rewrite/delete не меняет опубликованный
+  content/digest. Nonobject data root, NaN/infinity, malformed/unknown fields,
+  URLs/traversal/symlinks/hardlinks/special files и foreign scope отклоняются
+  до публикации всего нового batch; разрешённые mixed и empty-file batches проходят.
+- [ ] ENT-AC-98: пока Task working, approved explicit batch появляется в GetTask,
+  stream и UI немедленно, со stable server IDs и exact
+  `core_agent_artifact: {version:1,complete:true,immutable:true}` metadata.
+  Второй call append-ит новый batch; replace/remove/clear published невозможно.
+  Replay одного call не удваивает IDs, byte/count totals, notifications или charge.
+  Failure/cancel/budget-partial сохраняют ранее published Artifacts, без нового
+  uncommitted/rejected batch. Final text не копируется в Artifact автоматически.
+- [ ] ENT-AC-99: первый успешный batch pin-ит company attachment limit. Сумма всех
+  Task Artifact UTF-8 text/canonical JSON/raw file bytes проверяется cumulatively;
+  late company-limit increase не расширяет pin, decrease не повреждает принятый
+  output. Границы 64 Artifacts/256 Parts и independent single-blob
+  `MAX_RESPONSE_SIZE` проверяются до commit; ошибка одной части не даёт partial
+  нового batch и сохраняет прежний набор/source files. Повтор не удваивает totals.
+- [ ] ENT-AC-100: v2 `core_response_files` с непустым paths append-ит один explicit
+  file-only Artifact немедленно, `[]` no-op. Для accepted legacy/version-less run
+  сохраняются replace/clear-at-final semantics и прежний Artifact result.
+  Upgrade/recovery не превращает старый результат в Message, не реконструирует
+  selection из workspace/Markdown и не меняет pin. Неизвестный version fail closed.
+- [ ] ENT-AC-101: real peer до terminal присылает complete immutable typed Artifact.
+  Обе bindings проходят private quarantine, current scope/claim/deadline/cancel,
+  whole-batch integrity и guardrails до доступных files/paths/metadata публикации.
+  Partial/missing/unknown marker, append delta, lastChunk alone, rejected/expired
+  content не открывают bytes. Generic third-party terminal Artifact/Message без
+  marker по-прежнему принимается. Duplicate snapshots/restart не materialize-ят
+  содержимое повторно; изменённый immutable ID не заменяет accepted batch.
+- [ ] ENT-AC-102: Artifact text/data не склеивается с Message и не вставляется
+  автоматически в tool result/mailbox/summary/model context. Модель получает safe
+  typed manifest/paths и явно читает разрешённый файл; current negative review
+  скрывает content во всех проекциях. Final Message v2 остаётся доступен после
+  polling/reconnect/recovery независимо от history. Peer panel/UI различают
+  chronological replies и отдельные immutable Artifact cards.
+- [ ] ENT-AC-103: public working Message не создаёт input-required wait. Existing
+  peer public question/reply LONG-05 работает в прежней Task/context; нового
+  ask-caller tool нет. Private core_ask_owner question/answer/IDs и hidden
+  reasoning не появляются в Messages/Artifacts/Get/history/streams/push/files
+  для external caller; bearer/scope/privacy gates сохраняются.
+- [ ] ENT-AC-104: controlled model + real PostgreSQL/peer/browser выполняют
+  последовательность progress Message → mixed Artifact publish → дальнейший
+  model/tool turn → final Message. Удаление/rewrite исходного файла, disconnect,
+  restart и terminal success/failure/cancel не теряют ранее published identity/
+  content; child capability scope не создаёт root attachment автоматически.
+  Policy deny, HITL/refusal/timeout, guardrail refusal, malformed arguments и
+  exhausted tool budget предотвращают новую публикацию; existing accepted output
+  сохраняется. Local/shared usage и honest partial completion остаются canonical.

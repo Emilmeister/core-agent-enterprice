@@ -62,7 +62,7 @@
 
 Текст assistant response, который одновременно содержит tool calls, является
 промежуточным. После применения всех результатов нужен следующий ход модели;
-тот прежний текст не становится final Artifact после HITL, вопроса или recovery.
+тот прежний текст не становится final Message v2 либо legacy final Artifact после HITL, вопроса или recovery.
 Финальный ответ допустим только из response без tool calls.
 
 Последовательность является базовой семантикой. Runtime MAY построить dependency graph и параллельно исполнить доказуемо независимые read-only calls или изолированные child Tasks. Каждый call всё равно получает отдельные policy decision, lifecycle и audit. Порядок слияния результатов должен быть стабильным.
@@ -402,6 +402,37 @@ A2A protocol version. При чтении результата, записанн
 - Model streaming MAY быть перезапущен только если незавершённый ответ не породил side effect; частичный пользовательский текст помечается superseded.
 - Любая неопределённость вокруг внешней мутации требует reconciliation или `SIDE_EFFECT_UNKNOWN`, а не оптимистичного продолжения.
 - Доказанная runtime-ом ошибка schema/contract validation либо запуска process до dispatch и завершённые `failed`/`timed_out` tool outcomes записываются в context как tool result и возвращают workflow в `RUNNING`; модель получает следующий turn для исправления вызова или понятного ответа пользователю.
+
+## Публикация Messages и Artifacts v2
+
+Output contract закрепляется при создании root run; child наследует snapshot
+version родителя, включая v1 для legacy root без version. Pin не меняется при restart,
+continuation, deploy upgrade или обработке follow-up. Legacy accepted runs и
+results завершаются и читаются по прежней семантике; v2 не восстанавливает
+публикации из workspace, Markdown или старых result Artifacts.
+
+Обычный final tools-free model response сохраняется как canonical agent
+Message v2. Его identity, ordered Parts, completion provenance и terminal
+transition коммитятся durable до publication; configured push delivery входит
+в тот же terminal commit. SDK, Get/history, live stream, passive Subscribe,
+push и recovery не создают новый ID либо второй reply. Unread inbox gate,
+lease fencing, caller/tenant scope и honest budget-partial outcome сохраняются.
+
+`core_message_send` создаёт отдельный intended-recipient public Message и
+сохраняет `working`; `core_response_artifacts` публикует explicit immutable
+batch и также не завершает Task. Оба являются обычными model-issued calls:
+schema, capability/child allowlist, current policy/HITL, guardrails, budgets
+и audit проверяются до эффекта. Durable publication и idempotent receipt
+связаны с одним accepted call; crash после commit не повторяет эффект,
+crash до commit не оставляет частичную публикацию. Replay не требует нового
+model turn и повторного budget charge.
+
+Последующие Artifact calls только append; завершение, failure, cancel и
+budget exhaustion не меняют previously published immutable Artifacts.
+Uncommitted либо rejected batch не добавляется при terminalization.
+Child outputs не становятся root публичными Messages/Artifacts автоматически.
+Transient token previews не становятся history entries либо selected output;
+private owner correspondence и hidden reasoning не публикуются.
 
 ## Фаза публичного ответа
 

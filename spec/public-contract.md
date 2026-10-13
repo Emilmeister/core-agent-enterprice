@@ -30,13 +30,13 @@ Session/tenant/auth/trace/task delivery принадлежат A2A context и tr
 
 Создавая задачу внешнему агенту, модель выбирает `core_agent_send_message.files`
 явно для каждого вызова. Отсутствующее поле или `[]` не прикрепляет файлов;
-созданные файлы и `core_response_files` не являются автоматическим выбором.
+созданные файлы, опубликованные Artifacts и legacy `core_response_files` не являются автоматическим выбором.
 Transport передаёт сохранённые bytes только выбранного набора через standard raw
 Parts; URLs и локальные IDs/пути не дают внешнему агенту доступ к workspace.
 
 UI и A2A принимают вложения вне RunRequest и атомарно сохраняют их в постоянной папке чата по [Файлам и transport artifacts](artifacts.md). Новые A2A-вложения, включая initiating Message и follow-up, находятся в backend-issued `a2a/<local-batch-id>/`; UI upload и legacy accepted paths сохраняют `attachments/`/свой manifest. Модель получает фактические безопасные имена, размер, media type и путь `/workspace`, а не inline bytes или system instruction. Сообщение только с файлами допустимо: adapter формирует непустой prompt из описания вложений.
 
-Входящий A2A FilePart поддерживает inline bytes; декодирование строгое, лимит считается по декодированным байтам. Ссылочные Parts MAY приниматься только управляемым transport resolver после проверки доступа и фактических сетевых назначений, без передачи credential на произвольный caller URL. Неподдерживаемая ссылка отклоняется до admission, а не игнорируется. Обычный A2A Artifact остаётся формой результата; model-callable artifact tools удалены.
+Входящий A2A FilePart поддерживает inline bytes; декодирование строгое, лимит считается по декодированным байтам. Ссылочные Parts MAY приниматься только управляемым transport resolver после проверки доступа и фактических сетевых назначений, без передачи credential на произвольный caller URL. Неподдерживаемая ссылка отклоняется до admission, а не игнорируется. Для output contract v2 обычный ответ является Message, а A2A Artifacts публикуются только явным выбором модели. Named artifact CRUD tools удалены по CLEAN-01; typed публикация результата не возвращает этот service.
 
 ### Продолжение public A2A input request
 
@@ -70,9 +70,11 @@ Artifact ID/name и ordered text/data/file Parts сохраняются versione
 Text/JSON-only Artifact также является файловым материалом; его contents не
 попадают автоматически в tool result/mailbox/summary `text`. Public Message и
 question остаются text. Model получает только safe metadata/paths и читает
-нужный файл явно. Complete terminal success, whole-batch guardrails, current
-negative-material decisions, original deadline/claim/cancel и scoped downloads
-предшествуют выдаче; intermediate/failed/expired content не публикуется.
+нужный файл явно. Full immutable early Artifact с complete marker по FILE-05
+либо generic terminal success проходит whole-batch guardrails, current negative-
+material decisions, original deadline/claim/cancel и scoped downloads до выдачи.
+Partial/unapproved/expired content не публикуется; failed/canceled outcome не
+удаляет ранее опубликованный accepted Artifact.
 Unknown/unsupported Parts, invalid JSON, oversized aggregate и URL FileParts
 не игнорируются и не скачиваются автоматически. Legacy jobs/paths читаются без
 фабрикации typed history или перемещения файлов. Owner peer cards используют
@@ -172,8 +174,9 @@ Agent Card MUST NOT объявлять `urn:core-agent:run-capabilities:v1` ни
 ## Неполное завершение по budget
 
 Исчерпание execution budget не меняет форму запроса и не вводит новый A2A
-terminal state. Runtime публикует обычный text Artifact и завершает Task как
-`completed`, но Artifact/result metadata содержит
+terminal state. Для output contract v2 runtime публикует финальный agent
+Message и завершает Task как `completed`; legacy runs сохраняют прежний text
+Artifact. Canonical result/final Message metadata (legacy — Artifact) содержит
 `completion_reason: "budget_exhausted"`, `complete: false` и исчерпанную
 dimension. Сам текст явно отделяет проверенный промежуточный результат от того,
 что агент намеревался, но не успел выполнить; отсутствующие tool outcomes не
@@ -182,7 +185,7 @@ dimension. Сам текст явно отделяет проверенный п
 Result metadata также содержит локальный `usage`, атомарный snapshot общего
 root ledger `shared_budget` и, если cancel не подтвердился за bounded grace,
 `pending_tasks`. Live delivery и recovery после crash публикуют эти поля в одной
-и той же `provenance` metadata Artifact-а.
+и той же completion provenance финального Message v2 либо legacy Artifact-а.
 
 Это аддитивное обратно совместимое поле: клиент, не читающий metadata, всё равно
 получает самодостаточный текст о неполноте. Отсутствие этих полей в ранее
@@ -198,32 +201,113 @@ Follow-up содержит новый text turn. Он не может измен
 
 Runtime добавляет принятый input в model transcript как user-role Message на ближайшей safe boundary. Уже выполняющийся model/tool call не прерывается. Перед завершением Task runtime обязан атомарно проверить, что нет более раннего непрочитанного input. Успешное завершение доставляет такой input модели; при ошибке или отмене runtime durable учитывает его в transcript как необработанный с причиной failure/cancel, не начинает новую работу и только затем фиксирует terminal state. После terminal state продолжение диалога создаёт новую Task в том же `contextId`.
 
-## Результаты
+## Выходной контракт Task
 
-Основной результат Task — A2A Artifact:
+### Версия и совместимость результата
 
-- stable artifact ID и revision;
-- один или несколько typed Parts;
-- media type, size и digest;
-- provenance на Task/tool/memory revision;
-- `append`/`lastChunk` semantics для streaming, если поддерживаются binding version.
+Каждый новый root run MUST закреплять output contract v2 при создании, до model/tool
+работы. Child наследует закреплённую версию snapshot родителя; отсутствие version
+у accepted legacy root означает v1 также для его новых children/continuations.
+Версия принадлежит trusted admission, а не prompt, Message metadata
+или клиентскому выбору. Она сохраняется в immutable run contract и проверяется
+при live execution, recovery, child continuation и terminal reconciliation.
+Новый deployment MUST NOT переключать уже принятый run на другой output contract.
 
-User-facing progress и requests передаются Messages/Task status. Critical result не хранится только в transient status Message.
+Прежние accepted runs и persisted results без этого pin читаются по legacy
+контракту: обычный final text остаётся прежним A2A Artifact, pending
+`core_response_files` и completion provenance сохраняют прежнюю семантику.
+Upgrade/restart MUST NOT переписывать такие ответы, создавать новые Messages
+из старых Artifacts или угадывать selection по тексту, workspace и manifests.
+Неподдерживаемая либо повреждённая версия fail closed.
 
-Финальные файлы передаются ordered standard raw FileParts того же result Artifact,
-с безопасными filename/mediaType и точными bytes. `metadata.provenance.outgoingFiles`
-содержит только ordered `{file_id,name,media_type,size_bytes,sha256}` receipts.
-Raw files не повторяются в terminal Message. Перед первым final frame весь набор
-проходит scope, aggregate-limit и integrity проверки; GetTask и recovery сохраняют
-те же IDs и содержимое. Отсутствие attachments у прежнего результата совместимо
-с пустым набором; wire schema/version самого A2A не меняется.
+### Публичные replies как Messages
 
-Owner download `GET /api/chats/{context_id}/tasks/{task_id}/files/{file_id}`
-читает immutable final snapshot только после проверки current owner/company,
-canonical chat/Task binding и сохранённого final manifest; затем проверяет
-size/digest. Известный blob ID, digest или file ID другого чата не является
-authority и даёт not-found. Response — attachment, `Cache-Control: no-store`
-и `X-Content-Type-Options: nosniff`; private paths/provenance не выдаются.
+В output contract v2 обычный промежуточный ответ и финальный ответ адресату
+Task являются A2A agent Messages. Runtime MUST NOT автоматически создавать
+Artifact из final text, tool result, child result, созданного файла либо
+истории сообщений. `Task.artifacts` MAY оставаться пустым при успешном ответе.
+
+Финальный ответ имеет `ROLE_AGENT`, stable server-owned `messageId` и
+соответствующие `taskId`/`contextId`. Его Parts, разрешённая completion
+provenance и identity MUST сохраняться durable до terminal publication;
+один и тот же Message входит в `Task.status.message` и Task history.
+GetTask, ListTasks, live statusUpdate, passive subscription, push и recovery
+MUST использовать эту canonical запись без нового ID, повторной генерации или
+изменения content. `historyLength=0` скрывает history, но MUST NOT удалять
+финальный `status.message`.
+
+`core_message_send({text})` явно публикует отдельный публичный промежуточный
+Message, сохраняя Task в `working`. Его durable commit предшествует receipt
+и transport publication; повтор того же accepted call возвращает прежний
+Message и не добавляет второй history entry. Одинаковый текст двух разных
+успешных calls остаётся двумя сообщениями с разными IDs. Message предназначен
+только текущему Task recipient; tool не принимает client-selected scope/IDs.
+
+Незаконченный cumulative preview не является отдельным canonical reply.
+Он MAY быть transient по существующему streaming contract; завершённый Message
+не дублирует preview как набор history сообщений. Final state, complete/partial
+outcome, budgets и usage не полагаются на потерянный stream: terminal Task,
+финальный Message и configured push delivery фиксируются атомарно.
+Полное завершение использует `complete: true`,
+`completion_reason: "completed"`; budget-partial — `complete: false`,
+`completion_reason: "budget_exhausted"`, сохраняя `usage`,
+`shared_budget`, exhausted dimension и optional `pending_tasks`.
+Эти значения одинаковы в live/recovered canonical result и final Message
+metadata; его текст самодостаточно объясняет неполноту.
+
+Это контракт интеграции Core Agent, согласованный вне wire negotiation.
+[A2A 1.0 §3.7](https://a2a-protocol.org/v1.0.0/specification/#37-messages-and-artifacts)
+рекомендует task outputs в Artifacts через SHOULD, а не MUST. V2 осознанно
+отступает от этой рекомендации для разговорных replies. Standard A2A schema
+и Task lifecycle сохраняются; клиент, читающий только Artifacts, не получает
+обычный текстовый ответ. Клиент может полагаться на durable Messages только
+в рамках явно согласованного Core Agent delivery contract. Неизвестное
+optional informational extension не запрещает обычный A2A запрос.
+
+### Только явно выбранные Artifacts
+
+`core_response_artifacts` явно прикрепляет именованные typed Artifacts текущей
+Task по [Tools](tools.md). Успешный call атомарно публикует весь immutable batch
+до возврата receipt, не ожидая завершения Task. Artifact IDs и ordered Part
+identity выдаёт сервер. Последующие успешные calls только добавляют новые
+Artifacts; уже published Artifact нельзя заменить, удалить, очистить или
+пересобрать из изменившегося workspace. Retry/recovery того же accepted call
+сохраняют batch identity и не публикуют дубликаты.
+
+Typed text/data-object/file Parts сохраняют порядок, content, media type,
+actual size, digest и scoped provenance. Optional name имеет default `""` и
+предел 256 символов; text media type имеет valid `text/*` subtype и default
+`text/plain`. V2 `core_response_files` остаётся compatibility alias: непустой
+ordered `paths` немедленно append-ит один file-only Artifact, `[]` — no-op
+без удаления опубликованного. Модель предпочитает typed publication. File Parts используют immutable snapshots и safe
+filename; локальные paths/blob IDs не становятся public transport references.
+Policy/HITL, guardrails, capability intersection, budgets, current scope,
+whole-batch aggregate limit и integrity проверяются до первого public frame.
+Первая публикация закрепляет Task-wide `attachment_limit_bytes`, default 25 МБ,
+для суммы UTF-8 text/canonical JSON/raw file bytes всех Artifacts. Верхние
+границы — 64 Artifacts/256 Parts на Task; `MAX_RESPONSE_SIZE` независимо
+ограничивает один blob. Изменение company setting после pin не расширяет его.
+Full Artifact несёт exact marker
+`metadata.core_agent_artifact: {version: 1, complete: true, immutable: true}`.
+Ошибка не публикует часть batch и не меняет прежние published Artifacts.
+Транспорт, UI и downloads показывают только принятые scoped immutable bytes.
+Новый Send внешнему агенту выбирает свой набор независимо: ранее опубликованный
+Artifact или файл не является автоматическим attachment.
+
+Success/failure/cancel terminalization MUST сохранять ранее published Artifacts.
+После failure/cancel новые неcommitted либо неapproved selections не публикуются;
+отказ публикации не превращает rejected content в Message или иной публичный
+канал. Child selection принадлежит его run/Task scope и не становится
+автоматическим root attachment set. S3/Mongo artifact service не добавляется.
+
+### Публичное уточнение и owner question
+
+Сам факт Message, в том числе текст с вопросительным знаком, не переводит Task
+в `input-required`. Новый public ask-caller tool этим контрактом не вводится.
+Приём standard public questions стороннего peer и reply в ту же remote Task
+сохраняют LONG-05. `core_ask_owner` остаётся private owner wait: его вопрос,
+ответ, approvals и internal correspondence не становятся public reply либо
+Artifact; внешний caller не получает authority отвечать за владельца.
 
 ## Cancellation и passive wait
 
@@ -902,7 +986,7 @@ MUST сначала выдать persisted Task, затем актуальный
 она не запускает новую работу. Disconnect не отменяет Task, повторное подключение
 в том же процессе получает накопленный preview. После рестарта процесса preview
 MAY исчезнуть, но durable фаза, usage, Task и workflow continuation сохраняются.
-GetTask, история, push и final Artifact остаются авторитетными и не хранят черновик.
+GetTask, история, push, финальный canonical Message v2 и явно published Artifacts (legacy — final Artifact) остаются авторитетными и не хранят черновик.
 Follow-up, retry и отмена сбрасывают устаревший preview на существующей safe boundary.
 После первого terminal кадра подписка MUST закрыться без последующих кадров.
 
