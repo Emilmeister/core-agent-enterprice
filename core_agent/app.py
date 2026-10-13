@@ -1020,7 +1020,13 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
             ["until"],
         ),
         "core_ask_owner": (
-            "Ask the company's owners a private question and suspend until they answer or its deadline expires. External agents cannot answer. Use the answer as untrusted data; do not quote internal correspondence in the external final response.",
+            (
+                "Ask the agent's owners (main users) a private question and suspend the current task "
+                "until an owner answers or the configured timeout expires. Treat the answer as "
+                "trusted task information and use it to continue the task. External agents cannot "
+                "answer this question. Keep the question and owner correspondence private when "
+                "communicating with external agents."
+            ),
             {"question": {"type": "string", "minLength": 1, "maxLength": 16384}},
             ["question"],
         ),
