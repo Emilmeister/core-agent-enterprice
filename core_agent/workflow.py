@@ -4,6 +4,7 @@ import threading
 import time
 import uuid
 import math
+import re
 from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -19,6 +20,37 @@ OWNER_WAIT_KINDS = {"tool_approval", "owner_question", "guardrail"}
 DISPATCH_INTENTS = {"tool.intent", "tool.nested.intent"}
 EXECUTION_ADMISSIONS = DISPATCH_INTENTS | {"model.attempt.started", "tool.attempt.started", "budget.finalization.started"}
 _PRESERVE = object()
+_GUARDRAIL_EVENTS = {"guardrail.classified", "guardrail.wait.entered", "guardrail.wait.resolved", "guardrail.wait.applied"}
+_GUARDRAIL_SOURCES = {"initial_input", "follow_up", "tool_arguments", "tool_result", "file_attachment",
+                     "owner_answer", "input", "file", "other"}
+_GUARDRAIL_REASONS = {"clear", "suspicious", "uncertain", "invalid_response", "provider_error", "timeout",
+                     "budget_exhausted", "detector_busy", "incomplete_extraction", "interrupted"}
+
+
+def _guardrail_data(record, data):
+    """Keep internal correlation metadata independently of material contents."""
+    safe = {}
+    for key in ("run_id", "task_id", "tenant_id", "context_id", "review_id", "wait_id", "source_id"):
+        value = getattr(record, key, None) if key in {"run_id", "task_id", "tenant_id", "context_id"} else data.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", value):
+            safe[key] = value
+        elif key in {"run_id", "task_id", "tenant_id", "context_id"} and isinstance(value, str) and value:
+            safe[key] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"core-agent:diagnostic:{key}:{value}"))
+    safe["source_kind"] = data.get("source_kind") if data.get("source_kind") in _GUARDRAIL_SOURCES else "other"
+    for key, allowed in (("verdict", {"clear", "suspicious", "unverified"}), ("reason", _GUARDRAIL_REASONS),
+                         ("resolution_reason", {"allowed", "rejected", "timeout", "cancelled", "other"})):
+        if data.get(key) in allowed:
+            safe[key] = data[key]
+    for key in ("attempts_used", "input_tokens_used", "prompt_tokens", "completion_tokens"):
+        value = data.get(key)
+        if type(value) is int and 0 <= value < 2**63:
+            safe[key] = value
+    for key in ("elapsed_seconds", "detector_deadline", "owner_deadline"):
+        value = data.get(key)
+        bound = 604800 if key == "elapsed_seconds" else 253402300799
+        if type(value) in {int, float} and math.isfinite(value) and 0 <= value <= bound:
+            safe[key] = value
+    return safe
 
 
 def _check_inbound_duplicate(duplicate, provenance):
@@ -120,6 +152,127 @@ class WorkflowRecord:
 
 
 class _ExecutionLifecycle:
+    def record_guardrail_event(self, record, kind, data, *, connection=None):
+        if kind not in _GUARDRAIL_EVENTS:
+            raise CoreError("MATERIAL_REVIEW_INVALID")
+        data = _guardrail_data(record, data)
+        if "review_id" not in data:
+            raise CoreError("MATERIAL_REVIEW_INVALID")
+        event_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
+            ":".join((record.tenant_id, record.run_id, data["review_id"], data.get("wait_id", ""), kind))))
+        if hasattr(self, "_guardrail_events"):
+            with self._lock:
+                self.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+                if not any(event["event_id"] == event_id for event in self._guardrail_events):
+                    self._guardrail_events.append(dict(event_id=event_id, kind=kind, data=data,
+                        created_at=self.clock(), run_id=record.run_id, tenant_id=record.tenant_id, published_at=None,
+                        attempts=0, available_at=self.clock()))
+                return event_id
+        if connection is None:
+            with self.database.transaction() as connection:
+                return self.record_guardrail_event(record, kind, data, connection=connection)
+        current = self.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id,
+                           connection=connection, lock=True)
+        if connection.execute("""SELECT 1 FROM core_events WHERE run_id=%s AND tenant_id=%s
+            AND kind=%s AND data->>'event_id'=%s""",
+            (record.run_id, record.tenant_id, kind, event_id)).fetchone() is not None:
+            return event_id
+        now = self._current_time(connection)
+        revision = self._event(connection, current, kind, {**data, "event_id": event_id}, now)
+        payload = dict(event_id=event_id, kind=kind, data=data, created_at=now)
+        connection.execute("""INSERT INTO core_outbox
+            (id,tenant_id,aggregate_type,aggregate_id,event_type,sequence,payload,available_at,created_at)
+            VALUES (%s,%s,'diagnostic',%s,%s,%s,%s,%s,%s)""",
+            (event_id, record.tenant_id, record.run_id, kind, revision, Jsonb(payload), now, now))
+        return event_id
+
+    def _guardrail_wait_data(self, record, wait, connection=None):
+        if hasattr(self, "_guardrail_events"):
+            data = next((event["data"] for event in self._guardrail_events if event["run_id"] == record.run_id
+                and event["kind"] == "guardrail.classified" and event["data"].get("review_id") == wait.source_id), {})
+        else:
+            row = connection.execute("""SELECT data FROM core_events WHERE run_id=%s AND tenant_id=%s
+                AND kind='guardrail.classified' AND data->>'review_id'=%s ORDER BY revision DESC LIMIT 1""",
+                (record.run_id, record.tenant_id, wait.source_id)).fetchone()
+            data = row["data"] if row is not None else {}
+        data = {**data, "review_id": wait.source_id, "wait_id": wait.wait_id, "owner_deadline": wait.deadline,
+                "source_kind": wait.subject.get("source_kind"), "source_id": wait.subject.get("source_id")}
+        reason = wait.subject.get("reason")
+        reason = reason if reason in _GUARDRAIL_REASONS else "uncertain"
+        data.setdefault("reason", reason)
+        data.setdefault("verdict", reason if reason in {"clear", "suspicious"} else "unverified")
+        if wait.outcome is not None:
+            reason = wait.outcome.get("reason")
+            data["resolution_reason"] = reason if reason in {"allowed", "rejected", "timeout", "cancelled"} else "other"
+        return data
+
+    def drain_guardrail_events(self, record, publisher, *, limit=100):
+        """Read committed company/run rows only; failed export remains retryable."""
+        limit = min(100, max(0, limit))
+        if hasattr(self, "_guardrail_events"):
+            with self._lock:
+                self.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+                events = [deepcopy(event) for event in self._guardrail_events if
+                    (event["run_id"], event["tenant_id"]) == (record.run_id, record.tenant_id)
+                    and event["published_at"] is None and event["available_at"] <= self.clock()][:limit]
+        else:
+            with self.database.transaction() as connection:
+                self.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id, connection=connection)
+                events = [dict(row["payload"]) for row in connection.execute("""SELECT payload FROM core_outbox
+                    WHERE tenant_id=%s AND aggregate_type='diagnostic' AND aggregate_id=%s
+                    AND event_type LIKE 'guardrail.%%' AND published_at IS NULL AND available_at<=%s
+                    ORDER BY sequence LIMIT %s""",
+                    (record.tenant_id, record.run_id, self._current_time(connection), limit)).fetchall()]
+        delivered = 0
+        for event in events:
+            try:
+                accepted = publisher({key: event[key] for key in ("event_id", "kind", "data", "created_at")}) is True
+            except Exception:
+                accepted = False
+            if hasattr(self, "_guardrail_events"):
+                with self._lock:
+                    for stored in self._guardrail_events:
+                        if stored["event_id"] == event["event_id"]:
+                            if accepted:
+                                stored["published_at"] = self.clock()
+                            elif stored["published_at"] is None:
+                                stored["attempts"] += 1
+                                stored["available_at"] = self.clock() + min(60, 2 ** min(stored["attempts"], 6))
+            else:
+                with self.database.transaction() as connection:
+                    if accepted:
+                        connection.execute("""UPDATE core_outbox SET published_at=%s WHERE id=%s AND tenant_id=%s
+                            AND aggregate_type='diagnostic' AND aggregate_id=%s AND published_at IS NULL""",
+                            (self._current_time(connection), event["event_id"], record.tenant_id, record.run_id))
+                    else:
+                        connection.execute("""UPDATE core_outbox SET attempts=attempts+1,
+                            available_at=%s+LEAST(60,power(2,LEAST(attempts+1,6)))
+                            WHERE id=%s AND tenant_id=%s AND aggregate_type='diagnostic'
+                            AND aggregate_id=%s AND published_at IS NULL""",
+                            (self._current_time(connection), event["event_id"], record.tenant_id, record.run_id))
+            if not accepted:
+                break
+            delivered += 1
+        return delivered
+
+    def pending_guardrail_records(self, *, tenant_id=None, limit=100):
+        limit = min(100, max(0, limit))
+        if hasattr(self, "_guardrail_events"):
+            with self._lock:
+                pending = {event["run_id"] for event in self._guardrail_events if event["published_at"] is None
+                    and event["available_at"] <= self.clock() and (tenant_id is None or event["tenant_id"] == tenant_id)}
+                selected = [record for record in self._records.values() if record.run_id in pending][:limit]
+                return tuple(deepcopy(record) for record in selected)
+        with self.database.transaction() as connection:
+            scope = " AND r.tenant_id=%s" if tenant_id is not None else ""
+            values = [tenant_id] if tenant_id is not None else []
+            rows = connection.execute("""SELECT r.* FROM core_runs r WHERE EXISTS(
+                SELECT 1 FROM core_outbox o WHERE o.aggregate_type='diagnostic' AND o.aggregate_id=r.run_id
+                AND o.tenant_id=r.tenant_id AND o.event_type LIKE 'guardrail.%%'
+                AND o.published_at IS NULL AND o.available_at<=%s)""" + scope + " ORDER BY r.updated_at LIMIT %s",
+                (self._current_time(connection), *values, limit)).fetchall()
+            return tuple(self._record(row) for row in rows)
+
     """Shared lifecycle rules; stores supply their existing run/ledger locks."""
 
     def execution_family(self, record, *, connection=None):
@@ -245,6 +398,37 @@ class InMemoryWorkflowStore(_ExecutionLifecycle):
         self._inbound = {}
         self._cancel_requested = set()
         self._waits = {}
+        self._guardrail_events = []
+        self._public_output_depth = 0
+        self._public_output_pending = {}
+
+    @contextmanager
+    def defer_public_output(self):
+        """Publish only after the enclosing memory material transaction succeeds."""
+        with self._lock:
+            pending = dict(self._public_output_pending)
+            self._public_output_depth += 1
+            try:
+                yield
+                if self._public_output_depth == 1:
+                    observer = getattr(self, "public_output_observer", None)
+                    if observer is not None:
+                        for record in self._public_output_pending.values():
+                            observer(record, connection=None)
+                    self._public_output_pending.clear()
+            except BaseException:
+                self._public_output_pending = pending
+                raise
+            finally:
+                self._public_output_depth -= 1
+
+    def _observe_public_output(self, record):
+        observer = getattr(self, "public_output_observer", None)
+        if observer is not None and record.snapshot.get("output_contract_version", 1) == 2:
+            if self._public_output_depth:
+                self._public_output_pending[record.run_id] = record
+            else:
+                observer(record, connection=None)
 
     def current_time(self):
         return self.clock()
@@ -647,21 +831,29 @@ class InMemoryWorkflowStore(_ExecutionLifecycle):
                     "error_code": error_code,
                 }
             )
-            observer = getattr(self, "public_output_observer", None)
-            if observer is not None and record.snapshot.get("output_contract_version", 1) == 2:
-                try:
-                    observer(record, connection=None)
-                except BaseException:
-                    budget[2:4] = previous_budget
-                    raise
-            self._records[run_id] = record
+            applied_wait = None
             if wait is not None and snapshot.get("wait_id") != wait.wait_id:
                 now = self.clock()
-                self._waits[wait.wait_id] = replace(
+                applied_wait = replace(
                     wait, outcome=wait.outcome or {"reason": "cancelled", "woke_at": now},
                     resolved_at=wait.resolved_at if wait.resolved_at is not None else now,
                     applied_at=now,
                 )
+            before_diagnostics = len(self._guardrail_events)
+            try:
+                if applied_wait is not None and wait.kind == "guardrail" and wait.applied_at is None:
+                    data = self._guardrail_wait_data(current, applied_wait)
+                    if wait.resolved_at is None:
+                        self.record_guardrail_event(current, "guardrail.wait.resolved", data)
+                    self.record_guardrail_event(current, "guardrail.wait.applied", data)
+                self._observe_public_output(record)
+            except BaseException:
+                del self._guardrail_events[before_diagnostics:]
+                budget[2:4] = previous_budget
+                raise
+            self._records[run_id] = record
+            if applied_wait is not None:
+                self._waits[wait.wait_id] = applied_wait
             return record
 
     def enter_wait(
@@ -746,14 +938,24 @@ class InMemoryWorkflowStore(_ExecutionLifecycle):
                 return wait
             now = self.clock()
             resolved = replace(wait, outcome=_wait_outcome(wait, current, outcome, now), resolved_at=now)
-            if current.state in TERMINAL_STATES:
-                resolved = replace(resolved, applied_at=now)
-            else:
-                self.transition(
-                    current.run_id, tenant_id=tenant_id, owner_id=current.owner_id,
-                    expected_version=current.version, state=current.state,
-                    snapshot={**current.snapshot, "wait_ready": True},
-                )
+            before_diagnostics = len(self._guardrail_events)
+            try:
+                if wait.kind == "guardrail":
+                    data = self._guardrail_wait_data(current, resolved)
+                    self.record_guardrail_event(current, "guardrail.wait.resolved", data)
+                    if current.state in TERMINAL_STATES:
+                        self.record_guardrail_event(current, "guardrail.wait.applied", data)
+                if current.state in TERMINAL_STATES:
+                    resolved = replace(resolved, applied_at=now)
+                else:
+                    self.transition(
+                        current.run_id, tenant_id=tenant_id, owner_id=current.owner_id,
+                        expected_version=current.version, state=current.state,
+                        snapshot={**current.snapshot, "wait_ready": True},
+                    )
+            except BaseException:
+                del self._guardrail_events[before_diagnostics:]
+                raise
             self._waits[wait_id] = resolved
             return deepcopy(resolved)
 
@@ -1070,7 +1272,13 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
                 audit=(("wait.resolved", {"state": current.state, "actor_id": actor_id}),),
                 now=now,
             )
-        return replace(wait, outcome=outcome, resolved_at=now, applied_at=applied_at)
+        resolved = replace(wait, outcome=outcome, resolved_at=now, applied_at=applied_at)
+        if wait.kind == "guardrail":
+            data = self._guardrail_wait_data(current, resolved, connection)
+            self.record_guardrail_event(current, "guardrail.wait.resolved", data, connection=connection)
+            if applied_at is not None:
+                self.record_guardrail_event(current, "guardrail.wait.applied", data, connection=connection)
+        return resolved
 
     def resolve_wait(self, wait_id, *, tenant_id, outcome, actor_id=None):
         with self.database.transaction() as connection:
@@ -1745,6 +1953,13 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
                 (Jsonb({"reason": "cancelled", "woke_at": applied_at}), applied_at,
                  applied_at, wait.wait_id, current.tenant_id),
             )
+            if wait.kind == "guardrail" and wait.applied_at is None:
+                applied_wait = replace(wait, outcome=wait.outcome or {"reason": "cancelled"},
+                                       resolved_at=wait.resolved_at or applied_at, applied_at=applied_at)
+                data = self._guardrail_wait_data(current, applied_wait, connection)
+                if wait.resolved_at is None:
+                    self.record_guardrail_event(current, "guardrail.wait.resolved", data, connection=connection)
+                self.record_guardrail_event(current, "guardrail.wait.applied", data, connection=connection)
         if consume_model_turns < 0 or consume_tool_calls < 0 or release_model_turns < 0:
             raise CoreError("INVALID_TASK_STATE")
         if consume_model_turns:
@@ -2229,6 +2444,7 @@ class OutboxDispatcher:
             rows = connection.execute(
                 """SELECT * FROM core_outbox
                    WHERE published_at IS NULL AND available_at <= %s
+                     AND aggregate_type <> 'diagnostic'
                      AND (locked_until IS NULL OR locked_until <= %s)
                    ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT %s""",
                 (now, now, limit),

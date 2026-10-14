@@ -539,6 +539,18 @@ class CoreAgent:
         except Exception:
             return
 
+    def _flush_guardrail_events(self, record):
+        if self.material_review_store is None:
+            return
+        publisher = getattr(self.telemetry, "publish_diagnostic", None)
+        if publisher is None:
+            return
+        try:
+            self.workflow_store.drain_guardrail_events(record, publisher)
+        except Exception:
+            # Diagnostic export cannot undo an accepted classification or decision.
+            self._log("guardrail.export.deferred", run_id=record.run_id, task_id=record.task_id)
+
     @staticmethod
     def _context_to_dict(state):
         return {
@@ -1446,7 +1458,7 @@ class CoreAgent:
                     task_id=record.task_id, run_id=record.run_id, limit_bytes=settings.attachment_limit_bytes,
                 )
             except CoreError as error:
-                raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+                raise ExecutionNotStarted(error.code, error.message, data=error.data, diagnostics=error.diagnostics) from None
             contract.update(version=3, caller_scope={key: getattr(record, key) for key in (
                 "owner_id", "context_id", "task_id", "run_id")},
                 attachment_limit_bytes=settings.attachment_limit_bytes, outgoing_files=list(files))
@@ -1489,7 +1501,7 @@ class CoreAgent:
                 "task": call.arguments["task"], "outgoing_files": list(files),
                 "request_provenance": freeze_request_provenance(snapshot)}, contract)
         except CoreError as error:
-            raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+            raise ExecutionNotStarted(error.code, error.message, data=error.data, diagnostics=error.diagnostics) from None
         snapshot.setdefault("remote_calls", {})[f"{attempt}:{call.id}"] = {
             "version": 1, "contract": contract, "arguments_digest": self._remote_arguments_digest(call),
             "request_provenance": reply["request_provenance"], "operation_id": call.arguments["task_id"], "reply": reply}
@@ -1994,6 +2006,8 @@ class CoreAgent:
         )
         if state in TERMINAL_STATES and self.reply_hub is not None:
             self.reply_hub.discard(record.tenant_id, record.task_id)
+        if connection is None:
+            self._flush_guardrail_events(updated)
         if (connection is None and output_contract_version(updated) == 2
                 and prior_public != (updated.snapshot.get("published_artifacts", []), updated.snapshot.get("public_messages", []))):
             try:
@@ -3340,6 +3354,7 @@ class CoreAgent:
                 continuation=continuation, snapshot=snapshot, owner_timeout_seconds=timeout,
                 before_pending=before_pending, documents=documents, complete=complete,
             )
+        self._flush_guardrail_events(record)
         if review["state"] == "pending":
             wait = self.workflow_store.get_wait(review["wait_id"], tenant_id=record.tenant_id, owner_id=record.owner_id)
             raise _MaterialSuspended(self._finish_wait_entry(record, wait))
@@ -4417,6 +4432,7 @@ class CoreAgent:
         return len(tasks), tuple(pending)
 
     def _continue_workflow(self, record, *, decision=None, cancel_event=None, lease_token=None):
+        self._flush_guardrail_events(record)
         while True:
             try:
                 return self._run_execution_attempt(record, lambda current, token: self._continue_workflow_body(
@@ -5570,7 +5586,14 @@ class CoreAgent:
                         raise
                     record = self._record_tool_outcome(record, snapshot, call, self._failed_tool_outcome(call, error), lease_token=token)
                 else:
-                    record = self._execute_pending(record, snapshot, raw, discovered, effective, lease_token=token)
+                    with self.telemetry.span("core_agent.tool.execute", attributes={
+                        "core_agent.tool.namespace": call.name.split(".", 1)[0],
+                        "core_agent.run.id": record.run_id, "a2a.task.id": record.task_id,
+                        "core_agent.tenant.id": record.tenant_id, "a2a.context.id": record.context_id,
+                    }) as tool_span:
+                        self._instrument_tool(tool_span, call, definition)
+                        record = self._execute_pending(record, snapshot, raw, discovered, effective,
+                                                       lease_token=token, span=tool_span)
                     if isinstance(record, SuspendedRun):
                         return record
                 snapshot = copy.deepcopy(record.snapshot)
@@ -5678,7 +5701,7 @@ class CoreAgent:
                 arguments["artifacts"], task_id=record.task_id, run_id=record.run_id,
                 publication_id=call_id, limit_bytes=limit, published=published)
         except CoreError as error:
-            raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+            raise ExecutionNotStarted(error.code, error.message, data=error.data, diagnostics=error.diagnostics) from None
         snapshot["prepared_public_output"] = {"call_id": call_id, "artifacts": list(artifacts)}
         return {"artifacts": list(service.receipts(artifacts))}
 
@@ -5723,7 +5746,7 @@ class CoreAgent:
             )
         except CoreError as error:
             # Immutable preparation never commits the selected response set.
-            raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+            raise ExecutionNotStarted(error.code, error.message, data=error.data, diagnostics=error.diagnostics) from None
         snapshot["prepared_response_files"] = {"call_id": call_id, "files": list(files)}
         return {"files": self.response_files_service.receipts(files)}
 
@@ -6593,7 +6616,7 @@ class CoreAgent:
                         owner_id=parent.run_id, tenant_id=parent.tenant_id, admission=admit)
                 except CoreError as error:
                     if not admitted:
-                        raise ExecutionNotStarted(error.code, error.message, data=error.data) from None
+                        raise ExecutionNotStarted(error.code, error.message, data=error.data, diagnostics=error.diagnostics) from None
                     raise
             else:
                 task = self.task_scheduler.start_remote(contract, owner_id=parent.run_id, tenant_id=parent.tenant_id,
@@ -7134,6 +7157,7 @@ class CoreAgent:
                 record = self.workflow_store.lookup_task(task_id)
                 if record.snapshot.get("background_tool"):
                     raise CoreError("INVALID_TASK_STATE", "Background tools resume through their scheduler")
+                self._flush_guardrail_events(record)
                 if record.state == "COMPLETED":
                     result = record.result
                     return RunResult(
@@ -7410,6 +7434,9 @@ class CoreAgent:
     def _recover_workflows_once(self):
         """A run interrupted mid-dispatch cannot prove the side effect did not happen."""
         scope = {"tenant_id": self.recovery_tenant_id} if self.recovery_tenant_id is not None else {}
+        if self.material_review_store is not None:
+            for record in self.workflow_store.pending_guardrail_records(**scope):
+                self._flush_guardrail_events(record)
         cron = getattr(self, "cron_coordinator", None)
         if cron is not None:
             cron.tick()

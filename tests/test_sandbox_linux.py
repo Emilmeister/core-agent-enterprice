@@ -9,6 +9,7 @@ an isolation success; supervisor hooks below only inject failures into real runs
 """
 import contextlib
 import dataclasses
+import errno
 import ipaddress
 import json
 import os
@@ -27,7 +28,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core_agent import sandbox
-from core_agent.errors import CoreError
+from core_agent.errors import CoreError, ExecutionNotStarted
 from core_agent.guardrails import GuardrailClassifier
 from core_agent.model import ModelResponse
 
@@ -494,12 +495,24 @@ class SandboxLinuxTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 'EXECUTION_ENVIRONMENT_UNAVAILABLE')
                 self.assertFalse((self.workspace / 'forbidden').exists())
                 self.assertFalse(self.launcher._processes)
+                diagnostic = caught.exception.diagnostics
+                self.assertIsNotNone(diagnostic)
+                self.assertEqual(diagnostic.stage, ('namespace', 'network', 'network', 'supervisor', 'supervisor')[index])
+                self.assertEqual(diagnostic.cleanup, 'confirmed')
+                self.assertEqual(caught.exception.data, {})
 
     def test_exec_failure_is_predispatch_and_keeps_known_error(self):
-        with self.assertRaises(CoreError) as caught:
+        with self.assertRaises(ExecutionNotStarted) as caught:
             self.launcher.start(['/missing/executable'], workspace_path=self.workspace,
-                                readonly_input_path=self.inputs)
+                                readonly_input_path=self.inputs, environment={'CANARY': 'private-diagnostic-canary'})
         self.assertEqual(caught.exception.code, 'EXECUTION_ENVIRONMENT_UNAVAILABLE')
+        diagnostic = caught.exception.diagnostics
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual((diagnostic.stage, diagnostic.reason, diagnostic.errno, diagnostic.cleanup),
+                         ('target_exec', 'os_error', errno.ENOENT, 'confirmed'))
+        self.assertEqual(caught.exception.data, {})
+        self.assertNotIn('/missing/executable', str(diagnostic.as_dict()))
+        self.assertNotIn('private-diagnostic-canary', str(diagnostic.as_dict()))
 
     def test_broker_mount_exposes_only_the_current_socket(self):
         own, foreign = socket.socket(socket.AF_UNIX), socket.socket(socket.AF_UNIX)

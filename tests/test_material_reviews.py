@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import unittest
@@ -6,11 +7,16 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from a2a.types import Task, TaskState, TaskStatus
+
+from core_agent.a2a_sdk import ScopedMemoryTaskStore
+from core_agent.auth import AuthenticatedCallContext, ScopeUser
 from core_agent.database import PostgresDatabase
 from core_agent.errors import CoreError
 from core_agent.guardrails import GuardrailClassifier
 from core_agent.material_reviews import MemoryMaterialReviewStore, PostgresMaterialReviewStore
-from core_agent.workflow import InMemoryWorkflowStore, PostgresWorkflowStore, WorkflowRecord
+from core_agent.observability import RecordingExporter, Telemetry
+from core_agent.workflow import InMemoryWorkflowStore, OutboxDispatcher, PostgresWorkflowStore, WorkflowRecord
 
 
 class Model:
@@ -77,6 +83,150 @@ class MaterialReviewContract:
         else:
             restarted = PostgresMaterialReviewStore(self.database, PostgresWorkflowStore(self.database))
         self.store = restarted
+
+    def diagnostics(self):
+        if isinstance(self.workflow, InMemoryWorkflowStore):
+            return [event for event in getattr(self.workflow, "_guardrail_events", ())
+                    if event["run_id"] == self.record.run_id]
+        with self.database.transaction() as connection:
+            return connection.execute("""SELECT kind,data FROM core_events
+                WHERE run_id=%s AND tenant_id=%s AND kind LIKE 'guardrail.%%'
+                ORDER BY revision""", (self.record.run_id, self.record.tenant_id)).fetchall()
+
+    def test_clear_diagnostic_is_private_committed_once_without_workflow_transition(self):
+        row = self.create()
+        version = self.current().version
+        result = self.classify(row)
+        events = self.diagnostics()
+        self.assertEqual([event["kind"] for event in events], ["guardrail.classified"])
+        data = events[0]["data"]
+        self.assertEqual((data["verdict"], data["reason"]), ("clear", "clear"))
+        self.assertEqual(data["review_id"], row["review_id"])
+        self.assertEqual(data["source_id"], "input-1")
+        self.assertEqual(data["source_kind"], "input")
+        self.assertEqual(data["detector_deadline"], row["deadline"])
+        self.assertEqual(data["attempts_used"], 1)
+        self.assertEqual(data["input_tokens_used"], result["input_tokens_used"])
+        self.assertEqual((data["prompt_tokens"], data["completion_tokens"]), (10, 5))
+        self.assertGreaterEqual(data["elapsed_seconds"], 0)
+        self.assertEqual(self.current().version, version)
+        self.assertFalse({"payload", "sealed_ref", "completed_result_ref", "content_digest", "material_digest",
+                          "attempt_token", "answer"} & data.keys())
+        self.assertNotIn("secret raw material", json.dumps(data))
+        self.restart()
+        self.classify(row)
+        self.assertEqual(self.diagnostics(), events)
+
+    def test_pending_diagnostics_correlate_distinct_deadlines_and_deduplicate_lifecycle(self):
+        row = self.classify(self.create(), "suspicious")
+        wait = self.workflow.get_wait(row["wait_id"], tenant_id=self.record.tenant_id)
+        events = self.diagnostics()
+        self.assertEqual([event["kind"] for event in events], ["guardrail.classified", "guardrail.wait.entered"])
+        classified, entered = [event["data"] for event in events]
+        self.assertEqual(classified["review_id"], entered["review_id"])
+        self.assertEqual(entered["wait_id"], row["wait_id"])
+        self.assertEqual(entered["detector_deadline"], row["deadline"])
+        self.assertEqual(entered["owner_deadline"], wait.deadline)
+        self.assertAlmostEqual(wait.deadline - wait.created_at, 86400, delta=1)
+        self.resolve(row, "allowed")
+        self.resolve(row, "rejected")
+        self.restart()
+        self.get(row)
+        events = self.diagnostics()
+        self.assertEqual([event["kind"] for event in events].count("guardrail.wait.resolved"), 1)
+        resolved = next(event["data"] for event in events if event["kind"] == "guardrail.wait.resolved")
+        self.assertEqual(resolved["resolution_reason"], "allowed")
+        self.assertEqual(resolved["review_id"], row["review_id"])
+        self.assertEqual(resolved["wait_id"], row["wait_id"])
+        current = self.current()
+        self.token = self.lease()
+        snapshot = {key: value for key, value in current.snapshot.items() if key not in {"wait_id", "wait_ready"}}
+        self.workflow.transition(current.run_id, tenant_id=current.tenant_id, owner_id=current.owner_id,
+            expected_version=current.version, state="RUNNING", snapshot=snapshot, lease_token=self.token,
+            event_kind="wait.continued")
+        self.assertEqual([event["kind"] for event in self.diagnostics()].count("guardrail.wait.applied"), 1)
+
+    def test_rolled_back_pending_classification_does_not_leave_diagnostics(self):
+        row = self.create()
+        save = self.store._save
+
+        def fail(decision, connection):
+            save(decision, connection)
+            if decision["state"] == "pending":
+                raise RuntimeError("decision rollback")
+
+        with patch.object(self.store, "_save", side_effect=fail), self.assertRaisesRegex(RuntimeError, "rollback"):
+            self.classify(row, "suspicious")
+        self.assertEqual(self.get(row)["state"], "checking")
+        self.assertEqual(self.current().state, "RUNNING")
+        self.assertEqual(self.diagnostics(), [])
+
+    def test_detector_timeout_is_not_reported_as_owner_timeout(self):
+        self.classify(self.create(deadline=self.now - 1))
+        events = self.diagnostics()
+        self.assertEqual([event["kind"] for event in events], ["guardrail.classified", "guardrail.wait.entered"])
+        self.assertEqual(events[0]["data"]["reason"], "timeout")
+        self.assertEqual(events[0]["data"]["attempts_used"], 0)
+        self.assertEqual(events[1]["data"]["reason"], "timeout")
+        self.assertGreater(events[1]["data"]["owner_deadline"], self.now)
+        self.assertNotIn("resolution_reason", events[1]["data"])
+
+    def test_diagnostic_export_failure_keeps_committed_review_and_stable_retry_identity(self):
+        row = self.classify(self.create())
+        drain = getattr(self.workflow, "drain_guardrail_events", None)
+        self.assertTrue(callable(drain), "committed diagnostic export is not implemented")
+        seen = []
+
+        def failed(event):
+            self.assertEqual(self.get(row)["state"], "clear")
+            seen.append(event)
+            return False
+
+        self.assertEqual(drain(self.record, failed), 0)
+        self.assertEqual(self.get(row)["state"], "clear")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(drain(self.record, failed), 0)
+        self.assertEqual(len(seen), 1, "failed export was retried without backoff")
+        if isinstance(self.workflow, InMemoryWorkflowStore):
+            self.now += 2
+        else:
+            with self.database.transaction() as connection:
+                connection.execute("""UPDATE core_outbox SET available_at=0 WHERE tenant_id=%s
+                    AND aggregate_id=%s AND aggregate_type='diagnostic' AND published_at IS NULL""",
+                    (self.record.tenant_id, self.record.run_id))
+        self.assertEqual(drain(self.record, lambda event: seen.append(event) or True), 1)
+        self.assertEqual(seen[0]["event_id"], seen[1]["event_id"])
+        self.assertEqual(drain(self.record, lambda event: self.fail("accepted event was exported again")), 0)
+
+    def test_diagnostic_persistence_failure_rolls_back_classification_and_wait(self):
+        row = self.create()
+        writer = getattr(self.workflow, "record_guardrail_event", None)
+        self.assertTrue(callable(writer), "atomic diagnostic persistence is not implemented")
+        with patch.object(self.workflow, "record_guardrail_event", side_effect=RuntimeError("journal rollback")):
+            with self.assertRaisesRegex(RuntimeError, "journal rollback"):
+                self.classify(row, "suspicious")
+        self.assertEqual(self.current().state, "RUNNING")
+        self.assertEqual(self.get(row)["state"], "checking")
+        self.assertEqual(self.diagnostics(), [])
+
+    def test_valid_non_ascii_scope_exports_with_safe_correlation_and_omits_unsafe_source(self):
+        self.record = self.workflow.create(replace(self.record, run_id=str(uuid.uuid4()),
+            task_id=f"Задача с пробелом {self.record.task_id}", tenant_id="Компания диагностики", context_id="Чат с пробелом", snapshot={}))
+        self.token = self.lease()
+        row = self.store.create(self.record, source_id="private source/unsafe?value", source_kind="unknown private kind",
+            payload="secret source bytes", deadline=self.now + 60, lease_token=self.token)
+        self.classify(row)
+        data = self.diagnostics()[0]["data"]
+        self.assertTrue({"run_id", "task_id", "tenant_id", "review_id"} <= data.keys())
+        self.assertEqual(data["source_kind"], "other")
+        self.assertNotIn("source_id", data)
+        encoded = json.dumps(data, ensure_ascii=False)
+        for private in (self.record.tenant_id, self.record.task_id, self.record.context_id,
+                        "private source/unsafe?value", "unknown private kind", "secret source bytes"):
+            self.assertNotIn(private, encoded)
+        exporter = RecordingExporter()
+        self.assertEqual(self.workflow.drain_guardrail_events(self.record, Telemetry(exporter).publish_diagnostic), 1)
+        self.assertEqual(len(exporter.spans), 1)
 
     def test_private_identity_exact_replay_changed_content_and_scope(self):
         row = self.create(completed_result_ref={"call_id": "call-1", "status": "completed"})
@@ -372,6 +522,154 @@ class MemoryMaterialReviewTests(MaterialReviewContract, unittest.TestCase):
         self.store = MemoryMaterialReviewStore(self.workflow)
         self.setup_run()
 
+    def bind_canonical_observer(self):
+        self.record = replace(self.current(), snapshot={**self.current().snapshot,
+            "output_contract_version": 2, "public_messages": [], "published_artifacts": []})
+        self.workflow._records[self.record.run_id] = self.record
+        tasks = ScopedMemoryTaskStore(workflow_store=self.workflow)
+        context = AuthenticatedCallContext(tenant=self.record.tenant_id, user=ScopeUser(self.record.owner_id))
+        tasks._save_admission(Task(id=self.record.task_id, context_id=self.record.context_id,
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING)), context)
+        self.workflow.public_output_observer = tasks.reconcile_run
+        return tasks
+
+    @staticmethod
+    def canonical_aliases(tasks):
+        return {owner: {task_id: task.SerializeToString(deterministic=True) for task_id, task in rows.items()}
+                for owner, rows in tasks._impl.tasks.items()}
+
+    def test_pending_rollback_never_publishes_phantom_canonical_task(self):
+        for failure in ("review", "classified", "entered"):
+            with self.subTest(failure=failure):
+                tasks = self.bind_canonical_observer()
+                before = self.canonical_aliases(tasks)
+                row = self.create(payload="private fixture " + failure)
+                save, write = self.store._save, self.workflow.record_guardrail_event
+
+                def fail_save(decision, connection):
+                    save(decision, connection)
+                    if failure == "review" and decision["state"] == "pending":
+                        raise RuntimeError("atomic review rollback")
+
+                def fail_journal(record, kind, data, **options):
+                    result = write(record, kind, data, **options)
+                    if kind == "guardrail." + ("classified" if failure == "classified" else "wait.entered"):
+                        raise RuntimeError("atomic journal rollback")
+                    return result
+
+                with patch.object(self.store, "_save", side_effect=fail_save), \
+                        patch.object(self.workflow, "record_guardrail_event", side_effect=fail_journal):
+                    with self.assertRaisesRegex(RuntimeError, "atomic"):
+                        self.classify(row, "suspicious")
+                self.assertEqual(self.current().state, "RUNNING")
+                self.assertEqual(self.get(row)["state"], "checking")
+                self.assertIsNone(self.get(row)["wait_id"])
+                self.assertEqual(self.diagnostics(), [])
+                self.assertFalse(self.workflow.pending_waits())
+                self.assertEqual(self.canonical_aliases(tasks), before)
+
+    def test_applied_journal_failure_never_changes_canonical_task_or_wait(self):
+        tasks = self.bind_canonical_observer()
+        row = self.classify(self.create(), "suspicious")
+        self.resolve(row, "allowed")
+        self.get(row)
+        before_tasks = self.canonical_aliases(tasks)
+        before_record = self.current()
+        before_wait = self.workflow.get_wait(row["wait_id"], tenant_id=self.record.tenant_id)
+        before_journal = self.diagnostics().copy()
+        self.token = self.lease()
+        snapshot = {key: value for key, value in before_record.snapshot.items() if key not in {"wait_id", "wait_ready"}}
+        write = self.workflow.record_guardrail_event
+
+        def fail(record, kind, data, **options):
+            result = write(record, kind, data, **options)
+            if kind == "guardrail.wait.applied":
+                raise RuntimeError("applied rollback")
+            return result
+
+        with patch.object(self.workflow, "record_guardrail_event", side_effect=fail), \
+                self.assertRaisesRegex(RuntimeError, "applied rollback"):
+            self.workflow.transition(before_record.run_id, tenant_id=before_record.tenant_id,
+                owner_id=before_record.owner_id, expected_version=before_record.version, state="RUNNING",
+                snapshot=snapshot, lease_token=self.token)
+        self.assertEqual(self.current(), before_record)
+        self.assertEqual(self.workflow.get_wait(row["wait_id"], tenant_id=self.record.tenant_id), before_wait)
+        self.assertEqual(self.diagnostics(), before_journal)
+        self.assertEqual(self.get(row)["state"], "allowed")
+        self.assertEqual(self.canonical_aliases(tasks), before_tasks)
+
+    def test_nested_material_scope_publishes_once_after_review_wait_and_journal_commit(self):
+        tasks = self.bind_canonical_observer()
+        before = self.canonical_aliases(tasks)
+        row = self.create()
+        observed = []
+        canonical = tasks.reconcile_run
+
+        def observe(record, connection=None):
+            private = self.store.rows[row["review_id"]]
+            self.assertEqual(private["state"], "pending")
+            self.assertEqual(self.current().snapshot["wait_id"], private["wait_id"])
+            self.assertEqual([event["kind"] for event in self.diagnostics()],
+                             ["guardrail.classified", "guardrail.wait.entered"])
+            observed.append(record.version)
+            return canonical(record, connection)
+
+        self.workflow.public_output_observer = observe
+        with self.store._scope(self.record, lease_token=self.token):
+            self.classify(row, "suspicious")
+            self.assertEqual(observed, [])
+            self.assertEqual(self.canonical_aliases(tasks), before)
+        self.assertEqual(observed, [self.current().version])
+        self.assertNotEqual(self.canonical_aliases(tasks), before)
+
+    def test_public_observer_error_rolls_back_pending_scope_and_next_commit_still_publishes(self):
+        tasks = self.bind_canonical_observer()
+        before = self.canonical_aliases(tasks)
+        row = self.create()
+        canonical = tasks.reconcile_run
+
+        def fail(record, connection=None):
+            raise RuntimeError("canonical observer unavailable")
+
+        self.workflow.public_output_observer = fail
+        with self.assertRaisesRegex(RuntimeError, "canonical observer"):
+            self.classify(row, "suspicious")
+        self.assertEqual(self.current().state, "RUNNING")
+        self.assertEqual(self.get(row)["state"], "checking")
+        self.assertIsNone(self.get(row)["wait_id"])
+        self.assertFalse(self.workflow.pending_waits())
+        self.assertEqual(self.diagnostics(), [])
+        self.assertEqual(self.canonical_aliases(tasks), before)
+        self.workflow.public_output_observer = canonical
+        self.classify(row)
+        self.assertEqual(self.current().state, "WAITING_INPUT")
+        self.assertNotEqual(self.canonical_aliases(tasks), before)
+
+    def test_legacy_wait_resolution_retains_safe_verdict_without_classification_journal(self):
+        row = self.classify(self.create(), "suspicious")
+        self.workflow._guardrail_events.clear()
+        self.restart()
+        self.resolve(row, "allowed")
+        data = self.diagnostics()[0]["data"]
+        self.assertEqual(data.get("verdict"), "suspicious")
+        self.assertEqual(data.get("reason"), "suspicious")
+        self.assertEqual(data["resolution_reason"], "allowed")
+        self.assertEqual(data["review_id"], row["review_id"])
+        self.assertNotIn("content_digest", data)
+
+    def test_reading_and_classifying_own_review_never_clones_foreign_payloads(self):
+        row = self.create()
+
+        class ForeignPayload(dict):
+            def __deepcopy__(self, memo):
+                raise AssertionError("foreign private material was copied")
+
+        foreign = dict(self.store.rows[row["review_id"]], review_id=str(uuid.uuid4()), tenant_id="foreign",
+                       payload=ForeignPayload(private="foreign material"))
+        self.store.rows[foreign["review_id"]] = foreign
+        self.assertEqual(self.get(row)["state"], "checking")
+        self.assertEqual(self.classify(row)["state"], "clear")
+
     def test_timeout_wins_late_owner_decision_and_read_commits_timeout(self):
         row = self.classify(self.create(), "suspicious", owner_timeout_seconds=10)
         self.now += 10
@@ -401,6 +699,41 @@ class PostgresMaterialReviewTests(MaterialReviewContract, unittest.TestCase):
         self.store = PostgresMaterialReviewStore(self.database, self.workflow)
         self.setup_run()
 
+    def test_borrowed_classification_transaction_hides_and_rolls_back_private_events(self):
+        row = self.create()
+        finish = self.store.finish
+        with self.assertRaisesRegex(RuntimeError, "outer rollback"):
+            with self.database.transaction() as connection:
+                def joined(*args, **kwargs):
+                    return finish(*args, **kwargs, connection=connection)
+
+                with patch.object(self.store, "finish", side_effect=joined):
+                    self.classify(row, "suspicious")
+                count = connection.execute("""SELECT count(*) AS n FROM core_outbox
+                    WHERE aggregate_type='diagnostic' AND aggregate_id=%s""", (self.record.run_id,)).fetchone()["n"]
+                self.assertEqual(count, 2)
+                self.assertEqual(self.workflow.drain_guardrail_events(self.record,
+                    lambda event: self.fail("uncommitted event was exported")), 0)
+                raise RuntimeError("outer rollback")
+        self.assertEqual(self.get(row)["state"], "checking")
+        self.assertEqual(self.current().state, "RUNNING")
+        self.assertEqual(self.diagnostics(), [])
+
+    def test_restarted_terminal_diagnostic_export_is_scoped_and_uses_stable_event_id(self):
+        self.classify(self.create())
+        current = self.current()
+        self.workflow.transition(current.run_id, tenant_id=current.tenant_id, owner_id=current.owner_id,
+            expected_version=current.version, state="COMPLETED", snapshot=current.snapshot,
+            event_kind="task.completed", lease_token=self.token)
+        restarted = PostgresWorkflowStore(self.database)
+        self.assertNotIn(current.run_id, [record.run_id for record in restarted.pending_guardrail_records(tenant_id="foreign")])
+        records = restarted.pending_guardrail_records(tenant_id=current.tenant_id)
+        self.assertEqual([record.run_id for record in records], [current.run_id])
+        exporter = RecordingExporter()
+        self.assertEqual(restarted.drain_guardrail_events(records[0], Telemetry(exporter).publish_diagnostic), 1)
+        self.assertEqual(restarted.pending_guardrail_records(tenant_id=current.tenant_id), ())
+        self.assertEqual(len(exporter.spans), 1)
+
     def test_creation_joins_completed_outcome_transaction(self):
         with self.assertRaisesRegex(RuntimeError, "rollback"):
             with self.database.transaction() as conn:
@@ -423,9 +756,22 @@ class PostgresMaterialReviewTests(MaterialReviewContract, unittest.TestCase):
     def test_public_outbox_omits_review_payload_and_reference(self):
         row = self.classify(self.create(), "suspicious")
         with self.database.transaction() as conn:
-            events = conn.execute("SELECT payload FROM core_outbox WHERE aggregate_id=%s", (self.record.run_id,)).fetchall()
+            events = conn.execute("SELECT payload FROM core_outbox WHERE aggregate_id=%s AND aggregate_type='run'",
+                                  (self.record.run_id,)).fetchall()
+            private = conn.execute("""SELECT payload FROM core_outbox WHERE aggregate_id=%s
+                AND aggregate_type='diagnostic' ORDER BY sequence""", (self.record.run_id,)).fetchall()
         self.assertNotIn("secret raw material", str(events))
         self.assertNotIn(row["review_id"], str(events))
+        self.assertEqual(len(private), 2)
+        self.assertEqual(private[0]["payload"]["data"]["review_id"], row["review_id"])
+        self.assertNotIn("secret raw material", str(private))
+        self.assertNotIn("content_digest", str(private))
+
+    def test_generic_outbox_dispatcher_cannot_deliver_private_diagnostics(self):
+        self.classify(self.create(), "suspicious")
+        published = []
+        OutboxDispatcher(self.database, published.append).drain_once(limit=100)
+        self.assertFalse(any(event["aggregate_type"] == "diagnostic" for event in published))
 
 
 if __name__ == "__main__":

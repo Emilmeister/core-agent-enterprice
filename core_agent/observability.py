@@ -4,12 +4,15 @@ import secrets
 import contextvars
 import os
 import re
+import json
+import logging
+import math
 from dataclasses import dataclass
 
 from requests import Session
 from requests.exceptions import RequestException
 
-from .errors import CoreError
+from .errors import CoreError, SandboxDiagnostics
 from .security import safe_url, validate_http_url
 
 
@@ -289,6 +292,17 @@ class Span:
         code = getattr(error, "code", None)
         if code:
             self.set_attribute("core_agent.error.code", code)
+        diagnostics = getattr(error, "diagnostics", None)
+        if type(diagnostics) is SandboxDiagnostics:
+            try:
+                safe = SandboxDiagnostics(**diagnostics.as_dict()).as_dict()
+            except (TypeError, ValueError):
+                return
+            fields = {"core_agent.sandbox." + key: value for key, value in safe.items()}
+            self.set_attributes(fields)
+            self.telemetry._operator_log("sandbox.failed", {
+                **fields, "trace_id": self.context.trace_id, "span_id": self.context.span_id,
+            })
 
     def end(self, error=None):
         if self.ended:
@@ -298,7 +312,7 @@ class Span:
         elif error is not None:
             self.record_error(error)
         self.ended = True
-        self.telemetry._export_span(self)
+        return self.telemetry._export_span(self)
 
 
 class Telemetry:
@@ -457,8 +471,85 @@ class Telemetry:
     def _export_span(self, span):
         try:
             self.exporter.export_span(span)
+            return True
         except Exception:
             self.dropped_records += 1
+            return False
+
+    @staticmethod
+    def _guardrail_attributes(event):
+        kinds = {"guardrail.classified", "guardrail.wait.entered",
+                 "guardrail.wait.resolved", "guardrail.wait.applied"}
+        enums = {
+            "verdict": {"clear", "suspicious", "unverified"},
+            "reason": {"clear", "suspicious", "uncertain", "invalid_response", "provider_error",
+                       "timeout", "budget_exhausted", "detector_busy", "incomplete_extraction", "interrupted"},
+            "source_kind": {"initial_input", "follow_up", "tool_arguments", "tool_result", "file_attachment",
+                            "owner_answer", "input", "file", "other"},
+            "resolution_reason": {"allowed", "rejected", "timeout", "cancelled", "other"},
+        }
+        ids = {"run_id", "task_id", "tenant_id", "context_id", "source_id", "review_id", "wait_id"}
+        counters = {"attempts_used", "input_tokens_used", "prompt_tokens", "completion_tokens"}
+        timestamps = {"detector_deadline", "owner_deadline"}
+        required = {"run_id", "task_id", "tenant_id", "review_id", "source_kind", "verdict", "reason"}
+        if (type(event) is not dict or set(event) != {"event_id", "kind", "data", "created_at"}
+                or event["kind"] not in kinds or type(event["data"]) is not dict):
+            raise ValueError("Invalid diagnostic event")
+        data = event["data"]
+        if not required <= data.keys() <= ids | counters | timestamps | enums.keys() | {"elapsed_seconds"}:
+            raise ValueError("Invalid diagnostic fields")
+        if event["kind"] != "guardrail.classified" and "wait_id" not in data:
+            raise ValueError("Missing diagnostic wait")
+        if event["kind"].endswith(("resolved", "applied")) and "resolution_reason" not in data:
+            raise ValueError("Missing diagnostic outcome")
+        identifier = re.compile(r"[A-Za-z0-9_.:-]{1,256}\Z")
+        if type(event["event_id"]) is not str or not identifier.fullmatch(event["event_id"]):
+            raise ValueError("Invalid diagnostic identity")
+        created = event["created_at"]
+        if type(created) not in (int, float) or not math.isfinite(created) or not 0 <= created <= 253402300799:
+            raise ValueError("Invalid diagnostic time")
+        for key, value in data.items():
+            if key in ids:
+                valid = type(value) is str and identifier.fullmatch(value)
+            elif key in enums:
+                valid = type(value) is str and value in enums[key]
+            elif key in counters:
+                valid = type(value) is int and 0 <= value <= 2**63 - 1
+            else:
+                bound = 253402300799 if key in timestamps else 604800
+                valid = type(value) in (int, float) and math.isfinite(value) and 0 <= value <= bound
+            if not valid:
+                raise ValueError("Invalid diagnostic value")
+        canonical = {"run_id": "core_agent.run.id", "task_id": "a2a.task.id",
+                     "tenant_id": "core_agent.tenant.id", "context_id": "a2a.context.id"}
+        attrs = {canonical.get(key, "core_agent.guardrail." + key): value for key, value in data.items()}
+        return {**attrs, "core_agent.diagnostic.event_id": event["event_id"],
+                "core_agent.diagnostic.created_at": created}
+
+    def _operator_log(self, kind, attributes):
+        accepted = self.log(kind, attributes=attributes)
+        try:
+            logging.getLogger(__name__).info(json.dumps({"event": kind, **attributes}, sort_keys=True))
+        except Exception:
+            self.dropped_records += 1
+        return accepted
+
+    def publish_diagnostic(self, event):
+        """Accept only committed finite operator metadata; callers retain failures for replay."""
+        try:
+            attrs = self._guardrail_attributes(event)
+            span = self.span("core_agent." + event["kind"], attributes=attrs)
+            span.status_code = "ERROR" if event["kind"] == "guardrail.classified" and event["data"]["verdict"] == "unverified" else "OK"
+            accepted = span.end()
+            logged = self._operator_log(event["kind"], {
+                **attrs, "trace_id": span.context.trace_id, "span_id": span.context.span_id,
+            })
+            return accepted and logged
+        except (TypeError, ValueError, KeyError, OverflowError):
+            return False
+        except Exception:
+            self.dropped_records += 1
+            return False
 
     def _set_span_attribute(self, context, key, value):
         setter = getattr(self.exporter, "set_span_attribute", None)
@@ -488,8 +579,10 @@ class Telemetry:
             }
         try:
             self.exporter.export_log((body, attributes))
+            return True
         except Exception:
             self.dropped_records += 1
+            return False
 
     def shutdown(self):
         shutdown = getattr(self.exporter, "shutdown", None)

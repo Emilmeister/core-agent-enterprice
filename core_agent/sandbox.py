@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 
-from .errors import CoreError, ExecutionNotStarted
+from .errors import CoreError, ExecutionNotStarted, SandboxDiagnostics
 
 _POLICY_SHA256 = '8ef9479132f923e4c2f485ae4c06c98ddce9ad9448ce48232cc199663beefe2e'
 _HELPER_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'C.UTF-8'}
@@ -40,6 +40,87 @@ _CLEANUP_SECONDS = 3.0
 
 def _unavailable(message='Required Linux sandbox is unavailable'):
     return CoreError('EXECUTION_ENVIRONMENT_UNAVAILABLE', message)
+
+
+def _resource_stats(launcher=None):
+    """Best-effort fixed kernel counters, with no paths or unlimited values."""
+    values = {}
+    if launcher is not None:
+        limit = launcher.policy.max_concurrent_processes
+        if type(limit) is int and 1 <= limit < 2**63:
+            values.update(slots_limit=limit, slots_active=max(0, limit - launcher._semaphore._value))
+    for filename, field in (('memory.current', 'memory_current_bytes'), ('memory.max', 'memory_limit_bytes'),
+                            ('pids.current', 'pids_current'), ('pids.max', 'pids_limit')):
+        try:
+            with open('/sys/fs/cgroup/' + filename, encoding='ascii') as source:
+                raw = source.read(32).strip()
+            if raw.isascii() and raw.isdecimal() and 0 <= int(raw) < 2**63:
+                if int(raw) or not field.endswith(('limit', 'limit_bytes')):
+                    values[field] = int(raw)
+        except (OSError, ValueError, UnicodeError):
+            pass
+    try:
+        with open('/sys/fs/cgroup/memory.events', encoding='ascii') as source:
+            for line in source.read(512).splitlines():
+                key, raw = line.split()
+                if key == 'oom_kill' and raw.isascii() and raw.isdecimal() and 0 <= int(raw) < 2**63:
+                    values['oom_kill_count'] = int(raw)
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return values
+
+
+def _diagnostics(stage, error, started, cleanup, *, launcher=None):
+    existing = getattr(error, 'diagnostics', None)
+    if type(existing) is SandboxDiagnostics:
+        return dataclasses.replace(existing, cleanup=cleanup)
+    cause = error
+    for _ in range(3):
+        if not isinstance(cause, CoreError) or cause.__cause__ is None:
+            break
+        cause = cause.__cause__
+    number = code = None
+    if isinstance(cause, OSError) and type(cause.errno) is int and 1 <= cause.errno <= 4095:
+        number = cause.errno
+    if isinstance(cause, (TimeoutError, subprocess.TimeoutExpired)):
+        reason = 'timeout'
+    elif isinstance(cause, subprocess.CalledProcessError):
+        reason = 'child_exit'
+        if type(cause.returncode) is int and -255 <= cause.returncode <= 255:
+            code = cause.returncode
+    elif isinstance(cause, OSError):
+        reason = 'os_error'
+    elif isinstance(cause, (ValueError, TypeError, KeyError)):
+        reason = 'protocol_invalid'
+    else:
+        reason = {
+            'Sandbox startup timed out': 'timeout', 'Sandbox concurrency limit timed out': 'timeout',
+            'Sandbox launch was cancelled': 'cancelled',
+            'Sandbox requires native Linux amd64 or arm64': 'unsupported',
+            'Linux pidfds are required': 'dependency_missing', 'Sandbox native executable is missing': 'dependency_missing',
+            'libseccomp is required': 'dependency_missing', 'Sandbox policy resource is missing': 'dependency_missing',
+            'Sandbox policy integrity check failed': 'policy_invalid',
+            'Sandbox supervisor disconnected': 'protocol_invalid', 'Unexpected sandbox completion': 'protocol_invalid',
+        }.get(getattr(cause, 'message', None), 'unavailable')
+        if isinstance(cause, CoreError) and cause.code == 'INVALID_ARGUMENT':
+            reason = 'validation_failed'
+    elapsed = max(0, min(2**31 - 1, int((time.monotonic() - started) * 1000)))
+    return SandboxDiagnostics(stage=stage, reason=reason, errno=number, returncode=code,
+        elapsed_ms=elapsed, cleanup=cleanup, **_resource_stats(launcher))
+
+
+def _frame_diagnostics(message, started):
+    raw = message.get('diagnostics')
+    cleanup = 'unconfirmed' if message.get('cleanup_failed') else 'confirmed'
+    if raw is not None:
+        try:
+            diagnostic = SandboxDiagnostics(**raw)
+            if message.get('cleanup_failed') and diagnostic.cleanup != 'unconfirmed':
+                raise ValueError('Inconsistent private cleanup diagnosis')
+            return diagnostic
+        except (TypeError, ValueError):
+            return _diagnostics('supervisor', ValueError(), started, cleanup)
+    return _diagnostics('supervisor', _unavailable(), started, cleanup)
 
 
 def _policy_resource():
@@ -321,6 +402,8 @@ class SandboxProcess:
         self.returncode = None
         self.pid = process.pid
         self._lock = threading.RLock()
+        self._created_at = time.monotonic()
+        self._diagnostics = None
 
     def _message(self, deadline):
         remaining = deadline - time.monotonic() if deadline is not None else None
@@ -349,10 +432,11 @@ class SandboxProcess:
             # Never hold the state lock while waiting: stop/close must interrupt us.
             try:
                 ready = select.select([self._channel], [], [], remaining)[0]
-            except (OSError, ValueError):
+            except (OSError, ValueError) as error:
                 with self._lock:
                     if self._closed:
                         return self.returncode
+                error.diagnostics = _diagnostics('supervisor', error, self._created_at, 'unconfirmed')
                 raise
             with self._lock:
                 if self._closed:
@@ -370,14 +454,16 @@ class SandboxProcess:
                         self._launcher._unhealthy = True
                     self._close()
                     if message.get('error'):
-                        raise CoreError(message['error'], 'Sandbox execution failed')
+                        self._diagnostics = _frame_diagnostics(message, self._created_at)
+                        raise CoreError(message['error'], 'Sandbox execution failed', diagnostics=self._diagnostics)
                     return self.returncode
                 except BaseException as error:
                     self._emergency_cleanup()
                     if isinstance(error, CoreError) and error.code == 'SIDE_EFFECT_UNKNOWN':
                         raise
                     raise CoreError('SIDE_EFFECT_UNKNOWN' if self._released else 'EXECUTION_ENVIRONMENT_UNAVAILABLE',
-                                    'Sandbox supervisor failed') from error
+                                    'Sandbox supervisor failed', diagnostics=getattr(error, 'diagnostics', None)
+                                    or _diagnostics('supervisor', error, self._created_at, 'confirmed')) from error
 
     def poll(self):
         if self._closed:
@@ -418,9 +504,13 @@ class SandboxProcess:
             _confirm_dead(self._pidfds, _CLEANUP_SECONDS)
             if self.returncode is None:
                 self.returncode = self._process.returncode
-        except BaseException:
+        except BaseException as error:
             self._launcher._unhealthy = True
-            raise _unavailable('Sandbox tree cleanup failed; launcher disabled')
+            diagnostic = (dataclasses.replace(self._diagnostics, cleanup='unconfirmed')
+                          if self._diagnostics is not None else
+                          _diagnostics('cleanup', error, self._created_at, 'unconfirmed'))
+            raise CoreError('EXECUTION_ENVIRONMENT_UNAVAILABLE',
+                            'Sandbox tree cleanup failed; launcher disabled', diagnostics=diagnostic) from error
         finally:
             self._close()
 
@@ -452,6 +542,8 @@ class SandboxLauncher:
 
     def start(self, argv, *, workspace_path, readonly_input_path, cwd='.', environment=None,
               stdin=None, stdout=None, stderr=None, broker_socket=None, timeout=None):
+        started = time.monotonic()
+        stage = 'native_check'
         try:
             _workspace_cwd(cwd)
             if (not isinstance(argv, (list, tuple)) or not argv or not argv[0]
@@ -472,13 +564,16 @@ class SandboxLauncher:
                 _check_native()
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 raise _unavailable() from error
+            stage = 'queue'
             if not self._semaphore.acquire(timeout=max(0, deadline - time.monotonic())):
                 raise _unavailable('Sandbox concurrency limit timed out')
         except CoreError as error:
             raise ExecutionNotStarted(error.code, error.message, retryable=error.retryable,
-                                      data=error.data) from error
+                                      data=error.data,
+                                      diagnostics=_diagnostics(stage, error, started, 'not_started', launcher=self)) from error
         parent = child = None
         handle = None
+        stage = 'supervisor'
         try:
             with self._lock:
                 if self._closed or self._unhealthy:
@@ -512,26 +607,30 @@ class SandboxLauncher:
                     handle._released = False
                 if message.get('cleanup_failed'):
                     self._unhealthy = True
+                handle._diagnostics = _frame_diagnostics(message, started)
                 raise CoreError(message.get('error', 'EXECUTION_ENVIRONMENT_UNAVAILABLE'),
-                                'Sandbox did not start')
+                                'Sandbox did not start', diagnostics=handle._diagnostics)
         except BaseException as error:
+            diagnostic = getattr(error, 'diagnostics', None) or _diagnostics(
+                stage, error, started, 'confirmed' if handle else 'not_started', launcher=self)
             if child is not None:
                 child.close()
             if handle:
+                handle._diagnostics = diagnostic
                 handle._emergency_cleanup()
             else:
                 if parent is not None:
                     parent.close()
                 self._semaphore.release()
             if handle and handle._released:
-                raise CoreError('SIDE_EFFECT_UNKNOWN', 'Sandbox startup outcome is unknown') from error
+                raise CoreError('SIDE_EFFECT_UNKNOWN', 'Sandbox startup outcome is unknown', diagnostics=diagnostic) from error
             if isinstance(error, CoreError):
                 raise ExecutionNotStarted(error.code, error.message, retryable=error.retryable,
-                                          data=error.data) from error
+                                          data=error.data, diagnostics=diagnostic) from error
             if not isinstance(error, Exception):
                 raise
             raise ExecutionNotStarted('EXECUTION_ENVIRONMENT_UNAVAILABLE',
-                                      'Required Linux sandbox is unavailable') from error
+                                      'Required Linux sandbox is unavailable', diagnostics=diagnostic) from error
 
     def preflight(self):
         with tempfile.TemporaryDirectory(prefix='core-agent-preflight-') as root:
@@ -572,6 +671,7 @@ def _read_deadline(descriptor, length, deadline):
 
 
 def _supervise(channel):
+    started = time.monotonic()
     launch, received = _receive(channel)
     for descriptor in received:
         os.close(descriptor)
@@ -582,6 +682,8 @@ def _supervise(channel):
     deadline = launch['deadline']
     owned_fds, pidfds, children = [], [], []
     released, returncode, failure, cleanup_failed = False, 125, None, False
+    diagnostic = None
+    stage = 'namespace'
 
     def protect_helper():
         # Only this isolated single-threaded supervisor uses preexec_fn.
@@ -689,6 +791,7 @@ def _supervise(channel):
         userns = own(os.open(f'/proc/{pid}/ns/user', os.O_RDONLY | os.O_CLOEXEC))
         netns = own(os.open(f'/proc/{pid}/ns/net', os.O_RDONLY | os.O_CLOEXEC))
         _send(channel, {'state': 'owned'}, [initfd])
+        stage = 'network'
         nsenter = ['nsenter', '--preserve-credentials', f'--user=/proc/self/fd/{userns}',
                    f'--net=/proc/self/fd/{netns}', 'nft']
         run_helper([*nsenter, '-f', '-'], input=policy.nft_rules().encode(), pass_fds=(userns, netns))
@@ -735,6 +838,7 @@ def _supervise(channel):
             remaining = deadline - time.monotonic()
             if remaining <= 0 or select.select([initfd, slirpfd], [], [], min(.05, remaining))[0]:
                 raise _unavailable('Sandbox IPv6 setup failed')
+        stage = 'target_exec'
         # Releasing this barrier only starts the trusted isolated trampoline.
         if os.write(bootstrap_w, b'1') != 1:
             raise _unavailable('Incomplete bootstrap release')
@@ -748,7 +852,15 @@ def _supervise(channel):
         status = _read_deadline(ready_r, 32, deadline)
         if status.startswith(b'ERR:'):
             released = False
-            raise _unavailable('Sandbox target exec failed')
+            try:
+                number = int(status[4:])
+            except ValueError:
+                number = 0
+            error = _unavailable('Sandbox target exec failed')
+            error.diagnostics = SandboxDiagnostics(stage=stage, reason='os_error' if 1 <= number <= 4095 else 'unavailable',
+                errno=number if 1 <= number <= 4095 else None,
+                elapsed_ms=max(0, min(2**31 - 1, int((time.monotonic() - started) * 1000))), cleanup='confirmed')
+            raise error
         if status:
             raise _unavailable('Invalid target exec status')
         _send(channel, {'state': 'started'})
@@ -758,10 +870,12 @@ def _supervise(channel):
             returncode = bwrap.wait()
         elif slirpfd in ready:
             failure = 'SIDE_EFFECT_UNKNOWN'
+            diagnostic = _diagnostics('network', subprocess.CalledProcessError(slirp.poll(), []), started, 'confirmed')
         else:
             returncode = -signal.SIGKILL
-    except BaseException:
+    except BaseException as error:
         failure = 'SIDE_EFFECT_UNKNOWN' if released else 'EXECUTION_ENVIRONMENT_UNAVAILABLE'
+        diagnostic = _diagnostics(stage, error, started, 'confirmed')
     finally:
         try:
             # Never close bootstrap/exec gates until namespace death is confirmed.
@@ -772,14 +886,17 @@ def _supervise(channel):
                     process.kill()
                 process.wait(timeout=_CLEANUP_SECONDS)
             _confirm_dead(pidfds, _CLEANUP_SECONDS)
-        except BaseException:
+        except BaseException as error:
             cleanup_failed = True
             failure = 'SIDE_EFFECT_UNKNOWN' if released else 'EXECUTION_ENVIRONMENT_UNAVAILABLE'
+            diagnostic = (dataclasses.replace(diagnostic, cleanup='unconfirmed') if diagnostic is not None else
+                          _diagnostics('cleanup', error, started, 'unconfirmed'))
         for descriptor in owned_fds:
             os.close(descriptor)
         try:
             _send(channel, {'state': 'exited', 'returncode': returncode, 'error': failure,
-                            'not_executed': not released, 'cleanup_failed': cleanup_failed})
+                            'not_executed': not released, 'cleanup_failed': cleanup_failed,
+                            **({'diagnostics': diagnostic.as_dict()} if diagnostic is not None else {})})
         except OSError:
             pass
 

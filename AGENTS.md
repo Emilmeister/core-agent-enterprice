@@ -247,6 +247,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/security.py` | Redaction, safe paths, retry и tenant helpers |
 | `core_agent/skills.py` | Обнаружение, закрепление и безопасное чтение ресурсов навыков |
 | `core_agent/observability.py` | OpenTelemetry/OpenInference spans и exporters |
+| `core_agent/errors.py` | Public errors и отдельная finite private `SandboxDiagnostics`, не входящая в error data |
 | `core_agent/push.py` | Durable encrypted A2A push delivery |
 | `core_agent/memory.py` | Markdown revisions, hybrid retrieval, NER, graph index и `core_memory_*` tools |
 | `core_agent/memory_store.py` | In-memory и PostgreSQL backends memory corpus |
@@ -1131,6 +1132,23 @@ run получает отдельные MCP session и negotiated version; пе�
 ### Observability и secrets
 
 - Durable audit является product record и не заменяется OTel.
+- Guardrail classification/wait/resolution/application записывают stable private
+  события вместе с authoritative state. `core_outbox` aggregate `diagnostic`
+  отделён от public run/A2A delivery; bounded replay использует исходный tenant,
+  включая terminal runs, без новых model calls или workflow-version bump.
+  Телеметрия экспортируется после commit и освобождения borrowed connection;
+  exporter outage не отменяет решение, backoff не меняет agent deadline.
+  Verdict/reason/source/counters и detector/owner deadlines проходят finite
+  whitelist независимо от content capture; material payload/digest, paths,
+  owner answers и raw errors в эти события не входят.
+- Sandbox supervisor передаёт finite private stage/reason/time/errno/exit и
+  отдельный cleanup outcome через существующий control channel. Trusted error
+  wrappers сохраняют диагностику для terminal/Python/background operator spans,
+  но она не входит в public error/message/data или model result. Optional numeric
+  slot/cgroup snapshots не управляют запуском. `not_executed`, release/death
+  barriers, `SIDE_EFFECT_UNKNOWN` и unhealthy/quarantine остаются единственным
+  источником решения о допустимости retry; raw stderr/argv/environment не
+  экспортируются. Operator boundary повторно проверяет finite typed payload.
 - `THINKING_LEVEL` optional и маппится в native OpenAI-compatible/Anthropic request; пустое значение сохраняет provider default и никогда не управляется через RunRequest/prompt.
 - Provider-visible reasoning остаётся operator-only content: stdout требует `CORE_AGENT_LOG_CONTENT=true`, Phoenix — `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`; hidden/opaque thinking не экспортируется.
 - Incoming A2A call не создаёт отдельный transport/submission trace: agent processing сразу начинается `core_agent.task.execute`, продолжая валидный incoming W3C parent или становясь local root.

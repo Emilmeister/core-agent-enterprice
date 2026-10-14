@@ -352,7 +352,8 @@ class LocalTerminalBackend:
                 # POSIX rename cannot replace another initialized parent.
                 staged.rename(workspace.parent)
             except CoreError as error:
-                raise ExecutionNotStarted(error.code, error.message, data=error.data) from error
+                raise ExecutionNotStarted(error.code, error.message, data=error.data,
+                                          diagnostics=error.diagnostics) from error
             finally:
                 shutil.rmtree(staged, ignore_errors=True)
         return _LocalTerminalSession(spec, workspace, self.snapshot_store,
@@ -520,7 +521,8 @@ class _LocalTerminalSession:
             handle._process.wait()
             handle._cleanup = "sandbox_terminated" if self.launcher else "process_exited"
         except Exception as error:
-            handle._error = error if isinstance(error, CoreError) else CoreError("SIDE_EFFECT_UNKNOWN")
+            handle._error = error if isinstance(error, CoreError) else CoreError(
+                "SIDE_EFFECT_UNKNOWN", diagnostics=getattr(error, "diagnostics", None))
         finally:
             if handle.state == "running":
                 handle.state = "exited" if handle._error is None and handle._process.returncode == 0 else "failed"
@@ -591,7 +593,8 @@ class _LocalTerminalSession:
                 try:
                     handle._process.stop()
                 except Exception as error:
-                    handle._error = error if isinstance(error, CoreError) else CoreError("SIDE_EFFECT_UNKNOWN")
+                    handle._error = error if isinstance(error, CoreError) else CoreError(
+                        "SIDE_EFFECT_UNKNOWN", diagnostics=getattr(error, "diagnostics", None))
                     raise handle._error
                 handle._cleanup = "sandbox_terminated"
             else:

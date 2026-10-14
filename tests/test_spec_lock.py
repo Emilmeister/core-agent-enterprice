@@ -15,7 +15,7 @@ EXPECTED_SHA256 = {
     "context.md": "eceb11cbc60fb041f13df987f834ea65937b6de01e0ca444b18951892c694f14",
     "development-process.md": "3f0c3cd6881394705a921bbd767efddc56d5290c259b7ca9312eca13dc05a4c9",
     "execution-environment.md": "1ad7324e418abbb4861c132422ce48bf995508c93dbb12ccc04ac30fd05bb681",
-    "implementation-status.md": "6764192a45bb0cce72c831663fcdb70a75284fbaefb0e739987bc37a7fab0d79",
+    "implementation-status.md": "7b616c026fb5481e2c8caf4298e6c07a5a7820a930705778a21f74e257f4644d",
     "kernel-instructions.md": "f8fd3c248305c7d0d397d2272b58bdf56bfbcaed99d7b0f6c4c6aaccc17ab0b3",
     "memory-service.md": "454b5b741e90df5216ac1904e6fb17801bde876204bb0c369bf5e8923d775fd7",
     "observability.md": "151f1aaa1afd10bdec6f2e18381394e2e3803e3da147af2e3c998517599ab9d9",

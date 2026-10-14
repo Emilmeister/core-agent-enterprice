@@ -1,6 +1,9 @@
 import dataclasses
+import errno
 import importlib.util
 import ipaddress
+import io
+import json
 import os
 import socket
 import subprocess
@@ -84,6 +87,20 @@ class SandboxIntegrationTests(unittest.TestCase):
         snapshots.publish.assert_not_called()
         self.assertTrue(self.session.workspace.exists())
         self.assertIn(self.session.id, self.manager._environments)
+
+    def test_supervisor_os_error_keeps_private_diagnosis_across_execution_thread(self):
+        from core_agent.errors import SandboxDiagnostics
+        error = OSError(errno.EBADF, 'private-token-/private/company')
+        diagnostic = error.diagnostics = SandboxDiagnostics(stage='supervisor', reason='os_error',
+            errno=errno.EBADF, elapsed_ms=3, cleanup='confirmed')
+        self.process.wait.side_effect = error
+        handle = self.manager.start(self.session.id, {'argv': ['true']})
+        with self.assertRaises(CoreError) as caught:
+            self.manager.wait(self.session.id, handle.id)
+        self.assertEqual(caught.exception.code, 'SIDE_EFFECT_UNKNOWN')
+        self.assertIs(caught.exception.diagnostics, diagnostic)
+        self.assertEqual(caught.exception.data, {})
+        self.assertNotIn('private-token', str(caught.exception))
 
     def test_failed_stop_never_claims_cleanup_or_removes_workspace(self):
         error = CoreError('EXECUTION_ENVIRONMENT_UNAVAILABLE')
@@ -201,6 +218,70 @@ class SandboxIntegrationTests(unittest.TestCase):
                 recovery.assert_not_called()
                 self.assertFalse(model.calls)
 
+    def test_actual_composition_terminal_python_and_background_errors_have_private_operator_diagnostics(self):
+        from core_agent.errors import SandboxDiagnostics
+        from core_agent.guardrails import GuardrailClassifier
+        from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
+        from tests.app_support import ClearGuardrailModel, UnsandboxedTestLauncher, create_app
+
+        for tool in ('core_terminal_exec', 'core_python_exec', 'core_task_start'):
+            arguments = {'argv': ['private-argv-canary']}
+            if tool == 'core_python_exec':
+                arguments = {'code': "print('private-code-canary')"}
+            elif tool == 'core_task_start':
+                arguments = {'tool': 'core_terminal_exec', 'arguments': arguments, 'required': False}
+            class AwaitFailureModel(ScriptedModel):
+                def generate(inner, **kwargs):
+                    if tool == 'core_task_start' and len(inner.calls) == 1:
+                        output = next(json.loads(item['content'])['output'] for item in kwargs['messages']
+                                      if item.get('tool_call_id') == 'execute')
+                        task = agent.task_scheduler.wait(output['task_id'], timeout=5)
+                        self.assertEqual(task.state, 'failed')
+                        self.assertEqual(task.error.code, 'EXECUTION_ENVIRONMENT_UNAVAILABLE')
+                    return super().generate(**kwargs)
+            model = AwaitFailureModel([
+                ModelResponse(tool_requests=(ToolRequest('execute', tool, arguments),)),
+                ModelResponse(message='failure handled'),
+            ])
+            model.model = 'scripted-diagnostic-proof'
+            launcher = UnsandboxedTestLauncher()
+            diagnostic = SandboxDiagnostics(stage='target_exec', reason='os_error', errno=errno.ENOENT,
+                                            elapsed_ms=2, cleanup='confirmed')
+            failure = ExecutionNotStarted('EXECUTION_ENVIRONMENT_UNAVAILABLE', 'Sandbox did not start',
+                                          diagnostics=diagnostic)
+            classifier = GuardrailClassifier(ClearGuardrailModel())
+            classify = classifier.classify
+            lock = threading.Lock()
+            def available_classifier(*args, **kwargs):
+                with lock:
+                    return classify(*args, **kwargs)
+            environment = {'CORE_AGENT_ENVIRONMENT': 'development', 'CORE_AGENT_MEMORY': 'disabled',
+                'SESSION_STORAGE_TYPE': 'in-memory', 'LOCAL_WORKSPACE_ROOT': str(self.root / tool / 'scratch'),
+                'CHAT_WORKSPACE_ROOT': str(self.root / tool / 'chats'),
+                'CORE_AGENT_ALLOWED_BUILTIN_TOOLS': 'core_terminal_exec,core_python_exec,core_task_start,core_task_wait,core_task_get'}
+            with self.subTest(tool=tool), patch.dict(os.environ, environment, clear=True), \
+                    patch.object(classifier, 'classify', side_effect=available_classifier), \
+                    patch.object(launcher, 'start', side_effect=failure) as start:
+                app = create_app(model=model, sandbox_launcher=launcher, guardrail_classifier=classifier)
+                try:
+                    agent = app.state.core_agent
+                    result = agent.run({'prompt': 'exercise execution refusal'}, identity='owner',
+                                       tenant_id='company', session_id=tool)
+                    self.assertEqual(result.message, 'failure handled')
+                    start.assert_called_once()
+                    exporter = app.state.telemetry.exporter
+                    spans = [span for span in exporter.spans
+                             if span.attributes.get('core_agent.sandbox.stage') == 'target_exec']
+                    self.assertTrue(spans, 'actual execution lost its private operator diagnosis')
+                    self.assertTrue(all(span.attributes['core_agent.sandbox.errno'] == errno.ENOENT for span in spans))
+                    self.assertTrue(any(body == 'sandbox.failed' for body, _ in exporter.logs))
+                    exported = json.dumps([span.attributes for span in exporter.spans]) + str(exporter.logs)
+                    self.assertNotIn('private-argv-canary', exported)
+                    self.assertNotIn('private-code-canary', exported)
+                    self.assertNotIn('core_agent.sandbox', json.dumps(result.__dict__, default=str))
+                finally:
+                    app.state.close()
+
 
 class SandboxTests(unittest.TestCase):
     def sandbox(self):
@@ -309,6 +390,70 @@ class SandboxTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 'INVALID_ARGUMENT')
                 spawn.assert_not_called()
 
+    def test_native_failure_has_private_finite_diagnostics_without_exception_text(self):
+        sandbox = self.sandbox()
+        launcher = sandbox.SandboxLauncher(self.policy())
+        canary = 'private-token-/private/company/workspace'
+        with patch.object(sandbox, '_check_native', side_effect=OSError(errno.ENOENT, canary)), \
+                patch.object(sandbox.subprocess, 'Popen') as spawn:
+            with self.assertRaises(ExecutionNotStarted) as caught:
+                launcher.start(['private-argv'], workspace_path='/unused', readonly_input_path='/unused/attachments')
+        error = caught.exception
+        self.assertEqual(error.code, 'EXECUTION_ENVIRONMENT_UNAVAILABLE')
+        self.assertEqual(error.data, {})
+        self.assertNotIn(canary, str(error))
+        diagnostic = getattr(error, 'diagnostics', None)
+        self.assertIsNotNone(diagnostic, 'native failure lost its safe private diagnosis')
+        self.assertEqual(diagnostic.stage, 'native_check')
+        self.assertEqual(diagnostic.reason, 'os_error')
+        self.assertEqual(diagnostic.errno, errno.ENOENT)
+        self.assertNotIn(canary, str(diagnostic.as_dict()))
+        spawn.assert_not_called()
+
+    def test_queue_timeout_has_bounded_diagnostics_and_never_spawns(self):
+        sandbox = self.sandbox()
+        launcher = sandbox.SandboxLauncher(self.policy(max_concurrent_processes=1, start_timeout_seconds=.01))
+        launcher._semaphore.acquire()
+        self.addCleanup(launcher._semaphore.release)
+        with patch.object(sandbox, '_check_native'), patch.object(sandbox.subprocess, 'Popen') as spawn:
+            with self.assertRaises(ExecutionNotStarted) as caught:
+                launcher.start(['true'], workspace_path='/unused', readonly_input_path='/unused/attachments')
+        diagnostic = getattr(caught.exception, 'diagnostics', None)
+        self.assertIsNotNone(diagnostic, 'queue timeout lost its safe private diagnosis')
+        self.assertEqual((diagnostic.stage, diagnostic.reason), ('queue', 'timeout'))
+        self.assertEqual(diagnostic.cleanup, 'not_started')
+        self.assertIs(type(diagnostic.elapsed_ms), int)
+        self.assertGreaterEqual(diagnostic.elapsed_ms, 0)
+        self.assertLess(diagnostic.elapsed_ms, 2000)
+        self.assertEqual((diagnostic.slots_active, diagnostic.slots_limit), (1, 1))
+        self.assertEqual(caught.exception.data, {})
+        spawn.assert_not_called()
+
+    def test_supervisor_failure_reports_safe_stage_without_material_or_raw_error(self):
+        sandbox = self.sandbox()
+        channel = Mock()
+        policy = self.policy()
+        launch = {'workspace': '/private/company/workspace', 'inputs': '/private/company/workspace/attachments',
+                  'policy': dataclasses.asdict(policy), 'parent_pid': 999,
+                  'deadline': time.monotonic() + 10}
+        with patch.object(sandbox, '_receive', return_value=(launch, [])), \
+                patch.object(sandbox.ctypes, 'CDLL', return_value=Mock(prctl=Mock(return_value=0))), \
+                patch.object(sandbox.os, 'getppid', return_value=999), \
+                patch.object(sandbox, '_open_directory', side_effect=OSError(errno.EACCES, 'private-token')), \
+                patch.object(sandbox, '_send') as send:
+            sandbox._supervise(channel)
+        frame = send.call_args.args[1]
+        self.assertEqual(frame['error'], 'EXECUTION_ENVIRONMENT_UNAVAILABLE')
+        self.assertTrue(frame['not_executed'])
+        self.assertFalse(frame['cleanup_failed'])
+        diagnostic = frame.get('diagnostics')
+        self.assertIsNotNone(diagnostic, 'supervisor discarded the concrete failure stage')
+        self.assertEqual((diagnostic['stage'], diagnostic['reason']), ('namespace', 'os_error'))
+        self.assertEqual(diagnostic['errno'], errno.EACCES)
+        self.assertEqual(diagnostic['cleanup'], 'confirmed')
+        self.assertNotIn('private-token', str(frame))
+        self.assertNotIn('/private/company', str(frame))
+
     def test_stop_interrupts_concurrent_wait(self):
         sandbox = self.sandbox()
         launcher = sandbox.SandboxLauncher(self.policy())
@@ -340,6 +485,26 @@ class SandboxTests(unittest.TestCase):
             self.assertEqual(waiting.result(2), -9)
             self.assertEqual(handle.stop(), -9)
 
+    def test_supervisor_wait_os_error_has_private_diagnostics_without_changing_exception(self):
+        sandbox = self.sandbox()
+        launcher = sandbox.SandboxLauncher(self.policy())
+        launcher._semaphore.acquire()
+        parent, child = socket.socketpair()
+        self.addCleanup(child.close)
+        native = Mock(pid=100, returncode=0)
+        native.poll.return_value = 0
+        handle = sandbox.SandboxProcess(launcher, native, parent)
+        self.addCleanup(handle._close)
+        failure = OSError(errno.EBADF, 'private-token-/private/company')
+        with patch.object(sandbox.select, 'select', side_effect=failure):
+            with self.assertRaises(OSError) as caught:
+                handle.wait()
+        self.assertIs(caught.exception, failure)
+        diagnostic = getattr(failure, 'diagnostics', None)
+        self.assertIsNotNone(diagnostic, 'supervisor I/O failure discarded its private diagnosis')
+        self.assertEqual((diagnostic.stage, diagnostic.reason, diagnostic.errno), ('supervisor', 'os_error', errno.EBADF))
+        self.assertNotIn('private-token', str(diagnostic.as_dict()))
+
     def test_cleanup_failure_disables_launcher(self):
         sandbox = self.sandbox()
         launcher = sandbox.SandboxLauncher(self.policy())
@@ -349,10 +514,15 @@ class SandboxTests(unittest.TestCase):
         native = Mock(pid=100)
         native.wait.side_effect = subprocess.TimeoutExpired('supervisor', 1)
         handle = sandbox.SandboxProcess(launcher, native, parent)
-        with self.assertRaises(CoreError):
+        with self.assertRaises(CoreError) as caught:
             handle._emergency_cleanup()
         self.assertTrue(launcher._unhealthy)
         self.assertTrue(handle._closed)
+        diagnostic = getattr(caught.exception, 'diagnostics', None)
+        self.assertIsNotNone(diagnostic, 'unconfirmed cleanup lost its finite private diagnosis')
+        self.assertEqual((diagnostic.stage, diagnostic.reason, diagnostic.cleanup),
+                         ('cleanup', 'timeout', 'unconfirmed'))
+        self.assertEqual(caught.exception.data, {})
 
     def test_private_gate_rejects_eof_short_wrong_token_and_timeout(self):
         from core_agent import sandbox_exec
@@ -397,6 +567,112 @@ class SandboxTests(unittest.TestCase):
                         launcher.start(['true'], workspace_path='/unused', readonly_input_path='/unused/attachments')
                     self.assertEqual(caught.exception.code, 'EXECUTION_ENVIRONMENT_UNAVAILABLE'
                                      if explicit_no_exec else 'SIDE_EFFECT_UNKNOWN')
+
+    def test_private_supervisor_diagnosis_preserves_release_and_no_exec_proof(self):
+        sandbox = self.sandbox()
+        for explicit_no_exec in (False, True):
+            with self.subTest(no_exec=explicit_no_exec):
+                launcher = sandbox.SandboxLauncher(self.policy())
+                parent, child = socket.socketpair()
+                messages = [{'state': 'released'}, {'state': 'exited',
+                    'error': 'EXECUTION_ENVIRONMENT_UNAVAILABLE', 'not_executed': explicit_no_exec,
+                    'diagnostics': {'stage': 'target_exec', 'reason': 'os_error', 'errno': errno.ENOENT,
+                                    'elapsed_ms': 7, 'cleanup': 'confirmed'}}]
+                with patch.object(sandbox, '_check_native'), patch.object(sandbox, '_send'), \
+                        patch.object(sandbox.socket, 'socketpair', return_value=(parent, child)), \
+                        patch.object(sandbox.subprocess, 'Popen', return_value=Mock(pid=100, returncode=125)), \
+                        patch.object(sandbox.SandboxProcess, '_message', side_effect=messages):
+                    with self.assertRaises(CoreError) as caught:
+                        launcher.start(['private-argv'], workspace_path='/unused', readonly_input_path='/unused/attachments')
+                self.assertEqual(caught.exception.code, 'EXECUTION_ENVIRONMENT_UNAVAILABLE'
+                                 if explicit_no_exec else 'SIDE_EFFECT_UNKNOWN')
+                self.assertEqual(isinstance(caught.exception, ExecutionNotStarted), explicit_no_exec)
+                self.assertEqual(caught.exception.data, {})
+                diagnostic = getattr(caught.exception, 'diagnostics', None)
+                self.assertIsNotNone(diagnostic, 'wrapping the failure discarded its private diagnosis')
+                self.assertEqual(diagnostic.as_dict(), {'stage': 'target_exec', 'reason': 'os_error',
+                    'errno': errno.ENOENT, 'elapsed_ms': 7, 'cleanup': 'confirmed'})
+
+    def test_invalid_private_frame_cannot_export_extra_fields_or_paths(self):
+        sandbox = self.sandbox()
+        launcher = sandbox.SandboxLauncher(self.policy())
+        parent, child = socket.socketpair()
+        messages = [{'state': 'exited', 'error': 'EXECUTION_ENVIRONMENT_UNAVAILABLE', 'not_executed': True,
+            'diagnostics': {'stage': '/private/company', 'reason': 'private-token', 'elapsed_ms': True,
+                            'cleanup': 'confirmed', 'stderr': 'private-token'}}]
+        with patch.object(sandbox, '_check_native'), patch.object(sandbox, '_send'), \
+                patch.object(sandbox.socket, 'socketpair', return_value=(parent, child)), \
+                patch.object(sandbox.subprocess, 'Popen', return_value=Mock(pid=100, returncode=125)), \
+                patch.object(sandbox.SandboxProcess, '_message', side_effect=messages):
+            with self.assertRaises(ExecutionNotStarted) as caught:
+                launcher.start(['true'], workspace_path='/unused', readonly_input_path='/unused/attachments')
+        diagnostic = getattr(caught.exception, 'diagnostics', None)
+        self.assertIsNotNone(diagnostic, 'invalid private metadata must produce a finite protocol diagnosis')
+        self.assertEqual((diagnostic.stage, diagnostic.reason), ('supervisor', 'protocol_invalid'))
+        self.assertEqual(caught.exception.data, {})
+        self.assertNotIn('private-token', str(diagnostic.as_dict()))
+        self.assertNotIn('/private/company', str(diagnostic.as_dict()))
+
+    def test_private_diagnostic_type_is_immutable_and_rejects_unbounded_values(self):
+        from core_agent import errors
+        diagnostic_type = getattr(errors, 'SandboxDiagnostics', None)
+        self.assertIsNotNone(diagnostic_type, 'typed private sandbox diagnostics are missing')
+        values = {'stage': 'network', 'reason': 'child_exit', 'returncode': 125,
+                  'elapsed_ms': 4, 'cleanup': 'confirmed'}
+        diagnostic = diagnostic_type(**values)
+        self.assertEqual(diagnostic.as_dict(), values)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            diagnostic.stage = 'cleanup'
+        for changes in ({'stage': '/private/company'}, {'reason': 'private-token'},
+                        {'elapsed_ms': True}, {'elapsed_ms': float('nan')}, {'elapsed_ms': -1},
+                        {'errno': 0}, {'errno': 4096}, {'returncode': 256}, {'cleanup': 'private-token'},
+                        {'pids_current': -1}, {'memory_current_bytes': 2**63}, {'stderr': 'private-token'}):
+            with self.subTest(fields=tuple(changes)):
+                with self.assertRaises((TypeError, ValueError)):
+                    diagnostic_type(**{**values, **changes})
+        class UntrustedString(str):
+            pass
+        for field in ('stage', 'reason', 'cleanup'):
+            with self.subTest(field=field), self.assertRaises((TypeError, ValueError)):
+                diagnostic_type(**{**values, field: UntrustedString(values[field])})
+        error = CoreError('EXECUTION_ENVIRONMENT_UNAVAILABLE', diagnostics=diagnostic)
+        self.assertIs(error.diagnostics, diagnostic)
+        self.assertEqual(error.data, {})
+        untrusted = CoreError('EXECUTION_ENVIRONMENT_UNAVAILABLE', diagnostics={'stderr': 'private-token'})
+        self.assertIsNone(untrusted.diagnostics)
+        self.assertEqual(untrusted.data, {})
+
+    def test_optional_resource_snapshot_is_numeric_bounded_and_ignores_unlimited_or_unavailable(self):
+        sandbox = self.sandbox()
+        values = {'memory.current': '128\n', 'memory.max': 'max\n', 'pids.current': '12\n',
+                  'pids.max': '64\n', 'memory.events': 'oom 3\noom_kill 2\n'}
+        def source(path, **kwargs):
+            self.assertTrue(path.startswith('/sys/fs/cgroup/'))
+            return io.StringIO(values[Path(path).name])
+        with patch('builtins.open', side_effect=source):
+            snapshot = sandbox._resource_stats()
+        self.assertEqual(snapshot, {'memory_current_bytes': 128, 'pids_current': 12,
+                                    'pids_limit': 64, 'oom_kill_count': 2})
+        values.update({'memory.current': '9' * 40, 'pids.current': 'private-token', 'pids.max': '0',
+                       'memory.events': 'oom_kill private-token'})
+        with patch('builtins.open', side_effect=source):
+            self.assertEqual(sandbox._resource_stats(), {})
+        with patch('builtins.open', side_effect=PermissionError('private-token-/private/company')):
+            self.assertEqual(sandbox._resource_stats(), {})
+
+    def test_known_timeout_errno_remains_available_without_exception_text(self):
+        diagnostic = self.sandbox()._diagnostics('network', TimeoutError(errno.ETIMEDOUT, 'private-token'),
+                                                time.monotonic(), 'confirmed')
+        self.assertEqual(diagnostic.reason, 'timeout')
+        self.assertEqual(diagnostic.errno, errno.ETIMEDOUT)
+        self.assertNotIn('private-token', str(diagnostic.as_dict()))
+
+    def test_private_diagnostic_cannot_claim_cleanup_after_reported_failure(self):
+        frame = {'cleanup_failed': True, 'diagnostics': {'stage': 'network', 'reason': 'child_exit',
+                  'elapsed_ms': 1, 'cleanup': 'confirmed'}}
+        diagnostic = self.sandbox()._frame_diagnostics(frame, time.monotonic())
+        self.assertEqual((diagnostic.stage, diagnostic.reason, diagnostic.cleanup),
+                         ('supervisor', 'protocol_invalid', 'unconfirmed'))
 
     def test_close_attempts_every_owned_process_after_cleanup_error(self):
         launcher = self.sandbox().SandboxLauncher(self.policy())

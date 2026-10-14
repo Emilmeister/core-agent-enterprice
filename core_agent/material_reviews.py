@@ -304,6 +304,15 @@ class _MaterialReviews:
                 )
                 row["wait_id"] = wait.wait_id
             self._save(row, conn)
+            data = {key: row[key] for key in ("review_id", "source_id", "source_kind", "attempts_used", "input_tokens_used")}
+            data.update({key: row["classification"][key] for key in
+                         ("verdict", "reason", "prompt_tokens", "completion_tokens", "elapsed_seconds")})
+            data["detector_deadline"] = row["deadline"]
+            if row["wait_id"]:
+                data.update(wait_id=wait.wait_id, owner_deadline=wait.deadline)
+            self.workflow.record_guardrail_event(current, "guardrail.classified", data, connection=conn)
+            if row["wait_id"]:
+                self.workflow.record_guardrail_event(current, "guardrail.wait.entered", data, connection=conn)
             return _public(row)
 
     def classify(self, record, review_id, classifier, *, lease_token, continuation, snapshot,
@@ -350,15 +359,19 @@ class MemoryMaterialReviewStore(_MaterialReviews):
                 raise CoreError("MATERIAL_REVIEW_NOT_FOUND")
             if lease_token == "":
                 raise CoreError("LEASE_LOST")
-            # Roll back the only cross-store mutation (enter_wait) if persistence fails.
-            rows = deepcopy(self.rows)
-            records, waits, leases = (deepcopy(getattr(self.workflow, name))
+            # Saved rows are replaced, never mutated; rollback needs no private-payload clones.
+            # ponytail: shallow collection checkpoints, per-run journals if this test adapter grows.
+            rows = dict(self.rows)
+            records, waits, leases = (dict(getattr(self.workflow, name))
                                      for name in ("_records", "_waits", "_leases"))
+            diagnostics = list(self.workflow._guardrail_events)
             try:
-                yield current, None
+                with self.workflow.defer_public_output():
+                    yield current, None
             except BaseException:
                 self.rows = rows
                 self.workflow._records, self.workflow._waits, self.workflow._leases = records, waits, leases
+                self.workflow._guardrail_events = diagnostics
                 raise
 
     def _now(self, conn):

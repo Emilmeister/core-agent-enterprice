@@ -25,7 +25,7 @@ from core_agent.durability import (
     LeaseManager,
     RecoveryManager,
 )
-from core_agent.errors import CoreError
+from core_agent.errors import CoreError, SandboxDiagnostics
 from core_agent.mcp import InMemoryMcpConnector
 from core_agent.kernel import KernelCompiler
 from core_agent.model import (
@@ -2695,6 +2695,7 @@ class RuntimeTests(unittest.TestCase):
             raise CoreError(
                 "TOOL_START_FAILED",
                 "No such file or directory: 'echo && hello-tool-check && pwd'",
+                diagnostics=SandboxDiagnostics("network", "timeout", 60000, "confirmed"),
             )
 
         agent.tool_runtime.environment_manager.execute_transient = fail_before_start
@@ -2716,6 +2717,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(
             tool_span.attributes["core_agent.error.code"], "TOOL_START_FAILED"
         )
+        self.assertEqual(tool_span.attributes["core_agent.sandbox.stage"], "network")
+        self.assertEqual(tool_span.attributes["core_agent.sandbox.reason"], "timeout")
+        self.assertEqual(tool_span.attributes["core_agent.sandbox.elapsed_ms"], 60000)
+        self.assertEqual(tool_span.attributes["core_agent.sandbox.cleanup"], "confirmed")
+        log = next(attributes for name, attributes in exporter.logs if name == "sandbox.failed")
+        self.assertEqual(tool_span.attributes["tool.name"], "core_terminal_exec")
+        self.assertEqual(log["span_id"], tool_span.context.span_id)
+        self.assertEqual(log["trace_id"], tool_span.context.trace_id)
+        self.assertEqual(log["core_agent.sandbox.stage"], "network")
+        self.assertEqual(log["core_agent.sandbox.elapsed_ms"], 60000)
+        self.assertNotIn("core_agent.sandbox", model.calls[1].context)
+        self.assertNotIn('"diagnostics"', model.calls[1].context)
+        self.assertNotIn("diagnostics", result.__dict__)
 
     def test_mutating_tool_exception_aborts_with_unknown_side_effect(self):
         model = ScriptedModel(

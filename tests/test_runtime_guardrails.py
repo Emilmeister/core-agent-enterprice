@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from core_agent.guardrails import GuardrailClassifier
 from core_agent.material_reviews import MemoryMaterialReviewStore
 from core_agent.model import ModelResponse
+from core_agent.observability import FailingExporter, RecordingExporter, Telemetry
 from core_agent.workflow import SuspendedRun
 from tests import test_tool_approvals as approvals
 from tests import test_python_waits as python_waits
@@ -34,6 +35,69 @@ class RuntimeGuardrailTests(unittest.TestCase):
         agent.guardrail_classifier = GuardrailClassifier(detector, clock=lambda: self.now[0])
         agent.material_review_store = MemoryMaterialReviewStore(agent.workflow_store)
         return detector
+
+    def test_committed_guardrail_spans_correlate_wait_recovery_without_private_content(self):
+        agent, model = self.app(ModelResponse(message="done"))
+        exporter = RecordingExporter()
+        agent.telemetry = Telemetry(exporter)
+        detector = self.guard(agent, "suspicious")
+        sleeping = self.start(agent)
+        spans = [span for span in exporter.spans if span.name.startswith("core_agent.guardrail.")]
+        self.assertEqual([span.name for span in spans], ["core_agent.guardrail.classified", "core_agent.guardrail.wait.entered"])
+        self.assertEqual(spans[0].attributes["core_agent.guardrail.verdict"], "suspicious")
+        self.assertEqual(spans[0].attributes["core_agent.guardrail.reason"], "suspicious")
+        self.assertEqual(spans[1].attributes["core_agent.guardrail.wait_id"], sleeping.wait_id)
+        self.assertEqual(spans[1].attributes["core_agent.guardrail.owner_deadline"] - self.now[0], 86400)
+        self.assertEqual(spans[0].attributes["core_agent.guardrail.detector_deadline"] - self.now[0], 60)
+        self.assertGreaterEqual(spans[0].attributes["core_agent.guardrail.elapsed_seconds"], 0)
+        self.assertEqual(model.calls, ())
+        self.resolve(agent, sleeping, "allowed")
+        agent._runtime_cache.clear()
+        self.assertEqual(agent.resume_task("task").message, "done")
+        spans = [span for span in exporter.spans if span.name.startswith("core_agent.guardrail.")]
+        self.assertEqual([span.name for span in spans].count("core_agent.guardrail.wait.resolved"), 1)
+        self.assertEqual([span.name for span in spans].count("core_agent.guardrail.wait.applied"), 1)
+        self.assertEqual(detector.generate.call_count, 1)
+        self.assertEqual(len({span.attributes["core_agent.diagnostic.event_id"] for span in spans}), len(spans))
+        encoded = json.dumps([span.attributes for span in spans])
+        for private in ("perform task", "content_digest", "material_digest", "payload", "answer"):
+            self.assertNotIn(private, encoded)
+        agent.resume_task("task")
+        self.assertEqual(len([span for span in exporter.spans if span.name.startswith("core_agent.guardrail.")]), len(spans))
+
+    def test_guardrail_export_failure_does_not_undo_task_and_terminal_read_retries(self):
+        agent, model = self.app(ModelResponse(message="done"))
+        agent.telemetry = Telemetry(FailingExporter())
+        self.guard(agent, "clear")
+        result = self.start(agent)
+        self.assertEqual(result.message, "done")
+        self.assertEqual(len(model.calls), 1)
+        exporter = RecordingExporter()
+        agent.telemetry = Telemetry(exporter)
+        self.now[0] += 2
+        self.assertEqual(agent.resume_task("task").message, "done")
+        spans = [span for span in exporter.spans if span.name.startswith("core_agent.guardrail.")]
+        self.assertEqual([span.name for span in spans], ["core_agent.guardrail.classified"])
+
+    def test_terminal_diagnostic_recovery_is_company_scoped_and_does_not_call_model(self):
+        agent, model = self.app(ModelResponse(message="done"))
+        agent.telemetry = Telemetry(FailingExporter())
+        self.guard(agent, "clear")
+        self.start(agent)
+        agent.material_review_store = MemoryMaterialReviewStore(agent.workflow_store)
+        agent._runtime_cache.clear()
+        exporter = RecordingExporter()
+        agent.telemetry = Telemetry(exporter)
+        self.now[0] += 2
+        agent.recovery_tenant_id = "foreign"
+        agent._recover_workflows_once()
+        self.assertFalse(any(span.name.startswith("core_agent.guardrail.") for span in exporter.spans))
+        agent.recovery_tenant_id = "company"
+        agent._recover_workflows_once()
+        agent._recover_workflows_once()
+        spans = [span for span in exporter.spans if span.name.startswith("core_agent.guardrail.")]
+        self.assertEqual([span.name for span in spans], ["core_agent.guardrail.classified"])
+        self.assertEqual(len(model.calls), 1)
 
     def test_initial_material_is_private_until_owner_resolution(self):
         agent, model = self.app(ModelResponse(message="done"))
