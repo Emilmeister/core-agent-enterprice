@@ -63,4 +63,6 @@ Files: `core_agent/remote_agents.py`, `core_agent/remote_artifacts.py`, `core_ag
 
 - [x] Run canonical Ruff and complete unittest gates; run the affected real PostgreSQL and Compose/native sandbox checks.
 - [x] Update implementation status only for proof that enters the normal CI gate; update AGENTS/README for actual changes.
-- [ ] Save reviewed logical commits, merge the feature branch into `main`, and rebuild the local Compose image with the existing private configuration.
+- [x] Save reviewed logical commits, merge the feature branch into `main`, and rebuild the local Compose image with the existing private configuration.
+
+Local rollout verification: the running Compose agent uses the tested native arm64 image; readiness, UI and owner authentication passed. A real provider response completed as a stable final Message without implicit Artifacts. The initial guardrail classifier reached its configured 60-second timeout; the known test input was approved through the owner API before execution resumed. Security settings and existing volumes were preserved.
