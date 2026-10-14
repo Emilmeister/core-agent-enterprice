@@ -837,3 +837,25 @@ implemented. Automated proofs MUST входить в обычные applicable g
   Policy deny, HITL/refusal/timeout, guardrail refusal, malformed arguments и
   exhausted tool budget предотвращают новую публикацию; existing accepted output
   сохраняется. Local/shared usage и honest partial completion остаются canonical.
+
+## Диагностика guardrails и sandbox
+
+- [ ] ENT-AC-105: memory и PostgreSQL сохраняют committed classification/wait
+  events атомарно, включая clear без workflow-version bump. Rollback убирает
+  событие и решение; повторное finish/resolve/recovery не создаёт нового durable
+  event. Phoenix spans и logs показывают finite verdict/reason/source, два
+  разных deadlines, ожидание/решение/применение с stable IDs. Exporter outage
+  не влияет на Task и оставляет bounded private delivery для следующей попытки;
+  foreign-company rows, material payload/digest, paths, аргументы, owner answer
+  и raw provider errors закрыты даже при включённом content capture. Diagnostic
+  outbox не попадает в public A2A/push/model проекции; schema upgrades не нужны.
+- [ ] ENT-AC-106: ошибки native check, очереди, supervisor/namespace/network,
+  target exec и cleanup дают безопасные operator stage/reason/time/errno/exit
+  attributes и отдельный cleanup outcome. Malformed/private frames и отсутствие
+  resource counters не раскрывают текст/paths и не ломают execution. Wrapping
+  terminal/Python сохраняет private диагностику и прежний public payload.
+  Фактический pre-exec refusal остаётся ExecutionNotStarted; после release с
+  неизвестным исходом остаётся SIDE_EFFECT_UNKNOWN, неподтверждённая смерть
+  оставляет launcher unhealthy/quarantined. Native amd64/arm64 Linux gate
+  проверяет реальные terminal/Python/background execution и cleanup; новые
+  диагностические поля не служат основанием для retry или ослабления sandbox.

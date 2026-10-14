@@ -232,3 +232,52 @@ Audit record SHOULD хранить trace/span IDs для перехода от p
 Versioned eval hooks измеряют task completion, compaction fidelity, hybrid retrieval/rerank quality, NER/entity resolution, tool correctness, false allow/deny, subagent focus, duplicate side effects и cost/latency.
 
 Eval data подчиняется тем же ACL/retention. Evaluation output не становится memory без отдельного validated memory write.
+
+## Диагностика guardrails и sandbox
+
+### OBS-DIAG-01. Сохранённые решения и ожидания guardrails
+
+Каждая завершённая классификация MUST создавать внутреннее событие
+`guardrail.classified`, включая `clear` без ожидания. Событие, классификация и
+создание необходимого wait MUST сохраняться атомарно; rollback не оставляет
+ложного успешного события. Запись диагностики не должна искусственно менять
+workflow version, расходовать model turn или повторять detector call.
+
+Вход в ожидание, его разрешение и применение результата MUST различаться как
+`guardrail.wait.entered`, `guardrail.wait.resolved`, `guardrail.wait.applied`.
+События содержат stable event/review/wait/run/task IDs по применимости, тип
+источника, разрешённые verdict/reason/outcome, counters и elapsed time.
+Detector deadline и deadline решения владельца MUST иметь разные имена.
+Повторное разрешение/recovery не создаёт нового durable события того же решения.
+
+Только committed внутренние события экспортируются в operator logs и OTel
+spans, доступные Phoenix. Они MUST NOT проходить через публичные A2A/push/model
+проекции или содержать payload, digest материала, paths, tool arguments, ответы
+владельцев, свободный текст классификатора либо raw provider errors. Export и
+recovery ограничены исходной company; IDs запрещены как labels метрик.
+Для private доставки MAY использоваться существующий outbox с отдельным типом
+aggregate. Экспорт bounded и best effort: exporter failure не отменяет решение,
+не блокирует agent loop и не обещает exactly-once OTLP delivery. Повторная
+телеметрия сохраняет исходный event ID. Durable событие остаётся источником истины.
+
+### OBS-DIAG-02. Причина отказа обязательного sandbox
+
+Trusted supervisor и launcher MUST сохранять и передавать private диагностику:
+конечные allowlisted stage/reason, elapsed time, безопасные errno/exit status
+при наличии и отдельный cleanup outcome. Этапы покрывают native check, очередь,
+supervisor, namespace, сеть, target exec и cleanup. Непроверенные frames и
+произвольные строки не становятся диагностическими attributes.
+
+Operator event MUST связывать отказ с текущим execution/run/tool trace по
+применимости, не раскрывая argv, environment, workspace paths, user code,
+raw stderr или exception message. Optional bounded numeric snapshots available
+slots, cgroup memory/PIDs и OOM counters MAY дополнять событие; недоступность
+снимка не меняет запуск или результат команды. Unknown/unlimited значения не
+выдаются за конечные измеренные ограничения.
+
+Диагностика MUST NOT менять public error code/message/data, `not_executed`
+proof, release barriers, quarantine, подтверждение смерти процессов или
+решение о retry. До доказанного старта остаётся `ExecutionNotStarted`; после
+неопределённого исполнения сохраняется `SIDE_EFFECT_UNKNOWN`, а неподтверждённый
+cleanup оставляет launcher unhealthy. Новые attributes являются внутренними;
+они проходят проверку finite schema даже при выключенном content capture.
