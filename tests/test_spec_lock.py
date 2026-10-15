@@ -8,7 +8,7 @@ SPEC_ROOT = Path(__file__).resolve().parents[1] / "spec"
 EXPECTED_SHA256 = {
     "README.md": "333d8c714dd14322f1c52373aad8f414ae4f7174c0a3f0c32b7e8f5d5f12ba65",
     "a2a-protocol.md": "89f8728dcc7204bfdf4a513afb763aa20fc6c9767ff7c8db19068a406782b727",
-    "acceptance.md": "1b416801c7de53ed56534ab304a3ff927d6d7c11869a221adf09583b85d379fc",
+    "acceptance.md": "95fe84a731e0890b56dce535f45cc93564dbb1735b83fed69536b0702b63791b",
     "agent-configuration.md": "423c96909a33039b47f35d82672a85e57362e55e2f2efd1c3981e9393283361b",
     "architecture.md": "62b45026b159815a5494967105d9ce72981fcc5247df16eae0f09477cfec5090",
     "artifacts.md": "c7448130052c9920ee2626e6442032903480f7dfa93dd00bacf1e826c2a27c41",
@@ -19,7 +19,7 @@ EXPECTED_SHA256 = {
     "kernel-instructions.md": "f8fd3c248305c7d0d397d2272b58bdf56bfbcaed99d7b0f6c4c6aaccc17ab0b3",
     "memory-service.md": "454b5b741e90df5216ac1904e6fb17801bde876204bb0c369bf5e8923d775fd7",
     "observability.md": "151f1aaa1afd10bdec6f2e18381394e2e3803e3da147af2e3c998517599ab9d9",
-    "product.md": "c13c57f37a78c746d18fed0b7f8c9c5a1025b8f1ca075aa5e7df414497d2b1c3",
+    "product.md": "3916010dbdf3c6ba47d19af3fbb11c9de05be75ad3ec777aa269d39551c5ae79",
     "public-contract.md": "82cc57dab408ac74f65b91cb987b1af35393722399b6b9895c192e65c950f7f2",
     "releases/v1.md": "b1c67b942375c6116c0f5d55213d3bdb3c45c6c49d54d0ae91f7f2a0df33933d",
     "runtime.md": "1cfa4409e565210fad19cf57a61eec050d7fdf795fc66eb4593c81b51856e91f",

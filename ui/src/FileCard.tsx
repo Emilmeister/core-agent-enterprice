@@ -1,3 +1,4 @@
+import { DetailsIcon } from "./DetailsIcon";
 import { useLayoutEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
 import { formatFileSize, publicHistoryItems } from "./types";
@@ -147,9 +148,7 @@ export function FileCard({ api, contextId, taskId, file, downloadPath, available
       </div>
     </div>}
     {error && <p className="error" role="alert">{error}</p>}
-    <details className="file-properties"><summary>
-      <svg className="disclosure-chevron" viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m11 8 6 6-6 6" /></svg>
-      Свойства файла</summary><dl>
+    <details className="file-properties"><summary className="details-toggle" aria-label="Свойства файла" title="Свойства файла"><DetailsIcon /></summary><dl>
       {!responseFile && <><dt>Путь</dt><dd>{file.relative_path}</dd></>}
       {responseFile && <><dt>ID</dt><dd>{file.file_id}</dd></>}
       <dt>Размер в байтах</dt><dd>{file.size_bytes}</dd><dt>SHA-256</dt><dd>{file.sha256}</dd>

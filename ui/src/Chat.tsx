@@ -8,7 +8,7 @@ import {
 } from "react";
 import { Api, ApiError, errorText } from "./api";
 import { Attachments, ConversationFiles, History, pendingAction, useChatHistory } from "./History";
-import { actionLabel } from "./toolPresentation";
+import { actionLabel, awaitingModelReply } from "./toolPresentation";
 import { WorkspaceFiles } from "./WorkspaceFiles";
 import { Markdown } from "./Markdown";
 import { chatStreamEvent, nextLiveAnswer } from "./chatStream";
@@ -692,6 +692,11 @@ export function Chat({
             ? "Ответ подготовлен. Загружаем сохранённый результат…" : "Предварительный ответ · формируется"}</p>
           <div className="prose">{liveText}</div>
         </article>}
+        {awaitingModelReply(task, !!activeWait || !!currentAction || peers.length > 0 || !!timerUntil || !!error) && (
+          <div className="typing-indicator" role="status" aria-label="Агент готовит ответ">
+            <span aria-hidden="true" /><span aria-hidden="true" /><span aria-hidden="true" />
+          </div>
+        )}
         {directAnswer && (
           <article className="message result">
             <Markdown text={directAnswer} />

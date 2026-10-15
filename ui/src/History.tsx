@@ -1,3 +1,5 @@
+import { DetailsIcon } from "./DetailsIcon";
+import { matchingActionWait } from "./toolPresentation";
 import { Markdown } from "./Markdown";
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
@@ -318,13 +320,21 @@ export function History({
           else blocks.push([entry]);
         }
         function renderEntry({ item, action }: HistoryEntry) {
+          const pending = action && !action.result && !terminal?.outcome
+            ? matchingActionWait(action.callId, waits) : undefined;
+          if (pending?.kind === "tool_approval" && pending.deadline * 1000 > Date.now() && !rendered.has(pending.wait_id)) {
+            rendered.add(pending.wait_id);
+            return <div key={action!.key} data-history-id={item.id}>
+              <InteractionCard api={api} item={pending} refresh={refresh} />
+            </div>;
+          }
           const peer = onPeerOpen && peerConversations.find((value) => value.operation_id === peerOperationId(action));
           const review = item.review && !rendered.has(item.review.wait_id) ? reviews.get(item.review.wait_id) : undefined;
           if (review) rendered.add(review.wait_id);
           return <Fragment key={action?.key ?? item.id}>
             {action && peer && onPeerOpen ? <div className="peer-conversation-action" data-history-id={item.id}>
               <PeerConversationCard conversation={peer} onOpen={onPeerOpen} />
-              <details className="peer-action-details"><summary>Технические данные поручения</summary>
+              <details className="peer-action-details"><summary className="details-toggle" aria-label="Технические данные поручения" title="Технические данные поручения"><DetailsIcon /></summary>
                 <ActionCard action={action} terminal={terminal} waits={waits} onOpen={() => setSelectedAction(action.key)} />
               </details>
             </div> : action ? <ActionCard action={action} terminal={terminal} waits={waits} onOpen={() => setSelectedAction(action.key)} />
@@ -345,7 +355,7 @@ export function History({
                 </div>
               </details> : renderEntry(block[0]))}
             {interactions
-              .filter((item) => !linked.has(item.wait_id))
+              .filter((item) => !linked.has(item.wait_id) && !rendered.has(item.wait_id))
               .map((item) => (
                 <InteractionCard
                   key={item.wait_id}

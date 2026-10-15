@@ -1,3 +1,4 @@
+import { DetailsIcon } from "./DetailsIcon";
 import { useEffect, useRef, useState } from "react";
 import { Api, ApiError, errorText } from "./api";
 import type { Interaction } from "./types";
@@ -47,7 +48,7 @@ export function InteractionCard({
   const preview = actionPreview(toolName, args);
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const titles = {
-    tool_approval: "Разрешение на действие",
+    tool_approval: toolName === "core_ask_owner" ? "Разрешить задать уточняющий вопрос?" : actionLabel(toolName, args),
     owner_question: "Вопрос к вам",
     guardrail: "Проверка материала",
   };
@@ -121,30 +122,31 @@ export function InteractionCard({
   }
   if (item.outcome && item.kind !== "owner_question") return null;
   return (
-    <article id={`interaction-${item.wait_id}`} tabIndex={-1}
+    <article id={`interaction-${item.wait_id}`} tabIndex={-1} data-kind={item.kind}
       className={`interaction ${closed ? "resolved" : ""}`}>
-      <div className="eyebrow">
+      <div className="interaction-status">
         {item.outcome
           ? "Решение сохранено"
           : expired
             ? "Срок ожидания истёк"
-            : "Нужно ваше решение"}
+            : item.kind === "owner_question" ? "Нужен ваш ответ" : "Нужно ваше разрешение"}
       </div>
       <h3>{titles[item.kind] ?? "Ожидание"}</h3>
       {item.kind === "tool_approval" && (
         <>
-          <h4 className="interaction-heading">{actionLabel(toolName, args)}</h4>
           {preview.length > 0 && (
             <dl className="action-preview">
               {preview.map((field, index) => (
                 <div className="action-field" key={`${field.label}:${index}`}>
-                  <dt>{field.label}</dt>
-                  <dd>{field.value}</dd>
+                  <dt className={field.label === "Вопрос" ? "sr-only" : undefined}>{field.label}</dt>
+                  <dd className="prose">{field.value}</dd>
                 </div>
               ))}
             </dl>
           )}
-          <p className="muted">Разрешение относится только к этому вызову. Результат появится после выполнения.</p>
+          <p className="muted interaction-explanation">{toolName === "core_ask_owner"
+            ? "Разрешение позволит агенту задать этот вопрос. Сам ответ можно будет написать следующим шагом."
+            : "Разрешение относится только к этому вызову. Результат появится после выполнения."}</p>
         </>
       )}
       {typeof item.subject.question === "string" && (
@@ -156,12 +158,14 @@ export function InteractionCard({
           доверяете содержимому.
         </p>
       )}
-      <p className="muted">
-        Ответить до {new Date(item.deadline * 1000).toLocaleString("ru-RU", { timeZoneName: "short" })} · {timezone}
+      <p className="muted interaction-deadline" title={timezone}>
+        Ответить до <time dateTime={new Date(item.deadline * 1000).toISOString()}>{new Date(item.deadline * 1000).toLocaleString("ru-RU", {
+          day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+        })}</time>
       </p>
       {item.kind !== "owner_question" && (
-        <details>
-          <summary>Технические данные</summary>
+        <details className="interaction-details">
+          <summary className="details-toggle" aria-label="Технические данные" title="Технические данные"><DetailsIcon /></summary>
           <pre>{JSON.stringify(item.subject, null, 2)}</pre>
         </details>
       )}

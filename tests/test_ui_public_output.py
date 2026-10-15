@@ -43,3 +43,30 @@ assert.equal(responseArtifacts([artifact])[0].parts[0].type,"data");
         result = subprocess.run(["node", "--input-type=module", "-e", script], cwd=root,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_pending_interaction_and_reply_activity(self):
+        root = Path(__file__).resolve().parents[1]
+        script = r'''
+import assert from "node:assert/strict";
+import { matchingActionWait, awaitingModelReply } from "./ui/src/toolPresentation.ts";
+const wait = {wait_id:"wait", source_id:"call", subject:{}, kind:"tool_approval"};
+assert.equal(matchingActionWait("call",[wait]),wait);
+assert.equal(matchingActionWait("other",[wait]),undefined);
+assert.equal(matchingActionWait(undefined,[wait]),undefined);
+assert.equal(matchingActionWait("call",[{...wait,outcome:{reason:"rejected"}}]),undefined);
+for (const subject of [{tool_call_id:"call"},{call:{id:"call"}}, {source_id:"arguments:call"},{source_id:"result:call"}]) {
+  const linked = {...wait,source_id:"unrelated",subject};
+  assert.equal(matchingActionWait("call",[linked]),linked);
+}
+for (const state of ["TASK_STATE_WORKING","TASK_STATE_SUBMITTED"]) {
+  assert.equal(awaitingModelReply({status:{state}},false),true);
+  assert.equal(awaitingModelReply({status:{state}},true),false);
+}
+for (const state of ["TASK_STATE_COMPLETED","TASK_STATE_FAILED","TASK_STATE_CANCELED","TASK_STATE_REJECTED","TASK_STATE_INPUT_REQUIRED","TASK_STATE_AUTH_REQUIRED"]) {
+  assert.equal(awaitingModelReply({status:{state}},false),false);
+}
+assert.equal(awaitingModelReply(undefined,false),false);
+'''
+        result = subprocess.run(["node", "--input-type=module", "-e", script], cwd=root,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)

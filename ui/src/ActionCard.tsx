@@ -1,6 +1,7 @@
+import { DetailsIcon } from "./DetailsIcon";
 import { useId, useLayoutEffect, useRef } from "react";
 import { createPortal } from "react-dom";
-import { actionLabel, actionPreview } from "./toolPresentation";
+import { actionLabel, actionPreview, matchingActionWait } from "./toolPresentation";
 import type { HistoryItem, Interaction } from "./types";
 import { publicHistoryItems } from "./types";
 import { CodeBlock } from "./Code";
@@ -141,10 +142,7 @@ export function actionState(action: HistoryAction, terminal?: HistoryItem, waits
     }
     return { kind: "unknown", label: "Исход не определён", reason: `${error ? error + " · " : ""}Статус результата недоступен. ${verify}` };
   }
-  const wait = waits.find((item) => !item.outcome
-    && action.callId !== undefined && (item.source_id === action.callId || item.subject.tool_call_id === action.callId
-      || object(item.subject.call)?.id === action.callId || item.subject.source_id === "arguments:" + action.callId
-      || item.subject.source_id === "result:" + action.callId));
+  const wait = matchingActionWait(action.callId, waits);
   if (wait) return { kind: "waiting", label: wait.kind === "tool_approval" ? "Нужно ваше разрешение"
     : wait.kind === "owner_question" ? "Ожидает вашего ответа" : "Ожидает проверки материала" };
   if (terminal?.outcome || action.raw) return { kind: "unknown", label: "Исход не определён",
@@ -209,7 +207,7 @@ export function ActionDialog({ action, terminal, waits, onClose }: ActionProps &
             {output?.truncated === true && <p className="muted">Вывод ограничен при выполнении действия.</p>}
           </> : <pre>{typeof action.result?.output === "string" ? action.result.output : JSON.stringify(action.result?.output, null, 2)}</pre>}
         </section>}
-        <section className="action-technical"><h3>Технические данные</h3><dl>
+        <section className="action-technical"><h3 className="technical-icon-heading" aria-label="Технические данные" title="Технические данные"><DetailsIcon /></h3><dl>
           <dt>Инструмент</dt><dd>{action.name || "Неизвестен"}</dd>
           <dt>Аргументы</dt><dd><pre>{action.args === undefined ? "Недоступны" : JSON.stringify(action.args, null, 2)}</pre></dd>
           <dt>ID вызова</dt><dd>{action.callId ?? "Недоступен"}</dd><dt>ID задачи</dt><dd>{action.taskId ?? "Недоступен"}</dd>

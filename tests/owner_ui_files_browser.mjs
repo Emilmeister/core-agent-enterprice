@@ -154,7 +154,7 @@ try {
   await page.click('Отправить ↑');
   await page.wait("document.querySelector('.thread')?.textContent.includes('report_2.txt')",'root safe file receipt');
   check(posts.length===1&&posts[0].parts.length===2&&posts[0].parts.every(part=>typeof part.raw==='string'&&part.filename==='report.txt'&&part.mediaType==='text/plain'&&!('text' in part)),'files-only official A2A 1.0 raw Parts reach actual backend');
-  await page.wait("[...document.querySelectorAll('.interaction:not(.resolved)')].some(card=>card.querySelector('h3')?.textContent==='Разрешение на действие')",'actual owner tool approval wait');
+  await page.wait("!!document.querySelector('.interaction[data-kind=tool_approval]:not(.resolved)')",'actual owner tool approval wait');
   check(await page.evaluate("document.querySelector('.pending-interaction-bar')?.textContent.includes('Требуется ваше разрешение') && document.querySelector('.interaction .action-preview')?.textContent.includes('python3') && document.querySelector('.interaction')?.textContent.includes('Ответить до')"),'active approval explains saved command, deadline and one-call consequences');
   await page.click('Перейти к запросу');
   check(await page.evaluate("document.activeElement?.classList.contains('interaction')"),'approval jump moves keyboard focus to its actual request');
@@ -451,7 +451,7 @@ try {
   await page.wait("!document.querySelector('.history-refresh:disabled')",'history refresh finished');
   check(await page.evaluate(`document.querySelector('.diagram img')?.src===${JSON.stringify(diagramURL)} && document.querySelector('.diagram img').naturalWidth>0`),'history refresh preserves the rendered Mermaid image');
   check(approvals===4,'actual owner decisions resume both native reads, snapshot selection and source deletion');
-  check(await page.evaluate("![...document.querySelectorAll('.interaction.resolved')].some(card=>['Разрешение на действие','Проверка материала'].includes(card.querySelector('h3')?.textContent))"),'completed approval cards disappear while native decisions remain persisted');
+  check(await page.evaluate("!document.querySelector('.interaction.resolved[data-kind=tool_approval],.interaction.resolved[data-kind=guardrail]')"),'completed approval cards disappear while native decisions remain persisted');
   await page.call('Page.reload');
   await page.wait("!!document.querySelector('.chat-link')",'persisted company chat after browser reload');
   await page.evaluate("document.querySelector('.chat-link').click()");

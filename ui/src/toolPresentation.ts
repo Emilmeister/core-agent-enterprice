@@ -1,3 +1,5 @@
+import type { Interaction, Task } from "./types";
+
 const labels: Record<string, string> = {
   core_terminal_exec: "Выполнение команды",
   core_python_exec: "Выполнение Python",
@@ -105,4 +107,17 @@ export function actionPreview(name: string, args: unknown): Array<{ label: strin
   if (name === "core_task_start" && typeof values.tool === "string" && values.tool !== name)
     preview.push(...actionPreview(values.tool, values.arguments));
   return preview;
+}
+
+// The caller supplies waits scoped to the action's Task, since call IDs may repeat.
+export function matchingActionWait(callId: string | undefined, waits: Interaction[]): Interaction | undefined {
+  return waits.find((item) => !item.outcome && callId !== undefined
+    && (item.source_id === callId || item.subject.tool_call_id === callId
+      || (item.subject.call as { id?: unknown } | null)?.id === callId
+      || item.subject.source_id === "arguments:" + callId
+      || item.subject.source_id === "result:" + callId));
+}
+
+export function awaitingModelReply(task: Task | undefined, waiting: boolean): boolean {
+  return !waiting && (task?.status.state === "TASK_STATE_WORKING" || task?.status.state === "TASK_STATE_SUBMITTED");
 }
