@@ -1276,6 +1276,9 @@ main {
 .file-properties > summary:hover, .execution-group > summary:hover { color: var(--ink); }
 .file-properties > dl { margin: 0; }
 .execution-group[open] > summary { margin-bottom: 12px; }
+.execution-group > summary { flex-wrap: wrap; }
+.execution-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; overflow-wrap: anywhere; }
+.execution-warning { color: #a13732; }
 @media (max-width: 640px) {
   .message-attachments li.file-card { padding: 16px; }
 }

@@ -1,5 +1,5 @@
 import { DetailsIcon } from "./DetailsIcon";
-import { matchingActionWait } from "./toolPresentation";
+import { actionLabel, matchingActionWait } from "./toolPresentation";
 import { Markdown } from "./Markdown";
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
@@ -313,13 +313,10 @@ export function History({
         const blocks: HistoryEntry[][] = [];
         for (const entry of entries) {
           const previous = blocks.at(-1);
-          if (entry.action && !peerOperationId(entry.action) && actionState(entry.action, terminal, waits).kind === "success"
-            && previous?.at(-1)?.action
-            && !peerOperationId(previous.at(-1)!.action)
-            && actionState(previous.at(-1)!.action!, terminal, waits).kind === "success") previous.push(entry);
+          if (entry.action && previous?.at(-1)?.action) previous.push(entry);
           else blocks.push([entry]);
         }
-        function renderEntry({ item, action }: HistoryEntry) {
+        function renderInteraction({ item, action }: HistoryEntry) {
           const pending = action && !action.result && !terminal?.outcome
             ? matchingActionWait(action.callId, waits) : undefined;
           if (pending?.kind === "tool_approval" && pending.deadline * 1000 > Date.now() && !rendered.has(pending.wait_id)) {
@@ -328,9 +325,12 @@ export function History({
               <InteractionCard api={api} item={pending} refresh={refresh} />
             </div>;
           }
-          const peer = onPeerOpen && peerConversations.find((value) => value.operation_id === peerOperationId(action));
           const review = item.review && !rendered.has(item.review.wait_id) ? reviews.get(item.review.wait_id) : undefined;
           if (review) rendered.add(review.wait_id);
+          return review ? <InteractionCard key={review.wait_id} api={api} item={review} refresh={refresh} /> : null;
+        }
+        function renderEntry({ item, action }: HistoryEntry) {
+          const peer = onPeerOpen && peerConversations.find((value) => value.operation_id === peerOperationId(action));
           return <Fragment key={action?.key ?? item.id}>
             {action && peer && onPeerOpen ? <div className="peer-conversation-action" data-history-id={item.id}>
               <PeerConversationCard conversation={peer} onOpen={onPeerOpen} />
@@ -340,20 +340,35 @@ export function History({
             </div> : action ? <ActionCard action={action} terminal={terminal} waits={waits} onOpen={() => setSelectedAction(action.key)} />
               : <Entry api={api} contextId={contextId} item={item.status === "available"
                   ? { ...item, text: publicMessageText(item, task) } : item} />}
-            {review && <InteractionCard key={review.wait_id} api={api} item={review} refresh={refresh} />}
           </Fragment>;
         }
         return (
           <section key={entries[0].action?.key ?? entries[0].item.id} className="history-run" aria-label="Обращение">
-            {blocks.map((block) => block.length > 1
-              ? <details className="execution-group" key={block[0].action!.key}>
+            {blocks.map((block) => {
+              const states = block.flatMap(({ action }) => action ? [{ action, ...actionState(action, terminal, waits) }] : []);
+              const current = states.find((state) => !state.action.result && (state.kind === "active" || state.kind === "waiting"));
+              const succeeded = states.filter((state) => state.kind === "success").length;
+              const errors = states.filter((state) => state.kind === "error").length;
+              const unknown = states.filter((state) => state.kind === "unknown").length;
+              return <Fragment key={block[0].action?.key ?? block[0].item.id}>
+              {states.length ? <details className="execution-group">
                 <summary>
                   <svg className="disclosure-chevron" viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m11 8 6 6-6 6" /></svg>
-                  Ход выполнения · Выполнено действий: {block.length}</summary>
-                <div className="execution-steps" tabIndex={0} role="region" aria-label="Выполненные действия">
+                  <span>Ход выполнения</span>
+                  <span className="execution-summary" role="status" aria-live="polite">
+                    {succeeded > 0 && <span>Выполнено: {succeeded}</span>}
+                    {current && <span>{actionLabel(current.action.name, current.action.args).slice(0, 120)} · {current.label}</span>}
+                    {errors > 0 && <span className="execution-warning">Ошибок: {errors}</span>}
+                    {unknown > 0 && <span className="execution-warning">Исход не определён: {unknown}</span>}
+                  </span>
+                </summary>
+                <div className="execution-steps" tabIndex={0} role="region" aria-label="Действия агента">
                   {block.map(renderEntry)}
                 </div>
-              </details> : renderEntry(block[0]))}
+              </details> : renderEntry(block[0])}
+              {block.map(renderInteraction)}
+              </Fragment>;
+            })}
             {interactions
               .filter((item) => !linked.has(item.wait_id) && !rendered.has(item.wait_id))
               .map((item) => (

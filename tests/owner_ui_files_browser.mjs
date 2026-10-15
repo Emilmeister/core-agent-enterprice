@@ -396,7 +396,7 @@ try {
   check(await page.evaluate("document.querySelector('.thread').scrollTop<8 && !!document.querySelector('.new-messages')"),'new runtime events preserve reading position and offer new-message jump');
   await page.click('Новые сообщения ↓');
   await page.wait("(()=>{const t=document.querySelector('.thread');return t.scrollHeight-t.scrollTop-t.clientHeight<100;})()",'explicit latest-message jump');
-  check(await page.evaluate("(()=>{const keys=[...document.querySelectorAll('[data-action-key]')].map(card=>card.dataset.actionKey);return keys.length===4&&new Set(keys).size===4&&!!document.querySelector('.execution-group')&&!document.querySelector('.thread').textContent.includes('Вызов инструмента');})()"),'one correlated card per Task/call and consecutive successful execution group');
+  check(await page.evaluate("(()=>{const keys=[...document.querySelectorAll('[data-action-key]')].map(card=>card.dataset.actionKey);return keys.length===4&&new Set(keys).size===4&&!!document.querySelector('.execution-group')&&!document.querySelector('.thread').textContent.includes('Вызов инструмента');})()"),'one correlated card per Task/call and unified execution group');
   await page.evaluate("document.querySelector('.execution-group').open=true");
   check(await page.evaluate("[...document.querySelectorAll('.action-card')].every(card=>card.querySelector(':scope > button')&&!card.querySelector('.action-preview,.action-output,.action-technical'))"),'compact action cards keep output and technical data outside the chat');
   const actionScroll=await page.evaluate("document.querySelector('.thread').scrollTop");
@@ -577,7 +577,7 @@ try {
   await page.click('Отправить ответ','.interaction:not(.resolved) button');
   await page.wait("document.querySelector('.thread').textContent.includes('Owner clarification received;')",'native known-failure response after owner answer');
   check(await page.evaluate("[...document.querySelectorAll('.action-error')].some(card=>card.textContent.includes('кодом 3')) && [...document.querySelectorAll('.interaction.resolved')].some(card=>card.textContent.includes('Заказ 42'))"),'known command failure remains visible and answered owner question is retained');
-  check(await page.evaluate("(()=>{const card=[...document.querySelectorAll('.action-error')].find(card=>card.textContent.includes('Ожидание задачи'));return card && card.textContent.includes('Ошибка') && !card.closest('.execution-group');})()"),'actual failed background task stays visible despite successful status read');
+  check(await page.evaluate("(()=>{const card=[...document.querySelectorAll('.action-error')].find(card=>card.textContent.includes('Ожидание задачи'));return card && card.textContent.includes('Ошибка') && card.closest('.execution-group')?.querySelector('summary')?.textContent.includes('Ошибок:');})()"),'actual failed background task is included and advertised in collapsed execution group despite successful status read');
   await waitFor(()=>history.at(-1)?.some(item=>item.kind==='placeholder'&&item.status==='available'&&!item.review&&!item.outcome&&!item.attachments?.length&&!item.response_files?.length),'actual preserved internal history markers');
   const internalMarkers=history.at(-1).filter(item=>item.kind==='placeholder'&&item.status==='available'&&!item.review&&!item.outcome&&!item.attachments?.length&&!item.response_files?.length).map(item=>item.id);
   await page.wait(`(${JSON.stringify(internalMarkers)}).every(id=>!document.getElementById('history-'+id))`,'internal markers disappear only from presentation');
