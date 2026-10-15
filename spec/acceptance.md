@@ -878,3 +878,9 @@ implemented. Automated proofs MUST входить в обычные applicable g
   Отказ подтверждён до запуска, cleanup завершён; shell сохраняет собственный
   exit code/output. Ошибка инфраструктуры и неподтверждённый cleanup не маскируются
   под отсутствие команды.
+- EXEC-AC-02: `cat > /dev/null; echo finished` завершается при обычном terminal
+  call без ожидания ввода; pipe и перенаправление файла работают. Процесс без
+  timeout ограничен 120 секундами (либо меньшим deployment cap), explicit timeout
+  не превышает `CORE_AGENT_TERMINAL_MAX_SECONDS`; background и nested tool call
+  соблюдают те же правила. Deadline действует без wait и не продлевается поздним
+  wait; timeout подтверждает остановку потомков и возвращает `TOOL_TIMED_OUT`.

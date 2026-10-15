@@ -876,6 +876,14 @@ def _supervise(channel):
         _send(channel, {'state': 'started'})
         bwrapfd = own(os.pidfd_open(bwrap.pid))
         ready, _, _ = select.select([channel, bwrapfd, slirpfd], [], [])
+        if channel in ready:
+            # Consume stop before replying: closing a seqpacket socket with
+            # unread input can reset the peer and lose the completion frame.
+            message, descriptors = _receive(channel)
+            for descriptor in descriptors:
+                os.close(descriptor)
+            if message != {'state': 'stop'} or descriptors:
+                raise _unavailable('Unexpected sandbox control message')
         if bwrapfd in ready:
             returncode = bwrap.wait()
         elif slirpfd in ready:

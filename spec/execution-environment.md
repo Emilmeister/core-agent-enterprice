@@ -10,6 +10,22 @@
 
 Поставляемый Docker image MUST содержать Git, доступный terminal-командам внутри sandbox; сборка MUST проверять `git --version`.
 
+Синхронное выполнение команды (включая `core_terminal_exec` и его background-вызовы)
+MUST использовать закрытый stdin (`/dev/null`); stdout/stderr остаются PTY.
+Чтение файла, pipe и явное shell-перенаправление stdin сохраняются. Команды не
+запрещаются по имени или поиску подстрок shell. Низкоуровневый session start/write
+сохраняет поддержку интерактивного PTY; модель не получает бесконечный ввод.
+Без явного timeout действует 120 секунд. Для `core_terminal_exec` deployment
+`CORE_AGENT_TERMINAL_MAX_SECONDS` ограничивает явный timeout (default 600 секунд);
+если предел меньше 120, он ограничивает и значение по умолчанию. Предел MUST быть
+конечным положительным числом. Python сохраняет свой отдельный timeout.
+Deadline считается от старта процесса, повторный wait его не продлевает;
+контроль времени действует и без вызова wait. При истечении MUST завершиться
+всё process tree с подтверждением cleanup, результат содержит `timed_out=true`
+и статус `timed_out`; tool возвращает `TOOL_TIMED_OUT`, агент может продолжить.
+Неподтверждённый cleanup сохраняет `SIDE_EFFECT_UNKNOWN`. Уже исполняемые процессы
+старой версии не получают новый deadline до их остановки/перезапуска.
+
 В sandbox доступны только чат как `/workspace`, собственные временные файлы и необходимые read-only программы/библиотеки. Корень соседних чатов, server data, platform credentials и Kubernetes service-account token не монтируются. `/proc` показывает только изолированные процессы; лишние inherited descriptors закрыты. CPU, memory/process limits ограничиваются отдельно; общее ядро остаётся границей доверия.
 
 ## TerminalSession

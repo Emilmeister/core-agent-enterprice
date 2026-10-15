@@ -294,6 +294,11 @@ class ToolRuntime:
                 if call.name == "core_terminal_exec"
                 else {"tool": call.name, "arguments": call.arguments}
             )
+            if call.name == "core_terminal_exec" and "timeout" not in request:
+                from .execution import DEFAULT_COMMAND_TIMEOUT
+                schema = self.registry.get(call.name).input_schema
+                maximum = schema.get("properties", {}).get("timeout", {}).get("maximum", DEFAULT_COMMAND_TIMEOUT)
+                request = {**request, "timeout": min(DEFAULT_COMMAND_TIMEOUT, maximum)}
             result = self.environment_manager.execute_transient(request, run_id)
         status = getattr(result, "status", "succeeded")
         if status not in {"failed", "timed_out"}:

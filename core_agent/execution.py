@@ -30,6 +30,7 @@ from .workspace import ChatWorkspaces, WorkspaceBinding
 # its own is a pipe the caller expected a shell to interpret.
 SHELL_OPERATORS = frozenset({"&&", "||", "|", ";", ">", ">>", "<", "&"})
 SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ash", "ksh", "busybox", "env"})
+DEFAULT_COMMAND_TIMEOUT = 120.0
 
 
 @dataclass(frozen=True)
@@ -107,7 +108,7 @@ class ProcessHandle:
     _master_fd: int = field(repr=False, default=-1)
     _max_output_bytes: int = field(repr=False, default=1_000_000)
     _started_at: float = field(repr=False, default_factory=time.monotonic)
-    _timeout: float | None = field(repr=False, default=None)
+    _timeout: float = field(repr=False, default=DEFAULT_COMMAND_TIMEOUT)
     _output: bytearray = field(repr=False, default_factory=bytearray)
     _done: threading.Event = field(repr=False, default_factory=threading.Event)
     _process_done: threading.Event = field(repr=False, default_factory=threading.Event)
@@ -424,7 +425,7 @@ class _LocalTerminalSession:
         environment.update(request.get("_secret_env", {}))
         return environment
 
-    def start(self, request, *, broker_socket=None, on_start=None):
+    def start(self, request, *, broker_socket=None, on_start=None, interactive_stdin=True):
         argv = request.get("argv")
         if (
             not isinstance(argv, (list, tuple))
@@ -448,12 +449,12 @@ class _LocalTerminalSession:
                 f"{argv[0]!r} as an argument; use ['sh', '-lc', '<command>']",
             )
         max_output = request.get("max_output_bytes", self.spec.max_output_bytes)
-        timeout = request.get("timeout")
+        timeout = request.get("timeout", DEFAULT_COMMAND_TIMEOUT)
         if isinstance(max_output, bool) or not isinstance(max_output, int) or max_output <= 0:
             raise CoreError(
                 "TOOL_ARGUMENT_INVALID", "max_output_bytes must be a positive integer"
             )
-        if timeout is not None and (
+        if (
             isinstance(timeout, bool) or not isinstance(timeout, (int, float))
             or not math.isfinite(timeout) or timeout <= 0
         ):
@@ -479,13 +480,13 @@ class _LocalTerminalSession:
                         list(argv), workspace_path=self.workspace,
                         readonly_input_path=inputs,
                         cwd=cwd.relative_to(self.workspace.resolve()).as_posix(),
-                        environment=environment, stdin=slave_fd, stdout=slave_fd,
+                        environment=environment, stdin=slave_fd if interactive_stdin else subprocess.DEVNULL, stdout=slave_fd,
                         stderr=slave_fd, broker_socket=broker_socket, timeout=timeout,
                     )
                 else:
                     process = subprocess.Popen(
                         list(argv), cwd=cwd, env=environment,
-                        stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                        stdin=slave_fd if interactive_stdin else subprocess.DEVNULL, stdout=slave_fd, stderr=slave_fd,
                         start_new_session=True, close_fds=True,
                     )
             except BaseException as error:
@@ -503,7 +504,7 @@ class _LocalTerminalSession:
                 id=str(uuid.uuid4()), terminal_session_id=self.id,
                 process_group_id=process.pid, _process=process, _master_fd=master_fd,
                 _max_output_bytes=max_output,
-                _timeout=float(timeout) if timeout is not None else None,
+                _timeout=float(timeout),
             )
             self._processes[handle.id] = handle
             threading.Thread(target=self._reap, args=(handle,), daemon=True).start()
@@ -531,6 +532,8 @@ class _LocalTerminalSession:
     def _drain(self, handle):
         try:
             while True:
+                if time.monotonic() - handle._started_at >= handle._timeout and not handle._process_done.is_set():
+                    self._terminate(handle, timed_out=True)
                 if not select.select([handle._master_fd], [], [], 0.1)[0]:
                     if handle._process_done.is_set():
                         break
@@ -549,6 +552,10 @@ class _LocalTerminalSession:
                         handle._output.extend(chunk[:remaining])
                     if len(chunk) > remaining:
                         handle._truncated = True
+            # EOF can precede process exit when a command redirects its PTY.
+            remaining = max(0.0, handle._timeout - (time.monotonic() - handle._started_at))
+            if not handle._process_done.wait(remaining):
+                self._terminate(handle, timed_out=True)
         except Exception:
             failure = CoreError("SIDE_EFFECT_UNKNOWN", "Process output failed")
             try:
@@ -557,8 +564,6 @@ class _LocalTerminalSession:
                 failure = error
             handle._error = failure
         finally:
-            if handle._error is None:
-                handle._process_done.wait()
             handle._done.set()
 
     def _get(self, process_id):
@@ -626,7 +631,11 @@ class _LocalTerminalSession:
 
     def wait(self, process_id, timeout=None):
         handle = self._get(process_id)
-        effective_timeout = timeout if timeout is not None else handle._timeout
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                                    or not math.isfinite(timeout) or timeout <= 0):
+            raise CoreError("TOOL_ARGUMENT_INVALID", "timeout must be a positive number")
+        remaining = max(0, handle._timeout - (time.monotonic() - handle._started_at))
+        effective_timeout = min(timeout, remaining) if timeout is not None else remaining
         if not handle._done.wait(effective_timeout):
             self._terminate(handle, timed_out=True)
         self._confirmed(handle)
@@ -664,7 +673,7 @@ class _LocalTerminalSession:
                 pass
 
     def execute(self, request, *, broker_socket=None, on_start=None):
-        handle = self.start(request, broker_socket=broker_socket, on_start=on_start)
+        handle = self.start(request, broker_socket=broker_socket, on_start=on_start, interactive_stdin=False)
         return self.wait(handle.id)
 
     def cancel(self, process_id):

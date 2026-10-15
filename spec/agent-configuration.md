@@ -80,6 +80,11 @@ Production deployment MUST задавать `DURABLE_STORAGE_ROOT` для immuta
 
 ## Feature switches
 
+`CORE_AGENT_TERMINAL_MAX_SECONDS` — конечный положительный верхний предел timeout
+для `core_terminal_exec`, по умолчанию 600 секунд. При отсутствии аргумента timeout
+используется меньшее из 120 секунд и этого предела. Это deployment-настройка,
+не новое поле RunRequest. Python ограничивается собственным `CORE_AGENT_PYTHON_MAX_SECONDS`.
+
 Минимальные optional features:
 
 - `memory`: `disabled`, `optional`, `required`;

@@ -876,6 +876,9 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         }
     )
     registry = ToolRegistry()
+    terminal_max_seconds = _number("CORE_AGENT_TERMINAL_MAX_SECONDS", float, default="600")
+    if terminal_max_seconds <= 0:
+        raise CoreError("CONFIG_INVALID", "CORE_AGENT_TERMINAL_MAX_SECONDS must be positive")
     python_max_code_chars = _number("CORE_AGENT_PYTHON_MAX_CODE_CHARS", int, default="100000")
     python_max_seconds = _number("CORE_AGENT_PYTHON_MAX_SECONDS", float, default="120")
     python_max_output_bytes = _number("CORE_AGENT_PYTHON_MAX_OUTPUT_BYTES", int, default="1000000")
@@ -888,10 +891,13 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
             "core_terminal_exec",
             (
                 "Execute bounded argv directly in the owned terminal workspace when "
-                "a runtime or workspace command materially improves the result. There "
+                "a runtime or workspace command materially improves the result. "
+                "stdin is closed: use non-interactive flags or explicit shell input redirection, "
+                "never wait for a terminal prompt. The default timeout is at most 120 seconds; "
+                "set timeout explicitly for longer work within the schema limit. There "
                 "is no implicit shell: use ['sh', '-lc', '...'] only when shell syntax "
                 "such as pipes, redirects, or && is actually required. Preinstalled "
-                "CLI: GNU coreutils/findutils/gawk/sed/grep, rg, fd, file, tree, "
+                "CLI: Git, GNU coreutils/findutils/gawk/sed/grep, rg, fd, file, tree, "
                 "xxd, uchardet, jq, Mike Farah yq, xmlstarlet, sqlite3, curl, "
                 "bsdtar, zip/unzip/7z, "
                 "zstd/xz/bzip2, ip/ss/nc, openssl, "
@@ -904,7 +910,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "properties": {
                     "argv": {"type": "array", "items": {"type": "string"}},
                     "cwd": {"type": "string"},
-                    "timeout": {"type": "number"},
+                    "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": terminal_max_seconds},
                     "max_output_bytes": {"type": "integer"},
                 },
                 "required": ["argv"],

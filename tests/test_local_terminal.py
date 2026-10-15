@@ -2,8 +2,10 @@ import concurrent.futures
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from core_agent.errors import CoreError
 from core_agent.execution import (
@@ -143,6 +145,60 @@ class LocalTerminalTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIn("got:hello", result.stdout)
         self.assertFalse(result.truncated)
+
+    def test_deadline_survives_closed_pty_without_wait(self):
+        session = self.manager.create(spec("closed-pty", "main", self.snapshot, self.durable_root))
+        handle = self.manager.start(session.id, {
+            "argv": ["sh", "-c", "exec </dev/null >/dev/null 2>&1; sleep 30"],
+            "timeout": .1,
+        })
+        self.assertTrue(handle._done.wait(4))
+        self.assertTrue(handle._timed_out)
+        self.assertIsNotNone(handle._process.poll())
+
+    def test_synchronous_commands_get_eof_and_keep_shell_input_redirection(self):
+        session = self.manager.create(spec("stdin", "main", self.snapshot, self.durable_root))
+        result = self.manager.execute(session.id, {"argv": ["sh", "-c", "cat > /dev/null; echo finished"], "timeout": 1}, owner_id="main")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("finished", result.stdout)
+        self.assertFalse(result.timed_out)
+        result = self.manager.execute(session.id, {"argv": ["sh", "-c", "printf hello | cat"], "timeout": 1}, owner_id="main")
+        self.assertEqual(result.stdout.strip(), "hello")
+
+    def test_omitted_timeout_is_finite_and_process_expires_without_wait(self):
+        session = self.manager.create(spec("deadline", "main", self.snapshot, self.durable_root))
+        with patch("core_agent.execution.DEFAULT_COMMAND_TIMEOUT", .1):
+            process = self.manager.start(session.id, {"argv": [sys.executable, "-c", "import time; time.sleep(30)"]}, owner_id="main")
+        self.assertTrue(process._done.wait(4), "deadline must stop a process even without a wait caller")
+        result = self.manager.wait(session.id, process.id, timeout=30, owner_id="main")
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.status, "timed_out")
+        self.assertLess(result.duration, 4)
+        self.assertIn("terminated", result.cleanup)
+
+    def test_wait_does_not_restart_command_deadline(self):
+        session = self.manager.create(spec("remaining", "main", self.snapshot, self.durable_root))
+        process = self.manager.start(session.id, {"argv": [sys.executable, "-c", "import time; time.sleep(30)"], "timeout": .15}, owner_id="main")
+        time.sleep(.1)
+        result = self.manager.wait(session.id, process.id, timeout=30, owner_id="main")
+        self.assertTrue(result.timed_out)
+        self.assertLess(result.duration, 2)
+
+    def test_tool_default_honors_lower_deployment_limit(self):
+        from core_agent.tools import ToolCall, ToolDefinition, ToolRegistry, ToolRuntime
+        from core_agent.workspace import WorkspaceBinding
+        self.manager.bind_run("tool-limit", WorkspaceBinding("tenant-1", "owner", "chat"))
+        registry = ToolRegistry()
+        registry.register(ToolDefinition("core_terminal_exec", "test", {
+            "type": "object", "properties": {"argv": {"type": "array", "items": {"type": "string"}},
+            "timeout": {"type": "number", "maximum": .1}}, "required": ["argv"]}, True, frozenset()))
+        runtime = ToolRuntime(registry, self.manager)
+        arguments = {"argv": [sys.executable, "-c", "import time; time.sleep(30)"]}
+        result = runtime.execute(ToolCall("cap", "core_terminal_exec", arguments), run_id="tool-limit")
+        self.assertEqual(result.error_code, "TOOL_TIMED_OUT")
+        self.assertNotIn("timeout", arguments)
+        with self.assertRaises(CoreError):
+            runtime.execute(ToolCall("over", "core_terminal_exec", {**arguments, "timeout": 1}), run_id="tool-limit")
 
     def test_process_environment_is_clean_and_only_explicit_allowlist_is_added(self):
         session = self.manager.create(

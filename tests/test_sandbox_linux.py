@@ -538,6 +538,20 @@ class SandboxLinuxTests(unittest.TestCase):
                                   readonly_input_path=self.inputs, stdout=subprocess.DEVNULL)
         self.assertEqual(git.wait(timeout=15), 0)
 
+    def test_synchronous_terminal_stdin_and_deadline_in_real_sandbox(self):
+        from core_agent.execution import EnvironmentSpec, LocalTerminalBackend, TerminalSessionManager
+        manager = TerminalSessionManager(LocalTerminalBackend(self.root / "terminal", launcher=self.launcher))
+        self.addCleanup(manager.close)
+        session = manager.create(EnvironmentSpec("tenant", "timeout", "", (".",), (), {}, owner_id="owner"))
+        result = manager.execute(session.id, {"argv": ["sh", "-c", "cat > /dev/null; printf finished"], "timeout": 10}, owner_id="owner")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout, "finished")
+        self.assertFalse(result.timed_out)
+        result = manager.execute(session.id, {"argv": ["sh", "-c", "sleep 30 & wait"], "timeout": 5}, owner_id="owner")
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.cleanup, "sandbox_terminated")
+        self.assertFalse(self.launcher._processes)
+
     def test_broker_mount_exposes_only_the_current_socket(self):
         own, foreign = socket.socket(socket.AF_UNIX), socket.socket(socket.AF_UNIX)
         self.addCleanup(own.close)

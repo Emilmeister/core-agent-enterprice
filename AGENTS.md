@@ -172,6 +172,10 @@ criterion должны войти в тот же завершённый change. 
   Образ включает Git; отсутствие исполняемой команды внутри sandbox даёт
   `COMMAND_NOT_FOUND`, невозможность запуска существующего файла —
   `COMMAND_EXEC_FAILED`, отдельно от отказа sandbox.
+  Синхронные команды получают stdin=/dev/null и timeout 120 секунд по умолчанию;
+  `CORE_AGENT_TERMINAL_MAX_SECONDS` (600) ограничивает terminal tool timeout.
+  Watchdog завершает process tree независимо от wait; low-level start/write
+  сохраняет интерактивный PTY, а Python — отдельный лимит времени.
   Compose фиксирует container port 8000, bind host 0.0.0.0 и disjoint storage roots;
   `PORT` меняет опубликованный host port, а не внутренний listening port.
   Agent использует native OCI seccomp profile (`SANDBOX_OCI_ARCH=amd64|arm64`),
