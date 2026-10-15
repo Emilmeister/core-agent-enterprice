@@ -201,20 +201,20 @@ export function ActionDialog({ action, terminal, waits, onClose }: ActionProps &
         </div>)}</dl>}
         {hasOutput && <section className="action-output"><h3>Вывод действия</h3>
           {stdout !== undefined || stderr !== undefined ? <>
-            {stdout && <><div className="eyebrow">stdout</div><pre>{stdout}</pre></>}
-            {stderr && <><div className="eyebrow">stderr</div><pre>{stderr}</pre></>}
+            {stdout && <div className="action-output-stream"><div className="eyebrow">stdout</div><pre>{stdout}</pre></div>}
+            {stderr && <div className="action-output-stream"><div className="eyebrow">stderr</div><pre>{stderr}</pre></div>}
             {!stdout && !stderr && <p className="muted">Действие завершилось без текстового вывода.</p>}
             {output?.truncated === true && <p className="muted">Вывод ограничен при выполнении действия.</p>}
           </> : <pre>{typeof action.result?.output === "string" ? action.result.output : JSON.stringify(action.result?.output, null, 2)}</pre>}
         </section>}
-        <section className="action-technical"><h3 className="technical-icon-heading" aria-label="Технические данные" title="Технические данные"><DetailsIcon /></h3><dl>
+        <details className="action-technical" open><summary className="details-toggle" aria-label="Технические данные" title="Технические данные"><DetailsIcon /></summary><dl>
           <dt>Инструмент</dt><dd>{action.name || "Неизвестен"}</dd>
           <dt>Аргументы</dt><dd><pre>{action.args === undefined ? "Недоступны" : JSON.stringify(action.args, null, 2)}</pre></dd>
           <dt>ID вызова</dt><dd>{action.callId ?? "Недоступен"}</dd><dt>ID задачи</dt><dd>{action.taskId ?? "Недоступен"}</dd>
           {typeof output?.exit_code === "number" && <><dt>Exit code</dt><dd>{output.exit_code}</dd></>}
           {action.result?.status && <><dt>Статус инструмента</dt><dd>{action.result.status}</dd></>}
           {action.raw && <><dt>Сохранённая запись</dt><dd><pre>{action.raw}</pre></dd></>}
-        </dl></section>
+        </dl></details>
       </div>
     </dialog>, document.body);
 }

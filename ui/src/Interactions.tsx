@@ -1,5 +1,5 @@
 import { DetailsIcon } from "./DetailsIcon";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Api, ApiError, errorText } from "./api";
 import type { Interaction } from "./types";
 import { actionLabel, actionPreview } from "./toolPresentation";
@@ -16,6 +16,8 @@ export function InteractionCard({
   const [answer, setAnswer] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const detailsId = useId();
   const [material, setMaterial] = useState<Record<string, unknown> | null>(
     null,
   );
@@ -163,12 +165,6 @@ export function InteractionCard({
           day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", timeZoneName: "short",
         })}</time>
       </p>
-      {item.kind !== "owner_question" && (
-        <details className="interaction-details">
-          <summary className="details-toggle" aria-label="Технические данные" title="Технические данные"><DetailsIcon /></summary>
-          <pre>{JSON.stringify(item.subject, null, 2)}</pre>
-        </details>
-      )}
       {item.outcome && (
         <p className="outcome">
           {item.outcome.reason === "allowed"
@@ -181,29 +177,6 @@ export function InteractionCard({
           {typeof item.outcome.answer === "string" &&
             ` · ${item.outcome.answer}`}
         </p>
-      )}
-      {item.kind === "guardrail" && (
-        <div className="actions">
-          <button className="secondary" disabled={busy || closed} onClick={inspect}>
-            Просмотреть материал
-          </button>
-          {item.subject.affected_scope === "file_batch" && (
-            <button className="secondary" disabled={busy || closed} onClick={download}>
-              Скачать проверяемый файл
-            </button>
-          )}
-        </div>
-      )}
-      {material && (
-        <div className="material">
-          <div className="section-line">
-            <strong>Приватный материал</strong>
-            <button className="text-button" onClick={() => setMaterial(null)}>
-              Скрыть
-            </button>
-          </div>
-          <pre>{JSON.stringify(material, null, 2)}</pre>
-        </div>
       )}
       {!closed &&
         (item.kind === "owner_question" ? (
@@ -232,9 +205,10 @@ export function InteractionCard({
               Отправить ответ
             </button>
           </form>
-        ) : (
-          <div className="actions">
-            <button disabled={busy} onClick={() => void decide("allow")}>
+        ) : null)}
+      {item.kind !== "owner_question" && <>
+          <div className="actions interaction-actions">
+            {!closed && <><button disabled={busy} onClick={() => void decide("allow")}>
               Разрешить
             </button>
             <button
@@ -243,9 +217,24 @@ export function InteractionCard({
               onClick={() => void decide("reject")}
             >
               Отклонить
-            </button>
+            </button></>}
+            {item.kind === "guardrail" && <>
+              <button className="secondary" disabled={busy || closed} onClick={inspect}>Просмотреть материал</button>
+              {item.subject.affected_scope === "file_batch" && <button className="secondary" disabled={busy || closed} onClick={download}>Скачать проверяемый файл</button>}
+            </>}
+            <button type="button" className="details-toggle" aria-label="Технические данные" title="Технические данные"
+              aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}><DetailsIcon /></button>
           </div>
-        ))}
+          <div className="interaction-details" id={detailsId} hidden={!detailsOpen}><pre>{JSON.stringify(item.subject, null, 2)}</pre></div>
+      </>}
+      {material && (
+        <div className="material">
+          <div className="section-line"><strong>Приватный материал</strong>
+            <button className="text-button" onClick={() => setMaterial(null)}>Скрыть</button>
+          </div>
+          <pre>{JSON.stringify(material, null, 2)}</pre>
+        </div>
+      )}
       {error && (
         <p className="error" role="alert">
           {error}

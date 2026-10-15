@@ -607,6 +607,7 @@ try {
   await page.click('Открыть',previewCards+' li:nth-child(6) button');
   await page.wait("document.querySelector('.file-preview pre')?.textContent.includes('preview line')",'long native file preview');
   async function boundedPreview(){
+    await page.evaluate("(()=>{const button=document.querySelector('.file-preview').parentElement.querySelector('button[aria-label=\"Свойства файла\"]');if(button.getAttribute('aria-expanded')==='false')button.click();})()");
     check(await page.evaluate("(()=>{const box=document.querySelector('.file-preview'),body=box.querySelector('.file-preview-content'),properties=box.parentElement.querySelector('.file-properties');const b=box.getBoundingClientRect();return b.height<=281&&body.scrollHeight>body.clientHeight&&['auto','scroll'].includes(getComputedStyle(body).overflowY)&&properties.getBoundingClientRect().top>=b.bottom-1;})()"),'long file preview scrolls inside its bounds without covering properties');
     await page.call('Page.bringToFront');
     await page.evaluate("document.querySelector('.file-preview-content').focus()");

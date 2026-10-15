@@ -1,5 +1,5 @@
 import { DetailsIcon } from "./DetailsIcon";
-import { useLayoutEffect, useRef, useState } from "react";
+import { useId, useLayoutEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
 import { formatFileSize, publicHistoryItems } from "./types";
 import { Markdown } from "./Markdown";
@@ -34,6 +34,8 @@ export function FileCard({ api, contextId, taskId, file, downloadPath, available
   const [busy, setBusy] = useState<"open" | "download" | null>(null);
   const [error, setError] = useState("");
   const [opened, setOpened] = useState(false);
+  const [propertiesOpen, setPropertiesOpen] = useState(false);
+  const propertiesId = useId();
   const [preview, setPreview] = useState<{ text: string; truncated: boolean } | null>(null);
   const pending = useRef<AbortController | undefined>(undefined);
   const urls = useRef(new Set<string>());
@@ -41,6 +43,7 @@ export function FileCard({ api, contextId, taskId, file, downloadPath, available
     setBusy(null);
     setError("");
     setOpened(false);
+    setPropertiesOpen(false);
     setPreview(null);
     pending.current = undefined;
     return () => {
@@ -132,7 +135,10 @@ export function FileCard({ api, contextId, taskId, file, downloadPath, available
           <path d="M12 3v12m-5-5 5 5 5-5M4 14v4a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-4" />
         </svg>
         {busy === "download" ? "Скачиваем…" : "Скачать"}</button>
+      <button type="button" className="details-toggle" aria-label="Свойства файла" title="Свойства файла"
+        aria-expanded={propertiesOpen} aria-controls={propertiesId} onClick={() => setPropertiesOpen(value => !value)}><DetailsIcon /></button>
     </div>
+
     {!available && <p className="muted">Сохранённая копия файла недоступна.</p>}
     {opened && <div className="file-preview">
       <div className="file-preview-heading"><strong>Предпросмотр</strong><button type="button" className="text-button"
@@ -148,11 +154,11 @@ export function FileCard({ api, contextId, taskId, file, downloadPath, available
       </div>
     </div>}
     {error && <p className="error" role="alert">{error}</p>}
-    <details className="file-properties"><summary className="details-toggle" aria-label="Свойства файла" title="Свойства файла"><DetailsIcon /></summary><dl>
+    <div className="file-properties" id={propertiesId} hidden={!propertiesOpen}><dl>
       {!responseFile && <><dt>Путь</dt><dd>{file.relative_path}</dd></>}
       {responseFile && <><dt>ID</dt><dd>{file.file_id}</dd></>}
       <dt>Размер в байтах</dt><dd>{file.size_bytes}</dd><dt>SHA-256</dt><dd>{file.sha256}</dd>
-    </dl></details>
+    </dl></div>
   </li>;
 }
 
