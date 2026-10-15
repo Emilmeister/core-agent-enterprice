@@ -33,6 +33,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
         file \
         findutils \
         gawk \
+        git \
         grep \
         iproute2 \
         jq \
@@ -89,7 +90,7 @@ RUN cd /opt/core-agent/security && \
     sha256sum --check SHA256SUMS && \
     test -z "$(find . -type l -print -quit)" && \
     chmod -R a-w . && \
-    bwrap --version && slirp4netns --version && nft --version
+    bwrap --version && slirp4netns --version && nft --version && git --version
 
 ENV SKILLS_ROOT=/opt/core-agent/skills \
     CORE_AGENT_ALLOWED_SKILLS=systematic-debugging,verification-before-completion,knowledge-synthesis,explore-data,validate-data,statistical-analysis,sql-queries

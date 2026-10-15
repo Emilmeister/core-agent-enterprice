@@ -169,6 +169,9 @@ criterion должны войти в тот же завершённый change. 
   native CI `run --no-deps`. Без профиля Keycloak подключается отдельно через
   `KEYCLOAK_*`. Agent environment явно передаёт поддержанные model/guardrails,
   runtime/compaction, memory и telemetry настройки из `.env.example`.
+  Образ включает Git; отсутствие исполняемой команды внутри sandbox даёт
+  `COMMAND_NOT_FOUND`, невозможность запуска существующего файла —
+  `COMMAND_EXEC_FAILED`, отдельно от отказа sandbox.
   Compose фиксирует container port 8000, bind host 0.0.0.0 и disjoint storage roots;
   `PORT` меняет опубликованный host port, а не внутренний listening port.
   Agent использует native OCI seccomp profile (`SANDBOX_OCI_ARCH=amd64|arm64`),

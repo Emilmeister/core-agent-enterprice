@@ -865,3 +865,10 @@ implemented. Automated proofs MUST входить в обычные applicable g
   оставляет launcher unhealthy/quarantined. Native amd64/arm64 Linux gate
   проверяет реальные terminal/Python/background execution и cleanup; новые
   диагностические поля не служат основанием для retry или ослабления sandbox.
+
+- EXEC-AC-01: в поставляемом Docker-образе `git --version` успешно выполняется
+  внутри sandbox. Отсутствующая команда даёт `COMMAND_NOT_FOUND`; существующий
+  файл с отсутствующим interpreter, ошибкой формата или прав — `COMMAND_EXEC_FAILED`.
+  Отказ подтверждён до запуска, cleanup завершён; shell сохраняет собственный
+  exit code/output. Ошибка инфраструктуры и неподтверждённый cleanup не маскируются
+  под отсутствие команды.

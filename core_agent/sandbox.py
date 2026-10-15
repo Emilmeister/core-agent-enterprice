@@ -36,6 +36,10 @@ _POLICY_SHA256 = '8ef9479132f923e4c2f485ae4c06c98ddce9ad9448ce48232cc199663beefe
 _HELPER_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'C.UTF-8'}
 _MAX_CONFIG = 65536
 _CLEANUP_SECONDS = 3.0
+_COMMAND_ERRORS = {
+    'COMMAND_NOT_FOUND': 'Command was not found in the sandbox PATH or at the requested path',
+    'COMMAND_EXEC_FAILED': 'Command could not execute; check its permissions, format, and interpreter',
+}
 
 
 def _unavailable(message='Required Linux sandbox is unavailable'):
@@ -608,8 +612,9 @@ class SandboxLauncher:
                 if message.get('cleanup_failed'):
                     self._unhealthy = True
                 handle._diagnostics = _frame_diagnostics(message, started)
-                raise CoreError(message.get('error', 'EXECUTION_ENVIRONMENT_UNAVAILABLE'),
-                                'Sandbox did not start', diagnostics=handle._diagnostics)
+                code = message.get('error', 'EXECUTION_ENVIRONMENT_UNAVAILABLE')
+                raise CoreError(code, _COMMAND_ERRORS.get(code, 'Sandbox did not start'),
+                                diagnostics=handle._diagnostics)
         except BaseException as error:
             diagnostic = getattr(error, 'diagnostics', None) or _diagnostics(
                 stage, error, started, 'confirmed' if handle else 'not_started', launcher=self)
@@ -848,15 +853,20 @@ def _supervise(channel):
         if os.write(exec_w, token) != 32:
             raise _unavailable('Incomplete target release')
         released = True
-        # READY's descriptor is CLOEXEC; EOF confirms exec, ERR confirms no exec.
+        # READY's descriptor is CLOEXEC; EOF confirms exec, error frames confirm no exec.
         status = _read_deadline(ready_r, 32, deadline)
-        if status.startswith(b'ERR:'):
+        if status.startswith((b'ERR:', b'EXEC:', b'MISSING:')):
             released = False
+            kind, raw_number = status.split(b':', 1)
             try:
-                number = int(status[4:])
+                number = int(raw_number)
             except ValueError:
                 number = 0
             error = _unavailable('Sandbox target exec failed')
+            if kind == b'MISSING' and number == errno.ENOENT:
+                error = CoreError('COMMAND_NOT_FOUND')
+            elif kind == b'EXEC' and 1 <= number <= 4095:
+                error = CoreError('COMMAND_EXEC_FAILED')
             error.diagnostics = SandboxDiagnostics(stage=stage, reason='os_error' if 1 <= number <= 4095 else 'unavailable',
                 errno=number if 1 <= number <= 4095 else None,
                 elapsed_ms=max(0, min(2**31 - 1, int((time.monotonic() - started) * 1000))), cleanup='confirmed')
@@ -875,6 +885,8 @@ def _supervise(channel):
             returncode = -signal.SIGKILL
     except BaseException as error:
         failure = 'SIDE_EFFECT_UNKNOWN' if released else 'EXECUTION_ENVIRONMENT_UNAVAILABLE'
+        if not released and isinstance(error, CoreError) and error.code in _COMMAND_ERRORS:
+            failure = error.code
         diagnostic = _diagnostics(stage, error, started, 'confirmed')
     finally:
         try:

@@ -549,6 +549,27 @@ class SandboxTests(unittest.TestCase):
             os.close(reader)
             os.close(writer)
 
+    def test_target_exec_distinguishes_missing_command_from_interpreter_permissions_and_format(self):
+        from core_agent import sandbox_exec
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            interpreter = root / 'missing-interpreter'
+            script = root / 'script'
+            script.write_text(f'#!{interpreter}\n')
+            script.chmod(0o700)
+            denied = root / 'denied'
+            denied.write_text('#!/bin/sh\n')
+            denied.chmod(0o600)
+            invalid = root / 'invalid'
+            invalid.write_text('invalid executable\n')
+            invalid.chmod(0o700)
+            for command, expected in ((str(root / 'missing'), b'MISSING:2'), ('missing', b'MISSING:2'),
+                                      (str(script), b'EXEC:2'), ('script', b'EXEC:2'),
+                                      (str(denied), f'EXEC:{errno.EACCES}'.encode()),
+                                      (str(invalid), f'EXEC:{errno.ENOEXEC}'.encode())):
+                with self.subTest(command=command):
+                    self.assertEqual(sandbox_exec._exec_target([command], {'PATH': directory}), expected)
+
     def test_startup_failure_after_release_stays_unknown(self):
         sandbox = self.sandbox()
         for explicit_no_exec in (False, True):
@@ -567,6 +588,29 @@ class SandboxTests(unittest.TestCase):
                         launcher.start(['true'], workspace_path='/unused', readonly_input_path='/unused/attachments')
                     self.assertEqual(caught.exception.code, 'EXECUTION_ENVIRONMENT_UNAVAILABLE'
                                      if explicit_no_exec else 'SIDE_EFFECT_UNKNOWN')
+
+    def test_command_failure_preserves_safe_message_and_no_exec_proof(self):
+        sandbox = self.sandbox()
+        for code, expected in (
+                ('COMMAND_NOT_FOUND', 'Command was not found in the sandbox PATH or at the requested path'),
+                ('COMMAND_EXEC_FAILED', 'Command could not execute; check its permissions, format, and interpreter')):
+            with self.subTest(code=code):
+                launcher = sandbox.SandboxLauncher(self.policy())
+                parent, child = socket.socketpair()
+                messages = [{'state': 'released'}, {'state': 'exited', 'error': code,
+                            'not_executed': True, 'diagnostics': {'stage': 'target_exec',
+                            'reason': 'os_error', 'errno': errno.ENOENT, 'elapsed_ms': 7, 'cleanup': 'confirmed'}}]
+                with patch.object(sandbox, '_check_native'), patch.object(sandbox, '_send'), \
+                        patch.object(sandbox.socket, 'socketpair', return_value=(parent, child)), \
+                        patch.object(sandbox.subprocess, 'Popen', return_value=Mock(pid=100, returncode=125)), \
+                        patch.object(sandbox.SandboxProcess, '_message', side_effect=messages):
+                    with self.assertRaises(ExecutionNotStarted) as caught:
+                        launcher.start(['private-argv'], workspace_path='/unused', readonly_input_path='/unused/attachments')
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(caught.exception.message, expected)
+                self.assertEqual(caught.exception.data, {})
+                self.assertFalse(launcher._unhealthy)
+                self.assertFalse(launcher._processes)
 
     def test_private_supervisor_diagnosis_preserves_release_and_no_exec_proof(self):
         sandbox = self.sandbox()

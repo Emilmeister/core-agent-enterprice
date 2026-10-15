@@ -505,7 +505,7 @@ class SandboxLinuxTests(unittest.TestCase):
         with self.assertRaises(ExecutionNotStarted) as caught:
             self.launcher.start(['/missing/executable'], workspace_path=self.workspace,
                                 readonly_input_path=self.inputs, environment={'CANARY': 'private-diagnostic-canary'})
-        self.assertEqual(caught.exception.code, 'EXECUTION_ENVIRONMENT_UNAVAILABLE')
+        self.assertEqual(caught.exception.code, 'COMMAND_NOT_FOUND')
         diagnostic = caught.exception.diagnostics
         self.assertIsNotNone(diagnostic)
         self.assertEqual((diagnostic.stage, diagnostic.reason, diagnostic.errno, diagnostic.cleanup),
@@ -513,6 +513,30 @@ class SandboxLinuxTests(unittest.TestCase):
         self.assertEqual(caught.exception.data, {})
         self.assertNotIn('/missing/executable', str(diagnostic.as_dict()))
         self.assertNotIn('private-diagnostic-canary', str(diagnostic.as_dict()))
+
+    def test_command_errors_and_git_are_resolved_inside_sandbox(self):
+        for name, contents, mode in (('interpreter', '#!/missing/interpreter\n', 0o700),
+                                     ('denied', '#!/bin/sh\n', 0o600),
+                                     ('invalid', 'invalid executable\n', 0o700)):
+            path = self.workspace / name
+            path.write_text(contents)
+            path.chmod(mode)
+        for command, code, number in (
+                ('core-agent-nonexistent-command', 'COMMAND_NOT_FOUND', errno.ENOENT),
+                ('/workspace/interpreter', 'COMMAND_EXEC_FAILED', errno.ENOENT),
+                ('/workspace/denied', 'COMMAND_EXEC_FAILED', errno.EACCES),
+                ('/workspace/invalid', 'COMMAND_EXEC_FAILED', errno.ENOEXEC)):
+            with self.subTest(command=command):
+                with self.assertRaises(ExecutionNotStarted) as caught:
+                    self.launcher.start([command], workspace_path=self.workspace, readonly_input_path=self.inputs)
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(caught.exception.diagnostics.errno, number)
+                self.assertEqual(caught.exception.diagnostics.cleanup, 'confirmed')
+                self.assertFalse(self.launcher._unhealthy)
+                self.assertFalse(self.launcher._processes)
+        git = self.launcher.start(['git', '--version'], workspace_path=self.workspace,
+                                  readonly_input_path=self.inputs, stdout=subprocess.DEVNULL)
+        self.assertEqual(git.wait(timeout=15), 0)
 
     def test_broker_mount_exposes_only_the_current_socket(self):
         own, foreign = socket.socket(socket.AF_UNIX), socket.socket(socket.AF_UNIX)
