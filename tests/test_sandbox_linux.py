@@ -552,6 +552,36 @@ class SandboxLinuxTests(unittest.TestCase):
         self.assertEqual(result.cleanup, "sandbox_terminated")
         self.assertFalse(self.launcher._processes)
 
+    def test_virtual_cwd_and_temporary_files_across_terminal_and_python_calls(self):
+        from core_agent.execution import LocalTerminalBackend, TerminalSessionManager
+        from core_agent.python_exec import execute_python
+        from core_agent.workspace import WorkspaceBinding
+        manager = TerminalSessionManager(LocalTerminalBackend(self.root / "terminal",
+            chat_root=self.root / "chats", launcher=self.launcher))
+        self.addCleanup(manager.close)
+        binding = WorkspaceBinding("tenant", "owner", "chat")
+        manager.bind_run("paths", binding)
+        first = manager.execute_transient({"argv": ["sh", "-c",
+            "mkdir project; printf persistent > project/kept; printf temporary > /tmp/discarded"]}, "paths")
+        self.assertEqual(first.exit_code, 0)
+        self.assertEqual(first.cleanup, "sandbox_terminated")
+        for cwd in ("project", "/workspace/project"):
+            with self.subTest(cwd=cwd):
+                result = manager.execute_transient({"argv": ["sh", "-c",
+                    "test ! -e /tmp/discarded && cat kept && pwd"], "cwd": cwd}, "paths")
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(result.stdout.strip(), "persistent/workspace/project")
+        result = execute_python(manager, run_id="paths", cwd="/workspace/project",
+            code="from pathlib import Path; print(Path.cwd()); print(Path('kept').read_text())",
+            tool_names=(), dispatch=lambda *args: None)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("/workspace/project", result.stdout)
+        self.assertIn("persistent", result.stdout)
+        manager.bind_run("next-task", binding)
+        result = manager.execute_transient({"argv": ["cat", "kept"], "cwd": "/workspace/project"}, "next-task")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout, "persistent")
+
     def test_broker_mount_exposes_only_the_current_socket(self):
         own, foreign = socket.socket(socket.AF_UNIX), socket.socket(socket.AF_UNIX)
         self.addCleanup(own.close)

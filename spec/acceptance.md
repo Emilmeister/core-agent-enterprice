@@ -888,3 +888,8 @@ implemented. Automated proofs MUST входить в обычные applicable g
   не превышает `CORE_AGENT_TERMINAL_MAX_SECONDS`; background и nested tool call
   соблюдают те же правила. Deadline действует без wait и не продлевается поздним
   wait; timeout подтверждает остановку потомков и возвращает `TOOL_TIMED_OUT`.
+- EXEC-AC-03: terminal и Python принимают `cwd: /workspace/project` и
+  `cwd: project` как один каталог. Выход за корень, похожий префикс и ссылка
+  наружу отклоняются. Файл в workspace переживает следующий sandbox-вызов,
+  файл в `/tmp` — нет. Описания инструментов сообщают эти свойства до вызова;
+  Node.js/npm не добавляются в образ.

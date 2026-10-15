@@ -230,6 +230,25 @@ class LocalTerminalTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "POLICY_DENIED")
 
+    def test_sandbox_cwd_maps_virtual_paths_without_escaping_workspace(self):
+        session = self.manager.create(spec("paths", "main", self.snapshot, self.durable_root))
+        project = session.workspace / "project"
+        project.mkdir()
+        (session.workspace / "outside").symlink_to(self.temp.name, target_is_directory=True)
+        environment = self.manager._environments[session.id]
+        with patch.object(environment, "launcher", object()):
+            for path in ("project", "/workspace/project", "/workspace/project/."):
+                with self.subTest(path=path):
+                    self.assertEqual(environment._cwd(path), project.resolve())
+            self.assertEqual(environment._cwd("/workspace"), session.workspace.resolve())
+            for path in ("/workspace/../escape", "../escape", "/workspace-other/project", "/workspace/outside"):
+                with self.subTest(path=path), self.assertRaises(CoreError) as caught:
+                    environment._cwd(path)
+                self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
+            with self.assertRaises(CoreError) as caught:
+                environment._cwd("/workspace/missing")
+            self.assertEqual(caught.exception.message, "cwd is not a directory")
+
     def test_invalid_argv_cwd_and_timeout_fail_closed(self):
         session = self.manager.create(
             spec("run-1", "main", self.snapshot, self.durable_root)

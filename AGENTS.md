@@ -172,6 +172,9 @@ criterion должны войти в тот же завершённый change. 
   Образ включает Git; отсутствие исполняемой команды внутри sandbox даёт
   `COMMAND_NOT_FOUND`, невозможность запуска существующего файла —
   `COMMAND_EXEC_FAILED`, отдельно от отказа sandbox.
+  Terminal/Python `cwd` принимает относительные пути и sandbox-пути `/workspace/...`
+  с общей проверкой границ чата. Файлы `/workspace` сохраняются, `/tmp` создаётся
+  заново для каждого sandbox-процесса. Node.js/npm в runtime-образ не входят.
   Синхронные команды получают stdin=/dev/null и timeout 120 секунд по умолчанию;
   `CORE_AGENT_TERMINAL_MAX_SECONDS` (600) ограничивает terminal tool timeout.
   Watchdog завершает process tree независимо от wait; low-level start/write

@@ -391,7 +391,10 @@ class _LocalTerminalSession:
         return resolved
 
     def _cwd(self, requested):
-        resolved = self._contained(requested or ".", "cwd")
+        candidate = Path(requested or ".")
+        if self.launcher is not None and candidate.is_relative_to("/workspace"):
+            candidate = self.workspace / candidate.relative_to("/workspace")
+        resolved = self._contained(candidate, "cwd")
         if not resolved.is_dir():
             raise CoreError("TOOL_ARGUMENT_INVALID", "cwd is not a directory")
         return resolved

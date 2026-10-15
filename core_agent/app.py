@@ -892,6 +892,11 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
             (
                 "Execute bounded argv directly in the owned terminal workspace when "
                 "a runtime or workspace command materially improves the result. "
+                "Files under /workspace persist across calls and tasks in this chat; "
+                "/tmp is private to each sandbox call and is discarded when it ends. "
+                "sandbox_terminated confirms process cleanup, not deletion of /workspace. "
+                "cwd accepts workspace-relative paths or /workspace/...; it defaults "
+                "to /workspace. Shell cd and environment changes do not carry over to later calls. "
                 "stdin is closed: use non-interactive flags or explicit shell input redirection, "
                 "never wait for a terminal prompt. The default timeout is at most 120 seconds; "
                 "set timeout explicitly for longer work within the schema limit. There "
@@ -901,7 +906,8 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "xxd, uchardet, jq, Mike Farah yq, xmlstarlet, sqlite3, curl, "
                 "bsdtar, zip/unzip/7z, "
                 "zstd/xz/bzip2, ip/ss/nc, openssl, "
-                "pdftotext/pdfinfo/pdftoppm/pdfimages, and qpdf. This list is not "
+                "pdftotext/pdfinfo/pdftoppm/pdfimages, and qpdf. Node.js and npm are not "
+                "preinstalled. This list is not "
                 "exhaustive; use other installed commands or install workspace-local "
                 "tools when policy and network access allow."
             ),
@@ -909,7 +915,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "type": "object",
                 "properties": {
                     "argv": {"type": "array", "items": {"type": "string"}},
-                    "cwd": {"type": "string"},
+                    "cwd": {"type": "string", "description": "Directory inside this chat workspace: relative (project) or absolute (/workspace/project). Defaults to /workspace."},
                     "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": terminal_max_seconds},
                     "max_output_bytes": {"type": "integer"},
                 },
@@ -933,6 +939,11 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "arguments). Direct OS calls do not pass that broker and must not "
                 "simulate an unavailable capability. Execution is restricted to the "
                 "chat workspace and permitted public network destinations. "
+                "Files under /workspace persist across calls and tasks in this chat; "
+                "/tmp is private to each sandbox call and is discarded when it ends. "
+                "sandbox_terminated confirms process cleanup, not deletion of /workspace. "
+                "cwd accepts workspace-relative paths or /workspace/...; it defaults "
+                "to /workspace. Process working-directory and environment changes do not carry over. "
                 "This interpreter is the one core_terminal_exec installs into, so a "
                 "package installed there imports here without touching sys.path. "
                 "Preinstalled imports: pydantic/jsonschema, httpx/httpx_sse/h2/websockets, "
@@ -952,7 +963,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                         "minLength": 1,
                         "maxLength": python_max_code_chars,
                     },
-                    "cwd": {"type": "string"},
+                    "cwd": {"type": "string", "description": "Directory inside this chat workspace: relative (project) or absolute (/workspace/project). Defaults to /workspace."},
                     "timeout": {
                         "type": "number",
                         "minimum": 0.001,
