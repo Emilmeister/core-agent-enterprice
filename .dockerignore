@@ -12,3 +12,5 @@ dist
 node_modules
 **/node_modules
 core_agent/ui_dist
+
+storybook

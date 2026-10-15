@@ -91,3 +91,16 @@ docker compose logs -f agent
 Остановка: `docker compose down`. Данные сохраняются в Docker volumes.
 Команда `docker compose down -v` удаляет БД, файлы чатов и данные Keycloak.
 После изменения исходного кода: `docker compose up --build -d`.
+
+## Каталог интерфейса
+
+Отдельный Storybook запускается без Docker и backend. Требуется Node.js 24.
+
+```bash
+cd storybook
+npm ci
+npm run dev
+```
+
+Адрес: http://localhost:6007. Используются реальные UI-компоненты и изолированные
+демонстрационные данные. Подробности — в [storybook/README.md](storybook/README.md).

@@ -132,6 +132,10 @@ criterion должны войти в тот же завершённый change. 
   с Node.js 24 (минимум 22.12). Production build создаёт ignored `core_agent/ui_dist/`, который
   входит в Python wheel/sdist; Docker собирает его в отдельном Node stage
   на build platform, а Python runtime — на target platform.
+- `storybook/` — независимое локальное приложение каталога UI с собственными
+  package.json и lockfile. Оно импортирует реальные `ui/src/` компоненты, но
+  production UI не зависит от каталога. Все demo API работают в памяти без
+  реальных credentials/сети. Команды и состояния описаны в `storybook/README.md`.
 - `spec/` — target specification, acceptance и release profiles.
 - `docs/superpowers/specs/` — проектные черновики для согласования; не заменяют
   нормативный `spec/` и не разрешают менять замороженные spec/tests.

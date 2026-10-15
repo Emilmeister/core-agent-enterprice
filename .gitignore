@@ -11,3 +11,6 @@ __pycache__/
 .env.*
 !.env.example
 /kubeconfig
+
+storybook/node_modules/
+storybook/storybook-static/
