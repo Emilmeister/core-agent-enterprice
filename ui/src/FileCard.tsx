@@ -109,12 +109,28 @@ export function FileCard({ api, contextId, taskId, file, downloadPath, available
 
   const unavailable = !available || !api || !contextId || !api.session.valid || (responseFile && !taskId && !downloadPath);
   return <li className="file-card">
-    <div className="file-card-heading"><strong>{name}</strong><span className="muted">{partLabel ?? fileType} · {formatFileSize(file.size_bytes)}</span></div>
+    <div className="file-card-heading">
+      <span className="file-card-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" focusable="false">
+          <path d="M14 3H7a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3V9Z" />
+          <path d="M14 3v4a2 2 0 0 0 2 2h4" />
+        </svg>
+      </span>
+      <div className="file-card-info"><strong>{name}</strong><span className="muted">{partLabel ?? fileType} · {formatFileSize(file.size_bytes)}</span></div>
+    </div>
     <div className="file-card-actions">
       <button type="button" className="secondary" disabled={!!busy || unavailable}
-        aria-label={`Открыть ${name}`} onClick={() => void load("open")}>{busy === "open" ? "Открываем…" : "Открыть"}</button>
+        aria-label={`Открыть ${name}`} onClick={() => void load("open")}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+          <path d="M14 4h6v6M20 4 10 14M10 4H7a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3" />
+        </svg>
+        {busy === "open" ? "Открываем…" : "Открыть"}</button>
       <button type="button" className="secondary" disabled={!!busy || unavailable}
-        aria-label={`Скачать ${name}`} onClick={() => void load("download")}>{busy === "download" ? "Скачиваем…" : "Скачать"}</button>
+        aria-label={`Скачать ${name}`} onClick={() => void load("download")}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+          <path d="M12 3v12m-5-5 5 5 5-5M4 14v4a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-4" />
+        </svg>
+        {busy === "download" ? "Скачиваем…" : "Скачать"}</button>
     </div>
     {!available && <p className="muted">Сохранённая копия файла недоступна.</p>}
     {opened && <div className="file-preview">
@@ -131,7 +147,9 @@ export function FileCard({ api, contextId, taskId, file, downloadPath, available
       </div>
     </div>}
     {error && <p className="error" role="alert">{error}</p>}
-    <details className="file-properties"><summary>Свойства файла</summary><dl>
+    <details className="file-properties"><summary>
+      <svg className="disclosure-chevron" viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m11 8 6 6-6 6" /></svg>
+      Свойства файла</summary><dl>
       {!responseFile && <><dt>Путь</dt><dd>{file.relative_path}</dd></>}
       {responseFile && <><dt>ID</dt><dd>{file.file_id}</dd></>}
       <dt>Размер в байтах</dt><dd>{file.size_bytes}</dd><dt>SHA-256</dt><dd>{file.sha256}</dd>

@@ -337,7 +337,9 @@ export function History({
           <section key={entries[0].action?.key ?? entries[0].item.id} className="history-run" aria-label="Обращение">
             {blocks.map((block) => block.length > 1
               ? <details className="execution-group" key={block[0].action!.key}>
-                <summary>Ход выполнения · {block.length} действий выполнено</summary>
+                <summary>
+                  <svg className="disclosure-chevron" viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m11 8 6 6-6 6" /></svg>
+                  Ход выполнения · Выполнено действий: {block.length}</summary>
                 <div className="execution-steps" tabIndex={0} role="region" aria-label="Выполненные действия">
                   {block.map(renderEntry)}
                 </div>
