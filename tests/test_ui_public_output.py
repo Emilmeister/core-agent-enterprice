@@ -5,6 +5,29 @@ from pathlib import Path
 
 
 class PublicOutputUITests(unittest.TestCase):
+    def test_local_message_echo_reconciles_by_id_without_revealing_rejected_material(self):
+        script = r'''
+import assert from "node:assert/strict";
+import { withLocalMessages } from "./ui/src/types.ts";
+const local = {id:"input-1",text:"Same text",taskId:"task",delivery:"accepted"};
+const placeholder = {id:"stored",input_message_id:"input-1",task_id:"task",kind:"placeholder",status:"pending_guardrail",text:"Hidden",review:{wait_id:"wait"}};
+assert.equal(withLocalMessages([], [local])[0].text, "Same text");
+const rows = withLocalMessages([placeholder], [local]);
+assert.equal(rows.length,1);
+assert.equal(rows[0].text,"Same text");
+assert.deepEqual(rows[0].review,{wait_id:"wait"});
+for (const status of ["rejected","timed_out","unprocessed_due_to_failure","unprocessed_due_to_cancel"]) {
+  assert.deepEqual(withLocalMessages([{...placeholder,status}], [local]),[{...placeholder,status}]);
+}
+const accepted={...placeholder,kind:"user_message",status:"available",text:"Reviewed text"};
+assert.deepEqual(withLocalMessages([accepted],[local]),[accepted]);
+assert.equal(withLocalMessages([accepted],[local,{...local,id:"input-2"}]).length,2);
+assert.deepEqual(withLocalMessages([placeholder],[]),[placeholder]);
+'''
+        result = subprocess.run(["node", "--input-type=module", "-e", script],
+                                cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_messages_and_artifact_rows_survive_refresh_without_duplicates(self):
         root = Path(__file__).resolve().parents[1]
         script = r'''

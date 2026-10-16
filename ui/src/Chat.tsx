@@ -8,7 +8,7 @@ import {
 } from "react";
 import { Api, ApiError, errorText } from "./api";
 import { Attachments, ConversationFiles, History, pendingAction, useChatHistory } from "./History";
-import { actionLabel, awaitingModelReply } from "./toolPresentation";
+import { awaitingModelReply } from "./toolPresentation";
 import { WorkspaceFiles } from "./WorkspaceFiles";
 import { Markdown } from "./Markdown";
 import { chatStreamEvent, nextLiveAnswer } from "./chatStream";
@@ -22,11 +22,12 @@ import {
   terminal,
   textParts,
   publicHistoryItems,
+  withLocalMessages,
 } from "./types";
-import type { ChatRow, FileReceipt, LiveAnswerSnapshot, Message, Part, Settings, Task } from "./types";
+import type { ChatRow, FileReceipt, LiveAnswerSnapshot, LocalMessage, Message, Part, Settings, Task } from "./types";
 
 // App remounts the first submitted chat when it receives its context ID.
-const liveHandoff = new WeakMap<Api, string>();
+const liveHandoff = new WeakMap<Api, { taskId: string; messages: LocalMessage[] }>();
 
 function settingsLimit(settings: Settings): number {
   const value = settings.attachment_limit_bytes;
@@ -67,6 +68,9 @@ export function Chat({
 }) {
   const [task, setTask] = useState<Task>();
   const [draft, setDraft] = useState("");
+  const [localMessages, setLocalMessages] = useState<LocalMessage[]>(() =>
+    row?.latest_task_id && liveHandoff.get(api)?.taskId === row.latest_task_id ? liveHandoff.get(api)!.messages : []);
+  const submittedDraft = useRef<{ text: string; files: File[] }>({ text: "", files: [] });
   const [attachments, setAttachments] = useState<File[]>([]);
   const [attachmentLimit, setAttachmentLimit] = useState(25_000_000);
   const [limitConfirmed, setLimitConfirmed] = useState(false);
@@ -82,7 +86,7 @@ export function Chat({
   const [directAnswer, setDirectAnswer] = useState("");
   const [liveAnswer, setLiveAnswer] = useState<LiveAnswerSnapshot>();
   const liveTask = useRef<{ api: Api; id: string } | undefined>(
-    row?.latest_task_id && liveHandoff.get(api) === row.latest_task_id
+    row?.latest_task_id && liveHandoff.get(api)?.taskId === row.latest_task_id
       ? { api, id: row.latest_task_id } : undefined,
   );
   const [filesOpen, setFilesOpen] = useState(false);
@@ -168,6 +172,16 @@ export function Chat({
     else if (!deleteConfirm && dialog?.open) dialog.close();
   }, [deleteConfirm]);
   const history = useChatHistory(api, contextId);
+  const displayedHistory = { ...history, page: { ...history.page,
+    items: withLocalMessages(history.page.items, localMessages) } };
+  useEffect(() => {
+    setLocalMessages(current => {
+      const remaining = current.filter(message => !history.page.items.some(item =>
+        item.input_message_id === message.id && (!message.taskId || item.task_id === message.taskId)
+        && !["pending_guardrail", "queued"].includes(item.status)));
+      return remaining.length === current.length ? current : remaining;
+    });
+  }, [history.page.items]);
   const linkedPeers = new Set(historyEntries(history.page.items).map((entry) => peerOperationId(entry.action)));
   const unlinkedPeers = peerHistory.conversations.filter((value) => !linkedPeers.has(value.operation_id));
   const loadHistory = history.load;
@@ -216,7 +230,7 @@ export function Chat({
   useLayoutEffect(() => {
     const element = thread.current;
     if (!element) return;
-    const signature = JSON.stringify([history.page.items, history.waits, directAnswer, liveText]);
+    const signature = JSON.stringify([history.page.items, history.waits, directAnswer, liveText, localMessages]);
     if (olderAnchor.current) {
       element.scrollTop = olderAnchor.current.top + element.scrollHeight - olderAnchor.current.height;
       olderAnchor.current = null;
@@ -225,7 +239,7 @@ export function Chat({
       setNewMessages(false);
     } else if (signature !== historySignature.current) setNewMessages(true);
     historySignature.current = signature;
-  }, [history.page.items, history.waits, directAnswer, liveText]);
+  }, [history.page.items, history.waits, directAnswer, liveText, localMessages]);
   useLayoutEffect(() => {
     const input = composerInput.current;
     if (!input) return;
@@ -375,6 +389,26 @@ export function Chat({
       return;
     const revision = pending ? pendingRevision.current : view.current.revision;
     const previousBatch = fileReceipt(task?.metadata?.file_receipt)?.batch_id;
+    if (!pending) submittedDraft.current = { text: draft, files: attachments };
+    const messageId = pending?.message.messageId ?? crypto.randomUUID();
+    let echoes: LocalMessage[] = pending
+      ? localMessages.map(message => message.id === messageId ? { ...message, delivery: "sending" } : message)
+      : [...localMessages.filter(message => message.delivery !== "failed"), { id: messageId,
+        text: [draft, ...attachments.map(file => `${file.name} · ${formatFileSize(file.size)}`)].filter(Boolean).join("\n"),
+        taskId: task && !terminal(task) ? task.id : undefined, delivery: "sending" }];
+    setLocalMessages(echoes);
+    setDraft("");
+    setAttachments([]);
+    setDirectAnswer("");
+    if (!task || terminal(task)) setLiveAnswer(undefined);
+    stickToBottom.current = true;
+    function failedDelivery(delivery: "failed" | "uncertain") {
+      setLocalMessages(current => current.map(message => message.id === messageId ? { ...message, delivery } : message));
+      if (delivery === "failed") {
+        setDraft(submittedDraft.current.text);
+        setAttachments(submittedDraft.current.files);
+      }
+    }
     setBusy(true);
     setError("");
     try {
@@ -389,10 +423,11 @@ export function Chat({
             setAttachmentLimit(limit);
             setLimitConfirmed(true);
           } catch {
-            if (mounted.current) setError("Не удалось проверить лимит вложений. Сообщение и файлы сохранены. Повторите отправку.");
+            if (mounted.current) { failedDelivery("failed"); setError("Не удалось проверить лимит вложений. Сообщение и файлы сохранены. Повторите отправку."); }
             return;
           }
           if (attachmentBytes > limit) {
+            failedDelivery("failed");
             setError(errorText(new ApiError(413, "ATTACHMENTS_TOO_LARGE", { allowed_bytes: limit, actual_bytes: attachmentBytes })));
             return;
           }
@@ -404,7 +439,7 @@ export function Chat({
               if (!mounted.current) return;
             }
           } catch {
-            if (mounted.current) setError("Не удалось прочитать вложения. Сообщение и выбранные файлы сохранены; отправка не началась.");
+            if (mounted.current) { failedDelivery("failed"); setError("Не удалось прочитать вложения. Сообщение и выбранные файлы сохранены; отправка не началась."); }
             return;
           } finally {
             fileReader.current = null;
@@ -412,7 +447,7 @@ export function Chat({
         }
         body = {
           message: {
-            role: "ROLE_USER", messageId: crypto.randomUUID(), parts,
+            role: "ROLE_USER", messageId, parts,
             ...(row?.context_id ? { contextId: row.context_id } : {}),
             ...(task && !terminal(task) ? { taskId: task.id } : {}),
           },
@@ -428,9 +463,18 @@ export function Chat({
       );
       if (!mounted.current) return;
       if (!result.task && !result.message) throw new Error("Missing result");
+      const admissionError = result.task?.metadata?.error;
+      if (result.task?.status.state === "TASK_STATE_FAILED" && admissionError
+        && typeof admissionError === "object" && "code" in admissionError && admissionError.code === "CONTEXT_BUSY") {
+        throw new ApiError(409, "CONTEXT_BUSY");
+      }
       setDraft("");
       setAttachments([]);
       setPending(undefined);
+      submittedDraft.current = { text: "", files: [] };
+      echoes = echoes.map(message => message.id === messageId
+        ? { ...message, taskId: result.task?.id, delivery: "accepted" } : message);
+      setLocalMessages(echoes);
       stickToBottom.current = true;
       if (revision !== view.current.revision) {
         await loadHistory("refresh");
@@ -439,7 +483,7 @@ export function Chat({
       if (result.task) {
         acceptTask(result.task);
         liveTask.current = { api, id: result.task.id };
-        if (!row?.context_id) liveHandoff.set(api, result.task.id);
+        if (!row?.context_id) liveHandoff.set(api, { taskId: result.task.id, messages: echoes });
         onTask(result.task);
         if (result.task.id === taskId) await refresh();
       } else if (result.message)
@@ -457,12 +501,15 @@ export function Chat({
         failure.status !== 408
       ) {
         setPending(undefined);
+        failedDelivery("failed");
         setError(errorText(failure));
         await refresh().catch(() => {});
-      } else
+      } else {
+        failedDelivery("uncertain");
         setError(
           "Не удалось подтвердить приём сообщения. Повторите тот же запрос: идентификатор сохранён, новая задача не создаётся автоматически.",
         );
+      }
     } finally {
       if (mounted.current) setBusy(false);
     }
@@ -550,18 +597,17 @@ export function Chat({
   const latestOutcome = history.page.items.find((item) => item.task_id === taskId && item.kind === "result")?.outcome;
   const timerUntil = currentAction?.name === "core_wait_until" && currentAction.args && typeof currentAction.args === "object"
     ? (currentAction.args as Record<string, unknown>).until : undefined;
-  const status = !task ? (row?.latest_task_id ? "Загружаем текущий запрос…" : "Готов к новому запросу")
+  const status = !task ? ""
     : activeWait ? activeWait.kind === "owner_question" ? "Ожидает вашего ответа" : "Ожидает вашего разрешения"
-    : task.status.state === "TASK_STATE_COMPLETED" ? latestOutcome?.complete === false ? "Работа завершена частично" : "Ответ подготовлен"
+    : task.status.state === "TASK_STATE_COMPLETED" ? latestOutcome?.complete === false ? "Работа завершена частично" : ""
     : task.status.state === "TASK_STATE_FAILED" ? "Не удалось завершить запрос"
     : task.status.state === "TASK_STATE_CANCELED" ? "Запрос остановлен"
     : task.status.state === "TASK_STATE_REJECTED" ? "Запрос отклонён"
     : peers.length ? `Ожидает внешнего агента · ${peers[0].agent_name}`
     : typeof timerUntil === "string" && Number.isFinite(Date.parse(timerUntil)) ? `Ожидает до ${new Date(timerUntil).toLocaleString("ru-RU")}`
-    : currentAction ? actionLabel(currentAction.name, currentAction.args)
     : task.status.state === "TASK_STATE_INPUT_REQUIRED" ? "Ожидает вашего ответа"
     : task.status.state === "TASK_STATE_AUTH_REQUIRED" ? "Требуется авторизация"
-    : task.status.state === "TASK_STATE_SUBMITTED" ? "Запрос принят" : "Готовит ответ";
+    : "";
   const fileCount = publicHistoryItems(history.page.items).reduce((count, item) => count
     + (item.attachments?.length ?? 0) + (item.response_files?.length ?? 0)
     + (item.response_artifacts ?? []).reduce((total, artifact) => total + artifact.parts.length, 0), 0);
@@ -577,7 +623,7 @@ export function Chat({
       <header className="chat-heading">
         <div className="chat-title">
           <h1>{row?.title || "Новый чат"}</h1>
-          <p className="task-status" role="status" aria-live="polite" aria-atomic="true">{status}</p>
+          {status && <p className="task-status" role="status" aria-live="polite" aria-atomic="true">{status}</p>}
         </div>
         <div className="chat-heading-actions">
           {contextId && <button className="text-button history-refresh" disabled={history.loading}
@@ -665,18 +711,19 @@ export function Chat({
       >
         {unlinkedPeers.map((entry) => <PeerConversationCard key={entry.operation_id} conversation={entry} onOpen={openPeer} />)}
         {peerHistory.error && <p className="muted peer-list-error" role="status">Не удалось обновить список обращений к агентам.</p>}
-        {!task && !row && (
+        {!task && !row && !localMessages.length && (
           <div className="welcome">
             <h2>Чем помочь?</h2>
             <p>Напишите сообщение, чтобы начать.</p>
           </div>
         )}
-        {row?.latest_task_id && !task && !error && <p role="status">Загружаем задачу…</p>}
+        {row?.latest_task_id && !task && !error && !localMessages.length && <p role="status">Загружаем задачу…</p>}
         <History
           api={api}
           task={task}
           contextId={contextId}
-          history={history}
+          history={displayedHistory}
+          onRetry={busy ? undefined : () => void send()}
           peerConversations={peerHistory.conversations}
           onPeerOpen={openPeer}
           onOlder={() => {
@@ -688,11 +735,10 @@ export function Chat({
           }}
         />
         {liveText && <article className="message live-answer" aria-label="Предварительный ответ">
-          <p className="muted" role="status">{terminal(task)
-            ? "Ответ подготовлен. Загружаем сохранённый результат…" : "Предварительный ответ · формируется"}</p>
           <div className="prose">{liveText}</div>
         </article>}
-        {awaitingModelReply(task, !!activeWait || !!currentAction || peers.length > 0 || !!timerUntil || !!error) && (
+        {!liveText && !directAnswer && !activeWait && !error && (localMessages.some(message => message.delivery === "sending" || !task && message.delivery === "accepted")
+          || awaitingModelReply(task, peers.length > 0 || !!timerUntil)) && (
           <div className="typing-indicator" role="status" aria-label="Агент готовит ответ">
             <span aria-hidden="true" /><span aria-hidden="true" /><span aria-hidden="true" />
           </div>

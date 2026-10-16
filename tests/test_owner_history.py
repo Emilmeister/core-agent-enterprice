@@ -106,6 +106,7 @@ class OwnerHistoryTests(AuthAppTestCase):
         task = await self.submit("external-a", "first", "history")
         record = self.record(task)
         original = (await self.history()).json()["items"]
+        self.assertEqual(next(item for item in original if item["kind"] == "user_message")["input_message_id"], "first")
         old_page = (await self.history(limit="1")).json()
         schedule = await self.schedule("history")
         first, second = await self.skip_schedule(schedule), await self.skip_schedule(schedule)
@@ -274,6 +275,7 @@ class OwnerHistoryTests(AuthAppTestCase):
         queued = await self.history()
         self.assertEqual(queued.status_code, 200, queued.text)
         item = next(item for item in queued.json()["items"] if item["status"] == "queued")
+        self.assertEqual(item["input_message_id"], "correction")
         self.assertNotIn("CORRECTION", queued.text)
         self.assertEqual(agent.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id), before)
         wait = agent.workflow_store.get_wait(before.snapshot["wait_id"], tenant_id=record.tenant_id, owner_id=record.owner_id)
@@ -282,6 +284,7 @@ class OwnerHistoryTests(AuthAppTestCase):
         delivered = (await self.history()).json()["items"]
         matching = [value for value in delivered if value["id"] == item["id"]]
         self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["input_message_id"], "correction")
         self.assertEqual((matching[0]["status"], matching[0]["text"]), ("available", "CORRECTION"))
         self.assertEqual(sum(value["text"] == "CORRECTION" for value in delivered), 1)
 

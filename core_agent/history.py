@@ -54,6 +54,8 @@ def _root(admission, run_id, tenant, chat, connection):
             start=snapshot.get("context", {}).get("sequence_range", [1, 0])[0], admitted=admitted,
             original_prompt=record.request.get("prompt"), cron_origin=snapshot.get("cron_origin"),
             display_text=next((row.get("display_text") for key, row in admission.messages.items()
+                if key[0] == tenant and row["task_id"] == record.task_id and row["owner_id"] == chat["owner_id"]), None),
+            input_message_id=next((key[2] for key, row in admission.messages.items()
                 if key[0] == tenant and row["task_id"] == record.task_id and row["owner_id"] == chat["owner_id"]), None))
     else:
         value = connection.execute("""SELECT r.run_id,r.task_id,r.tenant_id,r.owner_id,r.context_id,
@@ -64,6 +66,8 @@ def _root(admission, run_id, tenant, chat, connection):
             r.request->>'prompt' AS original_prompt,r.snapshot->'cron_origin' AS cron_origin,
             (SELECT m.display_text FROM core_root_messages m WHERE m.tenant_id=r.tenant_id
                 AND m.task_id=r.task_id AND m.owner_id=r.owner_id AND m.context_id=r.context_id LIMIT 1) AS display_text,
+            (SELECT m.message_id FROM core_root_messages m WHERE m.tenant_id=r.tenant_id
+                AND m.task_id=r.task_id AND m.owner_id=r.owner_id AND m.context_id=r.context_id LIMIT 1) AS input_message_id,
             COALESCE((r.snapshot->>'initial_material_checked')::boolean,false) AS initial_checked,
             COALESCE((r.snapshot#>>'{context,sequence_range,0}')::bigint,1) AS start,
             EXISTS(SELECT 1 FROM core_root_messages m WHERE m.tenant_id=r.tenant_id
@@ -534,6 +538,9 @@ def _project(admission, root, entry, connection, chat):
     identity = root["task_id"] + ("/result" if position[0] == 2 else
         "/input/" + str(message["sequence"]) if message else "/transcript/" + str(position[1]))
     result = {"id": identity, "task_id": root["task_id"], "kind": "placeholder", "text": "", "status": "available"}
+    input_id = message["message_id"] if message else root.get("input_message_id") if (item or {}).get("kind") == "prompt" else None
+    if isinstance(input_id, str):
+        result["input_message_id"] = input_id
     terminal_result = position[0] == 2
     public_message, artifact_receipts, publisher_call = None, (), None
     sources, review_ids, materials, batches = [], [], [], []

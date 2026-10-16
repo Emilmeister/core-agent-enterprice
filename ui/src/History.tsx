@@ -180,7 +180,8 @@ export function Attachments({ entries, api, contextId }: { entries: AttachmentEn
   </ul>;
 }
 
-function Entry({ api, contextId, item }: { api: Api; contextId?: string; item: HistoryItem }) {
+function Entry({ api, contextId, item, onRetry }: { api: Api; contextId?: string; item: HistoryItem; onRetry?: () => void }) {
+  if (item.kind === "placeholder" && ["pending_guardrail", "queued"].includes(item.status)) return null;
   if (item.kind === "schedule_notice") {
     const reasons: Record<string, string> = {
       context_busy: "чат был занят", late: "время запуска пропущено",
@@ -199,12 +200,15 @@ function Entry({ api, contextId, item }: { api: Api; contextId?: string; item: H
       id={`history-${item.id}`} data-history-id={item.id}
     >
       <>
-          {item.kind === "placeholder" && <div className="eyebrow">Статус сообщения</div>}
           {item.kind !== "placeholder" && item.status === "available"
             && (item.display_text ?? item.text) && (item.kind === "user_message"
               ? <p className="prose">{item.display_text ?? item.text}</p>
               : <Markdown text={item.text} />)}
       </>
+      {(item.local_delivery === "failed" || item.local_delivery === "uncertain") && <div className="local-delivery" role="status">
+        <span>{item.local_delivery === "failed" ? "Не отправлено" : "Приём сообщения не подтверждён"}</span>
+        {onRetry && <button className="text-button" onClick={onRetry}>Повторить отправку</button>}
+      </div>}
       {statusLabels[item.status] && (
         <p className="muted history-status">{statusLabels[item.status]}</p>
       )}
@@ -237,6 +241,7 @@ export function History({
   onOlder,
   peerConversations = [],
   onPeerOpen,
+  onRetry,
 }: {
   api: Api;
   contextId?: string;
@@ -246,6 +251,7 @@ export function History({
   onOlder: () => void;
   peerConversations?: PeerConversation[];
   onPeerOpen?: (value: PeerConversation, trigger: HTMLButtonElement) => void;
+  onRetry?: () => void;
 }) {
   const groups: { root: string | null; entries: HistoryEntry[] }[] = [];
   for (const entry of historyEntries(history.page.items)) {
@@ -343,7 +349,7 @@ export function History({
                 <ActionCard action={action} terminal={terminal} waits={waits} onOpen={() => setSelectedAction(action.key)} />
               </details>
             </div> : action ? <ActionCard action={action} terminal={terminal} waits={waits} onOpen={() => setSelectedAction(action.key)} />
-              : <Entry api={api} contextId={contextId} item={item.status === "available"
+              : <Entry api={api} contextId={contextId} onRetry={onRetry} item={item.status === "available"
                   ? { ...item, text: publicMessageText(item, task) } : item} />}
           </Fragment>;
         }

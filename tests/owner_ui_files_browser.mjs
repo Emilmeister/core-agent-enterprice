@@ -186,8 +186,8 @@ try {
   loseNext=true;
   await page.call('Fetch.enable',{patterns:[{urlPattern:config.origin+'/a2a/owner/message:send',requestStage:'Response'}]});
   await page.click('Отправить ↑');
-  await page.wait("document.querySelector('.thread [role=alert]')?.textContent.includes('Повторите тот же запрос')&&document.querySelector('.composer textarea').disabled&&document.querySelector('input[type=file]').disabled&&document.querySelector('.composer-attachments button').disabled",'uncertain accepted follow-up is frozen');
-  check(dropped===1&&!!lostReceipt&&await page.evaluate("document.querySelector('.composer textarea').disabled&&document.querySelector('input[type=file]').disabled&&document.querySelector('.composer-attachments button').disabled"),'lost completed ACK preserves and freezes pending follow-up');
+  await page.wait("document.querySelector('.thread [role=alert]')?.textContent.includes('Повторите тот же запрос')&&document.querySelector('.composer textarea').disabled&&document.querySelector('input[type=file]').disabled&&!document.querySelector('.composer-attachments')&&!!document.querySelector('.thread .from-owner')",'uncertain accepted follow-up is frozen');
+  check(dropped===1&&!!lostReceipt&&await page.evaluate("document.querySelector('.composer textarea').disabled&&document.querySelector('input[type=file]').disabled&&!document.querySelector('.composer-attachments')&&!!document.querySelector('.thread .from-owner')"),'lost completed ACK preserves and freezes pending follow-up');
 
   const created=await page.call('Target.createTarget',{url:'about:blank'});second=await CDP.page(created.targetId);
   await second.call('Page.enable');await second.call('Runtime.enable');
@@ -746,7 +746,7 @@ try {
   await page.call('Page.reload');
   await page.wait("!!document.querySelector('.chat-link')",'streaming chat retained after reload');
   await page.evaluate("document.querySelector('.chat-link').click()");
-  await page.wait("document.querySelector('.chat-link')?.getAttribute('aria-current')==='page' && ['Запрос принят','Готовит ответ'].includes(document.querySelector('.task-status')?.textContent)",'reopened chat restores canonical state');
+  await page.wait("document.querySelector('.chat-link')?.getAttribute('aria-current')==='page' && !!document.querySelector('.typing-indicator') && !document.querySelector('.task-status')",'reopened chat restores canonical state');
   check(await page.evaluate(providerBlocked)&&await page.evaluate("!document.querySelector('.live-answer')&&!document.querySelector('.thread').textContent.includes('Native streamed reply')"),'page reload uses canonical history without restoring the transient prefix');
   check(await page.evaluate(`(async()=>{const response=await fetch('/api/browser-reply-fixture',{method:'POST',headers:{Authorization:${JSON.stringify(bearer)}},credentials:'omit'});return response.status===200;})()`),'authenticated native fixture releases the actual provider');
   await page.wait("document.querySelector('.thread .markdown h1')?.textContent==='Native streamed reply'&&!document.querySelector('.live-answer')",'stored final reply replaces provisional text');

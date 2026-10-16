@@ -100,6 +100,8 @@ export function fileReceipt(value: unknown): FileReceipt | undefined {
 }
 export interface HistoryItem {
   id: string;
+  input_message_id?: string;
+  local_delivery?: "sending" | "uncertain" | "failed" | "accepted";
   task_id: string | null;
   kind:
     | "user_message"
@@ -142,6 +144,30 @@ export interface HistoryItem {
 export interface HistoryPage {
   items: HistoryItem[];
   next_cursor: string | null;
+}
+
+export interface LocalMessage {
+  id: string;
+  text: string;
+  taskId?: string;
+  delivery: NonNullable<HistoryItem["local_delivery"]>;
+}
+
+// Local echoes never restore rejected material or infer identity from message text.
+export function withLocalMessages(items: HistoryItem[], messages: LocalMessage[]): HistoryItem[] {
+  const projected = items.map(item => {
+    const local = messages.find(message => message.id === item.input_message_id
+      && (!message.taskId || message.taskId === item.task_id));
+    return local && ["queued", "pending_guardrail"].includes(item.status)
+      ? { ...item, kind: "user_message" as const, status: "available" as const,
+        text: local.text, display_text: local.text, local_delivery: local.delivery } : item;
+  });
+  const missing: HistoryItem[] = messages.filter(message => !items.some(item => item.input_message_id === message.id
+    && (!message.taskId || message.taskId === item.task_id))).map(message => ({
+      id: `local:${message.id}`, input_message_id: message.id, task_id: message.taskId ?? null,
+      kind: "user_message", status: "available", text: message.text, local_delivery: message.delivery,
+    }));
+  return [...missing.reverse(), ...projected];
 }
 
 // Items and cursors remain in the server's newest-first order. Rendering reverses a copy.

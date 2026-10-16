@@ -138,7 +138,7 @@ export function createDemoRequest(mode: DemoMode = "normal", taskState = "TASK_S
     if (route === "/a2a/owner/message:send") {
       task.status.state = "TASK_STATE_COMPLETED";
       if (!chats.length) chats.push(structuredClone(demoRow));
-      history = [{ id: crypto.randomUUID(), task_id: task.id, kind: "result", status: "available", text: "Демонстрационный ответ. Реальный агент не вызывался.", outcome: { state: "COMPLETED" } }, { id: crypto.randomUUID(), task_id: task.id, kind: "user_message", status: "available", text: body.message.parts.map((p: { text?: string }) => p.text ?? "[Вложение]").join("\n") }, ...history];
+      history = [{ id: crypto.randomUUID(), task_id: task.id, kind: "result", status: "available", text: "Демонстрационный ответ. Реальный агент не вызывался.", outcome: { state: "COMPLETED" } }, { id: crypto.randomUUID(), input_message_id: body.message.messageId, task_id: task.id, kind: "user_message", status: "available", text: body.message.parts.map((p: { text?: string }) => p.text ?? "[Вложение]").join("\n") }, ...history];
       return json({ task });
     }
     if (route.endsWith(":subscribe")) return new Response(new ReadableStream({ start(controller) { options.signal?.addEventListener("abort", () => controller.close(), { once: true }); } }), { headers: { "Content-Type": "text/event-stream" } });
