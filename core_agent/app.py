@@ -890,31 +890,47 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         ToolDefinition(
             "core_terminal_exec",
             (
-                "Execute bounded argv directly in the owned terminal workspace when "
-                "a runtime or workspace command materially improves the result. "
-                "Files under /workspace persist across calls and tasks in this chat; "
-                "/tmp is private to each sandbox call and is discarded when it ends. "
-                "sandbox_terminated confirms process cleanup, not deletion of /workspace. "
-                "cwd accepts workspace-relative paths or /workspace/...; it defaults "
-                "to /workspace. Shell cd and environment changes do not carry over to later calls. "
-                "stdin is closed: use non-interactive flags or explicit shell input redirection, "
-                "never wait for a terminal prompt. The default timeout is at most 120 seconds; "
-                "set timeout explicitly for longer work within the schema limit. There "
-                "is no implicit shell: use ['sh', '-lc', '...'] only when shell syntax "
-                "such as pipes, redirects, or && is actually required. Preinstalled "
-                "CLI: Git, GNU coreutils/findutils/gawk/sed/grep, rg, fd, file, tree, "
-                "xxd, uchardet, jq, Mike Farah yq, xmlstarlet, sqlite3, curl, "
-                "bsdtar, zip/unzip/7z, "
-                "zstd/xz/bzip2, ip/ss/nc, openssl, "
-                "pdftotext/pdfinfo/pdftoppm/pdfimages, and qpdf. Node.js and npm are not "
-                "preinstalled. This list is not "
-                "exhaustive; use other installed commands or install workspace-local "
-                "tools when policy and network access allow."
+                "Run a command in this chat's workspace.\n"
+                "\n"
+                "Pass argv as the executable followed by individual arguments, for example:\n"
+                "[\"git\", \"clone\", \"https://github.com/org/repo.git\", \"project\"]\n"
+                "\n"
+                "Commands run directly, without a shell. Output and errors are captured\n"
+                "automatically, including when a command fails. Do not append \"2>&1\".\n"
+                "Shell operators, variable expansion and wildcards are not interpreted.\n"
+                "When shell syntax is needed, use [\"sh\", \"-lc\", \"command\"].\n"
+                "\n"
+                "Read the exit code and captured output before choosing the next action.\n"
+                "Terminal output combines stdout and stderr in the stdout field.\n"
+                "\n"
+                "Files in /workspace persist across calls and tasks in this chat.\n"
+                "/tmp is temporary and is discarded after each call. Use /workspace\n"
+                "for repositories, installed tools and files needed by later calls.\n"
+                "sandbox_terminated means sandbox cleanup, not deletion of /workspace.\n"
+                "\n"
+                "cwd defaults to /workspace and accepts workspace-relative paths or\n"
+                "absolute paths under /workspace. Working-directory and environment\n"
+                "changes made by a command do not carry over to later calls.\n"
+                "\n"
+                "stdin is closed. Use non-interactive options; commands must not wait\n"
+                "for user input. The default timeout is at most 120 seconds. Set timeout\n"
+                "explicitly for longer operations, within the allowed limit.\n"
+                "Output is bounded by max_output_bytes.\n"
+                "\n"
+                "Available commands include Git, standard Unix utilities, rg, fd, jq,\n"
+                "yq, curl, sqlite3, archive tools and PDF utilities. Node.js and npm are\n"
+                "not preinstalled. Additional tools may be installed in /workspace\n"
+                "when policy and network access allow.\n"
             ),
             {
                 "type": "object",
                 "properties": {
-                    "argv": {"type": "array", "items": {"type": "string"}},
+                    "argv": {"type": "array", "items": {"type": "string"}, "description": (
+                        'Executable and literal arguments, one array item per argument. '
+                        'Example: ["git", "status", "--short"]. '
+                        'Do not include shell quoting or redirection operators in direct calls. '
+                        'For shell syntax, use ["sh", "-lc", "command"].'
+                    )},
                     "cwd": {"type": "string", "description": "Directory inside this chat workspace: relative (project) or absolute (/workspace/project). Defaults to /workspace."},
                     "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": terminal_max_seconds},
                     "max_output_bytes": {"type": "integer"},
