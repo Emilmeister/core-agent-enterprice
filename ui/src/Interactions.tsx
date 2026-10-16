@@ -3,15 +3,19 @@ import { useEffect, useId, useRef, useState } from "react";
 import { Api, ApiError, errorText } from "./api";
 import type { Interaction } from "./types";
 import { actionLabel, actionPreview } from "./toolPresentation";
+import { GuardrailMaterial, guardrailReason } from "./GuardrailMaterial";
+import type { MaterialSource } from "./GuardrailMaterial";
 
 export function InteractionCard({
   api,
   item,
   refresh,
+  source,
 }: {
   api: Api;
   item: Interaction;
   refresh: () => Promise<void>;
+  source?: MaterialSource;
 }) {
   const [answer, setAnswer] = useState("");
   const [busy, setBusy] = useState(false);
@@ -155,10 +159,7 @@ export function InteractionCard({
         <p className="prose">{item.subject.question}</p>
       )}
       {item.kind === "guardrail" && (
-        <p>
-          Материал удерживается до решения. Разрешайте его, только если
-          доверяете содержимому.
-        </p>
+        <p>{guardrailReason(item.subject.reason)}</p>
       )}
       <p className="muted interaction-deadline" title={timezone}>
         Ответить до <time dateTime={new Date(item.deadline * 1000).toISOString()}>{new Date(item.deadline * 1000).toLocaleString("ru-RU", {
@@ -222,17 +223,17 @@ export function InteractionCard({
               <button className="secondary" disabled={busy || closed} onClick={inspect}>Просмотреть материал</button>
               {item.subject.affected_scope === "file_batch" && <button className="secondary" disabled={busy || closed} onClick={download}>Скачать проверяемый файл</button>}
             </>}
-            <button type="button" className="details-toggle" aria-label="Технические данные" title="Технические данные"
-              aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}><DetailsIcon /></button>
+            {item.kind !== "guardrail" && <button type="button" className="details-toggle" aria-label="Технические данные" title="Технические данные"
+              aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}><DetailsIcon /></button>}
           </div>
-          <div className="interaction-details" id={detailsId} hidden={!detailsOpen}><pre>{JSON.stringify(item.subject, null, 2)}</pre></div>
+          {item.kind !== "guardrail" && <div className="interaction-details" id={detailsId} hidden={!detailsOpen}><pre>{JSON.stringify(item.subject, null, 2)}</pre></div>}
       </>}
       {material && (
         <div className="material">
-          <div className="section-line"><strong>Приватный материал</strong>
+          <div className="section-line"><strong>Материал</strong>
             <button className="text-button" onClick={() => setMaterial(null)}>Скрыть</button>
           </div>
-          <pre>{JSON.stringify(material, null, 2)}</pre>
+          <GuardrailMaterial value={material} source={source} />
         </div>
       )}
       {error && (

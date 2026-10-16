@@ -273,6 +273,11 @@ export function History({
     ),
   );
   const rendered = new Set<string>();
+  function materialSource(item: Interaction, root: string | null) {
+    return groups.filter(group => group.root === root).flatMap(group => group.entries)
+      .find(({ action }) => action?.callId && ["result:", "arguments:"].some(prefix =>
+        item.subject.source_id === prefix + action.callId))?.action;
+  }
   return (
     <>
       {selected && <ActionDialog action={selected}
@@ -327,7 +332,7 @@ export function History({
           }
           const review = item.review && !rendered.has(item.review.wait_id) ? reviews.get(item.review.wait_id) : undefined;
           if (review) rendered.add(review.wait_id);
-          return review ? <InteractionCard key={review.wait_id} api={api} item={review} refresh={refresh} /> : null;
+          return review ? <InteractionCard key={review.wait_id} api={api} item={review} refresh={refresh} source={materialSource(review, root)} /> : null;
         }
         function renderEntry({ item, action }: HistoryEntry) {
           const peer = onPeerOpen && peerConversations.find((value) => value.operation_id === peerOperationId(action));
@@ -376,6 +381,7 @@ export function History({
                   key={item.wait_id}
                   api={api}
                   item={item}
+                  source={materialSource(item, root)}
                   refresh={refresh}
                 />
               ))}

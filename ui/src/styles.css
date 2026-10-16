@@ -821,6 +821,11 @@ main {
 .material strong {
   font-size: 12px;
 }
+.material-source { margin: 12px 0 8px; }
+.material-command { white-space: pre-wrap; overflow-wrap: anywhere; }
+.material-content { max-height: min(50dvh, 440px); overflow: auto; overscroll-behavior: contain; margin-top: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #f7f7f7; }
+.material-content pre { margin: 0; padding: 0; border: 0; background: transparent; white-space: pre-wrap; overflow-wrap: anywhere; max-height: none; overflow: visible; }
+.material-content > strong { display: block; margin: 16px 0 8px; }
 .outcome {
   color: var(--green);
   margin-top: 12px;

@@ -34,7 +34,7 @@ export const demoQuestion = "Для кого предназначена през
 export function demoInteraction(kind: Interaction["kind"] = "tool_approval"): Interaction {
   return { wait_id: kind, source_id: "ask", context_id: "demo", kind, subject_digest: "demo-digest", deadline: Date.now() / 1000 + 86400, outcome: null,
     subject: kind === "tool_approval" ? { tool_name: "core_ask_owner", arguments: { question: demoQuestion } }
-      : kind === "owner_question" ? { question: demoQuestion } : { affected_scope: "tool_result", reason: "Материал требует решения владельца", source_id: "result:read" } };
+      : kind === "owner_question" ? { question: demoQuestion } : { affected_scope: "tool_result", source_kind: "tool_result", reason: "suspicious", source_id: "result:read" } };
 }
 export const demoPeer: PeerConversation = {
   operation_id: "peer-operation", peer_id: "analyst", peer_name: "Аналитик", root_task_id: "demo-task",
@@ -114,7 +114,11 @@ export function createDemoRequest(mode: DemoMode = "normal", taskState = "TASK_S
     if (route === "/api/chats") return list("chats", chats);
     if (route.endsWith("/history")) return list("items", history);
     if (route === "/api/interactions") return list("interactions", []);
-    if (/^\/api\/(hitl|questions|guardrails)\//.test(route)) return json(route.endsWith("/material") ? { text: "Демонстрационный материал для проверки.", source: "Внешний документ" } : { outcome: { reason: body.decision === "reject" ? "rejected" : "allowed", answer: body.answer } });
+    if (/^\/api\/(hitl|questions|guardrails)\//.test(route)) return json(route.endsWith("/material")
+      ? { review: { review_id: "PRIVATE-REVIEW-ID", revision: 4, created_at: 1792136460, source_kind: "tool_result", classification: { reason: "suspicious", completion_tokens: 648 } },
+          material: { payload: { tool_name: "core_terminal_exec", tool_call_id: "PRIVATE-CALL-ID", status: "succeeded",
+            output: { status: "succeeded", stdout: "# README\n\nИнструкции проекта.\n<script>window.materialExecuted=true</script>\nКонец материала.", stderr: "Предупреждение проверки\n", exit_code: 0, cleanup: "sandbox_terminated" } }, sealed_ref: null } }
+      : { outcome: { reason: body.decision === "reject" ? "rejected" : "allowed", answer: body.answer } });
     if (route.includes("/peer-conversations")) {
       if (route.endsWith("/observation")) return json({});
       if (route.endsWith("/peer-conversations")) return list("conversations", mode === "empty" ? [] : [demoPeer]);

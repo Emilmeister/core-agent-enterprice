@@ -570,6 +570,9 @@ try {
   await page.field('.composer textarea','Browser guardrail review proof');
   await page.click('Отправить ↑');
   await page.wait("[...document.querySelectorAll('.interaction:not(.resolved) h3')].some(h=>h.textContent==='Проверка материала')",'actual suspicious input owner guardrail request');
+  await page.click('Просмотреть материал','.interaction:not(.resolved) button');
+  await page.wait("!!document.querySelector('.interaction .material-content')",'private material becomes readable after explicit inspect');
+  check(await page.evaluate("document.querySelector('.material-content').textContent.includes('Browser guardrail review proof') && !document.querySelector('.interaction[data-kind=guardrail] [aria-label=\"Технические данные\"]') && !/review_id|completion_tokens|subject_digest/.test(document.querySelector('.material').textContent)"),'guardrail exposes actual input without technical envelope or gear');
   await page.click('Отклонить','.interaction:not(.resolved) button');
   await page.wait("!!document.querySelector('.interaction:not(.resolved) textarea')",'durable owner clarification after withheld input');
   check(await page.evaluate("![...document.querySelectorAll('.interaction h3')].some(h=>h.textContent==='Проверка материала') && document.querySelector('.pending-interaction-bar').textContent.includes('нужен ваш ответ')"),'resolved guardrail stays hidden while active owner question remains visible');

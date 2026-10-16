@@ -32,7 +32,9 @@ function ApprovalState({ kind = "tool_approval", resolved = false }: { kind?: In
     return client;
   }, []);
   return <div>
-    <InteractionCard api={api} item={item} refresh={async () => { setItem(previous => ({ ...previous, outcome: decision.current })); }} />
+    <InteractionCard api={api} item={item}
+      source={kind === "guardrail" ? { name: "core_terminal_exec", args: { argv: ["cat", "README.md"] } } : undefined}
+      refresh={async () => { setItem(previous => ({ ...previous, outcome: decision.current })); }} />
     {item.outcome && kind !== "owner_question" && <p className="catalog-note" role="status">Решение сохранено в демосценарии. Обработанная карточка скрыта, как в чате.</p>}
     <button className="text-button catalog-reset" onClick={() => setItem(demoInteraction(kind))}>Сбросить пример</button>
   </div>;
