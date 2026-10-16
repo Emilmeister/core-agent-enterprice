@@ -207,7 +207,7 @@ export function ActionDialog({ action, terminal, waits, onClose }: ActionProps &
             {output?.truncated === true && <p className="muted">Вывод ограничен при выполнении действия.</p>}
           </> : <pre>{typeof action.result?.output === "string" ? action.result.output : JSON.stringify(action.result?.output, null, 2)}</pre>}
         </section>}
-        <details className="action-technical" open><summary className="details-toggle" aria-label="Технические данные" title="Технические данные"><DetailsIcon /></summary><dl>
+        <details className="action-technical"><summary className="details-toggle" aria-label="Технические данные" title="Технические данные"><DetailsIcon /></summary><dl>
           <dt>Инструмент</dt><dd>{action.name || "Неизвестен"}</dd>
           <dt>Аргументы</dt><dd><pre>{action.args === undefined ? "Недоступны" : JSON.stringify(action.args, null, 2)}</pre></dd>
           <dt>ID вызова</dt><dd>{action.callId ?? "Недоступен"}</dd><dt>ID задачи</dt><dd>{action.taskId ?? "Недоступен"}</dd>
