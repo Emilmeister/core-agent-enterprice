@@ -1033,6 +1033,13 @@ UI MUST показывать preview с доступным именем «Пре
 
 ### Безопасный прогресс внешних операций
 
+Task MAY содержать finite metadata `core_agent_execution: {version:1,
+state:"cleanup_pending"}` только пока canonical workflow ожидает подтверждения
+остановки. UI показывает это ожидание вместо typing indicator. Marker не меняет
+A2A lifecycle, не разрешает удаление активного чата и удаляется после завершения
+reconciliation. Container IDs, PID namespaces, execution generations и
+операторские evidence остаются приватными.
+
 Root A2A Task MAY содержать metadata `core_agent_remote_progress`: упорядоченный
 по local task ID список объектов ровно `{task_id, revision, agent_name,
 remote_state}`. `task_id` — локальный handle операции, `revision` — scheduler

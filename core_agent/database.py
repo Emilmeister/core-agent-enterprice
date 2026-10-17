@@ -1353,7 +1353,18 @@ def public_sdk_message(message):
                           role=a2a_pb2.ROLE_AGENT, parts=parts, metadata=ParseDict(message.metadata, Struct()))
 
 
-def _project_public_output(task, output, *, version, owner_wait=False):
+def _project_execution_progress(task, record):
+    values = record if isinstance(record, dict) else vars(record) if record is not None else {}
+    snapshot = values.get("snapshot") or {}
+    pending = (values.get("state") not in {"COMPLETED", "FAILED", "CANCELLED", "REJECTED", "ABORTED"}
+               and snapshot.get("execution_cleanup_pending") is True)
+    if pending:
+        task.metadata["core_agent_execution"] = {"version": 1, "state": "cleanup_pending"}
+    elif "core_agent_execution" in task.metadata:
+        del task.metadata["core_agent_execution"]
+
+
+def _project_public_output(task, output, *, version, owner_wait=False, record=None):
     before = task.SerializeToString(deterministic=True)
     states = {"submitted": a2a_pb2.TASK_STATE_SUBMITTED, "working": a2a_pb2.TASK_STATE_WORKING,
         "input-required": a2a_pb2.TASK_STATE_INPUT_REQUIRED, "auth-required": a2a_pb2.TASK_STATE_AUTH_REQUIRED,
@@ -1383,6 +1394,7 @@ def _project_public_output(task, output, *, version, owner_wait=False):
         task.metadata["core_agent_wait"] = {"version": 1, "kind": "owner"}
     elif "core_agent_wait" in task.metadata:
         del task.metadata["core_agent_wait"]
+    _project_execution_progress(task, record)
     if before == task.SerializeToString(deterministic=True):
         return False
     if version is not None:
@@ -1402,7 +1414,7 @@ def reconcile_workflow_task(task, *, run_id, state, result=None, error_code=None
         if version is not None and isinstance(prior_version, (int, float)) and version < prior_version:
             return False
         return _project_public_output(task, workflow_public_output(record, response_files_service, connection=connection),
-                                      version=version, owner_wait=state == "WAITING_INPUT")
+                                      version=version, owner_wait=state == "WAITING_INPUT", record=record)
     terminal = {
         "COMPLETED": a2a_pb2.TASK_STATE_COMPLETED,
         "FAILED": a2a_pb2.TASK_STATE_FAILED,
@@ -1432,6 +1444,10 @@ def reconcile_workflow_task(task, *, run_id, state, result=None, error_code=None
     prior_version = dict(task.metadata).get("core_agent_workflow_version", 0)
     marker = {"version": 1, "kind": "owner"} if state == "WAITING_INPUT" else None
     marker_changed = MessageToDict(task.metadata).get("core_agent_wait") != marker
+    before_progress = task.SerializeToString(deterministic=True)
+    if version is None or not isinstance(prior_version, (int, float)) or version >= prior_version:
+        _project_execution_progress(task, record)
+        marker_changed = marker_changed or before_progress != task.SerializeToString(deterministic=True)
     if artifact is None and not authoritative and version is not None and isinstance(prior_version, (int, float)):
         if version < prior_version or version == prior_version and not marker_changed:
             return False
@@ -1786,12 +1802,15 @@ class PostgresTaskStore(TaskStore):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Manage core-agent PostgreSQL schema and explicit remote import")
     parser.add_argument(
-        "command", nargs="?", default="migrate", choices=("migrate", "check", "import-remote-agents")
+        "command", nargs="?", default="migrate", choices=("migrate", "check", "import-remote-agents", "confirm-execution-stop")
     )
-    parser.add_argument("--file", help="Protected version1 remote import JSON file")
+    parser.add_argument("--file", help="Protected version1 operator JSON file")
     args = parser.parse_args(argv)
-    if (args.command == "import-remote-agents") != (args.file is not None):
-        parser.error("--file is required only for import-remote-agents")
+    if (args.command in {"import-remote-agents", "confirm-execution-stop"}) != (args.file is not None):
+        parser.error("--file is required only for import-remote-agents or confirm-execution-stop")
+    if args.command == "confirm-execution-stop":
+        from .execution_reconciliation import read_stop_confirmation, confirm_operator_stop
+        confirmation = read_stop_confirmation(args.file, os.getenv("CORE_AGENT_TENANT_ID", ""))
     if args.command == "import-remote-agents":
         from .remote_registry import PostgresRemoteRegistry, read_legacy_peer_import
 
@@ -1809,6 +1828,9 @@ def main(argv=None):
                 database.grant_application_role(os.environ["DATABASE_APP_ROLE"])
         else:
             database.verify_schema()
+            if args.command == "confirm-execution-stop":
+                confirm_operator_stop(database, confirmation)
+                print("Execution stop confirmed; workflow recovery will settle the task")
             if args.command == "import-remote-agents":
                 registry = PostgresRemoteRegistry(database, os.getenv("PUSH_NOTIFICATION_ENCRYPTION_KEY"))
                 imported = registry.import_legacy(tenant, entries)

@@ -119,5 +119,13 @@ export function matchingActionWait(callId: string | undefined, waits: Interactio
 }
 
 export function awaitingModelReply(task: Task | undefined, waiting: boolean): boolean {
-  return !waiting && (task?.status.state === "TASK_STATE_WORKING" || task?.status.state === "TASK_STATE_SUBMITTED");
+  return !waiting && !executionCleanupPending(task) && (task?.status.state === "TASK_STATE_WORKING" || task?.status.state === "TASK_STATE_SUBMITTED");
+}
+
+export function executionCleanupPending(task?: Task): boolean {
+  const progress = task?.metadata?.core_agent_execution;
+  return ["TASK_STATE_WORKING", "TASK_STATE_SUBMITTED", "TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"].includes(task?.status.state ?? "")
+    && !!progress && typeof progress === "object"
+    && (progress as Record<string, unknown>).version === 1
+    && (progress as Record<string, unknown>).state === "cleanup_pending";
 }

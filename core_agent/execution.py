@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .errors import CoreError, ExecutionNotStarted
+from .execution_identity import execution_host
 from .sandbox import SandboxLauncher, SandboxProcess
 from .security import redact
 from .workspace import ChatWorkspaces, WorkspaceBinding
@@ -730,6 +731,7 @@ class TerminalSessionManager:
             raise CoreError("EXECUTION_ENVIRONMENT_UNAVAILABLE")
         self.backend = backend
         self.instance_id = str(uuid.uuid4())
+        self.execution_host = execution_host()
         self._environments = {}
         self.telemetry_records = []
         self._run_environments = {}

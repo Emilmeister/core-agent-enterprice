@@ -204,6 +204,14 @@ Production release v1 разрешён только когда все строк
 
 ## Диагностика выполнения
 
+`EXEC-AC-04`: `tests.test_execution_identity` и `tests.test_terminal_barrier`
+проверяют same-container restart, отсутствие replay, exact operator receipt,
+PostgreSQL audit, child barrier и приватность проекции. Native Docker lifetime
+проверяется `tests.test_execution_restart_docker` в `sandbox-linux`; Storybook
+`Recovery/CleanupPending` проверяет ожидание без typing и доступность удаления
+после завершения. Статус partial: target Kubernetes restart и native amd64
+проверка на этом рабочем месте не выполнены.
+
 | Criterion | Contract | Automated proof | Status |
 |---|---|---|---|
 | ENT-AC-105 | [Guardrail diagnostics](observability.md#obs-diag-01-сохранённые-решения-и-ожидания-guardrails), [acceptance](acceptance.md#диагностика-guardrails-и-sandbox) | `tests.test_material_reviews`, `tests.test_runtime_guardrails`, `tests.test_runtime_observability`, `tests.test_operator_diagnostics`: memory/real PostgreSQL atomic events, active canonical Task observer rollback, nested commit, scoped terminal recovery/backoff, public dispatcher isolation, exporter failure and finite privacy; ordinary CI suite | implemented |

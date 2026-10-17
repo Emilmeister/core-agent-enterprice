@@ -119,6 +119,25 @@ class TerminalBarrierTests(unittest.TestCase):
         self.assertEqual(result.message, "recovered")
         self.assertEqual(len(model.calls), 1)
 
+    def test_verified_same_container_restart_finishes_without_replaying_model(self):
+        agent, model = self.app(ModelResponse(message="done"))
+        manager = agent.tool_runtime.environment_manager
+        manager.execution_host = {"version": 1, "platform": "docker", "slot": "a" * 64,
+                                  "boot_id": "b" * 32, "pid_namespace": 123, "init_start": 100}
+        with patch.object(manager, "close_execution_tree", side_effect=CoreError("EXECUTION_ENVIRONMENT_UNAVAILABLE")):
+            self.start(agent)
+        store = agent.workflow_store
+        record = store.lookup_task("task")
+        owner = {**record.snapshot["execution_owner"], "cleanup_confirmed": False, "local_execution_pending": True}
+        store._records[record.run_id] = replace(record, snapshot={**record.snapshot, "execution_owner": owner})
+        manager.instance_id = "new-server"
+        manager.execution_host = {**manager.execution_host, "pid_namespace": 124, "init_start": 200}
+        result = agent.resume_task("task")
+        self.assertNotIsInstance(result, SuspendedRun)
+        self.assertEqual(result.message, "done")
+        self.assertEqual(len(model.calls), 1)
+        self.assertTrue(store.lookup_task("task").snapshot["execution_owner"]["cleanup_confirmed"])
+
     def test_foreign_safe_wait_without_finally_ack_resumes(self):
         agent, model = self.app(self.call("core_wait_until", {"until": "2027-10-01T00:00:00Z"}), ModelResponse(message="awake"))
         self.policy(agent, "allow", "core_wait_until")
@@ -150,6 +169,36 @@ class TerminalBarrierTests(unittest.TestCase):
         self.assertIsInstance(result, SuspendedRun)
         record = agent.workflow_store.lookup_task("task")
         self.assertFalse(record.snapshot["execution_owner"]["cleanup_confirmed"])
+
+    def test_restart_aborts_unknown_local_mutation_without_replay(self):
+        from tests.test_execution_identity import HOST
+        agent, model = self.app()
+        store = agent.workflow_store
+        record, *_ = agent._new_workflow({"prompt": "interrupted"}, task_id="task", identity="owner", session_id="chat", tenant_id="company")
+        token = store.acquire_lease(record.run_id, tenant_id="company", owner_id="owner", worker_id="old", ttl=1)
+        record = store.register_execution(record, instance_id="old-server", worker_id="old", generation=token,
+                                          lease_token=token, execution_host=HOST)
+        snapshot = {**record.snapshot, "pending_call": {"id": "call", "name": "core_terminal_exec", "arguments": {"argv": ["true"]}}, "pending_mutating": True}
+        store.transition(record.run_id, tenant_id="company", owner_id="owner", expected_version=record.version,
+                         state="EXECUTING", snapshot=snapshot, event_kind="tool.intent", lease_token=token)
+        self.now[0] += 2
+        agent.tool_runtime.environment_manager.execution_host = {**HOST, "init_start": 200, "pid_namespace": 124}
+        agent._recover_workflows_once()
+        current = store.lookup_task("task")
+        self.assertEqual(current.state, "ABORTED")
+        self.assertEqual(current.error_code, "SIDE_EFFECT_UNKNOWN")
+        self.assertEqual(current.snapshot["execution_owner"]["cleanup_proof"]["kind"], "container_restart")
+        self.assertFalse(model.calls)
+
+    def test_pending_cleanup_is_durable_before_terminal_intent(self):
+        agent, model = self.app()
+        record, *_ = agent._new_workflow({"prompt": "legacy"}, task_id="task", identity="owner", session_id="chat", tenant_id="company")
+        snapshot = {**record.snapshot, "pending_call": {"id": "call", "name": "core_terminal_exec"}, "pending_mutating": True}
+        agent.workflow_store.transition(record.run_id, tenant_id="company", owner_id="owner", expected_version=record.version,
+            state="EXECUTING", snapshot=snapshot, event_kind="tool.intent")
+        self.assertIsInstance(agent.resume_task("task"), SuspendedRun)
+        self.assertTrue(agent.workflow_store.lookup_task("task").snapshot["execution_cleanup_pending"])
+        self.assertFalse(model.calls)
 
     def test_stale_attempt_finally_cannot_acknowledge_or_close_new_generation(self):
         agent, _ = self.app()
@@ -302,6 +351,34 @@ class TerminalBarrierStoreTests(unittest.TestCase):
                                   state="EXECUTING", snapshot=self.root.snapshot, event_kind="tool.intent", lease_token=self.token)
         self.assertEqual(raised.exception.code, "EXECUTION_CLOSING")
 
+    def test_operator_receipt_is_exact_idempotent_and_preserved(self):
+        self.root = self.store.register_execution(self.root, instance_id="instance", worker_id="worker",
+                                                  generation=self.token, lease_token=self.token)
+        owner = self.root.snapshot["execution_owner"]
+        proof = {"kind": "operator", "actor": "operator:test", "evidence": "verified container stopped"}
+        with self.assertRaises(CoreError):
+            self.store.confirm_execution(self.root, {**owner, "generation": "wrong"}, proof=proof, strict=True)
+        self.assertFalse(self.store.get(self.root.run_id, tenant_id="tenant").snapshot["execution_owner"]["cleanup_confirmed"])
+        confirmed = self.store.confirm_execution(self.root, owner, proof=proof, strict=True)
+        self.assertEqual(confirmed.snapshot["execution_owner"]["cleanup_proof"], proof)
+        again = self.store.confirm_execution(self.root, owner, proof={**proof, "evidence": "replacement"}, strict=True)
+        self.assertEqual(again.snapshot["execution_owner"]["cleanup_proof"], proof)
+        with self.assertRaises(CoreError):
+            self.store.confirm_execution(replace(self.root, tenant_id="foreign"), owner, proof=proof, strict=True)
+
+    def test_cleanup_marker_preserves_workflow_fields_and_rejects_stale_lease(self):
+        self.root = self.store.transition(self.root.run_id, tenant_id="tenant", owner_id="owner",
+            expected_version=self.root.version, state="RUNNING", snapshot=self.root.snapshot,
+            pending_approval_id="approval", result={"message": "saved"}, error_code="SAVED_ERROR",
+            event_kind="test", lease_token=self.token)
+        marked = self.store.mark_execution_cleanup_pending(self.root, lease_token=self.token)
+        self.assertEqual(marked.pending_approval_id, self.root.pending_approval_id)
+        self.assertEqual(marked.result, self.root.result)
+        self.assertEqual(marked.error_code, self.root.error_code)
+        self.assertTrue(marked.snapshot["execution_cleanup_pending"])
+        with self.assertRaises(CoreError):
+            self.store.mark_execution_cleanup_pending(marked, lease_token="stale")
+
     def test_unconfirmed_receipt_cannot_be_overwritten_and_stale_ack_is_inert(self):
         owner = dict(instance_id="instance", worker_id="worker", generation=self.token, cleanup_confirmed=False)
         self.root = self.store.register_execution(self.root, **{k: owner[k] for k in ("instance_id", "worker_id", "generation")}, lease_token=self.token)
@@ -343,6 +420,23 @@ class PostgresTerminalBarrierTests(TerminalBarrierStoreTests):
         self.database.migrate()
         self.store = PostgresWorkflowStore(self.database)
         self.create_root()
+
+    def test_operator_command_audits_exact_generation_once(self):
+        from core_agent.execution_reconciliation import confirm_operator_stop
+        self.root = self.store.register_execution(self.root, instance_id="instance", worker_id="worker",
+                                                  generation=self.token, lease_token=self.token)
+        confirmation = dict(version=1, tenant_id="tenant", owner_id="owner", run_id=self.root.run_id,
+                            instance_id="instance", worker_id="worker", generation=self.token,
+                            evidence="verified old container stopped")
+        for _ in range(2):
+            confirmed = confirm_operator_stop(self.database, confirmation)
+            self.assertTrue(confirmed.snapshot["execution_owner"]["cleanup_confirmed"])
+        with self.database.transaction() as connection:
+            rows = connection.execute("SELECT data FROM core_audit_records WHERE tenant_id=%s AND run_id=%s AND kind=%s",
+                ("tenant", self.root.run_id, "execution.stop_confirmed")).fetchall()
+            actor = connection.execute("SELECT current_user AS actor").fetchone()["actor"]
+        self.assertEqual([row["data"] for row in rows], [dict(kind="operator", actor=f"operator:{actor}",
+            evidence=confirmation["evidence"], instance_id="instance", worker_id="worker", generation=self.token)])
 
     def test_root_intent_serializes_concurrent_child_admission_and_dispatch(self):
         child = self.store.create(replace(self.root, run_id=str(uuid.uuid4()), task_id=str(uuid.uuid4()), parent_run_id=self.root.run_id, snapshot={}))

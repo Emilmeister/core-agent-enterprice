@@ -30,6 +30,7 @@ from .context import (
     StructuredSummarizer,
 )
 from .chat_files import _destination
+from .execution_identity import stopped_by_restart
 from .a2a import output_contract_version, workflow_public_output
 from .errors import CoreError, ExecutionNotStarted
 from .interactions import tool_origin
@@ -1710,9 +1711,19 @@ class CoreAgent:
             messages.append({"role": "user", "content": item.content})
         return messages
 
+    def _confirm_restarted_execution(self, record):
+        owner = record.snapshot.get("execution_owner")
+        manager = self.tool_runtime.environment_manager
+        host = getattr(manager, "execution_host", None)
+        if (owner and not owner["cleanup_confirmed"] and owner["instance_id"] != getattr(manager, "instance_id", None)
+                and stopped_by_restart(owner.get("execution_host"), host)):
+            return self.workflow_store.confirm_execution(record, owner,
+                proof={"kind": "container_restart", "observed_host": host})
+        return record
+
     def _finish_terminal(self, record, *, lease_token):
         intent = record.snapshot["terminal_intent"]
-        family = self.workflow_store.execution_family(record)
+        family = tuple(self._confirm_restarted_execution(item) for item in self.workflow_store.execution_family(record))
         if any(self._unproven_local_execution(item) for item in family):
             raise CoreError("EXECUTION_CLEANUP_PENDING", "Legacy execution has no durable cleanup receipt")
         manager = self.tool_runtime.environment_manager
@@ -1791,7 +1802,14 @@ class CoreAgent:
         except CoreError as error:
             if error.code not in {"EXECUTION_CLEANUP_PENDING", "EXECUTION_CLOSING"}:
                 raise
-            current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            try:
+                current = self.workflow_store.mark_execution_cleanup_pending(record, lease_token=token)
+            except CoreError as marking_error:
+                if marking_error.code != "LEASE_LOST":
+                    raise
+                # A durable wait may already have released this attempt's lease.
+                # Never let a stale UI marker overwrite a new attempt.
+                current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
             return SuspendedRun(current.run_id, current.task_id, current.snapshot.get("wait_id", ""), current.version)
         finally:
             try:
@@ -1806,7 +1824,8 @@ class CoreAgent:
         owner = None
         runtime_token = None
         try:
-            record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+            record = self._confirm_restarted_execution(self.workflow_store.get(
+                record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id))
             previous = record.snapshot.get("execution_owner")
             completed = record.snapshot.get("pending_completed_result") or {}
             call = completed.get("call") or {}
@@ -1845,8 +1864,16 @@ class CoreAgent:
                         manager.destroy_execution(record.run_id, previous["worker_id"], previous["generation"])
                     record = self.workflow_store.confirm_execution(record, previous)
                 record = self.workflow_store.register_execution(record, instance_id=manager.instance_id,
-                            worker_id=self._worker_id, generation=token, lease_token=token)
+                            worker_id=self._worker_id, generation=token, lease_token=token,
+                            execution_host=getattr(manager, "execution_host", None))
                 owner = record.snapshot["execution_owner"]
+                if record.snapshot.get("execution_cleanup_pending"):
+                    snapshot = {**record.snapshot}
+                    snapshot.pop("execution_cleanup_pending")
+                    record = self.workflow_store.transition(record.run_id, tenant_id=record.tenant_id,
+                        owner_id=record.owner_id, expected_version=record.version, state=record.state,
+                        pending_approval_id=record.pending_approval_id, result=record.result, error_code=record.error_code,
+                        snapshot=snapshot, event_kind="execution.resumed", lease_token=token)
                 next_scope = manager.execution_scope(record.run_id, self._worker_id, token, parent_run_id=record.parent_run_id,
                             ancestor_run_ids=ancestors)
                 next_scope.__enter__()

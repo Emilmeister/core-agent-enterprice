@@ -243,6 +243,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/context.py` | Context budget, compaction и structured summary |
 | `core_agent/tools.py` | Tool schemas, validation, policy и dispatch |
 | `core_agent/execution.py` | PTY/process groups, owned workspaces, snapshots и limits |
+| `core_agent/execution_identity.py`, `core_agent/execution_reconciliation.py` | Private container lifetime identity и exact operator stop attestation без повторного запуска команд |
 | `core_agent/workspace.py` | Trusted tenant/owner/context binding, постоянные папки чатов и nofollow owner file preview/download |
 | `core_agent/workspace_cleanup.py` | Подтверждённая exact selection, durable intent/receipt, private capture/journal и bounded recovery очистки |
 | `core_agent/python_exec.py` | Bounded Python process и `tools.call(...)` broker |
@@ -266,6 +267,15 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/memory.py` | Markdown revisions, hybrid retrieval, NER, graph index и `core_memory_*` tools |
 | `core_agent/memory_store.py` | In-memory и PostgreSQL backends memory corpus |
 | `core_agent/memory_providers.py` | Embedding provider и извлечение сущностей моделью агента |
+
+`core-agent-db confirm-execution-stop --file /run/secrets/stop.json` подтверждает
+остановку одного точного execution generation после внешней проверки оператором.
+Команда сверяет tenant/owner/run/instance/worker/generation, сохраняет доказательство
+в приватном receipt и audit; обычный recovery завершает Task. Она не останавливает
+процессы сама. Формат и проверка среды описаны в `docs/execution-recovery.md`.
+Автоматическое подтверждение поддерживает только поздний PID-1 lifetime того же
+Docker container или Kubernetes Pod/container в пределах одного boot. Другой
+контейнер, потерянный lease и отсутствие локальных handles не доказывают остановку.
 
 ## Progressive disclosure: что читать
 

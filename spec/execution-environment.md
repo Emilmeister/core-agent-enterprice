@@ -222,6 +222,26 @@ terminal/Python и снимается только при известном з�
 остановке. Сохранённый явный признак отсутствия такого dispatch позволяет новой
 fenced попытке восстановить model-only run или safe wait после сбоя сервера;
 отсутствующий признак не считается этим доказательством.
+Container recovery сохраняет private binding в execution receipt: Docker container ID
+из runtime-owned mounts либо trusted Kubernetes Pod UID/container name, а также
+boot ID, PID namespace и start time PID 1. Автоматическое подтверждение допустимо
+только для dedicated PID namespace с агентом как PID 1, при подтверждённой смене
+lifetime того же container slot на том же boot ID. Смена boot ID требует
+операторского подтверждения: новый host не доказывает остановку старого.
+HOSTNAME, новая replica/Pod/container identity,
+истечение lease и отсутствие handles сами по себе не являются доказательством.
+При недоступной или неоднозначной identity recovery MUST оставаться fail-closed.
+Receipt о restart/операторском подтверждении применяется к точным tenant/run/
+instance/worker/generation под canonical lock; stale proof не подтверждает новую
+generation. Проверка охватывает всех canonical descendants до terminal commit.
+Неизвестный outcome мутации остаётся `ABORTED / SIDE_EFFECT_UNKNOWN`, без replay.
+Legacy executions с существующим execution receipt и replacement-container
+executions допускают явное операторское подтверждение остановки после проверки
+инфраструктуры. Каждая команда выбирает ровно один receipt; scope, ожидаемая
+generation и evidence обязательны. Checkpoint без receipt остаётся fail-closed.
+Это operational
+command, не модельный tool и не owner HTTP API.
+
 Это правило распространяется на legacy checkpoint, указывающий на возможное
 незавершённое локальное выполнение без достаточных сведений для проверки.
 

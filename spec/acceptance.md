@@ -904,3 +904,11 @@ implemented. Automated proofs MUST входить в обычные applicable g
   наружу отклоняются. Файл в workspace переживает следующий sandbox-вызов,
   файл в `/tmp` — нет. Описания инструментов сообщают эти свойства до вызова;
   Node.js/npm не добавляются в образ.
+- EXEC-AC-04: same-slot restart с тем же boot ID и новым PID 1 подтверждает
+  остановку точной execution generation. Unknown mutation завершается ABORTED
+  без повторного model/tool call; terminal barrier проверяет дочерние generations.
+  Другая replica, boot ID, незавершённый старый запуск, отсутствующая identity
+  или stale receipt сохраняют барьер. Operator confirmation привязан к company,
+  owner, run, instance, worker и generation; evidence сохраняется один раз.
+  UI показывает ожидание подтверждения остановки без typing animation; после
+  terminal reconciliation удаление чата снова доступно, история/файлы сохранены.

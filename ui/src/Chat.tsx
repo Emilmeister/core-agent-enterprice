@@ -8,7 +8,7 @@ import {
 } from "react";
 import { Api, ApiError, errorText } from "./api";
 import { Attachments, ConversationFiles, History, pendingAction, useChatHistory } from "./History";
-import { awaitingModelReply } from "./toolPresentation";
+import { awaitingModelReply, executionCleanupPending } from "./toolPresentation";
 import { WorkspaceFiles } from "./WorkspaceFiles";
 import { Markdown } from "./Markdown";
 import { chatStreamEvent, nextLiveAnswer } from "./chatStream";
@@ -598,6 +598,7 @@ export function Chat({
   const timerUntil = currentAction?.name === "core_wait_until" && currentAction.args && typeof currentAction.args === "object"
     ? (currentAction.args as Record<string, unknown>).until : undefined;
   const status = !task ? ""
+    : executionCleanupPending(task) ? "Ожидает подтверждения остановки"
     : activeWait ? activeWait.kind === "owner_question" ? "Ожидает вашего ответа" : "Ожидает вашего разрешения"
     : task.status.state === "TASK_STATE_COMPLETED" ? latestOutcome?.complete === false ? "Работа завершена частично" : ""
     : task.status.state === "TASK_STATE_FAILED" ? "Не удалось завершить запрос"
@@ -711,6 +712,7 @@ export function Chat({
       >
         {unlinkedPeers.map((entry) => <PeerConversationCard key={entry.operation_id} conversation={entry} onOpen={openPeer} />)}
         {peerHistory.error && <p className="muted peer-list-error" role="status">Не удалось обновить список обращений к агентам.</p>}
+        {executionCleanupPending(task) && <p className="error" role="status">Ожидается подтверждение остановки среды исполнения. До подтверждения завершить задачу и удалить чат нельзя. Если ожидание затянулось, требуется проверка среды исполнения администратором.</p>}
         {!task && !row && !localMessages.length && (
           <div className="welcome">
             <h2>Чем помочь?</h2>

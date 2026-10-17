@@ -78,6 +78,19 @@ Database credentials являются Platform/deployment config и никогд
 
 Production deployment MUST задавать `DURABLE_STORAGE_ROOT` для immutable blobs, snapshots, manifests и artifacts; S3-backed mount допустим. `LOCAL_WORKSPACE_ROOT` MUST указывать на локальную ephemeral filesystem container-а. Авторизованное развёртывание MUST явно задавать `CHAT_WORKSPACE_ROOT` на постоянном POSIX томе. Все три root MUST быть различны и не находиться друг внутри друга; startup отклоняет пересечение в любом направлении. Optional `LOCAL_BASE_SNAPSHOT` содержит content-addressed snapshot ID для ephemeral scratch; если он задан, startup проверяет commit manifest и все blobs до первого terminal call. Он не материализуется поверх постоянной папки чата. Active workspace никогда не размещается под `DURABLE_STORAGE_ROOT`.
 
+## Привязка исполнения к контейнеру
+
+Для автоматического подтверждения остановки прежнего исполнения процесс агента
+MUST быть PID 1 в выделенном PID namespace контейнера. Docker identity читается
+из runtime mounts `/etc/hosts` и `/etc/hostname`. Для Kubernetes deployment MAY
+передавать `CORE_AGENT_POD_UID` из Downward API `metadata.uid` и
+`CORE_AGENT_CONTAINER_NAME` с точным именем контейнера. Эти значения принадлежат
+deployment, не caller. `hostPID` и `shareProcessNamespace` для этого режима запрещены.
+Поддерживается новый lifetime того же контейнера в том же boot; смена Pod,
+контейнера или boot требует отдельного доказательства остановки. Отсутствующая
+или неподдерживаемая identity оставляет прежний cleanup barrier закрытым;
+операторский путь описан в `execution-environment.md`.
+
 ## Feature switches
 
 `CORE_AGENT_TERMINAL_MAX_SECONDS` — конечный положительный верхний предел timeout

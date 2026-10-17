@@ -190,20 +190,18 @@ class ProductionConfigurationTests(unittest.TestCase):
             self.assertIn("Execution is restricted to the chat workspace", python)
             terminal = registry.get("core_terminal_exec").description
             self.assertIn(
-                "Preinstalled CLI: GNU coreutils/findutils/gawk/sed/grep, rg, fd",
+                "Available commands include Git, standard Unix utilities, rg, fd, jq,",
                 terminal,
             )
-            self.assertIn("Mike Farah yq", terminal)
+            self.assertIn("archive tools and PDF utilities", terminal)
+            self.assertIn("Commands run directly, without a shell", terminal)
+            self.assertIn('Do not append "2>&1"', terminal)
             self.assertIn(
-                "pdftotext/pdfinfo/pdftoppm/pdfimages, and qpdf", terminal
-            )
-            self.assertIn("This list is not exhaustive", terminal)
-            self.assertIn(
-                "install workspace-local tools when policy and network access allow",
+                "when policy and network access allow",
                 terminal,
             )
             self.assertNotIn("root", terminal)
-            self.assertLessEqual(len(terminal), 700)
+            self.assertLessEqual(len(terminal), 2000)
         finally:
             app.state.close()
 

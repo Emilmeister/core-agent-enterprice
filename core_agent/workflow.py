@@ -308,9 +308,11 @@ class _ExecutionLifecycle:
                 raise CoreError("EXECUTION_CLOSING")
             run_id = item.parent_run_id
 
-    def register_execution(self, record, *, instance_id, worker_id, generation, lease_token):
+    def register_execution(self, record, *, instance_id, worker_id, generation, lease_token, execution_host=None):
         owner = dict(instance_id=instance_id, worker_id=worker_id, generation=generation,
                      cleanup_confirmed=False, local_execution_pending=False)
+        if execution_host is not None:
+            owner["execution_host"] = deepcopy(execution_host)
         with self._execution_lock(record, lease_token) as (current, connection):
             self._check_execution_open(current, connection)
             previous = current.snapshot.get("execution_owner")
@@ -320,15 +322,34 @@ class _ExecutionLifecycle:
                 raise CoreError("EXECUTION_CLEANUP_PENDING")
             return self._save_execution_owner(current, owner, connection)
 
-    def confirm_execution(self, record, owner):
+    def confirm_execution(self, record, owner, *, proof=None, strict=False):
         # A stale worker may acknowledge only its own retired generation. This
         # operational receipt must not invalidate an active child's checkpoint.
         with self._execution_lock(record) as (current, connection):
             previous = current.snapshot.get("execution_owner")
             if previous and all(previous[key] == owner[key] for key in ("instance_id", "worker_id", "generation")):
-                return self._save_execution_owner(current, {**previous, "cleanup_confirmed": True,
-                                                            "local_execution_pending": False}, connection)
+                if previous["cleanup_confirmed"]:
+                    return current
+                receipt = {**previous, "cleanup_confirmed": True, "local_execution_pending": False}
+                if proof is not None:
+                    receipt["cleanup_proof"] = deepcopy(proof)
+                    if connection is not None:
+                        evidence = {**proof, **{key: previous[key] for key in ("instance_id", "worker_id", "generation")}}
+                        self._audit(connection, current, (("execution.stop_confirmed", evidence),), self._current_time(connection))
+                return self._save_execution_owner(current, receipt, connection)
+            if strict:
+                raise CoreError("CHECKPOINT_INVALID", "Execution generation no longer matches")
             return current
+
+    def mark_execution_cleanup_pending(self, record, *, lease_token):
+        with self._execution_lock(record, lease_token) as (current, connection):
+            if current.state in TERMINAL_STATES or current.snapshot.get("execution_cleanup_pending"):
+                return current
+            return self.transition(current.run_id, tenant_id=current.tenant_id, owner_id=current.owner_id,
+                expected_version=current.version, state=current.state,
+                snapshot={**current.snapshot, "execution_cleanup_pending": True},
+                pending_approval_id=current.pending_approval_id, result=current.result, error_code=current.error_code,
+                event_kind="execution.cleanup_pending", lease_token=lease_token, connection=connection)
 
     def begin_terminal(self, record, intent, *, lease_token):
         with self._execution_lock(record, lease_token) as (current, connection):
