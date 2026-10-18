@@ -678,8 +678,9 @@ run получает отдельные MCP session и negotiated version; пе�
   durable Tasks не отменяются.
 - Общий `InteractionCard` скрывает tool approval и guardrail карточки только
   после canonical outcome, включая reject/timeout. Решения/audit сохраняются;
-  owner questions с ответами остаются видимыми. Локальный deadline сам по себе
-  не является серверным outcome.
+  owner questions с ответами остаются в компактной раскрываемой истории без
+  прежней формы/deadline; timeout/cancelled не выдаются за отправленный ответ.
+  Локальный deadline сам по себе не является серверным outcome.
 - Authenticated composition root подключает company settings и per-tool policy
   до запуска recovery. `/api/chats`, `/api/settings`, `/api/tool-policies`, `/api/interactions`,
   `/api/hitl/{wait_id}/decision`, `/api/questions/{wait_id}/answer` и

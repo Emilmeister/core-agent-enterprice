@@ -16,11 +16,15 @@ const meta = { title: "Обзор/Компоненты", excludeStories: ["Appro
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export function ApprovalExample(props: { kind?: Interaction["kind"]; resolved?: boolean }) {
-  return <ApprovalState key={`${props.kind}:${props.resolved}`} {...props} />;
+type ApprovalProps = { kind?: Interaction["kind"]; resolved?: boolean; outcomeReason?: "answer" | "timeout" | "cancelled" };
+
+export function ApprovalExample(props: ApprovalProps) {
+  return <ApprovalState key={`${props.kind}:${props.resolved}:${props.outcomeReason}`} {...props} />;
 }
-function ApprovalState({ kind = "tool_approval", resolved = false }: { kind?: Interaction["kind"]; resolved?: boolean }) {
-  const [item, setItem] = useState(() => ({ ...demoInteraction(kind), outcome: resolved ? { reason: "answered", answer: "Для команды продаж, 5 слайдов." } : null } as Interaction));
+function ApprovalState({ kind = "tool_approval", resolved = false, outcomeReason = "answer" }: ApprovalProps) {
+  const [item, setItem] = useState(() => ({ ...demoInteraction(kind), outcome: resolved
+    ? kind === "owner_question" ? { reason: outcomeReason, ...(outcomeReason === "answer" ? { answer: "Для команды продаж, 5 слайдов." } : {}) }
+      : { reason: "allowed" } : null } as Interaction));
   const decision = useRef<Record<string, unknown>>({});
   const api = useMemo(() => {
     const client = createDemoApi(); const request = client.request.bind(client);

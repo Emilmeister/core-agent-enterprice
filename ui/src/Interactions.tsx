@@ -126,14 +126,28 @@ export function InteractionCard({
       if (!controller.signal.aborted && api.session.valid) setBusy(false);
     }
   }
-  if (item.outcome && item.kind !== "owner_question") return null;
+  if (item.outcome) {
+    if (item.kind !== "owner_question") return null;
+    const savedAnswer = typeof item.outcome.answer === "string" ? item.outcome.answer : null;
+    const label = savedAnswer !== null ? "Ответ отправлен"
+      : item.outcome.reason === "timeout" ? "Время ожидания ответа истекло"
+      : item.outcome.reason === "cancelled" ? "Вопрос отменён" : "Вопрос закрыт";
+    return <details id={`interaction-${item.wait_id}`} tabIndex={-1} data-kind={item.kind} className="owner-question-history">
+      <summary>
+        <svg className="disclosure-chevron" viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m11 8 6 6-6 6" /></svg>
+        {label}
+      </summary>
+      <div className="question-answer">
+        {typeof item.subject.question === "string" && <div><strong>Вопрос агента</strong><p className="prose">{item.subject.question}</p></div>}
+        {savedAnswer !== null && <div><strong>Ваш ответ</strong><p className="prose">{savedAnswer}</p></div>}
+      </div>
+    </details>;
+  }
   return (
     <article id={`interaction-${item.wait_id}`} tabIndex={-1} data-kind={item.kind}
       className={`interaction ${closed ? "resolved" : ""}`}>
       <div className="interaction-status">
-        {item.outcome
-          ? "Решение сохранено"
-          : expired
+        {expired
             ? "Срок ожидания истёк"
             : item.kind === "owner_question" ? "Нужен ваш ответ" : "Нужно ваше разрешение"}
       </div>
@@ -166,19 +180,6 @@ export function InteractionCard({
           day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", timeZoneName: "short",
         })}</time>
       </p>
-      {item.outcome && (
-        <p className="outcome">
-          {item.outcome.reason === "allowed"
-            ? "Разрешено"
-            : item.outcome.reason === "rejected"
-              ? "Отклонено"
-              : item.outcome.reason === "timeout"
-                ? "Срок истёк"
-                : "Обработано"}
-          {typeof item.outcome.answer === "string" &&
-            ` · ${item.outcome.answer}`}
-        </p>
-      )}
       {!closed &&
         (item.kind === "owner_question" ? (
           <form

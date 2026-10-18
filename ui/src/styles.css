@@ -1305,15 +1305,17 @@ main {
 .tool-action summary { font-size: 12px; }
 .tool-action pre { margin: 8px 0; }
 .tool-action .error { margin-top: 8px; }
-.execution-group { margin: 16px 0; }
-.file-properties > summary, .execution-group > summary { display: flex; align-items: center; gap: 10px; width: fit-content; max-width: 100%; min-height: 28px; border-radius: 8px; list-style: none; color: var(--muted); font-size: 14px; line-height: 1.5; }
-.file-properties > summary::-webkit-details-marker, .execution-group > summary::-webkit-details-marker { display: none; }
+:is(.execution-group, .owner-question-history) { margin: 16px 0; }
+.file-properties > summary, :is(.execution-group, .owner-question-history) > summary { display: flex; align-items: center; gap: 10px; width: fit-content; max-width: 100%; min-height: 28px; border-radius: 8px; list-style: none; color: var(--muted); font-size: 14px; line-height: 1.5; }
+.file-properties > summary::-webkit-details-marker, :is(.execution-group, .owner-question-history) > summary::-webkit-details-marker { display: none; }
 .disclosure-chevron { flex: 0 0 24px; width: 24px; height: 24px; border-radius: 8px; background: #f5f5f5; transition: transform .16s; }
-.file-properties[open] > summary > .disclosure-chevron, .execution-group[open] > summary > .disclosure-chevron { transform: rotate(90deg); }
-.file-properties > summary:hover, .execution-group > summary:hover { color: var(--ink); }
+.file-properties[open] > summary > .disclosure-chevron, :is(.execution-group, .owner-question-history)[open] > summary > .disclosure-chevron { transform: rotate(90deg); }
+.file-properties > summary:hover, :is(.execution-group, .owner-question-history) > summary:hover { color: var(--ink); }
 .file-properties > dl { margin: 0; }
-.execution-group[open] > summary { margin-bottom: 12px; }
-.execution-group > summary { flex-wrap: wrap; }
+:is(.execution-group, .owner-question-history)[open] > summary { margin-bottom: 12px; }
+:is(.execution-group, .owner-question-history) > summary { flex-wrap: wrap; }
+.question-answer { display: grid; gap: 16px; padding-left: 34px; font-size: 14px; overflow-wrap: anywhere; }
+.question-answer p { margin: 6px 0 0; }
 .execution-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; overflow-wrap: anywhere; }
 .execution-warning { color: #a13732; }
 @media (max-width: 640px) {

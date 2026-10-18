@@ -144,7 +144,7 @@ export function createDemoRequest(mode: DemoMode = "normal", taskState = "TASK_S
       ? { review: { review_id: "PRIVATE-REVIEW-ID", revision: 4, created_at: 1792136460, source_kind: "tool_result", classification: { reason: "suspicious", completion_tokens: 648 } },
           material: { payload: { tool_name: "core_terminal_exec", tool_call_id: "PRIVATE-CALL-ID", status: "succeeded",
             output: { status: "succeeded", stdout: "# README\n\nИнструкции проекта.\n<script>window.materialExecuted=true</script>\nКонец материала.", stderr: "Предупреждение проверки\n", exit_code: 0, cleanup: "sandbox_terminated" } }, sealed_ref: null } }
-      : { outcome: { reason: body.decision === "reject" ? "rejected" : "allowed", answer: body.answer } });
+      : { outcome: { reason: route.endsWith("/answer") ? "answer" : body.decision === "reject" ? "rejected" : "allowed", answer: body.answer } });
     if (route.includes("/peer-conversations")) {
       if (route.endsWith("/observation")) return json({});
       if (route.endsWith("/peer-conversations")) return list("conversations", mode === "empty" ? [] : [demoPeer]);
