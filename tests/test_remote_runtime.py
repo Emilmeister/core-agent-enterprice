@@ -73,6 +73,88 @@ class RemoteRuntimeTests(AuthAppTestCase):
         self.assertNotEqual(wire["message_id"], "message-one")
         self.assertNotIn("external-a", json.dumps(record.snapshot))
 
+    async def test_new_root_reuses_direct_message_context_after_metadata_change(self):
+        self.sent.return_value = replace(self.sent.return_value, context_id="remote-conversation")
+        self.script(self.request(), ModelResponse(message="done"))
+        first = await self.submit("owner-a", "context-first", "same-local-chat")
+        self.assertEqual(first["status"]["state"], "TASK_STATE_COMPLETED")
+        first_wire = self.sent.call_args.kwargs
+        self.assertNotIn("context_id", first_wire)
+        self.peer = self.registry.update(self.tenant, self.peer["id"], {
+            "url": self.peer["url"], "description": "Updated delivery description", "enabled": True,
+            "header_name": self.peer["header_name"]}, expected_revision=self.peer["revision"], actor_id="alice")
+        self.script(self.request(), ModelResponse(message="done again"))
+        second = await self.submit("owner-b", "context-second", "same-local-chat")
+        self.assertEqual(second["status"]["state"], "TASK_STATE_COMPLETED")
+        second_wire = self.sent.call_args.kwargs
+        self.assertEqual(second_wire.get("context_id"), "remote-conversation")
+        self.assertNotIn("task_id", second_wire)
+        self.assertNotEqual(first_wire["message_id"], second_wire["message_id"])
+        record = self.agent.workflow_store.lookup_task(second["id"])
+        entry = next(iter(record.snapshot["remote_calls"].values()))
+        self.assertEqual(entry["contract"]["peer_revision"], 2)
+        self.assertEqual(entry["contract"]["conversation"], {"version": 1,
+            "owner_id": record.owner_id, "context_id": record.context_id, "generation": 1})
+        self.script(self.request(), ModelResponse(message="separate"))
+        await self.submit("owner-a", "context-third", "another-local-chat")
+        self.assertNotIn("context_id", self.sent.call_args.kwargs)
+
+    async def test_actual_delegated_child_reuses_parent_peer_context_only_in_same_chat(self):
+        self.sent.return_value = replace(self.sent.return_value, context_id="remote-parent-conversation")
+        self.agent.model = ScriptedModel([
+            self.request("parent-send"),
+            ModelResponse(tool_requests=(ToolRequest("delegate", "core_delegate", {
+                "instruction": "Ask delivery for an update", "tools": ["core_agent_send_message"], "skills": [],
+                "budget": {"turns": 3, "tool_calls": 1}}),)),
+            self.request("child-send"), ModelResponse(message="child done"), ModelResponse(message="parent done"),
+        ])
+        start_remote = self.agent.task_scheduler.start_remote
+
+        def settled_remote(*args, **kwargs):
+            handle = start_remote(*args, **kwargs)
+            self.agent.task_scheduler.wait(handle.id, timeout=3, owner_id=kwargs["owner_id"], tenant_id=kwargs["tenant_id"])
+            return handle
+
+        with patch.object(self.agent.task_scheduler, "start_remote", side_effect=settled_remote):
+            task = await self.submit("owner-a", "parent-and-child", "delegated-peer-chat")
+
+            def settle():
+                with self.agent.task_scheduler._lock:
+                    workers = tuple(self.agent.task_scheduler._threads)
+                for worker in workers:
+                    worker.join(3)
+                    self.assertFalse(worker.is_alive())
+                with patch.object(self.agent, "_launch_recovery", return_value=False):
+                    self.agent._recover_workflows_once()
+                self.agent.resume_task(task["id"])
+
+            await asyncio.to_thread(settle)
+        root = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(root.state, "COMPLETED", root.error_code)
+        children = [self.agent.workflow_store.lookup_task(handle.id)
+                    for handle in self.agent.task_scheduler.list(owner_id=root.run_id, tenant_id=self.tenant)
+                    if not self.agent.task_scheduler.is_remote(handle.id, owner_id=root.run_id, tenant_id=self.tenant)]
+        self.assertEqual(len(children), 1)
+        child = children[0]
+        self.assertEqual((child.parent_run_id, child.context_id, child.owner_id, child.state),
+                         (root.run_id, root.context_id, root.owner_id, "COMPLETED"))
+        parent_contract = next(iter(root.snapshot["remote_calls"].values()))["contract"]
+        child_contract = next(iter(child.snapshot["remote_calls"].values()))["contract"]
+        self.assertEqual(parent_contract["conversation"], child_contract["conversation"])
+        self.assertEqual(child_contract["caller_scope"]["run_id"], child.run_id)
+        self.assertEqual(child_contract["caller_scope"]["task_id"], child.task_id)
+        self.assertEqual(self.sent.call_count, 2)
+        parent_wire, child_wire = [call.kwargs for call in self.sent.call_args_list]
+        self.assertNotIn("context_id", parent_wire)
+        self.assertEqual(child_wire["context_id"], "remote-parent-conversation")
+        self.assertNotIn("task_id", child_wire)
+        self.assertNotEqual(parent_wire["message_id"], child_wire["message_id"])
+        self.script(self.request(), ModelResponse(message="separate chat done"))
+        separate = await self.submit("owner-a", "separate-peer-chat", "another-peer-chat")
+        self.assertEqual(separate["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(self.sent.call_count, 3)
+        self.assertNotIn("context_id", self.sent.call_args.kwargs)
+
     async def test_card_and_model_catalog_follow_scoped_registry(self):
         response = await self.http.get("/a2a/owner/.well-known/agent-card.json", headers=self.headers("owner-a"))
         self.assertIn("core_agent_send_message", {skill["id"] for skill in response.json().get("skills", [])})

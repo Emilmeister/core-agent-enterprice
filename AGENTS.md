@@ -908,6 +908,15 @@ run получает отдельные MCP session и negotiated version; пе�
   boundary. Private owner wait проецируется только safe metadata marker.
   Local rows имеют null checkpoint. Миграции выполняет database entrypoint,
   а не serving process.
+- Новые remote contracts v1–v3 дополнительно закрепляют `conversation` v1:
+  canonical owner/context и приватное поколение URL/авторизации registry.
+  Scheduler сохраняет remote context в `core_remote_context_bindings` отдельно
+  от Task, сериализует поручения одной пары chat/peer до terminal и атомарно
+  публикует context вместе с checkpoint/file admission. Новый Task не получает
+  прежний taskId; прямой Message тоже может закрепить contextId. Metadata edits
+  сохраняют поколение, смена endpoint/credentials изолирует его. Unknown outcome
+  блокирует следующие Send с REMOTE_CONTEXT_UNRESOLVED без replay; scope и
+  compatibility задаёт LONG-06 в `spec/tasks-and-delegation.md`.
 - Send/Cancel marker сохраняется до network; один worker выполняет один bounded
   request и освобождает claim. Unknown Send без remote ID и уже сохранённый
   Cancel marker требуют reconciliation; они не повторяются после recovery.

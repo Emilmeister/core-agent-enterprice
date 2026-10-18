@@ -1413,6 +1413,9 @@ class CoreAgent:
                 raise CoreError("CHECKPOINT_INVALID")
             contract = CoreAgent._remote_entry_contract(entry)
             _remote_contract(contract, record.tenant_id, record.run_id)
+            if "conversation" in contract and any(contract["conversation"][key] != getattr(record, key)
+                    for key in ("owner_id", "context_id")):
+                raise CoreError("CHECKPOINT_INVALID")
             if contract["version"] in {2, 3} and contract["caller_scope"] != {
                 key: getattr(record, key) for key in ("owner_id", "context_id", "task_id", "run_id")
             }:
@@ -1437,6 +1440,9 @@ class CoreAgent:
         contract = self._remote_binding(snapshot, call, attempt=attempt)
         if contract is not None:
             _remote_contract(contract, record.tenant_id, record.run_id)
+            if "conversation" in contract and any(contract["conversation"][key] != getattr(record, key)
+                    for key in ("owner_id", "context_id")):
+                raise CoreError("CHECKPOINT_INVALID")
             if contract["version"] in {2, 3} and contract["caller_scope"] != {
                 key: getattr(record, key) for key in ("owner_id", "context_id", "task_id", "run_id")
             }:
@@ -1448,6 +1454,9 @@ class CoreAgent:
             raise ExecutionNotStarted("TOOL_ARGUMENT_INVALID", "task_id and input_id must be provided together")
         if "task_id" in call.arguments:
             return self._pin_remote_reply(record, snapshot, call, lease_token=lease_token, attempt=attempt)
+        from .chat_files import _caller_records
+        _caller_records(self.workflow_store, WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id),
+            record.run_id, record.task_id)
         peer = self._remote_peers(record.tenant_id).get(call.arguments["agent_name"])
         if peer is None:
             raise CoreError("TOOL_UNAVAILABLE", "Registered remote agent is unavailable")
@@ -1475,6 +1484,10 @@ class CoreAgent:
             entry["arguments_digest"] = self._remote_arguments_digest(call)
         try:
             with self.remote_registry.pin_current(record.tenant_id, peer["id"], peer["revision"]) as connection:
+                contract["conversation"] = {"version": 1, "owner_id": record.owner_id,
+                    "context_id": record.context_id, "generation": self.remote_registry.connection_generation(
+                        record.tenant_id, peer["id"], peer["revision"], connection=connection)}
+                _remote_contract(contract, record.tenant_id, record.run_id)
                 snapshot.setdefault("remote_calls", {})[f"{attempt}:{call.id}"] = entry
                 record = self._record_transition(record, state=record.state, snapshot=snapshot,
                     event_kind="remote.pinned", event_data={"tool_call_id": call.id, "peer_id": peer["id"], "peer_revision": peer["revision"]},

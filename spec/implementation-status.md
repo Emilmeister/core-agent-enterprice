@@ -218,3 +218,9 @@ PostgreSQL audit, child barrier и приватность проекции. Nati
 |---|---|---|---|
 | ENT-AC-105 | [Guardrail diagnostics](observability.md#obs-diag-01-сохранённые-решения-и-ожидания-guardrails), [acceptance](acceptance.md#диагностика-guardrails-и-sandbox) | `tests.test_material_reviews`, `tests.test_runtime_guardrails`, `tests.test_runtime_observability`, `tests.test_operator_diagnostics`: memory/real PostgreSQL atomic events, active canonical Task observer rollback, nested commit, scoped terminal recovery/backoff, public dispatcher isolation, exporter failure and finite privacy; ordinary CI suite | implemented |
 | ENT-AC-106 | [Sandbox diagnostics](observability.md#obs-diag-02-причина-отказа-обязательного-sandbox), [acceptance](acceptance.md#диагностика-guardrails-и-sandbox) | `tests.test_sandbox`, `tests.test_operator_diagnostics`, `tests.test_runtime_observability`: finite private frames/resources, pre/post-release and cleanup proofs, actual terminal/Python/background telemetry and public compatibility; required native ARM64 full sandbox and Compose gates passed. Native amd64 gate remains unverified on this local host | partial |
+
+## Контекст исходящей A2A-переписки
+
+| Requirement | Source | Automated proof | Status |
+|---|---|---|---|
+| LONG-AC-06 | [LONG-06](tasks-and-delegation.md), [acceptance](acceptance.md#контекст-исходящей-a2a-переписки) | `tests.test_remote_context_bindings`, `tests.test_peer_context_http`, `tests.test_remote_runtime`, `tests.test_remote_registry`, `tests.test_remote_operations`: memory/PostgreSQL serialization, restart, scoped generation, legacy active/unknown без ID, CAS и atomic file rollback; реальные HTTP+JSON/JSONRPC Send, Task/Message context и разные root runs | implemented |

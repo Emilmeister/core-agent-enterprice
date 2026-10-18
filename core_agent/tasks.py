@@ -4,6 +4,7 @@ import threading
 import time
 import uuid
 import copy
+import heapq
 import math
 from dataclasses import dataclass, field
 
@@ -30,8 +31,10 @@ class RemoteTaskClaim:
 
 def remote_timeout_result(contract):
     return {"agent_name": contract["peer_name"], "reason": "timeout",
-            "message": "Мы уже ожидали эту задачу, срок истёк. Повторное ожидание недоступно; можно создать новую задачу. Исход предыдущей неизвестен.",
-            "remote_outcome": "unknown", "can_create_new_task": True}
+            "message": ("Срок ожидания истёк. Исход поручения неизвестен; перед новой отправкой в этот разговор требуется сверка с контрагентом."
+                        if "conversation" in contract else
+                        "Мы уже ожидали эту задачу, срок истёк. Повторное ожидание недоступно; можно создать новую задачу. Исход предыдущей неизвестен."),
+            "remote_outcome": "unknown", "can_create_new_task": "conversation" not in contract}
 
 
 def _remote_text(value):
@@ -51,7 +54,7 @@ def _remote_contract(contract, tenant_id, owner_id):
         raise CoreError("CHECKPOINT_INVALID")
     if contract["version"] >= 2:
         required |= {"caller_scope", "attachment_limit_bytes", "outgoing_files"}
-    if (not required <= contract.keys() <= required | {"_trace_parent"}
+    if (not required <= contract.keys() <= required | {"_trace_parent", "conversation"}
             or contract["tenant_id"] != tenant_id or contract["owner_id"] != owner_id):
         raise CoreError("CHECKPOINT_INVALID")
     for key in ("tenant_id", "owner_id", "peer_id", "peer_name", "url", "message_id", "task"):
@@ -62,6 +65,19 @@ def _remote_contract(contract, tenant_id, owner_id):
             raise CoreError("CHECKPOINT_INVALID")
     if not isinstance(contract["binding"], str) or contract["binding"] not in {"JSONRPC", "HTTP+JSON"}:
         raise CoreError("CHECKPOINT_INVALID")
+    if "conversation" in contract:
+        conversation = contract["conversation"]
+        if (not isinstance(conversation, dict)
+                or conversation.keys() != {"version", "owner_id", "context_id", "generation"}
+                or type(conversation["version"]) is not int or conversation["version"] != 1
+                or type(conversation["generation"]) is not int
+                or not 1 <= conversation["generation"] <= contract["peer_revision"]):
+            raise CoreError("CHECKPOINT_INVALID")
+        for key in ("owner_id", "context_id"):
+            _remote_text(conversation[key])
+            scope = contract.get("caller_scope")
+            if contract["version"] >= 2 and (not isinstance(scope, dict) or conversation[key] != scope.get(key)):
+                raise CoreError("CHECKPOINT_INVALID")
     if contract["version"] >= 2:
         from .response_files import ResponseFileService
         from .workspace import WorkspaceBinding
@@ -103,6 +119,58 @@ def _initial_remote_checkpoint(contract=None):
     if contract is not None and contract["version"] == 3:
         checkpoint.update(version=2, input_request=None, reply=None, answered_inputs=[])
     return checkpoint
+
+
+def _remote_context_key(contract):
+    conversation = contract.get("conversation")
+    if conversation is None:
+        return None
+    return (contract["tenant_id"], conversation["owner_id"], conversation["context_id"],
+            contract["peer_id"], conversation["generation"], contract["binding"])
+
+
+def _remote_context_matches(contract, previous, checkpoint):
+    try:
+        _remote_contract(previous, contract["tenant_id"], previous.get("owner_id"))
+        _remote_checkpoint(checkpoint, previous)
+    except (CoreError, AttributeError):
+        return False
+    if any(previous[key] != contract[key] for key in ("tenant_id", "peer_id", "url", "binding")):
+        return False
+    if "conversation" in previous:
+        return _remote_context_key(previous) == _remote_context_key(contract)
+    scope, conversation = previous.get("caller_scope", {}), contract["conversation"]
+    return (previous["peer_revision"] == conversation["generation"]
+            and all(scope.get(key) == conversation[key] for key in ("owner_id", "context_id")))
+
+
+def _remote_context_unknown(checkpoint, outcome):
+    if not checkpoint["send_started"]:
+        return False
+    state, result, error = outcome
+    result = result if isinstance(result, dict) else {}
+    if (result.get("remote_outcome") == "unknown"
+            or error in {"SIDE_EFFECT_UNKNOWN", "REMOTE_OPERATION_TIMEOUT", "RECOVERY_REQUIRES_RECONCILIATION"}):
+        return True
+    return not (state == "completed" or result.get("remote_outcome") in {"completed", "not_dispatched"}
+                or result.get("reason") == "not_dispatched" or result.get("remote_state") in {
+                    "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"})
+
+
+def _remote_context_checkpoint(binding, task_id, old, new):
+    if binding is None or not isinstance(new, dict) or not new.get("send_started"):
+        return new
+    if binding["blocked"] or binding["active_operation_id"] != task_id:
+        raise CoreError("LEASE_LOST")
+    new = copy.deepcopy(new)
+    saved = binding["remote_context_id"]
+    if not old["send_started"] and new.get("send_started") is True:
+        if new.get("remote_context_id") not in (None, saved):
+            raise CoreError("CHECKPOINT_INVALID")
+        new["remote_context_id"] = saved
+    if saved is not None and new.get("remote_context_id") != saved:
+        raise CoreError("CHECKPOINT_INVALID")
+    return new
 
 
 def _remote_input_id(value):
@@ -489,6 +557,7 @@ class TaskScheduler:
         self.active_compute_waiters = 0
         self.clock = clock
         self._remote = {}
+        self._remote_contexts = {}
 
     def start_remote(self, contract, *, owner_id, tenant_id, task_id, required=True, admission=None, trace_context=None):
         _remote_contract(contract, tenant_id, owner_id)
@@ -599,7 +668,79 @@ class TaskScheduler:
             raise CoreError("LEASE_LOST")
         return row, task
 
+    def _remote_context(self, contract):
+        key = _remote_context_key(contract)
+        if key is None:
+            return None
+        if key not in self._remote_contexts:
+            binding = {"remote_context_id": None, "active_operation_id": None, "blocked": False}
+            # Bootstrap once from the newest validated operation in this exact conversation.
+            candidates = heapq.nlargest(101, (
+                (identifier, row) for identifier, row in self._remote.items()
+                if isinstance(row["checkpoint"], dict) and row["checkpoint"].get("send_started") is True
+                and isinstance(row["contract"], dict)
+                and all(row["contract"].get(field) == contract[field] for field in ("tenant_id", "peer_id", "url", "binding"))
+                and isinstance(row["contract"].get("conversation", row["contract"].get("caller_scope")), dict)
+                and all(row["contract"].get("conversation", row["contract"].get("caller_scope", {})).get(field)
+                        == contract["conversation"][field] for field in ("owner_id", "context_id"))
+                and row["contract"].get("conversation", {}).get("generation", row["contract"].get("peer_revision")) == key[4]
+            ), key=lambda item: (item[1]["created_at"], item[0]))
+            for identifier, row in candidates[:100]:
+                if not _remote_context_matches(contract, row["contract"], row["checkpoint"]):
+                    continue
+                task = self._tasks[identifier]
+                binding["remote_context_id"] = row["checkpoint"]["remote_context_id"]
+                if task.state not in _REMOTE_TERMINAL:
+                    binding["active_operation_id"] = identifier
+                else:
+                    binding["blocked"] = _remote_context_unknown(row["checkpoint"],
+                        (task.state, task.result, getattr(task.error, "code", None)))
+                if binding["remote_context_id"] is None and binding["active_operation_id"] is None and not binding["blocked"]:
+                    continue
+                break
+            else:
+                if len(candidates) > 100:
+                    raise CoreError("CHECKPOINT_INVALID")
+            self._remote_contexts[key] = binding
+        return self._remote_contexts[key]
+
+    def _reserve_remote_context(self, row, task):
+        binding = self._remote_context(row["contract"])
+        if binding is None or row["cancel_requested"] and not row["checkpoint"]["send_started"]:
+            return True
+        active = binding["active_operation_id"]
+        if active is not None and active != task.id:
+            previous, previous_task = self._remote.get(active), self._tasks.get(active)
+            if previous is None or previous_task is None or not _remote_context_matches(
+                    row["contract"], previous["contract"], previous["checkpoint"]):
+                binding["blocked"] = True
+            else:
+                previous_context = previous["checkpoint"]["remote_context_id"]
+                if previous_context is not None:
+                    if binding["remote_context_id"] not in (None, previous_context):
+                        binding["blocked"] = True
+                    else:
+                        binding["remote_context_id"] = previous_context
+                if previous_task.state not in _REMOTE_TERMINAL and not binding["blocked"]:
+                    return False
+                if previous_task.state in _REMOTE_TERMINAL:
+                    binding["blocked"] |= _remote_context_unknown(previous["checkpoint"],
+                        (previous_task.state, previous_task.result, getattr(previous_task.error, "code", None)))
+                    binding["active_operation_id"] = None
+        if binding["blocked"]:
+            self._finish_remote_locked(row, task, ("failed", {
+                "agent_name": row["contract"]["peer_name"], "reason": "remote_context_unresolved",
+                "message": "Исход предыдущего поручения неизвестен. Перед новой отправкой в этот разговор требуется сверка с контрагентом.",
+                "remote_outcome": "not_dispatched"}, "REMOTE_CONTEXT_UNRESOLVED"))
+            return False
+        binding["active_operation_id"] = task.id
+        return True
+
     def _finish_remote_locked(self, row, task, outcome):
+        binding = self._remote_context(row["contract"])
+        if binding is not None and binding["active_operation_id"] == task.id:
+            binding["blocked"] |= _remote_context_unknown(row["checkpoint"], outcome)
+            binding["active_operation_id"] = None
         state, result, error_code = outcome
         result = _remote_result_batches(result, row["checkpoint"])
         row["checkpoint"]["next_poll_at"] = None
@@ -649,12 +790,16 @@ class TaskScheduler:
                 checkpoint = {**checkpoint, "input_request": None if reply and reply["status"] == "confirmed"
                               and (pending is None or reply["input_id"] == pending["input_id"]) else pending}
             outcome = _remote_cancelled_outcome(row["contract"], outcome, row["cancel_requested"])
+            binding = self._remote_context(row["contract"])
+            checkpoint = _remote_context_checkpoint(binding, task.id, row["checkpoint"], checkpoint)
             checkpoint = _advance_remote_checkpoint(row["checkpoint"], checkpoint, row["contract"], now, row["cancel_requested"], outcome)
             progress = _remote_progress(progress, row["contract"], checkpoint, outcome)
             conversation = merge_observation(row.get("conversation"), conversation_observation, now)
             if outcome is None and (row.get("observed_until") or 0) > now and checkpoint["remote_task_id"]:
                 checkpoint["next_poll_at"] = min(checkpoint["next_poll_at"] or now, now + 15, checkpoint["deadline"])
             new_input = _new_remote_input(row["checkpoint"], checkpoint)
+            if binding is not None and checkpoint["remote_context_id"] is not None:
+                binding["remote_context_id"] = checkpoint["remote_context_id"]
             row["checkpoint"] = checkpoint
             row["conversation"] = conversation
             row["updated_at"] = now
@@ -694,6 +839,8 @@ class TaskScheduler:
                     return task
                 if row["cancel_requested"] or row["checkpoint"]["cancel_started"]:
                     raise CoreError("CANCEL_REQUESTED")
+                context_binding = self._remote_context(contract)
+                checkpoint = _remote_context_checkpoint(context_binding, task.id, row["checkpoint"], checkpoint)
                 updated = _advance_remote_checkpoint(row["checkpoint"], checkpoint, contract, self.clock(), False, outcome,
                     file_batch_id=batch["batch_id"] if checkpoint["version"] == 3 else None)
                 _remote_progress(progress, contract, updated, outcome)
@@ -705,6 +852,7 @@ class TaskScheduler:
                     before_row = copy.deepcopy(row)
                     before_task = (task.state, copy.deepcopy(task.result), task.error, task.revision)
                     before_events = dict(mailbox._events)
+                    before_context = copy.deepcopy(context_binding)
                     suspended, recovery = task.id in self._suspended, self._recovery.get(task.id)
                     try:
                         service.bind(batch["batch_id"], binding, task_id=scope["task_id"], run_id=scope["run_id"],
@@ -718,6 +866,8 @@ class TaskScheduler:
                                 raise CoreError("LEASE_LOST")
                             if row["cancel_requested"]:
                                 raise CoreError("CANCEL_REQUESTED")
+                            if context_binding is not None and updated["remote_context_id"] is not None:
+                                context_binding["remote_context_id"] = updated["remote_context_id"]
                             row["conversation"] = merge_observation(row.get("conversation"), conversation_observation, self.clock())
                             row["updated_at"] = self.clock()
                             row["checkpoint"] = updated
@@ -738,6 +888,9 @@ class TaskScheduler:
                         row.update(before_row)
                         task.state, task.result, task.error, task.revision = before_task
                         mailbox._events = before_events
+                        if context_binding is not None:
+                            context_binding.clear()
+                            context_binding.update(before_context)
                         if suspended:
                             self._suspended.add(task.id)
                         if recovery is not None:
@@ -766,6 +919,10 @@ class TaskScheduler:
         with self._lock:
             row = self._remote[task.id]
             if task.state in _REMOTE_TERMINAL:
+                return
+            if not self._reserve_remote_context(row, task):
+                if task.state not in _REMOTE_TERMINAL:
+                    self._suspended.add(task.id)
                 return
             token = str(uuid.uuid4())
             row["token"] = token
@@ -974,6 +1131,8 @@ class TaskScheduler:
                 if remote is not None:
                     canceled = remote["cancel_requested"]
                 if remote is not None and not _remote_due(remote["checkpoint"], self.clock(), canceled):
+                    continue
+                if remote is not None and not self._reserve_remote_context(remote, self._tasks[task_id]):
                     continue
                 if remote is None and not canceled and not ready_now:
                     continue

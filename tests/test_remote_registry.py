@@ -93,6 +93,55 @@ class RemoteRegistryContract:
             self.store.disable(self.tenant, peer["id"], expected_revision=1, actor_id="owner")
         self.assertEqual(error.exception.code, "REMOTE_AGENT_CONFLICT")
 
+    def test_connection_generation_preserves_metadata_edits_and_equal_credentials(self):
+        peer = self.create(header_value="Bearer PRIVATE")
+        self.assertEqual(self.raw(peer["id"], 1).get("connection_generation"), 1)
+        for changes in ({"description": "Changed"}, {"enabled": False}, {"enabled": True},
+                        {"header_name": "authorization"}, {"header_value": "Bearer PRIVATE"}):
+            peer = self.update(peer, **changes)
+            with self.subTest(revision=peer["revision"]):
+                self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], peer["revision"]), 1)
+                self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], 1), 1)
+                self.assertNotIn("connection_generation", peer)
+                self.assertNotIn("PRIVATE", repr(peer))
+        self.assertEqual(self.store.list(self.tenant), [peer])
+        with self.store.pin_current(self.tenant, peer["id"], peer["revision"]) as connection:
+            self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], peer["revision"],
+                                                              connection=connection), 1)
+        with self.assertRaises(CoreError) as error:
+            self.store.connection_generation(self.tenant + "other", peer["id"], 1)
+        self.assertEqual(error.exception.code, "REMOTE_AGENT_NOT_FOUND")
+
+    def test_connection_generation_rotates_only_changed_connection_and_preserves_pinned_revision(self):
+        peer = self.create(header_value="Bearer PRIVATE")
+        self.assertEqual(self.raw(peer["id"], 1).get("connection_generation"), 1)
+        generations = {1: 1}
+        for changes in ({"url": "https://other.example/a2a"}, {"header_name": "X-Key"},
+                        {"header_value": "Bearer ROTATED"}, {"header_value": None}):
+            peer = self.update(peer, **changes)
+            generations[peer["revision"]] = peer["revision"]
+            self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], peer["revision"]),
+                             peer["revision"])
+        cleared_generation = peer["revision"]
+        peer = self.update(peer, header_value=None)
+        self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], peer["revision"]),
+                         cleared_generation)
+        self.store.delete(self.tenant, peer["id"], expected_revision=peer["revision"], actor_id="owner")
+        for revision, generation in generations.items():
+            self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], revision), generation)
+        replacement = self.create(header_value="Bearer PRIVATE")
+        self.assertNotEqual(peer["id"], replacement["id"])
+        self.assertEqual(self.store.connection_generation(self.tenant, replacement["id"], 1), 1)
+
+    def test_explicit_replacement_of_unreadable_secret_starts_new_connection_generation(self):
+        peer = self.create(header_value="Bearer PRIVATE")
+        self.store._cipher = Fernet(Fernet.generate_key())
+        updated = self.update(peer, header_value="Bearer REPLACED")
+        self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], updated["revision"]), 2)
+        self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], 1), 1)
+        self.assertEqual(self.store.resolve_headers(self.tenant, peer["id"], updated["revision"]),
+                         {"Authorization": "Bearer REPLACED"})
+
     def test_pin_current_fences_delete_and_rejects_changed_or_deleted_registration(self):
         peer = self.create(header_value="Bearer PINNED")
         started, finished = threading.Event(), threading.Event()
@@ -335,6 +384,9 @@ class RemoteRegistryContract:
                 with self.assertRaises(CoreError) as error:
                     self.store.get_revision(self.tenant, peer["id"], revision)
                 self.assertEqual(error.exception.code, "REMOTE_AGENT_INVALID")
+                with self.assertRaises(CoreError) as error:
+                    self.store.connection_generation(self.tenant, peer["id"], revision)
+                self.assertEqual(error.exception.code, "REMOTE_AGENT_INVALID")
         original = self.store._cipher
         self.store._cipher = None
         self.assertEqual(self.store.get_revision(self.tenant, peer["id"]), peer)
@@ -360,6 +412,20 @@ class MemoryRemoteRegistryTests(RemoteRegistryContract, unittest.TestCase):
 
     def tamper(self, peer_id, revision, field, value):
         self.store._revisions[(self.tenant, peer_id, revision)][field] = value
+
+    def test_legacy_connection_generation_defaults_to_revision_and_rejects_invalid_values(self):
+        peer = self.update(self.create(), description="Legacy")
+        row = self.store._revisions[(self.tenant, peer["id"], peer["revision"])]
+        row.pop("connection_generation", None)
+        self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], 2), 2)
+        updated = self.update(peer, description="Updated")
+        self.assertEqual(self.store.connection_generation(self.tenant, peer["id"], updated["revision"]), 2)
+        for value in (0, -1, True, "1", 3):
+            with self.subTest(value=value):
+                row["connection_generation"] = value
+                with self.assertRaises(CoreError) as error:
+                    self.store.connection_generation(self.tenant, peer["id"], 2)
+                self.assertEqual(error.exception.code, "CHECKPOINT_INVALID")
 
     def test_ephemeral_key_wrong_key_unknown_version_and_company_binding(self):
         ephemeral = InMemoryRemoteRegistry()
@@ -504,8 +570,10 @@ class PostgresRemoteRegistryTests(RemoteRegistryContract, unittest.TestCase):
         with self.database.transaction() as connection:
             self.assertEqual(fresh.get_revision(self.tenant, peer["id"], 1, connection=connection), peer)
             self.assertEqual(fresh.resolve_headers(self.tenant, peer["id"], 1, connection=connection), {"Authorization": "SECRET"})
+            self.assertEqual(fresh.connection_generation(self.tenant, peer["id"], 1, connection=connection), 1)
         unavailable = PostgresRemoteRegistry(self.database)
         self.assertEqual(unavailable.list(self.tenant), [peer])
+        self.assertEqual(unavailable.connection_generation(self.tenant, peer["id"], 1), 1)
         with self.assertRaises(CoreError) as error:
             unavailable.resolve_headers(self.tenant, peer["id"], 1)
         self.assertEqual(error.exception.code, "REMOTE_AGENT_CREDENTIAL_UNAVAILABLE")

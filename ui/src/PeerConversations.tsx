@@ -60,6 +60,7 @@ const materialLabels = {
   timed_out: "Проверка материала не завершилась вовремя",
 };
 function status(value: PeerConversation): string {
+  if (value.error_code === "REMOTE_CONTEXT_UNRESOLVED") return "Исход предыдущего поручения неизвестен. Продолжение переписки требует сверки";
   if (value.outcome_unknown) return "Не удалось подтвердить отправку поручения";
   if (value.error_code === "REMOTE_OPERATION_TIMEOUT") return "Время ожидания ответа истекло";
   if (peerActive(value) && value.reply_delivery === "queued") return "Ответ принят";

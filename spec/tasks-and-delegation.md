@@ -500,12 +500,15 @@ terminal `state: failed`, error code `REMOTE_OPERATION_TIMEOUT` и result ров
 can_create_new_task: true}`. Message сообщает, что срок уже истёк, повторное
 ожидание недоступно и можно создать отдельную новую задачу; он не утверждает
 неизвестный remote outcome. Повторный wait/get/cancel возвращает тот же сохранённый
-outcome без отправки запросов. Local task snapshots сохраняют прежнюю семантику.
+outcome без отправки запросов. Для новых contracts с `conversation` по LONG-06 timeout возвращает
+`can_create_new_task: false` и сообщение о необходимости сверки перед
+продолжением этой переписки. Остальная форма timeout result сохраняется.
+Local task snapshots сохраняют прежнюю семантику.
 
 Immutable contract version1 содержит ровно `version`, `tenant_id`, `owner_id`
 (parent run ID), `peer_id`, `peer_revision`, `peer_name`, `url`, `binding`,
 `message_id`, `task`, `timeout_seconds`, `poll_interval_seconds`; internal trace
-parent MAY добавляться существующим scheduler. Mutable checkpoint version1
+parent и поле `conversation` по LONG-06 MAY добавляться trusted runtime/scheduler. Mutable checkpoint version1
 содержит ровно `version`, `send_started`, `deadline`, `remote_task_id`,
 `remote_context_id`, `next_poll_at`, `cancel_started`. Начальный checkpoint имеет
 оба marker=false и остальные nullable fields=null. Первый committed send marker
@@ -531,6 +534,47 @@ Progress и checkpoint коммитятся одной fenced/CAS transaction; �
 Отдельный durable public input request по LONG-05 может пробудить агента.
 Terminal timeout/outcome заменяет working progress и выигрывает у позднего update.
 Foreign human-wait остаётся working: согласование выполняет remote owner.
+
+### LONG-06. Контекст переписки с контрагентом
+
+Harness MUST сохранять полученный от peer `contextId` для пары локальный чат /
+подключение и автоматически передавать его в следующих новых поручениях. Модель
+не выбирает этот ID. Новый Task получает новый `messageId`, прежний `contextId`
+и не получает `taskId` завершённой задачи. Ответ на `input-required` сохраняет
+оба исходных ID по LONG-05. Context ID из самостоятельного Message сохраняется
+так же, как ID из Task; отсутствие ID не стирает уже подтверждённую связь.
+
+Область связи: tenant, canonical owner/chat, immutable peer ID, поколение
+адреса/авторизации и transport binding. Actual parent links подтверждают общий
+чат сабагента. Run ID и отображаемое имя peer не являются ключом переписки.
+Изменение описания либо enabled не меняет поколение. Смена URL, имени header
+(без учёта регистра) или его значения начинает новую связь; поколение хранится
+приватно в registry revision и не содержит секрет либо его fingerprint.
+
+Контракты v1–v3 MAY содержать дополнительное поле `conversation` версии 1:
+`version`, `owner_id`, `context_id`, `generation`. Для v2/v3 owner/context MUST
+совпадать с caller_scope. Старые контракты без поля сохраняют прежнюю семантику.
+Миграция PostgreSQL добавляет отдельную таблицу связей и generation в immutable
+registry revisions; существующим revisions присваивается их номер. Новая связь
+может использовать последний подтверждённый context из проверенного legacy
+checkpoint того же scope, peer, URL, binding и закреплённого поколения. Если
+раньше создались несколько context, выбирается последний по created_at/id;
+удалённые переписки не объединяются. Отсутствующий ID не реконструируется.
+
+Scheduler сериализует новые операции одной связи до завершения предыдущей: это
+не допускает двух первых чатов и CONTEXT_BUSY у принимающего агента. Другие
+чаты и контрагенты независимы. Очередь использует существующий recovery; deadline
+начинается при committed Send intent. Полученный context записывается атомарно
+с checkpoint/result и file admission под claim, revision и deadline fences.
+Worker lease не является сроком жизни связи. Повторное получение Task не
+создаёт новой мутации; неподтверждённый Send не повторяется.
+
+Если исход отправленного поручения неизвестен (включая timeout), связь остаётся
+закрытой для новых Send до внешней сверки; следующие операции завершаются
+`REMOTE_CONTEXT_UNRESOLVED` с понятным сообщением вместо бесконечной очереди или
+молчаливого создания другого context. Подтверждённые completed/failed/canceled
+освобождают очередь и сохраняют context. История и уже принятые результаты
+остаются доступными. Смена подключения не считается сверкой старой операции.
 
 ### OWNER-PEER. Исходящие разговоры в owner UI
 

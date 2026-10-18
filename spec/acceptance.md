@@ -927,3 +927,17 @@ implemented. Automated proofs MUST входить в обычные applicable g
   owner, run, instance, worker и generation; evidence сохраняется один раз.
   UI показывает ожидание подтверждения остановки без typing animation; после
   terminal reconciliation удаление чата снова доступно, история/файлы сохранены.
+
+## Контекст исходящей A2A-переписки
+
+- LONG-AC-06: два последовательных поручения из одного чата одному peer
+  (включая разные root runs и сабагента) передают одинаковый полученный
+  contextId, разные messageId и не переносят старый taskId. Task и прямой
+  Message сохраняют context; input-required reply сохраняет task/context.
+  Параллельные первые обращения сериализуются в memory и PostgreSQL, restart
+  не теряет связь. Metadata-only edit сохраняет её, смена endpoint/credentials,
+  peer, tenant, owner или чата изолирует её. Legacy checkpoint может безопасно
+  продолжить существующий context. Lost claim/CAS, rollback file admission и
+  late response не меняют связь; unknown Send/timeout не повторяется и не
+  оставляет очередь бесконечно активной. Реальный HTTP peer получает context
+  во втором Send; публичные проекции не раскрывают секреты.

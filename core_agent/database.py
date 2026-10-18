@@ -30,7 +30,7 @@ from .errors import CoreError
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -949,6 +949,44 @@ ALTER TABLE core_background_tasks ADD CONSTRAINT core_background_public_conversa
           (jsonb_typeof(remote_conversation)='object' AND remote_conversation->>'version'='1'));
 """,
 
+    30: """
+ALTER TABLE core_remote_agent_revisions ADD COLUMN connection_generation bigint;
+UPDATE core_remote_agent_revisions SET connection_generation = revision;
+ALTER TABLE core_remote_agent_revisions ALTER COLUMN connection_generation SET NOT NULL;
+ALTER TABLE core_remote_agent_revisions ADD CONSTRAINT core_remote_connection_generation
+    CHECK (connection_generation > 0 AND connection_generation <= revision);
+CREATE TABLE core_remote_context_bindings (
+    tenant_id text NOT NULL,
+    owner_id text NOT NULL,
+    context_id text NOT NULL,
+    peer_id text NOT NULL,
+    generation bigint NOT NULL CHECK (generation > 0),
+    binding text NOT NULL CHECK (binding IN ('JSONRPC', 'HTTP+JSON')),
+    remote_context_id text CHECK (remote_context_id IS NULL OR length(remote_context_id) > 0),
+    active_operation_id text,
+    blocked boolean NOT NULL DEFAULT false,
+    PRIMARY KEY (tenant_id, owner_id, context_id, peer_id, generation, binding)
+);
+CREATE FUNCTION core_remote_context_immutable_binding() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (NEW.tenant_id,NEW.owner_id,NEW.context_id,NEW.peer_id,NEW.generation,NEW.binding)
+        IS DISTINCT FROM (OLD.tenant_id,OLD.owner_id,OLD.context_id,OLD.peer_id,OLD.generation,OLD.binding)
+        OR (OLD.remote_context_id IS NOT NULL AND NEW.remote_context_id IS DISTINCT FROM OLD.remote_context_id) THEN
+        RAISE EXCEPTION 'immutable remote context binding';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER core_remote_context_immutable_binding BEFORE UPDATE ON core_remote_context_bindings
+    FOR EACH ROW EXECUTE FUNCTION core_remote_context_immutable_binding();
+CREATE INDEX core_background_remote_context_lookup ON core_background_tasks (
+    tenant_id, (contract->>'peer_id'),
+    (COALESCE(contract->'conversation'->>'owner_id',contract->'caller_scope'->>'owner_id')),
+    (COALESCE(contract->'conversation'->>'context_id',contract->'caller_scope'->>'context_id')),
+    created_at DESC, id DESC
+) WHERE kind='remote_a2a' AND checkpoint->>'send_started'='true';
+""",
+
 }
 
 
@@ -1103,6 +1141,7 @@ class PostgresDatabase:
             "core_agent_setting_revisions": "SELECT, INSERT",
             "core_remote_agents": "SELECT, INSERT, UPDATE",
             "core_remote_agent_revisions": "SELECT, INSERT",
+            "core_remote_context_bindings": "SELECT, INSERT, UPDATE",
             "core_tool_policies": "SELECT, INSERT, UPDATE",
             "core_chats": "SELECT, INSERT, UPDATE",
             "core_workspace_cleanups": "SELECT, INSERT, UPDATE",

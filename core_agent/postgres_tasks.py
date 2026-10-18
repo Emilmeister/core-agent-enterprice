@@ -17,6 +17,7 @@ from .tasks import (
     _remote_expired, _remote_due, _remote_text, remote_timeout_result, _remote_file_binding, remote_result_projection,
     _remote_cancelled_outcome, _remote_reply_status,
     _pending_remote_input, _queue_remote_reply, _new_remote_input, _remote_result_batches,
+    _remote_context_key, _remote_context_matches, _remote_context_unknown, _remote_context_checkpoint,
 )
 from .workflow import SuspendedRun
 from .peer_conversations import merge_observation, OBSERVATION_TTL
@@ -243,6 +244,87 @@ class PostgresTaskScheduler:
                            (Jsonb(checkpoint), row["id"], row["tenant_id"]))
         return self._finish_locked(connection, {**row, "checkpoint": checkpoint}, *outcome, now)
 
+    def _remote_context_locked(self, connection, contract):
+        key = _remote_context_key(contract)
+        if key is None:
+            return None
+        where = "tenant_id=%s AND owner_id=%s AND context_id=%s AND peer_id=%s AND generation=%s AND binding=%s"
+        found = connection.execute("SELECT * FROM core_remote_context_bindings WHERE " + where + " FOR UPDATE", key).fetchone()
+        if found is not None:
+            return found
+        context_id, active, blocked = None, None, False
+        # Foreign jobs are read without row locks: all writers lock their own job before its binding.
+        candidates = connection.execute("""SELECT * FROM core_background_tasks
+            WHERE tenant_id=%s AND kind=%s AND contract->>'peer_id'=%s
+              AND contract->>'url'=%s AND contract->>'binding'=%s
+              AND COALESCE(contract->'conversation'->>'owner_id',contract->'caller_scope'->>'owner_id')=%s
+              AND COALESCE(contract->'conversation'->>'context_id',contract->'caller_scope'->>'context_id')=%s
+              AND COALESCE(contract->'conversation'->>'generation',contract->>'peer_revision')=%s
+              AND checkpoint->>'send_started'='true'
+            ORDER BY created_at DESC,id DESC LIMIT 101""",
+            (contract["tenant_id"], REMOTE_KIND, contract["peer_id"], contract["url"], contract["binding"], key[1], key[2], str(key[4]))).fetchall()
+        for previous in candidates[:100]:
+            if not _remote_context_matches(contract, previous["contract"], previous["checkpoint"]):
+                continue
+            if previous["state"] not in TERMINAL:
+                active = previous["id"]
+            else:
+                blocked = _remote_context_unknown(previous["checkpoint"],
+                    (previous["state"], previous["result"], previous["error_code"]))
+            context_id = previous["checkpoint"]["remote_context_id"]
+            if context_id is None and active is None and not blocked:
+                continue
+            break
+        else:
+            if len(candidates) > 100:
+                raise CoreError("CHECKPOINT_INVALID")
+        connection.execute("""INSERT INTO core_remote_context_bindings
+            (tenant_id,owner_id,context_id,peer_id,generation,binding,remote_context_id,active_operation_id,blocked)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""", (*key, context_id, active, blocked))
+        return connection.execute("SELECT * FROM core_remote_context_bindings WHERE " + where + " FOR UPDATE", key).fetchone()
+
+    @staticmethod
+    def _save_remote_context(connection, contract, binding):
+        connection.execute("""UPDATE core_remote_context_bindings
+            SET remote_context_id=%s,active_operation_id=%s,blocked=%s
+            WHERE tenant_id=%s AND owner_id=%s AND context_id=%s AND peer_id=%s AND generation=%s AND binding=%s""",
+            (binding["remote_context_id"], binding["active_operation_id"], binding["blocked"], *_remote_context_key(contract)))
+
+    def _reserve_remote_context(self, connection, row, now):
+        binding = self._remote_context_locked(connection, row["contract"])
+        if binding is None or row["cancel_requested"] and not row["checkpoint"]["send_started"]:
+            return True
+        active = binding["active_operation_id"]
+        if active not in (None, row["id"]):
+            previous = connection.execute("SELECT * FROM core_background_tasks WHERE tenant_id=%s AND id=%s",
+                (row["tenant_id"], active)).fetchone()
+            if previous is None or not _remote_context_matches(row["contract"], previous["contract"], previous["checkpoint"]):
+                binding["blocked"] = True
+            else:
+                previous_context = previous["checkpoint"]["remote_context_id"]
+                if previous_context is not None:
+                    if binding["remote_context_id"] not in (None, previous_context):
+                        binding["blocked"] = True
+                    else:
+                        binding["remote_context_id"] = previous_context
+                if previous["state"] not in TERMINAL and not binding["blocked"]:
+                    self._save_remote_context(connection, row["contract"], binding)
+                    return False
+                if previous["state"] in TERMINAL:
+                    binding["blocked"] |= _remote_context_unknown(previous["checkpoint"],
+                        (previous["state"], previous["result"], previous["error_code"]))
+                    binding["active_operation_id"] = None
+        if binding["blocked"]:
+            self._save_remote_context(connection, row["contract"], binding)
+            self._remote_finish_locked(connection, row, row["checkpoint"],
+                ("failed", {"agent_name": row["contract"]["peer_name"], "reason": "remote_context_unresolved",
+                            "message": "Исход предыдущего поручения неизвестен. Перед новой отправкой в этот разговор требуется сверка с контрагентом.",
+                            "remote_outcome": "not_dispatched"}, "REMOTE_CONTEXT_UNRESOLVED"), now)
+            return False
+        binding["active_operation_id"] = row["id"]
+        self._save_remote_context(connection, row["contract"], binding)
+        return True
+
     def _notify_remote(self, task_id):
         with self._condition(task_id):
             self._condition(task_id).notify_all()
@@ -287,8 +369,13 @@ class PostgresTaskScheduler:
                     checkpoint = {**checkpoint, "input_request": None if reply and reply["status"] == "confirmed"
                                   and (pending is None or reply["input_id"] == pending["input_id"]) else pending}
                 outcome = _remote_cancelled_outcome(row["contract"], outcome, row["cancel_requested"])
+                context_binding = self._remote_context_locked(connection, row["contract"])
+                checkpoint = _remote_context_checkpoint(context_binding, row["id"], row["checkpoint"], checkpoint)
                 checkpoint = _advance_remote_checkpoint(row["checkpoint"], checkpoint, row["contract"], now, row["cancel_requested"], outcome)
                 progress = _remote_progress(progress, row["contract"], checkpoint, outcome)
+                if context_binding is not None and checkpoint["remote_context_id"] is not None:
+                    context_binding["remote_context_id"] = checkpoint["remote_context_id"]
+                    self._save_remote_context(connection, row["contract"], context_binding)
             new_input = outcome is None and _new_remote_input(row["checkpoint"], checkpoint)
             if not _remote_expired(row["checkpoint"], now):
                 conversation = merge_observation(row.get("remote_conversation"), conversation_observation, now)
@@ -339,6 +426,8 @@ class PostgresTaskScheduler:
                 else:
                     if row["cancel_requested"] or row["checkpoint"]["cancel_started"]:
                         raise CoreError("CANCEL_REQUESTED")
+                    context_binding = self._remote_context_locked(connection, contract)
+                    checkpoint = _remote_context_checkpoint(context_binding, row["id"], row["checkpoint"], checkpoint)
                     updated = _advance_remote_checkpoint(row["checkpoint"], checkpoint, contract, now, False, outcome,
                         file_batch_id=batch["batch_id"] if checkpoint["version"] == 3 else None)
                     _remote_progress(progress, contract, updated, outcome)
@@ -355,6 +444,9 @@ class PostgresTaskScheduler:
                             raise CoreError("LEASE_LOST")
                         if fresh["cancel_requested"]:
                             raise CoreError("CANCEL_REQUESTED")
+                        if context_binding is not None and updated["remote_context_id"] is not None:
+                            context_binding["remote_context_id"] = updated["remote_context_id"]
+                            self._save_remote_context(connection, contract, context_binding)
                         conversation = merge_observation(fresh.get("remote_conversation"), conversation_observation, now)
                         connection.execute("UPDATE core_background_tasks SET remote_conversation=%s WHERE id=%s AND tenant_id=%s",
                                            (Jsonb(conversation), claim.task_id, claim.tenant_id))
@@ -543,6 +635,8 @@ class PostgresTaskScheduler:
                 _remote_contract(row["contract"], tenant_id, row["owner_run_id"])
                 _remote_checkpoint(row["checkpoint"])
                 if not _remote_due(row["checkpoint"], now, row["cancel_requested"]):
+                    return None, None
+                if not self._reserve_remote_context(connection, row, now):
                     return None, None
             if allow_working and not row["cancel_requested"] and row["kind"] != REMOTE_KIND:
                 waiting = connection.execute(
@@ -816,6 +910,12 @@ class PostgresTaskScheduler:
 
     def _finish_locked(self, connection, row, state, result, error_code, now):
         task_id, tenant_id = row["id"], row["tenant_id"]
+        if row["kind"] == REMOTE_KIND:
+            binding = self._remote_context_locked(connection, row["contract"])
+            if binding is not None and binding["active_operation_id"] == task_id:
+                binding["blocked"] |= _remote_context_unknown(row["checkpoint"], (state, result, error_code))
+                binding["active_operation_id"] = None
+                self._save_remote_context(connection, row["contract"], binding)
         revision = row["revision"] + 1
         public_result = remote_result_projection(result) if row["kind"] == REMOTE_KIND else result
         payload = {"result": _value(public_result), "error_code": error_code}

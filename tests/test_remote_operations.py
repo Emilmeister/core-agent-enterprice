@@ -122,6 +122,31 @@ class RemoteOperationTests(unittest.TestCase):
         self.scheduler._handlers["remote_a2a"] = self.executor
         return folder, refs, service, source
 
+    def test_terminal_material_failure_preserves_context_for_next_task(self):
+        self.outbound_files()
+        self.contract.update(version=3, outgoing_files=[], conversation={"version": 1,
+            "owner_id": "source-person", "context_id": "source-chat", "generation": 1})
+        self.responses.extend([self.event("COMPLETED", files=True), self.event("COMPLETED")])
+        first = self.start()
+        self.assertEqual(first.state, "failed")
+        self.assertEqual(first.result["remote_state"], "TASK_STATE_COMPLETED")
+        second = self.start(message_id=str(uuid.uuid4()))
+        self.assertEqual(second.state, "completed", getattr(second.error, "code", None))
+        self.assertEqual(self.calls[-1][2].get("context_id"), "remote-context")
+        self.assertNotIn("task_id", self.calls[-1][2])
+
+    def test_direct_message_context_is_preserved_without_task_id(self):
+        self.responses.append(replace(self.event(kind="message"), context_id="message-conversation"))
+        task = self.start()
+        self.assertEqual(task.state, "completed")
+        if hasattr(self, "database"):
+            with self.database.pool.connection() as connection:
+                checkpoint = connection.execute("SELECT checkpoint FROM core_background_tasks WHERE id=%s", (task.id,)).fetchone()["checkpoint"]
+        else:
+            checkpoint = self.scheduler._remote[task.id]["checkpoint"]
+        self.assertEqual(checkpoint["remote_context_id"], "message-conversation")
+        self.assertIsNone(checkpoint["remote_task_id"])
+
     def test_v2_contract_validates_exact_source_scope_refs_and_uniform_pinned_limit(self):
         for child in (False, True):
             with self.subTest(child=child):

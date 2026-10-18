@@ -26,6 +26,19 @@ from core_agent.errors import CoreError
 from core_agent.remote_registry import PostgresRemoteRegistry
 
 
+class LegacyRemoteRegistry(PostgresRemoteRegistry):
+    """Seed pre-30 schemas using their historical revision INSERT shape."""
+
+    @staticmethod
+    def _insert_revision(connection, row):
+        connection.execute("""INSERT INTO core_remote_agent_revisions
+            (tenant_id,id,revision,storage_version,url,description,enabled,
+             header_name,encrypted_payload,actor_id,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            tuple(row[key] for key in ("tenant_id", "id", "revision", "storage_version", "url",
+                                      "description", "enabled", "header_name", "encrypted_payload", "actor_id", "created_at")))
+
+
 @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "TEST_DATABASE_URL is required")
 class EnterpriseMigrationTests(unittest.TestCase):
     def setUp(self):
@@ -57,7 +70,7 @@ class EnterpriseMigrationTests(unittest.TestCase):
 
     def test_remote_registration_delete_upgrade_restart_and_tombstone(self):
         database, url = self.database_at(26)
-        registry = PostgresRemoteRegistry(database, self.key)
+        registry = LegacyRemoteRegistry(database, self.key)
         values = {"name": "upgrade-peer", "url": "https://peer.example/a2a", "description": "Pinned",
                   "enabled": True, "header_name": "Authorization", "header_value": "Bearer migration-pinned"}
         peer = registry.create("company", values, actor_id="owner")
@@ -158,10 +171,13 @@ class EnterpriseMigrationTests(unittest.TestCase):
                     (tenant, owner))
         peer = None
         if version >= 19:
-            peer = PostgresRemoteRegistry(database, self.key).create(tenant,
+            registry = LegacyRemoteRegistry(database, self.key)
+            peer = registry.create(tenant,
                 {"name": "peer", "url": "https://peer.example/a2a", "description": "Migration",
                  "enabled": True, "header_name": "X-Api-Key", "header_value": "migration-secret-canary"},
                 actor_id="owner-actor")
+            if version == 29:
+                registry.disable(tenant, peer["id"], expected_revision=1, actor_id="owner-actor")
             tables += ["core_remote_agents", "core_remote_agent_revisions"]
         content = "Transport bytes: ё\n\x00".encode()
         artifact = PostgresArtifactStore(database, self.temporary.name).put(
@@ -239,6 +255,16 @@ class EnterpriseMigrationTests(unittest.TestCase):
                     self.assertEqual(registry.get_revision(tenant, peer["id"], 1), peer)
                     self.assertEqual(registry.resolve_headers(tenant, peer["id"], 1),
                                      {"X-Api-Key": "migration-secret-canary"})
+                    with reopened.pool.connection() as connection:
+                        revisions = connection.execute("""SELECT revision,connection_generation
+                            FROM core_remote_agent_revisions WHERE tenant_id=%s AND id=%s ORDER BY revision""",
+                            (tenant, peer["id"])).fetchall()
+                        self.assertEqual(connection.execute("SELECT count(*) AS n FROM core_remote_context_bindings").fetchone()["n"], 0)
+                    self.assertEqual(revisions, [{"revision": revision, "connection_generation": revision}
+                        for revision in (range(1, 3) if version == 29 else (1,))])
+                    if version == 29:
+                        self.assertEqual(registry.resolve_headers(tenant, peer["id"], 2),
+                                         {"X-Api-Key": "migration-secret-canary"})
 
     @unittest.skipUnless(os.getenv("TEST_POSTGRES_CONTAINER"), "TEST_POSTGRES_CONTAINER is required")
     def test_quiesced_backup_restores_schema_state_blobs_and_encrypted_peer_before_cutover_writes(self):

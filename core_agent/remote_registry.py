@@ -149,6 +149,13 @@ def _decrypt(cipher, row):
         raise CoreError("REMOTE_AGENT_CREDENTIAL_UNAVAILABLE") from None
 
 
+def _connection_generation(row):
+    generation = row.get("connection_generation", row["revision"])
+    if type(generation) is not int or not 1 <= generation <= row["revision"]:
+        raise CoreError("CHECKPOINT_INVALID")
+    return generation
+
+
 def _new_row(cipher, tenant_id, peer_id, values, *, actor_id, now, previous=None):
     row = {key: values[key] for key in _FIELDS}
     row.update(tenant_id=tenant_id, id=peer_id,
@@ -158,6 +165,20 @@ def _new_row(cipher, tenant_id, peer_id, values, *, actor_id, now, previous=None
     secret = values.get("header_value")
     if "header_value" not in values and previous is not None:
         secret = _decrypt(cipher, previous)
+    row["connection_generation"] = row["revision"]
+    if (previous is not None and row["url"] == previous["url"]
+            and row["header_name"].lower() == previous["header_name"].lower()):
+        unchanged = "header_value" not in values or secret is None and previous["encrypted_payload"] is None
+        if secret is not None and "header_value" in values:
+            try:
+                unchanged = secret == _decrypt(cipher, previous)
+            except CoreError as error:
+                if error.code != "REMOTE_AGENT_CREDENTIAL_UNAVAILABLE":
+                    raise
+                # An explicit replacement can repair an unreadable credential,
+                # but cannot claim continuity with its previous identity.
+        if unchanged:
+            row["connection_generation"] = _connection_generation(previous)
     if secret is not None:
         if cipher is None:
             raise CoreError("REMOTE_AGENT_CREDENTIAL_UNAVAILABLE")
@@ -258,6 +279,11 @@ class InMemoryRemoteRegistry:
         with self._lock:
             return _metadata(self._get(tenant_id, peer_id, revision))
 
+    def connection_generation(self, tenant_id, peer_id, revision, *, connection=None):
+        _revision(revision)
+        with self._lock:
+            return _connection_generation(self._get(tenant_id, peer_id, revision))
+
     @contextmanager
     def pin_current(self, tenant_id, peer_id, revision):
         _revision(revision)
@@ -284,10 +310,11 @@ class PostgresRemoteRegistry:
         connection.execute(
             """INSERT INTO core_remote_agent_revisions
                (tenant_id, id, revision, storage_version, url, description, enabled,
-                header_name, encrypted_payload, actor_id, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                header_name, encrypted_payload, actor_id, created_at, connection_generation)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             tuple(row[key] for key in ("tenant_id", "id", "revision", "storage_version", "url",
-                                      "description", "enabled", "header_name", "encrypted_payload", "actor_id", "created_at")),
+                                      "description", "enabled", "header_name", "encrypted_payload", "actor_id", "created_at",
+                                      "connection_generation")),
         )
 
     def create(self, tenant_id, values, *, actor_id, connection=None):
@@ -402,6 +429,11 @@ class PostgresRemoteRegistry:
     def get_revision(self, tenant_id, peer_id, revision=None, *, connection=None):
         with self.database.pool.connection() if connection is None else nullcontext(connection) as connection:
             return _metadata(self._get(connection, tenant_id, peer_id, revision))
+
+    def connection_generation(self, tenant_id, peer_id, revision, *, connection=None):
+        _revision(revision)
+        with self.database.pool.connection() if connection is None else nullcontext(connection) as connection:
+            return _connection_generation(self._get(connection, tenant_id, peer_id, revision))
 
     @contextmanager
     def pin_current(self, tenant_id, peer_id, revision):
