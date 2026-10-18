@@ -1,7 +1,9 @@
 import json
+import queue
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from core_agent.errors import CoreError
 from core_agent.guardrails import GuardrailClassifier
@@ -121,32 +123,78 @@ class GuardrailClassifierTests(unittest.TestCase):
         self.assertEqual(result.verdict, "unverified")
         self.assertEqual(result.reason, "provider_error")
 
+    def test_five_concurrent_requests_saturate_without_charging_sixth_and_reuse_slots(self):
+        entered = queue.Queue()
+        release = threading.Event()
+        model = ScriptedModel([])
+
+        def blocked(**_):
+            entered.put(threading.current_thread())
+            if not release.wait(5):
+                raise TimeoutError("test release not received")
+            return ModelResponse(finish_reason="stop", message='{"verdict":"clear"}')
+
+        model.generate = blocked
+        classifier = GuardrailClassifier(model, token_counter=len, timeout_seconds=10)
+        attempts = []
+        with ThreadPoolExecutor(max_workers=5) as workers:
+            futures = [workers.submit(classifier.classify, ("source",), source_kind="message",
+                                      record_attempt=attempts.append) for _ in range(5)]
+            try:
+                for _ in range(5):
+                    entered.get(timeout=1)
+                refused_attempts = []
+                refused = classifier.classify(("source",), source_kind="message",
+                                              record_attempt=refused_attempts.append)
+                self.assertEqual((refused.verdict, refused.reason), ("unverified", "detector_busy"))
+                self.assertEqual((refused.calls, refused.input_tokens), (0, 0))
+                self.assertEqual(refused_attempts, [])
+                self.assertEqual(len(attempts), 5)
+                self.assertTrue(entered.empty())
+            finally:
+                release.set()
+            self.assertEqual([future.result(timeout=2).verdict for future in futures], ["clear"] * 5)
+        self.assertEqual(classifier.classify(("source",), source_kind="message",
+                         record_attempt=attempts.append).verdict, "clear")
+        self.assertEqual(len(attempts), 6)
+
     def test_timeout_bounds_workers_and_ignores_late_clear(self):
         release = threading.Event()
-        exited = threading.Event()
+        entered = queue.Queue()
         self.addCleanup(release.set)
         model = ScriptedModel([])
 
         def blocked(**_):
-            try:
-                release.wait(3)
-                return ModelResponse(finish_reason="stop", message='{"verdict":"clear"}')
-            finally:
-                exited.set()
+            entered.put(threading.current_thread())
+            release.wait(5)
+            return ModelResponse(finish_reason="stop", message='{"verdict":"clear"}')
 
         model.generate = blocked
         classifier = GuardrailClassifier(model, token_counter=len, timeout_seconds=0.02)
         attempts = []
         start = time.monotonic()
-        first = classifier.classify(("source",), source_kind="message", record_attempt=attempts.append)
-        second = classifier.classify(("source",), source_kind="message", record_attempt=attempts.append)
-        self.assertLess(time.monotonic() - start, 1)
-        self.assertEqual((first.verdict, first.reason), ("unverified", "timeout"))
-        self.assertEqual((second.verdict, second.reason), ("unverified", "detector_busy"))
-        self.assertEqual(len(attempts), 1)
-        release.set()
-        self.assertTrue(exited.wait(1))
-        self.assertEqual(first.verdict, "unverified")
+        results = []
+        threads = []
+        try:
+            for _ in range(5):
+                result = classifier.classify(("source",), source_kind="message", record_attempt=attempts.append)
+                results.append(result)
+                self.assertEqual((result.verdict, result.reason), ("unverified", "timeout"))
+                threads.append(entered.get(timeout=1))
+            refused = classifier.classify(("source",), source_kind="message", record_attempt=attempts.append)
+            self.assertLess(time.monotonic() - start, 1)
+            self.assertEqual((refused.verdict, refused.reason), ("unverified", "detector_busy"))
+            self.assertEqual(refused.calls, 0)
+            self.assertEqual(len(attempts), 5)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=1)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual([result.verdict for result in results], ["unverified"] * 5)
+        classifier.timeout_seconds = 1
+        self.assertEqual(classifier.classify(("source",), source_kind="message",
+                         record_attempt=attempts.append).verdict, "clear")
 
     def test_frozen_caps_narrow_instance_without_mutation_and_preserve_usage(self):
         for caps in ({"max_calls": 1}, {"max_input_tokens": 8192}):

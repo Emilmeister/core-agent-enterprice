@@ -49,7 +49,7 @@ from .execution import (
 from .sandbox import SandboxLauncher, SandboxPolicy
 from .kernel import KernelCompiler
 from .interactions import InMemoryInteractionStore, PostgresInteractionStore, tool_origin
-from .guardrails import GuardrailClassifier
+from .guardrails import DETECTOR_RESPONSE_SCHEMA, GuardrailClassifier
 from .material_reviews import MemoryMaterialReviewStore, PostgresMaterialReviewStore
 from .chat_files import ChatFileService, MemoryChatFileStore, PostgresChatFileStore
 from .workspace_cleanup import WorkspaceCleanupService
@@ -358,6 +358,20 @@ def _guardrail_classifier(model):
     else:
         # Injected model adapters still receive a separate context and no tools.
         detector = model
+    if isinstance(detector, CompatibleHttpModel):
+        schema = copy.deepcopy(DETECTOR_RESPONSE_SCHEMA)
+        if detector.api_format == "openai":
+            detector.extra_body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "guardrail_verdict", "strict": True, "schema": schema},
+            }
+        else:
+            output_config = detector.extra_body.get("output_config", {})
+            if not isinstance(output_config, dict):
+                raise CoreError("CONFIG_INVALID", "output_config must be an object")
+            detector.extra_body["output_config"] = {
+                **output_config, "format": {"type": "json_schema", "schema": schema},
+            }
     return GuardrailClassifier(
         detector, timeout_seconds=timeout, max_calls=max_calls, max_input_tokens=max_input,
         token_counter=getattr(detector, "count_tokens", None) or (lambda text: max(1, (len(text.encode("utf-8")) + 2) // 3)),

@@ -837,7 +837,14 @@ run получает отдельные MCP session и negotiated version; пе�
   Default использует непотоковую копию подключения модели агента; четыре
   `GUARDRAILS_LLM_*` overrides требуют полного набора и не наследуют credentials
   основной модели. Detector имеет отдельные time/token/call limits; его tools
-  всегда пусты. File quarantine подключён к внутреннему canonical admission;
+  всегда пусты. Общий для чатов и субагентов detector допускает пять запросов
+  одновременно; при заполнении слотов возвращает `unverified/detector_busy`.
+  Timeout не освобождает слот до фактического завершения provider call.
+  HTTP adapter детектора передаёт полную строгую схему `verdict` через
+  OpenAI `response_format.json_schema` либо Anthropic `output_config.format`,
+  заменяя унаследованный формат только в копии подключения. Local validation
+  сохраняется; отказ провайдера не вызывает fallback без схемы.
+  File quarantine подключён к внутреннему canonical admission;
   public raw FileParts принимаются через scoped admission после native sandbox proof.
 - Initial/follow-up input, owner answers, tool args/results, background и nested
   Python проходят runtime material gates. Известный результат сохраняется до

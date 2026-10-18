@@ -372,6 +372,32 @@ class MaterialReviewContract:
         self.assertEqual(result["attempts_used"], 0)
         self.assertEqual(self.model.calls, [])
 
+    def test_five_occupied_slots_create_owner_wait_without_provider_attempt(self):
+        row = self.create()
+        model = Model()
+        classifier = GuardrailClassifier(model, clock=self.workflow.current_time)
+        acquired = 0
+        try:
+            for _ in range(5):
+                self.assertTrue(classifier._slot.acquire(blocking=False))
+                acquired += 1
+            result = self.store.classify(
+                self.record, row["review_id"], classifier, lease_token=self.token,
+                continuation={"version": 1, "phase": "input"}, snapshot=self.current().snapshot,
+            )
+        finally:
+            for _ in range(acquired):
+                classifier._slot.release()
+        self.assertEqual(result["classification"]["reason"], "detector_busy")
+        self.assertEqual((result["state"], result["attempts_used"], result["input_tokens_used"]), ("pending", 0, 0))
+        self.assertEqual(model.calls, [])
+        self.assertEqual(self.current().state, "WAITING_INPUT")
+        wait = self.workflow.get_wait(result["wait_id"], tenant_id=self.record.tenant_id)
+        self.assertEqual(wait.kind, "guardrail")
+        self.assertIsNone(self.lease_if_waiting())
+        self.restart()
+        self.assertEqual(self.get(row)["state"], "pending")
+
     def test_detector_deadline_does_not_restart(self):
         row = self.create(deadline=self.now - 1)
         result = self.classify(row)
