@@ -1164,7 +1164,12 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 ),
                 {
                     "agent_name": {"type": "string", "minLength": 1},
-                    "task": {"type": "string", "minLength": 1},
+                    "task": {"type": "string", "minLength": 1, "description": (
+                        "Task or reply for the remote agent. For messages you compose, prefer Markdown when it improves "
+                        "readability: paragraphs, lists, bold for key facts, and fenced code blocks for code. "
+                        "Short replies can be plain text. Preserve all facts, requirements and identifiers; "
+                        "keep forwarded verbatim text unchanged. Do not wrap the whole message in a code block."
+                    )},
                     "task_id": {"type": "string", "minLength": 1},
                     "input_id": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
                     **({"files": {"type": "array", "items": {"type": "string", "minLength": 1},
