@@ -58,7 +58,7 @@ export function Settings({ api }: { api: Api }) {
     }
   }
   return (
-    <section className="page">
+    <section className="page settings-page">
       <div className="eyebrow">Рабочее пространство</div>
       <h1>Настройки</h1>
       <p className="lede">Сроки ожидания и ограничения для новых операций.</p>
@@ -131,9 +131,10 @@ export function Settings({ api }: { api: Api }) {
 function AgentConfiguration({ api }: { api: Api }) {
   const [current, setCurrent] = useState<AgentSettings | null>(null);
   const [profile, setProfile] = useState("");
-  const [model, setModel] = useState("");
+  const [model, setModel] = useState<string | null>(null);
   const [models, setModels] = useState<string[]>([]);
-  const [contextWindow, setContextWindow] = useState("");
+  const [contextWindow, setContextWindow] = useState<string | null>(null);
+  const [structuredOutput, setStructuredOutput] = useState<AgentSettings["structured_output"] | null>(null);
   const [servers, setServers] = useState<(McpConnection & { header_value?: string | null; original_name?: string })[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -153,8 +154,9 @@ function AgentConfiguration({ api }: { api: Api }) {
     void api.json<AgentSettings>("/api/agent-settings", "GET", undefined, controller.signal).then((result) => {
       setCurrent(result);
       setProfile(result.profile_prompt);
-      setModel(result.model_id);
-      setContextWindow(result.inherits.context_window ? "" : String(result.context_window));
+      setModel(null);
+      setContextWindow(null);
+      setStructuredOutput(null);
       setServers(result.mcp_servers.map((server) => ({ ...server, original_name: server.name })));
     }).catch((failure) => {
       if (!controller.signal.aborted) setError(errorText(failure));
@@ -174,8 +176,9 @@ function AgentConfiguration({ api }: { api: Api }) {
       setCurrent(result);
       if (section === "profile") setProfile(result.profile_prompt);
       if (section === "model") {
-        setModel(result.model_id);
-        setContextWindow(result.inherits.context_window ? "" : String(result.context_window));
+        setModel(null);
+        setContextWindow(null);
+        setStructuredOutput(null);
       }
       if (section === "mcp") setServers((previous) => mcpName === undefined
         ? result.mcp_servers.map((server) => ({ ...server, original_name: server.name }))
@@ -228,6 +231,10 @@ function AgentConfiguration({ api }: { api: Api }) {
     await save("mcp", { mcp_servers: current.mcp_servers.filter((item) => item.name !== server.original_name).map(connectionPayload) }, server.original_name);
   }
   if (!current) return error ? <p className="error" role="alert">{error}</p> : <p role="status">Загружаем профиль агента…</p>;
+  const selectedModel = model ?? current.model_id;
+  const selectedContextWindow = contextWindow ?? (current.inherits.context_window ? "" : String(current.context_window));
+  const structuredSettings = structuredOutput ?? current.structured_output;
+  const modelDirty = (model !== null && model !== current.model_id) || contextWindow !== null || structuredOutput !== null;
   return <>
     {error && <p className="error" role="alert">{error}</p>}
     {notice && <p className="success" role="status">{notice}</p>}
@@ -243,28 +250,54 @@ function AgentConfiguration({ api }: { api: Api }) {
           onClick={() => void save("profile", { profile_prompt: null })}>Использовать профиль развёртывания</button>
       </div>
     </form>
-    <form className="form-sheet agent-model-settings" onSubmit={(event) => { event.preventDefault(); void save("model", { ...(model !== current.model_id ? { model_id: model } : {}),
-      context_window: contextWindow === "" ? null : Number(contextWindow) }); }}>
+    <form className="form-sheet agent-model-settings" onSubmit={(event) => { event.preventDefault(); if (!modelDirty) return; void save("model", { ...(model !== null && model !== current.model_id ? { model_id: model } : {}),
+      ...(contextWindow !== null ? { context_window: contextWindow === "" ? null : Number(contextWindow) } : {}),
+      ...(structuredOutput ? { structured_output: structuredOutput } : {}) }); }}>
       <h2>Модель</h2>
       <label>Модель провайдера
-        <select value={model} disabled={!!busy} onChange={(event) => { setModel(event.target.value); setContextWindow(""); }}>
-          {[...new Set([current.model_id, ...models])].sort().map((name) => <option key={name} value={name}>{name}</option>)}
+        <select value={selectedModel} disabled={!!busy} onChange={(event) => { setModel(event.target.value); setContextWindow(""); }}>
+          {[...new Set([current.model_id, selectedModel, ...models])].sort().map((name) => <option key={name} value={name}>{name}</option>)}
         </select>
       </label>
       <label>Размер контекстного окна, токенов
-        <input type="number" min={1024} max={100000000} step={1} value={contextWindow}
+        <input type="number" min={1024} max={100000000} step={1} value={selectedContextWindow}
           placeholder={String(current.context_window)} disabled={!!busy}
           onChange={(event) => setContextWindow(event.target.value)} />
       </label>
       <p className="muted">Сейчас: {current.context_window.toLocaleString("ru-RU")} токенов
         {current.inherits.context_window ? " из конфигурации развёртывания." : ", задано вручную."}
         {" "}Укажите размер из документации модели. Пустое поле возвращает значение развёртывания.</p>
+      <label>Рассуждения для структурированных ответов
+        <select value={structuredSettings.reasoning} disabled={!!busy} aria-describedby="structured-output-help"
+          onChange={(event) => setStructuredOutput({ ...structuredSettings, reasoning: event.target.value as AgentSettings["structured_output"]["reasoning"] })}>
+          <option value="auto">Автоматически</option>
+          <option value="off">Выключено</option>
+          <option value="inherit">Без переопределения</option>
+        </select>
+      </label>
+      <p className="muted" id="structured-output-help">Для проверок материалов, сводок и извлечения сущностей памяти.
+        {" "}«Автоматически» использует известные настройки провайдера и не оценивает качество ответов.
+        {" "}Для неизвестного подключения настройки сохраняются. В режиме «Выключено» укажите
+        {" "}поддерживаемый способ в дополнительных параметрах.
+        {" "}Изменения применятся к новым задачам.</p>
+      {structuredSettings.reasoning !== "inherit" && <details className="model-compatibility">
+        <summary>Дополнительные параметры</summary>
+        <label>Совместимость OpenAI API
+          <select value={structuredSettings.compatibility} disabled={!!busy}
+            onChange={(event) => setStructuredOutput({ ...structuredSettings, compatibility: event.target.value as AgentSettings["structured_output"]["compatibility"] })}>
+            <option value="auto">Автоматически</option>
+            <option value="chat_template">enable_thinking (vLLM)</option>
+            <option value="thinking">thinking.type</option>
+            <option value="reasoning_effort">reasoning_effort</option>
+          </select>
+        </label>
+      </details>}
       {modelError && <p className="error" role="alert">{modelError} Текущая модель сохранена.</p>}
       <div className="actions">
-        <button disabled={!!busy || (model !== current.model_id && !models.includes(model))}>{busy === "model" ? "Сохраняем…" : "Сохранить модель"}</button>
+        <button disabled={!!busy || !modelDirty || (selectedModel !== current.model_id && !models.includes(selectedModel))}>{busy === "model" ? "Сохраняем…" : "Сохранить модель"}</button>
         <button type="button" className="secondary" disabled={!!busy} onClick={() => void loadModels()}>Обновить список моделей</button>
-        <button type="button" className="secondary" disabled={!!busy || (current.inherits.model_id && current.inherits.context_window)}
-          onClick={() => void save("model", { model_id: null, context_window: null })}>Использовать модель развёртывания</button>
+        <button type="button" className="secondary" disabled={!!busy || (current.inherits.model_id && current.inherits.context_window && current.inherits.structured_output && model === null && contextWindow === null && !structuredOutput)}
+          onClick={() => void save("model", { model_id: null, context_window: null, structured_output: null })}>Использовать модель развёртывания</button>
       </div>
     </form>
     <section className="form-sheet agent-mcp-settings">

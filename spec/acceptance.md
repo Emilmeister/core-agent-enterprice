@@ -944,6 +944,17 @@ implemented. Automated proofs MUST входить в обычные applicable g
 
 ## Строгий формат суммаризации
 
+- STRUCTURED-REASONING: owner UI/API сохраняет nullable политику `auto/off/inherit`
+  и finite compatibility через CAS; проверены default/reset, старые revisions,
+  malformed input, tenant/owner isolation и недоступный каталог моделей.
+  Реальные wire payload guardrails/summary/NER используют общую политику после
+  объединения provider options, не меняют strict schema или обычные tool calls.
+  Root/child/background и восстановление сохраняют admitted политику после
+  изменения settings; legacy workflow наследует прежнее поведение. Пять detector
+  slots остаются общими при разных policies. Исправленная NER policy не наследует
+  permanent failure прежней. UI/Storybook отражают сохранение, конфликт и сброс;
+  поля и подписи страницы настроек имеют согласованные отступы.
+
 - CTX-AC-STRICT: фактический HTTP payload summary содержит собственную строгую
   схему в OpenAI-compatible и Anthropic форматах; унаследованная сторонняя схема
   заменена, основные model settings и tool schemas неизменны. Проверка охватывает

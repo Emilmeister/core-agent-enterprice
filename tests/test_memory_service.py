@@ -508,6 +508,39 @@ class FrontMatterInjectionTests(unittest.TestCase):
 
 
 class ExtractionAndDegradationTests(unittest.TestCase):
+    def test_mutations_pass_the_selected_policy_without_changing_other_extractors(self):
+        extractor = LlmEntityExtractor("https://gateway.test/v1", "deployment-model")
+        service, registry = make_service(entity_extractor=extractor)
+        self.addCleanup(registry.close)
+        off = {"reasoning": "off", "compatibility": "chat_template"}
+        inherit = {"reasoning": "inherit", "compatibility": "auto"}
+        calls = []
+        def respond(_endpoint, payload, **_kwargs):
+            calls.append(payload)
+            return {"choices": [{"message": {"content": '{"entities":[]}'}}]}
+        with patch("core_agent.memory_providers._post_json", side_effect=respond):
+            document, _ = service.create(title="Note", body="first", namespace=NAMESPACE,
+                entity_model="admitted-model", entity_structured_output=off)
+            document, _ = service.update(document.id, body="changed", expected_revision=1,
+                entity_model="admitted-model", entity_structured_output=inherit)
+            service.split(document.id, overview={"body": "overview"},
+                children=[{"title": "Child", "body": "child"}], expected_revision=2,
+                entity_model="admitted-model", entity_structured_output=off)
+            service.delete(document.id, reason="obsolete", expected_revision=3,
+                entity_model="admitted-model", entity_structured_output=off)
+        self.assertEqual([payload["model"] for payload in calls], ["admitted-model"] * 4)
+        self.assertEqual([payload.get("chat_template_kwargs") for payload in calls],
+                         [{"enable_thinking": False}, None, {"enable_thinking": False}, {"enable_thinking": False}])
+        self.assertEqual(extractor.model, "deployment-model")
+        class PlainExtractor:
+            def extract(self, text):
+                return {"entities": [{"text": "Local", "start": 0, "end": 5}], "relations": []}
+        plain, registry = make_service(entity_extractor=PlainExtractor())
+        self.addCleanup(registry.close)
+        document, _ = plain.create(title="Local", body="body", namespace=NAMESPACE,
+            entity_model="ignored", entity_structured_output=off)
+        self.assertEqual(plain.graph_mentions("Local"), (document.id,))
+
     def test_extraction_only_reruns_for_documents_whose_content_changed(self):
         """Re-extracting the corpus per write is N remote calls per tool call."""
 
@@ -788,6 +821,77 @@ class LlmEntityExtractorTests(unittest.TestCase):
             ["confidence", "text", "type"],
         )
         self.assertEqual(sent["temperature"], 0)
+
+    def test_structured_policy_controls_wire_reasoning_and_preserves_legacy_requests(self):
+        options = {"thinking": {"type": "enabled", "budget_tokens": 2048}, "reasoning_effort": "high",
+                   "chat_template_kwargs": {"enable_thinking": True, "private_template_option": "not-ner"},
+                   "response_format": {"type": "text"}, "messages": [], "temperature": 2, "model": "wrong",
+                   "output_config": {"effort": "high", "format": {"type": "text"}}, "store": True}
+        extractor = LlmEntityExtractor("https://gateway.test/v1", "m", provider="vllm", extra_body=options)
+        for policy, expected in (
+            (None, {}),
+            ({"reasoning": "inherit", "compatibility": "auto"}, {}),
+            ({"reasoning": "auto", "compatibility": "auto"}, {"chat_template_kwargs": {"enable_thinking": False}}),
+            ({"reasoning": "off", "compatibility": "thinking"}, {"thinking": {"type": "disabled"}}),
+            ({"reasoning": "off", "compatibility": "reasoning_effort"}, {"reasoning_effort": "none"}),
+        ):
+            with self.subTest(policy=policy):
+                sent = {}
+                with patch("core_agent.memory_providers.urlopen", self._gateway({"entities": []}, sent)):
+                    extractor.extract("note", structured_output=policy)
+                self.assertEqual(sent["model"], "m")
+                self.assertEqual(sent["temperature"], 0)
+                self.assertTrue(sent["response_format"]["json_schema"]["strict"])
+                self.assertEqual(sent["messages"][-1], {"role": "user", "content": "note"})
+                self.assertEqual({key: value for key, value in sent.items()
+                    if key not in {"model", "temperature", "messages", "response_format"}}, expected)
+        self.assertTrue(options["chat_template_kwargs"]["enable_thinking"])
+
+    def test_unsupported_off_policy_fails_before_network(self):
+        extractor = LlmEntityExtractor("https://vllm.test/v1", "Qwen/Qwen3")
+        with patch("core_agent.memory_providers._post_json") as transport:
+            with self.assertRaises(CoreError) as caught:
+                extractor.extract("note", structured_output={"reasoning": "off", "compatibility": "auto"})
+            self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+            transport.assert_not_called()
+
+    def test_auto_uses_declared_compatibility_without_importing_main_reasoning(self):
+        for options, expected in (
+            ({"reasoning_effort": "high"}, {}),
+            ({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": True}},
+             {"chat_template_kwargs": {"enable_thinking": False}}),
+            ({"reasoning_effort": "high", "thinking": {"type": "enabled", "budget_tokens": 2048}},
+             {"thinking": {"type": "disabled"}}),
+        ):
+            with self.subTest(options=options):
+                extractor = LlmEntityExtractor("https://gateway.test/v1", "m", extra_body=options)
+                sent = {}
+                with patch("core_agent.memory_providers.urlopen", self._gateway({"entities": []}, sent)):
+                    extractor.extract("note", structured_output={"reasoning": "auto", "compatibility": "auto"})
+                self.assertEqual({key: value for key, value in sent.items()
+                    if key not in {"model", "temperature", "messages", "response_format"}}, expected)
+                self.assertEqual(sent["temperature"], 0)
+                self.assertTrue(sent["response_format"]["json_schema"]["strict"])
+
+    def test_permanent_failure_cache_allows_a_corrected_policy(self):
+        extractor = LlmEntityExtractor("https://gateway.test/v1", "m")
+        calls = []
+        def respond(_endpoint, payload, **_kwargs):
+            calls.append(payload)
+            if payload.get("chat_template_kwargs") != {"enable_thinking": False}:
+                raise CoreError("MEMORY_PROVIDER_UNAVAILABLE", data={"status": 400})
+            return {"choices": [{"message": {"content": '{"entities":[]}'}}]}
+        with patch("core_agent.memory_providers._post_json", side_effect=respond):
+            for policy in (None, None, {"reasoning": "off", "compatibility": "thinking"},
+                           {"compatibility": "thinking", "reasoning": "off"}):
+                with self.assertRaises(CoreError):
+                    extractor.extract("note", structured_output=policy)
+            result = extractor.extract("note", structured_output={"reasoning": "off", "compatibility": "chat_template"})
+            with self.assertRaises(CoreError):
+                extractor.extract("note")
+        self.assertEqual(result["entities"], [])
+        self.assertEqual(len(calls), 3)
+        self.assertIsNotNone(extractor.disabled_reason)
 
     def test_an_invented_entity_is_dropped_and_offsets_come_from_the_note(self):
         extractor = LlmEntityExtractor("https://gateway.test/v1", "m")
@@ -1169,6 +1273,24 @@ class MemoryConfigurationTests(unittest.TestCase):
                     self.assertIsNone(registry.entity_extractor)
                 finally:
                     app.state.close()
+
+    def test_ner_uses_deployment_reasoning_compatibility_with_its_own_request(self):
+        app = self._app(LLM_PROVIDER="vllm", LLM_EXTRA_BODY_JSON=json.dumps({
+            "chat_template_kwargs": {"enable_thinking": True, "other": "not-ner"},
+            "messages": [{"role": "system", "content": "not-ner"}], "response_format": {"type": "text"},
+            "temperature": 2, "model": "wrong-model", "store": True}))
+        self.addCleanup(app.state.close)
+        service = app.state.core_agent.memory_registry.service("core-agent", "owner")
+        sent = {}
+        with patch("core_agent.memory_providers.urlopen", LlmEntityExtractorTests._gateway({"entities": []}, sent)):
+            service.create(title="Note", body="Alice", namespace="subject/owner", entity_model="admitted-model",
+                entity_structured_output={"reasoning": "auto", "compatibility": "auto"})
+        self.assertEqual(sent["model"], "admitted-model")
+        self.assertEqual(sent["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(sent["temperature"], 0)
+        self.assertTrue(sent["response_format"]["json_schema"]["strict"])
+        self.assertNotIn("not-ner", json.dumps(sent))
+        self.assertNotIn("store", sent)
 
     def test_the_disabled_string_removes_every_memory_tool_from_the_catalog(self):
         """`disabled` is a non-empty string; a truthiness gate would pass it."""

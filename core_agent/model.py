@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 from .errors import CoreError
 from .security import validate_http_url
 from .streaming import integrate_stream_chunk
+from .structured_output import normalize_structured_output_body, validate_structured_output
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class CompatibleHttpModel:
         context_window=128_000,
         token_chars=3,
         reasoning_effort=None,
+        structured_output=None,
         temperature=None,
         top_p=None,
         top_k=None,
@@ -130,11 +132,16 @@ class CompatibleHttpModel:
             api_format,
         )
         self.provider = provider or inferred_provider
+        self.configured_provider = provider
         self.api_key = api_key
         self.timeout = float(timeout)
         self.max_tokens = int(max_tokens)
         self.headers = dict(headers or {})
         self.extra_body = dict(extra_body or {})
+        self.structured_output = (
+            validate_structured_output(structured_output)
+            if structured_output is not None else None
+        )
         self.anthropic_version = anthropic_version
         self.context_window = int(context_window)
         self.token_chars = int(token_chars)
@@ -422,6 +429,11 @@ class CompatibleHttpModel:
             )
         if schemas:
             body["tools"] = schemas
+        body = normalize_structured_output_body(
+            body, self.structured_output, provider=self.configured_provider,
+            native_anthropic=self.api_format == "anthropic",
+            declared_parameters=self.extra_body,
+        )
         headers = {"Content-Type": "application/json", **self.headers}
         if self.api_format == "openai" and self.api_key:
             headers.setdefault("Authorization", f"Bearer {self.api_key}")

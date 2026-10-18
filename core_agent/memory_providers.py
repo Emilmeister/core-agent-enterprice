@@ -9,11 +9,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+from copy import deepcopy
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .errors import CoreError
+from .structured_output import normalize_structured_output_body, validate_structured_output
 
 MAX_PROVIDER_TEXT = 8000
 MAX_EXTRACTED_ENTITIES = 1000
@@ -205,6 +207,8 @@ class LlmEntityExtractor:
         timeout=30,
         headers=None,
         logger=None,
+        provider=None,
+        extra_body=None,
     ):
         if not (api_base or endpoint) or not model:
             raise CoreError("CONFIG_INVALID", "llm api base and model are required")
@@ -215,37 +219,28 @@ class LlmEntityExtractor:
         self.api_key = api_key
         self.timeout = timeout
         self.headers = dict(headers or {})
+        self.provider = provider
+        options = extra_body or {}
+        self.reasoning_options = {key: deepcopy(options[key]) for key in
+            ("reasoning_effort", "thinking", "enable_thinking") if key in options}
+        for key, names in (("chat_template_kwargs", ("enable_thinking", "thinking", "reasoning_effort")),
+                           ("reasoning", ("effort",)), ("output_config", ("effort",))):
+            if isinstance(options.get(key), dict):
+                self.reasoning_options[key] = {name: deepcopy(value) for name, value in options[key].items() if name in names}
         self.logger = logger or logging.getLogger("core_agent.runtime")
         self.version = f"llm-ner:{model}"
         self.disabled_reason = None
         self._disabled_models = {}
 
-    def extract(self, text, *, model=None):
+    def extract(self, text, *, model=None, structured_output=None):
         model = model or self.model
-        reason = self._disabled_models.get(model) or (self.disabled_reason if model == self.model else None)
+        policy = validate_structured_output(structured_output) if structured_output is not None else None
+        key = (model, tuple(policy.items()) if policy is not None else None)
+        reason = self._disabled_models.get(key) or (self.disabled_reason if model == self.model and policy is None else None)
         if reason:
             raise CoreError("MEMORY_PROVIDER_UNAVAILABLE", reason)
-        response = self._request(text[:MAX_PROVIDER_TEXT], model=model)
-        return {"entities": self._ground(response, text), "relations": []}
-
-    def _request(self, text, *, model=None):
-        model = model or self.model
         try:
-            return _post_json(
-                self.endpoint,
-                {
-                    "model": model,
-                    "temperature": 0,
-                    "messages": [
-                        {"role": "system", "content": EXTRACTION_INSTRUCTION},
-                        {"role": "user", "content": text},
-                    ],
-                    "response_format": EXTRACTION_RESPONSE_FORMAT,
-                },
-                headers=self.headers,
-                api_key=self.api_key,
-                timeout=self.timeout,
-            )
+            response = self._request(text[:MAX_PROVIDER_TEXT], model=model, structured_output=policy)
         except CoreError as error:
             status = (error.data or {}).get("status")
             # A gateway that rejects the request rejects it identically next
@@ -257,13 +252,29 @@ class LlmEntityExtractor:
                 429,
             ):
                 reason = f"model gateway rejected extraction ({status})"
-                self._disabled_models[model] = reason
-                if model == self.model:
+                self._disabled_models[key] = reason
+                if model == self.model and policy is None:
                     self.disabled_reason = reason
                 self.logger.warning(
                     "memory entity extraction disabled: %s", reason
                 )
             raise
+        return {"entities": self._ground(response, text), "relations": []}
+
+    def _request(self, text, *, model=None, structured_output=None):
+        body = {
+            "model": model or self.model,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": EXTRACTION_INSTRUCTION},
+                {"role": "user", "content": text},
+            ],
+            "response_format": EXTRACTION_RESPONSE_FORMAT,
+        }
+        # Main-model options identify compatibility; they are not NER parameters.
+        body = normalize_structured_output_body(body, structured_output, provider=self.provider,
+                                                declared_parameters=self.reasoning_options)
+        return _post_json(self.endpoint, body, headers=self.headers, api_key=self.api_key, timeout=self.timeout)
 
     def _ground(self, response, text):
         """Keep only entities the note actually contains, with their offsets."""

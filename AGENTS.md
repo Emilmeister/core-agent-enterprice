@@ -242,6 +242,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/a2a.py` | Внутренние A2A contract types и Task representation |
 | `core_agent/a2a_sdk.py` | Official A2A SDK HTTP+JSON binding и request handler |
 | `core_agent/model.py` | OpenAI-compatible/Anthropic adapters, streaming и tool wire payload |
+| `core_agent/structured_output.py` | Request-local reasoning policy для guardrails, summary и NER |
 | `core_agent/kernel.py` | Protected kernel, profile и skill instruction layers |
 | `core_agent/context.py` | Context budget, compaction и structured summary |
 | `core_agent/tools.py` | Tool schemas, validation, policy и dispatch |
@@ -735,6 +736,13 @@ run получает отдельные MCP session и negotiated version; пе�
   Сохранённый profile prompt не заменяет protected kernel или safety rules.
   Model ID admitted run применяется к основным turns, compaction и memory NER;
   embeddings и отдельная guardrails model остаются deployment configuration.
+  `structured_output` задаёт reasoning `auto/off/inherit` и способ совместимости
+  для guardrails/summary/NER, не меняя обычные ответы и tools. Политика закреплена
+  в snapshot root/child/background; legacy snapshot без поля сохраняет прежнее
+  поведение. Нормализация выполняется после сборки provider body, без probes,
+  retries и догадок по model ID/hostname. Копии classifier сохраняют общий
+  semaphore; NER cache отказов различает model и policy. Контракт —
+  `spec/agent-configuration.md`.
 - Owner-only `/api/chats/{context_id}/peer-conversations` показывает durable
   публичные исходящие поручения, ответы и доступные файлы remote jobs, включая
   child lineage. Панель выбирает контрагента по frozen `peer_id` и объединяет его

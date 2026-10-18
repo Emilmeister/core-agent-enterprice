@@ -3,6 +3,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
+from core_agent.agent_settings import AgentSettingsStore
 from core_agent.errors import CoreError, ExecutionNotStarted
 from core_agent.execution import ExecutionResult
 from core_agent.interactions import InMemoryInteractionStore, tool_origin
@@ -487,6 +488,39 @@ class ToolApprovalTests(unittest.TestCase):
         self.assertEqual(len(self.executed), 1)
         self.assertTrue(result.snapshot["finalization_turn_reserved"])
         self.assertEqual(agent.workflow_store._budgets[result.run_id][2:], [3, 2])
+
+    def test_background_inherits_admitted_structured_policy_after_settings_change(self):
+        off = {"reasoning": "off", "compatibility": "chat_template"}
+        inherit = {"reasoning": "inherit", "compatibility": "auto"}
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                agent, _ = self.background_app(
+                    self.call("core_task_start", {"tool": "core_terminal_exec", "arguments": {"argv": ["true"]}}),
+                    ModelResponse(message="submitted"),
+                )
+                settings = AgentSettingsStore(agent.workflow_store)
+                settings.update("company", {"structured_output": off}, expected_revision=0, actor_id="owner")
+                if not legacy:
+                    agent.agent_settings_store = settings
+                admitted, *_ = agent._new_workflow(
+                    {"prompt": "perform task"}, task_id="task", identity="owner",
+                    session_id="chat", tenant_id="company", defer_initialization=True,
+                )
+                agent.agent_settings_store = settings
+                settings.update("company", {"structured_output": inherit}, expected_revision=1, actor_id="owner")
+                parent = self.start_background_with_open_parent(agent)
+                self.settle_workers(agent)
+                task, = agent.task_scheduler.list(owner_id=parent.run_id, tenant_id="company")
+                child = agent.workflow_store.lookup_task(task.id)
+                self.assertEqual(parent.run_id, admitted.run_id)
+                self.assertEqual(child.parent_run_id, parent.run_id)
+                self.assertEqual(child.state, "WAITING_INPUT")
+                if legacy:
+                    self.assertNotIn("structured_output", parent.snapshot)
+                    self.assertNotIn("structured_output", child.snapshot)
+                else:
+                    self.assertEqual(parent.snapshot["structured_output"], off)
+                    self.assertEqual(child.snapshot["structured_output"], off)
 
     def test_background_parent_admission_restart_reuses_single_child(self):
         agent, model = self.background_app(self.call("core_task_start", {"tool": "core_terminal_exec", "arguments": {"argv": ["true"]}}), ModelResponse(message="recovered"))

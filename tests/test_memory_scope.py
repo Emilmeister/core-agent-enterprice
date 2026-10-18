@@ -16,6 +16,7 @@ from core_agent.database import PostgresDatabase
 from core_agent.errors import CoreError
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.memory import MemoryRegistry
+from core_agent.memory_providers import LlmEntityExtractor
 from core_agent.memory_store import InMemoryMemoryStore, PostgresMemoryStore
 from core_agent.owner_api import policy_catalog
 from core_agent.workflow import PostgresWorkflowStore
@@ -103,6 +104,44 @@ class MemoryScopeTests(AuthAppTestCase):
         elif operation == "delete":
             arguments["reason"] = "unauthorized deletion"
         return arguments
+
+    async def test_memory_tool_ner_keeps_admitted_policy_after_owner_settings_change(self):
+        off = {"reasoning": "off", "compatibility": "chat_template"}
+        inherit = {"reasoning": "inherit", "compatibility": "auto"}
+        options = {"chat_template_kwargs": {"enable_thinking": True}}
+        extractor = LlmEntityExtractor("https://provider.test/v1", "deployment-model", extra_body=options)
+        self.agent.memory_registry.entity_extractor = extractor
+        store = self.agent.agent_settings_store
+        store.update(self.tenant, {"structured_output": off}, expected_revision=0, actor_id="owner")
+        generate = self.model.generate
+        changed = False
+        def change_settings_after_admission(**kwargs):
+            nonlocal changed
+            if not changed:
+                store.update(self.tenant, {"structured_output": inherit}, expected_revision=1, actor_id="owner")
+                changed = True
+            return generate(**kwargs)
+        calls = []
+        def extract(_endpoint, payload, **_kwargs):
+            calls.append(payload)
+            return {"choices": [{"message": {"content": '{"entities":[]}'}}]}
+        with patch.object(self.model, "generate", side_effect=change_settings_after_admission), \
+                patch("core_agent.memory_providers._post_json", side_effect=extract):
+            first, admitted = await self.tool("core_memory_create", {"title": "Pinned", "body": "first note"})
+            second, updated = await self.tool("core_memory_create", {"title": "Current", "body": "second note"})
+        self.assertEqual(first["status"], "succeeded")
+        self.assertEqual(second["status"], "succeeded")
+        self.assertEqual(admitted.snapshot["structured_output"], off)
+        self.assertEqual(updated.snapshot["structured_output"], inherit)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertNotIn("chat_template_kwargs", calls[1])
+        self.assertEqual([request["model"] for request in calls], [self.model.model] * 2)
+        self.assertTrue(all(request["temperature"] == 0 and request["response_format"]["json_schema"]["strict"]
+                            for request in calls))
+        self.assertEqual(extractor.model, "deployment-model")
+        self.assertEqual(extractor.reasoning_options, options)
+        self.assertIs(self.agent.memory_registry.entity_extractor, extractor)
 
     async def test_two_companies_with_same_owner_cannot_search_or_use_direct_ids(self):
         for operation in ("search", "read", "update", "split", "delete"):

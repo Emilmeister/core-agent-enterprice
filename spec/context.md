@@ -131,7 +131,9 @@ HTTP-генерация summary MUST задавать отдельную стр�
 `response_format.json_schema` с `strict: true`, для Anthropic —
 `output_config.format` с `type: json_schema`. Эта статическая схема заменяет
 унаследованный формат ответа основной модели только в копии adapter для summary.
-Настройки основной модели, остальные provider options и схемы tools не меняются.
+Настройки основной модели и схемы tools не меняются. Отдельная закреплённая
+политика `structured_output` из agent settings может изменить reasoning только
+summary-запроса; остальные provider options сохраняются.
 
 Локальные проверки непустого текста, списка sources и принадлежности IDs
 исходному набору, provenance, finish reason и размера результата сохраняются.

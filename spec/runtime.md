@@ -77,7 +77,7 @@
 
 ## Reasoning
 
-- Ядро MUST использовать reasoning-capable режим модели, если он поддерживается выбранным provider.
+- Ядро MUST использовать reasoning-capable режим модели, если он поддерживается выбранным provider. Исключение — закреплённая owner-политика структурированных ответов для guardrails, summary и NER из [конфигурации агента](agent-configuration.md#reasoning-структурированных-ответов); она не меняет обычный agent loop и не является fallback после ошибки провайдера.
 - Deployment MAY задать `THINKING_LEVEL`; отсутствие значения оставляет provider default. OpenAI-compatible adapter передаёт его как `reasoning_effort`, Anthropic Messages — как `output_config.effort` с adaptive thinking. Неподдерживаемое provider-ом значение завершается обычной model error, а не silent downgrade.
 - Уровень reasoning и model route являются Platform/Agent configuration: remote A2A caller не управляет ими через RunRequest, prompt, MCP или skill.
 - Provider-returned visible reasoning/summary не является публичным ответом и не попадает в audit, memory или tool arguments. В A2A stream оно MAY публиковаться только как отдельная помеченная часть при включённом streaming и MUST вырезаться из терминального кадра и Artifact. В operator logs/traces оно появляется только при explicit content capture, после redaction и truncation.

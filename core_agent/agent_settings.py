@@ -15,9 +15,10 @@ from .mcp import RESERVED_MCP_HEADERS
 from .remote_agents import _validate_endpoint
 from .remote_registry import _header_value, _text
 from .security import safe_url
+from .structured_output import STRUCTURED_OUTPUT_DEFAULT, validate_structured_output
 
 
-CONFIG_FIELDS = frozenset({"profile_prompt", "model_id", "mcp_servers", "context_window"})
+CONFIG_FIELDS = frozenset({"profile_prompt", "model_id", "mcp_servers", "context_window", "structured_output"})
 RESERVED_HEADERS = RESERVED_MCP_HEADERS | frozenset({
     "host", "content-length", "connection", "transfer-encoding", "upgrade", "trailer", "te",
     "proxy-authorization", "traceparent", "tracestate", "baggage",
@@ -35,7 +36,8 @@ def _revision(value):
 
 def _default(tenant):
     return {"tenant_id": tenant, "revision": 0, "storage_version": 1,
-            "config": {"profile_prompt": None, "model_id": None, "mcp_servers": None, "context_window": None}, "encrypted_payload": None}
+            "config": {"profile_prompt": None, "model_id": None, "mcp_servers": None, "context_window": None,
+                       "structured_output": None}, "encrypted_payload": None}
 
 
 class AgentSettingsStore:
@@ -112,6 +114,9 @@ class AgentSettingsStore:
             if window is not None and (type(window) is not int or not 1024 <= window <= 100_000_000):
                 raise CoreError("SETTINGS_INVALID")
             config["context_window"] = window
+        if "structured_output" in values:
+            policy = values["structured_output"]
+            config["structured_output"] = validate_structured_output(policy) if policy is not None else None
         if "mcp_servers" in values:
             supplied = values["mcp_servers"]
             if supplied is not None and (not isinstance(supplied, list) or len(supplied) > 32):
@@ -204,6 +209,7 @@ class AgentSettingsStore:
                 else agent.agent_config.agent.get("profile_prompt", ""), "model_id": config["model_id"] if config["model_id"] is not None
                 else agent.agent_config.model["route"], "mcp_servers": servers,
                 "context_window": config.get("context_window") or agent.context_window,
+                "structured_output": copy.deepcopy(config.get("structured_output") or STRUCTURED_OUTPUT_DEFAULT),
                 "inherits": {key: config.get(key) is None for key in CONFIG_FIELDS}}
 
     def catalogs(self, tenant, declarations, workflow_store):

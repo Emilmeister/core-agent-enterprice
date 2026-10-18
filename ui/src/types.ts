@@ -291,7 +291,11 @@ export interface AgentSettings {
   model_id: string;
   mcp_servers: McpConnection[];
   context_window: number;
-  inherits: { profile_prompt: boolean; model_id: boolean; mcp_servers: boolean; context_window: boolean };
+  structured_output: {
+    reasoning: "auto" | "off" | "inherit";
+    compatibility: "auto" | "chat_template" | "thinking" | "reasoning_effort";
+  };
+  inherits: { profile_prompt: boolean; model_id: boolean; mcp_servers: boolean; context_window: boolean; structured_output: boolean };
 }
 export interface Peer {
   id: string;

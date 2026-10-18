@@ -526,6 +526,8 @@ def _memory_registry(state, telemetry, *, enabled):
             api_key=llm_key,
             timeout=timeout,
             headers=headers,
+            provider=_env("LLM_PROVIDER"),
+            extra_body=_json("LLM_EXTRA_BODY_JSON"),
         )
         # Anthropic's messages API has no `response_format`, so extraction there
         # would be one guaranteed rejection per write until the permanent-failure

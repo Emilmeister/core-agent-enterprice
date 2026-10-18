@@ -628,6 +628,111 @@ class OwnerAgentConfigurationAPITests(AuthAppTestCase):
         self.assertEqual(agent._context_window(child.snapshot), 65536)
         self.assertEqual(agent._context_window({}), agent.context_window)
 
+    async def test_structured_output_defaults_cas_reset_and_independent_save(self):
+        agent = self.app.state.core_agent
+        store = agent.agent_settings_store
+        tenant = self.app.state.authenticator.settings.tenant
+        endpoint = "/api/agent-settings"
+        default = {"reasoning": "auto", "compatibility": "auto"}
+        initial = await self.http.get(endpoint, headers=self.headers("owner-a"))
+        self.assertEqual(initial.status_code, 200, initial.text)
+        self.assertEqual(initial.json()["structured_output"], default)
+        self.assertTrue(initial.json()["inherits"]["structured_output"])
+        denied = await self.http.get(endpoint, headers=self.headers("external-a"))
+        self.assertEqual(denied.status_code, 403)
+        denied = await self.http.put(endpoint, headers=self.headers("external-a"),
+            json={"expected_revision": 0, "structured_output": default})
+        self.assertEqual(denied.status_code, 403)
+        server = {"name": "docs", "url": "https://docs.test/mcp", "enabled": True,
+                  "header_name": "Authorization", "header_value": "Bearer preserved-secret"}
+        previous = store.update(tenant, {"profile_prompt": "Preserved profile", "model_id": "selected-model",
+            "context_window": 65536, "mcp_servers": [server]}, expected_revision=0, actor_id="owner")
+        revision = previous["revision"]
+        with patch("core_agent.agent_settings_api.provider_models",
+                   side_effect=CoreError("MODEL_DISCOVERY_UNAVAILABLE")) as discovery:
+            for reasoning in ("auto", "off", "inherit"):
+                for compatibility in ("auto", "chat_template", "thinking", "reasoning_effort"):
+                    policy = {"reasoning": reasoning, "compatibility": compatibility}
+                    saved = await self.http.put(endpoint, headers=self.headers("owner-a"),
+                        json={"expected_revision": revision, "structured_output": policy})
+                    self.assertEqual(saved.status_code, 200, saved.text)
+                    revision += 1
+                    self.assertEqual(saved.json()["revision"], revision)
+                    self.assertEqual(saved.json()["structured_output"], policy)
+                    self.assertFalse(saved.json()["inherits"]["structured_output"])
+            discovery.assert_not_called()
+        other_owner = await self.http.get(endpoint, headers=self.headers("owner-b"))
+        self.assertEqual(other_owner.json(), saved.json())
+        current = store.get(tenant)
+        self.assertEqual({key: current["config"][key] for key in previous["config"] if key != "structured_output"},
+                         {key: value for key, value in previous["config"].items() if key != "structured_output"})
+        self.assertEqual(store._secrets(current), store._secrets(previous))
+        self.assertEqual(store.get(tenant, 1)["config"], previous["config"])
+        foreign = store.public(store.get(tenant + "-other"), agent)
+        self.assertEqual(foreign["structured_output"], default)
+        self.assertTrue(foreign["inherits"]["structured_output"])
+        stale = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": revision - 1, "structured_output": None, "profile_prompt": "stale"})
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(store.get(tenant)["config"], current["config"])
+        cleared = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": revision, "structured_output": None})
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertEqual(cleared.json()["structured_output"], default)
+        self.assertTrue(cleared.json()["inherits"]["structured_output"])
+        self.assertIsNone(store.get(tenant)["config"]["structured_output"])
+        self.assertEqual(store.get(tenant, revision)["config"]["structured_output"], policy)
+
+    async def test_structured_output_strict_validation_is_atomic(self):
+        endpoint = "/api/agent-settings"
+        invalid = [True, False, 0, 1.5, "auto", [], {}, {"reasoning": "auto"}, {"compatibility": "auto"},
+                   {"reasoning": "auto", "compatibility": "auto", "unknown": True}]
+        for value in (None, True, 1, 1.5, [], {}, "", "AUTO", "none", "unknown"):
+            invalid.extend(({"reasoning": value, "compatibility": "auto"},
+                            {"reasoning": "auto", "compatibility": value}))
+        for policy in invalid:
+            with self.subTest(policy=policy):
+                response = await self.http.put(endpoint, headers=self.headers("owner-a"),
+                    json={"expected_revision": 0, "structured_output": policy, "profile_prompt": "must not persist"})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(response.json(), {"error": {"code": "SETTINGS_INVALID"}})
+        current = await self.http.get(endpoint, headers=self.headers("owner-a"))
+        self.assertEqual(current.json()["revision"], 0)
+        self.assertEqual(current.json()["profile_prompt"], "")
+        self.assertEqual(current.json()["structured_output"], {"reasoning": "auto", "compatibility": "auto"})
+
+    async def test_structured_output_legacy_revision_inherits_without_rewriting(self):
+        from core_agent.agent_settings import AgentSettingsStore
+        agent = self.app.state.core_agent
+        store = agent.agent_settings_store
+        tenant = self.app.state.authenticator.settings.tenant
+        legacy = {"tenant_id": tenant, "revision": 1, "storage_version": 1,
+                  "config": {"profile_prompt": "Legacy profile", "model_id": None, "mcp_servers": None},
+                  "encrypted_payload": None, "actor_id": "legacy-owner"}
+        if self.use_postgres:
+            from psycopg.types.json import Jsonb
+            with store.database.transaction() as connection:
+                connection.execute("INSERT INTO core_agent_settings(tenant_id,revision) VALUES(%s,1)", (tenant,))
+                connection.execute("""INSERT INTO core_agent_setting_revisions
+                    (tenant_id,revision,storage_version,config,encrypted_payload,actor_id)
+                    VALUES(%s,1,1,%s,NULL,'legacy-owner')""", (tenant, Jsonb(legacy["config"])))
+            store = AgentSettingsStore(agent.workflow_store, self.push_encryption_key, database=store.database)
+        else:
+            store._revisions[(tenant, 1)] = legacy
+            store._current[tenant] = 1
+        current = await self.http.get("/api/agent-settings", headers=self.headers("owner-a"))
+        self.assertEqual(current.status_code, 200, current.text)
+        self.assertEqual(current.json()["structured_output"], {"reasoning": "auto", "compatibility": "auto"})
+        self.assertTrue(current.json()["inherits"]["structured_output"])
+        updated = store.update(tenant, {"context_window": 65536}, expected_revision=1, actor_id="owner")
+        self.assertTrue(store.public(updated, agent)["inherits"]["structured_output"])
+        policy = {"reasoning": "off", "compatibility": "thinking"}
+        updated = store.update(tenant, {"structured_output": policy}, expected_revision=2, actor_id="owner")
+        self.assertEqual(updated["config"]["structured_output"], policy)
+        self.assertEqual(updated["config"]["profile_prompt"], "Legacy profile")
+        self.assertEqual(updated["config"]["context_window"], 65536)
+        self.assertEqual(store.get(tenant, 1)["config"], legacy["config"])
+
     async def test_provider_models_are_fixed_bounded_sanitized_and_failure_preserves_selection(self):
         from core_agent.model import CompatibleHttpModel
         agent = self.app.state.core_agent

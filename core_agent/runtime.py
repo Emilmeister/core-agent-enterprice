@@ -31,6 +31,7 @@ from .context import (
     SUMMARY_RESPONSE_SCHEMA,
     StructuredSummarizer,
 )
+from .structured_output import STRUCTURED_OUTPUT_DEFAULT, validate_structured_output
 from .chat_files import _destination
 from .execution_identity import stopped_by_restart
 from .a2a import output_contract_version, workflow_public_output
@@ -2098,9 +2099,11 @@ class CoreAgent:
         raw = self.agent_config.to_dict()
         platform, declarations, settings_revision = self.platform_config, self.platform_mcp, None
         admitted_window = None
+        structured_output = None
         if parent_run_id is not None:
             parent = self.workflow_store.get(parent_run_id, tenant_id=tenant_id or "default", connection=connection)
             admitted_window = parent.snapshot.get("context_window")
+            structured_output = self._structured_output_policy(parent.snapshot)
         if self.agent_settings_store is not None:
             selected_tenant = tenant_id or "default"
             if parent_run_id is not None:
@@ -2113,6 +2116,8 @@ class CoreAgent:
                 settings_revision = settings["revision"]
                 if parent_run_id is None:
                     admitted_window = settings["config"].get("context_window")
+                    structured_output = validate_structured_output(
+                        settings["config"].get("structured_output") or STRUCTURED_OUTPUT_DEFAULT)
                 raw, platform, declarations = self.agent_settings_store.configure(settings, raw, platform, declarations,
                     profile=parent_run_id is None)
         budgets = raw.get("budgets", {})
@@ -2172,6 +2177,8 @@ class CoreAgent:
         }
         if admitted_window is not None:
             snapshot["context_window"] = admitted_window
+        if structured_output is not None:
+            snapshot["structured_output"] = structured_output
         if file_batch_id is not None:
             snapshot["file_batch_id"] = file_batch_id
         if settings_revision is not None:
@@ -2607,6 +2614,27 @@ class CoreAgent:
             raise CoreError("CHECKPOINT_INVALID")
         return window
 
+    @staticmethod
+    def _structured_output_policy(snapshot):
+        if "structured_output" not in snapshot:
+            return None
+        try:
+            return validate_structured_output(snapshot["structured_output"])
+        except CoreError:
+            raise CoreError("CHECKPOINT_INVALID", "Invalid structured output policy") from None
+
+    def _guardrail_for_snapshot(self, snapshot):
+        policy = self._structured_output_policy(snapshot)
+        classifier = self.guardrail_classifier
+        if policy is None or not isinstance(classifier.model, CompatibleHttpModel):
+            return classifier
+        # Copies keep the process-wide semaphore and limits; only this request's
+        # model policy varies. Mutating the shared classifier would race chats.
+        classifier = copy.copy(classifier)
+        classifier.model = copy.copy(classifier.model)
+        classifier.model.structured_output = policy
+        return classifier
+
     def _context_compactor(self, raw, effective, discovered, snapshot, *, tenant_id=None):
         if self.compactor:
             return self.compactor
@@ -2682,6 +2710,7 @@ class CoreAgent:
                 format_tokens = 0
                 if isinstance(model, CompatibleHttpModel):
                     model = copy.copy(model)
+                    model.structured_output = self._structured_output_policy(snapshot)
                     model.stream = False
                     model.max_tokens = self.summary_max_tokens
                     limit_key = ("max_completion_tokens" if model.api_format == "openai"
@@ -3436,7 +3465,7 @@ class CoreAgent:
             timeout = (self.interaction_store.get_settings(record.tenant_id).guardrails_timeout_seconds
                        if self.interaction_store is not None else 86400)
             review = self.material_review_store.classify(
-                record, review_id, self.guardrail_classifier, lease_token=lease_token,
+                record, review_id, self._guardrail_for_snapshot(snapshot), lease_token=lease_token,
                 continuation=continuation, snapshot=snapshot, owner_timeout_seconds=timeout,
                 before_pending=before_pending, documents=documents, complete=complete,
             )
@@ -5574,6 +5603,9 @@ class CoreAgent:
             "finalization_turn_reserved": False, "budget_exhausted": None,
             "context": self._context_to_dict(ContextState((), (), (0, 0))),
         }
+        structured_output = self._structured_output_policy(parent_snapshot)
+        if structured_output is not None:
+            snapshot["structured_output"] = structured_output
         compiled = self._compile_instructions(raw, effective, snapshot)
         snapshot.update(compiled_instructions=compiled.text, protected_kernel_digest=compiled.protected_digest)
         child = WorkflowRecord(child_run_id, identifier, parent.context_id, parent.tenant_id,
@@ -6498,12 +6530,15 @@ class CoreAgent:
         scope = self._run_scopes.get(run_id, {})
         return ({"task_id": scope.get("task_id") or "", "event_revision": 0},)
 
-    def _memory_entity_model(self, run_id):
+    def _memory_entity_options(self, run_id):
         if self.agent_settings_store is None:
-            return None
+            return {}
         scope = self._run_scopes.get(run_id, {})
         record = self.workflow_store.get(run_id, tenant_id=scope.get("tenant_id") or "default")
-        return record.snapshot.get("admission", {}).get("agent_config", {}).get("model", {}).get("route")
+        return {
+            "entity_model": record.snapshot.get("admission", {}).get("agent_config", {}).get("model", {}).get("route"),
+            "entity_structured_output": self._structured_output_policy(record.snapshot),
+        }
 
     def _memory_search(self, arguments, run_id):
         service, namespace = self._memory(run_id, arguments.get("scope", "user"))
@@ -6558,7 +6593,7 @@ class CoreAgent:
             kind=arguments.get("kind") or "fact",
             tags=tuple(arguments.get("tags") or ()),
             sources=self._memory_sources(run_id),
-            entity_model=self._memory_entity_model(run_id),
+            **self._memory_entity_options(run_id),
         )
         return {
             "memory_id": document.id,
@@ -6576,7 +6611,7 @@ class CoreAgent:
             expected_revision=int(arguments["expected_revision"]),
             title=arguments.get("title"),
             status=arguments.get("status"),
-            entity_model=self._memory_entity_model(run_id),
+            **self._memory_entity_options(run_id),
         )
         return {
             "memory_id": document.id,
@@ -6593,7 +6628,7 @@ class CoreAgent:
             overview=arguments["overview"],
             children=arguments["children"],
             expected_revision=int(arguments["expected_revision"]),
-            entity_model=self._memory_entity_model(run_id),
+            **self._memory_entity_options(run_id),
         )
         return {
             "memory_ids": list(memory_ids),
@@ -6607,7 +6642,7 @@ class CoreAgent:
             namespace=namespace,
             reason=arguments["reason"],
             expected_revision=int(arguments["expected_revision"]),
-            entity_model=self._memory_entity_model(run_id),
+            **self._memory_entity_options(run_id),
         )
         return {
             "committed": result.committed,

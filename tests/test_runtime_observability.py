@@ -5681,7 +5681,7 @@ class SemanticRuntimeTests(unittest.TestCase):
         self.assertIn('confirmed result', json.dumps(record.snapshot['context']['transcript']))
 
     def test_summary_http_wire_enforces_schema_and_limits_without_mutating_model(self):
-        for api_format, options, expected_limit, window in [(*case, window) for case in [
+        for api_format, options, expected_limit, window, reasoning in [(*case, window, reasoning) for case in [
             ('openai', {}, 'max_tokens'),
             ('anthropic', {}, 'max_tokens'),
             ('openai', {'stream': True, 'stream_options': {'include_usage': True}, 'max_tokens': 4096,
@@ -5690,8 +5690,8 @@ class SemanticRuntimeTests(unittest.TestCase):
             ('anthropic', {'stream': True, 'stream_options': {}, 'max_tokens': 4096, 'max_completion_tokens': 8192,
                            'response_format': {'type': 'json_object'},
                            'output_config': {'effort': 'low', 'format': {'type': 'text'}}}, 'max_tokens'),
-        ] for window in (2000, 50000)]:
-            with self.subTest(api_format=api_format, expected_limit=expected_limit, window=window):
+        ] for window in (2000, 50000) for reasoning in ('inherit', 'off', 'auto')]:
+            with self.subTest(api_format=api_format, expected_limit=expected_limit, window=window, reasoning=reasoning):
                 options = {**options, 'metadata': {'purpose': 'retained-option'}}
                 class HttpModel(CompatibleHttpModel):
                     def generate(inner, **call):
@@ -5717,7 +5717,8 @@ class SemanticRuntimeTests(unittest.TestCase):
                 agent.model = model
                 from core_agent.agent_settings import AgentSettingsStore
                 agent.agent_settings_store = AgentSettingsStore(agent.workflow_store)
-                agent.agent_settings_store.update('default', {'model_id': 'owner-selected-summary'},
+                agent.agent_settings_store.update('default', {'model_id': 'owner-selected-summary',
+                    'structured_output': {'reasoning': reasoning, 'compatibility': 'thinking'}},
                                                  expected_revision=0, actor_id='owner')
                 result = agent.run(run_request(), task_id='wire-' + api_format + expected_limit)
                 self.assertEqual(result.message, 'done')
@@ -5731,7 +5732,11 @@ class SemanticRuntimeTests(unittest.TestCase):
                     schema = response_format['json_schema']['schema']
                     format_options = {'response_format': response_format}
                     instructions = wire['messages'][0]['content']
-                    self.assertEqual(wire['reasoning_effort'], 'high')
+                    if reasoning == 'inherit':
+                        self.assertEqual(wire['reasoning_effort'], 'high')
+                    else:
+                        self.assertNotIn('reasoning_effort', wire)
+                        self.assertEqual(wire['thinking'], {'type': 'disabled'})
                     self.assertNotIn('output_config', wire)
                 else:
                     response_format = wire['output_config']['format']
@@ -5739,7 +5744,11 @@ class SemanticRuntimeTests(unittest.TestCase):
                     schema = response_format['schema']
                     format_options = {'output_config': {'format': response_format}}
                     instructions = wire['system']
-                    self.assertEqual(wire['output_config']['effort'], model.reasoning_effort or 'low')
+                    if reasoning == 'inherit':
+                        self.assertEqual(wire['output_config']['effort'], model.reasoning_effort or 'low')
+                    else:
+                        self.assertNotIn('effort', wire['output_config'])
+                        self.assertEqual(wire['thinking'], {'type': 'disabled'})
                     self.assertNotIn('response_format', wire)
                 sections = {'Goal', 'Constraints', 'Decisions', 'Completed', 'Artifacts', 'Pending', 'Failures'}
                 self.assertEqual(schema['type'], 'object')

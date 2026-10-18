@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import io
 import json
 import logging
@@ -986,6 +987,229 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(canonical.json(), legacy.json())
         finally:
             app.state.close()
+
+
+class StructuredOutputReasoningTests(unittest.TestCase):
+    def test_structured_request_overrides_merged_reasoning_effort(self):
+        model = CompatibleHttpModel(
+            api_format="openai", model="m", provider="vllm",
+            reasoning_effort="high",
+            structured_output={"reasoning": "auto", "compatibility": "auto"},
+            extra_body={"response_format": {"type": "json_object"}},
+        )
+        body, _, _ = model._request("context", "instructions", {})
+        self.assertNotIn("reasoning_effort", body)
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+
+    def test_policy_validation_is_finite_and_returns_an_independent_value(self):
+        from core_agent.structured_output import (
+            STRUCTURED_OUTPUT_DEFAULT, validate_structured_output,
+        )
+
+        policy = validate_structured_output(STRUCTURED_OUTPUT_DEFAULT)
+        policy["reasoning"] = "inherit"
+        self.assertEqual(STRUCTURED_OUTPUT_DEFAULT, {"reasoning": "auto", "compatibility": "auto"})
+        for value in (
+            None, True, [], "auto", {}, {"reasoning": "off"},
+            {"reasoning": "auto", "compatibility": "auto", "secret-canary": True},
+            {"reasoning": "secret-canary", "compatibility": "auto"},
+            {"reasoning": [], "compatibility": "auto"},
+            {"reasoning": "auto", "compatibility": {}},
+            {"reasoning": "auto", "compatibility": "secret-canary"},
+        ):
+            with self.subTest(value=value), self.assertRaises(CoreError) as caught:
+                validate_structured_output(value)
+            self.assertEqual(caught.exception.code, "SETTINGS_INVALID")
+            self.assertNotIn("secret-canary", str(caught.exception))
+
+    def test_unknown_auto_preserves_and_off_rejects_before_http(self):
+        for provider in (None, "openai", "unknown"):
+            for mode in ("auto", "off"):
+                with self.subTest(provider=provider, mode=mode):
+                    model = CompatibleHttpModel(
+                        api_format="openai", model="Qwen/deepseek-vllm-alias",
+                        base_url="https://vllm.deepseek.openai.test/v1", provider=provider,
+                        reasoning_effort="high",
+                        structured_output={"reasoning": mode, "compatibility": "auto"},
+                        extra_body={"response_format": {"type": "json_object"}},
+                    )
+                    if mode == "auto":
+                        body, _, _ = model._request("context", "instructions", {})
+                        self.assertEqual(body["reasoning_effort"], "high")
+                        self.assertNotIn("thinking", body)
+                        self.assertNotIn("chat_template_kwargs", body)
+                    else:
+                        with patch("core_agent.model.urlopen") as opened:
+                            with self.assertRaises(CoreError) as caught:
+                                model.generate(context="context", instructions="instructions", tools={})
+                        opened.assert_not_called()
+                        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                        self.assertEqual(str(caught.exception), "STRUCTURED_REASONING_UNSUPPORTED")
+                        self.assertFalse(caught.exception.retryable)
+
+    def test_explicit_compatibility_removes_conflicting_controls_without_mutation(self):
+        from core_agent.structured_output import normalize_structured_output_body
+
+        original = {
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "high", "enable_thinking": True,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "chat_template_kwargs": {
+                "enable_thinking": True, "thinking": True, "reasoning_effort": "high",
+                "preserved": {"value": [1]},
+            },
+            "output_config": {"effort": "max", "other": "preserved"},
+            "reasoning": {"effort": "high"},
+            "temperature": 0.4, "top_p": 0.8,
+        }
+        before = copy.deepcopy(original)
+        for mode in ("auto", "off"):
+            for style in ("chat_template", "thinking", "reasoning_effort"):
+                with self.subTest(mode=mode, style=style):
+                    result = normalize_structured_output_body(
+                        original, {"reasoning": mode, "compatibility": style}, provider="unknown",
+                    )
+                    expected = {
+                        "response_format": {"type": "json_object"},
+                        "chat_template_kwargs": {"preserved": {"value": [1]}},
+                        "output_config": {"other": "preserved"},
+                        "temperature": 0.4, "top_p": 0.8,
+                    }
+                    if style == "chat_template":
+                        expected["chat_template_kwargs"]["enable_thinking"] = False
+                    elif style == "thinking":
+                        expected["thinking"] = {"type": "disabled"}
+                    else:
+                        expected["reasoning_effort"] = "none"
+                    self.assertEqual(result, expected)
+                    result["chat_template_kwargs"]["preserved"]["value"].append(2)
+                    self.assertEqual(original, before)
+
+    def test_host_inferred_minimax_thinking_is_not_compatibility_evidence(self):
+        model = CompatibleHttpModel(
+            api_format="openai", model="alias", base_url="https://minimax.proxy.test/v1",
+            reasoning_effort="high", structured_output={"reasoning": "auto", "compatibility": "auto"},
+            extra_body={"response_format": {"type": "json_object"}},
+        )
+        body, _, _ = model._request("context", "instructions", {})
+        self.assertEqual(body["thinking"], {"type": "adaptive"})
+        self.assertEqual(body["reasoning_effort"], "high")
+        self.assertTrue(body["reasoning_split"])
+        model.structured_output = {"reasoning": "off", "compatibility": "auto"}
+        with self.assertRaises(CoreError) as caught:
+            model._request("context", "instructions", {})
+        self.assertEqual(str(caught.exception), "STRUCTURED_REASONING_UNSUPPORTED")
+
+    def test_auto_uses_configured_provider_or_existing_request_controls(self):
+        from core_agent.structured_output import normalize_structured_output_body
+
+        for provider, options, expected in (
+            ("vllm", {}, {"chat_template_kwargs": {"enable_thinking": False}}),
+            ("deepseek", {}, {"thinking": {"type": "disabled"}}),
+            (None, {"chat_template_kwargs": {"enable_thinking": True}},
+             {"chat_template_kwargs": {"enable_thinking": False}}),
+            ("unknown", {"thinking": {"type": "enabled", "budget_tokens": 100}},
+             {"thinking": {"type": "disabled"}}),
+        ):
+            with self.subTest(provider=provider, options=options):
+                body = {"response_format": {"type": "json_object"}, "reasoning_effort": "high", **options}
+                self.assertEqual(normalize_structured_output_body(
+                    body, {"reasoning": "auto", "compatibility": "auto"}, provider=provider,
+                ), {"response_format": {"type": "json_object"}, **expected})
+
+    def test_legacy_inherit_plain_responses_and_tool_schemas_preserve_reasoning(self):
+        for policy, structured in (
+            (None, True), ({"reasoning": "inherit", "compatibility": "chat_template"}, True),
+            ({"reasoning": "off", "compatibility": "auto"}, False),
+        ):
+            for api_format in ("openai", "anthropic"):
+                with self.subTest(policy=policy, structured=structured, api_format=api_format):
+                    extra = {"thinking": {"type": "enabled", "budget_tokens": 1234}}
+                    if structured:
+                        extra["response_format"] = {"type": "json_object"}
+                    model = CompatibleHttpModel(
+                        api_format=api_format, model="m", reasoning_effort="high",
+                        structured_output=policy, extra_body=extra,
+                    )
+                    tool_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+                    tools = {"strict_tool": {"input_schema": tool_schema}}
+                    body, _, _ = model._request("context", "instructions", tools)
+                    self.assertEqual(body["thinking"], extra["thinking"])
+                    if api_format == "openai":
+                        self.assertEqual(body["reasoning_effort"], "high")
+                        self.assertEqual(body["tools"][0]["function"]["parameters"], tool_schema)
+                        self.assertNotIn("strict", body["tools"][0]["function"])
+                    else:
+                        self.assertEqual(body["output_config"]["effort"], "high")
+                        self.assertEqual(body["tools"][0]["input_schema"], tool_schema)
+                    self.assertNotIn("chat_template_kwargs", body)
+
+    def test_copied_adapters_send_isolated_structured_http_requests(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                result = (
+                    {"content": [{"type": "text", "text": "{}"}], "stop_reason": "end_turn"}
+                    if self.path.endswith("/messages") else
+                    {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+                )
+                encoded = json.dumps(result).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        schema = {"type": "object", "properties": {}, "additionalProperties": False, "required": []}
+        for api_format in ("openai", "anthropic"):
+            with self.subTest(api_format=api_format):
+                main = CompatibleHttpModel(
+                    api_format=api_format, model="m", provider="vllm", reasoning_effort="high",
+                    base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                    temperature=0.4, top_p=0.8,
+                    structured_output={"reasoning": "off", "compatibility": "chat_template"},
+                    extra_body={"thinking": {"type": "enabled", "budget_tokens": 1024},
+                                "chat_template_kwargs": {"enable_thinking": True, "other": "preserved"}},
+                )
+                before = copy.deepcopy(main.extra_body)
+                structured = copy.copy(main)
+                structured.extra_body = dict(main.extra_body)
+                if api_format == "openai":
+                    structured.extra_body["response_format"] = {
+                        "type": "json_schema", "json_schema": {"name": "test", "strict": True, "schema": schema},
+                    }
+                else:
+                    structured.extra_body["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+                with patch.dict(os.environ, {"NO_PROXY": "*", "no_proxy": "*"}):
+                    structured.generate(context="context", instructions="instructions", tools={})
+                    main.generate(context="context", instructions="instructions", tools={})
+                normalized, ordinary = requests[-2:]
+                self.assertEqual(main.extra_body, before)
+                self.assertEqual(main.reasoning_effort, "high")
+                self.assertEqual(normalized["temperature"], 0.4)
+                self.assertEqual(normalized["top_p"], 0.8)
+                self.assertNotIn("reasoning_effort", normalized)
+                if api_format == "openai":
+                    self.assertNotIn("thinking", normalized)
+                    self.assertEqual(normalized["chat_template_kwargs"], {"other": "preserved", "enable_thinking": False})
+                    self.assertEqual(normalized["response_format"], structured.extra_body["response_format"])
+                    self.assertEqual(ordinary["reasoning_effort"], "high")
+                else:
+                    self.assertEqual(normalized["thinking"], {"type": "disabled"})
+                    self.assertEqual(normalized["chat_template_kwargs"], {"other": "preserved"})
+                    self.assertEqual(normalized["output_config"], structured.extra_body["output_config"])
+                    self.assertEqual(ordinary["output_config"]["effort"], "high")
+                self.assertEqual(ordinary["thinking"], before["thinking"])
+                self.assertEqual(ordinary["chat_template_kwargs"], before["chat_template_kwargs"])
 
 
 class ConfigurationTransferTests(unittest.TestCase):

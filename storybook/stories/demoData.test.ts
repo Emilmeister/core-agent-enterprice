@@ -42,13 +42,59 @@ test("renaming and archiving survive the App refresh", async () => {
 test("context window can be set and reset in the settings demo", async () => {
   const request = createDemoRequest();
   const saved = await (await request("/api/agent-settings", {
-    method: "PUT", body: JSON.stringify({ context_window: 65536 }),
+    method: "PUT", body: JSON.stringify({ expected_revision: 1, context_window: 65536 }),
   })).json();
   assert.equal(saved.context_window, 65536);
   assert.equal(saved.inherits.context_window, false);
   const reset = await (await request("/api/agent-settings", {
-    method: "PUT", body: JSON.stringify({ context_window: null }),
+    method: "PUT", body: JSON.stringify({ expected_revision: 2, context_window: null }),
   })).json();
   assert.equal(reset.context_window, 128000);
   assert.equal(reset.inherits.context_window, true);
+});
+
+test("structured settings preserve unrelated values, reject stale saves and reset to deployment", async () => {
+  const request = createDemoRequest();
+  const structured_output = { reasoning: "off", compatibility: "chat_template" };
+  const saved = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: 1, structured_output }),
+  })).json();
+  assert.deepEqual(saved.structured_output, structured_output);
+  assert.equal(saved.inherits.structured_output, false);
+  const unrelated = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: saved.revision, profile_prompt: "Новый профиль" }),
+  })).json();
+  assert.deepEqual(unrelated.structured_output, structured_output);
+  assert.equal((await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: saved.revision, structured_output: null }),
+  })).status, 409);
+  const reset = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: unrelated.revision, model_id: null, context_window: null, structured_output: null }),
+  })).json();
+  assert.deepEqual(reset.structured_output, { reasoning: "auto", compatibility: "auto" });
+  assert.equal(reset.inherits.structured_output, true);
+  assert.equal(reset.profile_prompt, "Новый профиль");
+});
+
+test("settings scenarios allow changes without discovery and retry after a conflict", async () => {
+  const request = createDemoRequest("normal", undefined, "discovery-error");
+  assert.equal((await request("/api/agent-settings/models")).status, 503);
+  const saved = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: 1, structured_output: { reasoning: "inherit", compatibility: "thinking" } }),
+  })).json();
+  assert.equal(saved.structured_output.reasoning, "inherit");
+  const conflict = createDemoRequest("normal", undefined, "conflict");
+  assert.equal((await conflict("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: 1, structured_output: saved.structured_output }),
+  })).status, 409);
+  const refreshed = await (await conflict("/api/agent-settings")).json();
+  assert.deepEqual(refreshed.structured_output, { reasoning: "auto", compatibility: "auto" });
+  assert.equal(refreshed.model_id, "demo-fast");
+  assert.equal(refreshed.context_window, 65536);
+  const retried = await (await conflict("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: refreshed.revision, structured_output: saved.structured_output }),
+  })).json();
+  assert.equal(retried.model_id, "demo-fast");
+  assert.equal(retried.context_window, 65536);
+  assert.deepEqual(retried.structured_output, saved.structured_output);
 });

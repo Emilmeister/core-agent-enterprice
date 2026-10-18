@@ -24,6 +24,46 @@ OpenAI-compatible adapter передаёт effort как `reasoning_effort`; д�
 
 Reasoning text имеет те же privileged capture boundaries, что остальной model content: stdout требует `CORE_AGENT_LOG_CONTENT=true`, Phoenix/OTel — `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. Оба значения безопасно выключены по умолчанию production runtime-ом.
 
+### Reasoning структурированных ответов
+
+Owner settings содержат nullable `structured_output`: ровно два обязательных
+поля `reasoning` (`auto`, `off`, `inherit`) и `compatibility` (`auto`,
+`chat_template`, `thinking`, `reasoning_effort`). Неизвестные поля/значения
+отклоняются атомарно. `null` и прежние settings revisions без поля наследуют
+значение `{reasoning: auto, compatibility: auto}`. Изменения используют общий
+CAS revision; настройку можно сохранить без повторного discovery модели.
+
+Политика действует только на JSON-ответы guardrails, semantic summary и memory
+NER. Обычные ответы и определения tools не изменяются. `inherit` сохраняет
+прежние параметры. `auto` отключает reasoning только при известном способе
+управления: native Anthropic, явно настроенный совместимый provider или
+существующий однозначный параметр thinking. Model ID и догадка по hostname
+не являются доказательством совместимости. Для неизвестного подключения
+`auto` сохраняет его настройки; UI явно объясняет это ограничение.
+
+Явный `compatibility` выбирает один способ управления OpenAI-compatible API:
+`chat_template_kwargs.enable_thinking=false`, `thinking.type=disabled` либо
+`reasoning_effort=none`. Anthropic использует собственный `thinking.type=disabled`.
+При отключении конфликтующие reasoning-параметры удаляются после объединения
+настроек adapter; strict schema и остальные provider options сохраняются.
+`off` с неизвестным способом отключения возвращает понятную ошибку конфигурации
+до сети; MUST NOT объявлять reasoning выключенным без поддерживаемого способа.
+Нет скрытых probes, retries, смены модели или ослабления JSON Schema.
+
+Эффективная политика закрепляется в admitted snapshot нового owner/external/cron
+root и наследуется subagent/background tasks. Follow-up и recovery используют
+тот же snapshot. Legacy workflows без поля сохраняют прежнее поведение `inherit`.
+Guardrails сохраняет свой deployment model/endpoint и общий process semaphore;
+выбор политики одной задачи не меняет classifier или NER других задач.
+NER permanent-failure cache различает model и policy, чтобы прежний отказ
+параметров не блокировал исправленную конфигурацию. Persisted settings version 1
+остаётся совместимым, изменения SQL schema не требуются.
+
+В блоке «Модель» UI показывает режим и дополнительный выбор совместимости API,
+область действия и применение только к новым задачам. Сброс к модели развёртывания
+сбрасывает также эту настройку. На странице настроек подписи отделены от полей,
+а группы полей, подсказки и действия имеют последовательные умеренные отступы.
+
 ## Пример
 
 ```yaml
