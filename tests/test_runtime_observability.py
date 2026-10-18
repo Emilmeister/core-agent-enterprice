@@ -5680,13 +5680,19 @@ class SemanticRuntimeTests(unittest.TestCase):
         self.assertEqual(record.snapshot['turns'], 2)
         self.assertIn('confirmed result', json.dumps(record.snapshot['context']['transcript']))
 
-    def test_summary_http_wire_overrides_stream_and_output_limits_without_mutating_model(self):
+    def test_summary_http_wire_enforces_schema_and_limits_without_mutating_model(self):
         for api_format, options, expected_limit, window in [(*case, window) for case in [
-            ('openai', {'stream': True, 'stream_options': {'include_usage': True}, 'max_tokens': 4096}, 'max_tokens'),
+            ('openai', {}, 'max_tokens'),
+            ('anthropic', {}, 'max_tokens'),
+            ('openai', {'stream': True, 'stream_options': {'include_usage': True}, 'max_tokens': 4096,
+                        'response_format': {'type': 'json_object'}, 'output_config': {'format': {'type': 'text'}}}, 'max_tokens'),
             ('openai', {'stream': True, 'max_tokens': 4096, 'max_completion_tokens': 8192}, 'max_completion_tokens'),
-            ('anthropic', {'stream': True, 'stream_options': {}, 'max_tokens': 4096, 'max_completion_tokens': 8192}, 'max_tokens'),
-        ] for window in (1000, 50000)]:
+            ('anthropic', {'stream': True, 'stream_options': {}, 'max_tokens': 4096, 'max_completion_tokens': 8192,
+                           'response_format': {'type': 'json_object'},
+                           'output_config': {'effort': 'low', 'format': {'type': 'text'}}}, 'max_tokens'),
+        ] for window in (2000, 50000)]:
             with self.subTest(api_format=api_format, expected_limit=expected_limit, window=window):
+                options = {**options, 'metadata': {'purpose': 'retained-option'}}
                 class HttpModel(CompatibleHttpModel):
                     def generate(inner, **call):
                         if call['instructions'].startswith('SEMANTIC CONTEXT SUMMARY'):
@@ -5701,7 +5707,8 @@ class SemanticRuntimeTests(unittest.TestCase):
                         return {'content': [{'type': 'text', 'text': answer.message}], 'stop_reason': 'end_turn'}
 
                 model = HttpModel(api_format=api_format, model='test', extra_body=copy.deepcopy(options),
-                                  stream=True, max_tokens=256)
+                                  stream=True, max_tokens=256,
+                                  reasoning_effort=None if options.get('output_config', {}).get('effort') else 'high')
                 model.script = ScriptedModel([ModelResponse(tool_requests=(ToolRequest('once', 'docs_search', {}),)),
                                               ModelResponse(message='done')])
                 model.bodies = []
@@ -5717,12 +5724,50 @@ class SemanticRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(model.bodies), 1)
                 wire = model.bodies[0]
                 self.assertEqual(wire['model'], 'owner-selected-summary')
+                if api_format == 'openai':
+                    response_format = wire['response_format']
+                    self.assertEqual(response_format['type'], 'json_schema')
+                    self.assertTrue(response_format['json_schema']['strict'])
+                    schema = response_format['json_schema']['schema']
+                    format_options = {'response_format': response_format}
+                    instructions = wire['messages'][0]['content']
+                    self.assertEqual(wire['reasoning_effort'], 'high')
+                    self.assertNotIn('output_config', wire)
+                else:
+                    response_format = wire['output_config']['format']
+                    self.assertEqual(response_format['type'], 'json_schema')
+                    schema = response_format['schema']
+                    format_options = {'output_config': {'format': response_format}}
+                    instructions = wire['system']
+                    self.assertEqual(wire['output_config']['effort'], model.reasoning_effort or 'low')
+                    self.assertNotIn('response_format', wire)
+                sections = {'Goal', 'Constraints', 'Decisions', 'Completed', 'Artifacts', 'Pending', 'Failures'}
+                self.assertEqual(schema['type'], 'object')
+                self.assertEqual(set(schema['properties']), sections)
+                self.assertEqual(set(schema['required']), sections)
+                self.assertFalse(schema['additionalProperties'])
+                for section in schema['properties'].values():
+                    self.assertEqual(section['type'], 'array')
+                    entry = section['items']
+                    self.assertEqual(entry['type'], 'object')
+                    self.assertEqual(set(entry['required']), {'text', 'basis', 'sources'})
+                    self.assertFalse(entry['additionalProperties'])
+                    self.assertEqual(entry['properties'], {
+                        'text': {'type': 'string'},
+                        'basis': {'type': 'string', 'enum': ['fact', 'inference', 'assumption']},
+                        'sources': {'type': 'array', 'items': {'type': 'string'}},
+                    })
+                self.assertEqual(wire['metadata'], options['metadata'])
                 record = agent.workflow_store.lookup_task('wire-' + api_format + expected_limit)
                 self.assertFalse(wire.get('stream', False))
                 self.assertNotIn('stream_options', wire)
                 self.assertEqual(wire[expected_limit], record.snapshot['compaction_operation']['output_limit'])
                 self.assertGreater(wire[expected_limit], 256)
                 self.assertLessEqual(wire[expected_limit], agent.summary_max_tokens)
+                format_tokens = agent.token_counter(json.dumps(format_options, ensure_ascii=False, separators=(',', ':')))
+                available = (window - agent.token_counter(wire['messages'][-1]['content'])
+                             - agent.token_counter(instructions) - format_tokens)
+                self.assertEqual(wire[expected_limit], min(agent.summary_max_tokens, available))
                 if window == 50000:
                     self.assertEqual(wire[expected_limit], 32768)
                 else:
@@ -5733,6 +5778,77 @@ class SemanticRuntimeTests(unittest.TestCase):
                 self.assertEqual(model.max_tokens, 256)
                 self.assertEqual(model.model, 'test')
                 self.assertEqual(model.extra_body, options)
+
+    def test_summary_schema_that_cannot_fit_is_rejected_before_provider_charge(self):
+        for api_format in ('openai', 'anthropic'):
+            with self.subTest(api_format=api_format):
+                class HttpModel(CompatibleHttpModel):
+                    def generate(inner, **call):
+                        if call['instructions'].startswith('SEMANTIC CONTEXT SUMMARY'):
+                            return super().generate(**call)
+                        return inner.script.generate(**call)
+
+                    def _post(inner, body, headers):
+                        inner.bodies.append(body)
+                        answer = self.semantic_answer({'context': body['messages'][-1]['content']})
+                        if inner.api_format == 'openai':
+                            return {'choices': [{'message': {'content': answer.message}, 'finish_reason': 'stop'}]}
+                        return {'content': [{'type': 'text', 'text': answer.message}], 'stop_reason': 'end_turn'}
+
+                agent, script, _ = self.semantic_agent(lambda call: self.fail('use actual HTTP adapter'), context_window=1000)
+                model = HttpModel(api_format=api_format, model='test')
+                model.script, model.bodies = script, []
+                agent.model, agent.output_reserve = model, 100
+                result = agent.run(run_request(), task_id='schema-does-not-fit')
+                self.assertEqual(result.message, 'verified partial')
+                self.assertEqual(model.bodies, [])
+                self.assertEqual(result.usage.model_turns, 2)
+                record = agent.workflow_store.lookup_task('schema-does-not-fit')
+                self.assertEqual(record.snapshot['compaction_operation']['attempts'], 0)
+                self.assertEqual(record.snapshot['compaction_operation']['failure_reason'], 'request_too_large')
+                self.assertFalse(any(item['kind'] == 'summary' for item in record.snapshot['context']['active']))
+                self.assertIn('confirmed result', script.calls[-1].context)
+
+    def test_summary_http_failures_keep_strict_schema_and_local_source_validation(self):
+        for api_format in ('openai', 'anthropic'):
+            for failure in ('provider_unavailable', 'invalid_sources'):
+                with self.subTest(api_format=api_format, failure=failure):
+                    class HttpModel(CompatibleHttpModel):
+                        def generate(inner, **call):
+                            if call['instructions'].startswith('SEMANTIC CONTEXT SUMMARY'):
+                                return super().generate(**call)
+                            return inner.script.generate(**call)
+
+                        def _post(inner, body, headers):
+                            inner.bodies.append(body)
+                            if failure == 'provider_unavailable':
+                                raise CoreError('MODEL_UNAVAILABLE')
+                            answer = self.semantic_answer({'context': body['messages'][-1]['content']})
+                            payload = json.loads(answer.message)
+                            payload['Pending'][0]['sources'] = ['invented-source']
+                            if inner.api_format == 'openai':
+                                return {'choices': [{'message': {'content': json.dumps(payload)}, 'finish_reason': 'stop'}]}
+                            return {'content': [{'type': 'text', 'text': json.dumps(payload)}], 'stop_reason': 'end_turn'}
+
+                    agent, script, _ = self.semantic_agent(lambda call: self.fail('use actual HTTP adapter'))
+                    model = HttpModel(api_format=api_format, model='test')
+                    model.script, model.bodies = script, []
+                    agent.model = model
+                    result = agent.run(run_request(), task_id='schema-failure')
+                    self.assertEqual(result.message, 'verified partial')
+                    self.assertEqual(len(model.bodies), 2)
+                    for body in model.bodies:
+                        if api_format == 'openai':
+                            self.assertEqual(body['response_format']['type'], 'json_schema')
+                            self.assertTrue(body['response_format']['json_schema']['strict'])
+                        else:
+                            self.assertEqual(body['output_config']['format']['type'], 'json_schema')
+                    self.assertEqual(result.usage.model_turns, 4)
+                    record = agent.workflow_store.lookup_task('schema-failure')
+                    self.assertEqual(record.snapshot['compaction_operation']['attempts'], 2)
+                    self.assertEqual(record.snapshot['compaction_operation']['failure_reason'], failure)
+                    self.assertFalse(any(item['kind'] == 'summary' for item in record.snapshot['context']['active']))
+                    self.assertIn('confirmed result', script.calls[-1].context)
 
     def test_recovered_summary_attempt_stops_when_new_window_cannot_fit_provider_request(self):
         class Crash(BaseException):

@@ -627,6 +627,11 @@ run получает отдельные MCP session и negotiated version; пе�
 
 ### Context и compaction
 
+- HTTP summary использует собственную строгую JSON Schema для OpenAI-compatible
+  и Anthropic, заменяя inherited response format только в copied adapter.
+  Размер формата учитывается в request budget до dispatch; local provenance,
+  source membership и output checks остаются обязательными. Provider rejection
+  не разрешает fallback к свободному JSON; схемы инструментов не меняются.
 - Base включает system/kernel/profile, tool schemas и output reserve; pinned
   сравнивается с оставшейся working capacity даже без summarizable history.
 - Неудачное interval compaction ниже pressure сохраняет исходный context;

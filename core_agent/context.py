@@ -222,6 +222,27 @@ class Compactor:
 
 
 SUMMARY_SECTIONS = ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")
+SUMMARY_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        section: {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "basis": {"type": "string", "enum": ["fact", "inference", "assumption"]},
+                    "sources": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["text", "basis", "sources"],
+                "additionalProperties": False,
+            },
+        }
+        for section in SUMMARY_SECTIONS
+    },
+    "required": list(SUMMARY_SECTIONS),
+    "additionalProperties": False,
+}
 SUMMARY_INSTRUCTION = (
     "SEMANTIC CONTEXT SUMMARY. Return only complete JSON with exactly Goal, Constraints, "
     "Decisions, Completed, Artifacts, Pending, Failures: lists of {text, basis, sources}; "

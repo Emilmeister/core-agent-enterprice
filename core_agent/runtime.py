@@ -28,6 +28,7 @@ from .context import (
     ContextBudget,
     ContextItem,
     ContextState,
+    SUMMARY_RESPONSE_SCHEMA,
     StructuredSummarizer,
 )
 from .chat_files import _destination
@@ -2678,6 +2679,7 @@ class CoreAgent:
                 if snapshot["turns"] >= max_turns - 1:
                     raise self._budget_error("model_turns", max_turns, max_turns)
                 model = self._model_for_snapshot(snapshot)
+                format_tokens = 0
                 if isinstance(model, CompatibleHttpModel):
                     model = copy.copy(model)
                     model.stream = False
@@ -2685,13 +2687,27 @@ class CoreAgent:
                     limit_key = ("max_completion_tokens" if model.api_format == "openai"
                                  and "max_completion_tokens" in model.extra_body else "max_tokens")
                     # The HTTP body is authoritative: extra provider options must
-                    # not restore streaming or override this summary's output cap.
-                    model.extra_body = {key: value for key, value in model.extra_body.items()
-                        if key not in {"stream", "stream_options", "max_tokens", "max_completion_tokens"}}
+                    # not restore streaming, output cap or an unrelated format.
+                    model.extra_body = {key: copy.deepcopy(value) for key, value in model.extra_body.items()
+                        if key not in {"stream", "stream_options", "max_tokens", "max_completion_tokens", "response_format"}}
                     model.extra_body.update({"stream": False, limit_key: model.max_tokens})
+                    schema = copy.deepcopy(SUMMARY_RESPONSE_SCHEMA)
+                    if model.api_format == "openai":
+                        model.extra_body.pop("output_config", None)
+                        format_options = {"response_format": {"type": "json_schema", "json_schema": {
+                            "name": "context_summary", "strict": True, "schema": schema}}}
+                        model.extra_body.update(format_options)
+                    else:
+                        output_config = model.extra_body.get("output_config", {})
+                        if not isinstance(output_config, dict):
+                            raise CoreError("CONFIG_INVALID", "output_config must be an object")
+                        format_options = {"output_config": {"format": {"type": "json_schema", "schema": schema}}}
+                        model.extra_body["output_config"] = {**output_config, **format_options["output_config"]}
+                    format_tokens = self.token_counter(json.dumps(format_options, ensure_ascii=False, separators=(",", ":")))
                 def bounded_generate(**call):
                     nonlocal record, snapshot, operation
-                    available = self._context_window(snapshot) - self.token_counter(call["context"]) - self.token_counter(call["instructions"])
+                    available = (self._context_window(snapshot) - self.token_counter(call["context"])
+                                 - self.token_counter(call["instructions"]) - format_tokens)
                     if target > available:
                         raise CompactionError("request_too_large")
                     output_limit = min(self.summary_max_tokens, available)

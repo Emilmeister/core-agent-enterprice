@@ -124,6 +124,24 @@ Summary MUST различать подтверждённые факты, выв�
 идентификаторы. Повторное summary сохраняет ссылки на originals, а не только
 на заменяемое summary. Metadata provider replay не является источником summary.
 
+HTTP-генерация summary MUST задавать отдельную строгую JSON Schema: все семь
+секций обязательны, дополнительные поля запрещены, элементы секций содержат
+ровно обязательные `text: string`, `basis: fact|inference|assumption` и
+`sources: string[]`. Для OpenAI-compatible API используется
+`response_format.json_schema` с `strict: true`, для Anthropic —
+`output_config.format` с `type: json_schema`. Эта статическая схема заменяет
+унаследованный формат ответа основной модели только в копии adapter для summary.
+Настройки основной модели, остальные provider options и схемы tools не меняются.
+
+Локальные проверки непустого текста, списка sources и принадлежности IDs
+исходному набору, provenance, finish reason и размера результата сохраняются.
+Strict output не доказывает истинность summary. Сериализованный формат учитывается
+в оценке входного бюджета до model dispatch; при нехватке места возвращается
+`request_too_large` без списания model turn. Отказ провайдера принять strict schema
+не запускает скрытый fallback к свободному JSON: обе допустимые попытки используют
+ту же схему и существующую диагностику отказа. Формат persisted summary version 1
+и recovery counters сохраняются.
+
 Новый reader сохраняет чтение прежних ContextItem/snapshot без provenance:
 источники восстанавливаются из сохранённого immutable transcript данного run,
 а прежний обрезанный summary не получает выдуманные точные citations и не

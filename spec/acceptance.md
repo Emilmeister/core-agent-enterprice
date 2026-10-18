@@ -941,3 +941,14 @@ implemented. Automated proofs MUST входить в обычные applicable g
   late response не меняют связь; unknown Send/timeout не повторяется и не
   оставляет очередь бесконечно активной. Реальный HTTP peer получает context
   во втором Send; публичные проекции не раскрывают секреты.
+
+## Строгий формат суммаризации
+
+- CTX-AC-STRICT: фактический HTTP payload summary содержит собственную строгую
+  схему в OpenAI-compatible и Anthropic форматах; унаследованная сторонняя схема
+  заменена, основные model settings и tool schemas неизменны. Проверка охватывает
+  обе формы OpenAI token cap, сохранение Anthropic effort, budget с учётом схемы
+  и отказ до dispatch при недостатке окна. Ответ неправильной структуры или с
+  неизвестными sources по-прежнему отклоняется локально. Provider rejection не
+  ослабляет формат в повторной попытке; исчерпание попыток сохраняет штатную
+  terminal recovery семантику.
