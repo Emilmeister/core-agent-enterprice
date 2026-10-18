@@ -44,6 +44,28 @@ export const demoPeer: PeerConversation = {
   last_message: "Расчёт завершён. Отчёт приложен.", error_code: null, outcome_unknown: false,
   request_delivery: "confirmed", material_status: "available",
 };
+const peerRequest = `## Запрос отчёта
+Подготовь **краткий отчёт** по заказам из [источника](https://example.com/orders).
+
+1. Сравни количество заказов и сумму.
+2. Укажи расхождения и приложи расчёт.
+
+| Период | Заказов | Сумма |
+| --- | ---: | ---: |
+| Октябрь | 12 | 57 500 ₽ |
+
+\`\`\`python
+order_reference = "${"order-reference-".repeat(12)}"
+print(sum([12000, 18000, 27500]))
+\`\`\`
+
+Идентификатор: ${"reference".repeat(24)}
+
+<script>globalThis.peerUnsafeContent = true</script>
+<img src="https://ui-content.invalid/peer.png" onerror="globalThis.peerUnsafeContent = true">
+
+![Внешнее изображение не загружается](https://ui-content.invalid/peer-markdown.png)
+`;
 export const demoHistory: HistoryItem[] = [
   { id: "answer", task_id: "demo-task", kind: "result", text: markdown, status: "available", outcome: { state: "COMPLETED" }, response_files: [demoFile] },
   { id: "read-result", task_id: "demo-task", kind: "tool_result", text: JSON.stringify({ tool_call_id: "read", tool_name: "core_terminal_exec", status: "succeeded", output: { stdout: "report.md\nnotes.txt\n", exit_code: 0 } }), status: "available" },
@@ -148,7 +170,7 @@ export function createDemoRequest(mode: DemoMode = "normal", taskState = "TASK_S
     if (route.includes("/peer-conversations")) {
       if (route.endsWith("/observation")) return json({});
       if (route.endsWith("/peer-conversations")) return list("conversations", mode === "empty" ? [] : [demoPeer]);
-      return json({ ...demoPeer, messages: [{ id: "request", direction: "outgoing", text: "Подготовь краткий отчёт по заказам.", created_at: demoPeer.created_at }, { id: "reply", direction: "incoming", text: markdown, created_at: demoPeer.updated_at }], files: [], artifacts: [], outgoing_files: [], outgoing_files_status: "none", history_truncated: false, observation_expires_at: null });
+      return json({ ...demoPeer, messages: [{ id: "request", direction: "outgoing", text: peerRequest, created_at: demoPeer.created_at }, { id: "reply", direction: "incoming", text: markdown, created_at: demoPeer.updated_at }], files: [], artifacts: [], outgoing_files: [], outgoing_files_status: "none", history_truncated: false, observation_expires_at: null });
     }
     if (route.endsWith("/files/delete")) {
       if (method === "GET") return json({ error: { code: "FILE_CLEANUP_NOT_FOUND" } }, 404);

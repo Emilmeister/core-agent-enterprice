@@ -313,14 +313,13 @@ export function PeerConversationPanel({ api, contextId, selected, conversations,
       {loading && <p className="muted" role="status">Загружаем переписку…</p>}
       {entries.map(({ key, detail, message }) => message ? <article className={`peer-message peer-${message.direction}`}
         key={key} data-peer-message={key} data-peer-operation={detail.operation_id}>
-        <div className="peer-message-heading"><strong>{message.direction === "outgoing"
-          ? (message.request_delivery ?? detail.request_delivery) === "confirmed"
-            ? message.id === detail.messages[0]?.id ? "Поручение" : "Ответ передан"
-            : (message.request_delivery ?? detail.request_delivery) === "unconfirmed" ? "Отправка не подтверждена" : "Готовим поручение"
-          : detail.peer_name}</strong>
+        <div className="peer-message-heading"><strong>{message.direction === "outgoing" ? "Наш агент" : detail.peer_name}</strong>
           <time dateTime={new Date(message.created_at * 1000).toISOString()}>{new Date(message.created_at * 1000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</time>
         </div>
         <Markdown text={message.text} />
+        {message.direction === "outgoing" && (message.request_delivery ?? detail.request_delivery) !== "confirmed"
+          && <p className="peer-delivery-note" role="status">{(message.request_delivery ?? detail.request_delivery) === "unconfirmed"
+            ? "Отправка не подтверждена" : "Готовим поручение"}</p>}
         {message.direction === "outgoing" && !!(message.outgoing_files ?? detail.outgoing_files).length && <ul className="message-attachments">
           {(message.outgoing_files ?? detail.outgoing_files).map((file) => <FileCard key={file.file_id} api={api} contextId={contextId} file={file}
             available={(message.outgoing_files_status ?? detail.outgoing_files_status) === "available"}

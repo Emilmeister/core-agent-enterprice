@@ -1,5 +1,6 @@
 import { useMemo, useState, type CSSProperties } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { userEvent, waitFor } from "storybook/test";
 import { Chat } from "../../ui/src/Chat";
 import { Settings, ToolPolicies } from "../../ui/src/Settings";
 import { Agents } from "../../ui/src/Agents";
@@ -97,4 +98,30 @@ export const ConfigurationConflict: Story = {
 };
 export const Cron: Story = { name: "Расписания", args: { screen: "Расписания" } };
 export const Workspace: Story = { name: "Файлы workspace", args: { screen: "Файлы workspace" } };
-export const Peers: Story = { name: "Переписка агентов", args: { screen: "Переписка агентов" } };
+export const Peers: Story = { name: "Переписка агентов", args: { screen: "Переписка агентов" },
+  play: async ({ canvasElement }) => {
+    await userEvent.click(canvasElement.querySelector(".peer-conversation-card button")!);
+    await waitFor(() => {
+      if (canvasElement.querySelectorAll(".peer-message").length !== 2)
+        throw new globalThis.Error("Both sides of the peer conversation must be loaded");
+    });
+    const messages = canvasElement.querySelector<HTMLElement>(".peer-messages")!;
+    const outgoing = messages.querySelector<HTMLElement>(".peer-outgoing")!;
+    const incoming = messages.querySelector<HTMLElement>(".peer-incoming")!;
+    for (const message of [outgoing, incoming]) {
+      for (const selector of ["h2", "strong", "li", "table", ".code-block code"])
+        if (!message.querySelector(`.markdown ${selector}`)) throw new globalThis.Error(`Markdown ${selector} is missing from a conversation direction`);
+      const style = getComputedStyle(message);
+      if (parseFloat(style.borderTopWidth) < 1 || style.borderTopStyle === "none"
+        || style.borderTopColor === "rgba(0, 0, 0, 0)" || parseFloat(style.borderTopLeftRadius) < 12)
+        throw new globalThis.Error("Both conversation directions need a visible rounded bubble");
+    }
+    if (outgoing.querySelector(".peer-message-heading strong")?.textContent !== "Наш агент"
+      || outgoing.getBoundingClientRect().left <= incoming.getBoundingClientRect().left
+      || messages.scrollWidth > messages.clientWidth + 1)
+      throw new globalThis.Error("Outgoing messages must align right and incoming left without panel overflow");
+    if (outgoing.querySelector(".markdown a")?.getAttribute("href") !== "https://example.com/orders"
+      || messages.querySelector('script, iframe, img[src^="https:"], [onerror]'))
+      throw new globalThis.Error("Conversation Markdown must preserve safe links without active HTML or remote images");
+  },
+};

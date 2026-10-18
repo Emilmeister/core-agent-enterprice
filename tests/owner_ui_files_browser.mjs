@@ -826,6 +826,8 @@ try {
   const observationBefore=apiResponses.length;
   await page.click('Переписка','.peer-conversation-card button');
   await page.wait("document.querySelector('.peer-messages')?.textContent.includes('Подготовь краткий отчёт по поручению.')&&document.querySelector('.peer-messages')?.textContent.includes('Поручение принято.')",'public outgoing request and initial peer reply');
+  const peerBubbleLayout="(()=>{const messages=document.querySelector('.peer-messages'),outgoing=messages.querySelector('.peer-outgoing'),incoming=messages.querySelector('.peer-incoming');return outgoing.querySelector('.peer-message-heading strong').textContent==='Наш агент'&&outgoing.getBoundingClientRect().left>incoming.getBoundingClientRect().left&&messages.scrollWidth<=messages.clientWidth+1&&[outgoing,incoming].every(message=>{const style=getComputedStyle(message);return parseFloat(style.borderTopWidth)>=1&&style.borderTopStyle!=='none'&&style.borderTopColor!=='rgba(0, 0, 0, 0)'&&parseFloat(style.borderTopLeftRadius)>=12;});})()";
+  check(await page.evaluate(peerBubbleLayout),'peer messages have rounded borders and align by sender');
   await waitFor(()=>apiResponses.slice(observationBefore).some(response=>response.path.endsWith('/observation')&&response.method==='POST'&&response.status===200),'real visible observation heartbeat');
   await page.wait("!!document.querySelector('.peer-outgoing .file-card')",'selected outgoing file appears with the actual request');
   await unlink(config.downloads+'/report.txt').catch(error=>{if(error.code!=='ENOENT')throw error;});
@@ -841,6 +843,7 @@ try {
   for(const key of ['Home','ArrowLeft','End']) {
     await page.call('Input.dispatchKeyEvent',{type:'keyDown',key,code:key});
     check(await page.evaluate(`(()=>{const p=document.querySelector('.peer-conversation-panel'),h=p.querySelector('[role=separator]');return Math.abs(p.getBoundingClientRect().width-Number(h.getAttribute('aria-valuenow')))<1&&Number(h.getAttribute('aria-valuenow'))${key==='Home'?'===Number(h.getAttribute("aria-valuemin"))':key==='End'?'===Number(h.getAttribute("aria-valuemax"))':'>Number(h.getAttribute("aria-valuemin"))'}&&document.querySelector('.thread').getBoundingClientRect().width>=359;})()`),'peer separator '+key+' applies accessible width limits');
+    check(await page.evaluate(peerBubbleLayout),'peer bubbles retain direction and bounded width after '+key);
   }
   const peerWidth=await page.evaluate("document.querySelector('.peer-conversation-panel').getBoundingClientRect().width");
   await page.wait("document.querySelector('.peer-messages')?.textContent.includes('Проверяю данные для поручения.')",'public peer progress arrives before task completion');
@@ -864,6 +867,7 @@ try {
   await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   await page.evaluate("document.querySelector('.peer-panel-toggle').click()");
   check(await page.evaluate("document.documentElement.scrollWidth<=innerWidth&&getComputedStyle(document.querySelector('.thread')).visibility==='hidden'&&document.querySelector('.peer-conversation-panel').getBoundingClientRect().width<=innerWidth"),'mobile peer panel avoids hidden chat controls and horizontal overflow');
+  check(await page.evaluate(peerBubbleLayout),'mobile peer bubbles preserve direction and scroll within the panel');
   check(await page.evaluate("getComputedStyle(document.querySelector('.peer-conversation-panel [role=separator]')).display==='none'"),'mobile peer overlay hides the resize separator');
   await page.click('×','.peer-panel-heading button');
   await page.call('Emulation.setDeviceMetricsOverride',{width:1440,height:960,deviceScaleFactor:1,mobile:false});
