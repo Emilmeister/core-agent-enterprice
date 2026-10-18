@@ -225,7 +225,9 @@ function Entry({ api, contextId, item, onRetry }: { api: Api; contextId?: string
         <p className="muted history-status">
           {outcomes[item.outcome.state] ?? "Задача завершена"}
           {item.outcome.complete === false && " · Неполный результат"}
-          {item.outcome.error_code && ` · ${item.outcome.error_code}`}
+          {item.outcome.error_code && (item.outcome.error_code === "CONTEXT_UNRECOVERABLE"
+            ? " · Не удалось сократить историю до допустимого размера. Задача остановлена; история и результаты выполненных действий сохранены."
+            : ` · ${item.outcome.error_code}`)}
         </p>
       )}
     </article>

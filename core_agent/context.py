@@ -6,6 +6,20 @@ import json
 from .errors import CoreError
 
 
+class CompactionError(CoreError):
+    """Finite private reason; public error data never includes model content."""
+    REASONS = frozenset({"invalid_budget", "pinned_context_too_large", "invalid_summary",
+        "invalid_sections", "invalid_entries", "invalid_entry", "invalid_sources",
+        "invalid_json", "duplicate_json_key", "output_truncated", "invalid_response",
+        "summary_too_large", "compacted_context_too_large", "compacted_context_too_small",
+        "unsupported_summary_version", "request_too_large", "provider_unavailable",
+        "attempts_exhausted", "unclassified"})
+
+    def __init__(self, reason):
+        super().__init__("CONTEXT_UNRECOVERABLE")
+        self.reason = reason if isinstance(reason, str) and reason in self.REASONS else "unclassified"
+
+
 @dataclass(frozen=True)
 class ContextBudget:
     total_tokens: int
@@ -21,7 +35,7 @@ class ContextBudget:
             or self.compact_at != 0.90
             or not 0.10 <= self.compact_to <= 0.15
         ):
-            raise CoreError("CONTEXT_UNRECOVERABLE")
+            raise CompactionError("invalid_budget")
 
     @property
     def base_tokens(self):
@@ -145,7 +159,7 @@ class Compactor:
         pinned_tokens = sum(item.tokens for item in pinned)
         if pinned_tokens > self.budget.working_capacity:
             # Fixed instructions, schemas and output reserve already occupy base.
-            raise CoreError("CONTEXT_UNRECOVERABLE")
+            raise CompactionError("pinned_context_too_large")
         overlap_segments = unpinned_segments[-self.overlap:] if self.overlap else ()
         overlap = tuple(item for segment in overlap_segments for item in segment)
         candidates = unpinned[: len(unpinned) - len(overlap)]
@@ -178,9 +192,9 @@ class Compactor:
             "Failures:",
         )
         if not isinstance(summary, ContextItem) or summary.kind != "summary":
-            raise CoreError("CONTEXT_UNRECOVERABLE")
+            raise CompactionError("invalid_summary")
         if not (summary.provenance and summary.provenance.get("summary_version") == 1) and not all(section in summary.content for section in sections):
-            raise CoreError("CONTEXT_UNRECOVERABLE")
+            raise CompactionError("invalid_sections")
         active = pinned + (summary,) + overlap
         after = sum(item.tokens for item in active)
         # Retain real, whole recent segments instead of padding a short summary.
@@ -195,10 +209,10 @@ class Compactor:
             extra.insert(0, segment)
             after += size
         active = pinned + (summary,) + tuple(item for segment in extra for item in segment) + overlap
-        if after > limit or (
-            not forced and after < int(self.budget.working_capacity * 0.10)
-        ):
-            raise CoreError("CONTEXT_UNRECOVERABLE")
+        if after > limit:
+            raise CompactionError("compacted_context_too_large")
+        if not forced and after < int(self.budget.working_capacity * 0.10):
+            raise CompactionError("compacted_context_too_small")
         return ContextState(
             active,
             state.transcript,
@@ -229,7 +243,7 @@ def _unique_object(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("duplicate JSON key")
+            raise CompactionError("duplicate_json_key")
         result[key] = value
     return result
 
@@ -244,12 +258,12 @@ class StructuredSummarizer:
 
     def __call__(self, items, max_tokens):
         if max_tokens <= 0:
-            raise CoreError("CONTEXT_UNRECOVERABLE")
+            raise CompactionError("invalid_budget")
         sources = {}
         def record(item):
             provenance = item.provenance or {}
             if item.kind == "summary" and provenance.get("summary_version") != 1:
-                raise CoreError("CONTEXT_UNRECOVERABLE")
+                raise CompactionError("unsupported_summary_version")
             sources.update(provenance.get("sources", {}))
             # Provider replay never crosses this boundary, including legacy envelopes.
             content = item.content
@@ -265,29 +279,33 @@ class StructuredSummarizer:
         response = self.generate(context=context, tools={},
             instructions=SUMMARY_INSTRUCTION + f" Maximum rendered output budget: {max_tokens} tokens.",
             messages=[{"role": "user", "content": context}])
+        if response.finish_reason in {"length", "max_tokens"}:
+            raise CompactionError("output_truncated")
         if (response.tool_requests or response.continue_reasoning
                 or response.finish_reason not in {"stop", "end_turn"}
                 or not isinstance(response.message, str)):
-            raise CoreError("CONTEXT_UNRECOVERABLE")
+            raise CompactionError("invalid_response")
         try:
             value = json.loads(response.message, object_pairs_hook=_unique_object)
             if not isinstance(value, dict) or set(value) != set(SUMMARY_SECTIONS):
-                raise ValueError("sections")
+                raise CompactionError("invalid_sections")
             for entries in value.values():
                 if not isinstance(entries, list):
-                    raise ValueError("entries")
+                    raise CompactionError("invalid_entries")
                 for entry in entries:
                     if (not isinstance(entry, dict) or set(entry) != {"text", "basis", "sources"}
                             or not isinstance(entry["text"], str) or not entry["text"].strip()
-                            or entry["basis"] not in {"fact", "inference", "assumption"}
-                            or not isinstance(entry["sources"], list) or not entry["sources"]
+                            or not isinstance(entry["basis"], str)
+                            or entry["basis"] not in {"fact", "inference", "assumption"}):
+                        raise CompactionError("invalid_entry")
+                    if (not isinstance(entry["sources"], list) or not entry["sources"]
                             or any(not isinstance(source, str) or source not in sources for source in entry["sources"])):
-                        raise ValueError("entry")
+                        raise CompactionError("invalid_sources")
             content = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         except (ValueError, TypeError, RecursionError):
-            raise CoreError("CONTEXT_UNRECOVERABLE") from None
+            raise CompactionError("invalid_json") from None
         tokens = self.token_counter(content)
         if tokens > max_tokens:
-            raise CoreError("CONTEXT_UNRECOVERABLE")
+            raise CompactionError("summary_too_large")
         return ContextItem("summary", content, tokens, provenance={
             "version": 1, "summary_version": 1, "sources": sources})

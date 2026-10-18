@@ -186,6 +186,7 @@ legacy routes только в явно выбранном development/test profi
 | `LLM_API_KEY` | пусто | Provider credential; не попадает в модель, audit и telemetry |
 | `LLM_PROVIDER` | автоопределение | Метка провайдера для OpenInference |
 | `LLM_MAX_TOKENS` | `4096` | Верхняя граница ответа |
+| `LLM_SUMMARY_MAX_TOKENS` | `32768` | Максимум выходных токенов semantic summary; отдельный от обычного ответа, ограничивается свободным местом входного запроса |
 | `LLM_CONTEXT_WINDOW` | `128000` | Окно модели для расчёта контекстного бюджета |
 | `LLM_TOKEN_CHARS` | `3` | Символов на токен в оценке занятости контекста |
 | `LLM_TIMEOUT` | `120` | Таймаут запроса в секундах |
@@ -460,11 +461,22 @@ Serving entrypoint MUST:
 provider URL и raw provider errors не выдаются. Model ID ограничен 256 ASCII
 characters `[A-Za-z0-9_.:/-]`. Изменение selection допускает только ID из текущего
 успешного списка; недоступность discovery возвращает `MODEL_DISCOVERY_UNAVAILABLE`
-и сохраняет прежнее значение. Provider route, credentials, context window,
+и сохраняет прежнее значение. Provider route, credentials,
 sampling и guardrails adapter остаются trusted deployment configuration.
 Основные model turns, semantic compaction и настроенный memory NER используют
 model ID admitted run; embedding provider и отдельный guardrails adapter
 сохраняют свои deployment connections. Token estimate остаётся локальным.
+
+Поле `context_window` в owner settings задаёт ручной размер полного окна в
+токенах: целое число от 1024 до 100 000 000, строго больше output reserve.
+`null` наследует `LLM_CONTEXT_WINDOW`; старые settings revisions без поля
+читаются как `null`. UI показывает effective значение и источник (вручную или
+из конфигурации развёртывания). Каталог IDs сам по себе не доказывает размер
+окна: runtime MUST NOT угадывать его по названию модели. Смена модели в UI
+сбрасывает несохранённый override; владелец может указать новый размер.
+Override сохраняется в admitted snapshot и наследуется дочерними задачами;
+последующие настройки не меняют бюджет уже принятых задач. Изменить окно можно
+и при недоступном каталоге моделей, если model ID не меняется.
 
 MCP section содержит максимум 32 уникальных connections: стабильное имя
 `[A-Za-z0-9_-]{1,64}`, HTTPS URL до 4096 bytes (loopback HTTP разрешён), enabled

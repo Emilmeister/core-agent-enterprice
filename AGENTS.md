@@ -168,7 +168,10 @@ criterion должны войти в тот же завершённый change. 
   публикуются агентом только на loopback. Сам агент остаётся независимым для
   native CI `run --no-deps`. Без профиля Keycloak подключается отдельно через
   `KEYCLOAK_*`. Agent environment явно передаёт поддержанные model/guardrails,
-  runtime/compaction, memory и telemetry настройки из `.env.example`.
+  runtime/compaction, memory и telemetry настройки из `.env.example`. Выход summary
+  отдельно ограничен `LLM_SUMMARY_MAX_TOKENS` (32768), обычные ответы —
+  `LLM_MAX_TOKENS`. Owner override `context_window` сохраняется в snapshot новых
+  задач и наследуется children; `null` использует `LLM_CONTEXT_WINDOW`.
   Образ включает Git; отсутствие исполняемой команды внутри sandbox даёт
   `COMMAND_NOT_FOUND`, невозможность запуска существующего файла —
   `COMMAND_EXEC_FAILED`, отдельно от отказа sandbox.

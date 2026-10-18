@@ -70,6 +70,10 @@ def agent_settings_routes(agent, store):
             else:
                 payload = await read_payload(request, {"expected_revision"}, optional_fields=CONFIG_FIELDS)
                 values = {key: value for key, value in payload.items() if key != "expected_revision"}
+                if values.get("context_window") is not None:
+                    window = values["context_window"]
+                    if type(window) is not int or window <= agent.output_reserve:
+                        raise CoreError("SETTINGS_INVALID")
                 if "model_id" in values and values["model_id"] is not None:
                     if not valid_model_id(values["model_id"]):
                         raise CoreError("SETTINGS_INVALID")

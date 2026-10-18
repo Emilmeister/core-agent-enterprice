@@ -38,3 +38,17 @@ test("renaming and archiving survive the App refresh", async () => {
   await request("/api/chats/demo", { method: "DELETE" });
   assert.deepEqual((await (await request("/api/chats")).json()).chats, []);
 });
+
+test("context window can be set and reset in the settings demo", async () => {
+  const request = createDemoRequest();
+  const saved = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ context_window: 65536 }),
+  })).json();
+  assert.equal(saved.context_window, 65536);
+  assert.equal(saved.inherits.context_window, false);
+  const reset = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ context_window: null }),
+  })).json();
+  assert.equal(reset.context_window, 128000);
+  assert.equal(reset.inherits.context_window, true);
+});

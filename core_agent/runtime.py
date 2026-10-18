@@ -24,6 +24,7 @@ from .config import (
 )
 from .context import (
     Compactor,
+    CompactionError,
     ContextBudget,
     ContextItem,
     ContextState,
@@ -322,6 +323,7 @@ class CoreAgent:
         kernel_compiler=None,
         context_window=128_000,
         output_reserve=4_096,
+        summary_max_tokens=32_768,
         artifact_store=None,
         retention_manager=None,
         logger=None,
@@ -379,6 +381,9 @@ class CoreAgent:
         )
         self.context_window = int(context_window)
         self.output_reserve = int(output_reserve)
+        if type(summary_max_tokens) is not int or summary_max_tokens < 1:
+            raise CoreError("CONFIG_INVALID", "LLM_SUMMARY_MAX_TOKENS must be a positive integer")
+        self.summary_max_tokens = summary_max_tokens
         self.artifact_store = artifact_store
         self.retention_manager = retention_manager
         self.logger = logger or logging.getLogger("core_agent.runtime")
@@ -1765,6 +1770,7 @@ class CoreAgent:
             # Cleanup retired this lease's execution capability. A fresh attempt
             # delivers the accepted input/cancel without reviving old callbacks.
             raise CoreError("EXECUTION_REOPENED") from error
+        self._drop_run_runtime(updated.run_id)
         release = getattr(manager, "release_run_workspaces", None)
         if release is not None:
             release(tuple(item.run_id for item in family))
@@ -2077,6 +2083,10 @@ class CoreAgent:
             cron_origin = validate_origin(cron_origin, prompt=request.prompt)
         raw = self.agent_config.to_dict()
         platform, declarations, settings_revision = self.platform_config, self.platform_mcp, None
+        admitted_window = None
+        if parent_run_id is not None:
+            parent = self.workflow_store.get(parent_run_id, tenant_id=tenant_id or "default", connection=connection)
+            admitted_window = parent.snapshot.get("context_window")
         if self.agent_settings_store is not None:
             selected_tenant = tenant_id or "default"
             if parent_run_id is not None:
@@ -2087,6 +2097,8 @@ class CoreAgent:
             if parent_run_id is None or settings_revision is not None:
                 settings = self.agent_settings_store.get(selected_tenant, settings_revision, connection=connection)
                 settings_revision = settings["revision"]
+                if parent_run_id is None:
+                    admitted_window = settings["config"].get("context_window")
                 raw, platform, declarations = self.agent_settings_store.configure(settings, raw, platform, declarations,
                     profile=parent_run_id is None)
         budgets = raw.get("budgets", {})
@@ -2144,6 +2156,8 @@ class CoreAgent:
             "finalization_turn_reserved": True,
             "budget_exhausted": None,
         }
+        if admitted_window is not None:
+            snapshot["context_window"] = admitted_window
         if file_batch_id is not None:
             snapshot["file_batch_id"] = file_batch_id
         if settings_revision is not None:
@@ -2573,6 +2587,12 @@ class CoreAgent:
         except KeyError:
             raise CoreError("CHECKPOINT_INVALID") from None
 
+    def _context_window(self, snapshot):
+        window = snapshot.get("context_window", self.context_window)
+        if type(window) is not int or window <= 0:
+            raise CoreError("CHECKPOINT_INVALID")
+        return window
+
     def _context_compactor(self, raw, effective, discovered, snapshot, *, tenant_id=None):
         if self.compactor:
             return self.compactor
@@ -2587,7 +2607,7 @@ class CoreAgent:
         )
         context = raw["context"]
         budget = ContextBudget(
-            self.context_window,
+            self._context_window(snapshot),
             self.token_counter(instructions),
             self.token_counter(catalog),
             self.output_reserve,
@@ -2648,7 +2668,7 @@ class CoreAgent:
                 if isinstance(model, CompatibleHttpModel):
                     model = copy.copy(model)
                     model.stream = False
-                    model.max_tokens = min(model.max_tokens, target)
+                    model.max_tokens = self.summary_max_tokens
                     limit_key = ("max_completion_tokens" if model.api_format == "openai"
                                  and "max_completion_tokens" in model.extra_body else "max_tokens")
                     # The HTTP body is authoritative: extra provider options must
@@ -2658,8 +2678,13 @@ class CoreAgent:
                     model.extra_body.update({"stream": False, limit_key: model.max_tokens})
                 def bounded_generate(**call):
                     nonlocal record, snapshot, operation
-                    if self.token_counter(call["context"]) + self.token_counter(call["instructions"]) + target > self.context_window:
-                        raise CoreError("CONTEXT_UNRECOVERABLE")
+                    available = self._context_window(snapshot) - self.token_counter(call["context"]) - self.token_counter(call["instructions"])
+                    if target > available:
+                        raise CompactionError("request_too_large")
+                    output_limit = min(self.summary_max_tokens, available)
+                    if isinstance(model, CompatibleHttpModel):
+                        model.max_tokens = output_limit
+                        model.extra_body[limit_key] = output_limit
                     with self.workflow_store._execution_lock(record, lease_token) as (current, connection):
                         checked, visibility = self._visible_context(current, snapshot, lease_token=lease_token, connection=connection)
                         if self._context_fingerprint(checked, visibility) != fingerprint:
@@ -2667,7 +2692,7 @@ class CoreAgent:
                         attempt = copy.deepcopy(snapshot)
                         attempt["turns"] += 1
                         operation = {**operation, "attempts": operation["attempts"] + 1,
-                            "target": target, "outcome": "in_flight", "purpose": "compaction",
+                            "target": target, "output_limit": output_limit, "required": pressure, "outcome": "in_flight", "purpose": "compaction",
                             "sources": [list((item.provenance or {}).get("sources", {})) for item in items]}
                         attempt["compaction_operation"] = operation
                         record = self._record_transition(current, state="RUNNING", snapshot=attempt,
@@ -2683,7 +2708,8 @@ class CoreAgent:
                     summary = summarizer(items, target)
                 except CoreError as error:
                     if error.code in {"MODEL_UNAVAILABLE", "MODEL_RESPONSE_INVALID", "MODEL_INVALID_RESPONSE"}:
-                        raise CoreError("CONTEXT_UNRECOVERABLE") from error
+                        raise CompactionError("provider_unavailable" if error.code == "MODEL_UNAVAILABLE"
+                                              else "invalid_response") from error
                     raise
                 self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
                 return summary
@@ -2732,13 +2758,17 @@ class CoreAgent:
                 # A selection/fit failure before provider admission made no
                 # progress. In particular, recovery must not spin on a paid
                 # unknown attempt whose count cannot advance in this window.
+                reason = error.reason if isinstance(error, CompactionError) else "unclassified"
+                snapshot["compaction_operation"] = {**operation, "outcome": "failed",
+                    "finished_turn": snapshot["turns"], "failure_reason": reason}
+                record = self._record_transition(record, state="RUNNING", snapshot=snapshot,
+                    event_kind="context.compaction.failed", event_data={"attempt": operation["attempts"],
+                        "reason": reason, "working_tokens": context.working_tokens,
+                        "working_capacity": compactor.budget.working_capacity}, lease_token=lease_token)
                 if self.compactor is not None or operation["attempts"] == attempts_before:
                     break
-                snapshot["compaction_operation"] = {**operation, "outcome": "failed", "finished_turn": snapshot["turns"]}
-                record = self._record_transition(record, state="RUNNING", snapshot=snapshot,
-                    event_kind="context.compaction.failed", event_data={"attempt": operation["attempts"]}, lease_token=lease_token)
         if pressure:
-            raise last_error or CoreError("CONTEXT_UNRECOVERABLE")
+            raise last_error or CompactionError(operation.get("failure_reason", "attempts_exhausted"))
         return record, snapshot, context
 
     @staticmethod
@@ -4235,10 +4265,12 @@ class CoreAgent:
         if not isinstance(self.model, CompatibleHttpModel):
             return self.model
         route = snapshot.get("admission", {}).get("agent_config", {}).get("model", {}).get("route")
-        if route is None or route == getattr(self.model, "model", None):
+        if (route is None or route == getattr(self.model, "model", None)) and "context_window" not in snapshot:
             return self.model
         model = copy.copy(self.model)
-        model.model = route
+        if route is not None:
+            model.model = route
+        model.context_window = self._context_window(snapshot)
         return model
 
     def _generate(self, *, before_retry=None, model=None, **call):
@@ -4566,6 +4598,14 @@ class CoreAgent:
                 self._cancel_at_boundary(
                     record, snapshot, cancel_event, lease_token=lease_token
                 )
+                operation = snapshot.get("compaction_operation")
+                if (isinstance(operation, dict) and operation.get("attempts") == 2
+                        and operation.get("outcome") in {"failed", "in_flight", "unknown"}
+                        and (operation.get("required") is True or compactor.budget.should_compact(
+                            self._context_from_dict(snapshot["context"]).working_tokens))):
+                    # Settle exhausted pressure before inbox delivery can change the
+                    # fingerprint and accidentally authorize two new attempts.
+                    raise CompactionError(operation.get("failure_reason", "attempts_exhausted"))
                 if wait is not None:
                     record = self._apply_tool_wait(record, snapshot, wait, lease_token=lease_token, active_result_token_limit=active_result_token_limit)
                     snapshot = copy.deepcopy(record.snapshot)
@@ -4766,7 +4806,7 @@ class CoreAgent:
                         )
                         if (self.token_counter(model_instructions)
                                 + self.token_counter(json.dumps(model_messages, ensure_ascii=False, separators=(",", ":")))
-                                + self.output_reserve > self.context_window):
+                                + self.output_reserve > self._context_window(snapshot)):
                             call_finalizer_model = False
                     retry_limit = max_turns if finalizing else max_turns - 1
                     stream = self._stream(record)
@@ -5312,6 +5352,14 @@ class CoreAgent:
         except _MaterialSuspended as suspended:
             return suspended.result
         except CoreError as error:
+            if error.code == "CONTEXT_UNRECOVERABLE":
+                current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+                if current.state not in TERMINAL_STATES:
+                    self._record_transition(current, state="FAILED", snapshot=copy.deepcopy(current.snapshot),
+                        event_kind="task.failed", event_data={"error_code": error.code,
+                            "reason": error.reason if isinstance(error, CompactionError) else "unclassified"},
+                        error_code=error.code, lease_token=lease_token)
+                raise
             if error.code != "CANCEL_REQUESTED":
                 raise
             current = self.workflow_store.get(
@@ -6905,6 +6953,7 @@ class CoreAgent:
             response_files_service=self.response_files_service,
             kernel_compiler=self.kernel_compiler,
             context_window=self.context_window,
+            summary_max_tokens=self.summary_max_tokens,
             output_reserve=self.output_reserve,
             artifact_store=self.artifact_store,
             retention_manager=self.retention_manager,

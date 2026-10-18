@@ -290,7 +290,8 @@ export interface AgentSettings {
   profile_prompt: string;
   model_id: string;
   mcp_servers: McpConnection[];
-  inherits: { profile_prompt: boolean; model_id: boolean; mcp_servers: boolean };
+  context_window: number;
+  inherits: { profile_prompt: boolean; model_id: boolean; mcp_servers: boolean; context_window: boolean };
 }
 export interface Peer {
   id: string;

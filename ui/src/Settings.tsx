@@ -133,6 +133,7 @@ function AgentConfiguration({ api }: { api: Api }) {
   const [profile, setProfile] = useState("");
   const [model, setModel] = useState("");
   const [models, setModels] = useState<string[]>([]);
+  const [contextWindow, setContextWindow] = useState("");
   const [servers, setServers] = useState<(McpConnection & { header_value?: string | null; original_name?: string })[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -153,6 +154,7 @@ function AgentConfiguration({ api }: { api: Api }) {
       setCurrent(result);
       setProfile(result.profile_prompt);
       setModel(result.model_id);
+      setContextWindow(result.inherits.context_window ? "" : String(result.context_window));
       setServers(result.mcp_servers.map((server) => ({ ...server, original_name: server.name })));
     }).catch((failure) => {
       if (!controller.signal.aborted) setError(errorText(failure));
@@ -171,7 +173,10 @@ function AgentConfiguration({ api }: { api: Api }) {
       });
       setCurrent(result);
       if (section === "profile") setProfile(result.profile_prompt);
-      if (section === "model") setModel(result.model_id);
+      if (section === "model") {
+        setModel(result.model_id);
+        setContextWindow(result.inherits.context_window ? "" : String(result.context_window));
+      }
       if (section === "mcp") setServers((previous) => mcpName === undefined
         ? result.mcp_servers.map((server) => ({ ...server, original_name: server.name }))
         : previous.flatMap((server) => {
@@ -238,19 +243,28 @@ function AgentConfiguration({ api }: { api: Api }) {
           onClick={() => void save("profile", { profile_prompt: null })}>Использовать профиль развёртывания</button>
       </div>
     </form>
-    <form className="form-sheet agent-model-settings" onSubmit={(event) => { event.preventDefault(); void save("model", { model_id: model }); }}>
+    <form className="form-sheet agent-model-settings" onSubmit={(event) => { event.preventDefault(); void save("model", { ...(model !== current.model_id ? { model_id: model } : {}),
+      context_window: contextWindow === "" ? null : Number(contextWindow) }); }}>
       <h2>Модель</h2>
       <label>Модель провайдера
-        <select value={model} disabled={!!busy} onChange={(event) => setModel(event.target.value)}>
+        <select value={model} disabled={!!busy} onChange={(event) => { setModel(event.target.value); setContextWindow(""); }}>
           {[...new Set([current.model_id, ...models])].sort().map((name) => <option key={name} value={name}>{name}</option>)}
         </select>
       </label>
+      <label>Размер контекстного окна, токенов
+        <input type="number" min={1024} max={100000000} step={1} value={contextWindow}
+          placeholder={String(current.context_window)} disabled={!!busy}
+          onChange={(event) => setContextWindow(event.target.value)} />
+      </label>
+      <p className="muted">Сейчас: {current.context_window.toLocaleString("ru-RU")} токенов
+        {current.inherits.context_window ? " из конфигурации развёртывания." : ", задано вручную."}
+        {" "}Укажите размер из документации модели. Пустое поле возвращает значение развёртывания.</p>
       {modelError && <p className="error" role="alert">{modelError} Текущая модель сохранена.</p>}
       <div className="actions">
-        <button disabled={!!busy || !models.includes(model)}>{busy === "model" ? "Сохраняем…" : "Сохранить модель"}</button>
+        <button disabled={!!busy || (model !== current.model_id && !models.includes(model))}>{busy === "model" ? "Сохраняем…" : "Сохранить модель"}</button>
         <button type="button" className="secondary" disabled={!!busy} onClick={() => void loadModels()}>Обновить список моделей</button>
-        <button type="button" className="secondary" disabled={!!busy || current.inherits.model_id}
-          onClick={() => void save("model", { model_id: null })}>Использовать модель развёртывания</button>
+        <button type="button" className="secondary" disabled={!!busy || (current.inherits.model_id && current.inherits.context_window)}
+          onClick={() => void save("model", { model_id: null, context_window: null })}>Использовать модель развёртывания</button>
       </div>
     </form>
     <section className="form-sheet agent-mcp-settings">

@@ -602,6 +602,32 @@ class OwnerAgentConfigurationAPITests(AuthAppTestCase):
             saved = await self.http.get("/api/agent-settings", headers=self.headers("owner-a"))
             self.assertEqual(saved.json()["model_id"], "selected-before-outage")
 
+    async def test_context_window_override_is_validated_and_pinned_for_roots(self):
+        agent = self.app.state.core_agent
+        endpoint = "/api/agent-settings"
+        for invalid in (True, 0, -1, 1.5, "32768", 100000001):
+            response = await self.http.put(endpoint, headers=self.headers("owner-a"),
+                json={"expected_revision": 0, "context_window": invalid})
+            self.assertEqual(response.status_code, 400)
+        saved = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 0, "context_window": 65536})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["context_window"], 65536)
+        self.assertFalse(saved.json()["inherits"]["context_window"])
+        tenant = self.app.state.authenticator.settings.tenant
+        record, *_ = agent._new_workflow({"prompt": "inspect"}, task_id="window-task",
+            identity="owner", session_id="window-chat", tenant_id=tenant, defer_initialization=True)
+        cleared = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 1, "context_window": None})
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertEqual(cleared.json()["context_window"], agent.context_window)
+        self.assertEqual(agent._context_window(record.snapshot), 65536)
+        child, *_ = agent._new_workflow({"prompt": "child"}, task_id="window-child",
+            identity="owner", session_id="window-child-chat", tenant_id=tenant,
+            parent_run_id=record.run_id, defer_initialization=True)
+        self.assertEqual(agent._context_window(child.snapshot), 65536)
+        self.assertEqual(agent._context_window({}), agent.context_window)
+
     async def test_provider_models_are_fixed_bounded_sanitized_and_failure_preserves_selection(self):
         from core_agent.model import CompatibleHttpModel
         agent = self.app.state.core_agent

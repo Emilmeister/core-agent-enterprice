@@ -121,6 +121,21 @@
 
 ## Context и compaction
 
+- [ ] Owner может задать/сбросить целочисленный размер окна без смены модели;
+  invalid значения отвергаются, старые revisions используют deployment default,
+  существующая задача и её children сохраняют admitted override. UI показывает
+  источник значения; недоступный discovery не блокирует изменение только окна.
+- [ ] Summary имеет отдельный выходной cap 32768 по умолчанию, ограниченный
+  свободным входным окном; обычный model output reserve не меняется, проверка
+  размера и provenance summary не ослабляется; provider extra_body не снимает cap.
+
+
+- [ ] Два отказа обязательного сжатия и recovery checkpoint с attempts=2
+  завершают задачу FAILED/CONTEXT_UNRECOVERABLE через cleanup barrier; повторное
+  recovery не запускает модель/tools. Transcript и результаты сохранены;
+  диагностика содержит конечную причину отказа без приватного содержимого,
+  UI объясняет остановку. Неподтверждённый cleanup сохраняет terminal intent.
+
 - [ ] Owner `/api/chats` показывает общий company список, включая чаты внешних
   callers, с bounded pagination и актуальным active root; external/dual-role
   получает 403, другая company не видит записи, чтение не вызывает модель.

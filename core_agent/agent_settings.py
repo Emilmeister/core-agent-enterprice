@@ -17,7 +17,7 @@ from .remote_registry import _header_value, _text
 from .security import safe_url
 
 
-CONFIG_FIELDS = frozenset({"profile_prompt", "model_id", "mcp_servers"})
+CONFIG_FIELDS = frozenset({"profile_prompt", "model_id", "mcp_servers", "context_window"})
 RESERVED_HEADERS = RESERVED_MCP_HEADERS | frozenset({
     "host", "content-length", "connection", "transfer-encoding", "upgrade", "trailer", "te",
     "proxy-authorization", "traceparent", "tracestate", "baggage",
@@ -35,7 +35,7 @@ def _revision(value):
 
 def _default(tenant):
     return {"tenant_id": tenant, "revision": 0, "storage_version": 1,
-            "config": {"profile_prompt": None, "model_id": None, "mcp_servers": None}, "encrypted_payload": None}
+            "config": {"profile_prompt": None, "model_id": None, "mcp_servers": None, "context_window": None}, "encrypted_payload": None}
 
 
 class AgentSettingsStore:
@@ -107,6 +107,11 @@ class AgentSettingsStore:
             if values["model_id"] is not None and not valid_model_id(values["model_id"]):
                 raise CoreError("SETTINGS_INVALID")
             config["model_id"] = values["model_id"]
+        if "context_window" in values:
+            window = values["context_window"]
+            if window is not None and (type(window) is not int or not 1024 <= window <= 100_000_000):
+                raise CoreError("SETTINGS_INVALID")
+            config["context_window"] = window
         if "mcp_servers" in values:
             supplied = values["mcp_servers"]
             if supplied is not None and (not isinstance(supplied, list) or len(supplied) > 32):
@@ -198,7 +203,8 @@ class AgentSettingsStore:
         return {"revision": row["revision"], "profile_prompt": config["profile_prompt"] if config["profile_prompt"] is not None
                 else agent.agent_config.agent.get("profile_prompt", ""), "model_id": config["model_id"] if config["model_id"] is not None
                 else agent.agent_config.model["route"], "mcp_servers": servers,
-                "inherits": {key: config[key] is None for key in CONFIG_FIELDS}}
+                "context_window": config.get("context_window") or agent.context_window,
+                "inherits": {key: config.get(key) is None for key in CONFIG_FIELDS}}
 
     def catalogs(self, tenant, declarations, workflow_store):
         """Reuse bounded durable discovery evidence for the owner policy editor."""

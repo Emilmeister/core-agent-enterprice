@@ -5681,12 +5681,12 @@ class SemanticRuntimeTests(unittest.TestCase):
         self.assertIn('confirmed result', json.dumps(record.snapshot['context']['transcript']))
 
     def test_summary_http_wire_overrides_stream_and_output_limits_without_mutating_model(self):
-        for api_format, options, expected_limit in [
+        for api_format, options, expected_limit, window in [(*case, window) for case in [
             ('openai', {'stream': True, 'stream_options': {'include_usage': True}, 'max_tokens': 4096}, 'max_tokens'),
             ('openai', {'stream': True, 'max_tokens': 4096, 'max_completion_tokens': 8192}, 'max_completion_tokens'),
             ('anthropic', {'stream': True, 'stream_options': {}, 'max_tokens': 4096, 'max_completion_tokens': 8192}, 'max_tokens'),
-        ]:
-            with self.subTest(api_format=api_format, expected_limit=expected_limit):
+        ] for window in (1000, 50000)]:
+            with self.subTest(api_format=api_format, expected_limit=expected_limit, window=window):
                 class HttpModel(CompatibleHttpModel):
                     def generate(inner, **call):
                         if call['instructions'].startswith('SEMANTIC CONTEXT SUMMARY'):
@@ -5705,7 +5705,7 @@ class SemanticRuntimeTests(unittest.TestCase):
                 model.script = ScriptedModel([ModelResponse(tool_requests=(ToolRequest('once', 'docs_search', {}),)),
                                               ModelResponse(message='done')])
                 model.bodies = []
-                agent, _, _ = self.semantic_agent(lambda call: self.fail('use actual HTTP adapter'), context_window=1000)
+                agent, _, _ = self.semantic_agent(lambda call: self.fail('use actual HTTP adapter'), context_window=window)
                 agent.output_reserve = 100
                 agent.model = model
                 from core_agent.agent_settings import AgentSettingsStore
@@ -5720,7 +5720,13 @@ class SemanticRuntimeTests(unittest.TestCase):
                 record = agent.workflow_store.lookup_task('wire-' + api_format + expected_limit)
                 self.assertFalse(wire.get('stream', False))
                 self.assertNotIn('stream_options', wire)
-                self.assertEqual(wire[expected_limit], min(256, record.snapshot['compaction_operation']['target']))
+                self.assertEqual(wire[expected_limit], record.snapshot['compaction_operation']['output_limit'])
+                self.assertGreater(wire[expected_limit], 256)
+                self.assertLessEqual(wire[expected_limit], agent.summary_max_tokens)
+                if window == 50000:
+                    self.assertEqual(wire[expected_limit], 32768)
+                else:
+                    self.assertLess(wire[expected_limit], window)
                 self.assertNotIn('max_tokens' if expected_limit == 'max_completion_tokens' else 'max_completion_tokens', wire)
                 self.assertNotIn('tools', wire)
                 self.assertTrue(model.stream)
