@@ -144,6 +144,10 @@ class WorkspaceCleanupAPITests(AuthAppTestCase):
         self.assertEqual((directory / "a.txt").read_bytes(), b"new owner content")
 
     async def test_committed_intent_reads_are_passive_and_coordinator_resumes(self):
+        # This test advances recovery explicitly, without a competing periodic scan.
+        self.agent._recovery_stop.set()
+        await asyncio.to_thread(self.agent._recovery_thread.join, 5)
+        self.assertFalse(self.agent._recovery_thread.is_alive())
         _, binding, directory, _, body = await self.prepare()
         with patch.object(self.service, "_execute", side_effect=CoreError("WORKSPACE_CLEANUP_INVALID")):
             started = await self.delete(body)
@@ -183,9 +187,12 @@ class WorkspaceCleanupAPITests(AuthAppTestCase):
         self.assertTrue((directory / "b.txt").exists())
 
     async def test_pending_cleanup_refuses_new_a2a_root_with_retryable_safe_error(self):
-        task, _, directory, _, body = await self.prepare()
-        with patch.object(self.service, "_execute", side_effect=CoreError("WORKSPACE_CLEANUP_INVALID")):
-            self.assertEqual((await self.delete(body)).status_code, 409)
+        task, binding, directory, _, body = await self.prepare()
+        # Keep the committed intent pending even if the recovery coordinator runs.
+        self.enterContext(patch.object(self.service, "_execute", side_effect=CoreError("WORKSPACE_CLEANUP_INVALID")))
+        self.assertEqual((await self.delete(body)).status_code, 409)
+        await asyncio.to_thread(self.service.recover, tenant_id=binding.tenant_id)
+        self.assertTrue(self.service.preview_state(binding)["cleanup_pending"])
         calls = len(self.model.calls)
         original = self.agent.workflow_store.lookup_task(task["id"])
         for method in ("message:send", "message:stream"):
