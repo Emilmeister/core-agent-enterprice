@@ -4,6 +4,8 @@ import re
 import uuid
 from dataclasses import dataclass, field
 
+from jsonschema import Draft202012Validator
+
 from .errors import CoreError
 
 
@@ -183,6 +185,8 @@ def _reason(schema, value, path="arguments"):
             return f"{path} needs at least {schema['minItems']} item(s)"
         if len(value) > schema.get("maxItems", len(value)):
             return f"{path} accepts at most {schema['maxItems']} item(s)"
+        if schema.get("uniqueItems") and not Draft202012Validator({"uniqueItems": True}).is_valid(value):
+            return f"{path} must contain unique items"
         for index, item in enumerate(value):
             reason = _reason(schema.get("items", {}), item, f"{path}[{index}]")
             if reason:

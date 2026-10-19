@@ -1077,9 +1077,18 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "until an owner answers or the configured timeout expires. Treat the answer as "
                 "trusted task information and use it to continue the task. External agents cannot "
                 "answer this question. Keep the question and owner correspondence private when "
-                "communicating with external agents."
+                "communicating with external agents. When useful, provide concise, distinct suggested "
+                "answers in options. The owner can choose one or write a custom answer; do not add "
+                "an Other option, because the UI always provides it."
             ),
-            {"question": {"type": "string", "minLength": 1, "maxLength": 16384}},
+            {
+                "question": {"type": "string", "minLength": 1, "maxLength": 16384},
+                "options": {
+                    "type": "array", "maxItems": 8, "uniqueItems": True,
+                    "description": "Optional suggested answers, in display order. Omit or pass [] for free text only.",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 500, "pattern": r"\S"},
+                },
+            },
             ["question"],
         ),
         "core_task_cancel": (

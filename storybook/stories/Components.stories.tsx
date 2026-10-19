@@ -16,13 +16,13 @@ const meta = { title: "Обзор/Компоненты", excludeStories: ["Appro
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-type ApprovalProps = { kind?: Interaction["kind"]; resolved?: boolean; outcomeReason?: "answer" | "timeout" | "cancelled" };
+type ApprovalProps = { kind?: Interaction["kind"]; resolved?: boolean; outcomeReason?: "answer" | "timeout" | "cancelled"; options?: string[] };
 
 export function ApprovalExample(props: ApprovalProps) {
-  return <ApprovalState key={`${props.kind}:${props.resolved}:${props.outcomeReason}`} {...props} />;
+  return <ApprovalState key={`${props.kind}:${props.resolved}:${props.outcomeReason}:${JSON.stringify(props.options)}`} {...props} />;
 }
-function ApprovalState({ kind = "tool_approval", resolved = false, outcomeReason = "answer" }: ApprovalProps) {
-  const [item, setItem] = useState(() => ({ ...demoInteraction(kind), outcome: resolved
+function ApprovalState({ kind = "tool_approval", resolved = false, outcomeReason = "answer", options }: ApprovalProps) {
+  const [item, setItem] = useState(() => ({ ...demoInteraction(kind, options), outcome: resolved
     ? kind === "owner_question" ? { reason: outcomeReason, ...(outcomeReason === "answer" ? { answer: "Для команды продаж, 5 слайдов." } : {}) }
       : { reason: "allowed" } : null } as Interaction));
   const decision = useRef<Record<string, unknown>>({});
@@ -40,7 +40,7 @@ function ApprovalState({ kind = "tool_approval", resolved = false, outcomeReason
       source={kind === "guardrail" ? { name: "core_terminal_exec", args: { argv: ["cat", "README.md"] } } : undefined}
       refresh={async () => { setItem(previous => ({ ...previous, outcome: decision.current })); }} />
     {item.outcome && kind !== "owner_question" && <p className="catalog-note" role="status">Решение сохранено в демосценарии. Обработанная карточка скрыта, как в чате.</p>}
-    <button className="text-button catalog-reset" onClick={() => setItem(demoInteraction(kind))}>Сбросить пример</button>
+    <button className="text-button catalog-reset" onClick={() => setItem(demoInteraction(kind, options))}>Сбросить пример</button>
   </div>;
 }
 

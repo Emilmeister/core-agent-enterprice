@@ -815,6 +815,12 @@ main {
 .interaction form button {
   margin-top: 12px;
 }
+.owner-answer-options { display: grid; gap: 8px; min-width: 0; margin: 0 0 12px; padding: 0; border: 0; }
+.owner-answer-option { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; line-height: 1.5; cursor: pointer; overflow-wrap: anywhere; }
+.owner-answer-option:has(:checked) { border-color: #aaa; background: #f7f7f7; }
+.owner-answer-option input { flex: 0 0 17px; width: 17px; height: 17px; min-height: 0; margin: 2px 0 0; padding: 0; accent-color: var(--green); }
+.owner-answer-option span { min-width: 0; }
+.owner-answer-options:disabled .owner-answer-option { cursor: default; opacity: .65; }
 .material {
   margin-top: 18px;
 }

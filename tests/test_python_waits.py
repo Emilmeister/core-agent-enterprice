@@ -203,9 +203,11 @@ class PythonWaitTests(unittest.TestCase):
             self.policy(agent, "allow", name)
         executed = []
         agent.tool_runtime.handlers["core_task_list"] = lambda *_: executed.append(1) or {"prior": "known"}
-        with self.python(agent, name="core_ask_owner", arguments={"question": "Which one?"}, prior=True):
+        with self.python(agent, name="core_ask_owner", arguments={"question": "Which one?", "options": ["first", "second"]}, prior=True):
             sleeping = self.start(agent)
         self.assertIsInstance(sleeping, SuspendedRun)
+        self.assertEqual(agent.workflow_store.get_wait(sleeping.wait_id, tenant_id="company").subject,
+                         {"question": "Which one?", "options": ["first", "second"]})
         record = agent.workflow_store.lookup_task("task")
         frame = record.snapshot["python_execution"]
         self.assertEqual(frame["request_id"], "stable-request")
@@ -214,7 +216,9 @@ class PythonWaitTests(unittest.TestCase):
         self.assertEqual(agent.resume_task("task").wait_id, sleeping.wait_id)
         self.assertEqual(len(agent.workflow_store.pending_inbound(agent.workflow_store.lookup_task("task"))), 1)
         agent.workflow_store.resolve_wait(sleeping.wait_id, tenant_id="company", outcome={"reason": "answer", "answer": "second"}, actor_id="owner-actor")
-        self.assertEqual(agent.resume_task("task").message, "answered")
+        agent._runtime_cache.clear()
+        with patch("core_agent.runtime.execute_python", side_effect=AssertionError("Python replay")):
+            self.assertEqual(agent.resume_task("task").message, "answered")
         self.assertEqual(executed, [1])
         self.assertIn('"answer": "second"', model.calls[-1].context)
         self.assertIn("extra detail", model.calls[-1].context)

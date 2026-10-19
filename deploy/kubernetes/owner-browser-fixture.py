@@ -313,7 +313,8 @@ flowchart LR
 [unsafe](javascript:alert('unsafe'))
 """),
         ModelResponse(message="Native manual cron completed."),
-        ModelResponse(tool_requests=(ToolRequest("browser-owner-question", "core_ask_owner", {"question": "Какой номер заказа использовать?"}),)),
+        ModelResponse(tool_requests=(ToolRequest("browser-owner-question", "core_ask_owner", {
+            "question": "Какой номер заказа использовать?", "options": ["Заказ 42", "Заказ 43"]}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-python-syntax", "core_python_exec", {"code": preview_python}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-known-failure", "core_terminal_exec", {"argv": ["python3", "-c", preview_program]}),)),
         ModelResponse(tool_requests=(

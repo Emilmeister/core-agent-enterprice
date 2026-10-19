@@ -3927,6 +3927,8 @@ class CoreAgent:
                 raise CoreError("CAPABILITY_DISABLED")
             timeout = self.interaction_store.get_settings(record.tenant_id).owner_answer_timeout_seconds
             subject = {"question": call.arguments["question"]}
+            if "options" in call.arguments:
+                subject["options"] = list(call.arguments["options"])
             if prepare_only:
                 return "owner_question", subject, now + timeout
             return self._enter_tool_wait(

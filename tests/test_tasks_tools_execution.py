@@ -23,6 +23,7 @@ from core_agent.tools import (
     ToolRegistry,
     ToolResult,
     ToolRuntime,
+    validate_json_schema,
 )
 from core_agent.workflow import SuspendedRun
 
@@ -642,6 +643,27 @@ class ToolRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(len(self.backend.executed), 1)
+
+    def test_unique_items_uses_json_equality_without_revealing_values(self):
+        schema = {"type": "array", "uniqueItems": True}
+        for values in ([], [True, 1], [False, 0], ["same", " same "], [{"value": True}, {"value": 1}]):
+            with self.subTest(valid=values):
+                self.assertTrue(validate_json_schema(schema, values))
+        for values in (["secret-canary", "secret-canary"], [1, 1.0], [True, True],
+                       [{"a": 1, "b": 2}, {"b": 2, "a": 1}], [[1], [1.0]]):
+            with self.subTest(invalid=values):
+                self.assertFalse(validate_json_schema(schema, values))
+        definition = replace(self.registry.get("core_terminal_exec"), input_schema={
+            "type": "object", "properties": {"argv": schema}, "required": ["argv"],
+        })
+        self.registry._tools[definition.name] = definition
+        with self.assertRaises(CoreError) as caught:
+            self.runtime.execute(ToolCall("duplicate", definition.name,
+                {"argv": ["secret-canary", "secret-canary"]}), run_id="run-1")
+        self.assertEqual(caught.exception.code, "TOOL_ARGUMENT_INVALID")
+        self.assertIn("arguments.argv", str(caught.exception))
+        self.assertNotIn("secret-canary", str(caught.exception))
+        self.assertEqual(self.backend.executed, [])
 
     def test_completed_terminal_failure_is_a_failed_tool_result(self):
         self.environment_manager.execute_transient = lambda _request, _run_id: (

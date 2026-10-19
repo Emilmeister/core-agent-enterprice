@@ -18,15 +18,22 @@ export function InteractionCard({
   source?: MaterialSource;
 }) {
   const [answer, setAnswer] = useState("");
+  const [selectedOption, setSelectedOption] = useState<number | "custom" | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const detailsId = useId();
+  const answerGroupId = useId();
   const [material, setMaterial] = useState<Record<string, unknown> | null>(
     null,
   );
   const expired = item.deadline * 1000 <= Date.now();
   const closed = !!item.outcome || expired;
+  const options = Array.isArray(item.subject.options)
+    ? item.subject.options.filter((option): option is string => typeof option === "string") : [];
+  const submittedAnswer = options.length > 0 && selectedOption !== "custom"
+    ? typeof selectedOption === "number" ? options[selectedOption] ?? "" : "" : answer;
+  const validAnswer = !!submittedAnswer.trim() && new TextEncoder().encode(submittedAnswer).length <= 65536;
   const request = useRef<AbortController | null>(null);
   useEffect(() => {
     if (closed) {
@@ -64,7 +71,7 @@ export function InteractionCard({
     guardrail: "guardrails",
   };
   async function decide(decision?: string) {
-    if (closed) return;
+    if (closed || busy || (item.kind === "owner_question" && !validAnswer)) return;
     const controller = beginRequest();
     try {
       await api.json(
@@ -72,12 +79,13 @@ export function InteractionCard({
         "POST",
         {
           subject_digest: item.subject_digest,
-          ...(item.kind === "owner_question" ? { answer } : { decision }),
+          ...(item.kind === "owner_question" ? { answer: submittedAnswer } : { decision }),
         },
         controller.signal,
       );
       if (controller.signal.aborted || !api.session.valid) return;
       setAnswer("");
+      setSelectedOption(null);
       setMaterial(null);
       await refresh();
     } catch (failure) {
@@ -188,7 +196,20 @@ export function InteractionCard({
               void decide();
             }}
           >
-            <label>
+            {options.length > 0 && <fieldset className="owner-answer-options" disabled={busy}>
+              <legend className="sr-only">Варианты ответа</legend>
+              {options.map((option, index) => <label className="owner-answer-option" key={index}>
+                <input type="radio" name={answerGroupId} value={index} checked={selectedOption === index}
+                  onChange={() => setSelectedOption(index)} />
+                <span>{option}</span>
+              </label>)}
+              <label className="owner-answer-option">
+                <input type="radio" name={answerGroupId} value="custom" checked={selectedOption === "custom"}
+                  onChange={() => setSelectedOption("custom")} />
+                <span>Свой ответ</span>
+              </label>
+            </fieldset>}
+            {(options.length === 0 || selectedOption === "custom") && <label>
               Ваш ответ
               <textarea
                 value={answer}
@@ -196,14 +217,8 @@ export function InteractionCard({
                 required
                 disabled={busy}
               />
-            </label>
-            <button
-              disabled={
-                busy ||
-                !answer.trim() ||
-                new TextEncoder().encode(answer).length > 65536
-              }
-            >
+            </label>}
+            <button disabled={busy || !validAnswer}>
               Отправить ответ
             </button>
           </form>

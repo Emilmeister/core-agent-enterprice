@@ -488,6 +488,17 @@ logout URI в allowlist Keycloak; application schema и persisted Tasks не м�
 и не отменяет уже принятые Tasks. Новый запрос со старым токеном завершённой
 Keycloak-сессии отклоняется обычной проверкой авторизации.
 
+Вопрос владельцу с непустыми `options` показывает группу выбора одного ответа
+и отдельный пункт «Свой ответ». Ничего не выбрано заранее. При выборе своего
+ответа появляется текстовое поле; при отсутствии вариантов оно доступно сразу,
+как в прежних вопросах. Выбор радиокнопки не отправляет ответ: отдельная кнопка
+«Отправить ответ» доступна только для выбранного варианта либо непустого своего
+текста в пределах существующего лимита. В API передаётся исходный текст варианта
+или введённый владельцем ответ; список вариантов не является серверным allowlist.
+Вопрос и варианты показываются безопасным текстом, доступны с клавиатуры и
+переносятся на узком экране без горизонтального переполнения. Во время отправки
+и после закрытия ожидания выбор и отправка недоступны.
+
 В чате остаются видимыми активные запросы разрешений на tools и проверки
 guardrails. После canonical сохранённого решения, включая отказ и timeout,
 их карточки скрываются и не возвращаются после обновления истории или reload.
@@ -756,7 +767,7 @@ Tenant, owner, actor и права не принимаются из JSON. Неи
 | `GET /api/chats/{context_id}/files/delete` | Owner-only read-only receipt: optional единственный `request_id`, без него —последняя сохранённая операция чата. Все владельцы company могут прочитать receipt и явно повторить прежнее подтверждённое тело. Missing/foreign receipt —404 `FILE_CLEANUP_NOT_FOUND`. GET не запускает очистку и не возобновляет операцию |
 | `GET /api/interactions?task_id=...&status=pending` | Запросы указанной Task и её root family в том же чате; status `pending` или `all`, limit 1–100 (default 50), непрозрачный cursor, привязанный к task_id и status; immutable subject, digest, generation, deadline и сохранённый outcome доступны владельцам. Timer и local-task waits в этот список не входят |
 | `POST /api/hitl/{wait_id}/decision` | Ровно `decision: allow|reject` и `subject_digest`; аргументы вызова изменить нельзя |
-| `POST /api/questions/{wait_id}/answer` | Ровно непустой `answer` до 64 KiB UTF-8 и `subject_digest` |
+| `POST /api/questions/{wait_id}/answer` | Ровно непустой `answer` до 64 KiB UTF-8 и `subject_digest`; выбранный предложенный вариант передаётся как текст ответа, произвольный ответ также допустим |
 | `POST /api/guardrails/{wait_id}/decision` | Ровно `decision: allow|reject` и `subject_digest`; kind ожидания обязан быть guardrail |
 | `GET /api/guardrails/{wait_id}/material` | Owner-only чтение сохранённого материала указанного guardrail wait: public interaction metadata и private payload либо sealed file reference. Tenant берётся из principal, run/owner — из сохранённого ожидания; query/body не меняют scope. Чужой или неподходящий wait имеет not-found semantics; ответ `Cache-Control: no-store` |
 | `GET /api/guardrails/{wait_id}/file` | Owner-only скачивание конкретного файла по сохранённому sealed reference проверки; batch/index/run/owner не принимаются от клиента. Scope и bytes/digest проверяются также после завершения Task. Ответ: attachment, `application/octet-stream`, no-store, nosniff и sandbox CSP; неподходящий/чужой review — 404, повреждённые bytes не выдаются |
@@ -892,8 +903,8 @@ previous-root chain; active summary и импортированные сообщ
 доставка/отказ сохраняют её identity вместо второго сообщения. Пока материал не
 проверен или отклонён, inline payload заменяется понятным placeholder; при наличии
 review владелец открывает полный материал через отдельный authorized API.
-Внутренние вопросы/ответы доступны владельцам, external/dual-role не получает
-history route даже для своей Task. Owner чужой company не получает её данные.
+Внутренние вопросы, их варианты и ответы доступны владельцам; external/dual-role
+не получает history route даже для своей Task. Owner чужой company не получает её данные.
 
 Доступная final entry завершённой Task содержит optional `response_files` —
 ordered `{file_id,name,media_type,size_bytes,sha256}` receipts из её immutable

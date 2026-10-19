@@ -1011,6 +1011,80 @@ class OwnerRuntimeAPITests(AuthAppTestCase):
         self.assertEqual(len(pending), 1, pending)
         return pending[0]
 
+    async def test_owner_question_options_round_trip_and_custom_answers_after_restart(self):
+        tenant = self.app.state.authenticator.settings.tenant
+        self.agent.interaction_store.update_policy(tenant, "core_ask_owner", "builtin:core_ask_owner",
+            mode="allow", guardrails_exempt=False, expected_revision=0, actor_id="owner")
+        cases = ((None, "legacy free text"), ([], "empty options free text"),
+                 (["first", "second"], "second"), (["first", "second"], "different custom answer"),
+                 (["exact", " exact "], " exact "), ([str(n) * 500 for n in range(8)], "0" * 500))
+        for options, answer in cases:
+            with self.subTest(options=options):
+                arguments = {"question": "Which route?"}
+                if options is not None:
+                    arguments["options"] = options
+                model = self.agent.model = ScriptedModel([
+                    ModelResponse(tool_requests=(ToolRequest("ask", "core_ask_owner", arguments),)),
+                    ModelResponse(message="continued"),
+                ])
+                task = await self.submit("owner-a", uuid.uuid4().hex, uuid.uuid4().hex)
+                waiting = await self.pending(task["id"])
+                self.assertEqual(waiting["kind"], "owner_question")
+                self.assertEqual(waiting["subject"].get("options", []), options or [])
+                self.agent._runtime_cache.clear()
+                pending = await asyncio.to_thread(self.agent.resume_task, task["id"])
+                self.assertEqual(pending.wait_id, waiting["wait_id"])
+                self.assertEqual(len(model.calls), 1)
+                response = await self.http.post(f"/api/questions/{waiting['wait_id']}/answer",
+                    headers=self.headers("owner-b"), json={"answer": answer, "subject_digest": waiting["subject_digest"]})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["outcome"]["answer"], answer)
+                result = await asyncio.to_thread(self.agent.resume_task, task["id"])
+                self.assertEqual(result.message, "continued")
+                self.assertIn(json.dumps(answer), model.calls[-1].context)
+                self.assertEqual((await asyncio.to_thread(self.agent.resume_task, task["id"])).message, "continued")
+                self.assertEqual(len(model.calls), 2)
+                history = await self.http.get("/api/interactions", headers=self.headers("owner-a"),
+                    params={"task_id": task["id"], "status": "all"})
+                self.assertEqual(history.status_code, 200, history.text)
+                self.assertEqual(len(history.json()["interactions"]), 1)
+
+    async def test_invalid_owner_question_options_do_not_create_wait(self):
+        tenant = self.app.state.authenticator.settings.tenant
+        self.agent.interaction_store.update_policy(tenant, "core_ask_owner", "builtin:core_ask_owner",
+            mode="allow", guardrails_exempt=False, expected_revision=0, actor_id="owner")
+        invalid = (None, "first", {}, [1], [False], [None], [["nested"]], [""], [" \t\n"],
+                   ["\u00a0\u2003"], ["x" * 501], [str(n) for n in range(9)], ["same", "same"])
+        for options in invalid:
+            with self.subTest(options=options):
+                model = self.agent.model = ScriptedModel([
+                    ModelResponse(tool_requests=(ToolRequest("ask", "core_ask_owner", {
+                        "question": "Which route?", "options": options}),)), ModelResponse(message="corrected"),
+                ])
+                task = await self.submit("owner-a", uuid.uuid4().hex, uuid.uuid4().hex)
+                record = self.agent.workflow_store.lookup_task(task["id"])
+                self.assertEqual(record.state, "COMPLETED", record.error_code)
+                self.assertIn("TOOL_ARGUMENT_INVALID", model.calls[-1].context)
+                response = await self.http.get("/api/interactions", headers=self.headers("owner-a"),
+                    params={"task_id": task["id"], "status": "all"})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["interactions"], [])
+
+    async def test_duplicate_owner_options_rejected_before_default_tool_approval(self):
+        self.agent.model = ScriptedModel([
+            ModelResponse(tool_requests=(ToolRequest("ask", "core_ask_owner", {
+                "question": "Which route?", "options": ["same", "same"]}),)),
+            ModelResponse(message="corrected"),
+        ])
+        task = await self.submit("owner-a", uuid.uuid4().hex, uuid.uuid4().hex)
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(record.state, "COMPLETED", record.error_code)
+        self.assertIn("TOOL_ARGUMENT_INVALID", self.agent.model.calls[-1].context)
+        response = await self.http.get("/api/interactions", headers=self.headers("owner-a"),
+            params={"task_id": task["id"], "status": "all"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["interactions"], [])
+
     async def test_external_task_asks_owner_with_private_publication_and_followup_after_wait(self):
         question, answer = "private-owner-question-739", "private-owner-answer-851"
         previews = []

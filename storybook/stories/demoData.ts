@@ -32,10 +32,10 @@ flowchart LR
 `;
 export const demoFile = { file_id: "report", name: "report.md", media_type: "text/markdown", size_bytes: new TextEncoder().encode(markdown).length, sha256: "a".repeat(64) };
 export const demoQuestion = "Для кого предназначена презентация? Укажите аудиторию, желаемое количество слайдов и основные темы.";
-export function demoInteraction(kind: Interaction["kind"] = "tool_approval"): Interaction {
+export function demoInteraction(kind: Interaction["kind"] = "tool_approval", options?: string[]): Interaction {
   return { wait_id: kind, source_id: "ask", context_id: "demo", kind, subject_digest: "demo-digest", deadline: Date.now() / 1000 + 86400, outcome: null,
     subject: kind === "tool_approval" ? { tool_name: "core_ask_owner", arguments: { question: demoQuestion } }
-      : kind === "owner_question" ? { question: demoQuestion } : { affected_scope: "tool_result", source_kind: "tool_result", reason: "suspicious", source_id: "result:read" } };
+      : kind === "owner_question" ? { question: demoQuestion, ...(options ? { options } : {}) } : { affected_scope: "tool_result", source_kind: "tool_result", reason: "suspicious", source_id: "result:read" } };
 }
 export const demoPeer: PeerConversation = {
   operation_id: "peer-operation", peer_id: "analyst", peer_name: "Аналитик", root_task_id: "demo-task",

@@ -461,9 +461,10 @@ class PostgresEnterpriseReleaseBoundaryTests(EnterpriseReleaseBoundaryTests):
 
     async def test_owner_question_answer_remain_private_across_restart_and_all_public_projections(self):
         question, answer = "private-owner-question-release", "private-owner-answer-release-" + "canary" * 2000
+        options = ["private-owner-option-first-release", "private-owner-option-second-release"]
         self.policy("core_ask_owner", "allow")
         self.agent.model = ScriptedModel([ModelResponse(message="private-owner-intermediate-release",
-            reasoning="private-owner-reasoning-release", tool_requests=(ToolRequest("private-question", "core_ask_owner", {"question": question}),))])
+            reasoning="private-owner-reasoning-release", tool_requests=(ToolRequest("private-question", "core_ask_owner", {"question": question, "options": options}),))])
         task = await self.submit("external-a", uuid.uuid4().hex, uuid.uuid4().hex)
         self.tasks.add(task["id"])
         record = self.agent.workflow_store.lookup_task(task["id"])
@@ -483,7 +484,7 @@ class PostgresEnterpriseReleaseBoundaryTests(EnterpriseReleaseBoundaryTests):
         ])
         model.model = "auth-test-model"
         await self.restart(model)
-        private = (question, "private-owner-answer-release", "private-owner-intermediate-release", "private-owner-reasoning-release")
+        private = (question, *options, "private-owner-answer-release", "private-owner-intermediate-release", "private-owner-reasoning-release")
         for route in ("/a2a/external/tasks/" + record.task_id, "/a2a/external/tasks"):
             response = await self.http.get(route, headers=self.headers("external-a"),
                 params={"includeArtifacts": "true"} if route.endswith("/tasks") else {})
@@ -496,6 +497,7 @@ class PostgresEnterpriseReleaseBoundaryTests(EnterpriseReleaseBoundaryTests):
             self.assertEqual(response.status_code, 403, response.text)
         waiting = await self.pending(record.task_id)
         self.assertEqual(waiting["subject"]["question"], question)
+        self.assertEqual(waiting["subject"]["options"], options)
         answered = await self.http.post(f"/api/questions/{waiting['wait_id']}/answer", headers=self.headers("owner-b"),
             json={"answer": answer, "subject_digest": waiting["subject_digest"]})
         self.assertEqual(answered.status_code, 200, answered.text)

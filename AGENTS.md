@@ -889,8 +889,13 @@ run получает отдельные MCP session и negotiated version; пе�
   получает interrupted result под исходным outer tool-call ID. Unit proof
   не заменяет обязательный native Linux gate.
 - `core_ask_owner` доступен при подключённом owner plane; создаёт private question
-  после собственной policy/HITL. External-owned Task публикует generic status и
-  публичный ответ, включая безопасный preview; внутренние вопросы, ответы,
+  после собственной policy/HITL. Optional `options` содержит до 8 уникальных
+  непустых ответов до 500 символов; omission/[] сохраняет свободный ответ.
+  Варианты входят в immutable wait subject/digest и переживают recovery.
+  UI предлагает один вариант или «Свой ответ» с явной отправкой, без предвыбора;
+  owner API/result сохраняют строковый `answer`, options не ограничивают ответ.
+  External-owned Task публикует generic status и
+  публичный ответ, включая безопасный preview; внутренние вопросы, варианты, ответы,
   reasoning и промежуточный tool/model stream остаются приватными.
 - Main-run model-only `core_response_begin({})` открывает durable tools-free
   answer phase, расходуя обычные tool/model budgets. Он условно добавляется

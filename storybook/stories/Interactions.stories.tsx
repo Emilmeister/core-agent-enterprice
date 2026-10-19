@@ -24,6 +24,43 @@ export const Question: Story = { name: "Ответ владельца", args: { 
     await userEvent.click(canvasElement.querySelector(".catalog-reset")!);
   },
 };
+export const QuestionOptions: Story = {
+  name: "Вопрос с вариантами ответа", args: { kind: "owner_question", options: ["Для команды продаж, 5 слайдов.", "Для руководства, 10 слайдов."] },
+  play: async ({ canvasElement, args }) => {
+    const form = () => canvasElement.querySelector<HTMLFormElement>(".interaction form")!;
+    const choices = () => form().querySelectorAll<HTMLInputElement>('input[type="radio"]');
+    if (choices().length !== 3 || [...choices()].some(choice => choice.checked)
+      || !form().querySelector<HTMLButtonElement>("button")!.disabled || form().querySelector("textarea"))
+      throw new Error("Options must start unselected and require an explicit answer submission");
+    choices()[0].focus();
+    await userEvent.keyboard(" ");
+    if (!choices()[0].checked || canvasElement.querySelector(".owner-question-history"))
+      throw new Error("Keyboard selection must choose an option without sending it");
+    await userEvent.click(choices()[2]);
+    const custom = "Для партнёров, 7 слайдов.";
+    await userEvent.type(form().querySelector("textarea")!, custom);
+    await userEvent.click(choices()[1]);
+    if (form().querySelector("textarea")) throw new Error("Custom editor should be hidden while an option is selected");
+    await userEvent.click(choices()[2]);
+    if (form().querySelector("textarea")!.value !== custom) throw new Error("Switching choices must preserve the custom answer draft");
+    await userEvent.click(choices()[0]);
+    await userEvent.click(form().querySelector("button")!);
+    await waitFor(() => {
+      const answer = canvasElement.querySelector(".owner-question-history .question-answer > div:last-child p")?.textContent;
+      if (answer !== args.options![0]) throw new Error("Submitted choice must match its exact original text");
+    });
+    await userEvent.click(canvasElement.querySelector(".catalog-reset")!);
+    await userEvent.click(choices()[2]);
+    await userEvent.type(form().querySelector("textarea")!, custom);
+    await userEvent.click(form().querySelector("button")!);
+    await waitFor(() => {
+      const answer = canvasElement.querySelector(".owner-question-history .question-answer > div:last-child p")?.textContent;
+      if (answer !== custom) throw new Error("Custom answers remain available even when suggestions exist");
+    });
+    await userEvent.click(canvasElement.querySelector(".catalog-reset")!);
+  },
+};
+export const QuestionEmptyOptions: Story = { name: "Вопрос без предложенных вариантов", args: { kind: "owner_question", options: [] }, play: Question.play };
 export const Answered: Story = { name: "Сохранённый ответ", args: { kind: "owner_question", resolved: true },
   play: async ({ canvasElement }) => {
     const history = canvasElement.querySelector<HTMLDetailsElement>("details.owner-question-history");
