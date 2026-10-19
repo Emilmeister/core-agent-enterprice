@@ -1308,6 +1308,8 @@ class CoreAgent:
             else:
                 catalog["core_agent_send_message"]["description"] = (
                     "Send one focused task to a trusted remote agent; returns a durable local task handle. "
+                    "You must write every task or reply in the task field as Markdown. Use paragraphs, lists, emphasis "
+                    "and fenced code blocks where appropriate; do not wrap the whole message in a code block. "
                     "Use core_task_wait without timeout for its result. "
                     "A public question returns input_id and question; answer from context or use core_ask_owner. "
                     "Reply with task_id and input_id together using the same agent_name and the selected answer in task. "

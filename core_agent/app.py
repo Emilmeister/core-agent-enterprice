@@ -1152,6 +1152,8 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
             "core_agent_send_message": (
                 (
                     "Delegate one focused task to a trusted remote A2A agent and return its durable local task handle. "
+                    "You must write every task or reply in the task field as Markdown. Use paragraphs, lists, emphasis "
+                    "and fenced code blocks where appropriate; do not wrap the whole message in a code block. "
                     "Wait using core_task_wait without timeout. To answer a public input question, pass its local "
                     "task_id and input_id together to continue the same operation. Do not resend the initial task. Available agents: "
                     f"{remote_agent_names}. Use it when the request belongs to another "
@@ -1165,9 +1167,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 {
                     "agent_name": {"type": "string", "minLength": 1},
                     "task": {"type": "string", "minLength": 1, "description": (
-                        "Task or reply for the remote agent. For messages you compose, prefer Markdown when it improves "
-                        "readability: paragraphs, lists, bold for key facts, and fenced code blocks for code. "
-                        "Short replies can be plain text. Preserve all facts, requirements and identifiers; "
+                        "Task or reply for the remote agent, required in Markdown. Preserve all facts, requirements and identifiers; "
                         "keep forwarded verbatim text unchanged. Do not wrap the whole message in a code block."
                     )},
                     "task_id": {"type": "string", "minLength": 1},
