@@ -213,7 +213,7 @@ class ResponseFilesRuntimeTests(AuthAppTestCase):
     async def test_guardrail_wait_persists_receipt_and_selection_together_without_recapture(self):
         agent, folder = await self.workspace()
         (folder / "frozen.txt").write_bytes(b"frozen before review")
-        verdicts = ["clear", "clear", "suspicious", *(["clear"] * 5)]
+        verdicts = ["clear", "suspicious", *(["clear"] * 5)]
         agent.guardrail_classifier = GuardrailClassifier(ScriptedModel([
             ModelResponse(message=json.dumps({"verdict": verdict}), finish_reason="stop") for verdict in verdicts
         ]), token_counter=len)

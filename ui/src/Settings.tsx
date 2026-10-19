@@ -135,6 +135,7 @@ function AgentConfiguration({ api }: { api: Api }) {
   const [models, setModels] = useState<string[]>([]);
   const [contextWindow, setContextWindow] = useState<string | null>(null);
   const [structuredOutput, setStructuredOutput] = useState<AgentSettings["structured_output"] | null>(null);
+  const [guardrailsEnabled, setGuardrailsEnabled] = useState<boolean | null>(null);
   const [servers, setServers] = useState<(McpConnection & { header_value?: string | null; original_name?: string })[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -157,6 +158,7 @@ function AgentConfiguration({ api }: { api: Api }) {
       setModel(null);
       setContextWindow(null);
       setStructuredOutput(null);
+      setGuardrailsEnabled(null);
       setServers(result.mcp_servers.map((server) => ({ ...server, original_name: server.name })));
     }).catch((failure) => {
       if (!controller.signal.aborted) setError(errorText(failure));
@@ -180,6 +182,7 @@ function AgentConfiguration({ api }: { api: Api }) {
         setContextWindow(null);
         setStructuredOutput(null);
       }
+      if (section === "guardrails") setGuardrailsEnabled(null);
       if (section === "mcp") setServers((previous) => mcpName === undefined
         ? result.mcp_servers.map((server) => ({ ...server, original_name: server.name }))
         : previous.flatMap((server) => {
@@ -300,6 +303,25 @@ function AgentConfiguration({ api }: { api: Api }) {
           onClick={() => void save("model", { model_id: null, context_window: null, structured_output: null })}>Использовать модель развёртывания</button>
       </div>
     </form>
+    <form className="form-sheet agent-guardrail-settings" onSubmit={(event) => {
+      event.preventDefault();
+      if (guardrailsEnabled !== null && guardrailsEnabled !== current.guardrails_enabled)
+        void save("guardrails", { guardrails_enabled: guardrailsEnabled });
+    }}>
+      <h2>Проверка материалов</h2>
+      <label className="check">
+        <input type="checkbox" role="switch" checked={guardrailsEnabled ?? current.guardrails_enabled}
+          disabled={!!busy} aria-describedby="guardrails-help"
+          onChange={(event) => setGuardrailsEnabled(event.target.checked)} />
+        Проверять материалы на prompt injection
+      </label>
+      <p className="muted" id="guardrails-help">Проверка входящих сообщений, файлов и результатов инструментов.
+        {" "}Изменение применяется к новым задачам. Уже запущенные задачи и ожидающие решения сохраняют свои настройки.
+        {" "}Разрешения на действия управляются отдельно.</p>
+      <button disabled={!!busy || guardrailsEnabled === null || guardrailsEnabled === current.guardrails_enabled}>
+        {busy === "guardrails" ? "Сохраняем…" : "Сохранить проверку материалов"}
+      </button>
+    </form>
     <section className="form-sheet agent-mcp-settings">
       <h2>MCP-серверы</h2>
       {servers.length === 0 && <p className="muted">Нет подключений.</p>}
@@ -391,7 +413,7 @@ export function ToolPolicies({ api }: { api: Api }) {
       </p>
       <p className="muted">
         Правила общие для всех владельцев и всех чатов этого агента.
-        Подтверждение действия и проверка его аргументов и результатов действуют отдельно.
+        Подтверждение действия и проверка его результатов действуют отдельно.
       </p>
       {error && (
         <p className="error" role="alert">

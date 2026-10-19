@@ -766,6 +766,14 @@ try {
   await second.field('.agent-profile-settings textarea','Native owner profile proof');
   const savedProfile=await ownerAction(second,'/api/agent-settings','PUT',()=>second.click('Сохранить профиль','.agent-profile-settings button'));
   check(savedProfile.body.profile_prompt==='Native owner profile proof'&&!savedProfile.body.inherits.profile_prompt,'owner profile is persisted independently');
+  await second.wait("!!document.querySelector('.agent-guardrail-settings input[role=switch]')",'owner guardrail setting');
+  for(const enabled of [false,true]){
+    await second.evaluate("document.querySelector('.agent-guardrail-settings input[role=switch]').click()");
+    const changed=await ownerAction(second,'/api/agent-settings','PUT',()=>second.click('Сохранить проверку материалов','.agent-guardrail-settings button'));
+    check(changed.body.guardrails_enabled===enabled&&changed.body.profile_prompt===savedProfile.body.profile_prompt
+      &&changed.body.model_id===savedProfile.body.model_id,'guardrail '+(enabled?'enable':'disable')+' persists independently');
+    await second.wait(`document.querySelector('.agent-guardrail-settings input').checked===${enabled}&&document.querySelector('.agent-guardrail-settings button').disabled`,'guardrail save reflected in form');
+  }
   await second.wait("[...document.querySelector('.agent-model-settings select').options].some(option=>option.value==='browser-model-two')",'actual fixed-provider model list');
   await second.field('.agent-model-settings select','browser-model-two');
   const savedModel=await ownerAction(second,'/api/agent-settings','PUT',()=>second.click('Сохранить модель','.agent-model-settings button'));

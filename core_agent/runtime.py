@@ -2102,10 +2102,12 @@ class CoreAgent:
         platform, declarations, settings_revision = self.platform_config, self.platform_mcp, None
         admitted_window = None
         structured_output = None
+        guardrails_enabled = True
         if parent_run_id is not None:
             parent = self.workflow_store.get(parent_run_id, tenant_id=tenant_id or "default", connection=connection)
             admitted_window = parent.snapshot.get("context_window")
             structured_output = self._structured_output_policy(parent.snapshot)
+            guardrails_enabled = self._guardrails_enabled(parent.snapshot)
         if self.agent_settings_store is not None:
             selected_tenant = tenant_id or "default"
             if parent_run_id is not None:
@@ -2117,6 +2119,7 @@ class CoreAgent:
                 settings = self.agent_settings_store.get(selected_tenant, settings_revision, connection=connection)
                 settings_revision = settings["revision"]
                 if parent_run_id is None:
+                    guardrails_enabled = self._guardrails_enabled(settings["config"])
                     admitted_window = settings["config"].get("context_window")
                     structured_output = validate_structured_output(
                         settings["config"].get("structured_output") or STRUCTURED_OUTPUT_DEFAULT)
@@ -2143,6 +2146,7 @@ class CoreAgent:
         )
         snapshot = {
             "initializing": True,
+            "guardrails_enabled": guardrails_enabled,
             "output_contract_version": (output_contract_version(self.workflow_store.get(parent_run_id,
                 tenant_id=tenant_id, owner_id=owner_id, connection=connection)) if parent_run_id is not None else 2),
             "published_artifacts": [],
@@ -2615,6 +2619,13 @@ class CoreAgent:
         if type(window) is not int or window <= 0:
             raise CoreError("CHECKPOINT_INVALID")
         return window
+
+    @staticmethod
+    def _guardrails_enabled(snapshot):
+        enabled = snapshot.get("guardrails_enabled", True)
+        if type(enabled) is not bool:
+            raise CoreError("CHECKPOINT_INVALID", "Invalid material checking setting")
+        return enabled
 
     @staticmethod
     def _structured_output_policy(snapshot):
@@ -3262,6 +3273,7 @@ class CoreAgent:
                 if batch_id:
                     content += "\n" + self._guard_file_batch(record, snapshot, batch_id,
                         sequence=message["sequence"], lease_token=lease_token)
+                    record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
             item = ContextItem(
                 item_kind,
                 content,
@@ -3388,6 +3400,7 @@ class CoreAgent:
         if snapshot.get("file_batch_id"):
             content += "\n" + self._guard_file_batch(record, snapshot, snapshot["file_batch_id"],
                 sequence=None, lease_token=lease_token)
+            record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
         item = ContextItem("prompt", content, self.token_counter(content), pinned=True,
             provenance=self._context_provenance(snapshot, 1, material_source_ids=("initial",) + tuple(
                 key for key in snapshot.get("context_materials", {}) if key.startswith("file:"))))
@@ -3443,9 +3456,10 @@ class CoreAgent:
         material_key = source_id + ":" + hashlib.sha256(json.dumps(payload, ensure_ascii=False,
             sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
         review_id = reviews.get(material_key)
-        # An exemption applies to subsequent sources, never to an existing decision.
+        # New model-generated arguments are not external material. Retain saved
+        # reviews for recovery; neither this change nor exemptions undo decisions.
         if review_id is None:
-            if exempt:
+            if exempt or source_kind == "tool_arguments" or not self._guardrails_enabled(snapshot):
                 tracked["allowed"] = True
                 return None
             classifier = self.guardrail_classifier
@@ -5600,6 +5614,7 @@ class CoreAgent:
             "effective_config_digest": effective.digest,
             "effective_platform_config": self._platform_snapshot(platform),
             "background_tool": True, "background_charged": False, "turns": 0, "tool_calls": 0,
+            "guardrails_enabled": self._guardrails_enabled(parent_snapshot),
             "pending_call": call, "pending_mutating": None, "tool_queue": [call],
             "pending_response": {"message": None, "tool_requests": [call]},
             "finalization_turn_reserved": False, "budget_exhausted": None,

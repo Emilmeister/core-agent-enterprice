@@ -134,6 +134,19 @@ class RemoteFileResultTests(AuthAppTestCase):
         self.assertNotIn("private file text", context)
         self.assertEqual(self.sent.call_count, 1)
 
+    async def test_disabled_guardrails_publish_remote_files_without_detector_calls(self):
+        settings = self.agent.agent_settings_store
+        settings.update(self.tenant, {"guardrails_enabled": False},
+            expected_revision=settings.get(self.tenant)["revision"], actor_id="alice")
+        record = await self.start()
+        self.assertEqual(record.state, "COMPLETED", record.error_code)
+        self.assertEqual((self.target / "report.txt").read_bytes(), b"private file text")
+        self.assertEqual((self.target / "empty.txt").read_bytes(), b"")
+        self.assertIn("Remote answer", self.model.calls[-1].context)
+        self.assertNotIn("private file text", self.model.calls[-1].context)
+        self.assertEqual(self.detector.calls, [])
+        self.assertEqual(self.sent.call_count, 1)
+
     async def test_file_rejection_withholds_entire_result_and_every_file(self):
         record = await self.start()
         self.assertEqual(record.state, "WAITING_INPUT")
@@ -617,6 +630,30 @@ class RemoteArtifactResultTests(AuthAppTestCase):
     asyncTearDown = RemoteFileResultTests.asyncTearDown
     start = RemoteFileResultTests.start
     exempt = RemoteFileResultTests.exempt
+
+    async def test_disabled_guardrails_preserve_typed_artifacts_and_receipts(self):
+        settings = self.agent.agent_settings_store
+        settings.update(self.tenant, {"guardrails_enabled": False},
+            expected_revision=settings.get(self.tenant)["revision"], actor_id="alice")
+        self.response = replace(RemoteEvent("task", "TASK_STATE_COMPLETED", "", True,
+            (), "artifact-task", "artifact-context"), artifacts=({"artifactId": "structured", "parts": (
+                {"text": "artifact-content-canary"}, {"data": {"marker": "json-value-canary"}},
+                {"raw": base64.b64encode(b"file-content-canary").decode(), "filename": "report.txt", "mediaType": "text/plain"},
+            )},), public_messages_complete=True)
+        record = await self.start()
+        self.assertEqual(record.state, "COMPLETED", record.error_code)
+        self.assertEqual(self.target.parent.name, "a2a")
+        self.assertEqual((self.target / "artifact-001-part-001.txt").read_text(), "artifact-content-canary")
+        self.assertEqual(json.loads((self.target / "artifact-001-part-002.json").read_text()), {"marker": "json-value-canary"})
+        manifest = json.loads((self.target / "manifest.json").read_text())
+        parts = manifest["artifacts"][0]["parts"]
+        self.assertEqual([part["type"] for part in parts], ["text", "data", "file"])
+        contexts = json.dumps([call.messages for call in self.model.calls])
+        for content in ("artifact-content-canary", "json-value-canary", "file-content-canary"):
+            self.assertNotIn(content, contexts)
+        self.assertIn("/workspace/a2a/", contexts)
+        self.assertEqual(self.detector.calls, [])
+        self.assertEqual(self.sent.call_count, 1)
 
     async def test_typed_artifact_canaries_only_appear_after_explicit_file_read(self):
         self.exempt()

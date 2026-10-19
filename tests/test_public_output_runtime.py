@@ -150,7 +150,7 @@ class PublicOutputRuntimeTests(AuthAppTestCase):
         for reason in ("allowed", "rejected"):
             with self.subTest(reason=reason):
                 detector = ScriptedModel([ModelResponse(message=json.dumps({"verdict": verdict}), finish_reason="stop")
-                    for verdict in ("clear", "clear", "suspicious", "clear")])
+                    for verdict in ("clear", "suspicious", "clear")])
                 detector.context_window, detector.max_tokens = 128000, 512
                 detector.count_tokens = lambda text: max(1, len(text) // 4)
                 agent.guardrail_classifier = GuardrailClassifier(detector, clock=agent.workflow_store.current_time)
@@ -230,7 +230,7 @@ class NestedPublicOutputRuntimeTests(unittest.TestCase):
                 self.policy(agent, "allow", "core_python_exec")
                 self.policy(agent, "allow", name)
                 detector = ScriptedModel([ModelResponse(message=json.dumps({"verdict": verdict}), finish_reason="stop")
-                    for verdict in ("clear", "clear", "clear", "suspicious", "clear")])
+                    for verdict in ("clear", "suspicious", "clear")])
                 detector.context_window, detector.max_tokens = 128000, 512
                 detector.count_tokens = lambda text: max(1, len(text) // 4)
                 agent.guardrail_classifier = GuardrailClassifier(detector, clock=lambda: self.now[0])

@@ -2,7 +2,7 @@ import type { AgentSettings, HistoryItem, Interaction, Peer, Schedule, Settings,
 import type { PeerConversation } from "../../ui/src/PeerConversations";
 
 export type DemoMode = "normal" | "empty" | "error" | "loading";
-export type DemoSettingsScenario = "default" | "off" | "inherit" | "discovery-error" | "conflict";
+export type DemoSettingsScenario = "default" | "off" | "inherit" | "discovery-error" | "conflict" | "guardrails-off";
 export const markdown = `## Результат проверки
 Подготовлены **три пункта** и файл с итогами.
 
@@ -75,7 +75,7 @@ export const demoHistory: HistoryItem[] = [
 export const demoTask: Task = { id: "demo-task", contextId: "demo", status: { state: "TASK_STATE_COMPLETED" } };
 export const demoRow = { context_id: "demo", latest_task_id: "demo-task", active: false, title: "Проверка отчёта" };
 const settings: Settings = { revision: 1, hitl_timeout_seconds: 86400, owner_answer_timeout_seconds: 86400, guardrails_timeout_seconds: 86400, attachment_limit_bytes: 25000000, remote_timeout_seconds: 86400, remote_poll_interval_seconds: 300 };
-const profile: AgentSettings = { revision: 1, profile_prompt: "Помогай владельцам с документами и расчётами. Задавай вопросы, когда данных недостаточно.", model_id: "demo-model", context_window: 128000, structured_output: { reasoning: "auto", compatibility: "auto" }, mcp_servers: [{ name: "documents", url: "https://mcp.example.invalid/mcp", enabled: true, header_name: "Authorization", has_header_value: true }], inherits: { profile_prompt: false, model_id: false, mcp_servers: false, context_window: true, structured_output: true } };
+const profile: AgentSettings = { revision: 1, profile_prompt: "Помогай владельцам с документами и расчётами. Задавай вопросы, когда данных недостаточно.", model_id: "demo-model", context_window: 128000, structured_output: { reasoning: "auto", compatibility: "auto" }, guardrails_enabled: true, mcp_servers: [{ name: "documents", url: "https://mcp.example.invalid/mcp", enabled: true, header_name: "Authorization", has_header_value: true }], inherits: { profile_prompt: false, model_id: false, mcp_servers: false, context_window: true, structured_output: true, guardrails_enabled: true } };
 const tools: ToolPolicy[] = ["core_terminal_exec", "core_python_exec", "core_ask_owner", "core_agent_send_message", "core_cron_create"].map((canonical_name, i) => ({ canonical_name, origin: `builtin:${canonical_name}`, mode: i === 2 ? "allow" : i === 4 ? "deny" : "require_hitl", guardrails_exempt: i === 2, revision: 1 }));
 const peer: Peer = { id: "analyst", name: "analyst", description: "Помогает с анализом данных и подготовкой отчётов", url: "https://agent.example.invalid/a2a/external/", enabled: true, header_name: "Authorization", has_header_value: true, revision: 1 };
 const schedule: Schedule = { id: "daily", context_id: "demo", prompt: "Подготовь ежедневный отчёт", expression: "0 9 * * 1-5", timezone: "Europe/Moscow", enabled: true, revision: 1, next_due_at: "2027-01-15T06:00:00Z", active_task_id: null };
@@ -88,6 +88,10 @@ export function createDemoRequest(mode: DemoMode = "normal", taskState = "TASK_S
   if (settingsScenario === "off" || settingsScenario === "inherit") {
     configuration.structured_output = { reasoning: settingsScenario, compatibility: "chat_template" };
     configuration.inherits.structured_output = false;
+  }
+  if (settingsScenario === "guardrails-off") {
+    configuration.guardrails_enabled = false;
+    configuration.inherits.guardrails_enabled = false;
   }
   let conflictPending = settingsScenario === "conflict";
   let policies = structuredClone(tools), peers = mode === "empty" ? [] : [structuredClone(peer)];
@@ -118,8 +122,10 @@ export function createDemoRequest(mode: DemoMode = "normal", taskState = "TASK_S
         }
         const { expected_revision, ...values } = body;
         if (expected_revision !== configuration.revision) return json({ error: { code: "SETTINGS_CONFLICT" } }, 409);
+        if ("guardrails_enabled" in values && typeof values.guardrails_enabled !== "boolean")
+          return json({ error: { code: "SETTINGS_INVALID" } }, 400);
         configuration = { ...configuration, ...values, revision: configuration.revision + 1 };
-        for (const key of ["profile_prompt", "model_id", "mcp_servers", "context_window", "structured_output"] as const) {
+        for (const key of ["profile_prompt", "model_id", "mcp_servers", "context_window", "structured_output", "guardrails_enabled"] as const) {
           if (key in body) {
             configuration.inherits = { ...configuration.inherits, [key]: body[key] === null };
             if (body[key] === null) Object.assign(configuration, { [key]: profile[key] });

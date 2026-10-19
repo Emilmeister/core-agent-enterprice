@@ -18,7 +18,7 @@ from .security import safe_url
 from .structured_output import STRUCTURED_OUTPUT_DEFAULT, validate_structured_output
 
 
-CONFIG_FIELDS = frozenset({"profile_prompt", "model_id", "mcp_servers", "context_window", "structured_output"})
+CONFIG_FIELDS = frozenset({"profile_prompt", "model_id", "mcp_servers", "context_window", "structured_output", "guardrails_enabled"})
 RESERVED_HEADERS = RESERVED_MCP_HEADERS | frozenset({
     "host", "content-length", "connection", "transfer-encoding", "upgrade", "trailer", "te",
     "proxy-authorization", "traceparent", "tracestate", "baggage",
@@ -117,6 +117,10 @@ class AgentSettingsStore:
         if "structured_output" in values:
             policy = values["structured_output"]
             config["structured_output"] = validate_structured_output(policy) if policy is not None else None
+        if "guardrails_enabled" in values:
+            if type(values["guardrails_enabled"]) is not bool:
+                raise CoreError("SETTINGS_INVALID")
+            config["guardrails_enabled"] = values["guardrails_enabled"]
         if "mcp_servers" in values:
             supplied = values["mcp_servers"]
             if supplied is not None and (not isinstance(supplied, list) or len(supplied) > 32):
@@ -210,6 +214,7 @@ class AgentSettingsStore:
                 else agent.agent_config.model["route"], "mcp_servers": servers,
                 "context_window": config.get("context_window") or agent.context_window,
                 "structured_output": copy.deepcopy(config.get("structured_output") or STRUCTURED_OUTPUT_DEFAULT),
+                "guardrails_enabled": config.get("guardrails_enabled", True),
                 "inherits": {key: config.get(key) is None for key in CONFIG_FIELDS}}
 
     def catalogs(self, tenant, declarations, workflow_store):

@@ -484,7 +484,7 @@ Serving entrypoint MUST:
 
 ## Настройки владельцев
 
-### UI-02A. Профиль, модель и MCP
+### UI-02A. Профиль, модель, MCP и проверка материалов
 
 `GET/PUT /api/agent-settings` доступны только verified company owners. Settings
 имеют company scope и одну CAS `revision`; PUT содержит `expected_revision` и
@@ -493,6 +493,16 @@ Serving entrypoint MUST:
 наследует deployment default, пустой profile явно очищает профиль. Read
 возвращает effective значения и признаки наследования. Профиль ограничен
 65 536 UTF-8 bytes и не может менять safety, host/kernel или capability policy.
+
+`guardrails_enabled` — строгое boolean поле с default `true`; `null`, строки
+и числа отклоняются. PUT без этого поля сохраняет прежнее значение. Старые
+immutable revisions и workflow snapshots без поля читаются как `true` без
+перезаписи или миграции. Настройка закрепляется в snapshot новых root Tasks,
+включая cron, и наследуется child/background/recovery. В UI отдельный
+переключатель «Проверять материалы на prompt injection» поясняет, что изменение
+действует на новые задачи. Выключение исключает новые LLM-проверки содержимого,
+сохраняя auth, schema, tool policy/HITL и ограничения среды; существующие
+ожидания и запреты не отменяются. Полная семантика — GUARD-05.
 
 `GET /api/agent-settings/models` выполняет только bounded read-only GET `models`
 на фиксированном deployment provider connection, без model inference. Response
@@ -562,7 +572,8 @@ serving role не изменяет/удаляет revisions. Откат посл
 | Настройка UI | Default | Семантика |
 |---|---|---|
 | Tool policy | HITL для нового tool | `allow`, `require_hitl`, `deny` внутри platform ceiling |
-| Guardrails exception | выключена | Только owner; отдельно для arguments/results конкретного tool |
+| Guardrails enabled | включено | Только owner; LLM-проверка новых материалов, значение закрепляется при приёме Task |
+| Guardrails exception | выключена | Только owner; отдельно для результатов конкретного tool |
 | HITL timeout | 24 часа | Абсолютный срок конкретного запроса |
 | Owner-answer timeout | 24 часа | Отдельный срок вопроса владельцу |
 | Guardrails decision timeout | 24 часа | Отдельный срок решения по материалу |

@@ -46,7 +46,7 @@ function ScreenContent({ screen, mode, working, settingsScenario }: { screen: Sc
 }
 const meta = { title: "Экраны/Приложение", component: ScreenExample,
   args: { screen: "Чат", mode: "normal", working: false, settingsScenario: "default" },
-  argTypes: { screen: { control: "select", options: screens }, mode: { control: "select", options: ["normal", "empty", "loading", "error"] }, working: { control: "boolean" }, settingsScenario: { control: "select", options: ["default", "off", "inherit", "discovery-error", "conflict"] } },
+  argTypes: { screen: { control: "select", options: screens }, mode: { control: "select", options: ["normal", "empty", "loading", "error"] }, working: { control: "boolean" }, settingsScenario: { control: "select", options: ["default", "off", "inherit", "discovery-error", "conflict", "guardrails-off"] } },
 } satisfies Meta<typeof ScreenExample>;
 export default meta;
 type Story = StoryObj<typeof meta>;
@@ -59,6 +59,7 @@ export const Tools: Story = { name: "Инструменты", args: { screen: "�
 export const Connections: Story = { name: "Внешние агенты", args: { screen: "Внешние агенты" } };
 export const Access: Story = { name: "Доступ к агенту", args: { screen: "Доступ к агенту" } };
 export const Configuration: Story = { name: "Настройки", args: { screen: "Настройки" } };
+export const GuardrailsOff: Story = { name: "Настройки — проверка материалов выключена", args: { screen: "Настройки", settingsScenario: "guardrails-off" } };
 export const StructuredReasoningOff: Story = { name: "Настройки — рассуждения выключены", args: { screen: "Настройки", settingsScenario: "off" } };
 export const StructuredReasoningInherited: Story = { name: "Настройки — без переопределения рассуждений", args: { screen: "Настройки", settingsScenario: "inherit" } };
 export const ModelsUnavailable: Story = { name: "Настройки — каталог моделей недоступен", args: { screen: "Настройки", settingsScenario: "discovery-error" } };

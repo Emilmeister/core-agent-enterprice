@@ -241,6 +241,8 @@ class OwnerUIFilesBrowserTests(unittest.TestCase):
         self.assertIn("PASS working publication survives browser reload without duplicate Messages or Artifacts", proof)
         self.assertIn("PASS final Message follows the mixed Artifact without creating another Artifact", proof)
         self.assertIn("PASS owner profile is persisted independently", proof)
+        self.assertIn("PASS guardrail disable persists independently", proof)
+        self.assertIn("PASS guardrail enable persists independently", proof)
         self.assertIn("PASS provider model selection preserves independently saved profile", proof)
         self.assertIn("PASS provider model outage preserves current selection", proof)
         self.assertIn("PASS MCP owner connection is persisted with write-only credentials", proof)

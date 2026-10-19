@@ -628,6 +628,65 @@ class OwnerAgentConfigurationAPITests(AuthAppTestCase):
         self.assertEqual(agent._context_window(child.snapshot), 65536)
         self.assertEqual(agent._context_window({}), agent.context_window)
 
+    async def test_guardrails_setting_owner_authority_defaults_cas_and_persistence(self):
+        from core_agent.agent_settings import AgentSettingsStore
+        agent = self.app.state.core_agent
+        store = agent.agent_settings_store
+        tenant = self.app.state.authenticator.settings.tenant
+        endpoint = "/api/agent-settings"
+        initial = await self.http.get(endpoint, headers=self.headers("owner-a"))
+        self.assertIs(initial.json()["guardrails_enabled"], True)
+        self.assertTrue(initial.json()["inherits"]["guardrails_enabled"])
+        denied = await self.http.get(endpoint, headers=self.headers("external-a"))
+        self.assertEqual(denied.status_code, 403)
+        denied = await self.http.put(endpoint, headers=self.headers("external-a"),
+            json={"expected_revision": 0, "guardrails_enabled": False})
+        self.assertEqual(denied.status_code, 403)
+        with patch("core_agent.agent_settings_api.provider_models") as discovery:
+            saved = await self.http.put(endpoint, headers=self.headers("owner-a"),
+                json={"expected_revision": 0, "guardrails_enabled": False})
+            discovery.assert_not_called()
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertIs(saved.json()["guardrails_enabled"], False)
+        self.assertFalse(saved.json()["inherits"]["guardrails_enabled"])
+        self.assertEqual(saved.json()["revision"], 1)
+        self.assertEqual(saved.headers["cache-control"], "no-store")
+        shared = await self.http.get(endpoint, headers=self.headers("owner-b"))
+        self.assertEqual(shared.json(), saved.json())
+        stale = await self.http.put(endpoint, headers=self.headers("owner-b"),
+            json={"expected_revision": 0, "guardrails_enabled": True, "profile_prompt": "stale"})
+        self.assertEqual(stale.status_code, 409)
+        unrelated = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 1, "profile_prompt": "Updated profile"})
+        self.assertEqual(unrelated.status_code, 200, unrelated.text)
+        self.assertIs(unrelated.json()["guardrails_enabled"], False)
+        if self.use_postgres:
+            store = AgentSettingsStore(agent.workflow_store, self.push_encryption_key, database=store.database)
+        self.assertIs(store.get(tenant)["config"]["guardrails_enabled"], False)
+        self.assertIs(store.get(tenant, 1)["config"]["guardrails_enabled"], False)
+        foreign = store.public(store.get(tenant + "-other"), agent)
+        self.assertIs(foreign["guardrails_enabled"], True)
+        enabled = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 2, "guardrails_enabled": True})
+        self.assertEqual(enabled.status_code, 200, enabled.text)
+        self.assertIs(enabled.json()["guardrails_enabled"], True)
+        self.assertEqual(enabled.json()["profile_prompt"], "Updated profile")
+        self.assertIs(store.get(tenant, 1)["config"]["guardrails_enabled"], False)
+        self.assertFalse(self.model.calls)
+
+    async def test_guardrails_setting_rejects_non_boolean_values_atomically(self):
+        endpoint = "/api/agent-settings"
+        for value in (None, 0, 1, 1.0, "true", "false", [], {}):
+            with self.subTest(value=value):
+                response = await self.http.put(endpoint, headers=self.headers("owner-a"),
+                    json={"expected_revision": 0, "guardrails_enabled": value, "profile_prompt": "must not persist"})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(response.json(), {"error": {"code": "SETTINGS_INVALID"}})
+        current = await self.http.get(endpoint, headers=self.headers("owner-a"))
+        self.assertEqual(current.json()["revision"], 0)
+        self.assertEqual(current.json()["profile_prompt"], "")
+        self.assertIs(current.json()["guardrails_enabled"], True)
+
     async def test_structured_output_defaults_cas_reset_and_independent_save(self):
         agent = self.app.state.core_agent
         store = agent.agent_settings_store
@@ -724,8 +783,11 @@ class OwnerAgentConfigurationAPITests(AuthAppTestCase):
         self.assertEqual(current.status_code, 200, current.text)
         self.assertEqual(current.json()["structured_output"], {"reasoning": "auto", "compatibility": "auto"})
         self.assertTrue(current.json()["inherits"]["structured_output"])
+        self.assertIs(current.json()["guardrails_enabled"], True)
+        self.assertTrue(current.json()["inherits"]["guardrails_enabled"])
         updated = store.update(tenant, {"context_window": 65536}, expected_revision=1, actor_id="owner")
         self.assertTrue(store.public(updated, agent)["inherits"]["structured_output"])
+        self.assertIs(store.public(updated, agent)["guardrails_enabled"], True)
         policy = {"reasoning": "off", "compatibility": "thinking"}
         updated = store.update(tenant, {"structured_output": policy}, expected_revision=2, actor_id="owner")
         self.assertEqual(updated["config"]["structured_output"], policy)
@@ -879,7 +941,7 @@ class OwnerRuntimeAPITests(AuthAppTestCase):
         ])
         self.agent.guardrail_classifier = GuardrailClassifier(ScriptedModel([
             ModelResponse(message=json.dumps({"verdict": verdict}), finish_reason="stop")
-            for verdict in ("clear", "clear", "suspicious")
+            for verdict in ("clear", "suspicious")
         ]), token_counter=len)
         self.agent.interaction_store.update_policy(
             self.app.state.authenticator.settings.tenant, "core_task_list", "builtin:core_task_list",

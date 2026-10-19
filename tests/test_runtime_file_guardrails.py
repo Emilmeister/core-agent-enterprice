@@ -60,6 +60,31 @@ class RuntimeFileGuardrailTests(unittest.TestCase):
         self.assertIn("/workspace/a2a/", model.calls[-1].context)
         self.assertEqual(detector.generate.call_count, 2)
 
+    def test_disabled_guardrails_publish_files_without_detector_and_keep_integrity_checks(self):
+        for tampered in (False, True):
+            with self.subTest(tampered=tampered):
+                data = b"%PDF binary content without text extraction"
+                agent, model, detector, service, batch, binding = self.files(files=[
+                    {"name": "report.pdf", "media_type": "application/pdf", "raw": data}])
+                record = agent.workflow_store.lookup_task("task")
+                record.snapshot["guardrails_enabled"] = False
+                agent.workflow_store._records[record.run_id] = record
+                target = service.workspaces.workspace(binding) / "a2a" / batch["batch_id"] / "report.pdf"
+                if tampered:
+                    (service.workspaces.root / "private/uploads" / batch["batch_id"] / "report.pdf").write_bytes(b"changed")
+                    with self.assertRaises(CoreError) as caught:
+                        agent.resume_task("task")
+                    self.assertEqual(caught.exception.code, "ARTIFACT_INTEGRITY_FAILED")
+                    self.assertFalse(target.exists())
+                    self.assertFalse(model.calls)
+                else:
+                    self.assertEqual(agent.resume_task("task").message, "done")
+                    self.assertEqual(target.read_bytes(), data)
+                    self.assertIn("/workspace/a2a/", model.calls[-1].context)
+                    self.assertNotIn(data.decode(), model.calls[-1].context)
+                detector.generate.assert_not_called()
+                self.assertFalse(agent.material_review_store.rows)
+
     def test_reject_excludes_entire_batch_and_continues_with_safe_notice(self):
         agent, model, detector, service, batch, binding = self.files("clear", "clear", "clear", "suspicious", files=[
             {"name": "good.txt", "media_type": "text/plain", "raw": b"good"},
@@ -74,6 +99,22 @@ class RuntimeFileGuardrailTests(unittest.TestCase):
         self.assertIn(batch["batch_id"], model.calls[-1].context)
         self.assertNotIn("good.txt", model.calls[-1].context)
         self.assertNotIn("bad.txt", model.calls[-1].context)
+
+    def test_disabled_guardrails_publish_followup_file_before_delivering_inbox(self):
+        agent, model, detector, service, batch, binding = self.files()
+        record = agent.workflow_store.lookup_task("task")
+        record.snapshot["guardrails_enabled"] = False
+        record.snapshot.pop("file_batch_id")
+        service.store.rows[batch["batch_id"]]["sequence"] = 1
+        agent.workflow_store.append_inbound("task", tenant_id="company", owner_id="owner", context_id="chat",
+            message_id="followup", content="read attached", provenance={"file_batch_id": batch["batch_id"]})
+        self.assertEqual(agent.resume_task("task").message, "done")
+        self.assertFalse(agent.workflow_store.pending_inbound(record))
+        self.assertIn("read attached", model.calls[-1].context)
+        self.assertIn("report.txt", model.calls[-1].context)
+        self.assertEqual((service.workspaces.workspace(binding) / "a2a" / batch["batch_id"] / "report.txt").read_bytes(),
+                         b"private file text")
+        detector.generate.assert_not_called()
 
     def test_unsupported_and_empty_files_require_owner_even_with_clear_detector(self):
         for data, media in ((b"%PDF binary", "application/pdf"), (b"", "text/plain"), (b"bad\x00text", "text/plain"),

@@ -735,6 +735,11 @@ run получает отдельные MCP session и negotiated version; пе�
   MCP-секреты шифруются в исторических revisions, читаются только runtime и не
   возвращаются в owner GET. Новое подключение не наследует auth другого сервера.
   Сохранённый profile prompt не заменяет protected kernel или safety rules.
+  `guardrails_enabled` — boolean, default true, пропуск поля сохраняет значение.
+  Оно закрепляется в новых root/cron runs и наследуется child/background/recovery;
+  старые revisions/snapshots без поля сохраняют включённую проверку. Выключение
+  исключает новые LLM-проверки материалов, но не отменяет сохранённые waits/отказы
+  и не меняет auth/schema/policy/HITL/sandbox. UI поясняет область новых задач.
   Model ID admitted run применяется к основным turns, compaction и memory NER;
   embeddings и отдельная guardrails model остаются deployment configuration.
   `structured_output` задаёт reasoning `auto/off/inherit` и способ совместимости
@@ -862,8 +867,11 @@ run получает отдельные MCP session и negotiated version; пе�
   сохраняется; отказ провайдера не вызывает fallback без схемы.
   File quarantine подключён к внутреннему canonical admission;
   public raw FileParts принимаются через scoped admission после native sandbox proof.
-- Initial/follow-up input, owner answers, tool args/results, background и nested
-  Python проходят runtime material gates. Известный результат сохраняется до
+- Initial/follow-up input, owner answers, tool results, background и nested
+  Python results проходят runtime material gates. Для новых tool arguments
+  модели LLM-проверка не создаётся; schema, policy/HITL и budgets сохраняются.
+  Legacy argument reviews завершают сохранённый lifecycle, включая checking,
+  с прежними attempt counters/deadlines и без автоматического одобрения. Известный результат сохраняется до
   review; возобновление раскрывает его без повторного dispatch. Pending nested
   review и ошибка его persistence сначала останавливают Python, поэтому код не
   может перехватить host-side отказ и продолжить выполнение.

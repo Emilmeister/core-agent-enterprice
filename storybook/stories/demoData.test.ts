@@ -53,6 +53,24 @@ test("context window can be set and reset in the settings demo", async () => {
   assert.equal(reset.inherits.context_window, true);
 });
 
+test("guardrail setting preserves other settings, rejects invalid values and can be reenabled", async () => {
+  const request = createDemoRequest("normal", undefined, "guardrails-off");
+  const initial = await (await request("/api/agent-settings")).json();
+  assert.equal(initial.guardrails_enabled, false);
+  assert.equal(initial.inherits.guardrails_enabled, false);
+  const invalid = await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: 1, guardrails_enabled: null }),
+  });
+  assert.equal(invalid.status, 400);
+  const saved = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: 1, guardrails_enabled: true }),
+  })).json();
+  assert.equal(saved.guardrails_enabled, true);
+  assert.equal(saved.model_id, initial.model_id);
+  assert.deepEqual(saved.structured_output, initial.structured_output);
+  assert.deepEqual(saved.mcp_servers, initial.mcp_servers);
+});
+
 test("structured settings preserve unrelated values, reject stale saves and reset to deployment", async () => {
   const request = createDemoRequest();
   const structured_output = { reasoning: "off", compatibility: "chat_template" };
