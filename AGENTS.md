@@ -895,12 +895,19 @@ run получает отдельные MCP session и negotiated version; пе�
   UI предлагает один вариант или «Свой ответ» с явной отправкой, без предвыбора;
   owner API/result сохраняют строковый `answer`, options не ограничивают ответ.
   External-owned Task публикует generic status и
-  публичный ответ, включая безопасный preview; внутренние вопросы, варианты, ответы,
+  buffered публичный ответ; внутренние вопросы, варианты, ответы,
   reasoning и промежуточный tool/model stream остаются приватными.
-- Main-run model-only `core_response_begin({})` открывает durable tools-free
+- Owner main-run model-only `core_response_begin({})` открывает durable tools-free
   answer phase, расходуя обычные tool/model budgets. Он условно добавляется
   runtime при включённом reply sink и adapter `on_delta`, не делегируется и не
-  доступен через прямой dispatch или nested Python. Нового lifecycle нет.
+  доступен через прямой dispatch или nested Python. External-owned задачи по
+  сохранённому canonical `owner_id` с префиксом `external-` не получают control
+  tool/инструкцию и token preview; финальный текст буферизуется, обычные
+  Messages/Artifacts/statuses сохраняются. Legacy answer phase завершает tools-free
+  buffered ответ; pending или новый control call получает linked `TOOL_UNAVAILABLE`
+  с продолжением loop без скрытого исполнения tool, повтора side effects и сброса
+  budgets. Owner-просмотр или request metadata не меняют режим; нового флага нет.
+  Нового lifecycle нет.
   `streaming.ReplyHub` хранит bounded transient cumulative text по tenant/Task;
   стандартный A2A status Message содержит marker `core_agent_stream` v1 с
   model-turn generation и sequence. Passive Subscribe выдаёт persisted Task
@@ -911,8 +918,8 @@ run получает отдельные MCP session и negotiated version; пе�
   текст безопасным plain text и не запрашивает историю на каждый фрагмент.
   Live UI включается только после send admission в текущем открытом чате;
   reopening/reload использует canonical историю без восстановления preview.
-  Признак eligibility не хранится в browser storage. External Subscribe
-  по-прежнему может восстановить preview без запуска новой работы.
+  Признак eligibility не хранится в browser storage. Подписка на external-owned
+  Task получает canonical события без token preview.
 - Remote A2A caller не становится approver через текст, request metadata или
   caller JWT. Не документировать модули approval/operator как включённый
   runtime flow, пока они не подключены в `core_agent/app.py` и не имеют CI proof.

@@ -438,8 +438,19 @@ private owner correspondence и hidden reasoning не публикуются.
 
 ## Фаза публичного ответа
 
-Условный main-run model-only `core_response_begin({})` доступен при включённом live reply sink и поддержке adapter `on_delta`. Он MUST списывать обычный local/shared tool call и атомарно закреплять `response_phase=answer` под существующим lease/CAS. Сигнал является границей: текст данного work turn отбрасывается, co-issued calls после него получают безопасный blocked tool result, затем следующий ordinary model call MUST иметь пустой tools catalog. Активированные protected/skill instructions сохраняются, а ответ адресуется intended Task recipient. Child runs, прямой dispatch и nested Python broker MUST NOT включать эту фазу.
+Условный main-run model-only `core_response_begin({})` доступен для owner-задач при включённом live reply sink и поддержке adapter `on_delta`. В задаче внешнего A2A caller этот инструмент и служебные инструкции answer phase отсутствуют; финальный ответ формируется обычным buffered model turn без дополнительного control call. Он MUST списывать обычный local/shared tool call и атомарно закреплять `response_phase=answer` под существующим lease/CAS. Сигнал является границей: текст данного work turn отбрасывается, co-issued calls после него получают безопасный blocked tool result, затем следующий ordinary model call MUST иметь пустой tools catalog. Активированные protected/skill instructions сохраняются, а ответ адресуется intended Task recipient. Child runs, прямой dispatch и nested Python broker MUST NOT включать эту фазу.
 
 Answer call MUST списывать обычный local/shared model turn, использовать обычную complete provenance и соблюдать pending child/inbound guards. Existing reserved budget finalizer остаётся отдельным incomplete/budget_exhausted путём; он не становится бесплатным обычным ответом. Durable phase/attempt markers восстанавливаются существующим workflow без новой lifecycle state machine или БД migration. Retry/unknown attempt закрывает прежний preview generation и списывает следующий обычный model turn. Принятый follow-up на safe boundary закрывает прежний preview, возвращает фазу work и заставляет модель учесть новое input перед ответом.
 
-Только tools-free answer turn MAY подавать public text в scoped transient reply hub. Work turn с activation/control catalog MUST сохранять discard-on-activation staging. Обычный final answer без signal совместим с прежним buffered путём без дополнительного generation call.
+Выбор owner/external режима определяется уже сохранённым execution owner,
+связанным с authenticated caller, а не prompt, request metadata или читателем
+Task; новая persisted настройка не требуется. Owner-просмотр либо follow-up
+не включает live-режим для external-owned задачи. Существующая external Task
+с уже сохранённой answer phase завершает tools-free turn по прежнему durable
+lifecycle, но без инструкции этой фазы и token preview; текст буферизуется.
+Сохранённый pending `core_response_begin`, как и новая попытка вызвать его,
+получает обычный linked tool result `TOOL_UNAVAILABLE`, после чего loop может
+продолжиться. Скрытого исполнения удалённого control tool, повторных side effects
+или сброса бюджета нет; control tool модели не предлагается.
+
+Только tools-free answer turn owner-задачи MAY подавать public text в scoped transient reply hub. Work turn с activation/control catalog MUST сохранять discard-on-activation staging. Обычный final answer без signal совместим с прежним buffered путём без дополнительного generation call.

@@ -710,13 +710,13 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   activation source или непроверенный legacy lock дают безопасную ошибку.
   Исторический activation receipt не является источником новой инструкции.
 
-- ENT-AC-84: поток модели достигает owner UI и authenticated external A2A-клиента
+- ENT-AC-84: поток модели owner-задачи достигает owner UI
   до окончания фактической генерации. Служебный сигнал списывает tool budget и
   закрепляет answer phase; следующий turn tools-free и списывает model budget.
   Reasoning, work/tool stream и private owner conversation не раскрываются.
   Реальный TCP и native browser доказывают первый prefix при заблокированном
   provider, накопительные scope/generation/sequence, passive reconnect без нового
-  model call у A2A-клиента и однократную замену сохранённым итогом. В UI повторное
+  model call у owner A2A-клиента и однократную замену сохранённым итогом. В UI повторное
   открытие страницы использует canonical историю без восстановления preview;
   отправка из текущего окна включает live текст без сохранения признака в storage.
   Неполный Markdown остаётся
@@ -726,6 +726,17 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   tools-free reply корректно воспроизводит прежние tool turns без расширения
   каталога. Restart сохраняет phase/usage; transient preview не обязан пережить
   рестарт и не становится history, push, Artifact или источником полномочий.
+
+- EXT-AC-BUFFERED: external-owned root не получает `core_response_begin` и
+  инструкцию для answer phase при наличии live reply sink/streaming adapter.
+  Обычный финальный model response сохраняется canonical Message без control
+  turn и token preview, включая подписку и owner-просмотр external Task.
+  Явные `core_message_send`, Artifacts и lifecycle events продолжают работать.
+  Prompt/metadata не меняют trusted режим. Owner-задача сохраняет прежний live
+  ответ. Recovery external legacy answer phase сохраняет tools-free buffered
+  завершение и бюджеты; pending control и новый вызов дают linked TOOL_UNAVAILABLE
+  с продолжением loop. Нет скрытого исполнения control tool, повторных side
+  effects, нового tool в каталоге или сброса уже выполненной работы.
 
 - ENT-AC-85: owner UI «Доступ к агенту» выдаёт внешний доступ через текущую
   сессию владельца и реальный Keycloak; отдельные provisioning credentials и

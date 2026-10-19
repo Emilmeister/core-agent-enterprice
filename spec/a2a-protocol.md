@@ -360,8 +360,17 @@ Owner и external A2A endpoints используют один A2A lifecycle и �
 
 ## Публичный live preview ответа
 
-Основной workflow MAY использовать служебный `core_response_begin`, чтобы следующий обычный tools-free model turn передавал реальный публичный ответ во время генерации. Его cumulative snapshots MUST использовать стандартный нетерминальный `statusUpdate.status.message`, agent role, только публичные text Parts и metadata `{"partial":true,"core_agent_stream":{"version":1,"generation":N,"sequence":S}}`. `generation` — положительный durable номер model turn данной Task; `sequence` — положительный возрастающий номер внутри generation. Новый generation заменяет прежний preview. `superseded:true` с пустыми Parts закрывает generation; дальнейший текст этого generation MUST NOT публиковаться.
+Основной owner workflow MAY использовать служебный `core_response_begin`, чтобы следующий обычный tools-free model turn передавал реальный публичный ответ во время генерации. Его cumulative snapshots MUST использовать стандартный нетерминальный `statusUpdate.status.message`, agent role, только публичные text Parts и metadata `{"partial":true,"core_agent_stream":{"version":1,"generation":N,"sequence":S}}`. `generation` — положительный durable номер model turn данной Task; `sequence` — положительный возрастающий номер внутри generation. Новый generation заменяет прежний preview. `superseded:true` с пустыми Parts закрывает generation; дальнейший текст этого generation MUST NOT публиковаться.
 
-Preview MUST NOT содержать hidden reasoning, work draft, arguments/results инструментов или raw owner question/answer. External caller получает только предназначенный ему публичный ответ через прежний authenticated Task scope. Fresh Subscribe MUST сначала выдать persisted Task, затем доступный preview и durable изменения; первый terminal event закрывает stream. Initial SendStreamingMessage и passive Subscribe MUST поддерживать этот preview, включая direct workflow recovery, cron и продолжение durable waits. Subscribe не запускает workflow.
+Preview MUST NOT содержать hidden reasoning, work draft, arguments/results инструментов или raw owner question/answer. Для owner-задач Fresh Subscribe MUST сначала выдать persisted Task, затем доступный preview и durable изменения; первый terminal event закрывает stream. Owner Initial SendStreamingMessage и passive Subscribe MUST поддерживать этот preview, включая direct workflow recovery, cron и продолжение durable waits. Subscribe не запускает workflow.
+
+Для external-owned Task `core_response_begin` и его служебные инструкции не
+предлагаются модели; частично сгенерированный текст не публикуется. Внешний caller
+получает предназначенный ему canonical итог после генерации. Send/Subscribe
+сохраняют обычные статусы и явно опубликованные Messages/Artifacts; отключение
+token preview не отключает A2A lifecycle или long-running взаимодействия.
+Режим закреплён trusted execution scope и не меняется request metadata либо
+подключением владельца к external-задаче. Recovery ранее сохранённой answer phase
+завершает её buffered путём с прежним учётом budgets и без повторных side effects.
 
 Preview является transient transport state: один bounded hub live serving process с ключом `(tenant,task)`, максимум 64 Task и 256KiB UTF-8 публичного префикса на Task. Eviction, process restart или обращение к другому serving process MAY потерять preview; durable Get/history/push, canonical final Message v2 и уже published immutable Artifacts остаются authoritative, не сохраняют partial progress и содержат полный итог; legacy final Artifacts неизменны. Медленный subscriber получает последний cumulative snapshot, а не неограниченный backlog токенов. Legacy plain final answer без control signal сохраняет buffered совместимость; runtime MUST NOT повторно генерировать готовый draft или изображать streaming задержанным replay.

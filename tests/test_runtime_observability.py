@@ -402,10 +402,10 @@ class RuntimeTests(unittest.TestCase):
         first = make_agent(CrashModel(), reply_hub=ReplyHub(min_chars=1))
         self.addCleanup(first.close)
         with self.assertRaises(CoreError) as failure:
-            first.run(RunRequest("hello"), task_id="recover-reply", identity="external-alice",
+            first.run(RunRequest("hello"), task_id="recover-reply", identity="owner-alice",
                       session_id="chat", tenant_id="company")
         self.assertEqual(failure.exception.code, "LEASE_LOST")
-        record = first.workflow_store.by_task("recover-reply", tenant_id="company", owner_id="external-alice")
+        record = first.workflow_store.by_task("recover-reply", tenant_id="company", owner_id="owner-alice")
         self.assertEqual(record.snapshot["response_phase"], "answer")
         self.assertEqual(record.snapshot["tool_calls"], 1)
         self.assertEqual(record.snapshot["turns"], 2)
@@ -475,7 +475,7 @@ class RuntimeTests(unittest.TestCase):
         model = ReplyModel()
         agent = make_agent(model, reply_hub=hub)
         self.addCleanup(agent.close)
-        result = agent.run(RunRequest("hello"), task_id="public-reply", identity="external-alice",
+        result = agent.run(RunRequest("hello"), task_id="public-reply", identity="owner-alice",
                            session_id="public-chat", tenant_id="company")
         self.assertIn("core_response_begin", model.catalogs[0])
         self.assertEqual(model.catalogs[1], {})
@@ -484,7 +484,97 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.usage.tool_calls, 1)
         self.assertEqual(result.message, "Public prefix and final answer.")
         self.assertNotIn("private work draft", str(agent.workflow_store.by_task(
-            "public-reply", tenant_id="company", owner_id="external-alice").result))
+            "public-reply", tenant_id="company", owner_id="owner-alice").result))
+
+    def test_external_recovery_rejects_queued_response_control_and_continues(self):
+        from core_agent.streaming import ReplyHub
+
+        class LegacyModel:
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                return ModelResponse(tool_requests=(ToolRequest("legacy-begin", "core_response_begin", {}),))
+
+        agent = make_agent(LegacyModel(), reply_hub=ReplyHub(min_chars=1))
+        self.addCleanup(agent.close)
+        transition = agent._record_transition
+
+        def crash_after_saved_response(record, **change):
+            saved = transition(record, **change)
+            if change["event_kind"] == "model.completed":
+                raise CoreError("LEASE_LOST")
+            return saved
+
+        with patch.object(agent, "_record_transition", side_effect=crash_after_saved_response):
+            with self.assertRaises(CoreError) as lost:
+                agent.run(RunRequest("hello"), task_id="external-legacy-queued", identity="external-alice",
+                          session_id="chat", tenant_id="company")
+        self.assertEqual(lost.exception.code, "LEASE_LOST")
+        record = agent.workflow_store.lookup_task("external-legacy-queued")
+        self.assertEqual(record.snapshot["tool_queue"][0]["name"], "core_response_begin")
+        self.assertEqual(record.snapshot["tool_calls"], 0)
+        model = agent.model = ScriptedModel([ModelResponse(message="External ordinary answer")])
+        agent._runtime_cache.clear()
+        result = agent.resume_task(record.task_id)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.message, "External ordinary answer")
+        self.assertEqual(result.usage.tool_calls, 1)
+        self.assertIn("TOOL_UNAVAILABLE", model.calls[-1].context)
+        self.assertNotIn("core_response_begin", model.calls[-1].tools)
+        self.assertNotIn("core_response_begin", model.calls[-1].instructions)
+        self.assertTrue(model.calls[-1].tools)
+        self.assertEqual(len(model.calls), 1)
+        self.assertIsNone(agent.reply_hub.latest("company", record.task_id))
+        self.assertEqual(agent.resume_task(record.task_id).message, result.message)
+        self.assertEqual(len(model.calls), 1)
+
+    def test_external_legacy_answer_phase_recovers_without_preview(self):
+        from core_agent.streaming import ReplyHub
+        for has_hub, followup in ((True, False), (False, False), (True, True)):
+            with self.subTest(has_hub=has_hub, followup=followup):
+                observed = []
+
+                class RecoveryModel:
+                    def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                        observed.append((tools, instructions, context))
+                        if on_delta:
+                            on_delta("Buffered external prefix", "private reasoning")
+                        self.preview = hub.latest("company", "external-legacy-answer") if hub else None
+                        return ModelResponse(message="Buffered complete answer")
+
+                hub = ReplyHub(min_chars=1) if has_hub else None
+                model = RecoveryModel()
+                agent = make_agent(model, reply_hub=hub)
+                self.addCleanup(agent.close)
+                record, *_ = agent._new_workflow(RunRequest("hello"), task_id="external-legacy-answer",
+                    identity="external-alice", session_id="chat", tenant_id="company")
+                store = agent.workflow_store
+                token = store.acquire_lease(record.run_id, tenant_id="company", owner_id="external-alice", worker_id="legacy", ttl=60)
+                snapshot = {**record.snapshot, "response_phase": "answer",
+                    "compiled_instructions": "Legacy instructions: call core_response_begin before replying."}
+                record = store.transition(record.run_id, tenant_id="company", owner_id="external-alice", expected_version=record.version,
+                    snapshot=snapshot, state="RUNNING", event_kind="test.legacy.answer", lease_token=token)
+                agent._supersede_public_reply(record, snapshot, lease_token=token)
+                if hub:
+                    self.assertIsNone(hub.latest("company", record.task_id))
+                store.release_lease(record.run_id, tenant_id="company", worker_id="legacy", token=token)
+                if followup:
+                    agent.enqueue_message(RunRequest("Additional external instruction"), task_id=record.task_id,
+                        message_id="followup", identity="external-alice", session_id="chat", tenant_id="company")
+                if has_hub:
+                    agent._runtime_cache.clear()
+                result = agent.resume_task(record.task_id)
+                self.assertEqual(result.message, "Buffered complete answer")
+                self.assertTrue(result.complete)
+                self.assertEqual(len(observed), 1)
+                if followup:
+                    self.assertTrue(observed[0][0])
+                    self.assertIn("Additional external instruction", observed[0][2])
+                else:
+                    self.assertEqual(observed[0][0], {})
+                self.assertNotIn("core_response_begin", observed[0][0])
+                self.assertNotIn("core_response_begin", observed[0][1])
+                self.assertIsNone(model.preview)
+                if hub:
+                    self.assertIsNone(hub.latest("company", record.task_id))
 
     def test_public_reply_followup_closes_preview_and_returns_to_work(self):
         from core_agent.streaming import ReplyHub

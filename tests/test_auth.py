@@ -132,13 +132,12 @@ class AuthAppTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class AuthBoundaryTests(AuthAppTestCase):
-    async def test_public_external_prefix_reconnect_is_scoped_and_private_work_is_withheld(self):
+    async def test_external_reply_is_buffered_and_reconnect_is_scoped(self):
         import json
         import socket
         import uvicorn
-        from core_agent.model import ToolRequest
-
         release = threading.Event()
+        generating = threading.Event()
         agent = self.app.state.core_agent
 
         class ReplyModel:
@@ -146,16 +145,16 @@ class AuthBoundaryTests(AuthAppTestCase):
 
             def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
                 self.calls += 1
-                if self.calls == 1:
-                    if on_delta:
-                        on_delta("PRIVATE work/owner QA", "PRIVATE reasoning")
-                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
-                if tools:
-                    raise AssertionError("public reply catalog must be empty")
-                on_delta("Visible public prefix", "PRIVATE reasoning/owner QA")
+                if "core_response_begin" in tools or "core_response_begin" in instructions:
+                    raise AssertionError("external tasks must not use the owner response control")
+                if not tools:
+                    raise AssertionError("external final response keeps the ordinary tool catalog")
+                if on_delta:
+                    on_delta("PRIVATE work/owner QA", "PRIVATE reasoning")
+                generating.set()
                 if not release.wait(10):
-                    raise TimeoutError("test did not observe live reply")
-                return ModelResponse(message="Visible public prefix and complete answer")
+                    raise TimeoutError("test did not release buffered reply")
+                return ModelResponse(message="Complete external answer")
 
         agent.model = ReplyModel()
         agent._model_streams_deltas = True
@@ -189,17 +188,16 @@ class AuthBoundaryTests(AuthAppTestCase):
                         self.assertNotIn("PRIVATE", json.dumps(event))
                         if "task" in event:
                             task_id = event["task"]["id"]
-                        message = (event.get("statusUpdate", {}).get("status", {}).get("message") or {})
-                        if (message.get("metadata") or {}).get("core_agent_stream"):
-                            self.assertIsNotNone(task_id)
-                            self.assertEqual(message["parts"][0]["text"], "Visible public prefix")
-                            self.assertFalse(release.is_set())
                             break
+                self.assertTrue(await asyncio.to_thread(generating.wait, 5))
+                self.assertIsNotNone(task_id)
+                self.assertIsNone(agent.reply_hub.latest(self.app.state.authenticator.settings.tenant, task_id))
                 foreign = await http.get(url + f"/a2a/external/tasks/{task_id}:subscribe", headers=self.headers("external-b"))
                 self.assertEqual(foreign.status_code, 404)
                 during = await http.get(url + f"/a2a/external/tasks/{task_id}", headers=self.headers("external-a"))
                 self.assertEqual(during.status_code, 200)
-                self.assertNotIn("Visible public prefix", during.text)
+                self.assertNotIn("Complete external answer", during.text)
+                self.assertNotIn("PRIVATE", during.text)
                 self.assertNotIn("core_agent_stream", during.text)
                 frames = []
                 async with http.stream("GET", url + f"/a2a/external/tasks/{task_id}:subscribe",
@@ -211,13 +209,12 @@ class AuthBoundaryTests(AuthAppTestCase):
                         event = json.loads(line[5:])
                         frames.append(event)
                         self.assertNotIn("PRIVATE", json.dumps(event))
-                        message = (event.get("statusUpdate", {}).get("status", {}).get("message") or {})
-                        if (message.get("metadata") or {}).get("core_agent_stream") and not release.is_set():
-                            self.assertIn("task", frames[0])
-                            self.assertEqual(message["parts"][0]["text"], "Visible public prefix")
+                        self.assertNotIn("core_agent_stream", json.dumps(event))
+                        if len(frames) == 1:
+                            self.assertIn("task", event)
                             self.assertFalse(release.is_set())
                             release.set()
-                self.assertTrue(release.is_set(), "reconnect did not receive cached preview")
+                self.assertTrue(release.is_set(), "reconnect did not receive the task snapshot")
                 terminal = [event for event in frames if (event.get("task") or event.get("statusUpdate") or {})
                             .get("status", {}).get("state") in {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"}]
                 self.assertEqual(len(terminal), 1)
@@ -226,12 +223,45 @@ class AuthBoundaryTests(AuthAppTestCase):
                 self.assertEqual(final.status_code, 200)
                 self.assertNotIn("core_agent_stream", final.text)
                 self.assertNotIn("PRIVATE", final.text)
+                self.assertIn("Complete external answer", final.text)
+                self.assertEqual(agent.model.calls, 1)
         finally:
             release.set()
             server.should_exit = True
             await asyncio.to_thread(thread.join, 10)
             listener.close()
             self.assertFalse(thread.is_alive())
+
+    async def test_owner_keeps_response_control_and_tools_free_live_reply(self):
+        from core_agent.model import ToolRequest
+        catalogs = []
+
+        class ReplyModel:
+            def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                catalogs.append(tools)
+                if len(catalogs) == 1:
+                    if "core_response_begin" not in tools or "core_response_begin" not in instructions:
+                        raise AssertionError("owner response control is unavailable")
+                    if on_delta:
+                        on_delta("PRIVATE work", "PRIVATE reasoning")
+                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
+                if tools:
+                    raise AssertionError("owner answer must be tools-free")
+                on_delta("Owner public prefix", "PRIVATE reasoning")
+                return ModelResponse(message="Owner public prefix and complete answer")
+
+        agent = self.app.state.core_agent
+        agent.model = ReplyModel()
+        agent._model_streams_deltas = True
+        with patch.object(agent.reply_hub, "update", wraps=agent.reply_hub.update) as published:
+            response = await self.http.post("/a2a/owner/message:stream", headers=self.headers("owner-a"), json={
+                "message": {"role": "ROLE_USER", "messageId": uuid.uuid4().hex, "parts": [{"text": "Reply"}]}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("Owner public prefix", [call.args[4] for call in published.call_args_list])
+        self.assertIn("Owner public prefix and complete answer", response.text)
+        self.assertNotIn("PRIVATE", response.text)
+        self.assertEqual(len(catalogs), 2)
+        self.assertEqual(catalogs[1], {})
 
     async def test_browser_bootstrap_is_absent_when_not_configured(self):
         response = await self.http.get("/ui/config")

@@ -1212,7 +1212,11 @@ class CoreAgent:
             schema["properties"]["skills"]["maxItems"] = 0
         return schema
 
-    def _tool_catalog(self, effective, discovered, snapshot=None, *, tenant_id=None, root_run=True):
+    def _can_stream_reply(self, owner_id):
+        return (self.reply_hub is not None and self._model_streams_deltas and self.depth == 0
+                and not (owner_id or "").startswith("external-"))
+
+    def _tool_catalog(self, effective, discovered, snapshot=None, *, tenant_id=None, root_run=True, owner_id=None):
         catalog = {}
         index = mcp_tool_index(effective.mcp_tools)
         for name in effective.model_tool_catalog:
@@ -1319,7 +1323,7 @@ class CoreAgent:
                        if "files" in catalog["core_agent_send_message"]["input_schema"].get("properties", {}) else "")
                     + "Available agents: "
                     + "; ".join(peer["name"] + ": " + peer["description"] for peer in peers.values()))
-        if (self.reply_hub is not None and self._model_streams_deltas and self.depth == 0
+        if (self._can_stream_reply(owner_id)
                 and root_run and (snapshot or {}).get("response_root", True)):
             catalog[RESPONSE_BEGIN_TOOL.name] = {
                 "description": RESPONSE_BEGIN_TOOL.description,
@@ -2320,7 +2324,7 @@ class CoreAgent:
             snapshot["skills"], snapshot["skill_activation_sources"] = self._inherited_skills(
                 record, effective, admitted_skills, lease_token=lease_token
             )
-            compiled = self._compile_instructions(raw, effective, snapshot)
+            compiled = self._compile_instructions(raw, effective, snapshot, owner_id=record.owner_id)
             snapshot["compiled_instructions"] = compiled.text
             snapshot["protected_kernel_digest"] = compiled.protected_digest
             skill_locks = []
@@ -2519,7 +2523,7 @@ class CoreAgent:
             snapshot["effective_platform_config"] = self._platform_snapshot(
                 admitted_platform
             )
-            compiled = self._compile_instructions(raw, effective, snapshot)
+            compiled = self._compile_instructions(raw, effective, snapshot, owner_id=record.owner_id)
             snapshot["compiled_instructions"] = compiled.text
             snapshot["protected_kernel_digest"] = compiled.protected_digest
             record = self._record_transition(
@@ -2550,7 +2554,7 @@ class CoreAgent:
         self._runtime_cache[record.run_id] = (raw, discovered, effective)
         return record, request, raw, discovered, effective
 
-    def _compile_instructions(self, raw, effective, snapshot, *, model_tools=None):
+    def _compile_instructions(self, raw, effective, snapshot, *, model_tools=None, owner_id=None):
         catalog = sorted(
             (
                 {
@@ -2602,7 +2606,7 @@ class CoreAgent:
             user_prompt="",
             skill_instructions=tuple(skill_instructions),
             response_phase=(snapshot.get("response_phase", "work")
-                            if self.reply_hub is not None and self._model_streams_deltas and self.depth == 0
+                            if self._can_stream_reply(owner_id)
                             and snapshot.get("response_root", True) else None),
             output_contract_version=version,
         )
@@ -2648,13 +2652,14 @@ class CoreAgent:
         classifier.model.structured_output = policy
         return classifier
 
-    def _context_compactor(self, raw, effective, discovered, snapshot, *, tenant_id=None):
+    def _context_compactor(self, raw, effective, discovered, snapshot, *, tenant_id=None, owner_id=None):
         if self.compactor:
             return self.compactor
         model_tools = ({} if snapshot.get("response_phase") == "answer" else
-                       self._tool_catalog(effective, discovered, snapshot, tenant_id=tenant_id))
-        instructions = (self._compile_instructions(raw, effective, snapshot, model_tools=model_tools).text
-                        if self.reply_hub is not None else self._instructions(snapshot))
+                       self._tool_catalog(effective, discovered, snapshot, tenant_id=tenant_id, owner_id=owner_id))
+        instructions = (self._compile_instructions(raw, effective, snapshot, model_tools=model_tools, owner_id=owner_id).text
+                        if self.reply_hub is not None or (owner_id or "").startswith("external-")
+                        else self._instructions(snapshot))
         catalog = json.dumps(
             model_tools,
             sort_keys=True,
@@ -2851,6 +2856,8 @@ class CoreAgent:
         if call.name in {"core_response_artifacts", "core_message_send"} and output_contract_version(record) != 2:
             raise ExecutionNotStarted("CAPABILITY_DISABLED")
         if call.name == RESPONSE_BEGIN_TOOL.name:
+            if (record.owner_id or "").startswith("external-"):
+                raise CoreError("TOOL_UNAVAILABLE", "External A2A tasks return their final answer directly")
             pending = record.snapshot.get("pending_call")
             if (self.reply_hub is None or not self._model_streams_deltas or self.depth != 0
                     or record.parent_run_id is not None or record.snapshot.get("python_execution")
@@ -2944,7 +2951,7 @@ class CoreAgent:
         sources = self._activation_sources(snapshot)
         if sources is not None:
             sources.update({name: record.run_id for name in names})
-        compiled = self._compile_instructions(raw, effective, snapshot)
+        compiled = self._compile_instructions(raw, effective, snapshot, owner_id=record.owner_id)
         snapshot["compiled_instructions"] = compiled.text
         snapshot["protected_kernel_digest"] = compiled.protected_digest
         return ToolResult(call.id, "succeeded", {"activated": activated})
@@ -4311,7 +4318,8 @@ class CoreAgent:
         return self._scoped_stream(record.task_id, record.owner_id)
 
     def _publish_public_reply(self, record, snapshot, text, *, lease_token, force=False):
-        if self.reply_hub is None or record.parent_run_id is not None:
+        if (self.reply_hub is None or record.parent_run_id is not None
+                or (record.owner_id or "").startswith("external-")):
             return
         with self.workflow_store._execution_lock(record, lease_token) as (current, _connection):
             if (current.state in TERMINAL_STATES or current.snapshot.get("response_phase") != "answer"
@@ -4323,6 +4331,7 @@ class CoreAgent:
 
     def _supersede_public_reply(self, record, snapshot, *, lease_token):
         if (self.reply_hub is None or record.parent_run_id is not None
+                or (record.owner_id or "").startswith("external-")
                 or snapshot.get("response_phase") != "answer"):
             return
         with self.workflow_store._execution_lock(record, lease_token) as (current, _connection):
@@ -4663,7 +4672,7 @@ class CoreAgent:
             )
             while True:
                 compactor = self._context_compactor(
-                    raw, effective, discovered, snapshot, tenant_id=record.tenant_id
+                    raw, effective, discovered, snapshot, tenant_id=record.tenant_id, owner_id=record.owner_id
                 )
                 active_result_token_limit = min(
                     compactor.budget.output_reserve,
@@ -4703,7 +4712,7 @@ class CoreAgent:
                     snapshot["pending_response"]["message"] = BUDGET_FOLLOWUP_MESSAGE
                     snapshot["budget_followup_unprocessed"] = True
                 if snapshot.get("response_phase") != phase_before_input:
-                    compactor = self._context_compactor(raw, effective, discovered, snapshot, tenant_id=record.tenant_id)
+                    compactor = self._context_compactor(raw, effective, discovered, snapshot, tenant_id=record.tenant_id, owner_id=record.owner_id)
                     active_result_token_limit = min(compactor.budget.output_reserve,
                         max(64, int(compactor.budget.working_capacity * 0.10)))
                 in_flight = snapshot.get("model_attempt_in_flight")
@@ -4868,13 +4877,14 @@ class CoreAgent:
                             {}
                             if finalizing or snapshot.get("response_phase") == "answer"
                             else self._tool_catalog(effective, discovered, snapshot, tenant_id=record.tenant_id,
-                                                    root_run=record.parent_run_id is None)
+                                                    root_run=record.parent_run_id is None, owner_id=record.owner_id)
                         )
-                        model_instructions = (self._compile_instructions(raw, effective, snapshot, model_tools=model_tools).text
-                                              if self.reply_hub is not None else self._instructions(snapshot))
+                        model_instructions = (self._compile_instructions(raw, effective, snapshot, model_tools=model_tools, owner_id=record.owner_id).text
+                                              if self.reply_hub is not None or (record.owner_id or "").startswith("external-")
+                                              else self._instructions(snapshot))
                         if "response_files" in effective.enabled_capability_policies and "core_response_files" not in model_tools:
                             model_instructions = self._compile_instructions(
-                                raw, effective, snapshot, model_tools=model_tools
+                                raw, effective, snapshot, model_tools=model_tools, owner_id=record.owner_id
                             ).text
                     if finalizing:
                         model_instructions = (
@@ -4887,7 +4897,7 @@ class CoreAgent:
                     retry_limit = max_turns if finalizing else max_turns - 1
                     stream = self._stream(record)
                     answering = (not finalizing and snapshot.get("response_phase") == "answer"
-                                 and self.reply_hub is not None and record.parent_run_id is None)
+                                 and self._can_stream_reply(record.owner_id) and record.parent_run_id is None)
                     buffered_delta = (
                         [None, None]
                         if (
@@ -5625,7 +5635,7 @@ class CoreAgent:
         structured_output = self._structured_output_policy(parent_snapshot)
         if structured_output is not None:
             snapshot["structured_output"] = structured_output
-        compiled = self._compile_instructions(raw, effective, snapshot)
+        compiled = self._compile_instructions(raw, effective, snapshot, owner_id=parent.owner_id)
         snapshot.update(compiled_instructions=compiled.text, protected_kernel_digest=compiled.protected_digest)
         child = WorkflowRecord(child_run_id, identifier, parent.context_id, parent.tenant_id,
                                parent.owner_id, parent.run_id, "MODEL_RESPONDED", 1, {"prompt": "Background tool"}, snapshot)

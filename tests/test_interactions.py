@@ -1087,24 +1087,27 @@ class OwnerRuntimeAPITests(AuthAppTestCase):
 
     async def test_external_task_asks_owner_with_private_publication_and_followup_after_wait(self):
         question, answer = "private-owner-question-739", "private-owner-answer-851"
+        options = ["private-option-first-739", "private-option-second-739"]
         previews = []
         agent = self.agent
 
         class ReplyModel(ScriptedModel):
             def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
                 response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
+                if "core_response_begin" in tools or "core_response_begin" in instructions:
+                    raise AssertionError("external task must not use the owner response control")
                 if response.message == "public-final-result":
-                    if tools:
-                        raise AssertionError("recovered answer must be tools-free")
-                    on_delta("public-final-prefix", "private-reasoning-739")
+                    if not tools:
+                        raise AssertionError("external reply keeps the ordinary tool catalog")
+                    if on_delta:
+                        on_delta("public-final-prefix", "private-reasoning-739")
                     record = agent.workflow_store.lookup_task(task_id)
                     previews.append(agent.reply_hub.latest(record.tenant_id, task_id))
                 return response
 
         self.agent.model = ReplyModel([
             ModelResponse(message="private-intermediate-735", reasoning="private-reasoning-739",
-                          tool_requests=(ToolRequest("ask-1", "core_ask_owner", {"question": question}),)),
-            ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),)),
+                          tool_requests=(ToolRequest("ask-1", "core_ask_owner", {"question": question, "options": options}),)),
             ModelResponse(message="public-final-result"),
         ])
         self.agent._model_streams_deltas = True
@@ -1119,20 +1122,24 @@ class OwnerRuntimeAPITests(AuthAppTestCase):
         task_id = next(task["id"] for task in listed.json()["tasks"] if task["contextId"] == "external-question-chat")
         record = self.agent.workflow_store.lookup_task(task_id)
         self.assertEqual(record.state, "WAITING_INPUT")
-        for private in (question, "private-intermediate-735", "private-reasoning-739", "core_ask_owner"):
+        for private in (question, *options, "private-intermediate-735", "private-reasoning-739", "core_ask_owner"):
             self.assertNotIn(private, response.text)
         approval = await self.pending(record.task_id)
         self.assertEqual(approval["kind"], "tool_approval")
         self.assertEqual(approval["subject"]["arguments"]["question"], question)
+        self.assertEqual(approval["subject"]["arguments"]["options"], options)
         approved = await self.http.post(f"/api/hitl/{approval['wait_id']}/decision", headers=self.headers("owner-a"),
                                         json={"decision": "allow", "subject_digest": approval["subject_digest"]})
         self.assertEqual(approved.status_code, 200, approved.text)
+        self.agent._runtime_cache.clear()
         await asyncio.to_thread(self.agent.resume_task, record.task_id)
         question_wait = await self.pending(record.task_id)
         self.assertEqual(question_wait["kind"], "owner_question")
+        self.assertEqual(question_wait["subject"]["options"], options)
         public = await self.http.get("/a2a/external/tasks/" + record.task_id, headers=self.headers("external-a"))
         self.assertEqual(public.json()["status"]["state"], "TASK_STATE_WORKING")
-        self.assertNotIn(question, public.text)
+        for private in (question, *options):
+            self.assertNotIn(private, public.text)
         followup = await self.http.post(
             "/a2a/external/message:send", headers=self.headers("external-a"),
             json={"message": {"messageId": "correction", "taskId": record.task_id,
@@ -1145,13 +1152,13 @@ class OwnerRuntimeAPITests(AuthAppTestCase):
         self.assertEqual((await self.http.post(path, headers=self.headers("external-a"), json=payload)).status_code, 403)
         answered = await self.http.post(path, headers=self.headers("owner-b"), json=payload)
         self.assertEqual(answered.status_code, 200, answered.text)
+        self.agent._runtime_cache.clear()
         result = await asyncio.to_thread(self.agent.resume_task, record.task_id)
         self.assertEqual(result.message, "public-final-result")
         current = self.agent.workflow_store.lookup_task(record.task_id)
-        self.assertEqual(current.snapshot["tool_calls"], 2)
-        self.assertEqual(current.snapshot["turns"], 3)
-        self.assertEqual(previews[0]["text"], "public-final-prefix")
-        self.assertEqual(previews[0]["generation"], 3)
+        self.assertEqual(current.snapshot["tool_calls"], 1)
+        self.assertEqual(current.snapshot["turns"], 2)
+        self.assertEqual(previews, [None])
         self.assertNotIn("private", json.dumps(previews))
         model_context = json.dumps(self.agent.model.calls[-1].messages)
         self.assertIn(answer, model_context)
@@ -1160,7 +1167,7 @@ class OwnerRuntimeAPITests(AuthAppTestCase):
         final = await self.http.get("/a2a/external/tasks/" + record.task_id, headers=self.headers("external-a"))
         self.assertEqual(final.json()["status"]["state"], "TASK_STATE_COMPLETED")
         self.assertIn("public-final-result", final.text)
-        for private in (question, answer, "private-intermediate-735", "private-reasoning-739"):
+        for private in (question, *options, answer, "private-intermediate-735", "private-reasoning-739"):
             self.assertNotIn(private, final.text)
 
     async def test_rejection_returns_tool_error_without_execution(self):
