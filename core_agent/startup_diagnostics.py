@@ -86,3 +86,9 @@ class StartupDiagnostics:
                   architecture=architecture if architecture in {"x86_64", "aarch64", "arm64", "AMD64"} else "other",
                   pidfd=hasattr(os, "pidfd_open"), tun_device=tun, helpers=helpers,
                   cgroups=cgroups, namespaces=namespaces, process=process)
+
+    def sandbox(self):
+        if not self.enabled or platform.system() != "Linux":
+            return
+        from .sandbox_diagnostics import run_probes
+        run_probes(self)

@@ -25,7 +25,7 @@
 | CLD-04 | Полный S3 workspace, empty/unchanged semantics, restore/cleanup/fencing | Existing snapshots/file integrity foundations; требуются CLD-AC-07–09 на PostgreSQL и S3-compatible API | partial |
 | CLD-05 | Sandbox, recovery без replay, постоянно работающий worker | Existing sandbox/execution recovery suite; CLD-AC-10/11 в целевом Cloud Pod не выполнены | partial |
 | CLD-06 | Проверяемый перенос, совместимость и platform release gate | CLD-AC-12: live Cloud proxy/browser/DB/S3/idle evidence отсутствует | missing |
-| CLD-TRIAL | Ограниченный запуск с RAM workspace и безопасными startup stages | `tests.test_startup_diagnostics.StartupDiagnosticsTests`: finite stages/failures, redaction, temporary storage, ignored retired ENV, opt-in и событие `application_ready`; `tests.test_cloudru_auth` и CI `npm test` проверяют auth/UI. Реальные startup logs и sandbox/browser smoke целевого Cloud Pod ещё не получены | partial |
+| CLD-TRIAL | Ограниченный запуск с RAM workspace и безопасными startup stages | `tests.test_startup_diagnostics.StartupDiagnosticsTests`: finite stages/failures, redaction, temporary storage, ignored retired ENV, opt-in, bounded namespace/Bubblewrap probes, timeout/child cleanup и событие `application_ready`; `tests.test_cloudru_auth` и CI `npm test` проверяют auth/UI. Полученные Cloud startup logs показывают успешную конфигурацию/БД и отказ sandbox; успешный sandbox/browser smoke целевого Cloud Pod отсутствует | partial |
 
 ## Существующие foundations и изменённые контракты
 

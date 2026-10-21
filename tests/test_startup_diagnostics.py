@@ -1,13 +1,17 @@
 """Operator startup diagnostics must explain the failing stage without secrets."""
 import json
 import os
+import platform
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 from core_agent import app as application
 from core_agent.errors import CoreError, SandboxDiagnostics
 from core_agent.model import ScriptedModel
+from core_agent.startup_diagnostics import StartupDiagnostics
 from tests.app_support import UnsandboxedTestLauncher
 
 
@@ -119,3 +123,110 @@ class StartupDiagnosticsTests(unittest.TestCase):
         failures = [r for r in self.records(logs) if r.get("status") == "failed"]
         self.assertTrue(any(r.get("stage") == "database" for r in failures))
         self.assertNotIn("private-database-detail", str(logs.output))
+
+    @unittest.skipUnless(platform.system() == "Linux", "real Linux process cleanup")
+    def test_sandbox_probe_reports_denied_operation_without_stderr_or_environment(self):
+        from core_agent.sandbox_diagnostics import _run_probe
+        result = _run_probe([sys.executable, "-I", "-S", "-c",
+            "import os,sys; assert 'LLM_API_KEY' not in os.environ; "
+            "sys.stderr.write('bwrap: Creating new namespace failed: Operation not permitted\\n'"
+            " + 'private-key-never-print /private/workspace'); sys.exit(1)"], timeout=2)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["operation"], "namespace_create")
+        self.assertEqual(result["errno"], 1)
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(result["cleanup"], "confirmed")
+        self.assertNotIn("private", str(result))
+
+    @unittest.skipUnless(platform.system() == "Linux", "real Linux process cleanup")
+    def test_sandbox_probe_bounds_output_and_timeout(self):
+        from core_agent.sandbox_diagnostics import _run_probe
+        for code, timeout, reason in (
+            ("import sys; sys.stderr.write('secret' * 10000)", 2, "output_limit"),
+            ("import time; time.sleep(60)", 0.1, "timeout"),
+            ("import sys; sys.stderr.write('unknown private detail'); sys.exit(7)", 2, "unclassified"),
+        ):
+            with self.subTest(reason=reason):
+                started = time.monotonic()
+                result = _run_probe([sys.executable, "-I", "-S", "-c", code], timeout=timeout)
+                self.assertEqual(result["reason"], reason)
+                self.assertEqual(result["cleanup"], "confirmed")
+                self.assertNotIn("secret", str(result))
+                self.assertNotIn("private", str(result))
+                self.assertLess(time.monotonic() - started, 4)
+
+    @unittest.skipUnless(platform.system() == "Linux", "real Linux process cleanup")
+    def test_sandbox_probe_stops_children_after_parent_exit_and_timeout(self):
+        from pathlib import Path
+        from core_agent.sandbox_diagnostics import _run_probe
+        for parent_delay in (0, 60):
+            with self.subTest(parent_delay=parent_delay):
+                pid_file = Path(self.directory.name) / "child-pid"
+                code = ("import os,time; from pathlib import Path; child=os.fork(); "
+                        "child == 0 and time.sleep(60); "
+                        f"Path({str(pid_file)!r}).write_text(str(child)); time.sleep({parent_delay})")
+                result = _run_probe([sys.executable, "-I", "-S", "-c", code], timeout=0.5)
+                self.assertEqual(result["cleanup"], "confirmed")
+                self.assertEqual(result["reason"], "completed" if parent_delay == 0 else "timeout")
+                child = int(pid_file.read_text())
+                try:
+                    fields = Path(f"/proc/{child}/stat").read_bytes().rsplit(b")", 1)[1].split()
+                except FileNotFoundError:
+                    continue
+                self.assertIn(fields[0], (b"Z", b"X"))
+
+    def test_sandbox_probe_budget_and_permission_message_are_not_success(self):
+        from core_agent.sandbox_diagnostics import _failure, run_probes
+        for message in (b"bwrap: No permissions to create new namespace, private details",
+                        b"bwrap: No permissions to create a new namespace, private details"):
+            projected = _failure(message)
+            self.assertEqual(projected, {"reason": "permission_denied", "operation": "namespace_create"})
+        with patch("core_agent.sandbox_diagnostics.time.monotonic", side_effect=[0] + [11] * 10), \
+                patch("core_agent.sandbox_diagnostics._run_probe") as launch, \
+                self.assertLogs("core_agent.runtime", level="CRITICAL") as logs:
+            run_probes(StartupDiagnostics(True))
+        launch.assert_not_called()
+        self.assertTrue(all(r["status"] == "skipped" and r["reason"] == "budget_exhausted"
+                            for r in self.records(logs)))
+
+    def test_sandbox_probe_disabled_or_non_linux_never_spawns(self):
+        with patch("subprocess.Popen") as launch:
+            StartupDiagnostics(False).sandbox()
+            with patch("platform.system", return_value="Darwin"):
+                StartupDiagnostics(True).sandbox()
+        launch.assert_not_called()
+
+    def test_sandbox_probe_failure_logs_at_critical_without_replacing_preflight(self):
+        from core_agent.sandbox_diagnostics import run_probes
+        denied = {"status": "failed", "reason": "permission_denied", "errno": 1,
+                  "operation": "namespace_create", "returncode": 1, "cleanup": "confirmed"}
+        with patch("core_agent.sandbox_diagnostics._run_probe", return_value=denied), \
+                self.assertLogs("core_agent.runtime", level="CRITICAL") as logs:
+            run_probes(StartupDiagnostics(True))
+        rows = self.records(logs)
+        self.assertEqual({r["probe"] for r in rows}, {
+            "user_namespace", "user_root_mapping", "mount_namespace", "pid_namespace",
+            "ipc_namespace", "network_namespace", "uts_namespace", "bwrap_minimal",
+            "bwrap_proc", "bwrap_full",
+        })
+        launcher = UnsandboxedTestLauncher()
+        launcher.preflight = lambda: (_ for _ in ()).throw(CoreError(
+            "EXECUTION_ENVIRONMENT_UNAVAILABLE", "Sandbox did not start"))
+        with patch.object(application, "SandboxLauncher", return_value=launcher), \
+                patch.object(application, "SandboxPolicy"), \
+                patch.object(StartupDiagnostics, "sandbox") as probe, \
+                self.assertRaises(CoreError) as error:
+            application.create_app(model=self.model)
+        probe.assert_called_once()
+        self.assertEqual(error.exception.code, "EXECUTION_ENVIRONMENT_UNAVAILABLE")
+        self.assertTrue(launcher._closed)
+
+    def test_sandbox_probe_cleanup_failure_stops_probes(self):
+        from core_agent.sandbox_diagnostics import run_probes
+        with patch("core_agent.sandbox_diagnostics._run_probe", return_value={
+                "status": "failed", "reason": "timeout", "cleanup": "unconfirmed"}) as launch, \
+                self.assertLogs("core_agent.runtime", level="CRITICAL"), \
+                self.assertRaises(CoreError) as error:
+            run_probes(StartupDiagnostics(True))
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(error.exception.code, "EXECUTION_ENVIRONMENT_UNAVAILABLE")

@@ -1672,6 +1672,7 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
     try:
         with diagnostics.stage("sandbox"):
             if sandbox_launcher is None:
+                diagnostics.sandbox()
                 sandbox_launcher = SandboxLauncher(SandboxPolicy.from_environment())
             sandbox_launcher.preflight()
         authenticator = (CloudAuthenticator(auth_settings, state["database"]) if cloud_auth else None)

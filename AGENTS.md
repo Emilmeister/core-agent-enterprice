@@ -225,7 +225,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/app.py` | Composition root: environment config, stores, tool registry, kernel, A2A app, health и Uvicorn |
 | `core_agent/auth.py` | Выбор auth profile, Keycloak introspection, immutable scope, owner/external access и SDK context builder |
 | `core_agent/cloudru_auth.py` | Общий Cloud.ru external actor, owner password/cookie, DB sessions, rate limit и запрет возврата retired password |
-| `core_agent/startup_diagnostics.py` | Opt-in finite startup stages/platform facts без secret values и raw exception bodies |
+| `core_agent/startup_diagnostics.py`, `core_agent/sandbox_diagnostics.py` | Opt-in finite startup stages/platform facts и изолированные namespace/Bubblewrap probes без secret values и raw exception bodies |
 | `core_agent/external_access.py` | Owner-session Keycloak Admin API: external service accounts, issuance metadata, single-display tokens, replacement и native revocation |
 | `core_agent/admission.py` | Atomic root admission, stable-caller deduplication и busy guard чата до SDK execution |
 | `core_agent/interactions.py` | Company settings, per-origin tool policies, CAS и транзакционный запрет pending approvals |
@@ -336,6 +336,14 @@ Target spec может описывать больше текущего runtime.
   Cloud trial игнорирует artifact settings, Keycloak продолжает их отклонять.
 - `CORE_AGENT_STARTUP_DIAGNOSTICS=true` с `LOG_LEVEL=INFO` показывает finite
   platform facts и стадии сборки приложения без ENV values, DSN и secrets.
+  Перед штатным launcher/preflight выполняются фиксированные
+  `startup.sandbox_probe`: native namespaces/UID/GID mapping и Bubblewrap с
+  `/usr/bin/true`, без кода модели и наследования ENV. Лимиты — 2 секунды на
+  проверку, 10 секунд на запуск набора, отдельно до 1 секунды на cleanup каждой
+  проверки, 4096 байт stderr без публикации raw text.
+  Отказы записываются на CRITICAL; неподтверждённый cleanup блокирует startup.
+  Переданный test launcher не запускает probes. Их успех не заменяет preflight;
+  `EPERM` не определяет, запретил ли операцию AppArmor или seccomp.
   `startup.storage` явно сообщает temporary-posix/durable=false для Cloud trial.
   `application_ready` означает готовое ASGI app; открытие socket подтверждают
   Uvicorn и probes. Диагностика не отключает обязательный sandbox или проверки.
