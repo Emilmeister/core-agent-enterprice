@@ -5,6 +5,7 @@ from pathlib import Path
 import select
 import signal
 import subprocess
+import sys
 import time
 
 from .errors import CoreError
@@ -76,7 +77,7 @@ def _group_stopped(group, deadline):
     return False
 
 
-def _run_probe(command, *, timeout):
+def _run_probe(command, *, timeout, structured=False):
     started = time.monotonic()
     result = {"status": "failed", "cleanup": "not_started"}
     try:
@@ -105,7 +106,11 @@ def _run_probe(command, *, timeout):
                 break
             exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             if exited is not None and not chunk:
-                if exited.si_code == os.CLD_EXITED and exited.si_status == 0:
+                if structured:
+                    from .sandbox_capability_probe import parse_result
+                    code = exited.si_status if exited.si_code == os.CLD_EXITED else -exited.si_status
+                    result.update(parse_result(stderr, code))
+                elif exited.si_code == os.CLD_EXITED and exited.si_status == 0:
                     result.update(status="succeeded", reason="completed")
                 else:
                     result.update(_failure(stderr))
@@ -120,7 +125,7 @@ def _run_probe(command, *, timeout):
         if type(error.errno) is int and 0 < error.errno < 4096:
             result["errno"] = error.errno
     finally:
-        # Only fixed helpers and /usr/bin/true are launched; none creates a new
+        # Only fixed trusted helpers are launched; none creates a new
         # session. Killing their owned group also stops unshare's forked child.
         try:
             cleanup_deadline = time.monotonic() + 1
@@ -169,12 +174,17 @@ def run_probes(diagnostics):
                         "--dev", "/dev", "--tmpfs", "/tmp", *true]),
     ])
     deadline = time.monotonic() + 10
+    helper = str(Path(__file__).with_name("sandbox_capability_probe.py").resolve())
+    capabilities = [(name, [sys.executable, "-I", "-S", helper, name]) for name in (
+        "landlock_abi", "landlock_filesystem", "seccomp_filter")]
+    commands = capabilities + commands
     for name, command in commands:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             result = {"status": "skipped", "reason": "budget_exhausted", "cleanup": "not_started"}
         else:
-            result = _run_probe(command, timeout=min(2, remaining))
+            result = _run_probe(command, timeout=min(2, remaining), structured=name in {
+                "landlock_abi", "landlock_filesystem", "seccomp_filter"})
         diagnostics.emit("startup.sandbox_probe", failed=result["status"] != "succeeded",
                          probe=name, **result)
         if result["cleanup"] == "unconfirmed":

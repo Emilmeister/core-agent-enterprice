@@ -181,7 +181,7 @@ class StartupDiagnosticsTests(unittest.TestCase):
                         b"bwrap: No permissions to create a new namespace, private details"):
             projected = _failure(message)
             self.assertEqual(projected, {"reason": "permission_denied", "operation": "namespace_create"})
-        with patch("core_agent.sandbox_diagnostics.time.monotonic", side_effect=[0] + [11] * 10), \
+        with patch("core_agent.sandbox_diagnostics.time.monotonic", side_effect=[0] + [11] * 13), \
                 patch("core_agent.sandbox_diagnostics._run_probe") as launch, \
                 self.assertLogs("core_agent.runtime", level="CRITICAL") as logs:
             run_probes(StartupDiagnostics(True))
@@ -208,6 +208,7 @@ class StartupDiagnosticsTests(unittest.TestCase):
             "user_namespace", "user_root_mapping", "mount_namespace", "pid_namespace",
             "ipc_namespace", "network_namespace", "uts_namespace", "bwrap_minimal",
             "bwrap_proc", "bwrap_full",
+            "landlock_abi", "landlock_filesystem", "seccomp_filter",
         })
         launcher = UnsandboxedTestLauncher()
         launcher.preflight = lambda: (_ for _ in ()).throw(CoreError(
@@ -230,3 +231,38 @@ class StartupDiagnosticsTests(unittest.TestCase):
             run_probes(StartupDiagnostics(True))
         self.assertEqual(launch.call_count, 1)
         self.assertEqual(error.exception.code, "EXECUTION_ENVIRONMENT_UNAVAILABLE")
+
+    def test_capability_output_rejects_unknown_or_inconsistent_fields(self):
+        from core_agent.sandbox_capability_probe import parse_result
+        good = {"status": "succeeded", "reason": "completed", "operation": "landlock_abi", "abi": 6}
+        self.assertEqual(parse_result(json.dumps(good).encode(), 0), good)
+        for row, code in ((dict(good, secret="private-key-never-print"), 0),
+                          (dict(good, abi=True), 0), (dict(good, operation="private-path"), 0),
+                          (good, 1), (dict(good, reason="permission_denied"), 0)):
+            with self.subTest(row=row, code=code):
+                result = parse_result(json.dumps(row).encode(), code)
+                self.assertEqual(result, {"status": "failed", "reason": "invalid_probe_result"})
+        self.assertEqual(parse_result(b"private traceback", 1)["reason"], "invalid_probe_result")
+
+    @unittest.skipUnless(platform.system() == "Linux", "real Linux capability probes")
+    def test_capability_probes_are_isolated_and_preserve_parent_access(self):
+        from pathlib import Path
+        from core_agent.sandbox_diagnostics import _run_probe
+        from core_agent import sandbox_capability_probe
+        helper = str(Path(sandbox_capability_probe.__file__).resolve())
+        for name in ("landlock_abi", "landlock_filesystem", "seccomp_filter"):
+            with self.subTest(probe=name):
+                result = _run_probe([sys.executable, "-I", "-S", helper, name], timeout=2, structured=True)
+                self.assertEqual(result["cleanup"], "confirmed")
+                self.assertIn(result["status"], {"succeeded", "failed"})
+                if result["reason"] == "os_error":
+                    # libseccomp may report ECANCELED when its load syscall is
+                    # unavailable under CPU emulation. This must remain a failure.
+                    self.assertEqual((result["status"], result["operation"], result["errno"]),
+                                     ("failed", "seccomp_load", 125))
+                else:
+                    self.assertIn(result["reason"], {"completed", "permission_denied", "unsupported", "disabled"})
+                self.assertNotIn("private", str(result))
+                self.assertGreaterEqual(os.getppid(), 0)
+                with open("/dev/zero", "rb") as source:
+                    self.assertEqual(source.read(1), b"\0")
