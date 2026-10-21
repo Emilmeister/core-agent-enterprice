@@ -2,6 +2,11 @@
 
 ## Deployment constraint
 
+Этот документ задаёт стандартный `SANDBOX_BACKEND=bubblewrap`. Единственное
+явное исключение для Cloud.ru development — [CLD-05-L](cloudru.md#cld-05-l-явный-development-backend-landlock):
+оно отдельно определяет Landlock/seccomp/proxy, реальные пути и process cleanup,
+не меняя гарантий стандартного профиля и не разрешая автоматический fallback.
+
 Целевой deployment — один Kubernetes Pod для всех чатов компании. Python, terminal и фоновые команды MUST запускаться через Bubblewrap, с собственными mount/PID/IPC/network namespaces, ограничением syscalls и профилем доверенного runtime. Отдельные pods, privileged mode, host runtime socket и широкие node privileges не требуются и не разрешают обходить этот профиль.
 
 Совместимость user namespaces/seccomp/AppArmor/SELinux с целевым кластером требует реальной проверки до release. Установка Bubblewrap сама по себе не доказывает изоляцию. Если обязательный sandbox или сетевой контроль отсутствует, команда отклоняется до запуска с `EXECUTION_ENVIRONMENT_UNAVAILABLE`; fallback без ограничений запрещён.

@@ -2,6 +2,12 @@
 
 ## Trust boundaries
 
+Стандартные требования Bubblewrap ниже имеют только одно явное исключение:
+[CLD-05-L](cloudru.md#cld-05-l-явный-development-backend-landlock) для выбранного
+Landlock backend в Cloud.ru development. Оно задаёт собственные обязательные
+filesystem/syscall/network/process barriers; fallback и ослабление остальных
+tenant, policy, durability и recovery guarantees не разрешены.
+
 Доверенными являются только safety-инварианты ядра и валидированные PlatformConfig/AgentConfig. Следующие источники MUST считаться недоверенными:
 
 - prompt;

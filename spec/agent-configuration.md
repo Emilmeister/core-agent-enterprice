@@ -195,6 +195,7 @@ legacy routes только в явно выбранном development/test profi
 | `CORE_AGENT_TENANT_ID` | обязательна в enterprise | Trusted company scope, не берётся из prompt/metadata |
 | `CORE_AGENT_AUTH_MODE` | `keycloak` | Ровно `keycloak` или `cloudru`; явный auth profile, без автоматического fallback; до S3 доступен только диагностический development Cloud trial с PostgreSQL |
 | `CORE_AGENT_STARTUP_DIAGNOSTICS` | `false` | `true` включает безопасные finite startup stages по [первому trial](cloudru.md); ENV values/secrets не выводятся и проверки не отключаются |
+| `SANDBOX_BACKEND` | `bubblewrap` | Ровно `bubblewrap` или `landlock`; Landlock разрешён только при `development` + `cloudru` по [CLD-05-L](cloudru.md#cld-05-l-явный-development-backend-landlock), с обязательным preflight и без fallback; неизвестное значение или несовместимый профиль дают `CONFIG_INVALID` |
 | `CORE_AGENT_OWNER_PASSWORD` | пусто | Обязательный отдельный secret длиной не менее 16 символов в `cloudru`; password/cookie контракт в [CLD-02](cloudru.md) |
 | `KEYCLOAK_ISSUER_URL` | обязательна | Realm issuer, HTTPS; loopback HTTP только development/test |
 | `KEYCLOAK_CLIENT_ID` | обязательна | Confidential introspection client |

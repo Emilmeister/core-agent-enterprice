@@ -140,10 +140,12 @@ Finite RAM/tree/I/O limits и bounded GC не допускают тихих пр
 
 ## CLD-05. Исполнение и восстановление
 
-Текущий Bubblewrap, mount/PID/network isolation, seccomp и resource limits
-обязательны для terminal, Python, background и nested calls. Недоступность
-профиля блокирует запуск; прямой subprocess, другой execution backend или
-тихое отключение инструментов не являются fallback.
+По умолчанию `SANDBOX_BACKEND=bubblewrap`: существующие mount/PID/network
+isolation, seccomp и resource limits обязательны для terminal, Python,
+background и nested calls. Единственное исключение — явно выбранный
+development backend по CLD-05-L ниже. Недоступность выбранного профиля
+блокирует запуск; прямой subprocess, автоматическая смена backend или тихое
+отключение инструментов не являются fallback.
 
 S3 snapshot не доказывает остановку прежнего процесса. Смена Pod, потеря lease
 или локальных handles не снимают execution cleanup barrier. Действуют прежние
@@ -156,10 +158,117 @@ S3 snapshot не доказывает остановку прежнего про
 shared owner sessions и одного writer workspace. A2A waits, cron, push и
 recovery не зависят от открытого браузера или HTTP stream.
 
+### CLD-05-L. Явный development backend Landlock
+
+`SANDBOX_BACKEND` принимает только `bubblewrap` и `landlock`, default —
+`bubblewrap`. `landlock` разрешён только при одновременных
+`CORE_AGENT_ENVIRONMENT=development` и `CORE_AGENT_AUTH_MODE=cloudru`.
+Неизвестный backend или другой profile/environment завершается
+`CONFIG_INVALID` до запуска недоверенного кода. Отказ Bubblewrap никогда не
+выбирает Landlock автоматически; production этим backend не разрешён.
+
+Это ограниченное исключение из требований Bubblewrap и его виртуальных
+mount/PID/IPC/network namespaces в остальных документах. Оно не обещает
+такие namespaces: файловую границу задаёт Landlock, доступные syscalls —
+seccomp, исходящую сеть — обязательный доверенный proxy. Tenant/owner scope,
+guardrails/HITL, limits, durability, no-replay и execution cleanup barriers
+сохраняются. По умолчанию и вне этого точного профиля прежние требования
+Bubblewrap действуют полностью.
+
+До serving обязательный реальный preflight MUST проверить Landlock ABI не
+ниже 4, действующий файловый ruleset, `no_new_privs`, строгий seccomp filter,
+user notification с `NEW_LISTENER` и фактическую передачу разрешённого socket
+FD через `SECCOMP_IOCTL_NOTIF_ADDFD` ограниченному child. Каждый execution
+устанавливает те же ограничения до запуска недоверенного кода. Номер ABI,
+наличие API и отдельные diagnostic probes недостаточны. Недоступность любой
+обязательной проверки или неподтверждённый cleanup прекращают startup с
+`EXECUTION_ENVIRONMENT_UNAVAILABLE`; ослабление фильтра и прямой запуск запрещены.
+Preflight проверяет выбранный backend; optional diagnostic probes MAY сообщать
+доступность остальных механизмов, но не выбирают backend и не заменяют этот gate.
+Проверка proxy использует реальную notification/FD передачу и отказ доступа
+к запрещённому private HTTP destination; внешний интернет для preflight не
+требуется. Перед ним `startup.sandbox_backend` сообщает только выбранный backend.
+
+В этом backend workspace имеет настоящий scoped путь. Процесс получает его
+как `HOME` и начальный `cwd`; относительный tool `cwd` и `/workspace/...`
+остаются API-обозначениями одного чата и проходят прежнюю проверку границ.
+Файлового alias `/workspace` внутри shell/Python нет; произвольные `argv`, shell
+строки и Python source MUST NOT переписываться. Tool descriptions и выдаваемые
+runtime пути файлов MUST соответствовать этой семантике. У каждого execution
+свой `TMPDIR` вне workspace; общий `/tmp`, соседние чаты, server state, secrets,
+service-account token и чужие broker sockets недоступны. Временные bytes
+исключены из workspace snapshots и удаляются только после подтверждённой
+остановки всего execution. Разрешаются только необходимые read-only runtime
+файлы, свой workspace и свои временные файлы. Inherited descriptors закрываются
+перед запуском, кроме явно разрешённых stdio и собственного tool broker transport.
+
+Path-based `chmod`/`fchmodat` и операции timestamps, включая `utime`/`utimensat`,
+MUST проходить доверенную seccomp notification mediation. Supervisor копирует
+аргументы из памяти caller с конечными лимитами и сам выполняет разрешённое
+изменение через закреплённые descriptors корней workspace/TMPDIR и безопасно
+открытого файла. `SECCOMP_USER_NOTIF_FLAG_CONTINUE` запрещён: kernel не должен
+повторно читать изменяемые caller pointers после проверки. Symlink, traversal,
+смена каталога и ссылка на чужой FD не открывают файл за разрешёнными корнями.
+Обычный `fchmod` своего уже открытого FD MAY использовать только mode bits
+`0777`; setuid/setgid/sticky bits запрещены. Runtime binaries/libraries MUST
+принадлежать root и быть недоступны для записи process UID. Эта ограниченная
+metadata поддержка обеспечивает обычные Git init/clone/checkout; `chown`,
+xattr, inotify и операции сигналов чужим процессам остаются запрещёнными.
+
+Первый Landlock trial не поддерживает защищённые owner attachments. Новые
+такие uploads MUST отклоняться с `CAPABILITY_DISABLED` в общем file admission
+до принятия batch/сообщения, включая параллельно работающие background commands.
+Публикация прежнего quarantined protected batch тоже отклоняется до записи
+файлов в workspace; уже сохранённые bytes, history и owner file access остаются.
+Это закрывает появление защищённых вложений после проверки, пока execution
+уже работает. Перед новой командой непустой `attachments` дополнительно
+даёт фиксированную безопасную ошибку `EXECUTION_ENVIRONMENT_UNAVAILABLE`.
+Обычные созданные агентом файлы и прежние writable A2A файлы в `a2a/`
+сохраняют свой контракт. Нельзя имитировать read-only вложения через `chmod`,
+переписывание `open` или широкое разрешение записи в parent workspace.
+Bubblewrap сохраняет прежнюю поддержку read-only attachments. Снятие этого
+ограничения требует отдельной согласованной схемы хранения и regression proof.
+
+Сеть доступна только proxy-aware HTTP/HTTPS клиентам через доверенный
+посредник. Seccomp запрещает прямое создание/подключение сетевых и Unix sockets,
+UDP, raw sockets и обход через альтернативные syscalls; исключение — выданный
+доверенным supervisor FD собственного Python tool broker. Разрешённый proxy
+transport передаётся execution через проверенную user notification/FD injection.
+Само наличие `HTTP_PROXY`/`HTTPS_PROXY` не является enforcement; удаление ENV,
+`NO_PROXY`, прямой IP и собственный socket-код не обходят ограничение.
+Каждый HTTP destination и HTTPS CONNECT проходит тот же `SandboxPolicy`, что
+Bubblewrap: только разрешённые DNS servers, все DNS answers и фактический
+адрес соединения проходят public/global и `SANDBOX_DENIED_CIDRS` проверки.
+DNS rebinding, redirects, IPv4/IPv6 и IPv4-mapped IPv6 не открывают private,
+loopback, link-local, metadata, cluster и другие запрещённые адреса.
+Proxy не пересылает credentials приложения и имеет конечные request, connection,
+I/O и time limits. Клиенты без поддержки proxy и произвольные TCP/UDP протоколы
+не входят в этот профиль; direct network fallback запрещён.
+
+Приложение MUST работать под non-root real/effective UID как PID 1 своего
+выделенного container PID namespace; effective/permitted/inheritable/ambient
+capabilities должны быть нулевыми.
+Shared PID namespace, supervisor-обёртка как PID 1 и запуск без этих проверяемых
+предпосылок отклоняются до serving. На каждый execution работает доверенный
+subreaper с отдельной фиксированной process group. Недоверенный код и потомки
+не могут выполнить `setsid`/`setpgid`, менять namespaces, воздействовать на
+чужие процессы, ptrace/process memory или получать чужие descriptors.
+Timeout/cancel/close и нормальный выход команды требуют остановки и reap всего
+execution tree, включая осиротевшие процессы; до этого `sandbox_terminated`
+не возвращается. Смерть trusted supervisor не оставляет execution работающим;
+подтверждение остановки опирается на полный tree либо проверенную смерть
+выделенного PID-1 lifetime контейнера. При неопределённом исходе сохраняются
+`SIDE_EFFECT_UNKNOWN`, запрет нового execution и прежний reconciliation barrier.
+Пропажа локального handle, lease или HTTP stream не является stop proof.
+
+CLD-AC-14–17 требуют автоматических проверок и настоящего preflight плюс
+terminal/Python/background smoke в целевом Cloud.ru Pod. Local/mock proof
+не закрывает этот deployment gate и не даёт статус `implemented` автоматически.
+
 ## Первый диагностический запуск
 
 Пользовательский первый trial включает Cloud auth, owner UI, platform PostgreSQL
-и существующий обязательный sandbox. Он использует `CORE_AGENT_ENVIRONMENT=development` и
+и выбранный обязательный sandbox. Он использует `CORE_AGENT_ENVIRONMENT=development` и
 `CORE_AGENT_AUTH_MODE=cloudru` с обязательной PostgreSQL, без дополнительного
 trial switch, и MAY использовать временные RAM/POSIX каталоги до реализации
 CLD-04. Production Cloud startup до реализации полного storage отклоняется. Это ограниченный nonproduction запуск: workspace,

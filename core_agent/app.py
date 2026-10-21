@@ -48,6 +48,7 @@ from .execution import (
     WorkspaceSnapshotStore,
 )
 from .sandbox import SandboxLauncher, SandboxPolicy
+from .sandbox_landlock import LandlockLauncher, validate_backend
 from .startup_diagnostics import StartupDiagnostics
 from .kernel import KernelCompiler
 from .interactions import InMemoryInteractionStore, PostgresInteractionStore, tool_origin
@@ -909,6 +910,25 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         python_max_code_chars, python_max_seconds, python_max_output_bytes
     ) <= 0 or not math.isfinite(python_max_seconds):
         raise CoreError("CONFIG_INVALID", "Python execution limits must be positive")
+    landlock_execution = getattr(sandbox_launcher, "isolation_level", None) == "landlock"
+    workspace_guidance = (
+        "Files in the current chat workspace persist across calls and tasks. "
+        "HOME is its real absolute path; use relative paths or $HOME in shell commands. "
+        "There is no virtual /workspace directory. cwd defaults to the workspace root "
+        "and accepts relative paths; /workspace/... is an alias in cwd only. "
+        "TMPDIR is a private temporary directory, discarded after this call; use it instead of /tmp. "
+        "sandbox_terminated confirms process cleanup, not deletion of workspace files. "
+        "Only proxy-aware HTTP/HTTPS networking is available; keep the configured proxy variables. "
+        "Direct sockets, UDP, Unix sockets, job control and process signals are restricted. "
+        "Commands cannot run while this chat contains protected attachments. "
+        "Working-directory and environment changes do not carry over to later calls.\n"
+        if landlock_execution else
+        "Files under /workspace persist across calls and tasks in this chat; "
+        "/tmp is private to each sandbox call and is discarded when it ends. "
+        "sandbox_terminated confirms process cleanup, not deletion of /workspace. "
+        "cwd accepts workspace-relative paths or /workspace/...; it defaults "
+        "to /workspace. Process working-directory and environment changes do not carry over.\n"
+    )
     registry.register(
         ToolDefinition(
             "core_terminal_exec",
@@ -926,15 +946,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "Read the exit code and captured output before choosing the next action.\n"
                 "Terminal output combines stdout and stderr in the stdout field.\n"
                 "\n"
-                "Files in /workspace persist across calls and tasks in this chat.\n"
-                "/tmp is temporary and is discarded after each call. Use /workspace\n"
-                "for repositories, installed tools and files needed by later calls.\n"
-                "sandbox_terminated means sandbox cleanup, not deletion of /workspace.\n"
-                "\n"
-                "cwd defaults to /workspace and accepts workspace-relative paths or\n"
-                "absolute paths under /workspace. Working-directory and environment\n"
-                "changes made by a command do not carry over to later calls.\n"
-                "\n"
+                + workspace_guidance + "\n"
                 "stdin is closed. Use non-interactive options; commands must not wait\n"
                 "for user input. The default timeout is at most 120 seconds. Set timeout\n"
                 "explicitly for longer operations, within the allowed limit.\n"
@@ -942,7 +954,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "\n"
                 "Available commands include Git, standard Unix utilities, rg, fd, jq,\n"
                 "yq, curl, sqlite3, archive tools and PDF utilities. Node.js and npm are\n"
-                "not preinstalled. Additional tools may be installed in /workspace\n"
+                "not preinstalled. Additional tools may be installed in the workspace\n"
                 "when policy and network access allow.\n"
             ),
             {
@@ -978,11 +990,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "arguments). Direct OS calls do not pass that broker and must not "
                 "simulate an unavailable capability. Execution is restricted to the "
                 "chat workspace and permitted public network destinations. "
-                "Files under /workspace persist across calls and tasks in this chat; "
-                "/tmp is private to each sandbox call and is discarded when it ends. "
-                "sandbox_terminated confirms process cleanup, not deletion of /workspace. "
-                "cwd accepts workspace-relative paths or /workspace/...; it defaults "
-                "to /workspace. Process working-directory and environment changes do not carry over. "
+                + workspace_guidance +
                 "This interpreter is the one core_terminal_exec installs into, so a "
                 "package installed there imports here without touching sys.path. "
                 "Preinstalled imports: pydantic/jsonschema, httpx/httpx_sse/h2/websockets, "
@@ -1648,6 +1656,8 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
             allow_legacy=environment in {"development", "test"},
         )
         cloud_auth = auth_settings is not None and auth_settings.mode == "cloudru"
+        sandbox_backend = validate_backend(_env("SANDBOX_BACKEND", "bubblewrap"),
+            cloud=cloud_auth, environment=environment)
         if cloud_auth:
             diagnostics.emit("startup.storage", backend="temporary-posix", durable=False)
         recovery_tenant_id = auth_settings.tenant if auth_settings else None
@@ -1673,7 +1683,9 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
         with diagnostics.stage("sandbox"):
             if sandbox_launcher is None:
                 diagnostics.sandbox()
-                sandbox_launcher = SandboxLauncher(SandboxPolicy.from_environment())
+                launcher_class = LandlockLauncher if sandbox_backend == "landlock" else SandboxLauncher
+                sandbox_launcher = launcher_class(SandboxPolicy.from_environment())
+            diagnostics.emit("startup.sandbox_backend", backend=sandbox_backend)
             sandbox_launcher.preflight()
         authenticator = (CloudAuthenticator(auth_settings, state["database"]) if cloud_auth else None)
         guardrail_classifier = guardrail_classifier or _guardrail_classifier(model)
@@ -2021,7 +2033,8 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
         try:
             files_store = (PostgresChatFileStore(state["database"], state["workflow"])
                            if state["database"] else MemoryChatFileStore(state["workflow"], admission.validate_workspace_scope))
-            file_service = ChatFileService(files_store, agent.tool_runtime.environment_manager.backend.chats)
+            file_service = ChatFileService(files_store, agent.tool_runtime.environment_manager.backend.chats,
+                protected_inputs_enabled=getattr(sandbox_launcher, "isolation_level", None) != "landlock")
             agent.chat_file_service = file_service
             agent.task_scheduler.chat_file_service = file_service
             if agent.remote_registry is not None:

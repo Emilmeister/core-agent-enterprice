@@ -140,6 +140,11 @@ criterion должны войти в тот же завершённый change. 
   `spec/cloudru.md` фиксирует отдельный Cloud.ru profile и ограниченный первый trial.
 - `docs/cloudru-trial.md` — запуск Cloud.ru trial, platform PostgreSQL, временные
   файлы, owner password и получение безопасных startup diagnostics.
+- `deploy/landlock-native-vm.sh` — только локальный ARM64 test fixture для
+  Docker host без Landlock: отдельный QEMU guest с packaged kernel, read-only
+  исходниками, private tmpfs/cgroups и явным outer test filter; не production
+  backend и не замена target Cloud Pod gate. Образ задаёт `LANDLOCK_TEST_IMAGE`,
+  полный guest log — `LANDLOCK_VM_LOG`; существующие контейнеры не меняются.
 - `docs/superpowers/specs/` — проектные черновики для согласования; не заменяют
   нормативный `spec/` и не разрешают менять замороженные spec/tests.
 - `docs/superpowers/plans/` — планы реализации; не снимают ограничения на
@@ -257,6 +262,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/workspace_cleanup.py` | Подтверждённая exact selection, durable intent/receipt, private capture/journal и bounded recovery очистки |
 | `core_agent/python_exec.py` | Bounded Python process и `tools.call(...)` broker |
 | `core_agent/sandbox.py`, `core_agent/sandbox_exec.py` | Gated Bubblewrap launcher, сетевой профиль, inner seccomp и подтверждённая остановка namespace |
+| `core_agent/sandbox_landlock.py`, `core_agent/landlock_policy.py`, `core_agent/landlock_network.py`, `core_agent/landlock_metadata.py` | Явный Cloud development backend: Landlock/seccomp, обязательный preflight, proxy FD injection, pinned-FD metadata mediation без CONTINUE и подтверждение полного process tree cleanup по CLD-05-L |
 | `core_agent/tasks.py` | Test scheduler, mailbox и delegation contracts |
 | `core_agent/postgres_tasks.py` | Durable PostgreSQL scheduler и mailbox |
 | `core_agent/workflow.py` | Workflow stores, transitions и durable outbox |
@@ -334,6 +340,28 @@ Target spec может описывать больше текущего runtime.
   retired `ARTIFACT_STORAGE_*`/`ARTIFACT_S3_*`/`ARTIFACT_MONGODB_*`/
   `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` не подключают backend или credentials;
   Cloud trial игнорирует artifact settings, Keycloak продолжает их отклонять.
+- `SANDBOX_BACKEND` по умолчанию `bubblewrap`; `landlock` разрешён только для
+  `CORE_AGENT_ENVIRONMENT=development` + `CORE_AGENT_AUTH_MODE=cloudru`.
+  Его отдельный контракт — `spec/cloudru.md`, CLD-05-L: приложение PID 1 своего
+  container PID namespace под non-root UID, нулевые effective/permitted/inheritable/ambient
+  capabilities, Landlock ABI >= 4, строгий seccomp и настоящий NEW_LISTENER/ADDFD
+  preflight без зависимости от внешнего сайта; `startup.sandbox_backend`
+  сообщает выбранный backend до проверки. Автоматический fallback запрещён.
+  Backend даёт реальные HOME/cwd,
+  отдельный TMPDIR вне workspace, `/workspace/...` только как tool cwd alias
+  и сеть только через обязательный proxy для HTTP/HTTPS клиентов. Непустой
+  `attachments` отклоняет execution до запуска с
+  `EXECUTION_ENVIRONMENT_UNAVAILABLE`. Новые protected owner uploads закрыты
+  общим file admission с `CAPABILITY_DISABLED`; публикация прежнего quarantined
+  protected batch отклоняется до workspace writes, включая background race.
+  Прежние bytes/history/owner file access, generated files и writable `a2a/`
+  сохраняются. Chmod/timestamps проходят bounded trusted notification и
+  pinned-FD paths без CONTINUE; fchmod своего FD допускает только mode bits
+  0777, runtime остаётся root-owned/immutable. Chown/xattr/inotify и воздействие
+  на чужие процессы запрещены.
+  Trusted subreaper/fixed PGID и dedicated PID-1 lifetime подтверждают teardown;
+  неизвестный outcome сохраняет reconciliation/no-replay. Успех local tests или
+  diagnostics не заменяет target Cloud Pod gate. Bubblewrap profile неизменён.
 - `CORE_AGENT_STARTUP_DIAGNOSTICS=true` с `LOG_LEVEL=INFO` показывает finite
   platform facts и стадии сборки приложения без ENV values, DSN и secrets.
   Перед штатным launcher/preflight выполняются фиксированные

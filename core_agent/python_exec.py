@@ -79,8 +79,12 @@ class Tools:
         return response.get("output")
 
 
-with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-    connection.connect(sys.argv[1])
+inherited = sys.argv[1].startswith("fd:")
+connection = (socket.socket(fileno=int(sys.argv[1][3:])) if inherited
+              else socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+with connection:
+    if not inherited:
+        connection.connect(sys.argv[1])
     with connection.makefile("rwb") as stream:
         send(stream, {"token": sys.argv[2]})
         initial = receive(stream)

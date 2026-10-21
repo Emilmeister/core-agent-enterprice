@@ -409,6 +409,13 @@ class SandboxProcess:
         self._created_at = time.monotonic()
         self._diagnostics = None
 
+    def _launch_resources(self):
+        """Prepare parent-owned resources after this process is registered."""
+        return {}
+
+    def _cleanup_resources(self):
+        """Release extra resources only after confirmed process-tree death."""
+
     def _message(self, deadline):
         remaining = deadline - time.monotonic() if deadline is not None else None
         if remaining is not None and remaining <= 0:
@@ -452,10 +459,15 @@ class SandboxProcess:
                     if message['state'] != 'exited':
                         raise _unavailable('Unexpected sandbox completion')
                     self.returncode = message['returncode']
-                    self._process.wait(timeout=_CLEANUP_SECONDS)
-                    _confirm_dead(self._pidfds, _CLEANUP_SECONDS)
                     if message.get('cleanup_failed'):
                         self._launcher._unhealthy = True
+                        self._diagnostics = _frame_diagnostics(message, self._created_at)
+                        self._emergency_cleanup()
+                        raise CoreError('SIDE_EFFECT_UNKNOWN' if self._released else 'EXECUTION_ENVIRONMENT_UNAVAILABLE',
+                                        'Sandbox cleanup could not be confirmed', diagnostics=self._diagnostics)
+                    self._process.wait(timeout=_CLEANUP_SECONDS)
+                    _confirm_dead(self._pidfds, _CLEANUP_SECONDS)
+                    self._cleanup_resources()
                     self._close()
                     if message.get('error'):
                         self._diagnostics = _frame_diagnostics(message, self._created_at)
@@ -506,6 +518,7 @@ class SandboxProcess:
                 self._process.kill()
             self._process.wait(timeout=_CLEANUP_SECONDS)
             _confirm_dead(self._pidfds, _CLEANUP_SECONDS)
+            self._cleanup_resources()
             if self.returncode is None:
                 self.returncode = self._process.returncode
         except BaseException as error:
@@ -536,6 +549,10 @@ class SandboxProcess:
 
 
 class SandboxLauncher:
+    isolation_level = 'bubblewrap'
+    _supervisor_module = 'core_agent.sandbox'
+    _process_class = SandboxProcess
+
     def __init__(self, policy):
         self.policy = policy
         self._semaphore = threading.BoundedSemaphore(policy.max_concurrent_processes)
@@ -543,6 +560,9 @@ class SandboxLauncher:
         self._processes = set()
         self._unhealthy = False
         self._closed = False
+
+    def _native_check(self):
+        _check_native()
 
     def start(self, argv, *, workspace_path, readonly_input_path, cwd='.', environment=None,
               stdin=None, stdout=None, stderr=None, broker_socket=None, timeout=None):
@@ -565,7 +585,7 @@ class SandboxLauncher:
             if self._unhealthy or self._closed:
                 raise _unavailable('Sandbox launcher is unavailable')
             try:
-                _check_native()
+                self._native_check()
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 raise _unavailable() from error
             stage = 'queue'
@@ -583,17 +603,18 @@ class SandboxLauncher:
                 if self._closed or self._unhealthy:
                     raise _unavailable('Sandbox launcher is unavailable')
                 parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-                process = subprocess.Popen([sys.executable, '-I', '-m', 'core_agent.sandbox', '--supervise', str(child.fileno())],
+                process = subprocess.Popen([sys.executable, '-I', '-m', self._supervisor_module, '--supervise', str(child.fileno())],
                                            env=_HELPER_ENV, pass_fds=(child.fileno(),),
                                            stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=True)
                 child.close()
-                handle = SandboxProcess(self, process, parent)
+                handle = self._process_class(self, process, parent)
                 self._processes.add(handle)
+                resources = handle._launch_resources()
             _send(parent, {'argv': list(argv), 'workspace': str(workspace_path),
                            'inputs': str(readonly_input_path), 'cwd': cwd, 'environment': environment,
                            'broker': str(broker_socket) if broker_socket is not None else None,
                            'policy': dataclasses.asdict(self.policy), 'deadline': deadline,
-                           'parent_pid': os.getpid()})
+                           'parent_pid': os.getpid(), **resources})
             while True:
                 message = handle._message(deadline)
                 if message['state'] == 'owned':

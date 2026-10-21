@@ -881,7 +881,7 @@ class TerminalSessionManager:
             spec.hardened(),
             session_id=spec.session_id or str(uuid.uuid4()),
             workspace_id=spec.workspace_id or str(uuid.uuid4()),
-            isolation_level="bubblewrap" if sandboxed else "process",
+            isolation_level=self.backend.launcher.isolation_level if sandboxed else "process",
             os_security_boundary=sandboxed,
         )
         environment = self.backend.create(prepared)

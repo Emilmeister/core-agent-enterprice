@@ -429,13 +429,15 @@ def _verify(fd, manifest):
 
 class ChatFileService:
     def __init__(self, store, workspaces, *, limit_bytes=DEFAULT_ATTACHMENT_LIMIT,
-                 clock=time.time, lease_seconds=300):
+                 clock=time.time, lease_seconds=300, protected_inputs_enabled=True):
         if (type(limit_bytes) is not int or limit_bytes < 1
                 or type(lease_seconds) not in (int, float)
-                or not 0 < lease_seconds <= sys.float_info.max):
+                or not 0 < lease_seconds <= sys.float_info.max
+                or type(protected_inputs_enabled) is not bool):
             raise CoreError("CONFIG_INVALID")
         self.store, self.workspaces = store, workspaces
         self.limit_bytes, self.clock, self.lease_seconds = limit_bytes, clock, lease_seconds
+        self.protected_inputs_enabled = protected_inputs_enabled
         self._orphan_scan = None
         self._orphan_scan_tenant = None
         with ExitStack() as descriptors:
@@ -524,6 +526,10 @@ class ChatFileService:
         if artifact_manifest is not None and (not isinstance(artifact_manifest, dict)
                 or artifact_manifest.keys() != {"artifacts", "messages", "manifest_path"}):
             raise CoreError("INVALID_FILE_INPUT")
+        if not self.protected_inputs_enabled and source != "a2a" and destination_id is None:
+            # A writable Landlock parent cannot exclude future attachments.
+            # Reject before staging/admission, not after accepting an input.
+            raise CoreError("CAPABILITY_DISABLED", "Protected file uploads are unavailable in this execution profile")
         batch_id, token, now = uuid.uuid4().hex, uuid.uuid4().hex, self.clock()
         row = dict(batch_id=batch_id, schema_version=1, tenant_id=tenant_id, actor_id=actor_id,
                    message_id=message_id, request_digest=request_digest, created_at=now,
@@ -660,6 +666,8 @@ class ChatFileService:
                 if not row["manifest"]:
                     raise CoreError("FILE_BATCH_NOT_PREPARED")
                 directory_kind, _ = _destination(row["manifest"])
+                if not self.protected_inputs_enabled and directory_kind == "attachments":
+                    raise CoreError("CAPABILITY_DISABLED", "Protected file uploads are unavailable in this execution profile")
                 occupied = self.store.reserved(binding, connection=conn) if directory_kind == "attachments" else set()
                 with self._attachments(binding, row["manifest"]) as attachments:
                     if directory_kind == "attachments":
@@ -837,6 +845,10 @@ class ChatFileService:
         # cannot publish using its own uncommitted allow on the same connection.
         batch = self.store.get(batch_id, binding.tenant_id)
         self._scope(batch, binding)
+        if not self.protected_inputs_enabled and _destination(batch["manifest"])[0] == "attachments":
+            # Also fence batches accepted before a backend change: publication
+            # must never introduce protected bytes into a live writable tree.
+            raise CoreError("CAPABILITY_DISABLED", "Protected file uploads are unavailable in this execution profile")
         if batch["state"] not in {"accepted_ready", "published"}:
             raise CoreError("FILE_BATCH_NOT_READY")
         source = _caller_records(self.store.workflow, binding, batch["run_id"])[-1]

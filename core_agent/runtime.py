@@ -3514,6 +3514,11 @@ class CoreAgent:
             return None
         return review["state"]
 
+    def _workspace_receipt_path(self, path):
+        launcher = getattr(self.tool_runtime.environment_manager.backend, "launcher", None)
+        prefix = "./" if getattr(launcher, "isolation_level", None) == "landlock" else "/workspace/"
+        return prefix + path
+
     def _guard_file_batch(self, record, snapshot, batch_id, *, sequence, lease_token,
                           continuation=None, before_pending=None, exempt=False, exemption_source=None):
         if self.chat_file_service is None or self.material_review_store is None:
@@ -3580,7 +3585,7 @@ class CoreAgent:
                 event_kind="file.delivery.pending", event_data=pending["file_delivery_pending"], lease_token=lease_token)
             raise _MaterialSuspended(SuspendedRun(current.run_id, current.task_id, "", current.version)) from error
         snapshot.pop("file_delivery_pending", None)
-        return "Attached files: " + json.dumps([entry["actual_name"] for entry in manifest["entries"]], ensure_ascii=False) + "; folder: /workspace/" + "/".join(_destination(manifest))
+        return "Attached files: " + json.dumps([entry["actual_name"] for entry in manifest["entries"]], ensure_ascii=False) + "; folder: " + self._workspace_receipt_path("/".join(_destination(manifest)))
 
     def _remote_result_batches(self, record, payload):
         """Freeze receipts from owned scheduler state; peer/model fields grant nothing."""
@@ -3612,9 +3617,9 @@ class CoreAgent:
                 files.extend({key: entry[key] for key in
                     ("index", "actual_name", "relative_path", "media_type", "size_bytes", "sha256")}
                     for entry in manifest["entries"])
-                folders.append("/workspace/" + "/".join(_destination(manifest)))
+                folders.append(self._workspace_receipt_path("/".join(_destination(manifest))))
                 if "manifest_path" in manifest:
-                    paths.append("/workspace/" + manifest["manifest_path"])
+                    paths.append(self._workspace_receipt_path(manifest["manifest_path"]))
                     artifacts.extend(copy.deepcopy(manifest["artifacts"]))
                     messages.extend(copy.deepcopy(manifest["messages"]))
                 batches.append((batch_id, output))

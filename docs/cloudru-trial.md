@@ -67,7 +67,8 @@ LOCAL_WORKSPACE_ROOT=/tmp/core-agent/runs
 - Стабильный `PUSH_NOTIFICATION_ENCRYPTION_KEY` в формате Fernet для encrypted
   settings/credentials. Сохраняйте его отдельно от БД и между перезапусками.
 - `SANDBOX_DNS_SERVERS` и `SANDBOX_DENIED_CIDRS` с реальными защищёнными сетями
-  deployment. Sandbox требует Linux namespaces, seccomp, TUN и resource limits;
+  deployment. Default `SANDBOX_BACKEND=bubblewrap` требует Linux namespaces,
+  seccomp, TUN и resource limits;
   параметры и outer security profile описаны в [инструкции](../deploy/kubernetes/apparmor/README.md)
   и [Pod fixture](../deploy/kubernetes/sandbox-pod.yaml).
 
@@ -76,6 +77,82 @@ MCP настраиваются в owner UI. Автоматические `MCP_UR
 и `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` тоже игнорируются: они не включают S3,
 не импортируют прежние blobs и не мешают диагностическому запуску. Default
 Keycloak profile продолжает отклонять эти retired artifact settings.
+
+## Ограниченный Landlock trial
+
+Для Cloud development можно явно выбрать альтернативный backend:
+
+```dotenv
+CORE_AGENT_ENVIRONMENT=development
+CORE_AGENT_AUTH_MODE=cloudru
+SANDBOX_BACKEND=landlock
+```
+
+Контракт и открытые проверки — [CLD-05-L](../spec/cloudru.md#cld-05-l-явный-development-backend-landlock)
+и [CLD-LANDLOCK](../spec/implementation-status.md). Это выбор оператора;
+отказ Bubblewrap сам его не включает. Production, Keycloak и test environment
+с этим выбором отклоняются. Без переменной остаётся Bubblewrap.
+
+Запускайте `core-agent` непосредственно как PID 1 выделенного container PID
+namespace, без init/supervisor wrapper и shared process namespace. Процесс
+должен работать под non-root UID и иметь нулевые
+effective/permitted/inheritable/ambient capabilities.
+Если платформа не обеспечивает эти условия, данный trial не запускается.
+Preflight обязан реально применить Landlock ABI >= 4 и seccomp, создать
+notification listener и передать socket FD ограниченному child через ADDFD.
+Одних успешных диагностических probes недостаточно; отказ закрывает serving.
+Запись `startup.sandbox_backend` показывает выбранный backend перед preflight.
+Проверка реальной FD injection использует отказ запрещённого private HTTP
+destination и не требует доступности внешнего сайта.
+
+Ограничения первого backend:
+
+- Команды работают с настоящим scoped workspace: `HOME` и начальный `cwd`
+  указывают на него. Используйте относительные пути или `$HOME`; `/workspace/...`
+  принимается только параметром `cwd` tools и не существует как shell alias.
+- Временные файлы создавайте через `$TMPDIR`/`tempfile`; этот частный каталог
+  находится вне workspace, очищается после execution и не сохраняется в проекте.
+  Общий `/tmp` недоступен.
+- Сеть доступна HTTP/HTTPS клиентам, поддерживающим переданный proxy.
+  Прямые sockets/IP, UDP, произвольные TCP протоколы и чужие Unix sockets
+  недоступны. DNS и destination checks используют обязательные
+  `SANDBOX_DNS_SERVERS`/`SANDBOX_DENIED_CIDRS`; удаление proxy ENV не открывает сеть.
+- Новые защищённые owner uploads отклоняются с `CAPABILITY_DISABLED` до
+  admission; прежние quarantined protected batches не публикуются в workspace.
+  Если в `attachments` уже есть файлы, terminal/Python/background execution
+  возвращает `EXECUTION_ENVIRONMENT_UNAVAILABLE` до запуска. Сохранённые bytes,
+  history и owner file access остаются. Для execution используйте чат без
+  защищённых вложений; созданные агентом файлы и writable A2A файлы `a2a/`
+  доступны по прежнему контракту.
+- Git init/clone/checkout используют доверенную обработку chmod/timestamps
+  внутри workspace/TMPDIR. Metadata paths проверяются через закреплённые FD;
+  чужие пути, special mode bits, chown, xattr, inotify и сигналы чужим
+  процессам запрещены.
+- Timeout/cancel и завершение команды подтверждают остановку всех её потомков.
+  Неопределённый результат сохраняет прежний cleanup/reconciliation barrier.
+
+После успешного preflight в целевом Pod отдельно проверьте terminal, Python
+с `tools.call`, background, отмену/timeout, разрешённый HTTP/HTTPS и отказ
+запрещённых destinations. Сохраните безопасные результаты этих проверок вместе
+со startup logs. До этого target gate остаётся открытым; S3 durability этот
+backend не добавляет.
+
+Для локальной ARM64 проверки при отсутствии Landlock в Docker host kernel
+есть отдельный [VM fixture](../deploy/landlock-native-vm.sh):
+
+```bash
+LANDLOCK_TEST_IMAGE=core-agent-enterprice-agent:latest bash deploy/landlock-native-vm.sh
+```
+
+Он устанавливает тестовые dependencies только в одноразовый Docker container,
+загружает packaged Debian kernel в QEMU TCG, использует read-only копию образа
+и исходников и отдельные guest tmpfs/cgroups. Python tests исполняются как
+непривилегированный PID 1 guest; явный outer test filter запрещает
+mount/unshare/setns. Это реальная kernel-проверка Landlock/seccomp, но не
+воспроизведение security profile Cloud.ru. Скрипт не меняет Docker Desktop или
+действующие контейнеры и считает успехом только явный результат suite.
+`LANDLOCK_VM_LOG` задаёт путь полного guest log; без него log остаётся во
+временной папке. Production image и target Cloud gate этим не заменяются.
 
 ## Миграция и первый вход
 
@@ -136,8 +213,9 @@ seccomp и другие ограничения могут вернуть оди�
 значений. Не прикладывайте ENV dump, пароли, DSN, tokens или содержимое запросов.
 Передайте записи `startup.sandbox_probe` для `landlock_abi`,
 `landlock_filesystem`, `seccomp_filter`, последующие namespace/Bubblewrap probes
-и stage/reason штатного preflight. В текущем Cloud.ru trial итоговый отказ
-старта на Bubblewrap по-прежнему ожидаем: новые probes не меняют execution
-backend или сетевой профиль. Их успех подтверждает только проверенные действия,
-а готовность sandbox определяет обязательный полный preflight. Локальные tests
-и успешная сборка образа не заменяют эту проверку реального Pod.
+и stage/reason обязательного preflight выбранного backend. Optional probes
+могут показывать недоступность Bubblewrap даже при явно выбранном Landlock;
+они не выбирают backend и не меняют его ограничения. Их успех подтверждает
+только проверенные действия, а готовность sandbox определяет полный preflight
+выбранного backend. Локальные tests и успешная сборка образа не заменяют эту
+проверку реального Pod.

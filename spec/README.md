@@ -73,6 +73,7 @@ Core Agent превращает пользовательский `prompt` в з�
 - Main agent и сабагенты используют общую память только когда parent явно делегировал им `core_memory_*` tools.
 - Сабагент получает явный allowlist рабочих tools и skills; обязательные kernel tools нельзя убрать.
 - Команды main и сабагентов имеют owned TerminalSessions; доступ к файлам/процессам/сети ограничен обязательным Bubblewrap в одном Kubernetes Pod, проверяемым на целевом кластере.
+- Только явный Cloud.ru development opt-in MAY использовать вместо Bubblewrap ограниченный Landlock/seccomp/proxy профиль [CLD-05-L](cloudru.md#cld-05-l-явный-development-backend-landlock); автоматического fallback нет.
 - Kernel rules для включённых capabilities имеют приоритет над настраиваемым agent prompt; AgentConfig определяет, какие capabilities вообще существуют.
 - Ядро не раскрывает скрытую chain-of-thought; клиент получает ответы, статусы и краткие основания решений.
 - Полный транскрипт хранится вне активного контекста, поэтому compaction не уничтожает аудит.
