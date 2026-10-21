@@ -9,8 +9,8 @@
 **Цель:** разместить enterprise-агента в Evolution AI Agents, сохранив наш UI,
 настройки, MCP, A2A, вопросы владельцу и восстановление долгих задач.
 
-**Предлагаемая архитектура:** приложение в обычном Pod, PostgreSQL для состояния,
-S3 для содержимого файлов, ограниченный RAM-каталог для рабочих копий.
+**Предлагаемая архитектура:** приложение в обычном Pod, платформенная PostgreSQL
+для состояния, S3 для содержимого файлов, ограниченный RAM-каталог для рабочих копий.
 Владельцы входят по отдельному паролю. Режим исполнения Python/команд выбирается
 после проверки возможностей платформы; он не должен незаметно ослабить изоляцию.
 
@@ -32,8 +32,10 @@ S3 для содержимого файлов, ограниченный RAM-ка
   платформенного механизма MCP через ENV не требуется. В новом профиле
   автоматически подставленные `MCP_URL` и связанные credentials не должны
   незаметно импортироваться или заменять сохранённые подключения.
-- Доступность внешней PostgreSQL из целевого Pod пока не подтверждена. План
-  предусматривает её как обязательную зависимость для сохранения текущих гарантий.
+- По уточнению пользователя, PostgreSQL предоставляет сама платформа через ENV;
+  работающий `core-agent-ai-agents` уже поддерживает эти параметры подключения.
+  Отдельная внешняя PostgreSQL не требуется. До переноса проверяются подключение
+  enterprise-профиля, совместимость схемы и полномочия для миграций.
 
 Официальные материалы Cloud.ru подтверждают запуск собственного Docker-образа,
 платформенные параметры модели и публичного URL. Они не подтверждают передачу
@@ -109,10 +111,44 @@ dedup и сохранения доступа при ротации ключа. �
 
 | Где | Что сохраняем |
 |---|---|
-| PostgreSQL | Чаты, Tasks, checkpoints, inbox/dedup, leases, настройки, encrypted credentials, HITL/guardrails, память, remote bindings, очереди и manifests файлов |
+| Платформенная PostgreSQL | Чаты, Tasks, checkpoints, inbox/dedup, leases, настройки, encrypted credentials, HITL/guardrails, память, remote bindings, очереди и manifests файлов |
 | S3 | Исходные вложения, приватный quarantine, содержимое A2A text/data/file artifacts, опубликованные результаты, offload blobs; позднее — версии изменяемого workspace |
 | RAM FS | Временные загрузки и проверенные рабочие копии выбранных файлов; потеря кэша не уничтожает подтверждённый результат |
 | Образ | Код, зависимости, закреплённые skills/resources; установка пакетов при старте не требуется |
+
+Используем PostgreSQL, предоставляемую Evolution AI Agents. В reference
+`core-agent-ai-agents` параметры объявлены в `.env.example` и используются в
+`core_agent/app.py`: `_session_database_url()` собирает DSN, а `_state()` передаёт
+его в `PostgresDatabase` для общих stores сессий, Tasks, workflow и checkpoints.
+Тот же путь уже есть в enterprise [app.py](../../../core_agent/app.py) и
+[шаблоне ENV](../../../.env.example); новый backend для этого не нужен.
+
+- Для состояния явно задаются `SESSION_STORAGE_TYPE=postgres` и
+  `TASK_STORAGE_TYPE=postgres`. Параметры подключения: `SESSION_POSTGRES_PROTOCOL`,
+  `SESSION_POSTGRES_HOST`, `SESSION_POSTGRES_PORT`, `SESSION_POSTGRES_DATABASE`,
+  `SESSION_POSTGRES_USER`, `SESSION_POSTGRES_PASSWORD`. Приоритет источников DSN:
+  `SESSION_DATABASE_URL`, затем `SESSION_POSTGRES_*` при непустом host,
+  затем `TASK_POSTGRES_URL`, затем `DATABASE_URL`. Tasks используют общий пул.
+- Для включённой памяти задаётся `MEMORY_STORAGE_TYPE=postgres`. При отсутствии
+  `MEMORY_POSTGRES_HOST` память использует общий пул; непустой host выбирает
+  отдельный DSN из `MEMORY_POSTGRES_PROTOCOL`, `MEMORY_POSTGRES_HOST`,
+  `MEMORY_POSTGRES_PORT`, `MEMORY_POSTGRES_DATABASE`, `MEMORY_POSTGRES_USER` и
+  `MEMORY_POSTGRES_PASSWORD`. Для отдельной базы также нужна подготовленная схема.
+- В production сохраняется `DATABASE_AUTO_MIGRATE=false`. Отдельный шаг
+  `core-agent-db migrate` в [database.py](../../../core_agent/database.py) читает
+  `DATABASE_MIGRATION_URL` либо `DATABASE_URL`, но не собирает URL из
+  `SESSION_POSTGRES_*`. Для него необходимо явно передать DSN платформенной базы
+  с DDL credential; `DATABASE_APP_ROLE` задаёт роль приложения для выдачи DML grants.
+  Serving process использует runtime credential и проверяет версию схемы.
+
+Подтверждена поддержка ENV в коде, а не готовность платформенной базы к
+enterprise-схеме. На этапе 0 проверяются соединение из целевого Pod и требования
+TLS, версия PostgreSQL, доступность `pgvector` для индекса векторного поиска, права
+на миграции и выдачу grants, лимиты соединений, совместимость существующих данных
+и порядок backup/restore. Отсутствие `pgvector` не блокирует подключение: текущая
+память поддерживает расчёт косинусной близости в процессе по сохранённым векторам.
+Эти проверки определяют настройку платформенной базы;
+развёртывание отдельной PostgreSQL не является предпосылкой плана.
 
 S3 используем напрямую по API. Это не требует FUSE и специальных mount permissions.
 Монтирование рассматривается только как отдельная проверяемая возможность
@@ -196,7 +232,7 @@ credentials приложения не передаются выполняемо�
 
 | Этап | Работы и основные файлы | Критерий завершения |
 |---|---|---|
-| 0. Проверить платформу | Зафиксировать proxy/browser routes, caller identity, Pod permissions, writable paths, PostgreSQL/S3 доступ, CPU/replicas/idle/SIGTERM, limits и версию A2A | Есть проверенный контракт размещения; неизвестные условия не заменены предположениями |
+| 0. Проверить платформу | Зафиксировать proxy/browser routes, caller identity, Pod permissions, writable paths, подключение к платформенной PostgreSQL через ENV, миграционные права/совместимость схемы/pgvector, S3 доступ, CPU/replicas/idle/SIGTERM, limits и версию A2A | Есть проверенный контракт размещения; неизвестные условия не заменены предположениями |
 | 1. Выделить профиль | `app.py`, `auth.py`, `config.py`, `.env.example`, `Dockerfile`; включение enterprise services не зависит от наличия Keycloak; MCP только из UI/settings | Ограниченный профиль запускается без Keycloak/sandbox при явно выключенном execution; прежний профиль сохраняет проверки |
 | 2. Подключить владельцев | `auth.py`, `ui.py`, `ui/src/auth.ts`, `ui/src/api.ts`, login UI, `external_access.py`; общие DB sessions | Owner входит/выходит, управляет settings и отвечает HITL; external не читает private данные; ротация пароля отзывает сессии |
 | 3. Подключить S3 | `artifacts.py`, `chat_files.py`, `response_files.py`, `response_artifacts.py`, `remote_artifacts.py`, `database.py`, `workspace.py`, `workspace_cleanup.py` | Подтверждённые вложения, quarantine и результаты сохраняются при полностью пустой FS нового Pod; GC/cleanup не воскрешают удалённое |
@@ -263,8 +299,9 @@ npm run build
 
 1. Как браузер открывает наш UI за proxy и какие доверенные данные о внешнем caller
    получает приложение. Общий пароль владельца уже выбран.
-2. Какая PostgreSQL доступна из Pod и кто применяет миграции; RAM и S3 не заменяют
-   транзакционное состояние существующего runtime.
+2. Подключение enterprise-профиля к предоставленной платформой PostgreSQL через
+   ENV, поддержка `pgvector`, миграционные права и ответственный за отдельный
+   шаг миграций. Выбор внешней БД не требуется; RAM и S3 не заменяют её транзакции.
 3. S3 endpoint/bucket/prefix, формат и срок credentials, session token/rotation,
    доступные операции и ограничения. Проверка — на отдельном служебном prefix.
 4. Нужны ли терминал/Python в первом релизе и допустим ли отдельный execution service,
