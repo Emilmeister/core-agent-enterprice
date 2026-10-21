@@ -5,6 +5,7 @@ export class LoginError extends Error {
   constructor(
     message: string,
     readonly switchAccount?: () => Promise<void>,
+    readonly passwordRequired = false,
   ) {
     super(message);
   }
@@ -14,20 +15,27 @@ export class Session {
   valid = true;
   onExpired: () => void = () => {};
   constructor(
-    readonly keycloak: Keycloak,
+    readonly keycloak: Keycloak | null,
     readonly identity: Identity,
+    readonly externalA2AUrl?: string,
   ) {
-    keycloak.onAuthLogout = () => this.expire();
-    keycloak.onAuthRefreshError = () => this.expire();
+    if (keycloak) {
+      keycloak.onAuthLogout = () => this.expire();
+      keycloak.onAuthRefreshError = () => this.expire();
+    }
+  }
+  get authMode() {
+    return this.keycloak ? "keycloak" : "cloudru";
   }
   expire() {
     if (!this.valid) return;
     this.valid = false;
-    this.keycloak.clearToken();
+    this.keycloak?.clearToken();
     this.onExpired();
   }
   async token() {
     if (!this.valid) throw new Error("Сессия завершена. Войдите снова.");
+    if (!this.keycloak) return undefined;
     try {
       await this.keycloak.updateToken(30);
       if (!this.valid || !this.keycloak.token) throw new Error();
@@ -38,6 +46,19 @@ export class Session {
     }
   }
   async logout() {
+    if (!this.keycloak) {
+      const response = await fetch("/api/auth/logout", {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+      });
+      if (!response.ok && response.status !== 401)
+        throw new LoginError("Не удалось завершить сессию. Повторите выход.");
+      this.expire();
+      location.replace("/ui/?logged_out=1");
+      return;
+    }
     const action = this.keycloak.logout({
       redirectUri: `${location.origin}/ui/?logged_out=1`,
     });
@@ -46,7 +67,7 @@ export class Session {
   }
 }
 
-export async function signIn(): Promise<Session> {
+export async function signIn(password?: string): Promise<Session> {
   const response = await fetch("/ui/config", {
     cache: "no-store",
     credentials: "omit",
@@ -57,6 +78,42 @@ export async function signIn(): Promise<Session> {
       "Вход в интерфейс не настроен. Обратитесь к администратору.",
     );
   const config: unknown = await response.json();
+  if (config && typeof config === "object" && "auth_mode" in config && config.auth_mode === "cloudru") {
+    if (!("external_a2a_url" in config) || typeof config.external_a2a_url !== "string")
+      throw new LoginError("Не удалось прочитать настройки входа.");
+    if (password !== undefined) {
+      const login = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+      });
+      if (!login.ok)
+        throw new LoginError(
+          login.status === 401 ? "Неверный пароль. Попробуйте снова."
+            : login.status === 429 ? "Слишком много попыток входа. Подождите несколько минут."
+              : "Не удалось войти. Попробуйте позже.",
+          undefined, true,
+        );
+    }
+    const identityResponse = await fetch("/api/identity", {
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+    });
+    if (!identityResponse.ok)
+      throw new LoginError(
+        identityResponse.status === 401 ? "Введите пароль владельца, чтобы продолжить."
+          : "Не удалось проверить доступ. Попробуйте войти снова.",
+        undefined, true,
+      );
+    const identity = (await identityResponse.json()) as Identity;
+    if (!identity || identity.role !== "owner" || typeof identity.actor_id !== "string" || typeof identity.tenant !== "string")
+      throw new LoginError("Доступ владельца не подтверждён.");
+    return new Session(null, identity, config.external_a2a_url);
+  }
   if (
     !config ||
     typeof config !== "object" ||

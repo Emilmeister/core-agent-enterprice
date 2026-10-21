@@ -134,7 +134,8 @@ Core Agent MUST поддерживать A2A operations, необходимые 
 
 - send message: начать или продолжить task;
 - send streaming message: получить status/artifact updates в реальном времени;
-- get/list task: polling и управление несколькими фоновыми tasks;
+- get/list task: polling и управление несколькими фоновыми tasks; external
+  listing в явном Cloud.ru profile запрещён по [CLD-03](cloudru.md);
 - subscribe to task: восстановить stream активной task;
 - cancel task;
 - create/get/list/delete push notification configuration;
@@ -350,7 +351,7 @@ A2A binding MUST принимать и передавать W3C Trace Context ч
 
 ## Owner и external представления
 
-Owner и external A2A endpoints используют один A2A lifecycle и отдельные authenticated access gates. На каждом новом HTTP-запросе проверяются Keycloak, tenant, стабильный caller scope и роль; внутри уже открытого ответа повторной introspection нет. Get/List/Subscribe/Cancel, history, push configuration и download не раскрывают чужие IDs. Owner-only решения и настройки недоступны service-account caller-ам независимо от текста/metadata.
+Owner и external A2A endpoints используют один A2A lifecycle и отдельные authenticated access gates. На каждом новом HTTP-запросе проверяются выбранный auth profile, tenant, стабильный caller scope и роль; внутри уже открытого ответа повторной introspection нет. Get/List/Subscribe/Cancel, history, push configuration и download не раскрывают IDs вне разрешённого scope. В явном [Cloud.ru profile](cloudru.md) external peers имеют общий scope для известных IDs и не могут перечислять Tasks; в Keycloak действует per-caller isolation. Owner-only решения и настройки недоступны service-account caller-ам независимо от текста/metadata.
 
 `contextId` соответствует одному чату. Создание новой root Task и durable `CONTEXT_BUSY` следуют TASK-01/02 [Публичного контракта](public-contract.md); ответ занятого чата является failed Task с `activeTaskId` только доступной вызывающему задачи, а не одновременно JSON-RPC error.
 

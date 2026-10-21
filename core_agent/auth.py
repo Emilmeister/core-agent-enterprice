@@ -32,9 +32,19 @@ class AuthSettings:
     owner_role: str = "agent-owner"
     external_role: str = "agent-external"
     ui_client_id: str = ""
+    mode: str = field(default="keycloak", init=False)
 
     @classmethod
     def from_environment(cls, get, *, production=False, allow_legacy=False):
+        mode = get("CORE_AGENT_AUTH_MODE", "keycloak")
+        if mode == "cloudru":
+            if production:
+                raise CoreError("CONFIG_INVALID", "Cloud.ru trial requires development/test until durable file storage is implemented")
+            from .cloudru_auth import CloudAuthSettings
+
+            return CloudAuthSettings.from_environment(get)
+        if mode != "keycloak":
+            raise CoreError("CONFIG_INVALID", "CORE_AGENT_AUTH_MODE must be keycloak or cloudru")
         values = [get(name, "") for name in (
             "KEYCLOAK_ISSUER_URL", "KEYCLOAK_CLIENT_ID", "KEYCLOAK_CLIENT_SECRET",
             "KEYCLOAK_AUDIENCE", "CORE_AGENT_TENANT_ID",
@@ -80,6 +90,7 @@ class Principal:
     is_owner: bool
     is_external: bool
     is_browser: bool = False
+    auth_mode: str = "keycloak"
 
     @property
     def owner_id(self):
@@ -128,6 +139,9 @@ class AuthContextBuilder(DefaultServerCallContextBuilder):
             name: value for name, value in context.state["headers"].items()
             if name.lower() not in {"authorization", "cookie", "proxy-authorization"}
         }
+        if actor.auth_mode == "cloudru":
+            context.state["headers"] = {name: value for name, value in context.state["headers"].items()
+                                        if name.lower() in {"traceparent", "tracestate", "a2a-version", "a2a-extensions"}}
         context.state["principal"] = actor
         return AuthenticatedCallContext(
             user=ScopeUser(actor.owner_id), tenant=actor.tenant,

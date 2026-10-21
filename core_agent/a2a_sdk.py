@@ -64,7 +64,8 @@ from .a2a import (
     output_contract_version,
     parse_run_request,
 )
-from .auth import AuthenticatedCallContext, OWNER_SCOPE, ScopeUser, is_company_owner
+from .auth import AuthenticatedCallContext, OWNER_SCOPE, Principal, ScopeUser, is_company_owner
+from .cloudru_auth import COOKIE_NAME
 from .a2a_input import input_error_response, protect_sdk_logs, read_input, request_limit
 from .database import (REMOTE_PROGRESS_KEY, _has_response_files, public_artifact_parts, public_sdk_message,
                        reconcile_remote_progress, reconcile_workflow_task)
@@ -513,9 +514,19 @@ def _agent_card_routes(sdk_card, *, derive_base_url, card_skills=None):
             for interface in card.supported_interfaces:
                 interface.url = (base_url or interface.url).rstrip("/") + prefix
             if authenticated:
-                scheme = card.security_schemes["keycloak"]
-                scheme.http_auth_security_scheme.scheme = "bearer"
-                card.security_requirements.add().schemes["keycloak"].SetInParent()
+                actor = request.scope["principal"]
+                cloud = isinstance(actor, Principal) and actor.auth_mode == "cloudru"
+                name = ("cloudruOwner" if actor.is_owner else "cloudruPlatform") if cloud else "keycloak"
+                scheme = card.security_schemes[name]
+                if cloud and actor.is_owner:
+                    scheme.api_key_security_scheme.location = "cookie"
+                    scheme.api_key_security_scheme.name = COOKIE_NAME
+                    scheme.api_key_security_scheme.description = "Owner session issued by POST /api/auth/login"
+                else:
+                    scheme.http_auth_security_scheme.scheme = "bearer"
+                    if cloud:
+                        scheme.http_auth_security_scheme.description = "Cloud.ru platform service-account API key"
+                card.security_requirements.add().schemes[name].SetInParent()
         if card_skills is not None:
             allowed = await run_in_threadpool(card_skills, request)
             skills = [skill for skill in card.skills if skill.id in allowed]
@@ -988,6 +999,12 @@ class CoreRequestHandler(DefaultRequestHandler):
         self.admission_handler = admission_handler
         self.admission_cleanup = admission_cleanup
         self.reply_hub = reply_hub
+
+    async def on_list_tasks(self, params, context):
+        actor = context.state.get("principal") if context else None
+        if isinstance(actor, Principal) and actor.auth_mode == "cloudru" and actor.is_external:
+            raise UnsupportedOperationError("Task enumeration is disabled for the shared external scope")
+        return await super().on_list_tasks(params, context)
 
     @staticmethod
     def _public_output_identity(task):

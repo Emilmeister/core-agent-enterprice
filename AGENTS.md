@@ -128,7 +128,7 @@ criterion должны войти в тот же завершённый change. 
   Ответы агента используют `ui/src/Markdown.tsx` (CommonMark/GFM), Mermaid
   рендерится как статический SVG Blob в image context. Raw HTML и автоматические
   Markdown images отключены; CSP разрешает blob только для img-src.
-  Команды `npm ci`, `npm run typecheck` и `npm run build` выполняются из этой папки
+  Команды `npm ci`, `npm test`, `npm run typecheck` и `npm run build` выполняются из этой папки
   с Node.js 24 (минимум 22.12). Production build создаёт ignored `core_agent/ui_dist/`, который
   входит в Python wheel/sdist; Docker собирает его в отдельном Node stage
   на build platform, а Python runtime — на target platform.
@@ -137,6 +137,9 @@ criterion должны войти в тот же завершённый change. 
   production UI не зависит от каталога. Все demo API работают в памяти без
   реальных credentials/сети. Команды и состояния описаны в `storybook/README.md`.
 - `spec/` — target specification, acceptance и release profiles.
+  `spec/cloudru.md` фиксирует отдельный Cloud.ru profile и ограниченный первый trial.
+- `docs/cloudru-trial.md` — запуск Cloud.ru trial, platform PostgreSQL, временные
+  файлы, owner password и получение безопасных startup diagnostics.
 - `docs/superpowers/specs/` — проектные черновики для согласования; не заменяют
   нормативный `spec/` и не разрешают менять замороженные spec/tests.
 - `docs/superpowers/plans/` — планы реализации; не снимают ограничения на
@@ -220,7 +223,9 @@ actor `migration:<database current_user>`; повторный import не зам
 | Файл | Ответственность |
 |---|---|
 | `core_agent/app.py` | Composition root: environment config, stores, tool registry, kernel, A2A app, health и Uvicorn |
-| `core_agent/auth.py` | Keycloak introspection, immutable authenticated scope, owner/external access и SDK context builder |
+| `core_agent/auth.py` | Выбор auth profile, Keycloak introspection, immutable scope, owner/external access и SDK context builder |
+| `core_agent/cloudru_auth.py` | Общий Cloud.ru external actor, owner password/cookie, DB sessions, rate limit и запрет возврата retired password |
+| `core_agent/startup_diagnostics.py` | Opt-in finite startup stages/platform facts без secret values и raw exception bodies |
 | `core_agent/external_access.py` | Owner-session Keycloak Admin API: external service accounts, issuance metadata, single-display tokens, replacement и native revocation |
 | `core_agent/admission.py` | Atomic root admission, stable-caller deduplication и busy guard чата до SDK execution |
 | `core_agent/interactions.py` | Company settings, per-origin tool policies, CAS и транзакционный запрет pending approvals |
@@ -288,6 +293,7 @@ Docker container или Kubernetes Pod/container в пределах одног�
 - product boundaries — `spec/product.md`;
 - architecture и durable state — `spec/architecture.md`;
 - config и runtime modes — `spec/agent-configuration.md`;
+- Cloud.ru auth/trial и будущий S3 workspace — `spec/cloudru.md`;
 - A2A/public input — `spec/a2a-protocol.md`, `spec/public-contract.md`;
 - agent loop и recovery — `spec/runtime.md`;
 - protected instructions — `spec/kernel-instructions.md`;
@@ -315,6 +321,24 @@ Target spec может описывать больше текущего runtime.
   `development`, `test`. Production требует полный набор `KEYCLOAK_*` и
   `CORE_AGENT_TENANT_ID`; legacy A2A без auth разрешён только при явно выбранном
   development/test и полностью отсутствующей auth-конфигурации.
+- `CORE_AGENT_AUTH_MODE=cloudru` — отдельный диагностический development profile
+  без Keycloak, с обязательной PostgreSQL и изолированным platform ingress.
+  Production Cloud startup закрыт до полного storage; RAM workspace/results
+  не обещают сохранность при замене Pod. Default mode остаётся `keycloak`.
+  Owner использует отдельный ENV password и DB-backed 8h cookie, точный Origin
+  для мутаций и tenant-wide login limiter. Retired password нельзя активировать
+  повторно: старый replica отклоняется до изменения действующей версии.
+  External peers имеют общий стабильный scope для известных external IDs;
+  listing закрыт в обеих A2A bindings, owner-private API остаются закрытыми.
+  MCP берутся только из persisted UI settings. Platform `MCP_URL`/headers и
+  retired `ARTIFACT_STORAGE_*`/`ARTIFACT_S3_*`/`ARTIFACT_MONGODB_*`/
+  `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` не подключают backend или credentials;
+  Cloud trial игнорирует artifact settings, Keycloak продолжает их отклонять.
+- `CORE_AGENT_STARTUP_DIAGNOSTICS=true` с `LOG_LEVEL=INFO` показывает finite
+  platform facts и стадии сборки приложения без ENV values, DSN и secrets.
+  `startup.storage` явно сообщает temporary-posix/durable=false для Cloud trial.
+  `application_ready` означает готовое ASGI app; открытие socket подтверждают
+  Uvicorn и probes. Диагностика не отключает обязательный sandbox или проверки.
 - Числовые deployment settings в `core_agent/app.py` разбираются через `_number`,
   сохраняют documented defaults и отклоняют malformed/NaN/infinite значения
   с `CONFIG_INVALID` и именем настройки без её raw value. Неверный `LOG_LEVEL`
@@ -330,8 +354,9 @@ Target spec может описывать больше текущего runtime.
   по company из authenticated principal при каждом чтении; allow/HITL видимы.
   Introspection выполняется один раз на HTTP request без кэша; уже открытый
   ответ не проверяется заново. Incoming credentials не передаются remote agents.
-  Owner browser uploads определяются только подтверждённым introspection
-  `client_id`, совпадающим с `KEYCLOAK_UI_CLIENT_ID`: они сохраняют `attachments/`;
+  В Keycloak owner browser uploads определяются подтверждённым introspection
+  `client_id`, совпадающим с `KEYCLOAK_UI_CLIENT_ID`; в Cloud.ru — owner cookie
+  Principal. Они сохраняют `attachments/`;
   остальные новые A2A-вложения используют `a2a/`. Message metadata не выбирает каталог.
 - Company scope задаётся deployment config и не меняется SDK tenant metadata.
   Автоматические recovery, timeout, cleanup, A2A projection и push ограничены
@@ -1115,7 +1140,10 @@ run получает отдельные MCP session и negotiated version; пе�
 ### Persistence и storage
 
 - Production использует PostgreSQL и fail closed без настроенного DSN, доступной
-  DB и совпадающей schema version. Нет SQLite/in-memory fallback.
+  DB и совпадающей schema version. Нет SQLite/in-memory fallback. Cloud.ru
+  development trial также требует PostgreSQL для sessions/tasks; memory test
+  adapter остаётся только явной test-фикстурой. Owner password versions, session
+  digests и login limiter сохраняются в БД, входящий password/token не хранится.
 - Tasks, workflow events/checkpoints, inbound inbox, outbox и audit
   tenant/owner-scoped и сохраняются в PostgreSQL согласованно.
 - `core_chats.latest_root_run_id` указывает на последний root; занятость
@@ -1158,12 +1186,13 @@ run получает отдельные MCP session и negotiated version; пе�
   idempotent ledger; recovered failure содержит только stable safe error code.
 - Serving process не выполняет production auto-migration; migration job имеет
   отдельный `DATABASE_MIGRATION_URL`.
-- `DURABLE_STORAGE_ROOT` предназначен для immutable durable blobs, snapshots и
-  artifacts, обычно на S3-backed mount.
+- `DURABLE_STORAGE_ROOT` предназначен для immutable blobs, snapshots и
+  artifacts; в прежнем профиле это durable root, обычно на S3-backed mount.
+  Cloud.ru trial использует временный root без S3 durability.
 - `LOCAL_WORKSPACE_ROOT` является отдельным ephemeral filesystem для активных
   процессов и не находится внутри durable mount.
-- `CHAT_WORKSPACE_ROOT` задаёт постоянный POSIX root папок чатов и обязателен
-  при Keycloak authentication. Все три storage roots не пересекаются ни в одном
+- `CHAT_WORKSPACE_ROOT` задаёт POSIX root папок чатов и обязателен при
+  аутентификации: постоянный в Keycloak, временный RAM root в Cloud.ru trial. Все три storage roots не пересекаются ни в одном
   направлении. Anonymous development/test без него сохраняет ephemeral режим.
 - Runtime связывает root, child, background и recovered run с исходными
   tenant/owner/context. Authenticated binding дополнительно проверяется по
@@ -1376,6 +1405,10 @@ docker compose logs -f agent
    коммитить.
 
 ## Управление входящим внешним доступом
+
+Ниже описан `keycloak` mode. В Cloud.ru вкладка даёт trusted A2A URL и
+инструкцию ручной выдачи/отзыва отдельного статического platform key на peer;
+Keycloak provisioning API не подключается.
 
 Owner UI «Доступ к агенту» использует текущий owner bearer для configured
 Keycloak Admin API. Роль agent-owner в deployment также получает принятые

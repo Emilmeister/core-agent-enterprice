@@ -17,7 +17,7 @@ Core Agent превращает пользовательский `prompt` в з�
 - встроенную долговременную память с Markdown, графом, NER и hybrid retrieval;
 - сжатие рабочего контекста при достижении 90% до 10–15%;
 - фоновые задачи и неблокирующие сабагенты;
-- общий owner UI, Keycloak, caller scope, постоянные папки чатов и Bubblewrap/egress в одном Kubernetes Pod;
+- общий owner UI, явные Keycloak/Cloud.ru auth profiles, caller scope, постоянные папки чатов и Bubblewrap/egress в одном Kubernetes Pod;
 - owner HITL, guardrails, cron и durable remote/time ожидания;
 - A2A-интерфейс и OpenTelemetry observability.
 
@@ -44,7 +44,8 @@ Core Agent превращает пользовательский `prompt` в з�
 17. [Критерии готовности продукта](acceptance.md) — сквозные свойства целевого ядра.
 18. [Трассируемость реализации](implementation-status.md) — release gate от требования к доказательству.
 19. [Spec-driven процесс](development-process.md) — как менять спецификацию и связывать её с реализацией.
-20. [Профиль поставки v1](releases/v1.md) — текущий enterprise release candidate и его непроверенные обязательства.
+20. [Профиль Cloud.ru](cloudru.md) — общий external scope, owner password, PostgreSQL/S3 и RAM workspace.
+21. [Профиль поставки v1](releases/v1.md) — текущий enterprise release candidate и его непроверенные обязательства.
 
 ## Нормативные слова
 

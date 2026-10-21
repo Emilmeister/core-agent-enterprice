@@ -81,12 +81,14 @@ Runtime MUST обеспечить проверенную mount/PID/IPC/network i
 - Согласованная среда развёртывания — один Kubernetes Pod; все чаты
   обрабатываются в этом pod. Отдельные pod на чат не предполагаются.
 - Python, terminal и фоновые команды изолируются через Bubblewrap по [профилю Bubblewrap](execution-environment.md).
-- При создании чата ему назначается отдельная постоянная папка.
+- Чату назначается отдельная постоянная логическая папка; физический каталог
+  создаётся лениво при необходимости работы с файлами.
 - Задачи этого чата работают с одной папкой, в том числе повторные cron-запуски.
 - Родительская папка задаётся переменной окружения.
 - Файлы сохраняются при restart сервиса.
-- Внешний агент и выполняемый по его запросу код не имеют доступа к соседним
-  чатам и их файлам.
+- Выполняемый по запросу код не имеет доступа к соседним чатам и их файлам.
+  Доступ external caller к известным IDs определяется auth profile: Keycloak
+  сохраняет per-caller isolation, [Cloud.ru](cloudru.md) — общий external scope.
 
 Текущее `LOCAL_WORKSPACE_ROOT` имеет семантику ephemeral workspace для run.
 Для постоянных папок чатов используется отдельный `CHAT_WORKSPACE_ROOT`,
@@ -95,7 +97,7 @@ Runtime MUST обеспечить проверенную mount/PID/IPC/network i
 через env. Bubblewrap предоставляет процессу папку текущего чата как
 `/workspace`; смысл существующей переменной нельзя менять молча.
 
-`DURABLE_STORAGE_ROOT` сохраняет immutable snapshots, manifests и transport blobs и MAY использовать S3-backed mount. `CHAT_WORKSPACE_ROOT` требует постоянный том с рабочей POSIX semantics для Git, package managers, compilers и файлов чата. `LOCAL_WORKSPACE_ROOT` остаётся ephemeral scratch; его прежняя семантика не меняется.
+`DURABLE_STORAGE_ROOT` сохраняет immutable snapshots, manifests и transport blobs и MAY использовать S3-backed mount. `CHAT_WORKSPACE_ROOT` требует рабочую POSIX semantics для Git, package managers, compilers и файлов чата. В `keycloak` это постоянный том; в явном `cloudru` — ограниченный RAM cache полного S3 workspace по [CLD-04](cloudru.md), с commit/restore на безопасных границах и без пустых архивов. Первый диагностический trial до реализации S3 явно не обещает сохранность RAM-файлов после замены Pod. `LOCAL_WORKSPACE_ROOT` остаётся ephemeral scratch; его прежняя семантика не меняется.
 
 Каждый чат имеет одну постоянную папку, повторные задачи и cron используют её. Отдельные child scratch copies MAY материализоваться из проверенного base snapshot и возвращать patch с conflict detection. Parent/child не меняют пересекающиеся targets параллельно без явной координации. Terminal completion удаляет временные окружения, но сохраняет папку чата. Snapshot restore учитывает текущую revision и tombstones ручной очистки; удалённые файлы не воскресают.
 

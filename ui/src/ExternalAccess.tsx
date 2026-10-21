@@ -20,6 +20,23 @@ function failureText(error: unknown) {
 }
 
 export function ExternalAccess({ api }: { api: Api }) {
+  if (api.session.authMode === "cloudru") return <section className="page">
+    <h1>Доступ к агенту</h1>
+    <p className="lede">Подключайте внешних агентов с помощью API-ключей Cloud.ru.</p>
+    <label>Адрес A2A<input readOnly value={api.session.externalA2AUrl} /></label>
+    <ol className="access-instructions">
+      <li>В личном кабинете Cloud.ru откройте сервисный аккаунт, используемый для аутентификации,
+        и создайте API-ключ для сервиса Evolution AI Agents.</li>
+      <li>Выдайте каждому внешнему агенту отдельный ключ и адрес A2A. В названии ключа укажите,
+        какому агенту он выдан.</li>
+      <li>Чтобы отозвать доступ, ключ нужно выключить или удалить в личном кабинете Cloud.ru.</li>
+    </ol>
+    <p className="muted">Ключи создаются и управляются в Cloud.ru. Отзыв ключа не отменяет уже принятые задачи.</p>
+  </section>;
+  return <KeycloakAccess api={api} />;
+}
+
+function KeycloakAccess({ api }: { api: Api }) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");

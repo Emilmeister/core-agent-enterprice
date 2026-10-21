@@ -110,13 +110,13 @@ budgets:
 
 ## Production persistence
 
-Database credentials являются Platform/deployment config и никогда не входят в RunRequest/AgentConfig. Production container требует runtime credential `DATABASE_URL=postgresql://...` из secret injection, использует bounded connection pool и owner/tenant-scoped PostgreSQL rows. Отдельный migration job MAY получать DDL credential через `DATABASE_MIGRATION_URL` и exact runtime role через `DATABASE_APP_ROLE`; serving process не читает migration credential. `DATABASE_POOL_MIN`, `DATABASE_POOL_MAX`, `DATABASE_CONNECT_TIMEOUT_SECONDS` и `DATABASE_AUTO_MIGRATE` управляются deployment-ом.
+Database credentials являются Platform/deployment config и никогда не входят в RunRequest/AgentConfig. Production container требует runtime credential из secret injection через документированный ниже порядок `SESSION_DATABASE_URL` / `SESSION_POSTGRES_*` / `TASK_POSTGRES_URL` / `DATABASE_URL`, использует bounded connection pool и owner/tenant-scoped PostgreSQL rows. Отдельный migration job MAY получать DDL credential через `DATABASE_MIGRATION_URL` и exact runtime role через `DATABASE_APP_ROLE`; serving process не читает migration credential. `DATABASE_POOL_MIN`, `DATABASE_POOL_MAX`, `DATABASE_CONNECT_TIMEOUT_SECONDS` и `DATABASE_AUTO_MIGRATE` управляются deployment-ом.
 
 Пул MUST проверять соединение перед выдачей и заменять непригодное. Managed PostgreSQL и сетевые посредники закрывают простаивающие соединения молча, поэтому без проверки первый запрос после паузы падает с транспортной ошибкой, хотя база доступна. Отказ MUST NOT доходить до caller как сбой задачи: замена соединения относится к обслуживанию пула, а не к семантике запроса.
 
 `DATABASE_AUTO_MIGRATE=false` обязателен production: migration job с DDL role выполняется до app rollout, выдаёт app role только необходимые DML grants, затем app role проверяет schema version. Production startup MUST reject `DATABASE_AUTO_MIGRATE=true`. Test profile MAY явно выбрать SQLite/in-memory adapter; implicit fallback при отсутствии PostgreSQL запрещён.
 
-Production deployment MUST задавать `DURABLE_STORAGE_ROOT` для immutable blobs, snapshots, manifests и artifacts; S3-backed mount допустим. `LOCAL_WORKSPACE_ROOT` MUST указывать на локальную ephemeral filesystem container-а. Авторизованное развёртывание MUST явно задавать `CHAT_WORKSPACE_ROOT` на постоянном POSIX томе. Все три root MUST быть различны и не находиться друг внутри друга; startup отклоняет пересечение в любом направлении. Optional `LOCAL_BASE_SNAPSHOT` содержит content-addressed snapshot ID для ephemeral scratch; если он задан, startup проверяет commit manifest и все blobs до первого terminal call. Он не материализуется поверх постоянной папки чата. Active workspace никогда не размещается под `DURABLE_STORAGE_ROOT`.
+Production deployment MUST задавать `DURABLE_STORAGE_ROOT` для immutable blobs, snapshots, manifests и artifacts; S3-backed mount допустим. `LOCAL_WORKSPACE_ROOT` MUST указывать на локальную ephemeral filesystem container-а. Авторизованное развёртывание MUST явно задавать `CHAT_WORKSPACE_ROOT`; в профиле `keycloak` это постоянный POSIX том, в явном [Cloud.ru профиле](cloudru.md) — RAM cache с обязательным S3 commit/restore для production release. Ограниченный первый диагностический запуск MAY использовать временную FS по явному trial-контракту Cloud.ru. Все три root MUST быть различны и не находиться друг внутри друга; startup отклоняет пересечение в любом направлении. Optional `LOCAL_BASE_SNAPSHOT` содержит content-addressed snapshot ID для ephemeral scratch; если он задан, startup проверяет commit manifest и все blobs до первого terminal call. Он не материализуется поверх постоянной папки чата. Active workspace никогда не размещается под `DURABLE_STORAGE_ROOT`.
 
 ## Привязка исполнения к контейнеру
 
@@ -183,15 +183,19 @@ Artifact/file-selection semantics. Этот version не является RunReq
 
 ### Identity и Agent Card
 
-Production enterprise authentication требует complete configuration ниже.
-Частичная configuration отклоняется; настроенная auth не переходит в legacy
-режим при ошибке Keycloak. Полностью отсутствующая configuration разрешает
+Production enterprise authentication выбирается `CORE_AGENT_AUTH_MODE`: `keycloak`
+по умолчанию либо явный `cloudru`. Для Keycloak требуется complete configuration
+ниже; Cloud.ru использует [CLD-01–03](cloudru.md). Частичная configuration
+отклоняется; настроенная auth не переходит в legacy режим при ошибке. Полностью отсутствующая configuration разрешает
 legacy routes только в явно выбранном development/test profile.
 
 | Переменная | По умолчанию | Семантика |
 |---|---|---|
 | `CORE_AGENT_ENVIRONMENT` | обязательна | Ровно `production`, `development` или `test`; отсутствие и неизвестное значение завершают startup с `CONFIG_INVALID` |
 | `CORE_AGENT_TENANT_ID` | обязательна в enterprise | Trusted company scope, не берётся из prompt/metadata |
+| `CORE_AGENT_AUTH_MODE` | `keycloak` | Ровно `keycloak` или `cloudru`; явный auth profile, без автоматического fallback; до S3 доступен только диагностический development Cloud trial с PostgreSQL |
+| `CORE_AGENT_STARTUP_DIAGNOSTICS` | `false` | `true` включает безопасные finite startup stages по [первому trial](cloudru.md); ENV values/secrets не выводятся и проверки не отключаются |
+| `CORE_AGENT_OWNER_PASSWORD` | пусто | Обязательный отдельный secret длиной не менее 16 символов в `cloudru`; password/cookie контракт в [CLD-02](cloudru.md) |
 | `KEYCLOAK_ISSUER_URL` | обязательна | Realm issuer, HTTPS; loopback HTTP только development/test |
 | `KEYCLOAK_CLIENT_ID` | обязательна | Confidential introspection client |
 | `KEYCLOAK_CLIENT_SECRET` | обязательна | Secret introspection credential; не сохраняется в task/model/audit |
@@ -200,7 +204,7 @@ legacy routes только в явно выбранном development/test profi
 | `KEYCLOAK_OWNER_ROLE` | `agent-owner` | Роль владельца |
 | `KEYCLOAK_EXTERNAL_ROLE` | `agent-external` | Роль внешнего caller; исключает owner/HITL authority |
 
-Новый HTTP-запрос проверяется introspection без auth cache; уже открытый ответ
+В Keycloak-профиле новый HTTP-запрос проверяется introspection без auth cache; уже открытый ответ
 не переавторизуется. `/a2a/owner`, `/a2a/external` и `/api` используют эти
 границы; `/health/live` и `/health/ready` остаются public probes.
 
@@ -210,7 +214,7 @@ legacy routes только в явно выбранном development/test profi
 | `AGENT_DESCRIPTION` | `Policy-enforced core agent runtime` | Описание в Agent Card |
 | `AGENT_VERSION` | `1.0.0` | Версия в Agent Card |
 | `AGENT_SYSTEM_PROMPT` | пусто | AgentProfilePrompt; не повторяет Task prompt и не выдаёт capability |
-| `AGENT_URL` | выводится из заголовков запроса | Advertised base URL карточки. Заданное значение authoritative; пустое означает вывод из `X-Forwarded-*`/`Host` на каждый запрос карточки. Синоним `URL_AGENT` принимается наравне, `AGENT_URL` имеет приоритет |
+| `AGENT_URL` | выводится из заголовков запроса в Keycloak/legacy | Advertised base URL карточки. В Cloud.ru обязателен canonical HTTPS origin; только там `URL_AGENT` служит fallback. Заданное значение authoritative; пустое означает вывод из `X-Forwarded-*`/`Host` на каждый запрос карточки. Синоним `URL_AGENT` принимается наравне, `AGENT_URL` имеет приоритет |
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8000` | Bind port |
 | `LOG_LEVEL` | `INFO` | Уровень structured stdout |
@@ -253,6 +257,10 @@ Override не наследует credential или дополнительные 
 | `GUARDRAILS_MAX_CALLS` | `32` | Положительный предел физических попыток на материал, начисляемых до сети |
 
 ### MCP
+
+В `cloudru` подключения и credentials берутся только из persisted owner UI
+settings по [CLD-01](cloudru.md); `MCP_URL` и `MCP_HEADERS_JSON` не импортируются.
+Следующие deployment подключения применяются в прежнем Keycloak/legacy профиле.
 
 | Переменная | По умолчанию | Семантика |
 |---|---|---|

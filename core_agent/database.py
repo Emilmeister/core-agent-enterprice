@@ -30,7 +30,7 @@ from .errors import CoreError
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -987,6 +987,27 @@ CREATE INDEX core_background_remote_context_lookup ON core_background_tasks (
 ) WHERE kind='remote_a2a' AND checkpoint->>'send_started'='true';
 """,
 
+    31: """
+CREATE TABLE core_owner_auth (
+    tenant_id text PRIMARY KEY,
+    password_version text NOT NULL,
+    window_started_at double precision NOT NULL DEFAULT 0,
+    attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0)
+);
+CREATE TABLE core_owner_sessions (
+    tenant_id text NOT NULL REFERENCES core_owner_auth(tenant_id),
+    token_digest text NOT NULL,
+    password_version text NOT NULL,
+    expires_at double precision NOT NULL,
+    PRIMARY KEY (tenant_id, token_digest)
+);
+CREATE TABLE core_owner_auth_versions (
+    tenant_id text NOT NULL REFERENCES core_owner_auth(tenant_id),
+    password_version text NOT NULL,
+    PRIMARY KEY (tenant_id, password_version)
+);
+CREATE INDEX core_owner_sessions_expiry ON core_owner_sessions (tenant_id, expires_at);
+""",
 }
 
 
@@ -1130,6 +1151,9 @@ class PostgresDatabase:
             raise CoreError("CONFIG_INVALID", "DATABASE_APP_ROLE is required")
         grants = {
             "core_schema_migrations": "SELECT",
+            "core_owner_auth": "SELECT, INSERT, UPDATE",
+            "core_owner_sessions": "SELECT, INSERT, DELETE",
+            "core_owner_auth_versions": "SELECT, INSERT",
             "core_events": "SELECT, INSERT, DELETE",
             "core_checkpoints": "SELECT, INSERT, UPDATE, DELETE",
             "core_audit_records": "SELECT, INSERT",

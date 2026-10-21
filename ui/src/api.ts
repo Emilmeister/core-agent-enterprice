@@ -48,13 +48,14 @@ export class Api {
       throw new Error("Invalid API path");
     const token = await this.session.token();
     const headers = new Headers(options.headers);
-    headers.set("Authorization", `Bearer ${token}`);
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    else headers.delete("Authorization");
     headers.set("A2A-Version", "1.0");
     if (options.body) headers.set("Content-Type", "application/json");
     const response = await fetch(path, {
       ...options,
       headers,
-      credentials: "omit",
+      credentials: this.session.authMode === "cloudru" ? "same-origin" : "omit",
       cache: "no-store",
       redirect: "error",
     });

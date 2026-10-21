@@ -31,6 +31,7 @@ from .admission import MemoryRootAdmission, PostgresRootAdmission
 from .artifacts import InMemoryArtifactStore, PostgresArtifactStore
 from .audit import InMemoryAuditLog
 from .auth import AuthContextBuilder, AuthenticationMiddleware, AuthSettings, KeycloakAuthenticator
+from .cloudru_auth import CloudAuthenticationMiddleware, CloudAuthenticator
 from .config import MAX_SUBAGENT_DEPTH, RETIRED_ARTIFACT_TOOLS, AgentConfig, PlatformConfig
 from .durability import CheckpointStore, InMemoryEventStore
 from .database import (
@@ -47,6 +48,7 @@ from .execution import (
     WorkspaceSnapshotStore,
 )
 from .sandbox import SandboxLauncher, SandboxPolicy
+from .startup_diagnostics import StartupDiagnostics
 from .kernel import KernelCompiler
 from .interactions import InMemoryInteractionStore, PostgresInteractionStore, tool_origin
 from .guardrails import DETECTOR_RESPONSE_SCHEMA, GuardrailClassifier
@@ -416,10 +418,13 @@ def _task_storage_type(session_storage_type):
 
 def _state(database=None):
     environment = _env("CORE_AGENT_ENVIRONMENT", "development")
+    cloud_trial = _env("CORE_AGENT_AUTH_MODE", "keycloak") == "cloudru" and environment != "test"
     backend = _env(
         "SESSION_STORAGE_TYPE",
-        "postgres" if environment == "production" or database else "in-memory",
+        "postgres" if environment == "production" or database or cloud_trial else "in-memory",
     )
+    if cloud_trial and (backend != "postgres" or _env("TASK_STORAGE_TYPE", "postgres") != "postgres"):
+        raise CoreError("CONFIG_INVALID", "Cloud.ru trial requires PostgreSQL sessions and tasks")
     if environment == "production" and backend != "postgres":
         raise CoreError(
             "PRODUCTION_DATABASE_REQUIRED",
@@ -724,6 +729,8 @@ def _mcp_name(url, index):
 
 def _platform_mcp():
     """MCP_URL declares deployment-owned Streamable HTTP servers for every run."""
+    if _env("CORE_AGENT_AUTH_MODE", "keycloak") == "cloudru":
+        return ()
     urls = _csv("MCP_URL")
     names = tuple(_mcp_name(url, index) for index, url in enumerate(urls))
     read_only = _read_only_mcp_tools(names)
@@ -1508,7 +1515,8 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         tool_runtime=tools,
         mcp_connector=mcp_connector
         or StreamableHttpMcpConnector(
-            headers={**_entity_headers(), **_json("MCP_HEADERS_JSON")},
+            headers=({} if _env("CORE_AGENT_AUTH_MODE", "keycloak") == "cloudru"
+                     else {**_entity_headers(), **_json("MCP_HEADERS_JSON")}),
             telemetry=telemetry,
             timeout=30.0 if mcp_timeout is None else mcp_timeout,
             sse_read_timeout=(
@@ -1580,7 +1588,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
             },
         ),
         memory=memory_configuration,
-        session_storage=_env("SESSION_STORAGE_TYPE", "in-memory"),
+        session_storage="postgres" if state["database"] is not None else "in-memory",
         streaming=_boolean("A2A_STREAMING_ENABLED", "true"),
         model={
             "name": model.model,
@@ -1604,37 +1612,56 @@ def create_app(
     guardrail_classifier=None,
 ):
     _configure_logging()
-    retired_settings = sorted(name for name in os.environ
-        if name.startswith(("ARTIFACT_STORAGE_", "ARTIFACT_S3_", "ARTIFACT_MONGODB_"))
-        or name == "RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS")
-    if retired_settings:
-        raise CoreError("CONFIG_INVALID", "Retired named-artifact settings: " + ", ".join(retired_settings)
-                        + ". Remove them; chat files and response files use workspace storage.")
-    _builtin_tool_names(_csv("CORE_AGENT_ALLOWED_BUILTIN_TOOLS"))
-    environment = _env("CORE_AGENT_ENVIRONMENT", "")
-    if environment not in {"production", "development", "test"}:
-        raise CoreError("CONFIG_INVALID", "Explicit CORE_AGENT_ENVIRONMENT=production|development|test is required")
-    _env("A2A_MAX_REQUEST_BYTES", "40000000")
-    request_limit()
-    def auth_env(name, default=""):
-        value = _env(name, default)
-        # Record the lookup, but validate the browser ID before whitespace cleanup.
-        return os.getenv(name, default) if name == "KEYCLOAK_UI_CLIENT_ID" else value
+    diagnostics = StartupDiagnostics(_boolean("CORE_AGENT_STARTUP_DIAGNOSTICS", "false"))
+    diagnostics.platform()
+    with diagnostics.stage("startup"):
+        app = _create_app(model=model, mcp_connector=mcp_connector, base_url=base_url,
+                          database=database, push_client=push_client, auth_transport=auth_transport,
+                          sandbox_launcher=sandbox_launcher, guardrail_classifier=guardrail_classifier,
+                          diagnostics=diagnostics)
+    diagnostics.emit("startup.stage", stage="application_ready", status="succeeded", port=app.state.bind[1])
+    return app
 
-    auth_settings = AuthSettings.from_environment(
-        auth_env, production=environment == "production",
-        allow_legacy=environment in {"development", "test"},
-    )
-    recovery_tenant_id = auth_settings.tenant if auth_settings else None
-    if auth_settings and not _env("CHAT_WORKSPACE_ROOT", ""):
-        raise CoreError("CONFIG_INVALID", "authenticated deployment requires CHAT_WORKSPACE_ROOT")
+
+def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_transport,
+                sandbox_launcher, guardrail_classifier, diagnostics):
+    with diagnostics.stage("configuration"):
+        retired_settings = sorted(name for name in os.environ
+            if name.startswith(("ARTIFACT_STORAGE_", "ARTIFACT_S3_", "ARTIFACT_MONGODB_"))
+            or name == "RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS")
+        if retired_settings and _env("CORE_AGENT_AUTH_MODE", "keycloak") != "cloudru":
+            raise CoreError("CONFIG_INVALID", "Retired named-artifact settings: " + ", ".join(retired_settings)
+                            + ". Remove them; chat files and response files use workspace storage.")
+        _builtin_tool_names(_csv("CORE_AGENT_ALLOWED_BUILTIN_TOOLS"))
+        environment = _env("CORE_AGENT_ENVIRONMENT", "")
+        if environment not in {"production", "development", "test"}:
+            raise CoreError("CONFIG_INVALID", "Explicit CORE_AGENT_ENVIRONMENT=production|development|test is required")
+        _env("A2A_MAX_REQUEST_BYTES", "40000000")
+        request_limit()
+        def auth_env(name, default=""):
+            value = _env(name, default)
+            # Record the lookup, but validate the browser ID before whitespace cleanup.
+            return os.getenv(name, default) if name in {"KEYCLOAK_UI_CLIENT_ID", "CORE_AGENT_OWNER_PASSWORD", "AGENT_URL", "URL_AGENT"} else value
+
+        auth_settings = AuthSettings.from_environment(
+            auth_env, production=environment == "production",
+            allow_legacy=environment in {"development", "test"},
+        )
+        cloud_auth = auth_settings is not None and auth_settings.mode == "cloudru"
+        if cloud_auth:
+            diagnostics.emit("startup.storage", backend="temporary-posix", durable=False)
+        recovery_tenant_id = auth_settings.tenant if auth_settings else None
+        if auth_settings and not _env("CHAT_WORKSPACE_ROOT", ""):
+            raise CoreError("CONFIG_INVALID", "authenticated deployment requires CHAT_WORKSPACE_ROOT")
     host = _env("HOST", "0.0.0.0")
     port = _number("PORT", int, default="8000")
     stream_buffer_size = _number("A2A_STREAMING_BUFFER_SIZE", int, default="10")
     max_chunk_size = _number("MAX_CHUNK_SIZE", int, default="0")
-    model = model or _model()
+    with diagnostics.stage("model_configuration"):
+        model = model or _model()
     push_key = _env("PUSH_NOTIFICATION_ENCRYPTION_KEY", "")
-    state = _state(database)
+    with diagnostics.stage("database"):
+        state = _state(database)
     if environment == "production" and not push_key:
         if state["database"]:
             state["database"].close()
@@ -1643,9 +1670,11 @@ def create_app(
             "production requires PUSH_NOTIFICATION_ENCRYPTION_KEY (Fernet key)",
         )
     try:
-        if sandbox_launcher is None:
-            sandbox_launcher = SandboxLauncher(SandboxPolicy.from_environment())
-        sandbox_launcher.preflight()
+        with diagnostics.stage("sandbox"):
+            if sandbox_launcher is None:
+                sandbox_launcher = SandboxLauncher(SandboxPolicy.from_environment())
+            sandbox_launcher.preflight()
+        authenticator = (CloudAuthenticator(auth_settings, state["database"]) if cloud_auth else None)
         guardrail_classifier = guardrail_classifier or _guardrail_classifier(model)
         material_review_store = (
             PostgresMaterialReviewStore(state["database"], state["workflow"])
@@ -1662,14 +1691,15 @@ def create_app(
                 PostgresRemoteRegistry(state["database"], push_key or None)
                 if state["database"] else InMemoryRemoteRegistry(push_key or None)
             )
-        agent, telemetry = _agent(model, mcp_connector, state=state,
-                                  interaction_store=interaction_store,
-                                  remote_registry=remote_registry_store,
-                                  material_review_store=material_review_store,
-                                  guardrail_classifier=guardrail_classifier,
-                                  response_files_enabled=auth_settings is not None,
-                                  sandbox_launcher=sandbox_launcher,
-                                  recovery_tenant_id=recovery_tenant_id)
+        with diagnostics.stage("runtime"):
+            agent, telemetry = _agent(model, mcp_connector, state=state,
+                                      interaction_store=interaction_store,
+                                      remote_registry=remote_registry_store,
+                                      material_review_store=material_review_store,
+                                      guardrail_classifier=guardrail_classifier,
+                                      response_files_enabled=auth_settings is not None,
+                                      sandbox_launcher=sandbox_launcher,
+                                      recovery_tenant_id=recovery_tenant_id)
         if auth_settings:
             agent.agent_settings_store = AgentSettingsStore(state["workflow"], push_key or None,
                 database=state["database"], deployment_mcp=agent.platform_mcp)
@@ -2042,68 +2072,73 @@ def create_app(
                 skills.discard("core_agent_send_message")
         return skills
 
-    app = build_starlette_app(
-        agent_card=card,
-        handler=handle,
-        cancel_handler=cancel,
-        cancel_signal=signal_cancel,
-        base_url=base_url,
-        derive_base_url=not configured_url,
-        card_skills=card_skills if remote_registry_store is not None else None,
-        task_store=task_store,
-        resume_handler=resume,
-        followup_handler=followup,
-        admission_handler=admit if admission else None,
-        admission_cleanup=release_admission if admission else None,
-        context_builder=AuthContextBuilder() if auth_settings else None,
-        push_config_store=push_config_store,
-        push_sender=push_sender,
-        shutdown_handler=close,
-        stream_buffer_size=stream_buffer_size,
-        max_chunk_size=max_chunk_size,
-        streaming_enabled=_boolean("A2A_STREAMING_ENABLED", "true")
-        and "streaming" in advertised,
-        reply_hub=agent.reply_hub,
-    )
+    with diagnostics.stage("routes"):
+        app = build_starlette_app(
+            agent_card=card,
+            handler=handle,
+            cancel_handler=cancel,
+            cancel_signal=signal_cancel,
+            base_url=base_url,
+            derive_base_url=not configured_url,
+            card_skills=card_skills if remote_registry_store is not None else None,
+            task_store=task_store,
+            resume_handler=resume,
+            followup_handler=followup,
+            admission_handler=admit if admission else None,
+            admission_cleanup=release_admission if admission else None,
+            context_builder=AuthContextBuilder() if auth_settings else None,
+            push_config_store=push_config_store,
+            push_sender=push_sender,
+            shutdown_handler=close,
+            stream_buffer_size=stream_buffer_size,
+            max_chunk_size=max_chunk_size,
+            streaming_enabled=_boolean("A2A_STREAMING_ENABLED", "true")
+            and "streaming" in advertised,
+            reply_hub=agent.reply_hub,
+        )
 
-    if auth_settings:
-        authenticator = KeycloakAuthenticator(auth_settings, transport=auth_transport)
-        # Both entrances share the handler, stores, queues and application lifespan.
-        # The SDK's caller-selected /{tenant} alias is not part of this deployment.
-        routes = [route for route in app.routes if getattr(route, "path", None) != "/{tenant}"]
+        if auth_settings:
+            if not cloud_auth:
+                authenticator = KeycloakAuthenticator(auth_settings, transport=auth_transport)
+            # Both entrances share the handler, stores, queues and application lifespan.
+            # The SDK's caller-selected /{tenant} alias is not part of this deployment.
+            routes = [route for route in app.routes if getattr(route, "path", None) != "/{tenant}"]
 
-        async def identity(request):
-            actor = request.scope["principal"]
-            return JSONResponse(
-                {"actor_id": actor.actor_id, "role": "owner", "tenant": actor.tenant},
-                headers={"Cache-Control": "no-store"},
-            )
-
-        app.routes[:] = [
-            Mount("/a2a/owner", routes=routes),
-            Mount("/a2a/external", routes=routes),
-            Route("/api/identity", identity),
-            *agent_settings_routes(agent, agent.agent_settings_store),
-            *owner_routes(agent, interaction_store, admission=admission, remote_registry=remote_registry_store,
-                          cron_store=cron_store, on_cron_admitted=cron_handoff,
-                          external_access=ExternalAccess(auth_settings, transport=auth_transport)),
-        ]
-        if auth_settings.ui_client_id:
-            async def ui_config(request):
-                invalid = bool(request.query_params)
+            async def identity(request):
+                actor = request.scope["principal"]
                 return JSONResponse(
-                    {"error": {"code": "REQUEST_INVALID"}} if invalid else
-                    {"issuer": auth_settings.issuer, "client_id": auth_settings.ui_client_id},
-                    status_code=400 if invalid else 200,
-                    headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
-                             "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'"},
+                    {"actor_id": actor.actor_id, "role": "owner", "tenant": actor.tenant,
+                     **({"auth_mode": "cloudru"} if cloud_auth else {})},
+                    headers={"Cache-Control": "no-store"},
                 )
-            app.routes.append(Route("/ui/config", ui_config))
-        static_routes, static_paths = ui_routes(auth_settings)
-        app.routes.extend(static_routes)
-        app.add_middleware(AuthenticationMiddleware, authenticator=authenticator, public_paths=static_paths)
-        app.state.authenticator = authenticator
-        app.state.remote_registry_store = remote_registry_store
+
+            app.routes[:] = [
+                Mount("/a2a/owner", routes=routes),
+                Mount("/a2a/external", routes=routes),
+                Route("/api/identity", identity),
+                *agent_settings_routes(agent, agent.agent_settings_store),
+                *owner_routes(agent, interaction_store, admission=admission, remote_registry=remote_registry_store,
+                              cron_store=cron_store, on_cron_admitted=cron_handoff,
+                              external_access=None if cloud_auth else ExternalAccess(auth_settings, transport=auth_transport)),
+            ]
+            if cloud_auth or auth_settings.ui_client_id:
+                async def ui_config(request):
+                    invalid = bool(request.query_params)
+                    return JSONResponse(
+                        {"error": {"code": "REQUEST_INVALID"}} if invalid else
+                        ({"auth_mode": "cloudru", "external_a2a_url": auth_settings.origin + "/a2a/external/"} if cloud_auth else
+                         {"issuer": auth_settings.issuer, "client_id": auth_settings.ui_client_id}),
+                        status_code=400 if invalid else 200,
+                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                                 "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'"},
+                    )
+                app.routes.append(Route("/ui/config", ui_config))
+            static_routes, static_paths = ui_routes(auth_settings)
+            app.routes.extend(static_routes)
+            app.add_middleware(CloudAuthenticationMiddleware if cloud_auth else AuthenticationMiddleware,
+                               authenticator=authenticator, public_paths=static_paths)
+            app.state.authenticator = authenticator
+            app.state.remote_registry_store = remote_registry_store
 
     async def live(_request):
         return JSONResponse({"status": "ok"})
@@ -2126,7 +2161,6 @@ def create_app(
     app.state.push_sender = push_sender
     app.state.telemetry = telemetry
 
-    atexit.register(close)
     app.state.close = close
     app.state.bind = (host, port)
     if cron_coordinator is not None:
@@ -2146,10 +2180,16 @@ def create_app(
         app.router.lifespan_context = cron_lifespan
     # Recovery needs the same owner policy and canonical chat validator as a
     # newly admitted call. No worker may run during composition in _agent().
-    agent.recover_durable_tasks()
-    agent.recover_workflows(
-        on_settled=reconcile_workflows,
-    )
+    try:
+        with diagnostics.stage("recovery"):
+            agent.recover_durable_tasks()
+            agent.recover_workflows(
+                on_settled=reconcile_workflows,
+            )
+    except Exception:
+        close()
+        raise
+    atexit.register(close)
     _log_environment(logging.getLogger("core_agent.runtime"))
     return app
 
@@ -2182,6 +2222,10 @@ def main():
         # offending setting on one readable line instead of a Python traceback.
         logger.critical("startup failed: %s [%s]", error.message, error.code)
         # The inventory matters most on the path where startup did not finish.
+        _log_environment(logger)
+        raise SystemExit(1) from None
+    except Exception:
+        logger.critical("startup failed: unexpected startup error [STARTUP_FAILED]; enable CORE_AGENT_STARTUP_DIAGNOSTICS for the failing stage")
         _log_environment(logger)
         raise SystemExit(1) from None
     host, port = app.state.bind

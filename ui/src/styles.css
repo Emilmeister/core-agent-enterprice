@@ -996,6 +996,18 @@ main {
   color: var(--muted);
   margin-bottom: 24px;
 }
+.entrance form {
+  display: grid;
+  gap: 18px;
+}
+.access-instructions {
+  padding-left: 24px;
+  margin: 28px 0;
+  line-height: 1.65;
+}
+.access-instructions li + li {
+  margin-top: 12px;
+}
 @media (max-width: 900px) {
   .workspace {
     grid-template-columns: 220px minmax(0, 1fr);

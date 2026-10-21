@@ -8,6 +8,25 @@
 - `partial` — существует часть поведения, но отсутствует обязательная гарантия или CI proof;
 - `missing` — production path отсутствует.
 
+## Cloud.ru: требования нового профиля
+
+Первый диагностический trial ограничен auth/UI/PostgreSQL и CLD-AC-13;
+полный S3 storage не входит в этот этап. Cloud.ru requirements приняты в
+[CLD-01–06](cloudru.md). Auth/PostgreSQL и diagnostics proofs входят в обычный
+`unittest discover`, а `ui/auth.test.mjs` — в CI `npm test`. Они проверяют
+приложение, но не browser/proxy и sandbox в реальном Cloud.ru Pod. Этот live gate
+остаётся открытым; весь Cloud.ru profile не объявляется `implemented`.
+
+| ID | Требование | Доказательство | Статус |
+|---|---|---|---|
+| CLD-01 | Явный профиль, platform PostgreSQL ENV и persisted-only MCP | `tests.test_cloudru_auth.CloudAuthConfigurationTests`, `CloudAuthTests.test_platform_mcp_urls_and_headers_never_seed_connections_or_owner_settings`, `PostgresCloudAuthTests.test_cloud_development_opens_real_postgres_from_environment_with_no_injected_database`: fail-closed config, реальная PostgreSQL без injected adapter и отсутствие ENV MCP import. Target platform DB/ingress ещё не проверены | partial |
+| CLD-02 | Owner password, DB sessions, 8h cookie, Origin/rate/rotation/logout | `tests.test_cloudru_auth.CloudAuthTests` и `PostgresCloudAuthTests`: cookie/Origin/expiry/logout, bounded login, shared rate limit, restart и запрет stale/retired password; `ui/auth.test.mjs`: login/session recovery/expiry/logout без browser storage. `tests.test_auth` и `tests.test_keycloak_integration` сохраняют Keycloak compatibility. Настоящий Cloud browser/proxy gate отсутствует | partial |
+| CLD-03 | Общий external scope, запрет listing, owner privacy и manual keys UI | `tests.test_cloudru_auth.CloudAuthTests.test_external_cookie_never_elevates_and_task_enumeration_is_disabled` и PG subclass: owner isolation, известные external IDs и запрет ListTasks через HTTP+JSON/реальный JSON-RPC handler; Agent Card tests различают cookie/platform bearer. `ui/auth.test.mjs` проверяет manual keys UI без provisioning calls. Live отзыв Cloud keys и browser ещё не проверены | partial |
+| CLD-04 | Полный S3 workspace, empty/unchanged semantics, restore/cleanup/fencing | Existing snapshots/file integrity foundations; требуются CLD-AC-07–09 на PostgreSQL и S3-compatible API | partial |
+| CLD-05 | Sandbox, recovery без replay, постоянно работающий worker | Existing sandbox/execution recovery suite; CLD-AC-10/11 в целевом Cloud Pod не выполнены | partial |
+| CLD-06 | Проверяемый перенос, совместимость и platform release gate | CLD-AC-12: live Cloud proxy/browser/DB/S3/idle evidence отсутствует | missing |
+| CLD-TRIAL | Ограниченный запуск с RAM workspace и безопасными startup stages | `tests.test_startup_diagnostics.StartupDiagnosticsTests`: finite stages/failures, redaction, temporary storage, ignored retired ENV, opt-in и событие `application_ready`; `tests.test_cloudru_auth` и CI `npm test` проверяют auth/UI. Реальные startup logs и sandbox/browser smoke целевого Cloud Pod ещё не получены | partial |
+
 ## Существующие foundations и изменённые контракты
 
 | ID | Требование v1 | Доказательство | Статус |
@@ -154,7 +173,7 @@
 
 ## Release rule
 
-Production release v1 разрешён только когда все строки, относящиеся к scope `releases/v1.md`, имеют статус `implemented`, а полный test command воспроизводится из чистого checkout без ручных шагов. Target-only exclusions остаются `partial`/`missing` только если явно перечислены в release profile.
+Production release v1 разрешён только когда все строки, относящиеся к выбранному deployment profile из `releases/v1.md`, имеют статус `implemented`, а полный test command воспроизводится из чистого checkout без ручных шагов. Target-only exclusions остаются `partial`/`missing` только если явно перечислены в release profile.
 
 ## Owner UI presentation
 

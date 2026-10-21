@@ -171,7 +171,7 @@ class EnterpriseMigrationTests(unittest.TestCase):
                     (tenant, owner))
         peer = None
         if version >= 19:
-            registry = LegacyRemoteRegistry(database, self.key)
+            registry = (LegacyRemoteRegistry if version < 30 else PostgresRemoteRegistry)(database, self.key)
             peer = registry.create(tenant,
                 {"name": "peer", "url": "https://peer.example/a2a", "description": "Migration",
                  "enabled": True, "header_name": "X-Api-Key", "header_value": "migration-secret-canary"},

@@ -115,6 +115,11 @@ Durable continuation является свойством целевого runtim
 
 ## Keycloak и scope входящих запросов
 
+Этот раздел, AUTH-02/03 и Keycloak provisioning AUTH-04 применяются к
+`CORE_AGENT_AUTH_MODE=keycloak`. Явный `cloudru` использует owner sessions и общий
+external scope по [CLD-01–03](cloudru.md); защита owner-private данных и tenant
+isolation остаются обязательными в обоих профилях.
+
 Компания определяется только trusted `CORE_AGENT_TENANT_ID`. Стабильная identity
 равна проверенной паре issuer + `sub`; credential string не является ключом
 ownership. Runtime introspection использует только настроенный issuer endpoint

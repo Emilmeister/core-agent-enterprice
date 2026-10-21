@@ -230,7 +230,7 @@ export function App({ session }: { session: Session }) {
           </div>
           <button
             className="text-button"
-            onClick={() => void session.logout().catch(() => {})}
+            onClick={() => void session.logout().catch(() => setError("Не удалось завершить сессию. Повторите выход."))}
           >
             Выйти
           </button>

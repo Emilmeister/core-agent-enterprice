@@ -223,6 +223,7 @@ jobs:
         working-directory: ui
         run: |
           npm ci
+          npm test
           npm run typecheck
           npm run build
       - run: uv build --no-sources

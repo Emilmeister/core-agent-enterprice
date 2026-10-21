@@ -1,5 +1,29 @@
 # Критерии готовности целевого продукта
 
+## Cloud.ru: PostgreSQL, S3 и общий внешний scope
+
+CLD-AC-01–12 обязательны для production профиля [Cloud.ru](cloudru.md).
+Первый диагностический trial ограничен CLD-AC-01–06 и CLD-AC-13; он не закрывает
+S3 durability или live platform gates. Они уточняют
+Keycloak-specific ENT-AC-01/03, browser/provisioning ENT-AC-72/85 и способ
+хранения FILE-01; остальные security, policy и lifecycle guarantees сохраняются.
+
+| ID | Дано / действие | Наблюдаемый результат |
+|---|---|---|
+| CLD-AC-01 | Default/unknown mode, неполный Cloud config, platform PostgreSQL ENV и автоматически переданный `MCP_URL` | Default сохраняет Keycloak; unknown/incomplete fail closed; Cloud использует общий PostgreSQL pool и только persisted UI MCP settings; отсутствующая БД не включает in-memory fallback |
+| CLD-AC-02 | Верный/неверный password, oversized body, более 10 попыток за 300 секунд, restart, второй экземпляр | Login выдаёт только непрозрачный Secure/HttpOnly/host-only cookie на 8 часов; в БД только digest; 401/429 не создают сессии; shared limiter не сбрасывается успехом, restart или password rotation |
+| CLD-AC-03 | Logout, expiry, password rotation с живым/перезапущенным старым replica, login/logout/mutation с отсутствующим, повторённым или чужим Origin | Отозванная сессия и старый replica не получают owner authority; startup с retired password отклонён без отзыва новых сессий; CSRF отклоняется до side effect; UI очищает private state и не входит автоматически; Keycloak flow не изменён |
+| CLD-AC-04 | Два platform keys обращаются к известной external Task, повторяют один messageId; пытаются ListTasks на обеих bindings | Известный external Task доступен обоим по lifecycle; общий dedup возвращает ту же Task либо conflict; внешний List полностью запрещён до выборки, без IDs/count; owner enumeration доступен |
+| CLD-AC-05 | External caller с owner cookie/поддельными headers обращается к owner Task, settings, HITL/private material или чужому tenant | Authority остаётся external, private данные и мутации недоступны; исполняемый код не читает соседний workspace; UUID и credential string не выбирают scope |
+| CLD-AC-06 | Owner открывает «Доступ к агенту»; один Cloud key отозван в console | UI показывает trusted A2A URL и ручные инструкции отдельного статического key на peer, не вызывает Keycloak provisioning и не хранит keys; real proxy закрывает новые запросы отозванного key; принятая Task не отменяется |
+| CLD-AC-07 | Новый чат без файлов; затем обычный/скрытый файл, каталог/permissions, изменение, удаление, повтор неизменного checkpoint | Пустой чат не создаёт S3 archive/blob; полное дерево без implicit ignores сохраняется; неизменные bytes/manifest переиспользуются; удаление последнего файла не создаёт пустого архива |
+| CLD-AC-08 | Заменён Pod, RAM FS полностью пуста после сохранения проекта, attachments/quarantine, typed result и offload | До чтения/исполнения восстанавливаются committed paths/permissions и проверенные bytes; доступ/guardrail barriers сохранены; cleanup/tombstones не воскрешают удалённые файлы; image skills не копируются без пользовательского действия |
+| CLD-AC-09 | Сбой до/после S3 PUT и DB commit, неизвестный PUT, stale writer, corrupt blob, traversal/symlink/special file либо лимит RAM/tree | Нет ложного durable receipt, пропуска файла, доступа за chat root или commit старого worker; S3 I/O не удерживает DB lock; неизвестный PUT сверяется; GC не удаляет referenced/live staged bytes |
+| CLD-AC-10 | Pod потерян во время команды; имеется snapshot, но нет доказательства остановки/результата; другая Task ждёт A2A/HITL | Команда не replay-ится; прежний cleanup/reconciliation barrier сохраняется; committed файлы и разрешённые durable waits восстанавливаются без повторных side effects |
+| CLD-AC-11 | Реальный target Pod: preflight и terminal/Python/background/nested execution, idle worker, SIGTERM/rolling overlap | Обязательный текущий sandbox работает; недоступность закрывает запуск без fallback; cron/push/recovery работают без HTTP, fencing исключает второго writer |
+| CLD-AC-12 | Реальный Cloud proxy/browser, platform DB migration/grants и S3; перенос старого deployment с проверкой пустой FS | UI/assets/cookies/SSE/A2A и bytes доступны через реальный endpoint, секреты не встроены в UI; migration/version/backup подтверждены; прежние owner IDs не переназначаются автоматически; непроверенный target gate блокирует выпуск |
+| CLD-AC-13 | Первый trial `development` + `cloudru` с обязательной PostgreSQL, временным workspace и `CORE_AGENT_STARTUP_DIAGNOSTICS=true`: успешный старт либо отказ на config/DB/schema/sandbox | Конечные stage/status/reason logs показывают достигнутую стадию без ENV/secrets/DSN/raw URL/body/private paths/traceback; checks не отключены; trial явно не обещает сохранность bytes после замены Pod; production Cloud startup до S3 отклонён; retired artifact ENV не подключают backend и не блокируют trial; application_ready подтверждает только ASGI app |
+
 Поставка может реализовать подмножество только через явный [release profile](releases/v1.md); реализованное поведение не может противоречить этим критериям.
 
 ## A2A и публичный контракт
@@ -390,7 +414,10 @@
 
 ## Enterprise v1: обязательные сценарии
 
-Все ENT-AC ниже входят в текущий release candidate. Перенос критерия не является автоматическим доказательством: статус исполнения фиксируется отдельно в implementation-status.
+Все ENT-AC ниже входят в текущий release candidate для исходного Keycloak/POSIX
+профиля. В явном Cloud.ru profile caller identity, login/provisioning и storage
+уточняются CLD-AC ниже; остальные policy, isolation и durability criteria
+остаются обязательными. Перенос критерия не является автоматическим доказательством: статус исполнения фиксируется отдельно в implementation-status.
 
 | ID | Дано / действие | Наблюдаемый результат |
 | --- | --- | --- |

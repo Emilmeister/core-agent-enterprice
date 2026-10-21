@@ -32,10 +32,11 @@ def ui_routes(settings, *, directory=None):
     """Return routes and their exact public GET/HEAD paths from a trusted build."""
     root = UI_DIST if directory is None else Path(directory)
     shell = root / "index.html"
-    if settings is None or not settings.ui_client_id or not _build_file(root, shell):
+    if (settings is None or (settings.mode != "cloudru" and not settings.ui_client_id)
+            or not _build_file(root, shell)):
         return [], frozenset()
 
-    issuer = urlsplit(settings.issuer)
+    issuer = urlsplit(settings.origin if settings.mode == "cloudru" else settings.issuer)
     origin = f"{issuer.scheme}://{issuer.netloc}"
     headers = {
         "Cache-Control": "no-store",

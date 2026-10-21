@@ -360,8 +360,10 @@ Embedded/local SDK MAY предоставить convenience `run(prompt)` и typ
 - Tenant/identity/права выводятся из проверенного transport context, а не из
   текста сообщения, поля metadata или аргументов инструмента.
 
-Production требует полную Keycloak configuration и закрывает прежние обходные
-пути. Только explicit development/test с полностью ненастроенной auth может
+Production требует полную configuration выбранного auth profile и закрывает
+прежние обходные пути. Default `keycloak` сохраняет прежнюю семантику; явный
+[Cloud.ru profile](cloudru.md) использует owner password/cookie и общий external
+scope, полностью запрещая external Task listing на обеих bindings. Только explicit development/test с полностью ненастроенной auth может
 сохранять legacy routes; частично настроенная или недоступная auth никогда не
 включает fallback. Входящий Authorization не передаётся внешнему агенту.
 
@@ -399,7 +401,9 @@ Production требует полную Keycloak configuration и закрыва�
 исходная задача не изменяется.
 
 Дедупликация scoped по tenant и стабильной authenticated identity вызывающего;
-совпадение messageId у другого caller-а не раскрывает чужую Task. Каждое
+в Keycloak-профиле совпадение messageId у другого caller-а не раскрывает чужую
+Task. В Cloud.ru все external peers используют один actor/dedup namespace
+по [CLD-03](cloudru.md). Каждое
 обращение предварительно проверяет текущие права. При сравнении учитываются
 содержимое сообщения, context и вложения, а не значение access token.
 Связь messageId с Task сохраняется атомарно при приёме, переживает restart
@@ -448,6 +452,10 @@ HITL и не продлевает deadline. Это правило согласо
 
 
 ## Owner API: настройки и решения
+
+Следующий Keycloak bootstrap/PKCE/logout контракт действует в `keycloak`.
+Явный `cloudru` использует bootstrap и password/session endpoints по
+[CLD-02](cloudru.md); private owner API и public asset allowlist сохраняются.
 
 `GET /ui/config` — отдельный публичный bootstrap для браузерного входа, доступный
 только при настроенном `KEYCLOAK_UI_CLIENT_ID`. Ответ содержит ровно `{issuer,
@@ -1120,6 +1128,10 @@ cron skip notices добавляются отдельной owner-only immutable
 собственным version2 cursor. Version1 transcript cursors продолжают работать.
 
 ## Owner API: доступ к агенту (AUTH-04)
+
+Keycloak API ниже действует только в `keycloak`. В `cloudru` вкладка показывает
+адрес A2A и инструкцию ручной выдачи/отзыва отдельного platform key для каждого
+peer по [CLD-03](cloudru.md); Keycloak provisioning endpoints не доступны.
 
 Вкладка «Доступ к агенту» показывает число и список внешних сервисных учёток,
 название, время выдачи/истечения и состояние pending/active/expired/revoked.

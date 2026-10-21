@@ -6,6 +6,13 @@
 
 Сохранённый transport blob имеет непрозрачный ID, tenant/chat/caller scope, media type, фактический размер, SHA-256 digest и source/task provenance. При чтении проверяются доступ, размер и digest; повреждённый объект не выдаётся. Ссылки на скачивание проверяют права на каждом новом HTTP-запросе и не открывают общий filesystem сервера. Snapshots имеют проверяемый commit manifest и не восстанавливают вручную удалённые файлы поверх новой revision workspace.
 
+В явном [Cloud.ru профиле](cloudru.md) локальные paths являются RAM cache,
+а подтверждённые bytes всех workspace, quarantine, results и offload сохраняются
+через S3 SDK по planned CLD-04 для production release. Первый диагностический
+trial использует временную FS без гарантии сохранности этих bytes после замены Pod. Это transport/workspace durability и не возвращает
+удалённый model-callable artifact service. Scope, integrity, guardrails и
+publication barrier этого документа действуют также после восстановления.
+
 ## Вложения и управление файлами
 
 ### FILE-02. Приём вложений
@@ -152,7 +159,8 @@ immutable batch; public bytes не дублируются в обычном fina
 Earlier Artifacts остаются в failed/canceled Task; неapproved/uncommitted
 batch после terminal outcome не публикуется. Immutable transport blobs
 сохраняются независимо от retired named artifact CRUD service; новая
-S3/Mongo инфраструктура не требуется.
+Сама typed publication не требует S3/Mongo инфраструктуры; выбор S3 для
+Cloud.ru workspace durability задаётся отдельным CLD-04.
 
 ### Legacy file selection
 
@@ -346,7 +354,9 @@ HITL, ответа владельца, внешнего агента или вр
 
 `core_artifact_save`, `core_artifact_load`, `core_artifact_list`, их registry, schemas, handlers и model instructions MUST быть удалены. Код, зависимости, S3/MongoDB adapters и configuration, используемые исключительно этими tools, также удаляются. Транспортные A2A Artifacts, storage для результатов/offload и workspace snapshots сохраняются; само слово artifact не является критерием удаления.
 
-До удаления service все входящие вложения переводятся на chat workspace. Прежние `ARTIFACT_STORAGE_*`, dedicated `ARTIFACT_S3_*`/`ARTIFACT_MONGODB_*` и `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` перестают задавать runtime capabilities. Upgrade MUST диагностировать неподдерживаемые старые настройки; отключение tools не разрешает молча потерять прежние файлы.
+До удаления service все входящие вложения переводятся на chat workspace. Прежние `ARTIFACT_STORAGE_*`, dedicated `ARTIFACT_S3_*`/`ARTIFACT_MONGODB_*` и `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` перестают задавать runtime capabilities. Keycloak/legacy upgrade MUST диагностировать неподдерживаемые старые настройки;
+явный диагностический Cloud.ru trial игнорирует их без включения backend по
+[CLD trial](cloudru.md); отключение tools не разрешает молча потерять прежние файлы.
 
 Согласованный cutover не имеет прежних named artifact данных для переноса.
 Export/import utility, перенос S3/MongoDB blobs и новый import journal не входят
