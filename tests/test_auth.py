@@ -272,8 +272,14 @@ class AuthBoundaryTests(AuthAppTestCase):
         response = await self.http.get("/api/identity")
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.checks, [])
-        legacy = await self.http.post("/message:send", json={})
-        self.assertEqual(legacy.status_code, 404)
+        for path in ("/", "/message:send"):
+            with self.subTest(method="POST", path=path):
+                legacy = await self.http.post(path, json={})
+                self.assertEqual(legacy.status_code, 404)
+        for path in ("/", "/.well-known/agent-card.json", "/.well-known/agent.json"):
+            with self.subTest(method="GET", path=path):
+                self.assertEqual((await self.http.get(path)).status_code, 404)
+        self.assertEqual(self.checks, [])
         self.assertEqual((await self.http.get("/health/live")).status_code, 200)
 
     async def test_roles_cards_and_conflicting_roles(self):

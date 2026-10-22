@@ -168,10 +168,22 @@ mount/unshare/setns. Это реальная kernel-проверка Landlock/se
 Откройте `<AGENT_URL>/ui/` и введите owner password. Proxy должен поддерживать
 browser access к UI, assets и API; platform key нельзя встраивать в JS/URL.
 Сессия — защищённая HttpOnly cookie на 8 часов, выход отзывает её в PostgreSQL.
-Для внешнего peer используйте `<AGENT_URL>/a2a/external/` и отдельный статический
+Для внешнего peer используйте `<AGENT_URL>/` и отдельный статический
 Cloud API key; выдача/отзыв выполняются вручную в Cloud console. Peers имеют общий
 external scope для известных Task IDs; перечисление Tasks закрыто, owner данные
 им недоступны.
+
+JSON-RPC принимает `POST /`; HTTP+JSON использует `/message:send`,
+`/message:stream` и `/tasks/...` от корня. Agent Card доступна по
+`/.well-known/agent-card.json` и `/.well-known/agent.json`; адрес в ней берётся
+из настроенного `AGENT_URL`. Прежний `/a2a/external/` работает как alias без
+redirect с тем же scope и дедупликацией. Owner A2A остаётся на `/a2a/owner/`;
+owner cookie не расширяет права внешних вызовов через корень или alias.
+
+`GET /` и `HEAD /` используют ту же проверку готовности, что `/health/ready`:
+200 при исправном sandbox и доступной БД с совместимой schema, иначе 503.
+HEAD возвращает статус без body. `/health/live` остаётся отдельным liveness
+endpoint. Эти root routes включены только в Cloud.ru profile.
 
 ## Какие logs передать
 
@@ -182,6 +194,11 @@ sandbox, runtime, routes, recovery и общий startup. `startup.storage` со
 `backend=temporary-posix`, `durable=false`. `application_ready` означает сборку
 ASGI application; фактическое открытие listener подтверждают сообщения Uvicorn
 и успешные `/health/live`, `/health/ready` через платформу.
+
+Если после успешного старта Pod перезапускается, сохраните platform event о
+завершении и результаты запросов к `/`, root Agent Card и `/health/ready`.
+Корневые маршруты обеспечивают discovery и readiness, но причина перезапуска
+без этих данных остаётся неподтверждённой.
 
 Перед штатной проверкой sandbox первые записи `startup.sandbox_probe` —
 `landlock_abi`, `landlock_filesystem` и `seccomp_filter`. Отдельные доверенные

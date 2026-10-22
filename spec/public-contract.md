@@ -354,7 +354,7 @@ Embedded/local SDK MAY предоставить convenience `run(prompt)` и typ
 ### API-01. Разделение входов
 
 - A2A endpoint `/a2a/owner` для владельцев.
-- A2A endpoint `/a2a/external` для внешних агентов.
+- A2A endpoint `/a2a/external` для внешних агентов; в [Cloud.ru](cloudru.md#cld-03-общий-внешний-scope) canonical вход находится в корне origin, а `/a2a/external` остаётся совместимым alias с тем же external scope и admission.
 - Owner API под `/api`, включая отдельный endpoint решений HITL `/api/hitl`, доступен только владельцам. Наличие маршрута в target contract не означает готовый UI/HITL flow.
 - Оба A2A endpoint используют один runtime и Task lifecycle. Public probes `/health/live` и `/health/ready` остаются без аутентификации; они не раскрывают пользовательские данные.
 - Tenant/identity/права выводятся из проверенного transport context, а не из

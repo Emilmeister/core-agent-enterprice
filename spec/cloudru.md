@@ -59,7 +59,7 @@ origin отклоняется до мутации, включая соседни
 очищает private state без автоматического повторного входа.
 
 Публичный `GET /ui/config` возвращает ровно `{auth_mode: "cloudru",
-external_a2a_url: "<origin>/a2a/external/"}`. `POST /api/auth/login` принимает
+external_a2a_url: "<origin>/"}`. `POST /api/auth/login` принимает
 только JSON `{password}`, body до 4096 bytes: успех — 200 `{status: "ok"}`
 и cookie с `Max-Age=28800`, неверный пароль — 401. Общий для tenant DB limiter
 разрешает не более 10 попыток за 300 секунд, затем возвращает 429. Все корректно
@@ -79,6 +79,28 @@ Owner-wide чтение/продолжение external Task сохраняет 
 Секреты и cookies никогда не пересылаются исходящим MCP/A2A peers.
 
 ## CLD-03. Общий внешний scope
+
+Канонический внешний A2A URL в Cloud.ru — `<origin>/`: `POST /` обслуживает
+JSON-RPC, а HTTP+JSON использует существующие точные SDK routes от корня,
+включая `/message:send`, `/message:stream` и `/tasks/...`. Agent Card доступна
+по `/.well-known/agent-card.json` и `/.well-known/agent.json`; оба пути
+объявляют trusted configured origin, без влияния `Host` или forwarding headers.
+Binding/protocol versions остаются заданными [A2A-контрактом](a2a-protocol.md).
+Произвольные пути и SDK tenant alias не становятся внешними входами.
+
+Прежний `/a2a/external/` остаётся совместимым alias без redirect, с теми же
+handlers, stores, lifespan, admission и external principal. Повтор одного
+Message через другой вход не создаёт новую Task; изменённый Message сохраняет
+прежний конфликт. Root A2A всегда получает external authority, в том числе
+при переданном owner cookie; запрет ListTasks действует на обоих входах.
+Owner A2A остаётся на `/a2a/owner/`, owner API, UI и probes сохраняют свои пути
+и access checks. В Keycloak profile корневые A2A routes остаются закрытыми.
+
+Только в Cloud.ru `GET /` и `HEAD /` выполняют тот же readiness predicate,
+что `/health/ready`: healthy sandbox и доступная БД с совместимой schema дают
+200, отказ — 503. GET возвращает тот же JSON status, HEAD — без body.
+Это не A2A-вызов и не требует owner session; `POST /` остаётся JSON-RPC.
+`/health/live` сохраняет отдельную liveness-проверку.
 
 Cloud.ru proxy не предоставляет приложению проверенную identity peer-а.
 Принятое решение — один стабильный external actor на deployment/company.

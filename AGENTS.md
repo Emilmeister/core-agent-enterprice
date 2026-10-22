@@ -336,6 +336,12 @@ Target spec может описывать больше текущего runtime.
   повторно: старый replica отклоняется до изменения действующей версии.
   External peers имеют общий стабильный scope для известных external IDs;
   listing закрыт в обеих A2A bindings, owner-private API остаются закрытыми.
+  Canonical external A2A и обе well-known Agent Cards доступны от корня origin;
+  `/a2a/external/` остаётся alias без redirect с общими admission/stores.
+  Root A2A всегда external, даже с owner cookie; owner entrance остаётся
+  `/a2a/owner/`, Keycloak root A2A закрыт. `GET/HEAD /` в Cloud.ru используют
+  тот же readiness predicate, что `/health/ready`; `POST /` — JSON-RPC.
+  Card и `/ui/config` используют configured origin без доверия forwarding headers.
   MCP берутся только из persisted UI settings. Platform `MCP_URL`/headers и
   retired `ARTIFACT_STORAGE_*`/`ARTIFACT_S3_*`/`ARTIFACT_MONGODB_*`/
   `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` не подключают backend или credentials;

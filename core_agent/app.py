@@ -2135,12 +2135,16 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
                               cron_store=cron_store, on_cron_admitted=cron_handoff,
                               external_access=None if cloud_auth else ExternalAccess(auth_settings, transport=auth_transport)),
             ]
+            if cloud_auth:
+                # Canonical Cloud endpoint; the prefixed alias shares the same
+                # handler, admission ledger and task store without redirects.
+                app.routes.extend(routes)
             if cloud_auth or auth_settings.ui_client_id:
                 async def ui_config(request):
                     invalid = bool(request.query_params)
                     return JSONResponse(
                         {"error": {"code": "REQUEST_INVALID"}} if invalid else
-                        ({"auth_mode": "cloudru", "external_a2a_url": auth_settings.origin + "/a2a/external/"} if cloud_auth else
+                        ({"auth_mode": "cloudru", "external_a2a_url": auth_settings.origin + "/"} if cloud_auth else
                          {"issuer": auth_settings.issuer, "client_id": auth_settings.ui_client_id}),
                         status_code=400 if invalid else 200,
                         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
@@ -2150,7 +2154,8 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
             static_routes, static_paths = ui_routes(auth_settings)
             app.routes.extend(static_routes)
             app.add_middleware(CloudAuthenticationMiddleware if cloud_auth else AuthenticationMiddleware,
-                               authenticator=authenticator, public_paths=static_paths)
+                               authenticator=authenticator, public_paths=static_paths,
+                               **({"external_routes": routes} if cloud_auth else {}))
             app.state.authenticator = authenticator
             app.state.remote_registry_store = remote_registry_store
 
@@ -2169,6 +2174,8 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
         return JSONResponse({"status": "ready"})
 
     app.routes[0:0] = (Route("/health/live", live), Route("/health/ready", ready))
+    if cloud_auth:
+        app.routes.append(Route("/", ready, methods=["GET", "HEAD"]))
     app.state.core_agent = agent
     app.state.store_attachments = store_attachments
     app.state.database = state["database"]

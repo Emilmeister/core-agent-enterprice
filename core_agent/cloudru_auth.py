@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.routing import Match
 
 from .auth import Principal
 from .errors import CoreError
@@ -222,10 +223,11 @@ class CloudAuthenticator:
 
 
 class CloudAuthenticationMiddleware:
-    def __init__(self, app, *, authenticator, public_paths=()):
+    def __init__(self, app, *, authenticator, public_paths=(), external_routes=()):
         self.app = app
         self.authenticator = authenticator
         self.public_paths = frozenset(public_paths)
+        self.external_routes = tuple(external_routes)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -236,7 +238,9 @@ class CloudAuthenticationMiddleware:
             await self.app(scope, receive, send)
             return
         owner = path == "/a2a/owner" or path.startswith(("/a2a/owner/", "/api/"))
-        external = path == "/a2a/external" or path.startswith("/a2a/external/")
+        external = (path == "/a2a/external" or path.startswith("/a2a/external/")
+                    or (not owner and any(route.matches(scope)[0] != Match.NONE
+                                          for route in self.external_routes)))
         if not owner and not external:
             await JSONResponse({"error": {"code": "NOT_FOUND"}}, status_code=404)(scope, receive, send)
             return

@@ -172,12 +172,55 @@ class CloudAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_public_config_and_legacy_routes_and_external_management(self):
         config = await self.http.get("/ui/config")
         self.assertEqual(config.status_code, 200, config.text)
-        self.assertEqual(config.json(), {"auth_mode": "cloudru", "external_a2a_url": ORIGIN + "/a2a/external/"})
+        self.assertEqual(config.json(), {"auth_mode": "cloudru", "external_a2a_url": ORIGIN + "/"})
         self.assertEqual((await self.http.get("/ui/config?auth_mode=keycloak")).status_code, 400)
-        for path in ("/", "/tasks", "/.well-known/agent-card.json", "/ui/anything"):
+        for path in ("/unknown", "/.well-known/unknown", "/ui/anything"):
             self.assertEqual((await self.http.get(path)).status_code, 404, path)
         await self.login()
         self.assertEqual((await self.http.get("/api/external-access")).status_code, 404)
+
+    async def test_root_get_and_head_use_real_readiness(self):
+        launcher = self.app.state.core_agent.tool_runtime.environment_manager.backend.launcher
+        for unhealthy, expected in ((False, 200), (True, 503)):
+            launcher._unhealthy = unhealthy
+            for path in ("/", "/health/ready"):
+                for method in ("GET", "HEAD"):
+                    response = await self.http.request(method, path)
+                    self.assertEqual(response.status_code, expected, (path, response.text))
+                    if method == "HEAD":
+                        self.assertEqual(response.content, b"")
+        launcher._unhealthy = False
+        if self.app.state.database is not None:
+            with patch.object(self.app.state.database, "check", side_effect=CoreError("DATABASE_UNAVAILABLE")):
+                for path in ("/", "/health/ready"):
+                    self.assertEqual((await self.http.get(path)).status_code, 503)
+
+    async def test_root_rpc_and_rest_share_external_task_and_dedup_with_alias(self):
+        message = {"messageId": str(uuid.uuid4()), "contextId": "root-chat", "role": "ROLE_USER",
+                   "parts": [{"text": "Answer briefly"}]}
+        headers = {"A2A-Version": "1.0"}
+        response = await self.http.post("/", headers=headers,
+            json={"jsonrpc": "2.0", "id": "root", "method": "SendMessage", "params": {"message": message}})
+        self.assertEqual(response.status_code, 200, response.text)
+        task = response.json()["result"]["task"]
+        for prefix in ("", "/a2a/external"):
+            duplicate = await self.http.post(prefix + "/message:send", headers=headers, json={"message": message})
+            self.assertEqual(duplicate.status_code, 200, duplicate.text)
+            self.assertEqual(duplicate.json()["task"]["id"], task["id"])
+            known = await self.http.get(prefix + "/tasks/" + task["id"], headers=headers)
+            self.assertEqual(known.status_code, 200, known.text)
+        self.assertEqual(len(self.app.state.core_agent.model.calls), 1)
+
+    async def test_root_discovery_uses_trusted_origin_and_external_authority(self):
+        await self.login()
+        for name in ("agent-card.json", "agent.json"):
+            card = await self.http.get("/.well-known/" + name, headers={
+                "Host": "attacker.invalid", "X-Forwarded-Host": "attacker.invalid",
+                "X-Forwarded-Proto": "http"})
+            self.assertEqual(card.status_code, 200, card.text)
+            self.assertEqual({item["url"] for item in card.json()["supportedInterfaces"]}, {ORIGIN})
+            self.assertEqual(set(card.json()["securitySchemes"]), {"cloudruPlatform"})
+            self.assertNotIn("attacker.invalid", card.text)
 
     async def test_platform_mcp_urls_and_headers_never_seed_connections_or_owner_settings(self):
         for headers in ('{"Authorization":"Bearer platform-mcp-secret"}', "not-valid-json"):
@@ -235,17 +278,18 @@ class CloudAuthTests(unittest.IsolatedAsyncioTestCase):
         await self.login()
         owner = await self.submit("owner", "owner-chat")
         external = await self.submit("external", "external-chat")
-        denied = await self.http.get("/a2a/external/tasks/" + owner["id"], headers={"A2A-Version": "1.0"})
-        self.assertNotEqual(denied.status_code, 200, denied.text)
+        for prefix in ("", "/a2a/external"):
+            denied = await self.http.get(prefix + "/tasks/" + owner["id"], headers={"A2A-Version": "1.0"})
+            self.assertNotEqual(denied.status_code, 200, denied.text)
+            listed = await self.http.get(prefix + "/tasks", headers={"A2A-Version": "1.0"})
+            self.assertNotEqual(listed.status_code, 200, listed.text)
+            listed_rpc = await self.http.post(prefix + "/", headers={"A2A-Version": "1.0"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": {}})
+            self.assertNotIn("result", listed_rpc.json())
+            self.assertIn("enumeration is disabled", listed_rpc.text)
         self.http.cookies.clear()
         known = await self.http.get("/a2a/external/tasks/" + external["id"], headers={"A2A-Version": "1.0"})
         self.assertEqual(known.status_code, 200, known.text)
-        listed = await self.http.get("/a2a/external/tasks", headers={"A2A-Version": "1.0"})
-        self.assertNotEqual(listed.status_code, 200, listed.text)
-        listed_rpc = await self.http.post("/a2a/external/", headers={"A2A-Version": "1.0"},
-            json={"jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": {}})
-        self.assertNotIn("result", listed_rpc.json())
-        self.assertIn("enumeration is disabled", listed_rpc.text)
         self.assertEqual((await self.http.get("/api/identity", headers={"Authorization": "Bearer arbitrary"})).status_code, 401)
 
 
