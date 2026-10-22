@@ -2618,6 +2618,11 @@ class CoreAgent:
         except KeyError:
             raise CoreError("CHECKPOINT_INVALID") from None
 
+    @staticmethod
+    def _request_instructions(instructions):
+        return (f"{instructions}\n\nCurrent date and time (trusted runtime clock): "
+                f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}. Timezone: UTC.")
+
     def _context_window(self, snapshot):
         window = snapshot.get("context_window", self.context_window)
         if type(window) is not int or window <= 0:
@@ -2668,7 +2673,7 @@ class CoreAgent:
         context = raw["context"]
         budget = ContextBudget(
             self._context_window(snapshot),
-            self.token_counter(instructions),
+            self.token_counter(self._request_instructions(instructions)),
             self.token_counter(catalog),
             self.output_reserve,
             compact_at=context["compact_at_working_ratio"],
@@ -4363,11 +4368,14 @@ class CoreAgent:
         model.context_window = self._context_window(snapshot)
         return model
 
-    def _generate(self, *, before_retry=None, model=None, **call):
+    def _generate(self, *, before_retry=None, on_request=None, model=None, **call):
         """Retry a retryable provider failure REFLECT_AND_RETRY_MAX_RETRIES times."""
         for attempt in range(self.model_retries + 1):
             try:
-                return (model or self.model).generate(**call)
+                instructions = self._request_instructions(call["instructions"])
+                if on_request is not None:
+                    on_request(instructions)
+                return (model or self.model).generate(**{**call, "instructions": instructions})
             except CoreError as error:
                 if attempt == self.model_retries or not getattr(
                     error, "retryable", False
@@ -4895,7 +4903,7 @@ class CoreAgent:
                         model_instructions = (
                             f"{model_instructions}\n\n{BUDGET_FINALIZATION_INSTRUCTION}"
                         )
-                        if (self.token_counter(model_instructions)
+                        if (self.token_counter(self._request_instructions(model_instructions))
                                 + self.token_counter(json.dumps(model_messages, ensure_ascii=False, separators=(",", ":")))
                                 + self.output_reserve > self._context_window(snapshot)):
                             call_finalizer_model = False
@@ -4993,6 +5001,9 @@ class CoreAgent:
                                 self._generate(
                                     model=self._model_for_snapshot(snapshot),
                                     before_retry=reserve_retry,
+                                    on_request=lambda instructions: model_span.set_attributes(self._llm_input_attributes(
+                                        model=raw["model"].get("route", "unknown"), messages=model_messages,
+                                        instructions=instructions, tools=model_tools, session_id=record.context_id)),
                                     context=model_context,
                                     tools=model_tools,
                                     instructions=model_instructions,

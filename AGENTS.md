@@ -714,6 +714,8 @@ run получает отдельные MCP session и negotiated version; пе�
   не разрешает fallback к свободному JSON; схемы инструментов не меняются.
 - Base включает system/kernel/profile, tool schemas и output reserve; pinned
   сравнивается с оставшейся working capacity даже без summarizable history.
+- Каждый запрос основной модели получает свежую trusted UTC отметку серверных
+  часов; она учитывается в budget и не меняет сохранённые profile или compiled kernel.
 - Неудачное interval compaction ниже pressure сохраняет исходный context;
   lease/storage ошибки не поглощаются. Overlap освобождается, если занимает
   всю цель; pinned выше цели получает реальное оставшееся место для summary.

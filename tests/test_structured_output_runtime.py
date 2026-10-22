@@ -73,6 +73,7 @@ class StructuredOutputRuntimeTests(unittest.TestCase):
             self.assertFalse(body["chat_template_kwargs"]["enable_thinking"])
             self.assertTrue(body["response_format"]["json_schema"]["strict"])
             self.assertEqual(body["model"], "guardrail")
+            self.assertNotIn("trusted runtime clock", json.dumps(body))
         self.assertEqual(agent.guardrail_classifier.model.reasoning_effort, "low")
         self.assertTrue(detector.extra_body["chat_template_kwargs"]["enable_thinking"])
 

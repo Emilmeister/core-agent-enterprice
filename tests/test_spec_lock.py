@@ -27,7 +27,7 @@ EXPECTED_SHA256 = {
     "security-and-reliability.md": "8a1d2ef152587cfdf086f8c900a91fd9808fd0c6b8d606bb35d555c01aadd9c2",
     "skills.md": "fe9eb87031d97367c111f724748fa4d2ea3c05e44a3b7666034a28f4c6d2590a",
     "tasks-and-delegation.md": "c59f4c923a5a34e00e34fb413920a93cb393e7d821ed74731a4d3ae532f6a408",
-    "tools.md": "a5f9eb6e85f8c46d8b24b6226ba532b2c8569cfab80c40f53a755e8c04b40adb",
+    "tools.md": "7fe6a1ca4dc44c2d4adb2bda43e3b5b30d264a58765d45a3ac67e7a7a3d72299",
 }
 
 

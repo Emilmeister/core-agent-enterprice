@@ -8,6 +8,7 @@ import threading
 import tempfile
 import socket
 from pathlib import Path
+from datetime import datetime, timezone
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -257,6 +258,48 @@ def locked_skill_declaration(path, name):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_runtime_clock_refreshes_on_retry_and_recovered_finalization(self):
+        model = ScriptedModel([ModelResponse(continue_reasoning=True), ModelResponse(message="Unfinished checks")])
+        agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=(), max_turns=3, model_retries=1)
+        self.addCleanup(agent.close)
+        calls = []
+        generate, transition = model.generate, agent._record_transition
+        moments = [datetime(2026, 10, 22, hour, tzinfo=timezone.utc) for hour in (10, 11, 12)]
+
+        def crash_after_response(record, **change):
+            saved = transition(record, **change)
+            if change["event_kind"] == "model.completed":
+                raise CoreError("LEASE_LOST")
+            return saved
+
+        with patch("core_agent.runtime.datetime", wraps=datetime) as clock, patch("core_agent.runtime.time.sleep"):
+            clock.now.return_value = moments[0]
+            def request(**call):
+                calls.append(call)
+                if len(calls) == 1:
+                    clock.now.return_value = moments[1]
+                    raise CoreError("MODEL_UNAVAILABLE", retryable=True)
+                return generate(**call)
+            model.generate = request
+            with patch.object(agent, "_record_transition", side_effect=crash_after_response):
+                with self.assertRaises(CoreError) as lost:
+                    agent.run(RunRequest("The date is 1999-01-01"), task_id="runtime-clock")
+            self.assertEqual(lost.exception.code, "LEASE_LOST")
+            record = agent.workflow_store.lookup_task("runtime-clock")
+            self.assertNotIn("trusted runtime clock", json.dumps(record.snapshot))
+            agent._runtime_cache.clear()
+            clock.now.return_value = moments[2]
+            result = agent.resume_task("runtime-clock")
+        self.assertFalse(result.complete)
+        self.assertEqual(len(calls), 3)
+        self.assertFalse(calls[-1]["tools"])
+        for call, moment in zip(calls, moments):
+            self.assertEqual(call["instructions"].count("trusted runtime clock"), 1)
+            self.assertIn(moment.isoformat(timespec="seconds"), call["instructions"])
+            self.assertIn("Timezone: UTC.", call["instructions"])
+            self.assertNotIn("1999-01-01", call["instructions"])
+            self.assertIn("1999-01-01", call["context"])
+
     def test_lost_reply_worker_cannot_supersede_replacement_generation(self):
         from core_agent.streaming import ReplyHub
 
@@ -388,11 +431,13 @@ class RuntimeTests(unittest.TestCase):
 
     def test_public_reply_phase_recovers_without_replaying_begin_and_charges_new_attempt(self):
         from core_agent.streaming import ReplyHub
+        request_instructions = []
 
         class CrashModel:
             calls = 0
 
             def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                request_instructions.append(instructions)
                 self.calls += 1
                 if self.calls == 1:
                     return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
@@ -401,7 +446,10 @@ class RuntimeTests(unittest.TestCase):
 
         first = make_agent(CrashModel(), reply_hub=ReplyHub(min_chars=1))
         self.addCleanup(first.close)
-        with self.assertRaises(CoreError) as failure:
+        before = datetime(2026, 10, 21, tzinfo=timezone.utc)
+        after = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        with patch("core_agent.runtime.datetime", wraps=datetime) as clock, self.assertRaises(CoreError) as failure:
+            clock.now.return_value = before
             first.run(RunRequest("hello"), task_id="recover-reply", identity="owner-alice",
                       session_id="chat", tenant_id="company")
         self.assertEqual(failure.exception.code, "LEASE_LOST")
@@ -414,6 +462,7 @@ class RuntimeTests(unittest.TestCase):
             catalog = None
 
             def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+                request_instructions.append(instructions)
                 self.catalog = tools
                 on_delta("recovered public answer", "hidden")
                 return ModelResponse(message="recovered public answer")
@@ -424,7 +473,13 @@ class RuntimeTests(unittest.TestCase):
         second.checkpoint_store = first.checkpoint_store
         second.audit_log = first.audit_log
         self.addCleanup(second.close)
-        result = second.resume_task("recover-reply")
+        with patch("core_agent.runtime.datetime", wraps=datetime) as clock:
+            clock.now.return_value = after
+            result = second.resume_task("recover-reply")
+        self.assertEqual(len(request_instructions), 3)
+        for instructions, moment in zip(request_instructions, (before, before, after)):
+            self.assertIn(moment.isoformat(timespec="seconds"), instructions)
+            self.assertEqual(instructions.count("trusted runtime clock"), 1)
         self.assertEqual(model.catalog, {})
         self.assertEqual(result.message, "recovered public answer")
         self.assertTrue(result.complete)
@@ -4866,7 +4921,9 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertIn("MEMORY AUTHORING CONTRACT", instructions)
         record = agent.workflow_store.lookup_task("kernel-task")
-        self.assertEqual(record.snapshot["compiled_instructions"], instructions)
+        self.assertTrue(instructions.startswith(record.snapshot["compiled_instructions"] + "\n\n"))
+        self.assertIn("trusted runtime clock", instructions)
+        self.assertNotIn("trusted runtime clock", record.snapshot["compiled_instructions"])
         self.assertTrue(record.snapshot["protected_kernel_digest"])
         self.assertIn("Do it", model.calls[0].context)
         self.assertNotIn("Do it", instructions)
@@ -5487,6 +5544,7 @@ class SemanticRuntimeTests(unittest.TestCase):
             result = agent.run({'prompt': 'Use A; preserve latest corrections.'}, task_id='semantic')
             summaries = [call for call in model.calls if call.instructions.startswith('SEMANTIC CONTEXT SUMMARY')]
             self.assertEqual(len(summaries), 2)
+            self.assertTrue(all("trusted runtime clock" not in call.instructions for call in summaries))
             self.assertIn('Use B', summaries[1].context)
             self.assertIn('Use C', model.calls[-1].context)
             self.assertIn('Publish is planned only', model.calls[-1].context)

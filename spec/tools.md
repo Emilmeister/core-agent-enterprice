@@ -71,7 +71,15 @@ root, абсолютные пути и внешние файлы модели н
 
 Выполняет bounded Python-код отдельным process в принадлежащем run workspace и предоставляет синхронный proxy `tools.call(canonical_name, arguments)` плюс immutable `tools.names`. Вложенный вызов built-in или MCP tool MUST повторно пройти EffectiveConfig, schema validation, policy, общий tool-call budget, owner/tenant checks, audit и дочерний OTel span. `core_python_exec` не может вызывать самого себя и не запускается через `core_task_start`.
 
-Agent SHOULD использовать Python для runtime-dependent, non-trivial или accuracy-sensitive deterministic computation, parsing/validation и небольшой synchronous композиции разрешённых tools. Тривиальная language work не требует process call. Текущее время MUST проверяться доступным authoritative runtime tool; при Python используются `datetime.now().astimezone()` и явный timezone/UTC offset, а указанная timezone конвертируется через `zoneinfo`, если доступна. Direct OS/process/network Python calls не подменяют отсутствующий agent tool и не проходят `tools.call` broker; direct OS/process/network calls ограничены обязательным Bubblewrap и egress profile.
+Agent SHOULD использовать Python для runtime-dependent, non-trivial или accuracy-sensitive deterministic computation, parsing/validation и небольшой synchronous композиции разрешённых tools. Тривиальная language work не требует process call. Для текущей даты достаточно trusted отметки начала model request ниже; более позднее точное время MUST проверяться доступным authoritative runtime tool. При Python используются `datetime.now().astimezone()` и явный timezone/UTC offset, а указанная timezone конвертируется через `zoneinfo`, если доступна. Direct OS/process/network Python calls не подменяют отсутствующий agent tool и не проходят `tools.call` broker; direct OS/process/network calls ограничены обязательным Bubblewrap и egress profile.
+
+Перед каждым физическим запросом основной модели runtime добавляет trusted
+текущие дату, время и UTC offset из серверных часов. Значение обновляется при
+retry, finalization и recovery, учитывается в token budget и не сохраняется
+как постоянная часть profile или compiled kernel. Эта отметка является
+authoritative временем начала запроса; для более позднего точного времени
+или преобразования часового пояса используются runtime tools. Summary,
+classifier и другие отдельные structured-output запросы сохраняют свои схемы.
 
 Capability присутствует в обоих runtime-профилях и управляется только built-in allowlist.
 
