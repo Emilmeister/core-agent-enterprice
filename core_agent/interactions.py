@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from .errors import CoreError
+from .response_files import with_prefetched_artifacts
 
 
 TIMEOUT_KEYS = frozenset({
@@ -198,6 +199,14 @@ class PostgresInteractionStore:
             yield ToolPolicy(**row), connection
 
     def update_policy(
+        self, tenant_id, canonical_name, origin, *, mode, guardrails_exempt,
+        expected_revision, actor_id,
+    ):
+        return with_prefetched_artifacts(getattr(self.database, "response_files_service", None),
+            lambda: self._update_policy(tenant_id, canonical_name, origin, mode=mode,
+                guardrails_exempt=guardrails_exempt, expected_revision=expected_revision, actor_id=actor_id))
+
+    def _update_policy(
         self, tenant_id, canonical_name, origin, *, mode, guardrails_exempt,
         expected_revision, actor_id,
     ):

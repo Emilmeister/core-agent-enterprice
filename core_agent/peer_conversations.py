@@ -192,6 +192,8 @@ def _file_identity(entry, content=None):
             identity["text_digest"] = _json_identity(content.decode("utf-8"))["material_digest"]
         except UnicodeError:
             pass
+    elif entry.get("text_digest") is not None:
+        identity["text_digest"] = entry["text_digest"]
     return identity
 
 
@@ -209,14 +211,20 @@ def _files(agent, binding, row, source, connection, materials=None, pending=None
                 if pending is not None and batch["state"] in {"accepted_quarantine", "accepted_ready"}:
                     pending.append(batch_id)
                 continue
-            with service._accepted_files(batch_id, binding, run_id=source.run_id,
-                                         task_id=source.task_id, connection=connection) as (batch, directory):
+            if service._stored_original(batch["manifest"]):
+                batch = service._accepted_row(batch_id, binding, source.run_id, source.task_id, connection)
+                service._validate_original(batch["manifest"])
                 if materials is not None:
-                    materials.extend(_file_identity(entry, service._read_entry(directory, entry))
-                                     for entry in batch["manifest"]["entries"])
-                files.extend({key: entry[key] for key in (
-                    "index", "actual_name", "relative_path", "size_bytes", "sha256")}
-                    for entry in batch["manifest"]["entries"])
+                    materials.extend(_file_identity(entry) for entry in batch["manifest"]["entries"])
+            else:
+                with service._accepted_files(batch_id, binding, run_id=source.run_id,
+                                             task_id=source.task_id, connection=connection) as (batch, directory):
+                    if materials is not None:
+                        materials.extend(_file_identity(entry, service._read_entry(directory, entry))
+                                         for entry in batch["manifest"]["entries"])
+            files.extend({key: entry[key] for key in (
+                "index", "actual_name", "relative_path", "size_bytes", "sha256")}
+                for entry in batch["manifest"]["entries"])
         return files
     except CoreError as error:
         if error.code in {"FILE_BATCH_NOT_FOUND", "FILE_NOT_FOUND", "TASK_NOT_FOUND"}:
@@ -424,6 +432,12 @@ def _artifact_receipts(agent, binding, row, files, connection):
 
 
 def read_outgoing_file(agent, admission, binding, operation_id, file_id):
+    from .response_files import with_prefetched_artifacts
+    return with_prefetched_artifacts(agent.response_files_service,
+        lambda: _read_outgoing_file(agent, admission, binding, operation_id, file_id))
+
+
+def _read_outgoing_file(agent, admission, binding, operation_id, file_id):
     database = getattr(admission, "database", None)
     with database.transaction() if database is not None else agent.workflow_store._lock as connection:
         connection = connection if database is not None else None
@@ -456,6 +470,12 @@ def read_outgoing_file(agent, admission, binding, operation_id, file_id):
 
 
 def read_conversations(agent, admission, binding, *, limit=50, after=None, operation_id=None):
+    from .response_files import with_prefetched_artifacts
+    return with_prefetched_artifacts(agent.response_files_service,
+        lambda: _read_conversations(agent, admission, binding, limit=limit, after=after, operation_id=operation_id))
+
+
+def _read_conversations(agent, admission, binding, *, limit=50, after=None, operation_id=None):
     database = getattr(admission, "database", None)
     locks = database.transaction() if database is not None else agent.workflow_store._lock
     with locks as connection:

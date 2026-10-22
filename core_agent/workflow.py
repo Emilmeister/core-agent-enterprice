@@ -8,10 +8,23 @@ import re
 from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
+from functools import wraps
 
 from psycopg.types.json import Jsonb
 
 from .errors import CoreError
+from .response_files import with_prefetched_artifacts
+
+
+def _prefetched_public_output(method):
+    """Hydrate only after a complete, rollback-safe workflow operation unwinds."""
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        if kwargs.get("connection") is not None:
+            return method(self, *args, **kwargs)
+        service = getattr(getattr(self, "database", None), "response_files_service", None)
+        return with_prefetched_artifacts(service, lambda: method(self, *args, **kwargs))
+    return run
 
 
 TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "REJECTED", "ABORTED"}
@@ -341,6 +354,7 @@ class _ExecutionLifecycle:
                 raise CoreError("CHECKPOINT_INVALID", "Execution generation no longer matches")
             return current
 
+    @_prefetched_public_output
     def mark_execution_cleanup_pending(self, record, *, lease_token):
         with self._execution_lock(record, lease_token) as (current, connection):
             if current.state in TERMINAL_STATES or current.snapshot.get("execution_cleanup_pending"):
@@ -351,6 +365,7 @@ class _ExecutionLifecycle:
                 pending_approval_id=current.pending_approval_id, result=current.result, error_code=current.error_code,
                 event_kind="execution.cleanup_pending", lease_token=lease_token, connection=connection)
 
+    @_prefetched_public_output
     def begin_terminal(self, record, intent, *, lease_token):
         with self._execution_lock(record, lease_token) as (current, connection):
             if current.state in TERMINAL_STATES:
@@ -363,6 +378,7 @@ class _ExecutionLifecycle:
                                    event_kind="execution.terminal_prepared", terminal_intent=deepcopy(intent),
                                    lease_token=lease_token, connection=connection)
 
+    @_prefetched_public_output
     def clear_terminal(self, record, intent_id, *, lease_token, snapshot=None):
         with self._execution_lock(record, lease_token) as (current, connection):
             if current.snapshot.get("terminal_intent", {}).get("id") != intent_id:
@@ -622,6 +638,7 @@ class InMemoryWorkflowStore(_ExecutionLifecycle):
         consume_tool_calls=0,
         release_model_turns=0,
         include_shared_budget=False,
+        connection=None,
     ):
         with self._lock:
             current = self.get(
@@ -1203,6 +1220,7 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             ).fetchall()
             return tuple(WaitRecord(**row) for row in rows)
 
+    @_prefetched_public_output
     def enter_wait(
         self, record, *, kind, source_id, subject, continuation, deadline,
         snapshot, lease_token, connection=None,
@@ -1301,6 +1319,7 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
                 self.record_guardrail_event(current, "guardrail.wait.applied", data, connection=connection)
         return resolved
 
+    @_prefetched_public_output
     def resolve_wait(self, wait_id, *, tenant_id, outcome, actor_id=None):
         with self.database.transaction() as connection:
             # Discover the run without a wait lock; all mutations lock run then wait.
@@ -1715,6 +1734,7 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             raise CoreError("TASK_NOT_FOUND")
         return self._record(row)
 
+    @_prefetched_public_output
     def append_inbound(
         self,
         task_id,
@@ -1827,6 +1847,7 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             ).fetchall()
         return tuple({**dict(row), "consumed": False} for row in rows)
 
+    @_prefetched_public_output
     def consume_inbound(
         self,
         record,
@@ -1846,9 +1867,10 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
         consume_tool_calls=0,
         release_model_turns=0,
         include_shared_budget=False,
+        connection=None,
     ):
         now = self.clock()
-        with self.database.transaction() as connection:
+        with (self.database.transaction() if connection is None else nullcontext(connection)) as connection:
             current = self.get(
                 record.run_id,
                 tenant_id=record.tenant_id,
@@ -2168,6 +2190,7 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             observer(next_record, connection=connection)
         return next_record
 
+    @_prefetched_public_output
     def enter_approval(
         self,
         record,
@@ -2240,6 +2263,7 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             )
         return next_record, approval
 
+    @_prefetched_public_output
     def reserve_approval(
         self,
         record,
@@ -2299,6 +2323,7 @@ class PostgresWorkflowStore(_ExecutionLifecycle):
             )
         return next_record, execution
 
+    @_prefetched_public_output
     def transition(
         self,
         run_id,

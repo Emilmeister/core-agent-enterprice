@@ -44,6 +44,7 @@ class WorkspaceCleanupService:
         self.admission, self.workspaces = admission, workspaces
         self.database = getattr(admission, "database", None)
         self._recovery_after = ""
+        self.durability = getattr(admission.agent, "workspace_durability", None)
         if not self.database and not hasattr(admission, "_workspace_cleanups"):
             admission._workspace_cleanups = {}
 
@@ -304,6 +305,15 @@ class WorkspaceCleanupService:
         payload = self._request(payload)
         if not _text(actor_id):
             raise CoreError("REQUEST_INVALID")
+        if self.durability is not None:
+            binding, _active = await self.admission.workspace_scope(tenant_id, context_id)
+            try:
+                await asyncio.to_thread(self.durability.ensure_restored, binding)
+            except CoreError as error:
+                if error.code != "WORKSPACE_CLEANUP_PENDING":
+                    raise
+                # Only the existing, matching request may pass _prepare and
+                # reconcile its intent against the durable manifest below.
         if self.database:
             operation = await asyncio.to_thread(self._prepare, tenant_id, context_id, actor_id, payload)
         else:
@@ -449,6 +459,61 @@ class WorkspaceCleanupService:
             return {"path": selected["path"], "status": "deleted", "size": proof["stat"][4]}
 
     def _execute(self, tenant, context, request):
+        if self.durability is None:
+            return self._execute_local(tenant, context, request)
+        # Resolve canonical scope before any remote I/O. Hold the local writer
+        # gate through deletion and publish the cache revision only after commit.
+        with self._locked(tenant, context) as (binding, _chat, _state, _connection):
+            pass
+        with self.durability.local_lock(binding):
+            try:
+                self.durability.ensure_restored(binding)
+            except CoreError as error:
+                if error.code != "WORKSPACE_CLEANUP_PENDING" or not self.durability.cache_empty(binding):
+                    raise
+                # The lost Pod's inode journal cannot be reused. The immutable
+                # manifest supplies the exact selected bytes instead; only its
+                # reference is deleted, atomically with the durable receipt.
+                return self._recover_durable(tenant, context, request)
+            revisions = []
+            result = self._execute_local(tenant, context, request, revisions=revisions)
+            if revisions:
+                self.durability.note_cleanup(binding, revisions[-1])
+            return result
+
+    def _recover_durable(self, tenant, context, request):
+        with self._locked(tenant, context) as (binding, chat, state, connection):
+            operation = self._load(binding, request, connection)
+            if operation is None:
+                raise CoreError("FILE_CLEANUP_NOT_FOUND")
+            self._validate(operation)
+            if operation["state"] == "completed":
+                return self._receipt(operation)
+            if (state is not None and state not in TERMINAL_STATES) or chat["workspace_revision"] != operation["base_revision"]:
+                raise CoreError("WORKSPACE_CLEANUP_INVALID")
+            pointer = self.durability._state(connection, binding, lock=True, cleanup=True)
+            for index, selected in enumerate(operation["selection"]):
+                previous = operation["results"][index]
+                if previous["status"] != "pending" and previous.get("reason") != "reconciliation_required":
+                    continue
+                entry = pointer["manifest"]["entries"].get(selected["path"])
+                proof = selected["proof"]
+                if entry is not None and (entry["type"] != "file"
+                        or entry["sha256"] != proof["sha256"] or entry["size"] != proof["stat"][4]
+                        or entry["mode"] != stat.S_IMODE(proof["stat"][2]) or entry["mtime_ns"] != proof["stat"][5]):
+                    operation["results"][index] = {"path": selected["path"], "status": "skipped", "reason": "identity_changed"}
+                else:
+                    operation["results"][index] = {"path": selected["path"], "status": "deleted", "size": proof["stat"][4]}
+            deleted = [item["path"] for item in operation["results"] if item["status"] == "deleted"]
+            self.durability.prune(connection, binding, deleted)
+            operation["workspace_revision"] = operation["base_revision"] + int(bool(deleted))
+            operation["state"] = "completed"
+            connection.execute("UPDATE core_chats SET workspace_revision=%s WHERE tenant_id=%s AND context_id=%s",
+                (operation["workspace_revision"], tenant, context))
+            self._save(operation, connection)
+            return self._receipt(operation)
+
+    def _execute_local(self, tenant, context, request, *, revisions=None):
         with self._locked(tenant, context) as (binding, chat, state, connection):
             operation = self._load(binding, request, connection)
             if operation is None:
@@ -493,6 +558,9 @@ class WorkspaceCleanupService:
                 self._save(operation, connection)
                 return self._receipt(operation)
             operation["state"] = "reconciliation" if reconciliation else "completed"
+            deleted = [item["path"] for item in operation["results"] if item and item["status"] == "deleted"]
+            if deleted and self.durability is not None:
+                revisions.append(self.durability.prune(connection, binding, deleted))
             if not reconciliation and any(item["status"] == "deleted" for item in operation["results"]):
                 operation["workspace_revision"] = operation["base_revision"] + 1
                 if connection is not None:

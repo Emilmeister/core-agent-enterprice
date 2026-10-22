@@ -1,8 +1,12 @@
 """Public output is explicit, durable and visible before the next model turn."""
 import asyncio
+import hashlib
 import json
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from core_agent.interactions import tool_origin
@@ -127,6 +131,9 @@ class PublicOutputRuntimeTests(AuthAppTestCase):
         generate = model.generate
         observed = []
         def files(**kwargs):
+            description = kwargs["tools"]["core_response_files"]["description"]
+            self.assertIn("relative workspace paths", description)
+            self.assertIn("test.csv", description)
             record = self.current("file-alias-chat")
             workspace = self.app.state.core_agent.response_files_service.workspaces.workspace(
                 WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id))
@@ -184,6 +191,101 @@ class PublicOutputRuntimeTests(AuthAppTestCase):
 @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "set TEST_DATABASE_URL for PostgreSQL public runtime tests")
 class PostgresPublicOutputRuntimeTests(PublicOutputRuntimeTests):
     use_postgres = True
+    durable_blobs = True
+
+    async def test_cold_public_output_survives_timer_followup_and_cancel_transactions(self):
+        agent = self.app.state.core_agent
+        workflow = agent.workflow_store
+        blobs = agent.response_files_service.artifact_store
+        contents, reads = {}, []
+        model = self.script(
+            self.call("core_response_artifacts", {"artifacts": [
+                {"parts": [{"type": "text", "text": "Published before waiting"}]}]}),
+            self.call("core_wait_until", {"until": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}, "timer"))
+        original_generate = model.generate
+
+        def evict():
+            with blobs._cache_lock:
+                blobs._cache.clear()
+                blobs._cache_bytes = 0
+
+        def remote_get(digest, size):
+            with blobs.database.pool.connection(timeout=1) as connection:
+                connection.execute("SELECT 1")
+            reads.append(digest)
+            return contents[digest]
+
+        def remote_put(content):
+            digest = hashlib.sha256(content).hexdigest()
+            contents[digest] = bytes(content)
+            return digest
+
+        def generate(**call):
+            if model.calls:
+                record = self.current("cold-wait")
+                for manifest in record.snapshot["published_artifacts"]:
+                    for part in manifest["parts"]:
+                        ref = part["ref"]
+                        contents[ref["sha256"]] = blobs.get(record.tenant_id, ref["blob_id"])[1]
+                blobs.blob_store = SimpleNamespace(tenant_id=record.tenant_id, get=remote_get, put=remote_put)
+                blobs.database.pool.resize(1, 1)
+                blobs.database.pool.timeout = 2
+                evict()
+            return original_generate(**call)
+
+        model.generate = generate
+        policy_scope = agent.interaction_store.policy_scope
+        @contextmanager
+        def cold_policy(*args, **kwargs):
+            if blobs.blob_store is not None:
+                evict()
+            with policy_scope(*args, **kwargs) as scope:
+                yield scope
+        self.enterContext(patch.object(agent.interaction_store, "policy_scope", cold_policy))
+        task = await self.submit("external-a", "publish-and-wait", "cold-wait")
+        def remove_test_task():
+            with workflow.database.transaction() as connection:
+                connection.execute("DELETE FROM core_root_messages WHERE task_id = %s AND tenant_id = %s",
+                                   (task["id"], self.app.state.authenticator.settings.tenant))
+                connection.execute("DELETE FROM core_a2a_tasks WHERE task_id = %s AND tenant = %s",
+                                   (task["id"], self.app.state.authenticator.settings.tenant))
+        self.addCleanup(remove_test_task)
+        async with asyncio.timeout(5):
+            while True:
+                record = workflow.lookup_task(task["id"])
+                if record.state in {"WAITING_TASK", "COMPLETED", "FAILED", "ABORTED", "CANCELLED"}:
+                    break
+                await asyncio.sleep(0.01)
+        self.assertEqual(record.state, "WAITING_TASK", record.error_code)
+        self.assertTrue(reads)
+        reads.clear()
+        append = workflow.append_inbound
+        cold = [True]
+        def append_after_eviction(*args, **kwargs):
+            if cold:
+                cold.clear()
+                evict()
+            return append(*args, **kwargs)
+        with patch.object(workflow, "append_inbound", side_effect=append_after_eviction):
+            response = await self.http.post("/a2a/external/message:send", headers=self.headers("external-a"),
+                json={"message": {"messageId": "wake-cold", "taskId": task["id"], "role": "ROLE_USER",
+                                  "parts": [{"text": "Stop after preserving the publication"}]}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(reads)
+        self.assertEqual(len(workflow.pending_inbound(record)), 1)
+        reads.clear()
+        begin = workflow.begin_terminal
+        def begin_after_eviction(*args, **kwargs):
+            evict()
+            return begin(*args, **kwargs)
+        with patch.object(workflow, "begin_terminal", side_effect=begin_after_eviction):
+            cancelled = await self.http.post(f"/a2a/external/tasks/{task['id']}:cancel",
+                                            headers=self.headers("external-a"), json={})
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["status"]["state"], "TASK_STATE_CANCELED")
+        self.assertTrue(reads)
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(len(workflow.lookup_task(task["id"]).snapshot["published_artifacts"]), 1)
 
 
 class NestedPublicOutputRuntimeTests(unittest.TestCase):

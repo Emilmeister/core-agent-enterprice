@@ -322,7 +322,8 @@ class LocalTerminalBackend:
             workspace = self.chats.workspace(spec.chat)
             # A snapshot must never overwrite the live files of an existing chat.
             return _LocalTerminalSession(spec, workspace, persistent=True,
-                                         launcher=self.launcher)
+                                         launcher=self.launcher,
+                                         workspace_durability=getattr(self, "workspace_durability", None))
         workspace = (
             self.root
             / self._path_component(spec.tenant_id)
@@ -364,7 +365,7 @@ class LocalTerminalBackend:
 
 class _LocalTerminalSession:
     def __init__(self, spec, workspace, snapshot_store=None, *, persistent=False,
-                 launcher=None):
+                 launcher=None, workspace_durability=None):
         self.id = spec.session_id
         self.spec = spec
         self.workspace = workspace
@@ -378,6 +379,7 @@ class _LocalTerminalSession:
         self.persistent = persistent
         self.launcher = launcher
         self._cleanup_error = None
+        self.workspace_durability = workspace_durability
 
     def _contained(self, requested, label):
         candidate = Path(requested)
@@ -430,6 +432,15 @@ class _LocalTerminalSession:
         return environment
 
     def start(self, request, *, broker_socket=None, on_start=None, interactive_stdin=True):
+        gate = self.workspace_durability
+        if gate is not None:
+            with gate.local_lock(self.spec.chat):
+                return self._start(request, broker_socket=broker_socket, on_start=on_start,
+                                   interactive_stdin=interactive_stdin)
+        return self._start(request, broker_socket=broker_socket, on_start=on_start,
+                           interactive_stdin=interactive_stdin)
+
+    def _start(self, request, *, broker_socket=None, on_start=None, interactive_stdin=True):
         argv = request.get("argv")
         if (
             not isinstance(argv, (list, tuple))
@@ -867,6 +878,20 @@ class TerminalSessionManager:
                 if environment.spec.run_id == run_id and environment.spec.chat != binding:
                     raise CoreError("WORKSPACE_SCOPE_CONFLICT")
             self._run_bindings[run_id] = binding
+
+    def require_workspace_quiescent(self, binding):
+        """The caller holds the durable cache spawn gate while taking a snapshot."""
+        with self._lock:
+            sessions = [session for session in self._environments.values() if session.spec.chat == binding]
+        for session in sessions:
+            with session._lock:
+                handles = tuple(session._processes.values())
+            for handle in handles:
+                if not handle._done.is_set() or not handle._process_done.is_set():
+                    raise CoreError("EXECUTION_CLEANUP_PENDING")
+                session._confirmed(handle)
+                if handle._cleanup not in {"sandbox_terminated", "process_group_terminated", "process_exited"}:
+                    raise CoreError("EXECUTION_CLEANUP_PENDING")
 
     def unbind_run(self, run_id):
         """Release an attempt's cached scope; recovery binds its durable scope again."""

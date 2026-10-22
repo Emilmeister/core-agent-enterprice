@@ -6,11 +6,12 @@ import json
 import unittest
 import uuid
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
 import psycopg
-from a2a.types import Task, TaskState
+from a2a.types import Task, TaskState, a2a_pb2
 from google.protobuf.json_format import MessageToDict
 from psycopg.types.json import Jsonb
 
@@ -313,6 +314,83 @@ class ResponseFileProjectionTests(AuthAppTestCase):
 @unittest.skipUnless(TEST_DATABASE_URL, "TEST_DATABASE_URL not set")
 class PostgresResponseFileProjectionTests(ResponseFileProjectionTests):
     use_postgres = True
+
+    async def test_cold_remote_bytes_are_hydrated_outside_transactions_for_all_projections(self):
+        task, record, _folder = await self.files_result()
+        agent = self.app.state.core_agent
+        store = self.app.state.a2a_request_handler.task_store
+        store = getattr(store, "inner", store)
+        blobs = agent.response_files_service.artifact_store
+        contents = {ref["sha256"]: blobs.get(record.tenant_id, ref["blob_id"])[1]
+                    for ref in record.result["outgoing_files"]}
+        canonical = self.cached_projection(task["id"], record)
+        context = admission_tests.AuthAdmissionTests.context(self, "external-a")
+        database = store.database
+        database.pool.resize(1, 1)
+        database.pool.timeout = 2
+        calls = []
+
+        def remote_get(digest, size):
+            # A single-connection pool proves that no caller retained its transaction.
+            with database.pool.connection(timeout=1) as connection:
+                connection.execute("SELECT 1")
+            calls.append(digest)
+            self.assertEqual(len(contents[digest]), size)
+            return contents[digest]
+
+        blobs.blob_store = SimpleNamespace(tenant_id=record.tenant_id, get=remote_get)
+        for operation in ("get", "save", "reconcile", "recover", "list", "download"):
+            with self.subTest(operation=operation):
+                with blobs._cache_lock:
+                    blobs._cache.clear()
+                    blobs._cache_bytes = 0
+                calls.clear()
+                if operation == "get":
+                    self.assert_files(MessageToDict(await store.get(task["id"], context)), record)
+                elif operation == "save":
+                    await store.save(canonical, context)
+                elif operation == "reconcile":
+                    await asyncio.to_thread(store.reconcile_run, record)
+                elif operation == "recover":
+                    interrupted = Task()
+                    interrupted.CopyFrom(canonical)
+                    interrupted.status.state = TaskState.TASK_STATE_WORKING
+                    del interrupted.artifacts[:]
+                    self.cached_projection(task["id"], record, interrupted)
+                    self.assertEqual(await asyncio.to_thread(store.reconcile_from_workflows,
+                                                            tenant_id=record.tenant_id), 1)
+                elif operation == "list":
+                    response = await store.list(a2a_pb2.ListTasksRequest(context_id=record.context_id), context)
+                    self.assert_files(MessageToDict(next(item for item in response.tasks if item.id == task["id"])), record)
+                else:
+                    response = await self.http.get(
+                        f"/api/chats/{record.context_id}/tasks/{record.task_id}/files/{record.result['outgoing_files'][0]['file_id']}",
+                        headers=self.headers("owner-b"))
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.content, b"\0\xff\x80")
+                self.assertEqual(set(calls), set(contents))
+
+    async def test_owner_download_rechecks_authorization_after_remote_hydration(self):
+        _task, record, _folder = await self.files_result()
+        blobs = self.app.state.core_agent.response_files_service.artifact_store
+        refs = record.result["outgoing_files"]
+        contents = {ref["sha256"]: blobs.get(record.tenant_id, ref["blob_id"])[1] for ref in refs}
+        calls = []
+
+        def remote_get(digest, size):
+            with blobs.database.transaction() as connection:
+                connection.execute("DELETE FROM core_root_messages WHERE tenant_id = %s AND task_id = %s",
+                                   (record.tenant_id, record.task_id))
+            calls.append(digest)
+            return contents[digest]
+
+        blobs.blob_store = SimpleNamespace(tenant_id=record.tenant_id, get=remote_get)
+        response = await self.http.get(
+            f"/api/chats/{record.context_id}/tasks/{record.task_id}/files/{refs[0]['file_id']}",
+            headers=self.headers("owner-b"))
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(b"\0\xff\x80", response.content)
 
     async def test_actual_restart_reconciles_interrupted_files_before_gettask_without_model_calls(self):
         task, record, folder = await self.files_result()

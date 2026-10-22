@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import os
 import time
 from contextlib import contextmanager, nullcontext
@@ -27,10 +28,11 @@ from .a2a import output_contract_version, workflow_public_output, workflow_resul
 from .auth import ScopeUser, is_company_owner
 from .durability import Event
 from .errors import CoreError
+from .response_files import with_prefetched_artifacts
 from .tasks import REMOTE_PROGRESS_STATES
 
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 MIGRATIONS = {
     1: """
 CREATE TABLE IF NOT EXISTS core_schema_migrations (
@@ -1008,6 +1010,30 @@ CREATE TABLE core_owner_auth_versions (
 );
 CREATE INDEX core_owner_sessions_expiry ON core_owner_sessions (tenant_id, expires_at);
 """,
+    32: """
+CREATE TABLE core_workspace_manifests (
+    tenant_id text NOT NULL,
+    owner_id text NOT NULL,
+    context_id text NOT NULL,
+    revision bigint NOT NULL CHECK (revision > 0),
+    manifest jsonb NOT NULL,
+    PRIMARY KEY (tenant_id, owner_id, context_id)
+);
+CREATE TABLE core_s3_blobs (
+    tenant_id text NOT NULL,
+    digest text NOT NULL CHECK (digest ~ '^[0-9a-f]{64}$'),
+    size bigint NOT NULL CHECK (size >= 0),
+    state text NOT NULL CHECK (state IN ('staging','live','deleting','deleted')),
+    generation text NOT NULL,
+    stage_until double precision NOT NULL,
+    unreferenced_at double precision,
+    updated_at double precision NOT NULL,
+    PRIMARY KEY (tenant_id, digest, generation)
+);
+CREATE UNIQUE INDEX core_s3_blobs_current_idx ON core_s3_blobs (tenant_id, digest)
+    WHERE state IN ('staging','live');
+CREATE INDEX core_s3_blobs_gc_idx ON core_s3_blobs (tenant_id, updated_at);
+""",
 }
 
 
@@ -1590,6 +1616,15 @@ class PostgresTaskStore(TaskStore):
     def reconcile_run(self, record, connection=None):
         """Project after the caller's fenced workflow write, in the same transaction."""
         values = record if isinstance(record, dict) else vars(record)
+        if connection is None:
+            def reconcile():
+                with self.database.transaction() as current_connection:
+                    current = current_connection.execute("""SELECT run_id, task_id, tenant_id, owner_id,
+                        context_id, state, version, result, error_code, snapshot FROM core_runs
+                        WHERE run_id = %s AND tenant_id = %s AND owner_id = %s""",
+                        (values["run_id"], values["tenant_id"], values["owner_id"])).fetchone()
+                    return self.reconcile_run(current, connection=current_connection) if current else None
+            return with_prefetched_artifacts(self.response_files_service, reconcile)
         with (self.database.transaction() if connection is None else nullcontext(connection)) as connection:
             row = connection.execute("""SELECT payload FROM core_a2a_tasks
                 WHERE task_id = %s AND tenant = %s AND owner = %s FOR UPDATE""",
@@ -1662,7 +1697,7 @@ class PostgresTaskStore(TaskStore):
                                         'WAITING_TASK','WAITING_INPUT')
                           OR run.state IN ('RUNNING','MODEL_RESPONDED','EXECUTING') AND run.snapshot ? 'remote_calls'
                           OR run.snapshot->>'output_contract_version' = '2')
-                   """ + tenant_filter + " FOR UPDATE OF task",
+                   """ + tenant_filter,
                 (
                     int(a2a_pb2.TASK_STATE_COMPLETED),
                     int(a2a_pb2.TASK_STATE_FAILED),
@@ -1670,27 +1705,43 @@ class PostgresTaskStore(TaskStore):
                     int(a2a_pb2.TASK_STATE_REJECTED),
                 ) + ((tenant_id,) if tenant_id is not None else ()),
             ).fetchall()
-            for row in rows:
-                # The task lock may have waited; reread canonical state afterwards.
-                run = connection.execute(
-                    "SELECT run_id, task_id, tenant_id, owner_id, context_id, state, version, result, error_code, snapshot FROM core_runs WHERE run_id = %s",
-                    (row["run_id"],),
-                ).fetchone()
-                task = a2a_pb2.Task.FromString(bytes(row["payload"]))
-                changed = reconcile_workflow_task(
-                    task, run_id=row["run_id"], state=run["state"], version=run["version"],
-                    result=run["result"], error_code=run["error_code"],
-                    record=run, response_files_service=self.response_files_service, connection=connection,
-                )
-                changed = reconcile_remote_progress(task, state=run["state"],
-                    tasks=self._remote_rows(connection, run, row["tenant"])) or changed
-                if not changed:
-                    continue
-                self._write_projection(connection, task, owner=row["owner"], tenant=row["tenant"], enqueue_notification=enqueue_notification)
-                reconciled += 1
+        for row in rows:
+            def reconcile():
+                with self.database.transaction() as connection:
+                    current = connection.execute("""SELECT payload FROM core_a2a_tasks
+                        WHERE task_id = %s AND owner = %s AND tenant = %s FOR UPDATE""",
+                        (row["task_id"], row["owner"], row["tenant"])).fetchone()
+                    if current is None:
+                        return 0
+                    # The task lock may have waited; reread canonical state afterwards.
+                    run = connection.execute(
+                        """SELECT run_id, task_id, tenant_id, owner_id, context_id, state, version, result, error_code, snapshot
+                        FROM core_runs WHERE run_id = %s AND tenant_id = %s AND owner_id = %s""",
+                        (row["run_id"], row["tenant"], row["owner"]),
+                    ).fetchone()
+                    if run is None:
+                        return 0
+                    task = a2a_pb2.Task.FromString(bytes(current["payload"]))
+                    changed = reconcile_workflow_task(
+                        task, run_id=row["run_id"], state=run["state"], version=run["version"],
+                        result=run["result"], error_code=run["error_code"],
+                        record=run, response_files_service=self.response_files_service, connection=connection,
+                    )
+                    changed = reconcile_remote_progress(task, state=run["state"],
+                        tasks=self._remote_rows(connection, run, row["tenant"])) or changed
+                    if changed:
+                        self._write_projection(connection, task, owner=row["owner"], tenant=row["tenant"],
+                                               enqueue_notification=enqueue_notification)
+                    return int(changed)
+            reconciled += with_prefetched_artifacts(self.response_files_service, reconcile)
         return reconciled
 
     def _save(self, task, context, *, connection=None, trusted_admission=False):
+        if connection is None:
+            def save():
+                with self.database.transaction() as current_connection:
+                    return self._save(task, context, connection=current_connection, trusted_admission=trusted_admission)
+            return with_prefetched_artifacts(self.response_files_service, save)
         # The SDK keeps its aggregate and may append further Artifact chunks.
         persisted = a2a_pb2.Task()
         persisted.CopyFrom(task)
@@ -1790,6 +1841,9 @@ class PostgresTaskStore(TaskStore):
                     self.enqueue_notification(task.id, task, owner=owner, tenant=tenant, connection=connection)
 
     def _get(self, task_id, context):
+        return with_prefetched_artifacts(self.response_files_service, lambda: self._get_transaction(task_id, context))
+
+    def _get_transaction(self, task_id, context):
         owner, tenant = self._scope(context)
         with self.database.transaction() as connection:
             rows = connection.execute(
@@ -1817,14 +1871,14 @@ class PostgresTaskStore(TaskStore):
             values.append(params.status_timestamp_after.ToMilliseconds() / 1000)
         sql += " ORDER BY status_timestamp DESC NULLS LAST, task_id DESC"
         with self.database.transaction() as connection:
-            rows = connection.execute(sql + " FOR UPDATE", values).fetchall()
-            tasks = [self._project_progress(connection, row) for row in rows]
-        total_size = len(tasks)
+            rows = connection.execute(sql, values).fetchall()
+        identifiers = [a2a_pb2.Task.FromString(bytes(row["payload"])).id for row in rows]
+        total_size = len(rows)
         start_idx = 0
         if params.page_token:
             task_id = decode_page_token(params.page_token)
-            for index, task in enumerate(tasks):
-                if task.id == task_id:
+            for index, identifier in enumerate(identifiers):
+                if identifier == task_id:
                     start_idx = index
                     break
             else:
@@ -1832,11 +1886,13 @@ class PostgresTaskStore(TaskStore):
         page_size = params.page_size or DEFAULT_LIST_TASKS_PAGE_SIZE
         end_idx = start_idx + page_size
         next_token = (
-            encode_page_token(tasks[end_idx].id) if end_idx < total_size else None
+            encode_page_token(identifiers[end_idx]) if end_idx < total_size else None
         )
+        # Each task rechecks scope after hydration without pinning another chat's bytes.
+        tasks = [self._get(identifier, copy.copy(context)) for identifier in identifiers[start_idx:end_idx]]
         return a2a_pb2.ListTasksResponse(
             next_page_token=next_token,
-            tasks=tasks[start_idx:end_idx],
+            tasks=[task for task in tasks if task is not None],
             total_size=total_size,
             page_size=page_size,
         )

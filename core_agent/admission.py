@@ -226,6 +226,7 @@ def accept_followup(admission, message, task, request, context):
     digest = fingerprint(message)
     database = getattr(admission, "database", None)
     workflow = agent.workflow_store
+    from .response_files import with_prefetched_artifacts
     def transaction():
         with (database.transaction() if database else workflow._lock) as connection:
             if database:
@@ -274,10 +275,10 @@ def accept_followup(admission, message, task, request, context):
                     raise
     try:
         try:
-            receipt, accepted = transaction()
+            receipt, accepted = with_prefetched_artifacts(agent.response_files_service, transaction)
         except _PrepareFiles:
             batch = prepare_files(agent, message, context, digest)
-            receipt, accepted = transaction()
+            receipt, accepted = with_prefetched_artifacts(agent.response_files_service, transaction)
     except BaseException:
         reject_files(agent, batch)
         raise

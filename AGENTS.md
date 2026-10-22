@@ -138,8 +138,8 @@ criterion должны войти в тот же завершённый change. 
   реальных credentials/сети. Команды и состояния описаны в `storybook/README.md`.
 - `spec/` — target specification, acceptance и release profiles.
   `spec/cloudru.md` фиксирует отдельный Cloud.ru profile и ограниченный первый trial.
-- `docs/cloudru-trial.md` — запуск Cloud.ru trial, platform PostgreSQL, временные
-  файлы, owner password и получение безопасных startup diagnostics.
+- `docs/cloudru-trial.md` — запуск Cloud.ru trial, platform PostgreSQL, явное S3
+  хранилище workspace, owner password и безопасные storage/startup diagnostics.
 - `deploy/landlock-native-vm.sh` — только локальный ARM64 test fixture для
   Docker host без Landlock: отдельный QEMU guest с packaged kernel, read-only
   исходниками, private tmpfs/cgroups и явным outer test filter; не production
@@ -261,6 +261,8 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/execution_identity.py`, `core_agent/execution_reconciliation.py` | Private container lifetime identity и exact operator stop attestation без повторного запуска команд |
 | `core_agent/workspace.py` | Trusted tenant/owner/context binding, постоянные папки чатов и nofollow owner file preview/download |
 | `core_agent/workspace_cleanup.py` | Подтверждённая exact selection, durable intent/receipt, private capture/journal и bounded recovery очистки |
+| `core_agent/workspace_durability.py`, `core_agent/postgres_workspace.py` | Полное bounded дерево, nofollow capture/restore, quiescence и атомарный lease-fenced manifest/outcome |
+| `core_agent/s3_storage.py`, `core_agent/s3_ledger.py` | Официальный S3 SDK, tenant/generation keys, staged uploads, pin и bounded GC без сетевого I/O под DB locks |
 | `core_agent/python_exec.py` | Bounded Python process и `tools.call(...)` broker |
 | `core_agent/sandbox.py`, `core_agent/sandbox_exec.py` | Gated Bubblewrap launcher, сетевой профиль, inner seccomp и подтверждённая остановка namespace |
 | `core_agent/sandbox_landlock.py`, `core_agent/landlock_policy.py`, `core_agent/landlock_network.py`, `core_agent/landlock_metadata.py` | Явный Cloud development backend: Landlock/seccomp, обязательный preflight, proxy FD injection, pinned-FD metadata mediation без CONTINUE и подтверждение полного process tree cleanup по CLD-05-L |
@@ -300,7 +302,7 @@ Docker container или Kubernetes Pod/container в пределах одног�
 - product boundaries — `spec/product.md`;
 - architecture и durable state — `spec/architecture.md`;
 - config и runtime modes — `spec/agent-configuration.md`;
-- Cloud.ru auth/trial и будущий S3 workspace — `spec/cloudru.md`;
+- Cloud.ru auth/trial и явный S3 workspace — `spec/cloudru.md`;
 - A2A/public input — `spec/a2a-protocol.md`, `spec/public-contract.md`;
 - agent loop и recovery — `spec/runtime.md`;
 - protected instructions — `spec/kernel-instructions.md`;
@@ -352,7 +354,8 @@ Target spec может описывать больше текущего runtime.
   MCP берутся только из persisted UI settings. Platform `MCP_URL`/headers и
   retired `ARTIFACT_STORAGE_*`/`ARTIFACT_S3_*`/`ARTIFACT_MONGODB_*`/
   `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` не подключают backend или credentials;
-  Cloud trial игнорирует artifact settings, Keycloak продолжает их отклонять.
+  Cloud trial использует `ARTIFACT_S3_*` только как credential fallback после
+  явного `WORKSPACE_STORAGE_TYPE=s3`; Keycloak продолжает отклонять retired settings.
 - `SANDBOX_BACKEND` по умолчанию `bubblewrap`; `landlock` разрешён только для
   `CORE_AGENT_ENVIRONMENT=development` + `CORE_AGENT_AUTH_MODE=cloudru`.
   Его отдельный контракт — `spec/cloudru.md`, CLD-05-L: приложение PID 1 своего
@@ -367,6 +370,9 @@ Target spec может описывать больше текущего runtime.
   `EXECUTION_ENVIRONMENT_UNAVAILABLE`. Новые protected owner uploads закрыты
   общим file admission с `CAPABILITY_DISABLED`; публикация прежнего quarantined
   protected batch отклоняется до workspace writes, включая background race.
+  В явном S3-режиме новые owner originals сохраняются до admission отдельно,
+  а writable копии после allow идут в `inputs/<batch>/`; legacy `attachments/`
+  не меняется. Original review/download читает S3 после проверки scope.
   Прежние bytes/history/owner file access, generated files и writable `a2a/`
   сохраняются. Chmod/timestamps проходят bounded trusted notification и
   pinned-FD paths без CONTINUE; fchmod своего FD допускает только mode bits
@@ -1244,7 +1250,15 @@ run получает отдельные MCP session и negotiated version; пе�
   отдельный `DATABASE_MIGRATION_URL`.
 - `DURABLE_STORAGE_ROOT` предназначен для immutable blobs, snapshots и
   artifacts; в прежнем профиле это durable root, обычно на S3-backed mount.
-  Cloud.ru trial использует временный root без S3 durability.
+  Cloud.ru default `posix` использует временный root. Явный `s3` сохраняет
+  workspace, response artifacts и private incoming originals в S3,
+  manifests и GC intents — в PostgreSQL;
+  `DURABLE_STORAGE_ROOT` остаётся cache. Старые POSIX bytes автоматически не
+  мигрируют; production не включается этим trial. Incoming PUT предшествует ACK,
+  batch bind/pin атомарен с Task/inbox; original GET не удерживает DB locks.
+  Публикация копии и workspace manifest commit-ятся вместе; последующий recovery
+  не копирует original поверх правок и удалений.
+  Конфигурация и лимиты — `spec/cloudru.md`, CLD-04.
 - `LOCAL_WORKSPACE_ROOT` является отдельным ephemeral filesystem для активных
   процессов и не находится внутри durable mount.
 - `CHAT_WORKSPACE_ROOT` задаёт POSIX root папок чатов и обязателен при

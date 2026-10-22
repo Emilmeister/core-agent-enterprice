@@ -50,7 +50,7 @@ from .model import CompatibleHttpModel, ModelResponse
 from .remote_agents import build_forwarded_headers
 from . import remote_agents as remote_transport
 from .remote_operations import RemoteA2AExecutor
-from .response_files import ResponseFileService
+from .response_files import ResponseFileService, with_prefetched_artifacts
 from .security import redact
 from .streaming import NullStreamPublisher
 from .tasks import DelegationContract, _remote_contract, remote_file_batch_ids, remote_result_projection
@@ -814,6 +814,10 @@ class CoreAgent:
         return ContextState(active, state.transcript, state.sequence_range), decisions
 
     def _import_previous_context(self, record, *, lease_token):
+        return with_prefetched_artifacts(self.response_files_service,
+            lambda: self._import_previous_context_transaction(record, lease_token=lease_token))
+
+    def _import_previous_context_transaction(self, record, *, lease_token):
         previous = record.snapshot.get("previous_root_run_id")
         imported = self._context_import(record.snapshot)
         if imported is not None:
@@ -1249,6 +1253,8 @@ class CoreAgent:
         elif "core_response_files" in catalog:
             catalog["core_response_files"]["description"] = (
                 "Publish explicitly selected files as one immutable Artifact batch and continue working. "
+                "Pass relative workspace paths to existing files, e.g. test.csv; "
+                "absolute paths (including /workspace/...), URLs, and traversal are rejected. "
                 "Selections append; [] makes no change. Write ordinary replies as Messages.")
         available_skills = sorted(
             {
@@ -1490,16 +1496,18 @@ class CoreAgent:
         entry = {"version": 1, "contract": contract, "request_provenance": freeze_request_provenance(snapshot)}
         if contract["version"] in {2, 3}:
             entry["arguments_digest"] = self._remote_arguments_digest(call)
-        try:
+        def pin():
             with self.remote_registry.pin_current(record.tenant_id, peer["id"], peer["revision"]) as connection:
                 contract["conversation"] = {"version": 1, "owner_id": record.owner_id,
                     "context_id": record.context_id, "generation": self.remote_registry.connection_generation(
                         record.tenant_id, peer["id"], peer["revision"], connection=connection)}
                 _remote_contract(contract, record.tenant_id, record.run_id)
                 snapshot.setdefault("remote_calls", {})[f"{attempt}:{call.id}"] = entry
-                record = self._record_transition(record, state=record.state, snapshot=snapshot,
+                return self._record_transition(record, state=record.state, snapshot=snapshot,
                     event_kind="remote.pinned", event_data={"tool_call_id": call.id, "peer_id": peer["id"], "peer_revision": peer["revision"]},
                     lease_token=lease_token, connection=connection)
+        try:
+            record = with_prefetched_artifacts(self.response_files_service, pin)
         except CoreError as error:
             if error.code in {"REMOTE_AGENT_NOT_FOUND", "REMOTE_AGENT_CONFLICT"}:
                 raise ExecutionNotStarted("TOOL_UNAVAILABLE", "Registered remote agent changed before admission") from None
@@ -1911,6 +1919,10 @@ class CoreAgent:
                     raise CoreError("LEASE_LOST")
                 self._runtime_generations[record.run_id] = token
                 runtime_token = self._runtime_owner.set((record.run_id, token))
+            workspace_durability = getattr(manager.backend, "workspace_durability", None)
+            if workspace_durability is not None:
+                workspace_durability.ensure_restored(WorkspaceBinding(
+                    record.tenant_id, record.owner_id, record.context_id))
             return callback(record, token)
         finally:
             try:
@@ -1994,6 +2006,7 @@ class CoreAgent:
                         consume_tool_calls=consume_tool_calls,
                         release_model_turns=transition_release,
                         include_shared_budget=include_shared_budget,
+                        connection=connection,
                     )
                 except CoreError as error:
                     if error.code == "INBOUND_MESSAGE_PENDING":
@@ -2008,25 +2021,40 @@ class CoreAgent:
                     "core_agent.task.checkpoint",
                     attributes={"core_agent.task.state": state},
                 ):
-                    updated = self.workflow_store.transition(
-                        record.run_id,
-                        tenant_id=record.tenant_id,
-                        owner_id=record.owner_id,
-                        expected_version=record.version,
-                        state=state,
-                        snapshot=transition_snapshot,
-                        event_kind=event_kind,
-                        event_data=event_data,
-                        audit=audit,
-                        result=result,
-                        error_code=error_code,
-                        lease_token=lease_token,
-                        consume_model_turns=consume_model_turns,
-                        consume_tool_calls=consume_tool_calls,
-                        release_model_turns=transition_release,
-                        include_shared_budget=include_shared_budget,
-                        connection=connection,
-                    )
+                    def transition(active_connection=connection):
+                        return self.workflow_store.transition(
+                            record.run_id,
+                            tenant_id=record.tenant_id,
+                            owner_id=record.owner_id,
+                            expected_version=record.version,
+                            state=state,
+                            snapshot=transition_snapshot,
+                            event_kind=event_kind,
+                            event_data=event_data,
+                            audit=audit,
+                            result=result,
+                            error_code=error_code,
+                            lease_token=lease_token,
+                            consume_model_turns=consume_model_turns,
+                            consume_tool_calls=consume_tool_calls,
+                            release_model_turns=transition_release,
+                            include_shared_budget=include_shared_budget,
+                            connection=active_connection,
+                        )
+                    durability = getattr(self.tool_runtime.environment_manager.backend, "workspace_durability", None)
+                    # Launch/wait receipts may coexist with a live background
+                    # writer. Its own terminal transition commits the files.
+                    local_tool = (record.snapshot.get("pending_call") or {}).get("name") in {
+                        "core_terminal_exec", "core_python_exec"}
+                    checkpoint = (state in TERMINAL_STATES or event_kind == "python.stopped"
+                        or local_tool and event_kind in {
+                            "tool.result.saved", "tool.completed", "tool.failed", "tool.denied"})
+                    operation = (lambda: durability.transition(record, lease_token, transition)) if (
+                        durability is not None and checkpoint and connection is None) else transition
+                    # A cache miss must unwind the entire owning transaction
+                    # before immutable artifact bytes are fetched from S3.
+                    updated = (with_prefetched_artifacts(self.response_files_service, operation)
+                               if connection is None else operation())
                 snapshot = transition_snapshot
                 break
             except CoreError as error:
@@ -2266,9 +2294,12 @@ class CoreAgent:
         return fork() if fork is not None else self.mcp_connector
 
     def _bind_workspace(self, run_id, tenant_id, owner_id, context_id):
-        self.tool_runtime.environment_manager.bind_run(
-            run_id, WorkspaceBinding(tenant_id, owner_id, context_id)
-        )
+        manager = self.tool_runtime.environment_manager
+        binding = WorkspaceBinding(tenant_id, owner_id, context_id)
+        durability = getattr(manager.backend, "workspace_durability", None)
+        if durability is not None:
+            durability.ensure_restored(binding)
+        manager.bind_run(run_id, binding)
 
     def _initialize_workflow(
         self, record, *, raw=None, cancel_event=None, lease_token=None
@@ -2766,21 +2797,24 @@ class CoreAgent:
                     if isinstance(model, CompatibleHttpModel):
                         model.max_tokens = output_limit
                         model.extra_body[limit_key] = output_limit
-                    with self.workflow_store._execution_lock(record, lease_token) as (current, connection):
-                        checked, visibility = self._visible_context(current, snapshot, lease_token=lease_token, connection=connection)
-                        if self._context_fingerprint(checked, visibility) != fingerprint:
-                            raise CoreError("CONTEXT_SOURCE_CHANGED")
-                        attempt = copy.deepcopy(snapshot)
-                        attempt["turns"] += 1
-                        operation = {**operation, "attempts": operation["attempts"] + 1,
-                            "target": target, "output_limit": output_limit, "required": pressure, "outcome": "in_flight", "purpose": "compaction",
-                            "sources": [list((item.provenance or {}).get("sources", {})) for item in items]}
-                        attempt["compaction_operation"] = operation
-                        record = self._record_transition(current, state="RUNNING", snapshot=attempt,
-                            event_kind="model.attempt.started", event_data={"turn": attempt["turns"],
-                                "purpose": "compaction", "attempt": operation["attempts"]},
-                            consume_model_turns=1, lease_token=lease_token, connection=connection)
-                        snapshot = copy.deepcopy(record.snapshot)
+                    def reserve_attempt():
+                        with self.workflow_store._execution_lock(record, lease_token) as (current, connection):
+                            checked, visibility = self._visible_context(current, snapshot, lease_token=lease_token, connection=connection)
+                            if self._context_fingerprint(checked, visibility) != fingerprint:
+                                raise CoreError("CONTEXT_SOURCE_CHANGED")
+                            attempt = copy.deepcopy(snapshot)
+                            attempt["turns"] += 1
+                            attempt_operation = {**operation, "attempts": operation["attempts"] + 1,
+                                "target": target, "output_limit": output_limit, "required": pressure, "outcome": "in_flight", "purpose": "compaction",
+                                "sources": [list((item.provenance or {}).get("sources", {})) for item in items]}
+                            attempt["compaction_operation"] = attempt_operation
+                            updated = self._record_transition(current, state="RUNNING", snapshot=attempt,
+                                event_kind="model.attempt.started", event_data={"turn": attempt["turns"],
+                                    "purpose": "compaction", "attempt": attempt_operation["attempts"]},
+                                consume_model_turns=1, lease_token=lease_token, connection=connection)
+                        return updated, attempt_operation
+                    record, operation = with_prefetched_artifacts(self.response_files_service, reserve_attempt)
+                    snapshot = copy.deepcopy(record.snapshot)
                     self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
                     return model.generate(**call)
                 summarizer = StructuredSummarizer(self.token_counter, bounded_generate,
@@ -2803,20 +2837,23 @@ class CoreAgent:
                 if compacted is context:
                     return record, snapshot, context
                 self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
-                with self.workflow_store._execution_lock(record, lease_token) as (current, connection):
-                    checked, visibility = self._visible_context(current, snapshot, lease_token=lease_token, connection=connection)
-                    if self._context_fingerprint(checked, visibility) != fingerprint:
-                        raise CoreError("CONTEXT_SOURCE_CHANGED")
-                    snapshot["context"] = self._context_to_dict(compacted)
-                    if self.compactor is None:
-                        snapshot["compaction_operation"] = {**operation, "outcome": "committed",
-                            "finished_turn": snapshot["turns"], "committed_fingerprint": self._context_fingerprint(compacted, visibility)}
-                    record = self._record_transition(current, state="RUNNING", snapshot=snapshot,
-                        event_kind="context.compacted", event_data={"before": compacted.event.before_working_tokens,
-                            "after": compacted.event.after_working_tokens,
-                            "working_capacity": compactor.budget.working_capacity,
-                            "replaced_sequence_range": list(compacted.event.replaced_sequence_range)},
-                        audit=(("context.compacted", {"content": False}),), lease_token=lease_token, connection=connection)
+                def commit_compaction():
+                    with self.workflow_store._execution_lock(record, lease_token) as (current, connection):
+                        checked, visibility = self._visible_context(current, snapshot, lease_token=lease_token, connection=connection)
+                        if self._context_fingerprint(checked, visibility) != fingerprint:
+                            raise CoreError("CONTEXT_SOURCE_CHANGED")
+                        attempt = copy.deepcopy(snapshot)
+                        attempt["context"] = self._context_to_dict(compacted)
+                        if self.compactor is None:
+                            attempt["compaction_operation"] = {**operation, "outcome": "committed",
+                                "finished_turn": snapshot["turns"], "committed_fingerprint": self._context_fingerprint(compacted, visibility)}
+                        return self._record_transition(current, state="RUNNING", snapshot=attempt,
+                            event_kind="context.compacted", event_data={"before": compacted.event.before_working_tokens,
+                                "after": compacted.event.after_working_tokens,
+                                "working_capacity": compactor.budget.working_capacity,
+                                "replaced_sequence_range": list(compacted.event.replaced_sequence_range)},
+                            audit=(("context.compacted", {"content": False}),), lease_token=lease_token, connection=connection)
+                record = with_prefetched_artifacts(self.response_files_service, commit_compaction)
                 return record, copy.deepcopy(record.snapshot), compacted
             except CoreError as error:
                 if error.code == "CONTEXT_SOURCE_CHANGED":
@@ -3255,6 +3292,7 @@ class CoreAgent:
         consume_tool_calls=0,
         release_model_turns=0,
         include_shared_budget=False,
+        connection=None,
     ):
         messages = self.workflow_store.pending_inbound(record)
         if not messages:
@@ -3307,24 +3345,31 @@ class CoreAgent:
             )
         )
         sequences = tuple(message["sequence"] for message in messages)
-        record = self.workflow_store.consume_inbound(
-            record,
-            expected_version=record.version,
-            snapshot=snapshot,
-            sequences=sequences,
-            lease_token=lease_token,
-            state=state,
-            event_kind=event_kind,
-            inbound_event_kind=inbound_event_kind,
-            event_data=event_data,
-            audit=audit,
-            result=result,
-            error_code=error_code,
-            consume_model_turns=consume_model_turns,
-            consume_tool_calls=consume_tool_calls,
-            release_model_turns=release_model_turns,
-            include_shared_budget=include_shared_budget,
-        )
+        def consume(active_connection=connection):
+            return self.workflow_store.consume_inbound(
+                record,
+                expected_version=record.version,
+                snapshot=snapshot,
+                sequences=sequences,
+                lease_token=lease_token,
+                state=state,
+                event_kind=event_kind,
+                inbound_event_kind=inbound_event_kind,
+                event_data=event_data,
+                audit=audit,
+                result=result,
+                error_code=error_code,
+                consume_model_turns=consume_model_turns,
+                consume_tool_calls=consume_tool_calls,
+                release_model_turns=release_model_turns,
+                include_shared_budget=include_shared_budget,
+                connection=active_connection,
+            )
+        durability = getattr(self.tool_runtime.environment_manager.backend, "workspace_durability", None)
+        operation = (lambda: durability.transition(record, lease_token, consume)) if (
+            durability is not None and state in TERMINAL_STATES and connection is None) else consume
+        record = (with_prefetched_artifacts(self.response_files_service, operation)
+                  if connection is None else operation())
         consumed_event_kind = inbound_event_kind or event_kind
         if not self.workflow_store.atomic:
             self.audit_log.append(
@@ -3524,6 +3569,16 @@ class CoreAgent:
         prefix = "./" if getattr(launcher, "isolation_level", None) == "landlock" else "/workspace/"
         return prefix + path
 
+    def _pending_file_delivery(self, record, snapshot, batch_id, code, lease_token, before_pending):
+        if before_pending is not None:
+            snapshot, _ = before_pending()
+        current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
+        pending = copy.deepcopy(snapshot)
+        pending["file_delivery_pending"] = {"batch_id": batch_id, "error_code": code}
+        current = self._record_transition(current, state=current.state, snapshot=pending,
+            event_kind="file.delivery.pending", event_data=pending["file_delivery_pending"], lease_token=lease_token)
+        return _MaterialSuspended(SuspendedRun(current.run_id, current.task_id, "", current.version))
+
     def _guard_file_batch(self, record, snapshot, batch_id, *, sequence, lease_token,
                           continuation=None, before_pending=None, exempt=False, exemption_source=None):
         if self.chat_file_service is None or self.material_review_store is None:
@@ -3533,7 +3588,13 @@ class CoreAgent:
         batch = service.store.get(batch_id, record.tenant_id)
         if (batch["run_id"], batch["sequence"]) != (record.run_id, sequence):
             raise CoreError("FILE_BATCH_NOT_FOUND")
-        material = service.review_material(batch_id, binding, run_id=record.run_id, task_id=record.task_id)
+        try:
+            material = service.review_material(batch_id, binding, run_id=record.run_id, task_id=record.task_id)
+        except CoreError as error:
+            if error.code != "STORAGE_UNAVAILABLE":
+                raise
+            raise self._pending_file_delivery(record, snapshot, batch_id, error.code,
+                                              lease_token, before_pending) from error
         manifest = material["manifest"]
         decision = None
         review_refs = []
@@ -3581,14 +3642,8 @@ class CoreAgent:
             # Acceptance is already durable. A temporary storage outage leaves
             # the original input unread and recoverable, never an HTTP rejection
             # followed by a later surprise publication.
-            if before_pending is not None:
-                snapshot, continuation = before_pending()
-            current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
-            pending = copy.deepcopy(snapshot)
-            pending["file_delivery_pending"] = {"batch_id": batch_id, "error_code": code}
-            current = self._record_transition(current, state=current.state, snapshot=pending,
-                event_kind="file.delivery.pending", event_data=pending["file_delivery_pending"], lease_token=lease_token)
-            raise _MaterialSuspended(SuspendedRun(current.run_id, current.task_id, "", current.version)) from error
+            raise self._pending_file_delivery(record, snapshot, batch_id, code,
+                                              lease_token, before_pending) from error
         snapshot.pop("file_delivery_pending", None)
         return "Attached files: " + json.dumps([entry["actual_name"] for entry in manifest["entries"]], ensure_ascii=False) + "; folder: " + self._workspace_receipt_path("/".join(_destination(manifest)))
 
@@ -3616,9 +3671,10 @@ class CoreAgent:
             output["result"] = self._value(remote_result_projection(result))
             files, folders, paths, artifacts, messages = [], [], [], [], []
             for batch_id in batch_ids:
-                material = self.chat_file_service.review_material(batch_id, binding,
-                    run_id=record.run_id, task_id=record.task_id)
-                manifest = material["manifest"]
+                batch = self.chat_file_service._accepted_row(batch_id, binding, record.run_id, record.task_id)
+                manifest = batch["manifest"]
+                if self.chat_file_service._stored_original(manifest):
+                    self.chat_file_service._validate_original(manifest)
                 files.extend({key: entry[key] for key in
                     ("index", "actual_name", "relative_path", "media_type", "size_bytes", "sha256")}
                     for entry in manifest["entries"])
@@ -4064,6 +4120,11 @@ class CoreAgent:
         return self._record_tool_outcome(record, snapshot, call, output, lease_token=lease_token, active_result_token_limit=active_result_token_limit)
 
     def _tool_dispatch_intent(self, record, snapshot, call, definition, effective, *, lease_token, durable_wait, check_only=False):
+        return with_prefetched_artifacts(self.response_files_service,
+            lambda: self._tool_dispatch_transaction(record, snapshot, call, definition, effective,
+                lease_token=lease_token, durable_wait=durable_wait, check_only=check_only))
+
+    def _tool_dispatch_transaction(self, record, snapshot, call, definition, effective, *, lease_token, durable_wait, check_only=False):
         subject = self._approval_subject(call, definition, effective, snapshot)
         scope = (
             self.interaction_store.policy_scope(record.tenant_id, call.name, subject["origin"])
@@ -6200,51 +6261,54 @@ class CoreAgent:
         context = self._current_dispatch(record.run_id)
         subject_snapshot = ({**context["snapshot"], "tool_calls": context["snapshot"]["tool_calls"] + 1} if context else None)
         subject = self._approval_subject(call, definition, effective, subject_snapshot)
-        scope = (self.interaction_store.policy_scope(record.tenant_id, call.name, subject["origin"])
-                 if self.interaction_store is not None else nullcontext((None, None)))
-        with scope as (policy, connection):
-            mode = policy.mode if policy is not None else "allow"
-            error = failure
-            if error is None and (mode == "deny" or (context is None and mode == "require_hitl")):
-                error = CoreError("POLICY_DENIED" if mode == "deny" else "OWNER_APPROVAL_REQUIRED")
-            if context is None:
-                raise error or CoreError("CAPABILITY_DISABLED", "Nested dispatch requires an active owned outer call")
-            current = context["record"]
-            if current.state != "EXECUTING" or current.snapshot.get("pending_call", {}).get("name") != "core_python_exec":
-                raise CoreError("INVALID_TASK_STATE")
-            snapshot = copy.deepcopy(context["snapshot"])
-            raw = self._runtime_cache[record.run_id][0]
-            limit = min(raw["budgets"].get("tool_calls", self.platform_config.max_tool_calls), self.platform_config.max_tool_calls)
-            if snapshot["tool_calls"] >= limit:
-                raise self._budget_error("tool_calls", snapshot["tool_calls"], limit)
-            snapshot["tool_calls"] += 1
-            frame = snapshot.setdefault("python_execution", {
-                "version": 1, "phase": "running", "outer_call": copy.deepcopy(snapshot["pending_call"]),
-                "completed": [],
-            })
-            suspend = error is None and (mode == "require_hitl" or wait_needed)
-            if suspend:
-                frame.update(
-                    phase="stopping", nested_call={"id": call.id, "name": call.name, "arguments": copy.deepcopy(call.arguments)},
-                    request_id=request_id, subject=subject,
-                    approval_required=mode == "require_hitl",
-                    approval_deadline=(self.workflow_store.current_time() + self.interaction_store.get_settings(record.tenant_id).hitl_timeout_seconds) if mode == "require_hitl" else None,
+        def admit():
+            scope = (self.interaction_store.policy_scope(record.tenant_id, call.name, subject["origin"])
+                     if self.interaction_store is not None else nullcontext((None, None)))
+            with scope as (policy, connection):
+                mode = policy.mode if policy is not None else "allow"
+                error = failure
+                if error is None and (mode == "deny" or (context is None and mode == "require_hitl")):
+                    error = CoreError("POLICY_DENIED" if mode == "deny" else "OWNER_APPROVAL_REQUIRED")
+                if context is None:
+                    raise error or CoreError("CAPABILITY_DISABLED", "Nested dispatch requires an active owned outer call")
+                current = context["record"]
+                if current.state != "EXECUTING" or current.snapshot.get("pending_call", {}).get("name") != "core_python_exec":
+                    raise CoreError("INVALID_TASK_STATE")
+                snapshot = copy.deepcopy(context["snapshot"])
+                raw = self._runtime_cache[record.run_id][0]
+                limit = min(raw["budgets"].get("tool_calls", self.platform_config.max_tool_calls), self.platform_config.max_tool_calls)
+                if snapshot["tool_calls"] >= limit:
+                    raise self._budget_error("tool_calls", snapshot["tool_calls"], limit)
+                snapshot["tool_calls"] += 1
+                frame = snapshot.setdefault("python_execution", {
+                    "version": 1, "phase": "running", "outer_call": copy.deepcopy(snapshot["pending_call"]),
+                    "completed": [],
+                })
+                suspend = error is None and (mode == "require_hitl" or wait_needed)
+                if suspend:
+                    frame.update(
+                        phase="stopping", nested_call={"id": call.id, "name": call.name, "arguments": copy.deepcopy(call.arguments)},
+                        request_id=request_id, subject=subject,
+                        approval_required=mode == "require_hitl",
+                        approval_deadline=(self.workflow_store.current_time() + self.interaction_store.get_settings(record.tenant_id).hitl_timeout_seconds) if mode == "require_hitl" else None,
+                    )
+                snapshot["nested_dispatch"] = {
+                    "call_id": call.id, "request_id": request_id, "subject": subject,
+                    "state": "failed" if error is not None else ("stopping" if suspend else ("checking" if self.material_review_store is not None else "executing")),
+                    "error_code": error.code if error is not None else None,
+                }
+                updated = self._record_transition(
+                    current, state="EXECUTING", snapshot=snapshot,
+                    event_kind="tool.nested.rejected" if error is not None else "tool.nested.intent",
+                    event_data={"tool_call_id": call.id, "tool_name": call.name},
+                    audit=() if self.material_review_store is not None and error is None else (("tool.execution.failed" if error is not None else "tool.execution.started", {
+                        "tool_call_id": call.id, "tool_name": call.name, "source": "core_python_exec",
+                        **({"error_code": error.code} if error is not None else {}),
+                    }),),
+                    consume_tool_calls=1, lease_token=context["lease_token"], connection=connection,
                 )
-            snapshot["nested_dispatch"] = {
-                "call_id": call.id, "request_id": request_id, "subject": subject,
-                "state": "failed" if error is not None else ("stopping" if suspend else ("checking" if self.material_review_store is not None else "executing")),
-                "error_code": error.code if error is not None else None,
-            }
-            updated = self._record_transition(
-                current, state="EXECUTING", snapshot=snapshot,
-                event_kind="tool.nested.rejected" if error is not None else "tool.nested.intent",
-                event_data={"tool_call_id": call.id, "tool_name": call.name},
-                audit=() if self.material_review_store is not None and error is None else (("tool.execution.failed" if error is not None else "tool.execution.started", {
-                    "tool_call_id": call.id, "tool_name": call.name, "source": "core_python_exec",
-                    **({"error_code": error.code} if error is not None else {}),
-                }),),
-                consume_tool_calls=1, lease_token=context["lease_token"], connection=connection,
-            )
+            return updated, error, suspend
+        updated, error, suspend = with_prefetched_artifacts(self.response_files_service, admit)
         context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
         if error is not None:
             self._complete_python_nested(context, call, self._failed_tool_outcome(call, error))
@@ -6346,19 +6410,22 @@ class CoreAgent:
         self._guard_python_material(context, call, call.arguments, stage="tool_gate")
         if self.material_review_store is not None:
             subject = self._approval_subject(call, definition, effective, context["snapshot"])
-            policy_scope = (self.interaction_store.policy_scope(record.tenant_id, call.name, subject["origin"])
-                     if self.interaction_store is not None else nullcontext((None, None)))
-            with policy_scope as (policy, connection):
-                if policy is not None and policy.mode == "deny":
-                    raise CoreError("POLICY_DENIED")
-                needs_approval = policy is not None and policy.mode == "require_hitl"
-                if not needs_approval:
-                    context["snapshot"]["nested_dispatch"]["state"] = "executing"
-                    updated = self._record_transition(context["record"], state="EXECUTING", snapshot=context["snapshot"],
-                        event_kind="tool.nested.dispatch", event_data={"tool_call_id": call.id},
-                        audit=(("tool.execution.started", {"tool_call_id": call.id, "tool_name": call.name, "source": "core_python_exec"}),),
-                        lease_token=context["lease_token"], connection=connection)
-                    context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+            def authorize():
+                policy_scope = (self.interaction_store.policy_scope(record.tenant_id, call.name, subject["origin"])
+                         if self.interaction_store is not None else nullcontext((None, None)))
+                with policy_scope as (policy, connection):
+                    if policy is not None and policy.mode == "deny":
+                        raise CoreError("POLICY_DENIED")
+                    needs_approval = policy is not None and policy.mode == "require_hitl"
+                    if not needs_approval:
+                        context["snapshot"]["nested_dispatch"]["state"] = "executing"
+                        updated = self._record_transition(context["record"], state="EXECUTING", snapshot=context["snapshot"],
+                            event_kind="tool.nested.dispatch", event_data={"tool_call_id": call.id},
+                            audit=(("tool.execution.started", {"tool_call_id": call.id, "tool_name": call.name, "source": "core_python_exec"}),),
+                            lease_token=context["lease_token"], connection=connection)
+                        context.update(record=updated, snapshot=copy.deepcopy(updated.snapshot))
+                return needs_approval
+            needs_approval = with_prefetched_artifacts(self.response_files_service, authorize)
             if needs_approval:
                 snapshot = copy.deepcopy(context["snapshot"])
                 snapshot["python_execution"].update(phase="stopping", nested_call={"id": call.id, "name": call.name, "arguments": call.arguments},
@@ -7619,6 +7686,17 @@ class CoreAgent:
     def _recover_workflows_once(self):
         """A run interrupted mid-dispatch cannot prove the side effect did not happen."""
         scope = {"tenant_id": self.recovery_tenant_id} if self.recovery_tenant_id is not None else {}
+        blobs = getattr(self, "workspace_blob_store", None)
+        if blobs is not None and time.monotonic() >= getattr(self, "_blob_sweep_due", 0):
+            try:
+                removed = blobs.sweep(limit=100)
+                self._log("storage.gc", operation="delete", outcome="succeeded", count=removed)
+                delay = 2 if blobs.last_sweep_scanned == 100 else 3600
+            except Exception as error:
+                self._log("storage.gc", operation="delete", outcome="failed",
+                          error_code=getattr(error, "code", "STORAGE_UNAVAILABLE"))
+                delay = 60
+            self._blob_sweep_due = time.monotonic() + delay
         if self.material_review_store is not None:
             for record in self.workflow_store.pending_guardrail_records(**scope):
                 self._flush_guardrail_events(record)

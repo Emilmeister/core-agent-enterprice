@@ -369,7 +369,7 @@ class WaitStoreTests(unittest.TestCase):
                         return Mock()
 
                     connection = Mock(execute=execute)
-                    database = Mock(transaction=lambda: nullcontext(connection))
+                    database = Mock(transaction=lambda: nullcontext(connection), response_files_service=None)
                     context = ServerCallContext(user=ScopeUser("external"), tenant="tenant")
                     PostgresTaskStore(database)._save(incoming, context)
                     self.assertEqual(saved[0].status.state, a2a_pb2.TASK_STATE_WORKING)

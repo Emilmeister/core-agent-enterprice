@@ -2,9 +2,10 @@
 
 Этот запуск нужен для проверки образа и получения диагностических logs из
 целевого Pod. Используйте `development` + `cloudru`: production Cloud.ru пока
-запрещён. PostgreSQL сохраняет состояние и owner-сессии; workspace, uploads,
-quarantine и результаты в RAM могут исчезнуть при замене Pod. Полное S3-хранилище
-остаётся следующим этапом. Контракт: [spec/cloudru.md](../spec/cloudru.md).
+запрещён. PostgreSQL сохраняет состояние и owner-сессии. По умолчанию файлы
+временные; явный S3-режим ниже сохраняет рабочие папки чатов и опубликованные
+результаты, а также закрытые оригиналы входящих вложений до подтверждения приёма.
+Контракт: [spec/cloudru.md](../spec/cloudru.md).
 
 Для первого запуска включите диагностические logs без содержимого запросов:
 
@@ -14,6 +15,57 @@ LOG_LEVEL=INFO
 CORE_AGENT_LOG_CONTENT=false
 OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false
 ```
+
+## S3-режим для следующего прогона
+
+Дополнительно к работающей конфигурации включите:
+
+```dotenv
+WORKSPACE_STORAGE_TYPE=s3
+WORKSPACE_S3_PREFIX=core-agent
+WORKSPACE_MAX_BYTES=100000000
+WORKSPACE_MAX_FILES=10000
+WORKSPACE_S3_MAX_INFLIGHT=4
+```
+
+Подключение берётся из `WORKSPACE_S3_ENDPOINT_URL`, `WORKSPACE_S3_BUCKET`,
+`WORKSPACE_S3_REGION`, `WORKSPACE_S3_ACCESS_KEY_ID`, `WORKSPACE_S3_SECRET_ACCESS_KEY`.
+Для незаданных полей используются соответствующие платформенные `ARTIFACT_S3_*`.
+Опциональный временный токен — `WORKSPACE_S3_SESSION_TOKEN`. Секреты передаются
+через secret/env настройки платформы, не через UI или запрос модели.
+
+Схема БД обновляется обычной migration-командой; development auto-migration
+также поддержана. `CHAT_WORKSPACE_ROOT` и `DURABLE_STORAGE_ROOT` остаются локальными
+путями. При ошибке bucket/auth запуск завершается ошибкой, временного fallback нет.
+S3-режим не импортирует старые POSIX blobs и не восстанавливает уже потерянные
+файлы прошлого trial: используйте отдельный tenant/prefix для нового прогона.
+`LOCAL_BASE_SNAPSHOT` здесь не поддержан.
+
+Сохраняются скрытые файлы, `.git`, permissions, изменения и удаления.
+Фоновый запуск сохраняет receipt сразу, а дерево — после подтверждённой остановки.
+Неизвестные команды после сбоя не выполняются повторно. Пустое дерево не создаёт
+S3 blob; неизменные bytes переиспользуются. Общий восстановленный cache ограничен
+двумя лимитами дерева, без автоматического удаления пользовательских файлов.
+
+Входящий файл проходит bounded decode в памяти, затем сохраняется закрытым
+оригиналом в S3. Только после записи ссылки вместе с Task/сообщением в PostgreSQL
+приём подтверждается. Проверка материала может продолжаться после замены Pod.
+После разрешения агент получает рабочую копию: owner-файлы в Landlock —
+`inputs/<batch>/`, A2A — `a2a/`. Изменение/удаление копии сохраняется в workspace;
+скачивание оригинала из проверки материала всегда возвращает исходные bytes.
+При ошибке S3 до приёма сообщение не принимается; после приёма временная
+недоступность original оставляет доставку pending. POSIX/Landlock по-прежнему
+не принимает protected owner uploads; старые `attachments/` не мигрируют.
+Перед публикацией проверяется место для всей копии. Временное чтение оригинала
+ограничено одним private cache на tenant; после аварии его lease истекает через
+300 секунд, и следующий проход очистки освобождает cache. Событие
+`file.cache.cleanup_pending` означает отложенную уборку временной копии.
+
+При `LOG_LEVEL=INFO` события `workspace.storage` и `storage.gc` показывают
+operation/outcome, число/размер файлов и безопасный код ошибки. В них нет
+имён файлов, содержимого, ключей и подписанных URL. Startup diagnostics
+показывают выбранный backend. Следующий отдельный этап — реальная замена Pod,
+проверка Cloud S3, A2A/MCP и доступов; локальные тесты не заменяют его.
 
 ## Образ и окружение
 
@@ -74,8 +126,9 @@ LOCAL_WORKSPACE_ROOT=/tmp/core-agent/runs
 
 MCP настраиваются в owner UI. Автоматические `MCP_URL`/`MCP_HEADERS_JSON` здесь
 игнорируются. Platform `ARTIFACT_STORAGE_*`, `ARTIFACT_S3_*`, `ARTIFACT_MONGODB_*`
-и `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` тоже игнорируются: они не включают S3,
-не импортируют прежние blobs и не мешают диагностическому запуску. Default
+и `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` сами не включают S3,
+не импортируют прежние blobs и не мешают диагностическому запуску. Только
+явный `WORKSPACE_STORAGE_TYPE=s3` использует fallback `ARTIFACT_S3_*`. Default
 Keycloak profile продолжает отклонять эти retired artifact settings.
 
 ## Ограниченный Landlock trial
@@ -124,6 +177,9 @@ destination и не требует доступности внешнего са�
   history и owner file access остаются. Для execution используйте чат без
   защищённых вложений; созданные агентом файлы и writable A2A файлы `a2a/`
   доступны по прежнему контракту.
+  Исключение — включённый S3: private original сохраняется до приёма, после
+  allow создаётся writable копия в `inputs/`. Защита прежнего `attachments/`
+  и read-only вложений Bubblewrap не меняется.
 - Git init/clone/checkout используют доверенную обработку chmod/timestamps
   внутри workspace/TMPDIR. Metadata paths проверяются через закреплённые FD;
   чужие пути, special mode bits, chown, xattr, inotify и сигналы чужим
@@ -202,7 +258,8 @@ endpoint. Эти root routes включены только в Cloud.ru profile.
 `startup.platform` показывает ограниченные факты о helpers, namespaces, cgroups
 и TUN; `startup.stage` — стадии configuration, model_configuration, database,
 sandbox, runtime, routes, recovery и общий startup. `startup.storage` сообщает
-`backend=temporary-posix`, `durable=false`. `application_ready` означает сборку
+`backend=temporary-posix`, `durable=false` в POSIX trial либо `backend=s3`,
+`durable=true` при включённом S3. `application_ready` означает сборку
 ASGI application; фактическое открытие listener подтверждают сообщения Uvicorn
 и успешные `/health/live`, `/health/ready` через платформу.
 

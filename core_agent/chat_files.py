@@ -12,6 +12,7 @@ import copy
 import ctypes
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -33,6 +34,7 @@ from .interactions import DEFAULT_ATTACHMENT_LIMIT
 
 _MANIFEST_LIMIT = 1_000_000
 _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_CACHE_LEASE_OWNER = "private-file-cache"
 _ACCEPTED = {"accepted_quarantine", "accepted_ready", "published", "excluded"}
 _TRANSITIONS = {
     "staging": {"staging", "accepted_quarantine", "rejected"},
@@ -124,6 +126,11 @@ class MemoryChatFileStore:
         with self.lock:
             if row["batch_id"] in self.rows:
                 raise CoreError("FILE_BATCH_CONFLICT")
+            if row["lease_owner"] == _CACHE_LEASE_OWNER and any(
+                value["tenant_id"] == row["tenant_id"] and value["lease_owner"] == _CACHE_LEASE_OWNER
+                and value["cleaned_at"] is None for value in self.rows.values()
+            ):
+                raise CoreError("STORAGE_UNAVAILABLE", retryable=True)
             self.rows[row["batch_id"]] = copy.deepcopy(row)
 
     def get(self, batch_id, tenant_id, *, connection=None):
@@ -169,7 +176,8 @@ class MemoryChatFileStore:
                 (r for r in self.rows.values() if tenant_id is None or r["tenant_id"] == tenant_id),
                 key=lambda r: (r["created_at"], r["batch_id"]))
                 if r["state"] in {"staging", "rejected"} and r["cleaned_at"] is None
-                and r["lease_expires_at"] <= now and r["created_at"] <= cutoff][:limit]
+                and r["lease_expires_at"] <= now
+                and (r["created_at"] <= cutoff or r["lease_owner"] == _CACHE_LEASE_OWNER)][:limit]
 
     @contextmanager
     def orphan(self, batch_id):
@@ -192,8 +200,32 @@ class PostgresChatFileStore:
             row["manifest"] = json.loads(manifest["manifest_json"])
         return row
 
+    @staticmethod
+    def _encode_manifest(manifest):
+        if manifest is None:
+            return None
+        # JSONB cannot hold NUL or lone surrogates. Keep exact metadata in
+        # escaped JSON text and trusted constraint/GC fields native.
+        encoded = {"schema_version": manifest["schema_version"],
+            "entries": [{"actual_name": entry["actual_name"]} for entry in manifest["entries"]],
+            "manifest_json": json.dumps(manifest, ensure_ascii=True, sort_keys=True)}
+        if "storage" in manifest:
+            if manifest["storage"] != {"version": 1, "backend": "s3"}:
+                raise CoreError("FILE_BATCH_CONFLICT")
+            encoded["storage"] = dict(manifest["storage"])
+            for projected, entry in zip(encoded["entries"], manifest["entries"]):
+                projected.update(sha256=entry["sha256"], size_bytes=entry["size_bytes"])
+        return encoded
+
     def create(self, row):
         with self.database.transaction() as connection:
+            if row["lease_owner"] == _CACHE_LEASE_OWNER:
+                connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                                   ("file-cache:" + row["tenant_id"],))
+                if connection.execute("""SELECT 1 FROM core_chat_file_batches
+                        WHERE tenant_id=%s AND lease_owner=%s AND cleaned_at IS NULL LIMIT 1""",
+                        (row["tenant_id"], _CACHE_LEASE_OWNER)).fetchone():
+                    raise CoreError("STORAGE_UNAVAILABLE", retryable=True)
             connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("file-upload:" + row["batch_id"],))
             connection.execute(
                 """INSERT INTO core_chat_file_batches
@@ -231,13 +263,7 @@ class PostgresChatFileStore:
             row["version"] = old["version"] + 1
             manifest = stored_manifest
             if row["manifest"] != old["manifest"]:
-                manifest = row["manifest"]
-                if manifest is not None:
-                    # JSONB cannot hold NUL or lone surrogates. Preserve exact
-                    # metadata as JSON text, keeping constraint/index fields native.
-                    manifest = {"schema_version": manifest["schema_version"],
-                        "entries": [{"actual_name": entry["actual_name"]} for entry in manifest["entries"]],
-                        "manifest_json": json.dumps(manifest, ensure_ascii=True, sort_keys=True)}
+                manifest = self._encode_manifest(row["manifest"])
             conn.execute(
                 """UPDATE core_chat_file_batches SET state=%s, manifest=%s, context_id=%s,
                    owner_id=%s, task_id=%s, run_id=%s, sequence=%s, lease_expires_at=%s,
@@ -281,11 +307,11 @@ class PostgresChatFileStore:
     def expired(self, now, cutoff, limit, *, tenant_id=None):
         with self.database.transaction() as connection:
             tenant_filter = " AND tenant_id=%s" if tenant_id is not None else ""
-            values = (now, cutoff) + ((tenant_id,) if tenant_id is not None else ())
+            values = (now, cutoff, _CACHE_LEASE_OWNER) + ((tenant_id,) if tenant_id is not None else ())
             rows = connection.execute(
                 """SELECT batch_id, tenant_id FROM core_chat_file_batches
                    WHERE state IN ('staging','rejected') AND cleaned_at IS NULL
-                   AND lease_expires_at<=%s AND created_at<=%s""" + tenant_filter
+                   AND lease_expires_at<=%s AND (created_at<=%s OR lease_owner=%s)""" + tenant_filter
                 + " ORDER BY created_at,batch_id LIMIT %s", (*values, limit),
             ).fetchall()
         return [(r["batch_id"], r["tenant_id"]) for r in rows]
@@ -376,7 +402,8 @@ def _destination(manifest):
         return "attachments", manifest["batch_id"]
     if (not isinstance(destination, dict) or destination.keys() != {"version", "directory", "id"}
             or type(destination["version"]) is not int or destination["version"] != 1
-            or destination["directory"] != "a2a" or not isinstance(destination["id"], str)
+            or destination["directory"] not in {"a2a", "inputs"} or not isinstance(destination["id"], str)
+            or (destination["directory"] == "inputs" and manifest.get("storage") != {"version": 1, "backend": "s3"})
             or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", destination["id"])):
         raise CoreError("ARTIFACT_INTEGRITY_FAILED")
     return destination["directory"], destination["id"]
@@ -429,7 +456,7 @@ def _verify(fd, manifest):
 
 class ChatFileService:
     def __init__(self, store, workspaces, *, limit_bytes=DEFAULT_ATTACHMENT_LIMIT,
-                 clock=time.time, lease_seconds=300, protected_inputs_enabled=True):
+                 clock=time.time, lease_seconds=300, protected_inputs_enabled=True, blob_store=None):
         if (type(limit_bytes) is not int or limit_bytes < 1
                 or type(lease_seconds) not in (int, float)
                 or not 0 < lease_seconds <= sys.float_info.max
@@ -438,6 +465,8 @@ class ChatFileService:
         self.store, self.workspaces = store, workspaces
         self.limit_bytes, self.clock, self.lease_seconds = limit_bytes, clock, lease_seconds
         self.protected_inputs_enabled = protected_inputs_enabled
+        self.blob_store = blob_store
+        self._original_gate = threading.BoundedSemaphore(1)
         self._orphan_scan = None
         self._orphan_scan_tenant = None
         with ExitStack() as descriptors:
@@ -504,6 +533,17 @@ class ChatFileService:
         if row["state"] != "staging" or row["lease_token"] != token or row["lease_expires_at"] <= self.clock():
             raise CoreError("FILE_UPLOAD_LEASE_LOST")
 
+    def _new_stage(self, tenant_id, actor_id, message_id, request_digest, *, cache=False):
+        batch_id, token, now = uuid.uuid4().hex, uuid.uuid4().hex, self.clock()
+        row = dict(batch_id=batch_id, schema_version=1, tenant_id=tenant_id, actor_id=actor_id,
+                   message_id=message_id, request_digest=request_digest, created_at=now,
+                   storage_key=batch_id, lease_owner=_CACHE_LEASE_OWNER if cache else actor_id, lease_token=token,
+                   lease_expires_at=now + self.lease_seconds, state="staging", manifest=None,
+                   context_id=None, owner_id=None, task_id=None, run_id=None, sequence=None,
+                   decision_ref=None, published_at=None, error_code=None, cleaned_at=None, version=1)
+        self.store.create(row)  # Durable age/lease precedes any local or remote bytes.
+        return row
+
     def prepare(self, files, *, tenant_id, actor_id, message_id, request_digest, source,
                 request_metadata=None, limit_bytes=None, destination_id=None, artifact_manifest=None):
         """Accept transport data containing exactly raw or base64 file content.
@@ -520,37 +560,40 @@ class ChatFileService:
         limit_bytes = self.limit_bytes if limit_bytes is None else limit_bytes
         if type(limit_bytes) is not int or limit_bytes < 1:
             raise CoreError("CONFIG_INVALID")
+        if self.blob_store is not None:
+            if tenant_id != self.blob_store.tenant_id:
+                raise CoreError("FILE_BATCH_NOT_FOUND")
+            limit_bytes = min(limit_bytes, self.blob_store.max_bytes)
         if destination_id is not None and (
                 not isinstance(destination_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", destination_id)):
             raise CoreError("INVALID_FILE_INPUT")
         if artifact_manifest is not None and (not isinstance(artifact_manifest, dict)
                 or artifact_manifest.keys() != {"artifacts", "messages", "manifest_path"}):
             raise CoreError("INVALID_FILE_INPUT")
-        if not self.protected_inputs_enabled and source != "a2a" and destination_id is None:
+        if self.blob_store is None and not self.protected_inputs_enabled and source != "a2a" and destination_id is None:
             # A writable Landlock parent cannot exclude future attachments.
             # Reject before staging/admission, not after accepting an input.
             raise CoreError("CAPABILITY_DISABLED", "Protected file uploads are unavailable in this execution profile")
-        batch_id, token, now = uuid.uuid4().hex, uuid.uuid4().hex, self.clock()
-        row = dict(batch_id=batch_id, schema_version=1, tenant_id=tenant_id, actor_id=actor_id,
-                   message_id=message_id, request_digest=request_digest, created_at=now,
-                   storage_key=batch_id, lease_owner=actor_id, lease_token=token,
-                   lease_expires_at=now + self.lease_seconds, state="staging", manifest=None,
-                   context_id=None, owner_id=None, task_id=None, run_id=None, sequence=None,
-                   decision_ref=None, published_at=None, error_code=None, cleaned_at=None, version=1)
-        self.store.create(row)  # Durable original age precedes any filesystem creation.
+        row = self._new_stage(tenant_id, actor_id, message_id, request_digest)
+        batch_id, token, now = row["batch_id"], row["lease_token"], row["created_at"]
         directory = None
         try:
             manifest = dict(schema_version=1, batch_id=batch_id, tenant_id=tenant_id, created_at=now,
                             source=source, metadata=copy.deepcopy(request_metadata or {}), entries=[], total_bytes=0)
+            if self.blob_store is not None:
+                manifest["storage"] = {"version": 1, "backend": "s3"}
             if source == "a2a" or destination_id is not None:
                 manifest["destination"] = {"version": 1, "directory": "a2a", "id": destination_id or batch_id}
+            elif not self.protected_inputs_enabled:
+                manifest["destination"] = {"version": 1, "directory": "inputs", "id": batch_id}
             if artifact_manifest is not None:
                 manifest.update(copy.deepcopy(artifact_manifest))
             destination, identifier = _destination(manifest)
-            with self.store.locked(batch_id, tenant_id) as (current, _):
-                self._lease(current, token)
-                directory = _mkdir(self.uploads, batch_id)
-                _manifest(directory, manifest)
+            if self.blob_store is None:
+                with self.store.locked(batch_id, tenant_id) as (current, _):
+                    self._lease(current, token)
+                    directory = _mkdir(self.uploads, batch_id)
+                    _manifest(directory, manifest)
             occupied = {".manifest.json"}
             for index, file in enumerate(files):
                 self.renew(batch_id, tenant_id, token)
@@ -589,13 +632,32 @@ class ChatFileService:
                     raise CoreError("ATTACHMENTS_TOO_LARGE", data={
                         "allowed_bytes": limit_bytes, "actual_bytes": manifest["total_bytes"]})
                 actual = _safe_name(original, index, occupied)
-                _write(directory, actual, content, lambda: self.renew(batch_id, tenant_id, token))
+                digest = hashlib.sha256(content).hexdigest()
+                if self.blob_store is None:
+                    _write(directory, actual, content, lambda: self.renew(batch_id, tenant_id, token))
+                elif self.blob_store.put(content) != digest:
+                    raise CoreError("ARTIFACT_INTEGRITY_FAILED")
                 manifest["entries"].append(dict(index=index, original_name=original, actual_name=actual,
                     relative_path=f"{destination}/{identifier}/{actual}", media_type=media,
-                    size_bytes=len(content), sha256=hashlib.sha256(content).hexdigest(),
+                    size_bytes=len(content), sha256=digest,
                     metadata=copy.deepcopy(file.get("metadata", {}))))
-            _manifest(directory, manifest)
-            os.fsync(self.uploads)
+                if self.blob_store is not None:
+                    try:
+                        text_digest = hashlib.sha256(json.dumps(content.decode("utf-8"), ensure_ascii=False,
+                            separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+                    except UnicodeDecodeError:
+                        text_digest = None
+                    manifest["entries"][-1]["text_digest"] = text_digest
+                    self._validate_original(manifest)
+                    # Pin each completed PUT while the batch is still private;
+                    # subsequent files cannot let its staging lease expire in GC.
+                    with self.store.locked(batch_id, tenant_id) as (current, conn):
+                        self._lease(current, token)
+                        self.blob_store.pin(conn, {digest})
+                        current["manifest"] = copy.deepcopy(manifest)
+            if directory is not None:
+                _manifest(directory, manifest)
+                os.fsync(self.uploads)
             with self.store.locked(batch_id, tenant_id) as (current, _):
                 self._lease(current, token)
                 current["manifest"] = manifest
@@ -669,6 +731,17 @@ class ChatFileService:
                 if not self.protected_inputs_enabled and directory_kind == "attachments":
                     raise CoreError("CAPABILITY_DISABLED", "Protected file uploads are unavailable in this execution profile")
                 occupied = self.store.reserved(binding, connection=conn) if directory_kind == "attachments" else set()
+                if self._stored_original(row["manifest"]):
+                    self._validate_original(row["manifest"])
+                    if directory_kind == "attachments":
+                        for entry in row["manifest"]["entries"]:
+                            actual = _safe_name(entry["original_name"], entry["index"], occupied)
+                            entry.update(actual_name=actual, relative_path=f"attachments/{batch_id}/{actual}")
+                    self.blob_store.pin(conn, {entry["sha256"] for entry in row["manifest"]["entries"]})
+                    self._recheck_caller(source, root, binding, conn, accept_input=sequence is not None)
+                    row.update(state="accepted_quarantine", context_id=binding.context_id,
+                               owner_id=binding.owner_id, task_id=root.task_id, run_id=run_id, sequence=sequence)
+                    return copy.deepcopy(row)
                 with self._attachments(binding, row["manifest"]) as attachments:
                     if directory_kind == "attachments":
                         occupied.update(os.listdir(attachments))
@@ -697,8 +770,82 @@ class ChatFileService:
                            owner_id=binding.owner_id, task_id=root.task_id, run_id=run_id, sequence=sequence)
         return copy.deepcopy(row)
 
+    def _stored_original(self, manifest):
+        storage = manifest.get("storage")
+        if storage is None:
+            return False
+        if storage != {"version": 1, "backend": "s3"}:
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        if self.blob_store is None:
+            raise CoreError("STORAGE_UNAVAILABLE")
+        if manifest.get("tenant_id") != self.blob_store.tenant_id:
+            raise CoreError("FILE_BATCH_NOT_FOUND")
+        return True
+
+    def _validate_original(self, manifest):
+        if not self._stored_original(manifest):
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        entries = manifest.get("entries")
+        if (not isinstance(entries, list) or not 1 <= len(entries) <= 10000
+                or len(json.dumps(manifest, ensure_ascii=True).encode()) > _MANIFEST_LIMIT):
+            raise CoreError("FILE_METADATA_TOO_LARGE")
+        names, total = set(), 0
+        for entry in entries:
+            name, size, digest = entry.get("actual_name"), entry.get("size_bytes"), entry.get("sha256")
+            text_digest = entry.get("text_digest")
+            if (not isinstance(name, str) or name in {"", ".", "..", ".manifest.json"} or name in names
+                    or "/" in name or "\\" in name or "\x00" in name
+                    or type(size) is not int or not 0 <= size <= self.blob_store.max_bytes
+                    or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or "text_digest" not in entry or text_digest is not None and (
+                        not isinstance(text_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", text_digest))):
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+            names.add(name)
+            total += size
+        if total != manifest.get("total_bytes") or total > self.blob_store.max_bytes:
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+
     @contextmanager
-    def _accepted_files(self, batch_id, binding, *, run_id, task_id, connection=None):
+    def _original_directory(self, manifest):
+        """Bounded disposable materialization, never inside an open DB transaction."""
+        self._validate_original(manifest)
+        if not self._original_gate.acquire(timeout=30):
+            raise CoreError("STORAGE_UNAVAILABLE", retryable=True)
+        stage, directory = None, None
+        try:
+            self.sweep(startup=True, limit=100, tenant_id=manifest["tenant_id"])
+            stage = self._new_stage(manifest["tenant_id"], _CACHE_LEASE_OWNER,
+                                    manifest["batch_id"], "private-cache", cache=True)
+            name = stage["batch_id"]
+            directory = _mkdir(self.uploads, name)
+            for entry in manifest["entries"]:
+                self.renew(name, manifest["tenant_id"], stage["lease_token"])
+                content = self.blob_store.get(entry["sha256"], entry["size_bytes"])
+                if len(content) != entry["size_bytes"] or hashlib.sha256(content).hexdigest() != entry["sha256"]:
+                    raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+                _write(directory, entry["actual_name"], content,
+                       lambda: self.renew(name, manifest["tenant_id"], stage["lease_token"]))
+            _manifest(directory, manifest)
+            yield name, directory
+        finally:
+            if directory is not None:
+                os.close(directory)
+            try:
+                if stage is not None:
+                    try:
+                        self.reject(stage["batch_id"], stage["tenant_id"], stage["lease_token"], "FILE_CACHE_RELEASED")
+                    except Exception:
+                        # A committed result is not undone by disposable-cache
+                        # bookkeeping. Its durable lease remains sweepable.
+                        try:
+                            self._remove(stage["batch_id"])
+                        except OSError:
+                            pass
+                        logging.getLogger(__name__).warning("file.cache.cleanup_pending")
+            finally:
+                self._original_gate.release()
+
+    def _accepted_row(self, batch_id, binding, run_id, task_id, connection=None):
         if not isinstance(task_id, str) or not task_id:
             raise CoreError("FILE_BATCH_NOT_FOUND")
         row = self.store.get(batch_id, binding.tenant_id, connection=connection)
@@ -706,6 +853,20 @@ class ChatFileService:
         records = _caller_records(self.store.workflow, binding, run_id, task_id, connection=connection)
         if row["state"] not in _ACCEPTED or (row["run_id"], row["task_id"]) != (run_id, records[0].task_id):
             raise CoreError("FILE_BATCH_NOT_FOUND")
+        return row
+
+    @contextmanager
+    def _accepted_files(self, batch_id, binding, *, run_id, task_id, connection=None):
+        row = self._accepted_row(batch_id, binding, run_id, task_id, connection)
+        if self._stored_original(row["manifest"]):
+            if connection is not None:
+                raise CoreError("FILE_READ_TRANSACTION_REQUIRED")
+            with self._original_directory(row["manifest"]) as (_, directory):
+                current = self._accepted_row(batch_id, binding, run_id, task_id)
+                if current["manifest"] != row["manifest"]:
+                    raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+                yield current, directory
+            return
         try:
             with ExitStack() as stack:
                 if row["state"] == "published":
@@ -796,6 +957,31 @@ class ChatFileService:
                 if row["task_id"] != root.task_id:
                     raise CoreError("FILE_BATCH_NOT_FOUND")
                 if row["state"] == "accepted_ready" and not allow:
+                    if self._stored_original(row["manifest"]):
+                        # Only an uncommitted publication may exist here. Never
+                        # read S3 while holding the review/admission transaction.
+                        with ExitStack() as stack:
+                            workspace = stack.enter_context(self.workspaces.open_workspace(binding))
+                            parent_name, target_name = _destination(row["manifest"])
+                            target = None
+                            if workspace is not None:
+                                try:
+                                    attachments = os.open(parent_name, _DIRECTORY, dir_fd=workspace)
+                                    stack.callback(os.close, attachments)
+                                    target = os.open(target_name, _DIRECTORY, dir_fd=attachments)
+                                except FileNotFoundError:
+                                    pass
+                            if target is not None:
+                                try:
+                                    _verify(target, row["manifest"])
+                                finally:
+                                    os.close(target)
+                                self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
+                                shutil.rmtree(target_name, dir_fd=attachments)
+                                os.fsync(attachments)
+                        self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
+                        row.update(state="excluded", decision_ref=decision_ref)
+                        return copy.deepcopy(row)
                     # A later exact-material denial supersedes an earlier allow.
                     # Recovery can find a rename whose DB publication rolled back:
                     # retract that verified directory before committing exclusion.
@@ -826,12 +1012,13 @@ class ChatFileService:
                     return
                 if row["state"] != "accepted_quarantine":
                     raise CoreError("FILE_BATCH_CONFLICT")
-                with self._private(batch_id) as (parent, directory):
-                    _verify(directory, row["manifest"])
-                    if parent == self.uploads:
-                        _rename(parent, batch_id, self.quarantine, batch_id)
-                        os.fsync(parent)
-                        os.fsync(self.quarantine)
+                if not self._stored_original(row["manifest"]):
+                    with self._private(batch_id) as (parent, directory):
+                        _verify(directory, row["manifest"])
+                        if parent == self.uploads:
+                            _rename(parent, batch_id, self.quarantine, batch_id)
+                            os.fsync(parent)
+                            os.fsync(self.quarantine)
                 self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
                 row.update(state="accepted_ready" if allow else "excluded", decision_ref=decision_ref)
 
@@ -851,7 +1038,12 @@ class ChatFileService:
             raise CoreError("CAPABILITY_DISABLED", "Protected file uploads are unavailable in this execution profile")
         if batch["state"] not in {"accepted_ready", "published"}:
             raise CoreError("FILE_BATCH_NOT_READY")
+        if self._stored_original(batch["manifest"]):
+            return self._publish_original(batch, binding, lease_token)
         source = _caller_records(self.store.workflow, binding, batch["run_id"])[-1]
+        durability = getattr(self, "workspace_durability", None)
+        if durability is not None:
+            durability.ensure_restored(binding)
         try:
             with self.caller_scope(binding, run_id=source.run_id, task_id=source.task_id,
                     lease_token=lease_token) as (source, root, conn):
@@ -895,6 +1087,119 @@ class ChatFileService:
                 raise
             raise CoreError("FILE_PUBLICATION_PENDING", retryable=True) from error
 
+    def _publish_original(self, batch, binding, lease_token):
+        durability = getattr(self, "workspace_durability", None)
+        if durability is None:
+            raise CoreError("CONFIG_INVALID", "S3 inputs require durable workspace publication")
+        batch_id = batch["batch_id"]
+        source = _caller_records(self.store.workflow, binding, batch["run_id"])[-1]
+        try:
+            with durability.local_lock(binding):
+                durability.ensure_restored(binding)
+                with self.caller_scope(binding, run_id=source.run_id, task_id=source.task_id,
+                        lease_token=lease_token) as (source, root, conn):
+                    current = self.store.get(batch_id, binding.tenant_id, connection=conn)
+                    self._scope(current, binding)
+                    if current["state"] == "published":
+                        # The same commit already captured this working copy.
+                        # Recovery must preserve its subsequent edits/deletions.
+                        return copy.deepcopy(current["manifest"])
+                    if current["state"] != "accepted_ready":
+                        raise CoreError("FILE_BATCH_NOT_READY")
+                durability.manager.require_workspace_quiescent(binding)
+                installed, committed_state = False, None
+                try:
+                    with self._original_directory(current["manifest"]) as (stage, directory):
+                        durability.reserve_publication(binding, "/".join(_destination(current["manifest"])), directory)
+                        with self.caller_scope(binding, run_id=source.run_id, task_id=source.task_id,
+                                lease_token=lease_token) as (source, root, conn):
+                            current = self.store.get(batch_id, binding.tenant_id, connection=conn)
+                            if current["state"] != "accepted_ready":
+                                raise CoreError("FILE_BATCH_NOT_READY")
+                            with self._attachments(binding, current["manifest"]) as attachments:
+                                target_name = _destination(current["manifest"])[1]
+                                try:
+                                    target = os.open(target_name, _DIRECTORY, dir_fd=attachments)
+                                except FileNotFoundError:
+                                    _verify(directory, current["manifest"])
+                                    self._recheck_caller(source, root, binding, conn, lease_token=lease_token)
+                                    _rename(self.uploads, stage, attachments, target_name)
+                                    installed = True
+                                    os.fsync(self.uploads)
+                                    target = os.open(target_name, _DIRECTORY, dir_fd=attachments)
+                                try:
+                                    _verify(target, current["manifest"])
+                                    installed = True
+                                finally:
+                                    os.close(target)
+                                os.fsync(attachments)
+
+                        def commit(connection):
+                            nonlocal committed_state
+                            with self.caller_scope(binding, run_id=source.run_id, task_id=source.task_id,
+                                    connection=connection, lease_token=lease_token) as (latest, root, conn):
+                                with self.store.locked(batch_id, binding.tenant_id, connection=conn) as (row, _):
+                                    if row["state"] != "accepted_ready" or row["decision_ref"] != current["decision_ref"]:
+                                        raise CoreError("FILE_BATCH_NOT_READY")
+                                    self._recheck_caller(latest, root, binding, conn, lease_token=lease_token)
+                                    row.update(state="published", published_at=self.clock(), error_code=None)
+                            committed_state = durability._state(connection, binding)
+                            return copy.deepcopy(current["manifest"])
+
+                        return durability.transition(source, lease_token, commit)
+                except Exception as error:
+                    if installed:
+                        published = durability.reconcile_publication(binding,
+                            lambda: self._reconcile_original_publication(binding, current, committed_state))
+                        if published:
+                            return copy.deepcopy(current["manifest"])
+                        if not isinstance(error, (CoreError, OSError)):
+                            raise CoreError("FILE_PUBLICATION_PENDING", retryable=True) from error
+                    raise
+        except (OSError, CoreError) as error:
+            code = getattr(error, "code", "FILE_PUBLICATION_PENDING")
+            if isinstance(error, OSError) or code in {"STORAGE_UNAVAILABLE", "EXECUTION_CLEANUP_PENDING",
+                                                     "WORKSPACE_SNAPSHOT_LIMIT", "WORKSPACE_CACHE_LIMIT"}:
+                raise CoreError("FILE_PUBLICATION_PENDING", retryable=True) from error
+            raise
+
+    def _reconcile_original_publication(self, binding, batch, committed_state):
+        """Called under the local gate, before any other workspace use is allowed."""
+        durability = self.workspace_durability
+        with durability.database.transaction() as connection:
+            state = durability._state(connection, binding, lock=True)
+            current = self.store.get(batch["batch_id"], binding.tenant_id, connection=connection)
+            self._scope(current, binding)
+        if current["manifest"] != batch["manifest"]:
+            raise CoreError("FILE_PUBLICATION_CONFLICT")
+        if current["state"] == "published":
+            if committed_state is None or state != committed_state:
+                raise CoreError("WORKSPACE_RESTORE_CONFLICT")
+            durability._remember(binding, state["revision"], state["manifest"])
+            return True
+        if current["state"] not in {"accepted_ready", "excluded"}:
+            raise CoreError("FILE_BATCH_NOT_READY")
+        if state["revision"] != durability._initialized.get(binding):
+            raise CoreError("WORKSPACE_RESTORE_CONFLICT")
+        durability.manager.require_workspace_quiescent(binding)
+        with ExitStack() as stack:
+            workspace = stack.enter_context(self.workspaces.open_workspace(binding))
+            if workspace is not None:
+                parent_name, target_name = _destination(batch["manifest"])
+                try:
+                    parent = os.open(parent_name, _DIRECTORY, dir_fd=workspace)
+                    stack.callback(os.close, parent)
+                    target = os.open(target_name, _DIRECTORY, dir_fd=parent)
+                except FileNotFoundError:
+                    return False
+                try:
+                    _verify(target, batch["manifest"])
+                finally:
+                    os.close(target)
+                shutil.rmtree(target_name, dir_fd=parent)
+                os.fsync(parent)
+        return False
+
     def sweep(self, *, startup=False, limit=100, tenant_id=None):
         """Bounded lifecycle hook; call again immediately when has_more is true.
 
@@ -911,7 +1216,8 @@ class ChatFileService:
         for batch_id, batch_tenant_id in candidates[:limit]:
             with self.store.locked(batch_id, batch_tenant_id) as (row, _):
                 if (row["state"] not in {"staging", "rejected"} or row["cleaned_at"] is not None
-                        or row["lease_expires_at"] > now or row["created_at"] > cutoff
+                        or row["lease_expires_at"] > now
+                        or (row["created_at"] > cutoff and row["lease_owner"] != _CACHE_LEASE_OWNER)
                         or any(row[k] is not None for k in ("task_id", "run_id", "decision_ref"))):
                     continue
                 self._remove(batch_id)

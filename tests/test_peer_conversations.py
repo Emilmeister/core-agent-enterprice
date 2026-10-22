@@ -966,6 +966,36 @@ class PostgresPeerConversationAPITests(unittest.IsolatedAsyncioTestCase):
     test_historical_reply_grants_do_not_repeat_initial_files_or_leak_denied_descendants = PeerConversationAPITests.test_historical_reply_grants_do_not_repeat_initial_files_or_leak_denied_descendants
     review_material = PeerConversationAPITests.review_material
     digest = staticmethod(PeerConversationAPITests.digest)
+
+    async def test_cold_outgoing_files_hydrate_outside_authorized_peer_read(self):
+        await self.prepare()
+        service, refs, _contract, _checkpoint = self.prepare_request_files()
+        store = service.artifact_store
+        contents = {ref["sha256"]: store.get(self.tenant, ref["blob_id"])[1] for ref in refs}
+        reads = []
+        def get(digest, size):
+            with store.database.pool.connection(timeout=1) as connection:
+                connection.execute("SELECT 1")
+            reads.append(digest)
+            return contents[digest]
+        store.blob_store = SimpleNamespace(tenant_id=self.tenant, get=get)
+        store.database.pool.resize(1, 1)
+        store.database.pool.timeout = 2
+        path = self.path + "/" + self.operation
+        for suffix in ("", "/outgoing-files/" + refs[0]["file_id"]):
+            with store._cache_lock:
+                store._cache.clear()
+                store._cache_bytes = 0
+            reads.clear()
+            response = await self.http.get(path + suffix, headers=self.headers("owner-b"))
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(set(reads), set(contents))
+            if suffix:
+                self.assertEqual(response.content, b"frozen request bytes")
+            else:
+                self.assertEqual(response.json()["outgoing_files_status"], "available")
+                self.assertNotIn("blob_id", response.text)
+
     async def prepare(self, context_id=None):
         await PeerConversationAPITests.prepare(self, context_id=context_id)
         self.addCleanup(self.cleanup_remote_tasks)

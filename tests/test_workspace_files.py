@@ -9,6 +9,7 @@ import threading
 import unittest
 import uuid
 from dataclasses import replace
+from types import SimpleNamespace
 from contextlib import nullcontext
 from urllib.parse import quote
 from unittest.mock import patch
@@ -58,6 +59,29 @@ class WorkspaceFileAPITests(AuthAppTestCase):
         self.assertEqual(sorted(str(path) for path in self.manager.root.rglob("*")), before)
         self.assertEqual(self.app.state.core_agent.workflow_store.lookup_task(task["id"]), record)
         self.assertEqual(len(self.model.calls), calls)
+
+    async def test_owner_reads_restore_workspace_only_after_authorization(self):
+        task = await self.submit("external-a", "root", "files")
+        binding = self.binding(task)
+        backend = self.app.state.core_agent.tool_runtime.environment_manager.backend
+        restored = []
+
+        def restore(scope):
+            self.assertEqual(scope, binding)
+            restored.append(scope)
+            (self.manager.workspace(scope) / "restored.txt").write_bytes(b"durable file")
+
+        with patch.object(backend, "workspace_durability", SimpleNamespace(ensure_restored=restore), create=True):
+            self.assertEqual((await self.files(token="external-a")).status_code, 403)
+            self.assertEqual((await self.files("missing")).status_code, 404)
+            self.assertEqual(restored, [])
+            listed = await self.files()
+            self.assertEqual(listed.status_code, 200, listed.text)
+            self.assertEqual([item["path"] for item in listed.json()["files"]], ["restored.txt"])
+            downloaded = await self.files(content=True, path="restored.txt")
+            self.assertEqual(downloaded.status_code, 200, downloaded.text)
+            self.assertEqual(downloaded.content, b"durable file")
+        self.assertEqual(restored, [binding, binding])
 
     async def test_recursive_files_age_boundary_paging_and_safe_download(self):
         task = await self.submit("external-a", "root", "files")

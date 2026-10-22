@@ -186,6 +186,10 @@ jobs:
       TEST_KEYCLOAK_URL: http://127.0.0.1:8080
       TEST_KEYCLOAK_ADMIN: enterprise-admin
       TEST_KEYCLOAK_ADMIN_PASSWORD: enterprise-test
+      TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      TEST_S3_BUCKET: core-agent-proof
+      TEST_S3_ACCESS_KEY_ID: integration-test
+      TEST_S3_SECRET_ACCESS_KEY: isolated-storage-test-only
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -203,6 +207,34 @@ jobs:
           cache-dependency-path: ui/package-lock.json
       - run: uv run core-agent-db migrate
       - run: uv run ruff check core_agent tests
+      - name: Start isolated MinIO for durable storage integration
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-minio/bin" "$RUNNER_TEMP/core-minio/data"
+          # Official prebuilt community images are no longer distributed.
+          # Build the pinned official RELEASE.2025-09-07T16-13-09Z source.
+          GOTOOLCHAIN=go1.24.2 GOBIN="$RUNNER_TEMP/core-minio/bin" \
+            go install github.com/minio/minio@07c3a429bfed433e49018cb0f78a52145d4bedeb
+          nohup env MINIO_ROOT_USER="$TEST_S3_ACCESS_KEY_ID" \
+            MINIO_ROOT_PASSWORD="$TEST_S3_SECRET_ACCESS_KEY" \
+            "$RUNNER_TEMP/core-minio/bin/minio" server "$RUNNER_TEMP/core-minio/data" \
+            --address 127.0.0.1:9000 --console-address 127.0.0.1:9001 \
+            >"$RUNNER_TEMP/core-minio/server.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/core-minio/server.pid"
+          curl --fail --silent --show-error --retry 30 --retry-delay 2 \
+            --retry-connrefused --retry-max-time 90 --max-time 5 \
+            "$TEST_S3_ENDPOINT/minio/health/ready" >/dev/null
+          uv run python - <<'PY'
+          import os
+          import botocore.session
+          client = botocore.session.get_session().create_client(
+              "s3", region_name="us-east-1", endpoint_url=os.environ["TEST_S3_ENDPOINT"],
+              aws_access_key_id=os.environ["TEST_S3_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["TEST_S3_SECRET_ACCESS_KEY"],
+          )
+          client.create_bucket(Bucket=os.environ["TEST_S3_BUCKET"])
+          client.head_bucket(Bucket=os.environ["TEST_S3_BUCKET"])
+          client.close()
+          PY
       - name: Start isolated Keycloak for authentication integration
         run: |
           docker run -d --name core-agent-keycloak-test -p 127.0.0.1:8080:8080 \
@@ -219,6 +251,15 @@ jobs:
       - name: Remove isolated Keycloak
         if: always()
         run: docker rm -f core-agent-keycloak-test
+      - name: Remove isolated MinIO
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/core-minio/server.pid"; then
+            kill "$(cat "$RUNNER_TEMP/core-minio/server.pid")" || true
+          fi
+          if test -f "$RUNNER_TEMP/core-minio/server.log"; then
+            tail -n 30 "$RUNNER_TEMP/core-minio/server.log"
+          fi
       - name: Build owner UI
         working-directory: ui
         run: |

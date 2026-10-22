@@ -17,7 +17,7 @@ from psycopg.types.json import Jsonb
 
 from .errors import CoreError
 from .guardrails import Classification
-from .workflow import TERMINAL_STATES
+from .workflow import TERMINAL_STATES, _prefetched_public_output
 
 
 _PRIVATE = {"payload", "sealed_ref", "completed_result_ref", "attempt_token"}
@@ -101,6 +101,7 @@ class _MaterialReviews:
                 return {"state": state, "review_id": row["review_id"]}
         return None
 
+    @_prefetched_public_output
     def create(self, record, *, source_id, source_kind, deadline, lease_token,
                payload=None, sealed_ref=None, content_digest=None, completed_result_ref=None,
                max_calls=32, max_input_tokens=100000, connection=None):
@@ -183,6 +184,7 @@ class _MaterialReviews:
             subject.update(affected_scope="file_batch", batch_id=row["sealed_ref"]["batch_id"])
         return subject
 
+    @_prefetched_public_output
     def visibility_reference(self, record, review_id, *, lease_token, connection=None, source_run_id=None):
         """Digest identities and decision revision only; never return quarantined bytes."""
         _lease(lease_token)
@@ -214,6 +216,7 @@ class _MaterialReviews:
                 "completed_result_ref": {key: reference[key] for key in
                     ("material_digest", "material_kind", "text_digest") if key in reference}}
 
+    @_prefetched_public_output
     def get(self, record, review_id, *, connection=None):
         with self._scope(record, connection=connection) as (current, conn):
             return _public(self._refresh(current, self._review(current, review_id, conn), conn))
@@ -224,6 +227,7 @@ class _MaterialReviews:
             row = self._review(current, review_id, conn)
             return deepcopy({key: row[key] for key in ("payload", "sealed_ref", "completed_result_ref")})
 
+    @_prefetched_public_output
     def read_payload(self, record, review_id, *, lease_token, connection=None):
         _lease(lease_token)
         with self._scope(record, lease_token=lease_token, connection=connection) as (current, conn):
@@ -271,19 +275,35 @@ class _MaterialReviews:
                 or type(owner_timeout_seconds) is not int or not 1 <= owner_timeout_seconds <= 2147483647):
             raise CoreError("MATERIAL_REVIEW_INVALID")
         if before_pending is not None:
-            # Commit a clear result under the same deadline fence, or release the
-            # transaction before stopping a live interpreter and creating its wait.
-            with self._scope(record, lease_token=lease_token, connection=connection) as (current, conn):
-                row = self._review(current, review_id, conn)
-                if row["state"] != "checking" or (result.verdict == "clear" and row["attempts_used"]
-                                                   and self._now(conn) < row["deadline"]):
-                    return self.finish(record, review_id, result, lease_token=lease_token, attempt_token=attempt_token,
-                        continuation=continuation, snapshot=snapshot, owner_timeout_seconds=owner_timeout_seconds,
-                        connection=conn, _clear_fenced=True)
-                if result.verdict == "clear":
-                    result = Classification("unverified", "timeout", result.calls, result.input_tokens,
-                                            result.prompt_tokens, result.completion_tokens, result.elapsed_seconds)
+            finished, result = self._prepare_pending(record, review_id, result, lease_token=lease_token,
+                attempt_token=attempt_token, continuation=continuation, snapshot=snapshot,
+                owner_timeout_seconds=owner_timeout_seconds, connection=connection)
+            if finished is not None:
+                return finished
+            # Interpreter shutdown is outside both retryable DB transactions.
             snapshot, continuation = before_pending()
+        return self._finish_result(record, review_id, result, lease_token=lease_token,
+            attempt_token=attempt_token, continuation=continuation, snapshot=snapshot,
+            owner_timeout_seconds=owner_timeout_seconds, connection=connection, _clear_fenced=_clear_fenced)
+
+    @_prefetched_public_output
+    def _prepare_pending(self, record, review_id, result, *, lease_token, attempt_token,
+                         continuation, snapshot, owner_timeout_seconds, connection=None):
+        with self._scope(record, lease_token=lease_token, connection=connection) as (current, conn):
+            row = self._review(current, review_id, conn)
+            if row["state"] != "checking" or (result.verdict == "clear" and row["attempts_used"]
+                                               and self._now(conn) < row["deadline"]):
+                return self._finish_result(record, review_id, result, lease_token=lease_token,
+                    attempt_token=attempt_token, continuation=continuation, snapshot=snapshot,
+                    owner_timeout_seconds=owner_timeout_seconds, connection=conn, _clear_fenced=True), result
+            if result.verdict == "clear":
+                result = Classification("unverified", "timeout", result.calls, result.input_tokens,
+                                        result.prompt_tokens, result.completion_tokens, result.elapsed_seconds)
+        return None, result
+
+    @_prefetched_public_output
+    def _finish_result(self, record, review_id, result, *, lease_token, attempt_token,
+                       continuation, snapshot, owner_timeout_seconds, connection=None, _clear_fenced=False):
         with self._scope(record, lease_token=lease_token, connection=connection) as (current, conn):
             _live(current)
             row = self._review(current, review_id, conn)
@@ -318,16 +338,10 @@ class _MaterialReviews:
     def classify(self, record, review_id, classifier, *, lease_token, continuation, snapshot,
                  owner_timeout_seconds=86400, documents=None, complete=True, before_pending=None):
         _lease(lease_token)
-        with self._scope(record, lease_token=lease_token) as (current, conn):
-            _live(current)
-            row = self._review(current, review_id, conn)
-            if row["state"] != "checking":
-                return _public(self._refresh(current, row, conn))
-            interrupted = row["attempt_token"] is not None
-            if not interrupted:
-                row["attempt_token"] = str(uuid.uuid4())
-                self._save(row, conn)
-            attempt_token = row["attempt_token"]
+        row, interrupted = self._start_classification(record, review_id, lease_token=lease_token)
+        if interrupted is None:
+            return row
+        attempt_token = row["attempt_token"]
         if interrupted:
             result = Classification("unverified", "interrupted", 0, 0, 0, 0, 0)
         else:
@@ -343,6 +357,19 @@ class _MaterialReviews:
         return self.finish(record, review_id, result, lease_token=lease_token, attempt_token=attempt_token,
                            continuation=continuation, snapshot=snapshot, owner_timeout_seconds=owner_timeout_seconds,
                            before_pending=before_pending)
+
+    @_prefetched_public_output
+    def _start_classification(self, record, review_id, *, lease_token):
+        with self._scope(record, lease_token=lease_token) as (current, conn):
+            _live(current)
+            row = self._review(current, review_id, conn)
+            if row["state"] != "checking":
+                return _public(self._refresh(current, row, conn)), None
+            interrupted = row["attempt_token"] is not None
+            if not interrupted:
+                row["attempt_token"] = str(uuid.uuid4())
+                self._save(row, conn)
+        return row, interrupted
 
 
 class MemoryMaterialReviewStore(_MaterialReviews):

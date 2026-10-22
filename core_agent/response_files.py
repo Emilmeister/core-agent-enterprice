@@ -36,6 +36,16 @@ for _extension, _media_type in {
 _PUBLIC_KEYS = ("file_id", "name", "media_type", "size_bytes", "sha256")
 _SCOPE_KEYS = ("tenant_id", "owner_id", "context_id", "task_id", "run_id")
 _REF_KEYS = frozenset(("schema_version", "limit_bytes", "blob_id", *_SCOPE_KEYS, *_PUBLIC_KEYS))
+_PATH_GUIDANCE = (
+    "Pass unique relative workspace paths, e.g. reports/report.pdf. "
+    "Absolute paths (including /workspace/...), URLs, and traversal are not accepted."
+)
+
+
+def with_prefetched_artifacts(service, operation):
+    """Retry a complete transaction after hydrating its authorized immutable bytes."""
+    run = getattr(getattr(service, "artifact_store", None), "run_prefetched", None)
+    return operation() if run is None else run(operation)
 
 
 def _identity(stream):
@@ -70,7 +80,7 @@ class ResponseFileService:
                 raise ValueError()
             return parts
         except (CoreError, ValueError):
-            raise CoreError("INVALID_FILE_PATH") from None
+            raise CoreError("INVALID_FILE_PATH", _PATH_GUIDANCE) from None
 
     def prepare(self, binding, paths, *, task_id, run_id, limit_bytes):
         self._scope(binding, task_id, run_id, limit_bytes)
@@ -82,13 +92,17 @@ class ResponseFileService:
     def _capture(self, binding, paths, limit_bytes, *, used_bytes=0):
         """Capture the complete workspace set before granting any blob reference."""
         if not isinstance(paths, (list, tuple)):
-            raise CoreError("INVALID_FILE_PATH")
+            raise CoreError("INVALID_FILE_PATH", _PATH_GUIDANCE)
         parts = [self._parts(path) for path in paths]
         if len(set(paths)) != len(paths):
-            raise CoreError("INVALID_FILE_PATH")
+            raise CoreError("INVALID_FILE_PATH", _PATH_GUIDANCE)
         captured = []
         try:
             with ExitStack() as stack:
+                durability = getattr(self, "workspace_durability", None)
+                if durability is not None:
+                    stack.enter_context(durability.local_lock(binding))
+                    durability.ensure_restored(binding)
                 sources = []
                 for path, components in zip(paths, parts):
                     try:
@@ -191,7 +205,11 @@ class ResponseFileService:
             try:
                 metadata, content = self.artifact_store.get(binding.tenant_id, ref["blob_id"],
                     **({"connection": connection} if connection is not None else {}))
-            except (CoreError, OSError):
+            except CoreError as error:
+                if error.code in {"STORAGE_NOT_PREFETCHED", "STORAGE_UNAVAILABLE", "STORAGE_LIMIT_EXCEEDED"}:
+                    raise
+                raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
+            except OSError:
                 raise CoreError("ARTIFACT_INTEGRITY_FAILED") from None
             if (metadata.id != ref["blob_id"] or metadata.tenant_id != binding.tenant_id
                     or metadata.size != ref["size_bytes"] or len(content) != ref["size_bytes"]

@@ -245,7 +245,9 @@ async def final_response_file(agent, admission, actor, request):
             return load({"owner_id": record.owner_id, "run_id": record.run_id, "state": record.state,
                 "files": (record.result or {}).get("outgoing_files")})
 
-    entry, content = await asyncio.to_thread(read)
+    from .response_files import with_prefetched_artifacts
+
+    entry, content = await asyncio.to_thread(with_prefetched_artifacts, agent.response_files_service, read)
     return WorkspaceDownload(io.BytesIO(content), len(content), entry["name"])
 
 
@@ -280,9 +282,13 @@ async def workspace_files(agent, admission, actor, request):
                 raise CoreError("REQUEST_INVALID")
         ChatWorkspaces.path_parts(query.get("directory", ""), directory=True)
     binding, active = await admission.workspace_scope(actor.tenant, context_id)
-    manager = agent.tool_runtime.environment_manager.backend.chats
+    backend = agent.tool_runtime.environment_manager.backend
+    manager = backend.chats
     if manager is None:
         raise CoreError("WORKSPACE_UNAVAILABLE")
+    durability = getattr(backend, "workspace_durability", None)
+    if durability is not None:
+        await asyncio.to_thread(durability.ensure_restored, binding)
     if content:
         opened = asyncio.create_task(asyncio.to_thread(manager.open_file, binding, query["path"]))
         try:

@@ -1,0 +1,46 @@
+"""Explicit storage activation and bounded, credential-safe deployment configuration."""
+import os
+import unittest
+from unittest.mock import patch
+
+from core_agent.app import _workspace_storage
+from core_agent.errors import CoreError
+
+
+class CloudStorageConfigurationTests(unittest.TestCase):
+    def environment(self):
+        return {
+            "CORE_AGENT_AUTH_MODE": "cloudru", "CORE_AGENT_ENVIRONMENT": "development",
+            "CORE_AGENT_TENANT_ID": "company", "WORKSPACE_STORAGE_TYPE": "s3",
+            "ARTIFACT_S3_ENDPOINT_URL": "https://s3.example.test", "ARTIFACT_S3_BUCKET": "workspace",
+            "ARTIFACT_S3_REGION": "test", "ARTIFACT_S3_ACCESS_KEY_ID": "test-key",
+            "ARTIFACT_S3_SECRET_ACCESS_KEY": "private-test-secret",
+        }
+
+    def test_platform_fields_do_not_enable_s3(self):
+        values = self.environment()
+        values.pop("WORKSPACE_STORAGE_TYPE")
+        with patch.dict(os.environ, values, clear=True):
+            self.assertIsNone(_workspace_storage())
+
+    def test_explicit_s3_uses_platform_credentials_and_workspace_override(self):
+        with patch.dict(os.environ, {**self.environment(), "WORKSPACE_S3_BUCKET": "override"}, clear=True):
+            settings = _workspace_storage()
+        self.assertEqual(settings["bucket"], "override")
+        self.assertEqual(settings["secret_access_key"], "private-test-secret")
+        self.assertEqual(settings["tenant_id"], "company")
+        self.assertEqual((settings["max_bytes"], settings["max_files"], settings["max_inflight"]),
+                         (100_000_000, 10_000, 4))
+
+    def test_invalid_profile_and_limits_fail_without_secret_diagnostics(self):
+        for override in ({"CORE_AGENT_AUTH_MODE": "keycloak"},
+                         {"CORE_AGENT_ENVIRONMENT": "production"},
+                         {"WORKSPACE_STORAGE_TYPE": "unknown"},
+                         {"WORKSPACE_MAX_BYTES": "NaN"}, {"WORKSPACE_MAX_FILES": "0"},
+                         {"WORKSPACE_S3_MAX_INFLIGHT": "17"},
+                         {"ARTIFACT_S3_SECRET_ACCESS_KEY": ""}):
+            with self.subTest(override=override), patch.dict(os.environ, {**self.environment(), **override}, clear=True):
+                with self.assertRaises(CoreError) as caught:
+                    _workspace_storage()
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                self.assertNotIn("private-test-secret", str(caught.exception))

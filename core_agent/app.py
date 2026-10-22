@@ -260,6 +260,37 @@ def _reasoning_effort():
     return level if _boolean("THINKING_ENABLED", "true") else "none"
 
 
+def _workspace_storage():
+    """Explicit Cloud trial storage; platform artifact ENV alone never enables it."""
+    backend = _env("WORKSPACE_STORAGE_TYPE", "posix")
+    if backend == "posix":
+        return None
+    if backend != "s3":
+        raise CoreError("CONFIG_INVALID", "WORKSPACE_STORAGE_TYPE must be posix or s3")
+    if (_env("CORE_AGENT_AUTH_MODE", "keycloak") != "cloudru"
+            or _env("CORE_AGENT_ENVIRONMENT") != "development"):
+        raise CoreError("CONFIG_INVALID", "S3 workspace storage requires Cloud.ru development profile")
+    settings = {}
+    for suffix in ("ENDPOINT_URL", "BUCKET", "REGION", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY"):
+        value = _env("WORKSPACE_S3_" + suffix) or _env("ARTIFACT_S3_" + suffix)
+        if not value:
+            raise CoreError("CONFIG_INVALID", "WORKSPACE_S3_" + suffix + " is required")
+        settings[suffix.lower()] = value
+    settings["session_token"] = _env("WORKSPACE_S3_SESSION_TOKEN") or None
+    settings["prefix"] = _env("WORKSPACE_S3_PREFIX", "core-agent")
+    settings["tenant_id"] = _env("CORE_AGENT_TENANT_ID")
+    for name, key, default, maximum in (
+        ("WORKSPACE_MAX_BYTES", "max_bytes", 100_000_000, 1_000_000_000),
+        ("WORKSPACE_MAX_FILES", "max_files", 10_000, 10_000),
+        ("WORKSPACE_S3_MAX_INFLIGHT", "max_inflight", 4, 16),
+    ):
+        value = _number(name, int, default=str(default))
+        if not 1 <= value <= maximum:
+            raise CoreError("CONFIG_INVALID", f"{name} must be between 1 and {maximum}")
+        settings[key] = value
+    return settings
+
+
 A2A_CAPABILITIES = frozenset(
     {"streaming", "push_notifications", "tool_calling", "multi_turn"}
 )
@@ -748,7 +779,8 @@ def _platform_mcp():
 
 def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
            material_review_store=None, guardrail_classifier=None, remote_registry=None,
-           response_files_enabled=False, sandbox_launcher, recovery_tenant_id=None):
+           response_files_enabled=False, sandbox_launcher, recovery_tenant_id=None,
+           workspace_storage=None):
     platform_mcp = _platform_mcp()
     servers = set(_csv("MCP_ALLOWED_SERVERS")) | {item["name"] for item in platform_mcp}
     remote_connections, remote_agents_configured, remote_agent_failures = (
@@ -1350,17 +1382,31 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         for other in roots[index + 1:]:
             if root == other or root in other.parents or other in root.parents:
                 raise CoreError("CONFIG_INVALID", "workspace and durable roots must not overlap")
-    snapshot_store = WorkspaceSnapshotStore(durable_value) if durable_value else None
+    snapshot_store = WorkspaceSnapshotStore(durable_value) if durable_value and workspace_storage is None else None
     base_snapshot = _env("LOCAL_BASE_SNAPSHOT") or None
     if base_snapshot and not snapshot_store:
         raise CoreError("CONFIG_INVALID", "base snapshot requires durable storage")
     if base_snapshot:
         snapshot_store.get(base_snapshot)
+    blob_store = None
+    if workspace_storage is not None:
+        from .s3_storage import S3BlobStore
+        from .s3_ledger import PostgresS3BlobStore
+
+        if not state["database"] or chat_root is None or not durable_value:
+            raise CoreError("CONFIG_INVALID", "S3 storage requires PostgreSQL, CHAT_WORKSPACE_ROOT and DURABLE_STORAGE_ROOT")
+        transport_settings = {key: value for key, value in workspace_storage.items() if key != "max_files"}
+        transport_settings["max_bytes"] = max(workspace_storage["max_bytes"],
+            _number("MAX_RESPONSE_SIZE", int, default="100000000"))
+        blob_store = PostgresS3BlobStore(state["database"], S3BlobStore(**transport_settings))
+        state["workspace_blob_store"] = blob_store
+        blob_store.check()
     artifact_store = (
         PostgresArtifactStore(
             state["database"],
             durable_value,
             max_bytes=_number("MAX_RESPONSE_SIZE", int, default="100000000"),
+            blob_store=blob_store,
         )
         if state["database"] and durable_value
         else InMemoryArtifactStore()
@@ -1379,10 +1425,20 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
             launcher=sandbox_launcher,
         )
     )
+    workspace_durability = None
+    if blob_store is not None:
+        from .workspace_durability import WorkspaceDurability
+        from .postgres_workspace import PostgresWorkspaceDurability
+
+        codec = WorkspaceDurability(sessions.backend.chats, blob_store,
+            max_bytes=workspace_storage["max_bytes"], max_files=workspace_storage["max_files"])
+        workspace_durability = PostgresWorkspaceDurability(state["database"], codec, sessions)
+        sessions.backend.workspace_durability = workspace_durability
     response_files_service = None
     if response_files_enabled:
         from .response_files import ResponseFileService
         response_files_service = ResponseFileService(sessions.backend.chats, artifact_store)
+        response_files_service.workspace_durability = workspace_durability
     state = state or _state()
     tools = ToolRuntime(
         registry,
@@ -1570,6 +1626,10 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                    if _boolean("A2A_STREAMING_ENABLED", "true") and "streaming" in _advertised_capabilities()
                    and getattr(model, "stream", True) else None),
     )
+    agent.workspace_durability = workspace_durability
+    agent.workspace_blob_store = blob_store
+    if workspace_durability is not None:
+        workspace_durability.log = agent._log
     agent._log(
         "startup.configuration",
         runtime_mode=runtime_mode,
@@ -1658,8 +1718,10 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
         cloud_auth = auth_settings is not None and auth_settings.mode == "cloudru"
         sandbox_backend = validate_backend(_env("SANDBOX_BACKEND", "bubblewrap"),
             cloud=cloud_auth, environment=environment)
+        workspace_storage = _workspace_storage()
         if cloud_auth:
-            diagnostics.emit("startup.storage", backend="temporary-posix", durable=False)
+            diagnostics.emit("startup.storage", backend="s3" if workspace_storage else "temporary-posix",
+                             durable=workspace_storage is not None)
         recovery_tenant_id = auth_settings.tenant if auth_settings else None
         if auth_settings and not _env("CHAT_WORKSPACE_ROOT", ""):
             raise CoreError("CONFIG_INVALID", "authenticated deployment requires CHAT_WORKSPACE_ROOT")
@@ -1712,7 +1774,8 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
                                       guardrail_classifier=guardrail_classifier,
                                       response_files_enabled=auth_settings is not None,
                                       sandbox_launcher=sandbox_launcher,
-                                      recovery_tenant_id=recovery_tenant_id)
+                                      recovery_tenant_id=recovery_tenant_id,
+                                      workspace_storage=workspace_storage)
         if auth_settings:
             agent.agent_settings_store = AgentSettingsStore(state["workflow"], push_key or None,
                 database=state["database"], deployment_mcp=agent.platform_mcp)
@@ -1725,8 +1788,12 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
             if sandbox_launcher is not None:
                 sandbox_launcher.close()
         finally:
-            if state["database"]:
-                state["database"].close()
+            try:
+                if state.get("workspace_blob_store") is not None:
+                    state["workspace_blob_store"].close()
+            finally:
+                if state["database"]:
+                    state["database"].close()
         raise
     push_config_store = None
     push_sender = None
@@ -2009,11 +2076,17 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
                     if file_service is not None:
                         file_service.close()
             finally:
-                telemetry.shutdown()
-                if state["database"]:
-                    state["database"].close()
-                for owned in state["owned_databases"]:
-                    owned.close()
+                try:
+                    telemetry.shutdown()
+                finally:
+                    try:
+                        if agent.workspace_blob_store is not None:
+                            agent.workspace_blob_store.close()
+                    finally:
+                        if state["database"]:
+                            state["database"].close()
+                        for owned in state["owned_databases"]:
+                            owned.close()
 
     task_store = state["tasks"] or ScopedMemoryTaskStore(
         workflow_store=state["workflow"], task_scheduler=agent.task_scheduler,
@@ -2034,7 +2107,9 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
             files_store = (PostgresChatFileStore(state["database"], state["workflow"])
                            if state["database"] else MemoryChatFileStore(state["workflow"], admission.validate_workspace_scope))
             file_service = ChatFileService(files_store, agent.tool_runtime.environment_manager.backend.chats,
-                protected_inputs_enabled=getattr(sandbox_launcher, "isolation_level", None) != "landlock")
+                protected_inputs_enabled=getattr(sandbox_launcher, "isolation_level", None) != "landlock",
+                blob_store=agent.workspace_blob_store)
+            file_service.workspace_durability = agent.workspace_durability
             agent.chat_file_service = file_service
             agent.task_scheduler.chat_file_service = file_service
             if agent.remote_registry is not None:

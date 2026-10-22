@@ -20,6 +20,7 @@ from .tasks import (
     _remote_context_key, _remote_context_matches, _remote_context_unknown, _remote_context_checkpoint,
 )
 from .workflow import SuspendedRun
+from .response_files import with_prefetched_artifacts
 from .peer_conversations import merge_observation, OBSERVATION_TTL
 
 
@@ -174,25 +175,30 @@ class PostgresTaskScheduler:
             return _remote_reply_status(row["checkpoint"], input_id, row["state"], row["cancel_requested"], self._remote_now(connection))
 
     def queue_remote_reply(self, task_id, reply, *, owner_id, tenant_id, admission=None):
-        with self.database.transaction() as connection:
-            row = connection.execute("""SELECT * FROM core_background_tasks
-                WHERE id=%s AND tenant_id=%s AND owner_run_id=%s AND kind=%s FOR UPDATE""",
-                (task_id, tenant_id, owner_id, REMOTE_KIND)).fetchone()
-            if row is None:
-                raise CoreError("TASK_NOT_FOUND")
-            now = self._remote_now(connection)
-            checkpoint, changed = _queue_remote_reply(row["contract"], row["checkpoint"], row["state"],
-                                                     row["cancel_requested"], now, reply)
-            if admission is not None:
-                admission(connection)
+        def commit_reply():
+            with self.database.transaction() as connection:
+                row = connection.execute("""SELECT * FROM core_background_tasks
+                    WHERE id=%s AND tenant_id=%s AND owner_run_id=%s AND kind=%s FOR UPDATE""",
+                    (task_id, tenant_id, owner_id, REMOTE_KIND)).fetchone()
+                if row is None:
+                    raise CoreError("TASK_NOT_FOUND")
                 now = self._remote_now(connection)
                 checkpoint, changed = _queue_remote_reply(row["contract"], row["checkpoint"], row["state"],
                                                          row["cancel_requested"], now, reply)
-            if changed:
-                result = {key: value for key, value in (row["result"] or {}).items() if key not in {"input_id", "question"}}
-                row = connection.execute("""UPDATE core_background_tasks SET checkpoint=%s, result=%s,
-                    revision=revision+1, updated_at=%s WHERE id=%s AND tenant_id=%s RETURNING *""",
-                    (Jsonb(checkpoint), Jsonb(result), now, task_id, tenant_id)).fetchone()
+                if admission is not None:
+                    admission(connection)
+                    now = self._remote_now(connection)
+                    checkpoint, changed = _queue_remote_reply(row["contract"], row["checkpoint"], row["state"],
+                                                             row["cancel_requested"], now, reply)
+                if changed:
+                    result = {key: value for key, value in (row["result"] or {}).items() if key not in {"input_id", "question"}}
+                    row = connection.execute("""UPDATE core_background_tasks SET checkpoint=%s, result=%s,
+                        revision=revision+1, updated_at=%s WHERE id=%s AND tenant_id=%s RETURNING *""",
+                        (Jsonb(checkpoint), Jsonb(result), now, task_id, tenant_id)).fetchone()
+            return row, changed
+
+        row, changed = with_prefetched_artifacts(
+            getattr(self.database, "response_files_service", None), commit_reply)
         if changed:
             self._notify_remote(task_id)
         return self._task(row)
@@ -560,31 +566,36 @@ class PostgresTaskScheduler:
                 "span_id": linked_context.span_id,
                 "trace_flags": linked_context.trace_flags,
             }
-        with self.database.transaction() as connection:
-            connection.execute(
-                """INSERT INTO core_background_tasks
-                   (id, owner_run_id, tenant_id, kind, state, required,
-                    recoverable, contract, mutating, created_at, updated_at, checkpoint)
-                   VALUES (%s, %s, %s, %s, 'submitted', %s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    task.id,
-                    owner_id,
-                    tenant_id,
-                    kind,
-                    required,
-                    recoverable,
-                    Jsonb(_value(stored_contract)),
-                    bool(mutating),
-                    now,
-                    now,
-                    Jsonb(_initial_remote_checkpoint(contract)) if kind == REMOTE_KIND else None,
-                ),
-            )
-            if admission is not None:
-                admission(connection)
-            initial_claim = self._claim(
-                task.id, tenant_id, allow_working=False, connection=connection
-            )
+        def commit_admission():
+            with self.database.transaction() as connection:
+                connection.execute(
+                    """INSERT INTO core_background_tasks
+                       (id, owner_run_id, tenant_id, kind, state, required,
+                        recoverable, contract, mutating, created_at, updated_at, checkpoint)
+                       VALUES (%s, %s, %s, %s, 'submitted', %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        task.id,
+                        owner_id,
+                        tenant_id,
+                        kind,
+                        required,
+                        recoverable,
+                        Jsonb(_value(stored_contract)),
+                        bool(mutating),
+                        now,
+                        now,
+                        Jsonb(_initial_remote_checkpoint(contract)) if kind == REMOTE_KIND else None,
+                    ),
+                )
+                if admission is not None:
+                    admission(connection)
+                initial_claim = self._claim(
+                    task.id, tenant_id, allow_working=False, connection=connection
+                )
+            return initial_claim
+
+        initial_claim = with_prefetched_artifacts(
+            getattr(self.database, "response_files_service", None), commit_admission)
         if on_cancel is not None:
             with self._lock:
                 self._cancel_callbacks[(tenant_id, task.id)] = on_cancel

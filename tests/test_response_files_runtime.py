@@ -94,6 +94,8 @@ class ResponseFilesRuntimeTests(AuthAppTestCase):
                                                self.choose(["../escape"], "bad"))
         self.assertEqual([entry["name"] for entry in result.outgoing_files], ["safe.txt"])
         self.assertIn("INVALID_FILE_PATH", self.model.calls[-1].context)
+        self.assertIn("relative workspace paths", self.model.calls[-1].context)
+        self.assertIn("reports/report.pdf", self.model.calls[-1].context)
         cleared, record = await self.selection(self.choose([], "clear"))
         self.assertEqual(cleared.outgoing_files, ())
         self.assertFalse(record.result.get("outgoing_files"))

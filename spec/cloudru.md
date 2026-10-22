@@ -158,12 +158,31 @@ Owner Tasks, owner-private вопросы/ответы, HITL, settings, private 
 запрос возвращает прежнюю Task, изменённый payload даёт существующий конфликт.
 Разные platform keys не создают разные dedup namespaces.
 
-## CLD-04. Планируемое полное хранилище
+## CLD-04. Хранилище и этап проверки durability
 
 Полный Cloud.ru release требует PostgreSQL для state/manifests/receipts, S3
 через SDK для immutable bytes и ограниченный RAM/POSIX cache для `/workspace`.
-Прямая работа команд на S3 mount и FUSE не требуются. Storage implementation
-и его deployment variables остаются следующим этапом, не частью первого trial.
+Прямая работа команд на S3 mount и FUSE не требуются. Первый trial сохраняет
+временное POSIX-хранилище. Следующий этап включается явно через
+`WORKSPACE_STORAGE_TYPE=s3` только в Cloud.ru development profile с PostgreSQL;
+default `posix` сохраняет прежний режим. Ошибка S3 не включает временный fallback.
+`WORKSPACE_S3_ENDPOINT_URL`, `WORKSPACE_S3_BUCKET`, `WORKSPACE_S3_REGION`,
+`WORKSPACE_S3_ACCESS_KEY_ID`, `WORKSPACE_S3_SECRET_ACCESS_KEY` задают S3 connection;
+в этом режиме для отсутствующих значений допускаются платформенные
+`ARTIFACT_S3_*` с теми же suffix. `WORKSPACE_S3_SESSION_TOKEN` опционален,
+`WORKSPACE_S3_PREFIX` по умолчанию `core-agent`. Настройки не публикуют ключи
+в tools, browser, logs или sandbox; tenant namespace выводится из trusted
+deployment scope. Подпись запросов выполняет поддерживаемый S3 SDK.
+`WORKSPACE_MAX_BYTES` (default 100000000), `WORKSPACE_MAX_FILES` (default 10000)
+и `WORKSPACE_S3_MAX_INFLIGHT` (default 4) задают конечные положительные лимиты.
+Максимумы — 1000000000 bytes, 10000 entries и 16 одновременных S3 operations.
+Сумма восстановленных деревьев одного процесса ограничена двумя per-tree
+лимитами bytes/entries; исчерпание даёт явную ошибку до restore/checkpoint,
+без скрытого удаления файлов. Это cache budget, а не замена process/cgroup
+ограничений живых команд. Projection hydration сериализована с конечным
+таймаутом и ограничена четырьмя `MAX_RESPONSE_SIZE` bytes и 256 references.
+`DURABLE_STORAGE_ROOT` в этом режиме является локальным cache, а не источником
+постоянных bytes. Смена bucket/prefix/tenant не является автоматической миграцией.
 
 Target durability включает весь пользовательский проект: обычные и скрытые
 файлы, `.git`, каталоги/permissions, attachments, A2A-файлы, промежуточные
@@ -179,6 +198,12 @@ DB revision без пустого архива. Неизменный checkpoint 
 границах действий до объявления результата durable; изменение живым процессом
 нельзя выдавать за согласованный checkpoint. Неизвестная команда не replay-ится.
 
+Receipt запуска фоновой команды подтверждает запуск, а не snapshot живого
+дерева. Он сохраняется без snapshot; завершение фонового процесса и terminal
+cleanup проходят общий checkpoint barrier. Вложенный Python broker не снимает
+snapshot, пока родительский Python ещё может писать. Обычные lifecycle/model
+переходы не копируют дерево заново.
+
 Commit требует immutable bytes с digest/size и затем fenced DB reference под
 актуальными scope/lease/generation/revision, без S3 I/O под DB lock. Unknown PUT
 сверяется для того же object; незакреплённые bytes не доступны caller/model.
@@ -186,7 +211,51 @@ Restore с пустой FS проверяет paths/types/permissions/digests, �
 revision/tombstones, не воскрешает удалённое и не открывает соседние чаты.
 Finite RAM/tree/I/O limits и bounded GC не допускают тихих пропусков файлов,
 удаления referenced bytes или ложного успешного checkpoint. Эти требования
-остаются planned до полного regression proof по CLD-AC-07–10.
+проверяются локальными regression checks по CLD-AC-07–10; работа целевого
+Cloud.ru S3 и восстановление после реальной замены Pod требуют отдельного прогона.
+Storage events сообщают operation, outcome, размеры/количество и safe error code,
+но не credentials, signed URLs, имена или содержимое пользовательских файлов.
+
+Миграция схемы добавляет manifests и staging/GC ledger, не меняя прежние
+Task IDs, scopes или artifacts metadata. Она не переносит потерянные RAM bytes
+и не импортирует POSIX blobs автоматически: новый trial использует отдельный
+tenant/bucket prefix либо явно подготовленную миграцию. В S3-режиме входящие
+оригиналы сохраняются до подтверждения приёма: bounded decode → immutable PUT →
+atomic batch/Task/inbox reference в PostgreSQL. Сбой PUT не создаёт принятого
+сообщения. Private quarantine остаётся недоступной модели и sandbox; review и
+owner download читают original bytes с проверкой scope/digest/size, включая
+после потери локальной FS. Сетевое чтение не удерживает DB transaction/locks.
+Принятые и исключённые originals остаются referenced независимо от удаления
+или изменения рабочей копии. Незавершённый upload очищается bounded GC.
+
+После whole-batch allow рабочая копия публикуется вместе с workspace checkpoint
+и DB receipt. До этого модель не получает пути/содержимое. Сбой
+не оставляет незакреплённую копию доступной параллельным командам или tools
+публикации файлов. При неизвестном исходе DB commit локальные starts, capture
+и checkpoints блокируются до сверки receipt; подтверждённая публикация
+сохраняет копию, неподтверждённая убирает её под общим локальным lock.
+Повтор после сбоя использует тот же batch; уже опубликованная рабочая копия восстанавливается
+только из текущего workspace manifest, без перезаписи изменений и воскрешения
+удалений из оригинала. До публикации проверяются bytes/entries рабочего дерева
+и общий resident budget, включая служебный manifest и родительские каталоги.
+Исчерпание сохраняет pending delivery без частичной публикации.
+Bounded original reads используют временные private каталоги, удаляемые после
+чтения. Durable lease резервирует не более одного такого каталога на tenant;
+после сбоя истёкшая 300-секундная lease позволяет bounded sweep убрать остаток
+до следующего чтения. Пока прежняя lease жива, новое чтение получает retryable
+storage error. Legacy batches без S3 references не мигрируют
+автоматически и не объявляются durable. Target Cloud S3 и настоящая замена Pod
+остаются отдельным release gate.
+
+GC удаляет только unreferenced bytes после минимум 24 часов. PUT intent и
+lease записываются до сетевой операции; manifest/artifact pin проверяется в
+транзакции публикации. Каждая повторная incarnation digest имеет отдельный
+object generation: запоздавший DELETE не удаляет новое содержимое. Bounded
+проходы по 100 записей сохраняют tombstones для неизвестных поздних PUT.
+Owner cleanup атомарно изменяет manifest и receipt. После потери RAM journal
+сохранённый intent завершается только на пустом локальном cache и при совпадении
+immutable digest/size/mode/mtime выбранного файла; изменившийся файл сохраняется.
+Неизвестные/повреждённые intents сохраняют admission barrier.
 
 ## CLD-05. Исполнение и восстановление
 
@@ -276,8 +345,14 @@ xattr, inotify и операции сигналов чужим процесса�
 Обычные созданные агентом файлы и прежние writable A2A файлы в `a2a/`
 сохраняют свой контракт. Нельзя имитировать read-only вложения через `chmod`,
 переписывание `open` или широкое разрешение записи в parent workspace.
-Bubblewrap сохраняет прежнюю поддержку read-only attachments. Снятие этого
-ограничения требует отдельной согласованной схемы хранения и regression proof.
+Bubblewrap сохраняет прежнюю поддержку read-only attachments.
+
+Исключение для явного S3-режима: новые owner uploads сохраняют закрытый
+неизменяемый original по CLD-04, а после allow получают writable рабочую копию
+в `inputs/<batch>/`. В A2A сохраняется `a2a/`. Это не read-only mount: агент
+может менять/удалять копию, но не original. Default POSIX и старые batches
+в `attachments/` по-прежнему запрещены Landlock; они не превращаются в mutable
+копии автоматически. Snapshot/receipt сохраняют редактирование копий при recovery.
 
 Сеть доступна только proxy-aware HTTP/HTTPS клиентам через доверенный
 посредник. Seccomp запрещает прямое создание/подключение сетевых и Unix sockets,

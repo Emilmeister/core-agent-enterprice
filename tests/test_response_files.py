@@ -169,10 +169,13 @@ class ResponseFileContract:
     def test_invalid_paths_and_nonregular_sources_preserve_old_set(self):
         source = self.write("valid", b"original")
         old = self.prepare(["valid"])
-        for paths in (["/etc/passwd"], ["https://example.com/a"], ["../valid"], ["a//b"],
+        for paths in (["/etc/passwd"], ["/workspace/valid"], ["https://example.com/a"], ["../valid"], ["a//b"],
                       ["a/./b"], ["a\\b"], ["\0"], ["a\nb"], [""], [123], ["valid", "valid"]):
             with self.subTest(paths=paths), patch.object(self.store, "put", wraps=self.store.put) as put:
-                self.assert_code("INVALID_FILE_PATH", lambda: self.prepare(paths))
+                error = self.assert_code("INVALID_FILE_PATH", lambda: self.prepare(paths))
+                self.assertIn("relative workspace paths", error.message)
+                self.assertIn("reports/report.pdf", error.message)
+                self.assertNotIn(str(self.workspace), error.message)
                 put.assert_not_called()
         (self.workspace / "folder").mkdir()
         (self.workspace / "link").symlink_to(source)
