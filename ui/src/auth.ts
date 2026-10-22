@@ -90,13 +90,18 @@ export async function signIn(password?: string): Promise<Session> {
         cache: "no-store",
         redirect: "error",
       });
-      if (!login.ok)
+      if (!login.ok) {
+        const error = await login.json().catch(() => null);
         throw new LoginError(
-          login.status === 401 ? "Неверный пароль. Попробуйте снова."
+          login.status === 401
+            ? error?.error?.code === "AUTHENTICATION_REQUIRED"
+              ? "Неверный пароль. Попробуйте снова."
+              : "Платформа не авторизовала запрос входа. Проверьте, что ключ доступа передаётся во всех запросах к агенту."
             : login.status === 429 ? "Слишком много попыток входа. Подождите несколько минут."
               : "Не удалось войти. Попробуйте позже.",
           undefined, true,
         );
+      }
     }
     const identityResponse = await fetch("/api/identity", {
       credentials: "same-origin",

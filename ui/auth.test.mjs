@@ -9,6 +9,7 @@ const identity = {actor_id:"owner", role:"owner", tenant:"company"};
 const config = {auth_mode:"cloudru", external_a2a_url:"https://agent.test/a2a/external/"};
 const requests = [];
 let authenticated = false, unauthorized = false, logoutFails = false, redirected = "";
+let loginFailure;
 globalThis.location = {origin:"https://agent.test", replace: value => {redirected=value}};
 globalThis.localStorage = globalThis.sessionStorage = new Proxy({}, {get() {throw Error("No browser storage")}});
 globalThis.fetch = async (path, options={}) => {
@@ -21,8 +22,9 @@ globalThis.fetch = async (path, options={}) => {
   if (path === "/api/auth/login") {
     assert.equal(options.method, "POST");
     assert.equal(headers.get("Content-Type"), "application/json");
+    if (loginFailure) return loginFailure;
     authenticated = JSON.parse(options.body).password === "owner-password";
-    return Response.json({status:"ok"}, {status:authenticated ? 200 : 401});
+    return Response.json(authenticated ? {status:"ok"} : {error:{code:"AUTHENTICATION_REQUIRED"}}, {status:authenticated ? 200 : 401});
   }
   if (path === "/api/identity") return Response.json(identity, {status:authenticated ? 200 : 401});
   if (path === "/api/auth/logout") {
@@ -38,7 +40,15 @@ globalThis.fetch = async (path, options={}) => {
 };
 await assert.rejects(signIn(), error => error.passwordRequired === true);
 assert.deepEqual(requests.map(row => row.path), ["/ui/config", "/api/identity"]);
-await assert.rejects(signIn("wrong-password"), error => error.passwordRequired === true);
+await assert.rejects(signIn("wrong-password"), error => error.passwordRequired === true && error.message === "Неверный пароль. Попробуйте снова.");
+for (const response of [
+  Response.json({message:"Missing authorization in request"}, {status:401}),
+  new Response("Unauthorized", {status:401}),
+]) {
+  loginFailure = response;
+  await assert.rejects(signIn("owner-password"), error => error.passwordRequired === true && error.message === "Платформа не авторизовала запрос входа. Проверьте, что ключ доступа передаётся во всех запросах к агенту.");
+}
+loginFailure = undefined;
 const session = await signIn("owner-password");
 assert.equal(session.authMode, "cloudru");
 assert.deepEqual(session.identity, identity);
