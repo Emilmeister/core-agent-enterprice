@@ -288,6 +288,7 @@ class AuthBoundaryTests(AuthAppTestCase):
         self.assertEqual(owner.json()["role"], "owner")
         denied = await self.http.get("/api/identity", headers=self.headers("external-a"))
         self.assertEqual(denied.status_code, 403)
+
         for kind, token in (("owner", "owner-a"), ("external", "external-a")):
             card = await self.http.get(
                 f"/a2a/{kind}/.well-known/agent-card.json", headers=self.headers(token)
@@ -303,6 +304,17 @@ class AuthBoundaryTests(AuthAppTestCase):
         self.tokens["external-a"]["realm_access"]["roles"].append("agent-owner")
         denied = await self.http.get("/api/identity", headers=self.headers("external-a"))
         self.assertEqual(denied.status_code, 403)
+
+    async def test_keycloak_routes_keep_only_current_a2a_protocol(self):
+        for kind, token in (("owner", "owner-a"), ("external", "external-a")):
+            headers = {**self.headers(token), "A2A-Version": "0.3"}
+            rejected = await self.http.post(f"/a2a/{kind}/", headers=headers,
+                json={"jsonrpc": "2.0", "id": "legacy", "method": "tasks/get", "params": {"id": "missing"}})
+            self.assertEqual(rejected.json()["error"]["code"], -32601, rejected.text)
+            card = await self.http.get(f"/a2a/{kind}/.well-known/agent.json", headers=self.headers(token))
+            self.assertIn("supportedInterfaces", card.json())
+            self.assertNotIn("protocolVersion", card.json())
+        self.assertEqual(len(self.model.calls), 0)
 
     async def test_owner_shared_tasks_and_external_isolation_survive_token_replacement(self):
         external = await self.submit("external-a", "external-message", "external-chat")

@@ -250,7 +250,8 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/runtime.py` | Agent loop, workflow continuation, recovery, tool handlers и delegation |
 | `core_agent/config.py` | RunRequest, Platform/Agent/EffectiveConfig и capability intersection |
 | `core_agent/a2a.py` | Внутренние A2A contract types и Task representation |
-| `core_agent/a2a_sdk.py` | Official A2A SDK HTTP+JSON binding и request handler |
+| `core_agent/a2a_sdk.py` | Official A2A SDK JSON-RPC/HTTP+JSON bindings, request handler и version-specific Agent Cards |
+| `core_agent/a2a_compat.py` | Только Cloud external: SDK adapter 0.3, строгая версия и безопасные JSON-RPC/SSE ошибки |
 | `core_agent/model.py` | OpenAI-compatible/Anthropic adapters, streaming и tool wire payload |
 | `core_agent/structured_output.py` | Request-local reasoning policy для guardrails, summary и NER |
 | `core_agent/kernel.py` | Protected kernel, profile и skill instruction layers |
@@ -342,6 +343,12 @@ Target spec может описывать больше текущего runtime.
   `/a2a/owner/`, Keycloak root A2A закрыт. `GET/HEAD /` в Cloud.ru используют
   тот же readiness predicate, что `/health/ready`; `POST /` — JSON-RPC.
   Card и `/ui/config` используют configured origin без доверия forwarding headers.
+  Только Cloud external JSON-RPC допускает A2A 0.3 через официальный SDK:
+  общие handler/admission/stores и access/file/size checks, прежний 1.0 wire contract.
+  Canonical `agent-card.json` остаётся чистой 1.0; historical `agent.json` без
+  version header или с 0.3 отдаёт чистую 0.3 JSONRPC card, с `A2A-Version: 1.0`
+  — canonical 1.0; неизвестная explicit версия отклоняется. Owner/Keycloak
+  и HTTP+JSON сохраняют только 1.0, fields двух card versions не смешиваются.
   MCP берутся только из persisted UI settings. Platform `MCP_URL`/headers и
   retired `ARTIFACT_STORAGE_*`/`ARTIFACT_S3_*`/`ARTIFACT_MONGODB_*`/
   `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` не подключают backend или credentials;

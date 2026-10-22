@@ -173,11 +173,22 @@ Cloud API key; выдача/отзыв выполняются вручную в 
 external scope для известных Task IDs; перечисление Tasks закрыто, owner данные
 им недоступны.
 
-JSON-RPC принимает `POST /`; HTTP+JSON использует `/message:send`,
-`/message:stream` и `/tasks/...` от корня. Agent Card доступна по
-`/.well-known/agent-card.json` и `/.well-known/agent.json`; адрес в ней берётся
-из настроенного `AGENT_URL`. Прежний `/a2a/external/` работает как alias без
-redirect с тем же scope и дедупликацией. Owner A2A остаётся на `/a2a/owner/`;
+JSON-RPC принимает `POST /`: прежние методы 1.0 и исторические 0.3
+(`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`) через SDK adapter.
+Для legacy методов header можно опустить или передать `A2A-Version: 0.3`;
+методы 1.0 сохраняют прежние требования к версии. HTTP+JSON остаётся 1.0
+на `/message:send`, `/message:stream` и `/tasks/...` от корня.
+
+Карточки разделены: `/.well-known/agent-card.json` всегда имеет прежнюю
+схему 1.0, а `/.well-known/agent.json` без version header или с 0.3 — схему
+0.3 для встроенного чата Cloud.ru. Header `A2A-Version: 1.0` на историческом
+URL возвращает canonical карточку 1.0; неподдержанная explicit версия отклоняется.
+Клиенту 1.0 на старом URL нужно указать header либо перейти на canonical URL.
+Адрес берётся из `AGENT_URL`, query parameters не выбирают версию.
+
+Прежний `/a2a/external/` работает как alias без redirect с теми же правилами
+версий, scope и дедупликацией: смена версии или пути не создаёт новую задачу
+для того же Message. Owner A2A остаётся на `/a2a/owner/` с протоколом 1.0;
 owner cookie не расширяет права внешних вызовов через корень или alias.
 
 `GET /` и `HEAD /` используют ту же проверку готовности, что `/health/ready`:

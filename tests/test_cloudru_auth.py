@@ -1,7 +1,9 @@
 """Cloud.ru owner sessions and proxy external-scope acceptance proofs."""
 import asyncio
+import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -9,6 +11,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from a2a.compat.v0_3.types import AgentCard as LegacyAgentCard, Task as LegacyTask
+from a2a.types import AgentCard, Task
+from google.protobuf.json_format import ParseDict
 
 from core_agent.auth import AuthContextBuilder, AuthSettings, Principal
 from core_agent.app import _state
@@ -215,12 +220,251 @@ class CloudAuthTests(unittest.IsolatedAsyncioTestCase):
         await self.login()
         for name in ("agent-card.json", "agent.json"):
             card = await self.http.get("/.well-known/" + name, headers={
+                "A2A-Version": "1.0",
                 "Host": "attacker.invalid", "X-Forwarded-Host": "attacker.invalid",
                 "X-Forwarded-Proto": "http"})
             self.assertEqual(card.status_code, 200, card.text)
             self.assertEqual({item["url"] for item in card.json()["supportedInterfaces"]}, {ORIGIN})
             self.assertEqual(set(card.json()["securitySchemes"]), {"cloudruPlatform"})
             self.assertNotIn("attacker.invalid", card.text)
+
+    async def test_external_cards_keep_version_schemas_separate(self):
+        await self.login()
+        for prefix in ("", "/a2a/external"):
+            canonical = (await self.http.get(prefix + "/.well-known/agent-card.json")).json()
+            ParseDict(canonical, AgentCard(), ignore_unknown_fields=False)
+            self.assertEqual({(item["protocolBinding"], item["protocolVersion"])
+                              for item in canonical["supportedInterfaces"]},
+                             {("HTTP+JSON", "1.0"), ("JSONRPC", "1.0")})
+            for field in ("url", "preferredTransport", "protocolVersion", "additionalInterfaces"):
+                self.assertNotIn(field, canonical)
+            modern = await self.http.get(prefix + "/.well-known/agent.json", headers={"A2A-Version": "1.0"})
+            self.assertEqual(modern.json(), canonical)
+            modern_patch = await self.http.get(prefix + "/.well-known/agent.json", headers={"A2A-Version": "1.0.0"})
+            self.assertEqual(modern_patch.json(), canonical)
+            for headers in ({}, {"A2A-Version": "0.3"}):
+                legacy = await self.http.get(prefix + "/.well-known/agent.json?agentId=platform-agent", headers=headers)
+                self.assertEqual(legacy.status_code, 200, legacy.text)
+                payload = legacy.json()
+                LegacyAgentCard.model_validate(payload, extra="forbid")
+                self.assertIn(payload["protocolVersion"], {"0.3", "0.3.0"})
+                self.assertEqual(payload["url"], ORIGIN + prefix)
+                self.assertEqual(payload["preferredTransport"], "JSONRPC")
+                self.assertEqual(set(payload["securitySchemes"]), {"cloudruPlatform"})
+                self.assertEqual(payload["securitySchemes"]["cloudruPlatform"]["type"], "http")
+                self.assertEqual(payload["security"], [{"cloudruPlatform": []}])
+                self.assertNotIn("supportedInterfaces", payload)
+                self.assertNotIn("securityRequirements", payload)
+                self.assertFalse(any(item["transport"] != "JSONRPC" for item in payload.get("additionalInterfaces", [])))
+            unsupported = await self.http.get(prefix + "/.well-known/agent.json", headers={"A2A-Version": "9.0"})
+            self.assertGreaterEqual(unsupported.status_code, 400, unsupported.text)
+        owner = await self.http.get("/a2a/owner/.well-known/agent.json")
+        ParseDict(owner.json(), AgentCard(), ignore_unknown_fields=False)
+        self.assertNotIn("protocolVersion", owner.json())
+
+    async def test_legacy_send_get_share_modern_dedup_and_context(self):
+        message_id = uuid.uuid4().hex
+        legacy_message = {"kind": "message", "messageId": message_id, "contextId": "compat-chat",
+                          "role": "user", "parts": [{"kind": "text", "text": "Remember compat-token-31"}]}
+        response = await self.http.post("/", json={"jsonrpc": "2.0", "id": "legacy", "method": "message/send",
+                                                  "params": {"message": legacy_message}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("result", response.json(), response.text)
+        task = response.json()["result"]
+        LegacyTask.model_validate(task, extra="forbid")
+        self.assertEqual((task["kind"], task["status"]["state"]), ("task", "completed"))
+        modern_message = {"messageId": message_id, "contextId": "compat-chat", "role": "ROLE_USER",
+                          "parts": [{"text": "Remember compat-token-31"}]}
+        duplicate = await self.http.post("/a2a/external/", headers={"A2A-Version": "1.0"},
+            json={"jsonrpc": "2.0", "id": "modern", "method": "SendMessage", "params": {"message": modern_message}})
+        self.assertEqual(duplicate.json()["result"]["task"]["id"], task["id"], duplicate.text)
+        self.assertEqual(len(self.app.state.core_agent.model.calls), 1)
+        for prefix in ("", "/a2a/external"):
+            known = await self.http.post(prefix + "/", headers={"A2A-Version": "0.3"},
+                json={"jsonrpc": "2.0", "id": "get", "method": "tasks/get", "params": {"id": task["id"]}})
+            self.assertEqual(known.json()["result"]["id"], task["id"], known.text)
+            LegacyTask.model_validate(known.json()["result"], extra="forbid")
+        modern_message.update(messageId=uuid.uuid4().hex, parts=[{"text": "Continue the same chat"}])
+        followup = await self.http.post("/message:send", headers={"A2A-Version": "1.0"}, json={"message": modern_message})
+        self.assertEqual(followup.status_code, 200, followup.text)
+        self.assertEqual(followup.json()["task"]["contextId"], task["contextId"])
+        self.assertNotEqual(followup.json()["task"]["id"], task["id"])
+        self.assertIn("compat-token-31", str(self.app.state.core_agent.model.calls[-1].context))
+
+    async def test_legacy_and_modern_streams_keep_distinct_wire_shapes(self):
+        for prefix, method, version, role, parts in (
+                ("", "message/stream", None, "user", [{"kind": "text", "text": "Reply"}]),
+                ("/a2a/external", "message/stream", "0.3", "user", [{"kind": "text", "text": "Reply"}]),
+                ("", "SendStreamingMessage", "1.0", "ROLE_USER", [{"text": "Reply"}])):
+            response = await self.http.post(prefix + "/", headers={"A2A-Version": version} if version else {},
+                json={"jsonrpc": "2.0", "id": "stream", "method": method,
+                      "params": {"message": {"messageId": uuid.uuid4().hex, "role": role, "parts": parts}}})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn("text/event-stream", response.headers["content-type"], response.text)
+            events = [json.loads(line[5:]) for line in response.text.splitlines() if line.startswith("data:")]
+            self.assertTrue(events, response.text)
+            self.assertFalse(any("error" in event for event in events), response.text)
+            results = [event["result"] for event in events]
+            if version == "1.0":
+                tasks = [result["task"] for result in results if "task" in result]
+                self.assertTrue(tasks, response.text)
+                ParseDict(tasks[0], Task(), ignore_unknown_fields=False)
+                self.assertTrue(all("kind" not in result for result in results))
+            else:
+                tasks = [result for result in results if result.get("kind") == "task"]
+                self.assertTrue(tasks, response.text)
+                LegacyTask.model_validate(tasks[0], extra="forbid")
+                self.assertTrue(all("task" not in result for result in results))
+            self.assertIn("verified", response.text)
+
+    async def test_legacy_calls_keep_external_scope_and_do_not_enable_owner_compatibility(self):
+        await self.login()
+        owner = await self.submit("owner", "private-owner-chat")
+        for prefix in ("", "/a2a/external"):
+            for method in ("tasks/get", "tasks/cancel", "tasks/resubscribe"):
+                denied = await self.http.post(prefix + "/", json={"jsonrpc": "2.0", "id": "private",
+                    "method": method, "params": {"id": owner["id"]}})
+                payload = (json.loads(next(line[5:] for line in denied.text.splitlines() if line.startswith("data:")))
+                           if method == "tasks/resubscribe" else denied.json())
+                self.assertEqual(payload["error"]["code"], -32001, denied.text)
+                self.assertNotIn("verified", denied.text)
+                self.assertNotIn("private-owner-chat", denied.text)
+        rejected = await self.http.post("/a2a/owner/", headers={"Origin": ORIGIN, "A2A-Version": "0.3"},
+            json={"jsonrpc": "2.0", "id": "owner", "method": "tasks/get", "params": {"id": owner["id"]}})
+        self.assertEqual(rejected.json()["error"]["code"], -32601, rejected.text)
+        self.assertEqual((await self.http.get("/api/identity")).json()["role"], "owner")
+        rest = await self.http.get("/tasks/" + owner["id"], headers={"A2A-Version": "0.3"})
+        self.assertGreaterEqual(rest.status_code, 400, rest.text)
+        self.http.cookies.clear()
+        self.assertEqual((await self.http.get("/api/identity", headers={"A2A-Version": "0.3"})).status_code, 401)
+
+    async def test_legacy_cancel_stops_active_task_and_modern_get_agrees(self):
+        started, release = threading.Event(), threading.Event()
+        agent = self.app.state.core_agent
+        generate = agent.model.generate
+
+        def waiting_model(**kwargs):
+            started.set()
+            release.wait(10)
+            return generate(**kwargs)
+
+        agent.model.generate = waiting_model
+        self.addCleanup(release.set)
+        created = await self.http.post("/", json={"jsonrpc": "2.0", "id": "start", "method": "message/send",
+            "params": {"configuration": {"blocking": False}, "message": {"messageId": uuid.uuid4().hex,
+                "contextId": "cancel-compat-chat", "role": "user", "parts": [{"kind": "text", "text": "Begin work"}]}}})
+        task = created.json()["result"]
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            signal_cancel = agent.signal_task_cancel
+
+            def release_on_cancellation(task_id):
+                signal_cancel(task_id)
+                release.set()
+
+            with patch.object(agent, "signal_task_cancel", side_effect=release_on_cancellation):
+                canceled = await self.http.post("/a2a/external/", json={"jsonrpc": "2.0", "id": "cancel",
+                    "method": "tasks/cancel", "params": {"id": task["id"]}})
+            result = canceled.json()["result"]
+            LegacyTask.model_validate(result, extra="forbid")
+            self.assertEqual((result["id"], result["contextId"], result["status"]["state"]),
+                             (task["id"], task["contextId"], "canceled"), canceled.text)
+            modern = await self.http.get("/tasks/" + task["id"], headers={"A2A-Version": "1.0"})
+            self.assertEqual(modern.status_code, 200, modern.text)
+            self.assertEqual((modern.json()["id"], modern.json()["contextId"], modern.json()["status"]["state"]),
+                             (task["id"], task["contextId"], "TASK_STATE_CANCELED"), modern.text)
+        finally:
+            release.set()
+
+    async def test_legacy_files_are_validated_before_decoding_or_admission(self):
+        for prefix in ("", "/a2a/external"):
+            for method in ("message/send", "message/stream"):
+                for file in ({"bytes": "YR==", "name": "private-name.txt"},
+                             {"uri": "https://private.example/secret", "name": "private-name.txt"}):
+                    response = await self.http.post(prefix + "/", json={"jsonrpc": "2.0", "id": "file",
+                        "method": method, "params": {"message": {"kind": "message", "messageId": uuid.uuid4().hex,
+                            "role": "user", "parts": [{"kind": "file", "file": file}]}}})
+                    self.assertIn("error", response.json(), response.text)
+                    self.assertEqual(response.json()["error"]["code"], -32602 if "bytes" in file else -32005, response.text)
+                    if "bytes" in file:
+                        self.assertIn("INVALID_FILE_ENCODING", response.text)
+                    self.assertNotIn("private-name", response.text)
+                    self.assertNotIn("private.example", response.text)
+        self.assertEqual(len(self.app.state.core_agent.model.calls), 0)
+
+    async def test_legacy_request_body_keeps_deployment_limit(self):
+        with patch.dict(os.environ, {"A2A_MAX_REQUEST_BYTES": "524288"}):
+            app = self.make_app()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN) as http:
+            for prefix in ("", "/a2a/external"):
+                response = await http.post(prefix + "/", json={"jsonrpc": "2.0", "id": "oversized",
+                    "method": "message/send", "params": {"message": {"messageId": uuid.uuid4().hex,
+                        "role": "user", "parts": [{"kind": "text", "text": "x" * 524288}]}}})
+                self.assertEqual(response.json()["error"]["code"], -32602, response.text)
+                self.assertIn("REQUEST_TOO_LARGE", response.text)
+        self.assertEqual(len(app.state.core_agent.model.calls), 0)
+
+    async def test_legacy_explicit_version_rejection_and_patch_version_support(self):
+        request = {"jsonrpc": "2.0", "id": "version", "method": "message/send", "params": {
+            "message": {"messageId": uuid.uuid4().hex, "role": "user", "parts": [{"kind": "text", "text": "Reply"}]}}}
+        for headers in ({"A2A-Version": "1.0"}, {"A2A-Version": "0.4"},
+                        [("A2A-Version", "0.3"), ("A2A-Version", "0.3")]):
+            rejected = await self.http.post("/", headers=headers, json=request)
+            self.assertIn("error", rejected.json(), rejected.text)
+            self.assertEqual(rejected.json()["error"]["code"], -32009, rejected.text)
+        self.assertEqual(len(self.app.state.core_agent.model.calls), 0)
+        accepted = await self.http.post("/", headers={"A2A-Version": "0.3.0"}, json=request)
+        self.assertEqual(accepted.json()["result"]["status"]["state"], "completed", accepted.text)
+        self.assertEqual(len(self.app.state.core_agent.model.calls), 1)
+
+    async def test_legacy_schema_errors_do_not_echo_input_in_response_or_logs(self):
+        secret = "private-legacy-schema-sentinel"
+        for method in ("message/send", "message/stream"):
+            with self.assertLogs(level="DEBUG") as logs:
+                response = await self.http.post("/", json={"jsonrpc": "2.0", "id": "invalid", "method": method,
+                    "params": {"message": {"messageId": uuid.uuid4().hex, "role": secret,
+                        "parts": [{"kind": "text", "text": secret}]}}})
+            self.assertEqual(response.json()["error"]["code"], -32602, response.text)
+            self.assertNotIn(secret, response.text)
+            self.assertNotIn(secret, "\n".join(logs.output))
+        self.assertEqual(len(self.app.state.core_agent.model.calls), 0)
+
+    async def test_legacy_unexpected_errors_are_safe_for_json_and_sse(self):
+        secret = "private-legacy-error-sentinel"
+        handler = self.app.state.a2a_request_handler
+
+        async def broken_stream(*_args, **_kwargs):
+            raise RuntimeError(secret)
+            yield  # An async iterator that fails before its first event.
+
+        for method in ("tasks/get", "tasks/resubscribe"):
+            target = "on_get_task" if method == "tasks/get" else "on_subscribe_to_task"
+            failure = {"side_effect": RuntimeError(secret)} if method == "tasks/get" else {"new": broken_stream}
+            with patch.object(handler, target, **failure), self.assertLogs(level="DEBUG") as logs:
+                response = await self.http.post("/", json={"jsonrpc": "2.0", "id": "failure",
+                    "method": method, "params": {"id": "missing"}})
+            payload = (json.loads(next(line[5:] for line in response.text.splitlines() if line.startswith("data:")))
+                       if method == "tasks/resubscribe" else response.json())
+            self.assertEqual(payload["error"]["code"], -32603, response.text)
+            self.assertEqual(payload["error"]["message"], "Internal error", response.text)
+            self.assertNotIn(secret, response.text)
+            self.assertNotIn(secret, "\n".join(logs.output))
+
+    async def test_legacy_raw_file_shares_modern_admission_and_dedup(self):
+        message_id = uuid.uuid4().hex
+        legacy = await self.http.post("/", json={"jsonrpc": "2.0", "id": "file", "method": "message/send", "params": {
+            "message": {"messageId": message_id, "role": "user", "contextId": "file-chat", "parts": [
+                {"kind": "text", "text": "Keep attached file"},
+                {"kind": "file", "file": {"name": "hello.txt", "mimeType": "text/plain", "bytes": "aGVsbG8="}}]}}})
+        self.assertIn("result", legacy.json(), legacy.text)
+        task = legacy.json()["result"]
+        modern = await self.http.post("/message:send", headers={"A2A-Version": "1.0"}, json={
+            "message": {"messageId": message_id, "role": "ROLE_USER", "contextId": "file-chat", "parts": [
+                {"text": "Keep attached file"}, {"filename": "hello.txt", "mediaType": "text/plain", "raw": "aGVsbG8="}]}})
+        self.assertEqual(modern.json()["task"]["id"], task["id"], modern.text)
+        files = list(Path(self.temp.name, "chats").rglob("hello.txt"))
+        self.assertTrue(files)
+        self.assertTrue(all(file.read_bytes() == b"hello" for file in files))
 
     async def test_platform_mcp_urls_and_headers_never_seed_connections_or_owner_settings(self):
         for headers in ('{"Authorization":"Bearer platform-mcp-secret"}', "not-valid-json"):
@@ -261,7 +505,7 @@ class CloudAuthTests(unittest.IsolatedAsyncioTestCase):
         await self.login()
         for path in ("agent-card.json", "agent.json"):
             owner = await self.http.get("/a2a/owner/.well-known/" + path)
-            external = await self.http.get("/a2a/external/.well-known/" + path)
+            external = await self.http.get("/a2a/external/.well-known/" + path, headers={"A2A-Version": "1.0"})
             self.assertEqual(owner.status_code, 200, owner.text)
             self.assertEqual(external.status_code, 200, external.text)
             self.assertNotIn("keycloak", owner.text.lower())

@@ -11,6 +11,7 @@ from google.protobuf import json_format
 from google.protobuf.struct_pb2 import Value
 
 from a2a.server.agent_execution import AgentExecutor
+from a2a.compat.v0_3.conversions import to_compat_agent_card
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.jsonrpc_models import JSONRPCError
 from a2a.server.request_handlers.response_helpers import EXCEPTION_MAP
@@ -67,6 +68,7 @@ from .a2a import (
 from .auth import AuthenticatedCallContext, OWNER_SCOPE, Principal, ScopeUser, is_company_owner
 from .cloudru_auth import COOKIE_NAME
 from .a2a_input import input_error_response, protect_sdk_logs, read_input, request_limit
+from .a2a_compat import CloudJSONRPC03Adapter, cloud_a2a_version
 from .database import (REMOTE_PROGRESS_KEY, _has_response_files, public_artifact_parts, public_sdk_message,
                        reconcile_remote_progress, reconcile_workflow_task)
 from .errors import CoreError
@@ -461,13 +463,18 @@ def _strip_envelope(payload):
     return {name: payload[name] for name in payload if name not in extra}
 
 
-def _input_guard(endpoint, limit, *, rpc):
+def _input_guard(endpoint, limit, *, rpc, legacy_adapter=None):
     async def wrapper(request):
         try:
-            body, payload = await read_input(request, limit, rpc=rpc)
+            body, payload = await read_input(request, limit, rpc=rpc, allow_legacy=legacy_adapter is not None)
         except A2AError as error:
             return input_error_response(error, rpc=rpc, request_id=getattr(error, "request_id", None))
         cleaned = _strip_envelope(payload) if rpc else payload
+        if (legacy_adapter is not None and isinstance(cleaned, dict)
+                and isinstance(cleaned.get("method"), str)
+                and legacy_adapter.supports_method(cleaned["method"])):
+            return await legacy_adapter.handle_request(
+                cleaned.get("id"), cleaned["method"], cleaned, request)
         if cleaned == payload:
             return await endpoint(Request(request.scope, _replay(body)))
         return await endpoint(
@@ -496,7 +503,7 @@ def _replay(body):
     return receive
 
 
-def _agent_card_routes(sdk_card, *, derive_base_url, card_skills=None):
+def _agent_card_routes(sdk_card, *, derive_base_url, card_skills=None, legacy_discovery=False):
     """Serve the card on the canonical and the historical path.
 
     Registries written before the card was renamed still probe the historical
@@ -532,6 +539,23 @@ def _agent_card_routes(sdk_card, *, derive_base_url, card_skills=None):
             skills = [skill for skill in card.skills if skill.id in allowed]
             del card.skills[:]
             card.skills.extend(skills)
+        if legacy_discovery and request.url.path.endswith(LEGACY_AGENT_CARD_PATH):
+            headers = {"Vary": "A2A-Version"}
+            try:
+                version = cloud_a2a_version(request)
+            except A2AError as error:
+                response = input_error_response(error, rpc=False)
+                response.headers.update(headers)
+                return response
+            if version == "0.3":
+                legacy = SdkAgentCard()
+                legacy.CopyFrom(card)
+                url = next(item.url for item in legacy.supported_interfaces if item.protocol_binding == "JSONRPC")
+                del legacy.supported_interfaces[:]
+                legacy.supported_interfaces.add(url=url, protocol_binding="JSONRPC", protocol_version="0.3")
+                return JSONResponse(to_compat_agent_card(legacy).model_dump(
+                    mode="json", by_alias=True, exclude_none=True), headers=headers)
+            return JSONResponse(json_format.MessageToDict(card), headers=headers)
         return JSONResponse(json_format.MessageToDict(card))
 
     return [
@@ -1315,6 +1339,7 @@ def build_starlette_app(
     streaming_enabled=True,
     max_chunk_size=0,
     reply_hub=None,
+    cloud_external_compat=False,
 ):
     """Build the official A2A 1.0 JSON-RPC and HTTP+JSON bindings around the runtime."""
     limit = request_limit()
@@ -1341,15 +1366,17 @@ def build_starlette_app(
         admission_cleanup=admission_cleanup,
         reply_hub=reply_hub,
     )
+    def rpc_routes(legacy_adapter=None):
+        entries = create_jsonrpc_routes(request_handler, DEFAULT_RPC_URL, context_builder=context_builder)
+        for route in entries:
+            route.endpoint = _input_guard(route.endpoint, limit, rpc=True, legacy_adapter=legacy_adapter)
+            route.app = request_response(route.endpoint)
+        return entries
+
     routes = _agent_card_routes(sdk_card, derive_base_url=derive_base_url, card_skills=card_skills)
-    for route in create_jsonrpc_routes(
-        request_handler, DEFAULT_RPC_URL, context_builder=context_builder
-    ):
-        # A client that also repeats a field outside `params` must not be rejected.
-        route.endpoint = _input_guard(route.endpoint, limit, rpc=True)
-        route.app = request_response(route.endpoint)
-        routes.append(route)
-    for route in create_rest_routes(request_handler, context_builder=context_builder):
+    routes.extend(rpc_routes())
+    rest_routes = create_rest_routes(request_handler, context_builder=context_builder)
+    for route in rest_routes:
         if route.path in {"/message:send", "/message:stream"}:
             route.endpoint = _input_guard(route.endpoint, limit, rpc=False)
             route.app = request_response(route.endpoint)
@@ -1379,4 +1406,11 @@ def build_starlette_app(
 
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.a2a_request_handler = request_handler
+    if cloud_external_compat:
+        app.state.external_a2a_routes = [
+            *_agent_card_routes(sdk_card, derive_base_url=derive_base_url,
+                                card_skills=card_skills, legacy_discovery=True),
+            *rpc_routes(CloudJSONRPC03Adapter(request_handler, context_builder)),
+            *rest_routes,
+        ]
     return app

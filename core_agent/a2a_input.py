@@ -81,6 +81,8 @@ def protect_sdk_logs():
     for name in (
         "a2a.server.routes.jsonrpc_dispatcher",
         "a2a.server.routes.rest_dispatcher",
+        "a2a.compat.v0_3.jsonrpc_adapter",
+        "a2a.compat.v0_3.request_handler",
         "a2a.server.request_handlers.default_request_handler_v2",
         "a2a.server.agent_execution.active_task",
         "a2a.server.events.event_queue_v2",
@@ -127,19 +129,29 @@ def _decode_raw(raw):
     return decoded
 
 
-def _validate_files(message):
+def _validate_files(message, *, legacy=False):
     if not isinstance(message, dict) or not isinstance(message.get("parts"), list):
         return  # The SDK retains responsibility for the public message schema.
     for part in message["parts"]:
-        if not isinstance(part, dict) or "raw" not in part:
+        if not isinstance(part, dict):
+            continue
+        source = part.get("file") if legacy else part
+        key = "bytes" if legacy else "raw"
+        if not isinstance(source, dict):
+            continue
+        if legacy and "uri" in source:
+            if "bytes" in source:
+                raise InvalidParamsError("File must have a single content source", data={"code": "INVALID_FILE_INPUT"})
+            raise ContentTypeNotSupportedError("File URLs are not supported")
+        if key not in source:
             continue
         try:
-            _decode_raw(part["raw"])
+            _decode_raw(source[key])
         except (ValueError, binascii.Error):
             raise InvalidParamsError("File bytes require canonical standard base64", data={"code": "INVALID_FILE_ENCODING"}) from None
 
 
-async def read_input(request, limit, *, rpc):
+async def read_input(request, limit, *, rpc, allow_legacy=False):
     encodings = request.headers.getlist("content-encoding")
     if any(encoding.strip().lower() != "identity" for encoding in encodings):
         raise ContentTypeNotSupportedError(data={"code": "CONTENT_TYPE_NOT_SUPPORTED"})
@@ -164,12 +176,14 @@ async def read_input(request, limit, *, rpc):
     if rpc:
         envelopes = payload if isinstance(payload, list) else [payload]
         for envelope in envelopes:
+            legacy = (allow_legacy and isinstance(envelope, dict)
+                      and envelope.get("method") in ("message/send", "message/stream"))
             if (isinstance(envelope, dict) and isinstance(envelope.get("method"), str)
-                    and envelope["method"] in {"SendMessage", "SendStreamingMessage"}):
+                    and (legacy or envelope["method"] in {"SendMessage", "SendStreamingMessage"})):
                 params = envelope.get("params")
                 if isinstance(params, dict):
                     try:
-                        _validate_files(params.get("message"))
+                        _validate_files(params.get("message"), legacy=legacy)
                     except A2AError as error:
                         request_id = envelope.get("id")
                         error.request_id = request_id if type(request_id) in {str, int} else None

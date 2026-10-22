@@ -2,8 +2,8 @@
 
 ## Cloud.ru: PostgreSQL, S3 и общий внешний scope
 
-CLD-AC-01–12 и CLD-AC-18 обязательны для production профиля [Cloud.ru](cloudru.md).
-Первый диагностический trial ограничен CLD-AC-01–06/13/18; явный
+CLD-AC-01–12 и CLD-AC-18–19 обязательны для production профиля [Cloud.ru](cloudru.md).
+Первый диагностический trial ограничен CLD-AC-01–06/13/18–19; явный
 Landlock development opt-in дополнительно требует CLD-AC-14–17. Он не закрывает
 S3 durability или live platform gates. Эти критерии уточняют
 Keycloak-specific ENT-AC-01/03, browser/provisioning ENT-AC-72/85 и способ
@@ -30,14 +30,15 @@ Landlock trial. Остальные security, policy и lifecycle guarantees со
 | CLD-AC-16 | HTTP и HTTPS CONNECT через proxy; direct IP/socket, UDP/Unix, unset proxy/NO_PROXY, запрещённый или mixed DNS answer, rebinding, redirect, IPv4/IPv6 и metadata/cluster targets; чужой broker | Разрешённый proxy-aware HTTP/HTTPS проходит только через доверенный FD injection и общий SandboxPolicy; все DNS answers и адрес реального connection проверяются; прямой сетевой обход и чужой broker закрыты; доступен только собственный bounded Python tools broker; finite proxy limits и отсутствие server credentials сохраняются; ошибки не включают direct network fallback |
 | CLD-AC-17 | Native Linux Landlock terminal/Python/background/nested calls: fork/orphan, setsid/setpgid, signal/ptrace/process-fd escape, timeout/cancel/normal exit, смерть supervisor и PID-1 приложения | Trusted subreaper и фиксированный PGID удерживают descendants; escape/воздействие на соседний execution запрещены; `sandbox_terminated` появляется только после подтверждённого полного cleanup; потеря supervisor не оставляет tree; неизвестный outcome сохраняет SIDE_EFFECT_UNKNOWN/reconciliation/no-replay; target Cloud Pod проходит тот же preflight и smoke, local/mock результат не закрывает deployment gate |
 | CLD-AC-18 | Cloud caller читает обе root Agent Cards, вызывает JSON-RPC и HTTP+JSON от корня, повторяет Message через `/a2a/external/`, передаёт owner cookie и поддельные forwarding headers; читает GET/HEAD `/` при исправном и unhealthy sandbox, отказе БД/schema; те же root A2A запросы в Keycloak | Root cards и `/ui/config` используют configured origin; alias работает без redirect через общие admission/stores и возвращает ту же Task либо прежний conflict, без повторного исполнения; owner cookie не повышает external authority, owner-private Task/API закрыты и listing запрещён на обоих входах/bindings; GET/HEAD `/` совпадают с `/health/ready` по 200/503, HEAD без body, POST остаётся A2A; owner/API/UI и `/health/live` сохраняют контракт, неизвестные/tenant alias paths и Keycloak root A2A закрыты |
+| CLD-AC-19 | Cloud external root/alias: JSON-RPC 0.3 Send/Get/Cancel/Stream и эквивалентный 1.0 Message, version headers, обе карточки с query/поддельными headers/owner cookie; те же legacy вызовы на owner, Keycloak и HTTP+JSON; malformed/oversized input и FileParts | Только external JSON-RPC принимает legacy wire format через официальный SDK; Task/context/admission/dedup общие, нормальные file/size/policy/access barriers сохранены, owner-private данные закрыты; методы/ответы/errors/SSE/files 1.0 не меняются; canonical card чистая 1.0, historical card без header или с 0.3 чистая 0.3 и только JSONRPC, с 1.0 идентична canonical; неподдержанная explicit version отклоняется; owner/Keycloak и HTTP+JSON не получают 0.3 совместимость |
 
 Поставка может реализовать подмножество только через явный [release profile](releases/v1.md); реализованное поведение не может противоречить этим критериям.
 
 ## A2A и публичный контракт
 
 - [ ] Core Agent публикует валидную Agent Card с protocol/binding versions, auth, media types, skills и capabilities.
-- [ ] Карточка доступна и по `/.well-known/agent-card.json`, и по историческому `/.well-known/agent.json`; оба пути возвращают идентичный документ, а query-параметры игнорируются.
-- [ ] Каждая объявленная в карточке пара binding/version принимается соответствующим endpoint: `JSONRPC` и `HTTP+JSON` отвечают на `1.0`, карточка не содержит пар, которых нет, и не содержит полей карточки A2A 0.3 (`url`, `preferredTransport`, `protocolVersion` верхнего уровня); методы JSON-RPC 0.3 (`message/send` и др.) не принимаются.
+- [ ] Карточка доступна и по `/.well-known/agent-card.json`, и по историческому `/.well-known/agent.json`; оба пути возвращают идентичный документ, кроме разделённого Cloud external discovery CLD-AC-19; query-параметры игнорируются.
+- [ ] Каждая объявленная в карточке пара binding/version принимается соответствующим endpoint: `JSONRPC` и `HTTP+JSON` отвечают на `1.0`, карточка не содержит пар, которых нет, и не содержит полей карточки A2A 0.3 (`url`, `preferredTransport`, `protocolVersion` верхнего уровня); методы JSON-RPC 0.3 (`message/send` и др.) не принимаются, кроме явно ограниченного Cloud external adapter CLD-AC-19 с отдельной legacy карточкой.
 - [ ] При заданном `AGENT_URL` карточка объявляет именно его, и никакой заголовок запроса это не меняет; `URL_AGENT` принимается как то же значение, а при обоих заданных выигрывает `AGENT_URL`.
 - [ ] Без `AGENT_URL` карточка объявляет адрес из `X-Forwarded-Proto`/`X-Forwarded-Host`, иначе из схемы и `Host`; непригодное значение отбрасывается, а запрос карточки всё равно завершается успешно.
 - [ ] Лишний член верхнего уровня JSON-RPC конверта не отклоняет запрос, не интерпретируется как session id и попадает в предупреждение с именами удалённых полей.

@@ -2109,6 +2109,7 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
             streaming_enabled=_boolean("A2A_STREAMING_ENABLED", "true")
             and "streaming" in advertised,
             reply_hub=agent.reply_hub,
+            cloud_external_compat=cloud_auth,
         )
 
         if auth_settings:
@@ -2117,6 +2118,8 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
             # Both entrances share the handler, stores, queues and application lifespan.
             # The SDK's caller-selected /{tenant} alias is not part of this deployment.
             routes = [route for route in app.routes if getattr(route, "path", None) != "/{tenant}"]
+            external_routes = ([route for route in app.state.external_a2a_routes if route.path != "/{tenant}"]
+                               if cloud_auth else routes)
 
             async def identity(request):
                 actor = request.scope["principal"]
@@ -2128,7 +2131,7 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
 
             app.routes[:] = [
                 Mount("/a2a/owner", routes=routes),
-                Mount("/a2a/external", routes=routes),
+                Mount("/a2a/external", routes=external_routes),
                 Route("/api/identity", identity),
                 *agent_settings_routes(agent, agent.agent_settings_store),
                 *owner_routes(agent, interaction_store, admission=admission, remote_registry=remote_registry_store,
@@ -2138,7 +2141,7 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
             if cloud_auth:
                 # Canonical Cloud endpoint; the prefixed alias shares the same
                 # handler, admission ledger and task store without redirects.
-                app.routes.extend(routes)
+                app.routes.extend(external_routes)
             if cloud_auth or auth_settings.ui_client_id:
                 async def ui_config(request):
                     invalid = bool(request.query_params)
@@ -2155,7 +2158,7 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
             app.routes.extend(static_routes)
             app.add_middleware(CloudAuthenticationMiddleware if cloud_auth else AuthenticationMiddleware,
                                authenticator=authenticator, public_paths=static_paths,
-                               **({"external_routes": routes} if cloud_auth else {}))
+                               **({"external_routes": external_routes} if cloud_auth else {}))
             app.state.authenticator = authenticator
             app.state.remote_registry_store = remote_registry_store
 

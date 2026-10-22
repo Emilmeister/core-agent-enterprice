@@ -85,8 +85,36 @@ JSON-RPC, а HTTP+JSON использует существующие точны�
 включая `/message:send`, `/message:stream` и `/tasks/...`. Agent Card доступна
 по `/.well-known/agent-card.json` и `/.well-known/agent.json`; оба пути
 объявляют trusted configured origin, без влияния `Host` или forwarding headers.
-Binding/protocol versions остаются заданными [A2A-контрактом](a2a-protocol.md).
+Основной binding/protocol contract остаётся [A2A `1.0`](a2a-protocol.md).
 Произвольные пути и SDK tenant alias не становятся внешними входами.
+
+Только внешний JSON-RPC от корня и его `/a2a/external/` alias дополнительно
+принимают исторические методы A2A `0.3` через compatibility adapter официального
+SDK. Они допускают отсутствие `A2A-Version` либо явную `0.3`; неверная явно
+заданная версия отклоняется. Методы `1.0`, HTTP+JSON, owner вход и Keycloak
+сохраняют прежний wire contract и version negotiation. Adapter преобразует
+legacy запрос до общего handler и его ответ/ошибки/SSE обратно в `0.3` только
+для этого запроса. Нет отдельного runtime, Task store или lifecycle; нормализованный
+Message проходит те же admission/dedup/context, scope, size limits, file validation
+и policy checks. Смена версии или входа не повторяет исполнение принятого Message.
+
+Discovery внешнего входа разделяет версии без смешивания полей:
+
+- `/.well-known/agent-card.json` сохраняет чистую карточку `1.0` и прежние
+  `supportedInterfaces`; legacy interfaces в неё не добавляются.
+- `/.well-known/agent.json` без заголовка версии либо с `A2A-Version: 0.3`
+  возвращает чистую SDK projection `0.3`, объявляющую только поддержанный
+  legacy JSON-RPC binding. С `A2A-Version: 1.0` возвращается та же карточка
+  `1.0`, что на canonical path. Другие явно заданные версии отклоняются.
+- Эти правила действуют и под external alias. Query parameters не выбирают
+  версию; trusted origin, auth schemes и актуальная фильтрация skills сохраняются.
+  Owner discovery и Keycloak карточки остаются прежними.
+
+Совместимость с историческим URL меняется явно: клиент `1.0`, читающий
+`agent.json` без version header, MUST перейти на `agent-card.json` либо передавать
+`A2A-Version: 1.0`. Новые поля не добавляются в ответы/ошибки/SSE `1.0`, старые
+поля не удаляются; legacy projection не меняет persisted state и не требует
+миграции Tasks или контекстов.
 
 Прежний `/a2a/external/` остаётся совместимым alias без redirect, с теми же
 handlers, stores, lifespan, admission и external principal. Повтор одного

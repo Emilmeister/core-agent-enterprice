@@ -10,7 +10,7 @@
 
 ## Cloud.ru: требования нового профиля
 
-Первый диагностический trial ограничен auth/UI/PostgreSQL и CLD-AC-13/18;
+Первый диагностический trial ограничен auth/UI/PostgreSQL и CLD-AC-13/18–19;
 для явного Landlock opt-in приняты дополнительные CLD-AC-14–17. Полный S3
 storage не входит в этот этап. Cloud.ru requirements приняты в
 [CLD-01–06](cloudru.md). Auth/PostgreSQL и diagnostics proofs входят в обычный
@@ -27,6 +27,7 @@ storage не входит в этот этап. Cloud.ru requirements приня
 | CLD-05 | Sandbox, recovery без replay, постоянно работающий worker | Existing sandbox/execution recovery suite; CLD-AC-10/11 в целевом Cloud Pod не выполнены | partial |
 | CLD-06 | Проверяемый перенос, совместимость и platform release gate | CLD-AC-12: live Cloud proxy/browser/DB/S3/idle evidence отсутствует | missing |
 | CLD-ROOT | Canonical root A2A, совместимый external alias и GET/HEAD readiness | CLD-AC-18: `tests.test_cloudru_auth.CloudAuthTests` и `PostgresCloudAuthTests` проверяют root/alias admission и dedup, внешний scope при owner cookie, trusted card URL и readiness failures; `tests.test_auth` проверяет закрытые root routes в Keycloak. Target Cloud ingress/restart ещё не проверены | partial |
+| CLD-A2A03 | Cloud external JSON-RPC 0.3 и раздельные карточки без изменения 1.0 | CLD-AC-19: `tests.test_cloudru_auth.CloudAuthTests` и `PostgresCloudAuthTests` проверяют раздельные card/SSE schemas, versions, send/get/cancel, общий context/dedup и raw-file admission, access/size/encoding barriers и безопасные ошибки; `tests.test_auth`, `tests.test_transfer_features` и real `tests.test_keycloak_integration` сохраняют 1.0 и owner/Keycloak contract. Target Cloud built-in chat ещё не проверен | partial |
 | CLD-LANDLOCK | Только Cloud development opt-in: non-root PID 1, Landlock ABI ≥ 4, строгий seccomp, proxy FD injection, pinned-FD metadata mediation, реальные пути, protected uploads disabled до admission/publication и execution с attachments denied, subreaper cleanup | CLD-AC-14–17: обязательны automated native proofs и real Cloud Pod preflight/terminal/Python/background smoke; наличие кода или diagnostic probes не подтверждает эти гарантии | missing |
 | CLD-TRIAL | Ограниченный запуск с RAM workspace и безопасными startup stages | `tests.test_startup_diagnostics.StartupDiagnosticsTests`: finite stages/failures, redaction, temporary storage, ignored retired ENV, opt-in, bounded Landlock ABI/filesystem, seccomp и namespace/Bubblewrap probes, timeout/child cleanup и событие `application_ready`; `tests.test_cloudru_auth` и CI `npm test` проверяют auth/UI. Полученные Cloud startup logs показывают успешную конфигурацию/БД и отказ Bubblewrap; результаты новых Landlock/seccomp probes целевого Pod ещё не получены. Эти probes не заменяют полный sandbox preflight; успешный sandbox/browser smoke целевого Cloud Pod отсутствует | partial |
 
