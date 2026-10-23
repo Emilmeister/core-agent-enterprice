@@ -8,7 +8,7 @@ from psycopg.types.json import Jsonb
 
 from .errors import CoreError
 from .workspace import WorkspaceBinding
-from .workspace_durability import prune_manifest
+from .workspace_durability import SNAPSHOT_INVALID_REASONS, prune_manifest
 
 
 class PostgresWorkspaceDurability:
@@ -25,8 +25,10 @@ class PostgresWorkspaceDurability:
         if self.log is None:
             return
         files = [entry for entry in (manifest or {}).get("entries", {}).values() if entry["type"] == "file"]
+        reason = error.data.get("reason") if error is not None and error.code == "WORKSPACE_SNAPSHOT_INVALID" else None
         self.log("workspace.storage", operation=operation, outcome="failed" if error else "succeeded",
                  file_count=len(files), bytes=sum(entry["size"] for entry in files),
+                 **({"reason": reason} if type(reason) is str and reason in SNAPSHOT_INVALID_REASONS else {}),
                  **({"error_code": error.code} if error else {}))
 
     def _capacity(self, binding, manifest):
@@ -55,7 +57,7 @@ class PostgresWorkspaceDurability:
             for index in range(1, len(parts) + 1):
                 parent = "/".join(parts[:index])
                 if parent in current and not stat.S_ISDIR(current[parent][2]):
-                    raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+                    raise CoreError("WORKSPACE_SNAPSHOT_INVALID", data={"reason": "manifest_parent"})
             if destination not in current:
                 added = self.codec._scan(directory)
                 if any(len(parts) + (len(path.split("/")) if path else 0) > self.codec.workspaces.depth_limit

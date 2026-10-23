@@ -213,6 +213,18 @@ cleanup проходят общий checkpoint barrier. Вложенный Pytho
 snapshot, пока родительский Python ещё может писать. Обычные lifecycle/model
 переходы не копируют дерево заново.
 
+Детерминированный отказ terminal checkpoint (`WORKSPACE_SNAPSHOT_INVALID` или
+`WORKSPACE_SNAPSHOT_LIMIT`) MUST NOT оставлять Task в бесконечном recovery.
+После подтверждённой остановки execution family обычный fenced terminal commit
+завершает её как `FAILED` с этим кодом вместо `COMPLETED`; уже выбранные
+`CANCELLED`, `REJECTED` или `ABORTED` и их причины сохраняются. Непринятый
+snapshot не публикуется, предыдущий manifest и ранее опубликованные результаты
+остаются доступны. Принятый inbox получает прежнюю failure/cancel disposition;
+модель и команды не вызываются повторно. Это правило применяется и к terminal
+intent, сохранённому прежней версией приложения. Cleanup, lease/CAS и проверка
+неизвестного исхода публикации остаются обязательными; временная ошибка S3
+или изменяющееся дерево не считаются детерминированным отказом.
+
 Commit требует immutable bytes с digest/size и затем fenced DB reference под
 актуальными scope/lease/generation/revision, без S3 I/O под DB lock. Unknown PUT
 сверяется для того же object; незакреплённые bytes не доступны caller/model.
@@ -224,6 +236,9 @@ Finite RAM/tree/I/O limits и bounded GC не допускают тихих пр
 Cloud.ru S3 и восстановление после реальной замены Pod требуют отдельного прогона.
 Storage events сообщают operation, outcome, размеры/количество и safe error code,
 но не credentials, signed URLs, имена или содержимое пользовательских файлов.
+Отказ проверки snapshot дополнительно сообщает конечный код причины: unsafe
+path/link/mode, hardlink, неподдержанный тип записи или schema/metadata/parent
+manifest. Raw exception и значения отвергнутых полей в этот код не включаются.
 
 Миграция схемы добавляет manifests и staging/GC ledger, не меняя прежние
 Task IDs, scopes или artifacts metadata. Она не переносит потерянные RAM bytes

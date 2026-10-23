@@ -72,6 +72,39 @@ class TerminalBarrierTests(unittest.TestCase):
         self.assertEqual(record.snapshot["terminal_intent"]["state"], "COMPLETED")
         self.assertEqual(agent.resume_task("task").message, "done")
 
+    def test_invalid_snapshot_finishes_saved_terminal_intent_without_replay(self):
+        for code in ("WORKSPACE_SNAPSHOT_INVALID", "WORKSPACE_SNAPSHOT_LIMIT"):
+            for saved_intent, followup in ((False, False), (True, False), (True, True)):
+                with self.subTest(code=code, saved_intent=saved_intent, followup=followup):
+                    agent, model = self.app(ModelResponse(message="uncommitted answer"))
+                    manager = agent.tool_runtime.environment_manager
+                    if saved_intent:
+                        with patch.object(manager, "close_execution_tree", side_effect=CoreError("EXECUTION_ENVIRONMENT_UNAVAILABLE")):
+                            self.assertIsInstance(self.start(agent), SuspendedRun)
+                    if followup:
+                        agent.enqueue_message({"prompt": "accepted while closing"}, task_id="task", message_id="followup",
+                                              identity="owner", session_id="chat", tenant_id="company")
+                    durability = Mock()
+                    durability.transition.side_effect = CoreError(code)
+                    manager.backend.workspace_durability = durability
+                    with self.assertRaises(CoreError) as caught:
+                        agent.resume_task("task") if saved_intent else self.start(agent)
+                    self.assertEqual(caught.exception.code, code)
+                    record = agent.workflow_store.lookup_task("task")
+                    self.assertEqual(record.state, "FAILED")
+                    self.assertEqual(record.error_code, code)
+                    self.assertIsNone(record.result)
+                    self.assertNotIn("terminal_intent", record.snapshot)
+                    self.assertTrue(record.snapshot["execution_owner"]["cleanup_confirmed"])
+                    self.assertEqual(agent.workflow_store.pending_inbound(record), ())
+                    if followup:
+                        self.assertIn("accepted while closing", [item["content"] for item in record.snapshot["context"]["transcript"]
+                                                              if item["kind"] == "unprocessed_due_to_failure"])
+                    agent._recover_workflows_once()
+                    agent._recover_workflows_once()
+                    self.assertEqual(len(model.calls), 1)
+                    durability.transition.assert_called_once()
+
     def test_followup_during_cleanup_uses_new_generation_and_model_turn(self):
         agent, model = self.app(ModelResponse(message="old answer"), ModelResponse(message="updated answer"))
         manager = agent.tool_runtime.environment_manager

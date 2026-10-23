@@ -364,6 +364,10 @@ Target spec может описывать больше текущего runtime.
   При включённом `CORE_AGENT_STARTUP_DIAGNOSTICS` запись `startup.s3_configuration`
   показывает только ограниченные endpoint/bucket/region с редактированием credentials;
   ошибки S3 config называют поле или тип SDK exception без raw error body.
+  Детерминированный отказ terminal snapshot завершает Task после confirmed
+  cleanup без публикации нового manifest; ранее сохранённые файлы/результаты
+  сохраняются. Recovery не повторяет команды ради snapshot. Storage diagnostics
+  сообщают только конечный reason, без путей и содержимого файлов (CLD-AC-29).
 - `SANDBOX_BACKEND` по умолчанию `bubblewrap`; `landlock` разрешён только для
   `CORE_AGENT_ENVIRONMENT=development` + `CORE_AGENT_AUTH_MODE=cloudru`.
   Его отдельный контракт — `spec/cloudru.md`, CLD-05-L: приложение PID 1 своего

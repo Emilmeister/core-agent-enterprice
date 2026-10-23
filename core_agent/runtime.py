@@ -1784,8 +1784,27 @@ class CoreAgent:
             raise CoreError("EXECUTION_CLEANUP_PENDING", "Previous server execution requires reconciliation")
         record = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
         try:
-            updated = self._record_transition(record, **{key: value for key, value in intent.items() if key != "id"},
-                                              lease_token=lease_token, _terminal_committing=True)
+            try:
+                updated = self._record_transition(record, **{key: value for key, value in intent.items() if key != "id"},
+                                                  lease_token=lease_token, _terminal_committing=True)
+            except CoreError as error:
+                if error.code not in {"WORKSPACE_SNAPSHOT_INVALID", "WORKSPACE_SNAPSHOT_LIMIT"}:
+                    raise
+                # Cleanup is already proven. A rejected tree cannot become a
+                # durable success, but must not prevent a fenced failure/cancel
+                # from settling. Keep the last published workspace and output.
+                completed = intent["state"] == "COMPLETED"
+                updated = self._record_transition(
+                    record, state="FAILED" if completed else intent["state"],
+                    snapshot=copy.deepcopy(record.snapshot),
+                    event_kind="task.failed" if completed else intent["event_kind"],
+                    event_data={**({} if completed else intent.get("event_data") or {}),
+                                "workspace_error_code": error.code},
+                    audit=tuple(() if completed else intent.get("audit", ())) + (
+                        ("workspace.checkpoint.rejected", {"error_code": error.code}),),
+                    error_code=error.code if completed else intent.get("error_code"),
+                    lease_token=lease_token, _terminal_committing=True, _workspace_checkpoint=False,
+                )
         except CoreError as error:
             if error.code not in {"INBOUND_MESSAGE_PENDING", "CANCEL_REQUESTED"}:
                 raise
@@ -1953,7 +1972,10 @@ class CoreAgent:
         include_shared_budget=False,
         connection=None,
         _terminal_committing=False,
+        _workspace_checkpoint=True,
     ):
+        if not _workspace_checkpoint and (not _terminal_committing or state not in {"FAILED", "CANCELLED", "REJECTED", "ABORTED"}):
+            raise CoreError("INVALID_TASK_STATE")
         prior_public = (record.snapshot.get("published_artifacts", []), record.snapshot.get("public_messages", []))
         if state in TERMINAL_STATES and not _terminal_committing:
             if connection is not None:
@@ -2007,6 +2029,7 @@ class CoreAgent:
                         release_model_turns=transition_release,
                         include_shared_budget=include_shared_budget,
                         connection=connection,
+                        _workspace_checkpoint=_workspace_checkpoint,
                     )
                 except CoreError as error:
                     if error.code == "INBOUND_MESSAGE_PENDING":
@@ -2050,7 +2073,7 @@ class CoreAgent:
                         or local_tool and event_kind in {
                             "tool.result.saved", "tool.completed", "tool.failed", "tool.denied"})
                     operation = (lambda: durability.transition(record, lease_token, transition)) if (
-                        durability is not None and checkpoint and connection is None) else transition
+                        durability is not None and checkpoint and connection is None and _workspace_checkpoint) else transition
                     # A cache miss must unwind the entire owning transaction
                     # before immutable artifact bytes are fetched from S3.
                     updated = (with_prefetched_artifacts(self.response_files_service, operation)
@@ -3293,6 +3316,7 @@ class CoreAgent:
         release_model_turns=0,
         include_shared_budget=False,
         connection=None,
+        _workspace_checkpoint=True,
     ):
         messages = self.workflow_store.pending_inbound(record)
         if not messages:
@@ -3367,7 +3391,7 @@ class CoreAgent:
             )
         durability = getattr(self.tool_runtime.environment_manager.backend, "workspace_durability", None)
         operation = (lambda: durability.transition(record, lease_token, consume)) if (
-            durability is not None and state in TERMINAL_STATES and connection is None) else consume
+            durability is not None and state in TERMINAL_STATES and connection is None and _workspace_checkpoint) else consume
         record = (with_prefetched_artifacts(self.response_files_service, operation)
                   if connection is None else operation())
         consumed_event_kind = inbound_event_kind or event_kind
@@ -5489,19 +5513,8 @@ class CoreAgent:
                             snapshot["pending_response"] = None
                         snapshot["tool_queue"] = []
                         continue
-                    result = record.result
                     self._drop_run_runtime(record.run_id)
-                    return RunResult(
-                        record.run_id,
-                        result["message"],
-                        "completed",
-                        Usage(**result["usage"]),
-                        result["complete"],
-                        result["completion_reason"],
-                        result.get("exhausted_dimension"),
-                        result.get("shared_budget"),
-                        tuple(result.get("pending_tasks", ())), tuple(result.get("outgoing_files", ())),
-                    )
+                    return self._terminal_result(record)
                 snapshot["pending_response"] = None
                 snapshot["finalizing_response"] = False
                 record = self._record_transition(
@@ -5851,9 +5864,7 @@ class CoreAgent:
                 result={"output": outcome["output"]} if succeeded else None,
                 error_code=code, lease_token=token,
             )
-            if not succeeded:
-                raise CoreError(code)
-            return record.result["output"]
+            return self._terminal_result(record)
         except _MaterialSuspended as suspended:
             return suspended.result
         except CoreError as error:

@@ -104,6 +104,44 @@ class CloudStorageRuntimeFixture(unittest.IsolatedAsyncioTestCase):
 
 
 class CloudStorageRuntimeTests(CloudStorageRuntimeFixture):
+    async def test_invalid_tree_aborts_once_and_preserves_durable_files(self):
+        self.model._responses = [self.terminal("open('report.txt','w').write('saved report')"),
+            ModelResponse(tool_requests=(ToolRequest("publish", "core_response_files", {"paths": ["report.txt"]}),)),
+            ModelResponse(message="Saved")]
+        published = await self.submit("invalid-tree")
+        saved = self.agent.workflow_store.lookup_task(published["id"])
+        reference = saved.snapshot["published_artifacts"][0]["parts"][0]["ref"]
+        download = f"/api/chats/invalid-tree/tasks/{saved.task_id}/files/{reference['file_id']}"
+        database = self.agent.workflow_store.database
+        with database.transaction() as connection:
+            before = connection.execute("SELECT revision,manifest FROM core_workspace_manifests WHERE tenant_id=%s AND context_id=%s",
+                                        (self.tenant, "invalid-tree")).fetchone()
+        self.model._responses = [self.terminal("import os; open('report.txt','w').write('uncommitted'); os.mkfifo('unsupported')")]
+        task = await self.submit("invalid-tree")
+        with self.assertRaises(CoreError) as caught:
+            await asyncio.to_thread(self.agent.resume_task, task["id"])
+        self.assertEqual(caught.exception.code, "SIDE_EFFECT_UNKNOWN")
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertEqual(record.state, "ABORTED")
+        self.assertEqual(record.error_code, "SIDE_EFFECT_UNKNOWN")
+        self.assertNotIn("terminal_intent", record.snapshot)
+        self.assertTrue(record.snapshot["execution_owner"]["cleanup_confirmed"])
+        with database.transaction() as connection:
+            after = connection.execute("SELECT revision,manifest FROM core_workspace_manifests WHERE tenant_id=%s AND context_id=%s",
+                                       (self.tenant, "invalid-tree")).fetchone()
+        self.assertEqual(after, before)
+        calls = len(self.model.calls)
+        for _ in range(2):
+            recovered = await asyncio.to_thread(self.agent._recover_workflows_once)
+            self.assertEqual(recovered, ())
+        self.assertEqual(len(self.model.calls), calls)
+        await self.restart([])
+        self.assertEqual((await self.http.get(download)).content, b"saved report")
+        restored = await self.http.get("/api/chats/invalid-tree/files/content", params={"path": "report.txt"})
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(restored.content, b"saved report")
+        self.assertFalse(self.model.calls)
+
     async def test_real_composition_publication_restore_and_owner_cleanup(self):
         self.model._responses = [self.terminal("from pathlib import Path; Path('.git').mkdir(); Path('.git/config').write_text('project'); Path('report.txt').write_text('immutable report')"),
             ModelResponse(tool_requests=(ToolRequest("publish", "core_response_files", {"paths": ["report.txt"]}),)),

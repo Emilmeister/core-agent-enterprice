@@ -19,24 +19,32 @@ from .workspace import ChatWorkspaces
 
 _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _HEX = re.compile(r"[0-9a-f]{64}")
+SNAPSHOT_INVALID_REASONS = frozenset({
+    "unsafe_path", "unsafe_symlink", "unsafe_mode", "hardlink", "unsupported_node",
+    "manifest_schema", "manifest_metadata", "manifest_parent",
+})
+
+
+def _invalid(reason):
+    return CoreError("WORKSPACE_SNAPSHOT_INVALID", data={"reason": reason})
 
 
 def _parts(path):
     try:
         return ChatWorkspaces.path_parts(path)
     except CoreError:
-        raise CoreError("WORKSPACE_SNAPSHOT_INVALID") from None
+        raise _invalid("unsafe_path") from None
 
 
 def _link(path, target):
     try:
         target_size = len(target.encode("utf-8")) if isinstance(target, str) else 0
     except UnicodeError:
-        raise CoreError("WORKSPACE_SNAPSHOT_INVALID") from None
+        raise _invalid("unsafe_symlink") from None
     if (not isinstance(target, str) or not target or target_size > 4096
             or target.startswith("/") or "\\" in target
             or any(ord(char) < 32 or ord(char) == 127 for char in target)):
-        raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+        raise _invalid("unsafe_symlink")
     stack = _parts(path)[:-1]
     traversed = False
     for part in target.split("/"):
@@ -44,7 +52,7 @@ def _link(path, target):
             # A named component may itself be a symlink. A later '..' could
             # escape despite a seemingly contained lexical normalization.
             if traversed or not stack:
-                raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+                raise _invalid("unsafe_symlink")
             stack.pop()
         elif part not in {"", "."}:
             traversed = True
@@ -59,7 +67,7 @@ def validate_manifest(manifest, binding=None, *, max_bytes=1_000_000_000, max_fi
                 or not isinstance(manifest["scope"], str) or not _HEX.fullmatch(manifest["scope"])
                 or binding is not None and manifest["scope"] != ChatWorkspaces._scope(binding)
                 or not isinstance(manifest["entries"], dict)):
-            raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+            raise _invalid("manifest_schema")
         entries = manifest["entries"]
         if len(entries) > max_files:
             raise CoreError("WORKSPACE_SNAPSHOT_LIMIT")
@@ -69,21 +77,21 @@ def validate_manifest(manifest, binding=None, *, max_bytes=1_000_000_000, max_fi
             if len(parts) > ChatWorkspaces.depth_limit:
                 raise CoreError("WORKSPACE_SNAPSHOT_LIMIT")
             if not isinstance(entry, dict) or entry.get("type") not in {"file", "directory", "symlink"}:
-                raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+                raise _invalid("manifest_metadata")
             kind = entry["type"]
             keys = {"type", "mode", "mtime_ns"}
             keys |= {"sha256", "size"} if kind == "file" else {"target"} if kind == "symlink" else set()
             if (entry.keys() != keys or type(entry["mode"]) is not int or not 0 <= entry["mode"] <= 0o1777
                     or type(entry["mtime_ns"]) is not int or not -(2**63) <= entry["mtime_ns"] < 2**63):
-                raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+                raise _invalid("manifest_metadata")
             for index in range(1, len(parts)):
                 parent = entries.get("/".join(parts[:index]))
                 if not isinstance(parent, dict) or parent.get("type") != "directory":
-                    raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+                    raise _invalid("manifest_parent")
             if kind == "file":
                 if (type(entry["size"]) is not int or entry["size"] < 0
                         or not isinstance(entry["sha256"], str) or not _HEX.fullmatch(entry["sha256"])):
-                    raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+                    raise _invalid("manifest_metadata")
                 total += entry["size"]
                 if total > max_bytes:
                     raise CoreError("WORKSPACE_SNAPSHOT_LIMIT")
@@ -91,7 +99,7 @@ def validate_manifest(manifest, binding=None, *, max_bytes=1_000_000_000, max_fi
                 _link(path, entry["target"])
         return entries
     except (KeyError, TypeError, ValueError, UnicodeError, OverflowError):
-        raise CoreError("WORKSPACE_SNAPSHOT_INVALID") from None
+        raise _invalid("manifest_metadata") from None
 
 
 def prune_manifest(manifest, deleted_paths):
@@ -137,7 +145,7 @@ class WorkspaceDurability:
                     raise CoreError("WORKSPACE_SNAPSHOT_LIMIT")
                 before = os.stat(name, dir_fd=directory, follow_symlinks=False)
                 if before.st_mode & 0o6000:
-                    raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+                    raise _invalid("unsafe_mode")
                 identities[path] = _identity(before)
                 metadata = {"mode": stat.S_IMODE(before.st_mode), "mtime_ns": before.st_mtime_ns}
                 if stat.S_ISDIR(before.st_mode):
@@ -175,7 +183,7 @@ class WorkspaceDurability:
                     if consume:
                         consume(path, {"type": "symlink", **metadata, "target": target}, None)
                 else:
-                    raise CoreError("WORKSPACE_SNAPSHOT_INVALID")
+                    raise _invalid("hardlink" if stat.S_ISREG(before.st_mode) else "unsupported_node")
 
         visit(root, [])
         return identities

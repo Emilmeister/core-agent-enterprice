@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from core_agent.errors import CoreError
+from core_agent.postgres_workspace import PostgresWorkspaceDurability
 from core_agent.workspace import ChatWorkspaces, WorkspaceBinding
 from core_agent.workspace_durability import WorkspaceDurability, prune_manifest
 
@@ -47,6 +48,7 @@ class WorkspaceDurabilityTests(unittest.TestCase):
         with self.assertRaises(CoreError) as caught:
             action()
         self.assertEqual(caught.exception.code, code)
+        return caught.exception
 
     def test_empty_and_unchanged_checkpoints_do_not_upload(self):
         empty = self.service.prepare(self.binding, None)
@@ -98,33 +100,53 @@ class WorkspaceDurabilityTests(unittest.TestCase):
         empty = self.service.prepare(self.binding, None)
         invalid = []
         wrong_scope = {**empty, "scope": "0" * 64}
-        invalid.append(wrong_scope)
-        for path, entry in (("../escape", {"type": "directory", "mode": 0o700, "mtime_ns": 1}),
-                            ("missing/child", {"type": "directory", "mode": 0o700, "mtime_ns": 1}),
-                            ("link", {"type": "symlink", "mode": 0o777, "mtime_ns": 1, "target": "../outside"}),
-                            ("node", {"type": "device", "mode": 0o600, "mtime_ns": 1})):
-            invalid.append({**empty, "entries": {path: entry}})
-        for manifest in invalid:
+        invalid.append((wrong_scope, "manifest_schema"))
+        for path, entry, reason in (
+                ("../escape", {"type": "directory", "mode": 0o700, "mtime_ns": 1}, "unsafe_path"),
+                ("missing/child", {"type": "directory", "mode": 0o700, "mtime_ns": 1}, "manifest_parent"),
+                ("link", {"type": "symlink", "mode": 0o777, "mtime_ns": 1, "target": "../outside"}, "unsafe_symlink"),
+                ("node", {"type": "device", "mode": 0o600, "mtime_ns": 1}, "manifest_metadata"),
+                ("time", {"type": "directory", "mode": 0o700, "mtime_ns": 1.5}, "manifest_metadata")):
+            invalid.append(({**empty, "entries": {path: entry}}, reason))
+        for manifest, reason in invalid:
             with self.subTest(manifest=manifest):
                 _, restored = self.fresh()
-                self.assert_code("WORKSPACE_SNAPSHOT_INVALID", lambda: restored.restore(self.binding, manifest))
+                error = self.assert_code("WORKSPACE_SNAPSHOT_INVALID", lambda: restored.restore(self.binding, manifest))
+                self.assertEqual(error.data, {"reason": reason})
+                self.assertEqual(str(error), "WORKSPACE_SNAPSHOT_INVALID")
         self.assertEqual(self.blobs.gets, [])
 
     def test_unsafe_nodes_never_follow_outside_workspace(self):
         folder = self.workspaces.workspace(self.binding)
         outside = self.root / "outside"
         outside.write_bytes(b"secret")
-        for kind in ("symlink", "hardlink", "fifo"):
+        events = []
+        coordinator = PostgresWorkspaceDurability(None, self.service, None)
+        coordinator.log = lambda event, **fields: events.append((event, fields))
+        for kind, reason in (("symlink", "unsafe_symlink"), ("hardlink", "hardlink"),
+                             ("fifo", "unsupported_node"), ("setuid", "unsafe_mode")):
             with self.subTest(kind=kind):
                 target = folder / "unsafe"
                 if kind == "symlink":
                     target.symlink_to(outside)
                 elif kind == "hardlink":
                     os.link(outside, target)
-                else:
+                elif kind == "fifo":
                     os.mkfifo(target)
-                self.assert_code("WORKSPACE_SNAPSHOT_INVALID", lambda: self.service.prepare(self.binding, None))
+                else:
+                    target.write_bytes(b"private contents")
+                    target.chmod(0o4600)
+                error = self.assert_code("WORKSPACE_SNAPSHOT_INVALID", lambda: self.service.prepare(self.binding, None))
                 target.unlink()
+                self.assertEqual(error.data, {"reason": reason})
+                self.assertEqual(str(error), "WORKSPACE_SNAPSHOT_INVALID")
+                coordinator._report("checkpoint", error=error)
+                self.assertEqual(events[-1], ("workspace.storage", {
+                    "operation": "checkpoint", "outcome": "failed", "file_count": 0, "bytes": 0,
+                    "error_code": "WORKSPACE_SNAPSHOT_INVALID", "reason": reason}))
+        for reason in (str(outside), ["unsafe_path"]):
+            coordinator._report("checkpoint", error=CoreError("WORKSPACE_SNAPSHOT_INVALID", data={"reason": reason}))
+            self.assertNotIn("reason", events[-1][1])
         self.assertEqual(self.blobs.puts, [])
 
     def test_tree_change_during_upload_cannot_commit_a_snapshot(self):
