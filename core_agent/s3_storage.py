@@ -11,7 +11,7 @@ from threading import BoundedSemaphore
 
 import botocore.session
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import BotoCoreError, ClientError, InvalidRegionError
 
 from .errors import CoreError
 from .security import validate_http_url
@@ -28,16 +28,22 @@ class S3BlobStore:
             loopback = False
         if (endpoint.username is not None or endpoint.password is not None
                 or endpoint.query or endpoint.fragment or endpoint.path not in {"", "/"}
-                or (endpoint.scheme != "https" and not loopback)
-                or not all(isinstance(value, str) and value for value in
-                           (bucket, region, access_key_id, secret_access_key, tenant_id, prefix))
-                or re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) is None
-                or len(prefix) > 512 or any(re.fullmatch(r"[A-Za-z0-9_-]+", part) is None
-                                          for part in prefix.split("/"))
-                or type(max_bytes) is not int or not 1 <= max_bytes <= 2_147_483_647
-                or type(max_inflight) is not int or not 1 <= max_inflight <= 32
-                or (session_token is not None and (not isinstance(session_token, str) or not session_token))):
-            raise CoreError("CONFIG_INVALID", "Invalid S3 storage configuration")
+                or (endpoint.scheme != "https" and not loopback)):
+            raise CoreError("CONFIG_INVALID", "S3_ENDPOINT_URL requires an HTTPS origin without credentials, path, query or fragment (HTTP allowed only on loopback)")
+        for name, value in (("BUCKET", bucket), ("REGION", region), ("ACCESS_KEY_ID", access_key_id),
+                            ("SECRET_ACCESS_KEY", secret_access_key), ("TENANT_ID", tenant_id), ("PREFIX", prefix)):
+            if not isinstance(value, str) or not value:
+                raise CoreError("CONFIG_INVALID", f"S3_{name} must be a non-empty string")
+        if re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) is None:
+            raise CoreError("CONFIG_INVALID", "S3_BUCKET must contain 3-63 lowercase letters, digits, dots or hyphens, starting and ending with a letter or digit")
+        if len(prefix) > 512 or any(re.fullmatch(r"[A-Za-z0-9_-]+", part) is None for part in prefix.split("/")):
+            raise CoreError("CONFIG_INVALID", "S3_PREFIX requires slash-separated letters, digits, underscores or hyphens, at most 512 characters")
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 2_147_483_647:
+            raise CoreError("CONFIG_INVALID", "S3 max_bytes must be an integer between 1 and 2147483647")
+        if type(max_inflight) is not int or not 1 <= max_inflight <= 32:
+            raise CoreError("CONFIG_INVALID", "S3 max_inflight must be an integer between 1 and 32")
+        if session_token is not None and (not isinstance(session_token, str) or not session_token):
+            raise CoreError("CONFIG_INVALID", "S3_SESSION_TOKEN must be a non-empty string when supplied")
         self.tenant_id = tenant_id
         self.bucket = bucket
         self.prefix = f"{prefix}/tenants/{hashlib.sha256(tenant_id.encode()).hexdigest()}/blobs/sha256"
@@ -53,8 +59,10 @@ class S3BlobStore:
                     s3={"addressing_style": "path"},
                     request_checksum_calculation="when_required", response_checksum_validation="when_required"),
             )
-        except (BotoCoreError, ValueError):
-            raise CoreError("CONFIG_INVALID", "Invalid S3 storage configuration") from None
+        except InvalidRegionError:
+            raise CoreError("CONFIG_INVALID", "S3_REGION is not a valid SDK region name") from None
+        except (BotoCoreError, ValueError) as error:
+            raise CoreError("CONFIG_INVALID", f"S3 client initialization failed ({type(error).__name__})") from None
 
     def key(self, digest, *, object_id=None):
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:

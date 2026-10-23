@@ -356,6 +356,9 @@ Target spec может описывать больше текущего runtime.
   `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` не подключают backend или credentials;
   Cloud trial использует `ARTIFACT_S3_*` только как credential fallback после
   явного `WORKSPACE_STORAGE_TYPE=s3`; Keycloak продолжает отклонять retired settings.
+  При включённом `CORE_AGENT_STARTUP_DIAGNOSTICS` запись `startup.s3_configuration`
+  показывает только ограниченные endpoint/bucket/region с редактированием credentials;
+  ошибки S3 config называют поле или тип SDK exception без raw error body.
 - `SANDBOX_BACKEND` по умолчанию `bubblewrap`; `landlock` разрешён только для
   `CORE_AGENT_ENVIRONMENT=development` + `CORE_AGENT_AUTH_MODE=cloudru`.
   Его отдельный контракт — `spec/cloudru.md`, CLD-05-L: приложение PID 1 своего

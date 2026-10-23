@@ -13,7 +13,7 @@ import time
 import sys
 from dataclasses import replace
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
@@ -1722,6 +1722,18 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
         if cloud_auth:
             diagnostics.emit("startup.storage", backend="s3" if workspace_storage else "temporary-posix",
                              durable=workspace_storage is not None)
+        if workspace_storage and diagnostics.enabled:
+            storage_secrets = tuple(workspace_storage.get(key) for key in
+                                    ("access_key_id", "secret_access_key", "session_token"))
+            storage_details = redact(
+                {key: workspace_storage[key] for key in ("endpoint_url", "bucket", "region")},
+                known_secrets=storage_secrets,
+            )
+            storage_details["endpoint_url"] = safe_url(storage_details["endpoint_url"])
+            for key in storage_details:
+                if any(secret and secret in unquote(workspace_storage[key]) for secret in storage_secrets):
+                    storage_details[key] = "[REDACTED]"
+            diagnostics.emit("startup.s3_configuration", **{key: value[:512] for key, value in storage_details.items()})
         recovery_tenant_id = auth_settings.tenant if auth_settings else None
         if auth_settings and not _env("CHAT_WORKSPACE_ROOT", ""):
             raise CoreError("CONFIG_INVALID", "authenticated deployment requires CHAT_WORKSPACE_ROOT")

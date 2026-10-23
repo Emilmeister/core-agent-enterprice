@@ -86,6 +86,40 @@ class StartupDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("private-error-detail", str(logs.output))
         self.assertTrue(launcher._closed)
 
+    def test_s3_diagnostics_show_effective_settings_without_credentials(self):
+        from urllib.parse import quote
+
+        secret = "private-s3/secret+" * 50
+        cloud = {
+            "CORE_AGENT_AUTH_MODE": "cloudru", "CORE_AGENT_ENVIRONMENT": "development",
+            "CORE_AGENT_TENANT_ID": "trial", "CORE_AGENT_OWNER_PASSWORD": "private-owner-password",
+            "AGENT_URL": "https://agent.example.test", "CHAT_WORKSPACE_ROOT": self.directory.name + "/chats",
+            "WORKSPACE_STORAGE_TYPE": "s3", "ARTIFACT_S3_BUCKET": "platform_bucket",
+            "ARTIFACT_S3_REGION": "platform-region", "ARTIFACT_S3_ACCESS_KEY_ID": "private-access-key",
+            "ARTIFACT_S3_SECRET_ACCESS_KEY": secret, "WORKSPACE_S3_SESSION_TOKEN": "private-session-token",
+            "ARTIFACT_S3_ENDPOINT_URL": "https://private-user:private-password@s3.example.test/?token=private-query#private-fragment",
+        }
+        for enabled, endpoint, expected in (
+            ("true", cloud["ARTIFACT_S3_ENDPOINT_URL"], "https://s3.example.test/"),
+            ("false", cloud["ARTIFACT_S3_ENDPOINT_URL"], None),
+            ("true", "https://s3.example.test/" + quote(secret, safe=""), "[REDACTED]"),
+        ):
+            with self.subTest(enabled=enabled, expected=expected), patch.dict(os.environ, {
+                    **cloud, "CORE_AGENT_STARTUP_DIAGNOSTICS": enabled,
+                    "ARTIFACT_S3_ENDPOINT_URL": endpoint}), patch.object(
+                    application, "_state", side_effect=CoreError("CONFIG_INVALID", "stop before database")):
+                capture = self.assertLogs if enabled == "true" else self.assertNoLogs
+                with capture("core_agent.runtime", level="INFO") as logs:
+                    with self.assertRaises(CoreError):
+                        application.create_app(model=self.model, sandbox_launcher=UnsandboxedTestLauncher())
+                rows = [row for row in self.records(logs) if row["event"] == "startup.s3_configuration"] if logs else []
+                self.assertEqual(rows, [{"event": "startup.s3_configuration",
+                    "endpoint_url": expected,
+                    "bucket": "platform_bucket", "region": "platform-region"}] if enabled == "true" else [])
+                for value in ("private-user", "private-password", "private-query", "private-fragment",
+                              "private-access-key", "private-s3", "private-session-token", "private-owner-password"):
+                    self.assertNotIn(value, str(logs.output) if logs else "")
+
     def test_success_logs_stages_and_disabled_switch_suppresses_diagnostics(self):
         for enabled in ("true", "false"):
             with self.subTest(enabled=enabled), patch.dict(os.environ, {"CORE_AGENT_STARTUP_DIAGNOSTICS": enabled}):

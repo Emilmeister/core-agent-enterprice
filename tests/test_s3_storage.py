@@ -57,6 +57,28 @@ class S3BlobTests(unittest.TestCase):
         self.assertNotIn("test-secret", str(error.exception))
         self.stub.assert_no_pending_responses()
 
+    def test_invalid_configuration_identifies_field_without_raw_values(self):
+        from core_agent.s3_storage import S3BlobStore
+
+        settings = dict(endpoint_url="https://s3.example.test", bucket="private-files", region="test",
+            access_key_id="test-key", secret_access_key="test-secret", tenant_id="tenant-a")
+        for field, value, expected in (
+            ("endpoint_url", "https://s3.example.test/private-path", "S3_ENDPOINT_URL"),
+            ("bucket", "private_bad_bucket", "S3_BUCKET"),
+            ("prefix", "private.invalid.prefix", "S3_PREFIX"),
+            ("region", "private/invalid/region", "S3_REGION"),
+        ):
+            with self.subTest(field=field), self.assertRaises(CoreError) as caught:
+                S3BlobStore(**{**settings, field: value})
+            self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+            self.assertIn(expected, str(caught.exception))
+            self.assertNotIn(value, str(caught.exception))
+        with patch("core_agent.s3_storage.botocore.session.get_session", side_effect=ValueError("test-secret")):
+            with self.assertRaises(CoreError) as caught:
+                S3BlobStore(**settings)
+            self.assertIn("ValueError", str(caught.exception))
+            self.assertNotIn("test-secret", str(caught.exception))
+
     def test_missing_bytes_use_conditional_put_and_verified_receipt(self):
         self.missing()
         self.stub.add_response("put_object", {}, {**self.params, "Body": self.content,

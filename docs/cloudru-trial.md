@@ -263,6 +263,13 @@ sandbox, runtime, routes, recovery и общий startup. `startup.storage` со
 ASGI application; фактическое открытие listener подтверждают сообщения Uvicorn
 и успешные `/health/live`, `/health/ready` через платформу.
 
+При `CORE_AGENT_STARTUP_DIAGNOSTICS=true` в S3-режиме событие
+`startup.s3_configuration` показывает фактически выбранные endpoint, bucket и
+region, включая fallback из `ARTIFACT_S3_*`. URL очищается от userinfo, query и
+fragment; credentials не выводятся, значения ограничены 512 символами. Ошибка
+валидации указывает поле и ожидаемый формат, ошибка инициализации SDK — тип
+исключения без его содержимого. Эти логи появляются до подключения к S3.
+
 Если после успешного старта Pod перезапускается, сохраните platform event о
 завершении и результаты запросов к `/`, root Agent Card и `/health/ready`.
 Корневые маршруты обеспечивают discovery и readiness, но причина перезапуска
