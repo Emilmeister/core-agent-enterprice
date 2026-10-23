@@ -31,6 +31,13 @@ WORKSPACE_S3_MAX_INFLIGHT=4
 Подключение берётся из `WORKSPACE_S3_ENDPOINT_URL`, `WORKSPACE_S3_BUCKET`,
 `WORKSPACE_S3_REGION`, `WORKSPACE_S3_ACCESS_KEY_ID`, `WORKSPACE_S3_SECRET_ACCESS_KEY`.
 Для незаданных полей используются соответствующие платформенные `ARTIFACT_S3_*`.
+Платформенный endpoint вида `https://s3.cloud.ru/<bucket>` автоматически
+преобразуется в адрес сервиса, только если путь точно совпадает с выбранным
+бакетом (допустим один завершающий `/`). При наличии `ARTIFACT_S3_TENANT_ID`
+платформенный access key передаётся в SDK как `tenant:key`; уже добавленный
+совпадающий prefix не дублируется, конфликт отклоняется. Это S3 tenant,
+не `CORE_AGENT_TENANT_ID`. Явный `WORKSPACE_S3_ENDPOINT_URL` должен содержать
+только адрес сервиса; явный `WORKSPACE_S3_ACCESS_KEY_ID` передаётся без изменений.
 Опциональный временный токен — `WORKSPACE_S3_SESSION_TOKEN`. Секреты передаются
 через secret/env настройки платформы, не через UI или запрос модели.
 

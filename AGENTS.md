@@ -356,6 +356,11 @@ Target spec может описывать больше текущего runtime.
   `RUNTIME_SAVE_INPUT_BLOBS_AS_ARTIFACTS` не подключают backend или credentials;
   Cloud trial использует `ARTIFACT_S3_*` только как credential fallback после
   явного `WORKSPACE_STORAGE_TYPE=s3`; Keycloak продолжает отклонять retired settings.
+  Только платформенный endpoint допускает точный путь к configured bucket (с
+  завершающим `/` или без него), который удаляется перед передачей SDK.
+  Для платформенного access key `ARTIFACT_S3_TENANT_ID` добавляется ровно один
+  раз как `tenant:key`; конфликтующий prefix отклоняется. Явные `WORKSPACE_S3_*`
+  сохраняют приоритет и прежний формат; storage tenant не меняет app tenant.
   При включённом `CORE_AGENT_STARTUP_DIAGNOSTICS` запись `startup.s3_configuration`
   показывает только ограниченные endpoint/bucket/region с редактированием credentials;
   ошибки S3 config называют поле или тип SDK exception без raw error body.

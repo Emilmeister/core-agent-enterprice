@@ -13,7 +13,7 @@ import time
 import sys
 from dataclasses import replace
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, urlsplit
 
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
@@ -271,11 +271,28 @@ def _workspace_storage():
             or _env("CORE_AGENT_ENVIRONMENT") != "development"):
         raise CoreError("CONFIG_INVALID", "S3 workspace storage requires Cloud.ru development profile")
     settings = {}
+    platform_fields = set()
     for suffix in ("ENDPOINT_URL", "BUCKET", "REGION", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY"):
-        value = _env("WORKSPACE_S3_" + suffix) or _env("ARTIFACT_S3_" + suffix)
+        value = _env("WORKSPACE_S3_" + suffix)
+        if not value:
+            value = _env("ARTIFACT_S3_" + suffix)
+            platform_fields.add(suffix)
         if not value:
             raise CoreError("CONFIG_INVALID", "WORKSPACE_S3_" + suffix + " is required")
         settings[suffix.lower()] = value
+    if "ENDPOINT_URL" in platform_fields:
+        endpoint = validate_http_url(settings["endpoint_url"], "ARTIFACT_S3_ENDPOINT_URL")
+        bucket_path = "/" + settings["bucket"]
+        if urlsplit(settings["endpoint_url"]).path in {bucket_path, bucket_path + "/"}:
+            settings["endpoint_url"] = endpoint._replace(path="").geturl()
+    if "ACCESS_KEY_ID" in platform_fields and (storage_tenant := _env("ARTIFACT_S3_TENANT_ID")):
+        key = settings["access_key_id"]
+        credential = key if ":" in key else f"{storage_tenant}:{key}"
+        if (credential.count(":") != 1 or credential.partition(":")[0] != storage_tenant
+                or not credential.partition(":")[2] or not credential.isascii()
+                or any(ord(char) < 33 or ord(char) == 127 for char in credential)):
+            raise CoreError("CONFIG_INVALID", "ARTIFACT_S3_ACCESS_KEY_ID must be a bare key or an ASCII tenant:key matching ARTIFACT_S3_TENANT_ID")
+        settings["access_key_id"] = credential
     settings["session_token"] = _env("WORKSPACE_S3_SESSION_TOKEN") or None
     settings["prefix"] = _env("WORKSPACE_S3_PREFIX", "core-agent")
     settings["tenant_id"] = _env("CORE_AGENT_TENANT_ID")
@@ -1725,6 +1742,7 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
         if workspace_storage and diagnostics.enabled:
             storage_secrets = tuple(workspace_storage.get(key) for key in
                                     ("access_key_id", "secret_access_key", "session_token"))
+            storage_secrets += (workspace_storage["access_key_id"].partition(":")[2],)
             storage_details = redact(
                 {key: workspace_storage[key] for key in ("endpoint_url", "bucket", "region")},
                 known_secrets=storage_secrets,

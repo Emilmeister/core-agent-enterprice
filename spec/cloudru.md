@@ -169,7 +169,16 @@ default `posix` сохраняет прежний режим. Ошибка S3 н
 `WORKSPACE_S3_ENDPOINT_URL`, `WORKSPACE_S3_BUCKET`, `WORKSPACE_S3_REGION`,
 `WORKSPACE_S3_ACCESS_KEY_ID`, `WORKSPACE_S3_SECRET_ACCESS_KEY` задают S3 connection;
 в этом режиме для отсутствующих значений допускаются платформенные
-`ARTIFACT_S3_*` с теми же suffix. `WORKSPACE_S3_SESSION_TOKEN` опционален,
+`ARTIFACT_S3_*` с теми же suffix. Только для платформенного endpoint допускается
+путь, точно равный `/<effective bucket>` или `/<effective bucket>/`: перед SDK
+он удаляется, origin сохраняется; остальные paths, params, credentials, query и
+fragment не становятся допустимыми. Явный `WORKSPACE_S3_ENDPOINT_URL` требует
+origin. При fallback access key и заданном `ARTIFACT_S3_TENANT_ID` подпись
+использует `tenant_id:key_id`; уже составленный key сохраняется только при
+совпадении tenant, конфликт или malformed credential отклоняется без его значения
+в ошибке. Явный `WORKSPACE_S3_ACCESS_KEY_ID` передаётся без добавления platform
+tenant. Это S3 account, он не меняет trusted tenant namespace приложения.
+`WORKSPACE_S3_SESSION_TOKEN` опционален,
 `WORKSPACE_S3_PREFIX` по умолчанию `core-agent`. Настройки не публикуют ключи
 в tools, browser, logs или sandbox; tenant namespace выводится из trusted
 deployment scope. Подпись запросов выполняет поддерживаемый S3 SDK.

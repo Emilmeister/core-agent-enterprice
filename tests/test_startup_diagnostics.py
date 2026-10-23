@@ -96,6 +96,7 @@ class StartupDiagnosticsTests(unittest.TestCase):
             "AGENT_URL": "https://agent.example.test", "CHAT_WORKSPACE_ROOT": self.directory.name + "/chats",
             "WORKSPACE_STORAGE_TYPE": "s3", "ARTIFACT_S3_BUCKET": "platform_bucket",
             "ARTIFACT_S3_REGION": "platform-region", "ARTIFACT_S3_ACCESS_KEY_ID": "private-access-key",
+            "ARTIFACT_S3_TENANT_ID": "storage-tenant",
             "ARTIFACT_S3_SECRET_ACCESS_KEY": secret, "WORKSPACE_S3_SESSION_TOKEN": "private-session-token",
             "ARTIFACT_S3_ENDPOINT_URL": "https://private-user:private-password@s3.example.test/?token=private-query#private-fragment",
         }
@@ -103,6 +104,7 @@ class StartupDiagnosticsTests(unittest.TestCase):
             ("true", cloud["ARTIFACT_S3_ENDPOINT_URL"], "https://s3.example.test/"),
             ("false", cloud["ARTIFACT_S3_ENDPOINT_URL"], None),
             ("true", "https://s3.example.test/" + quote(secret, safe=""), "[REDACTED]"),
+            ("true", "https://s3.example.test/private-access-key", "[REDACTED]"),
         ):
             with self.subTest(enabled=enabled, expected=expected), patch.dict(os.environ, {
                     **cloud, "CORE_AGENT_STARTUP_DIAGNOSTICS": enabled,

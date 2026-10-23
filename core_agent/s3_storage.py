@@ -8,6 +8,7 @@ import ipaddress
 import re
 from contextlib import contextmanager
 from threading import BoundedSemaphore
+from urllib.parse import urlsplit
 
 import botocore.session
 from botocore.config import Config
@@ -27,7 +28,7 @@ class S3BlobStore:
         except ValueError:
             loopback = False
         if (endpoint.username is not None or endpoint.password is not None
-                or endpoint.query or endpoint.fragment or endpoint.path not in {"", "/"}
+                or endpoint.query or endpoint.fragment or urlsplit(endpoint_url).path not in {"", "/"}
                 or (endpoint.scheme != "https" and not loopback)):
             raise CoreError("CONFIG_INVALID", "S3_ENDPOINT_URL requires an HTTPS origin without credentials, path, query or fragment (HTTP allowed only on loopback)")
         for name, value in (("BUCKET", bucket), ("REGION", region), ("ACCESS_KEY_ID", access_key_id),
