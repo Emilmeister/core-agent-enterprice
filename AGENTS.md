@@ -137,9 +137,9 @@ criterion должны войти в тот же завершённый change. 
   production UI не зависит от каталога. Все demo API работают в памяти без
   реальных credentials/сети. Команды и состояния описаны в `storybook/README.md`.
 - `spec/` — target specification, acceptance и release profiles.
-  `spec/cloudru.md` фиксирует отдельный Cloud.ru profile и ограниченный первый trial.
-- `docs/cloudru-trial.md` — запуск Cloud.ru trial, platform PostgreSQL, явное S3
-  хранилище workspace, owner password и безопасные storage/startup diagnostics.
+  `spec/cloudru.md` фиксирует Cloud.ru production candidate и ограниченный development trial.
+- `docs/cloudru-trial.md` — Cloud.ru development trial, подготовка production и
+  единый candidate rollout; PostgreSQL/S3, secrets и безопасная диагностика.
 - `deploy/landlock-native-vm.sh` — только локальный ARM64 test fixture для
   Docker host без Landlock: отдельный QEMU guest с packaged kernel, read-only
   исходниками, private tmpfs/cgroups и явным outer test filter; не production
@@ -151,6 +151,12 @@ criterion должны войти в тот же завершённый change. 
   замороженные spec/tests и не подтверждают готовность runtime capabilities.
 - `tests/` — frozen acceptance, unit, integration, PostgreSQL, A2A и E2E suite.
 - `.github/workflows/ci.yml` — канонический CI-порядок.
+- В существующей matrix `sandbox-linux` обязательный Landlock step запускает
+  `deploy/landlock-native.sh` на том же native amd64/arm64 candidate image.
+  `CORE_AGENT_REQUIRE_LANDLOCK_TESTS=1` и
+  `CORE_AGENT_REQUIRE_NATIVE_SECCOMP_TESTS=1` превращают недоступность enforcement
+  в failure без skip; Bubblewrap gates сохраняются. Native proof не заменяет
+  real Cloud idle/background/SIGTERM/rolling/security gates.
 - CI job `sandbox-linux` запускает обязательные Linux sandbox tests в отдельных
   native amd64/arm64 kind-кластерах. Его fixtures из `deploy/kubernetes/`
   назначают контрольные адреса только внутри одноразового node network namespace.
@@ -265,7 +271,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/s3_storage.py`, `core_agent/s3_ledger.py` | Официальный S3 SDK, tenant/generation keys, staged uploads, pin и bounded GC без сетевого I/O под DB locks |
 | `core_agent/python_exec.py` | Bounded Python process и `tools.call(...)` broker |
 | `core_agent/sandbox.py`, `core_agent/sandbox_exec.py` | Gated Bubblewrap launcher, сетевой профиль, inner seccomp и подтверждённая остановка namespace |
-| `core_agent/sandbox_landlock.py`, `core_agent/landlock_policy.py`, `core_agent/landlock_network.py`, `core_agent/landlock_metadata.py` | Явный Cloud development backend: Landlock/seccomp, обязательный preflight, proxy FD injection, pinned-FD metadata mediation без CONTINUE и подтверждение полного process tree cleanup по CLD-05-L |
+| `core_agent/sandbox_landlock.py`, `core_agent/landlock_policy.py`, `core_agent/landlock_network.py`, `core_agent/landlock_metadata.py` | Явный Cloud development/production backend: Landlock/seccomp, обязательный preflight, proxy FD injection, pinned-FD metadata mediation без CONTINUE и подтверждение полного process tree cleanup по CLD-05-L |
 | `core_agent/tasks.py` | Test scheduler, mailbox и delegation contracts |
 | `core_agent/postgres_tasks.py` | Durable PostgreSQL scheduler и mailbox |
 | `core_agent/workflow.py` | Workflow stores, transitions и durable outbox |
@@ -302,7 +308,7 @@ Docker container или Kubernetes Pod/container в пределах одног�
 - product boundaries — `spec/product.md`;
 - architecture и durable state — `spec/architecture.md`;
 - config и runtime modes — `spec/agent-configuration.md`;
-- Cloud.ru auth/trial и явный S3 workspace — `spec/cloudru.md`;
+- Cloud.ru production/trial и явный S3 workspace — `spec/cloudru.md`;
 - A2A/public input — `spec/a2a-protocol.md`, `spec/public-contract.md`;
 - agent loop и recovery — `spec/runtime.md`;
 - protected instructions — `spec/kernel-instructions.md`;
@@ -330,10 +336,11 @@ Target spec может описывать больше текущего runtime.
   `development`, `test`. Production требует полный набор `KEYCLOAK_*` и
   `CORE_AGENT_TENANT_ID`; legacy A2A без auth разрешён только при явно выбранном
   development/test и полностью отсутствующей auth-конфигурации.
-- `CORE_AGENT_AUTH_MODE=cloudru` — отдельный диагностический development profile
-  без Keycloak, с обязательной PostgreSQL и изолированным platform ingress.
-  Production Cloud startup закрыт до полного storage; RAM workspace/results
-  не обещают сохранность при замене Pod. Default mode остаётся `keycloak`.
+- `CORE_AGENT_AUTH_MODE=cloudru` — отдельный профиль без Keycloak, с обязательной
+  PostgreSQL и изолированным platform ingress. Production требует явный S3,
+  валидный стабильный Fernet key, раздельные storage roots, отдельную миграцию
+  и preflight выбранного sandbox; code support не закрывает platform release
+  gates. Development POSIX trial остаётся временным. Default mode — `keycloak`.
   Owner использует отдельный ENV password и DB-backed 8h cookie, точный Origin
   для мутаций и tenant-wide login limiter. Retired password нельзя активировать
   повторно: старый replica отклоняется до изменения действующей версии.
@@ -372,7 +379,8 @@ Target spec может описывать больше текущего runtime.
   `setuid` везде и `setgid` у остальных типов запрещены. Старый reader не читает
   directory-SGID manifests; rollback limitation описан в CLD-04.
 - `SANDBOX_BACKEND` по умолчанию `bubblewrap`; `landlock` разрешён только для
-  `CORE_AGENT_ENVIRONMENT=development` + `CORE_AGENT_AUTH_MODE=cloudru`.
+  `CORE_AGENT_ENVIRONMENT=development|production` + `CORE_AGENT_AUTH_MODE=cloudru`.
+  Production также требует S3/PostgreSQL/secrets/migration gates CLD-01.
   Его отдельный контракт — `spec/cloudru.md`, CLD-05-L: приложение PID 1 своего
   container PID namespace под non-root UID, нулевые effective/permitted/inheritable/ambient
   capabilities, Landlock ABI >= 4, строгий seccomp и настоящий NEW_LISTENER/ADDFD
@@ -411,7 +419,8 @@ Target spec может описывать больше текущего runtime.
   Отказы записываются на CRITICAL; неподтверждённый cleanup блокирует startup.
   Переданный test launcher не запускает probes. Их успех не заменяет preflight;
   `EPERM` не определяет, запретил ли операцию AppArmor или seccomp.
-  `startup.storage` явно сообщает temporary-posix/durable=false для Cloud trial.
+  `startup.storage` сообщает temporary-posix/durable=false для POSIX trial
+  либо s3/durable=true для явного S3 profile.
   `application_ready` означает готовое ASGI app; открытие socket подтверждают
   Uvicorn и probes. Диагностика не отключает обязательный sandbox или проверки.
 - Числовые deployment settings в `core_agent/app.py` разбираются через `_number`,
@@ -1220,7 +1229,8 @@ run получает отдельные MCP session и negotiated version; пе�
 
 - Production использует PostgreSQL и fail closed без настроенного DSN, доступной
   DB и совпадающей schema version. Нет SQLite/in-memory fallback. Cloud.ru
-  development trial также требует PostgreSQL для sessions/tasks; memory test
+  profile также требует PostgreSQL для sessions/tasks и включённой памяти,
+  включая development; memory test
   adapter остаётся только явной test-фикстурой. Owner password versions, session
   digests и login limiter сохраняются в БД, входящий password/token не хранится.
 - Tasks, workflow events/checkpoints, inbound inbox, outbox и audit
@@ -1267,11 +1277,12 @@ run получает отдельные MCP session и negotiated version; пе�
   отдельный `DATABASE_MIGRATION_URL`.
 - `DURABLE_STORAGE_ROOT` предназначен для immutable blobs, snapshots и
   artifacts; в прежнем профиле это durable root, обычно на S3-backed mount.
-  Cloud.ru default `posix` использует временный root. Явный `s3` сохраняет
+  Cloud.ru development default `posix` использует временный root; production
+  требует `s3`. Явный `s3` сохраняет
   workspace, response artifacts и private incoming originals в S3,
   manifests и GC intents — в PostgreSQL;
   `DURABLE_STORAGE_ROOT` остаётся cache. Старые POSIX bytes автоматически не
-  мигрируют; production не включается этим trial. Incoming PUT предшествует ACK,
+  мигрируют. Incoming PUT предшествует ACK,
   batch bind/pin атомарен с Task/inbox; original GET не удерживает DB locks.
   Карточки входящих S3-файлов используют server-owned `download_path` из
   history/receipt на `/api/chats/{context_id}/tasks/{task_id}/attachments/{batch_id}/{index}`;
@@ -1283,7 +1294,7 @@ run получает отдельные MCP session и negotiated version; пе�
 - `LOCAL_WORKSPACE_ROOT` является отдельным ephemeral filesystem для активных
   процессов и не находится внутри durable mount.
 - `CHAT_WORKSPACE_ROOT` задаёт POSIX root папок чатов и обязателен при
-  аутентификации: постоянный в Keycloak, временный RAM root в Cloud.ru trial. Все три storage roots не пересекаются ни в одном
+  аутентификации: постоянный в Keycloak, локальный cache в Cloud.ru S3 либо временный root POSIX trial. Все три storage roots не пересекаются ни в одном
   направлении. Anonymous development/test без него сохраняет ephemeral режим.
 - Runtime связывает root, child, background и recovered run с исходными
   tenant/owner/context. Authenticated binding дополнительно проверяется по
@@ -1304,7 +1315,9 @@ run получает отдельные MCP session и negotiated version; пе�
   `MEMORY_STORAGE_TYPE` выбирает `in-memory` или `postgres`. При `disabled` ни
   один `core_memory_*` tool не попадает в catalog и backend не создаётся; при
   `required` неработоспособный backend является ошибкой старта. Production с
-  включённой памятью и `in-memory` fail closed.
+  включённой памятью и `in-memory` fail closed; Cloud.ru требует
+  `MEMORY_STORAGE_TYPE=postgres` и в development. `optional` не разрешает
+  ephemeral fallback; при отсутствии memory DSN переиспользуется общий pool.
 - Модель не имеет ни filesystem, ни SQL доступа к corpus: любая mutation идёт
   через `core_memory_*`. Namespace выводится runtime-ом из scope текущего run,
   модель передаёт только `user|session`; secrets и private reasoning в memory

@@ -88,6 +88,7 @@ RUN
 
 cat > /vm/rootfs/vm-bootstrap.py <<'PY'
 import ctypes
+import json
 import os
 import platform
 import sys
@@ -115,6 +116,15 @@ os.setgroups([])
 os.setgid(10001)
 os.setuid(10001)
 sys.path.insert(0, '/app')
+from core_agent.errors import SandboxDiagnostics
+
+class NativeResult(unittest.TextTestResult):
+    def addError(self, test, error):
+        diagnostic = getattr(error[1], 'diagnostics', None)
+        if type(diagnostic) is SandboxDiagnostics:
+            print('NATIVE_DIAGNOSTICS=' + json.dumps(diagnostic.as_dict()), flush=True)
+        super().addError(test, error)
+
 abi = libc.syscall(444, 0, 0, 1)
 assert abi >= 4, (abi, ctypes.get_errno())
 print('NATIVE_FIXTURE', platform.release(), platform.machine(), 'pid', os.getpid(),
@@ -123,7 +133,7 @@ suite = unittest.defaultTestLoader.loadTestsFromNames([
     'tests.test_landlock_policy', 'tests.test_landlock_network',
     'tests.test_landlock_metadata', 'tests.test_sandbox_landlock',
     'tests.test_landlock_chat_files'])
-result = unittest.TextTestRunner(verbosity=2).run(suite)
+result = unittest.TextTestRunner(verbosity=2, resultclass=NativeResult).run(suite)
 status = 0 if result.wasSuccessful() else 1
 print('LANDLOCK_VM_RESULT=' + str(status), flush=True)
 os._exit(status)

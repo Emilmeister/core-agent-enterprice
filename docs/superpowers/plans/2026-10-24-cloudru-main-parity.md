@@ -1,6 +1,6 @@
 # Core Agent: завершение адаптации main для Cloud.ru AI Agents
 
-> **For agentic workers:** После согласования использовать `subagent-driven-development` для независимых проверок или `executing-plans` для последовательных этапов. Этот документ — план на согласование; он не утверждает готовность выпуска и не запускает реализацию.
+> **For agentic workers:** После согласования использовать `subagent-driven-development` для независимых проверок или `executing-plans` для последовательных этапов. План согласован пользователем; связанные spec/tests/frozen hashes разрешены. Выполнение пакетное: весь код и документация, затем общий прогон и один candidate image. Документ не утверждает готовность выпуска.
 
 **Goal:** Довести `feat/cloudru-ai-agents` до рабочей поставки возможностей текущего `main` на Cloud.ru AI Agents, сохранив согласованные отличия платформенного профиля.
 
@@ -8,7 +8,15 @@
 
 **Tech Stack:** Python/uv, PostgreSQL, S3, Landlock/seccomp, официальный A2A SDK, React/TypeScript, существующие unittest и native/browser проверки.
 
-**Статус:** на согласование, 24 октября 2026. Ниже отдельно указаны обязательные доработки, проверки существующих возможностей и критерий завершения.
+**Статус:** пакет кода и документации завершён, 24 октября 2026; общий Cloud rollout и целевые проверки впереди.
+
+Общий ordinary suite: 2404 tests, exit 0, 16 платформенных skips; PostgreSQL,
+Keycloak и MinIO работали в изолированных fixtures. В linux/amd64 candidate
+прошли 178 config/memory/S3 tests без skips. ARM64 Landlock VM: 39 tests без
+skips после повторного запуска; первая ошибка preflight не воспроизвелась,
+причина не установлена, добавлена конечная приватная диагностика.
+Ruff, spec lock/quality, UI tests/typecheck/build и wheel/sdist/image build прошли.
+Это не подтверждение native amd64/arm64 CI и полного target Cloud release gate.
 
 ## 1. Исходная точка
 
@@ -34,11 +42,11 @@
 digest `sha256:539c38fa73bd38ba14331f09f916bb29bea2c991e8ccf0a189864835ae824f7b`.
 Эти результаты закрывают перечисленные сценарии, но не полный набор возможностей main.
 
-## 2. Предлагаемая граница готовности
+## 2. Согласованная граница готовности
 
 Цель следующего этапа — поддерживаемый Cloud.ru-профиль для постоянной работы.
-Сейчас код разрешает Cloud.ru + S3 + Landlock только в `development`.
-Предлагаю после прохождения проверок явно разрешить этот состав в `production`,
+До этого пакета код разрешал Cloud.ru + S3 + Landlock только в `development`.
+Согласовано реализовать поддержку этого состава в `production`,
 с обязательными PostgreSQL/S3, стабильным ключом шифрования, проверенным sandbox
 и отдельным запуском миграций. Простое удаление проверок `development` не является задачей.
 
@@ -78,8 +86,8 @@ digest `sha256:539c38fa73bd38ba14331f09f916bb29bea2c991e8ccf0a189864835ae824f7b`
 
 Файлы: `core_agent/app.py`; существующие Cloud configuration и memory tests.
 
-- [ ] Добавить регрессию для включённой памяти Cloud с отсутствующим/неверным backend, корректного PostgreSQL и полностью отключённой памяти.
-- [ ] В общей точке startup потребовать поддерживаемый persistent backend без изменения поведения Keycloak/development вне Cloud.
+- [x] Добавить регрессию для включённой памяти Cloud с отсутствующим/неверным backend, корректного PostgreSQL и полностью отключённой памяти.
+- [x] В общей точке startup потребовать поддерживаемый persistent backend без изменения поведения Keycloak/development вне Cloud.
 - [ ] Проверить реальную запись, чтение, поиск, embeddings/NER и сохранение после замены Pod.
 - [ ] Сохранить изменение отдельным коммитом с соответствующим proof.
 
@@ -89,8 +97,8 @@ digest `sha256:539c38fa73bd38ba14331f09f916bb29bea2c991e8ccf0a189864835ae824f7b`
 существующие `tests/test_landlock_policy.py`, `test_landlock_network.py`,
 `test_landlock_metadata.py`, `test_sandbox_landlock.py`, `test_landlock_chat_files.py`.
 
-- [ ] Выбрать native Linux fixture для поставляемого `linux/amd64` образа с требуемым Landlock ABI; переиспользовать существующие tests и tooling.
-- [ ] Сделать обязательными `CORE_AGENT_REQUIRE_LANDLOCK_TESTS=1` и `CORE_AGENT_REQUIRE_NATIVE_SECCOMP_TESTS=1` в этом gate.
+- [x] Выбрать native Linux fixture для поставляемого `linux/amd64` образа с требуемым Landlock ABI; переиспользовать существующие tests и tooling.
+- [x] Сделать обязательными `CORE_AGENT_REQUIRE_LANDLOCK_TESTS=1` и `CORE_AGENT_REQUIRE_NATIVE_SECCOMP_TESTS=1` в этом gate.
 - [ ] Проверить недоступность чужих workspace и секретов, запрет прямого/private/metadata egress, IPv4/IPv6, broker isolation и завершение дерева процессов.
 - [ ] Отдельно подтвердить применимые свойства в целевом Cloud Pod контролируемыми ограниченными пробами.
 
@@ -161,26 +169,27 @@ uv run python -m unittest tests.test_landlock_policy tests.test_landlock_network
 
 ### Этап 6. Завершённый Cloud production-профиль
 
-Этот пункт входит в предлагаемый объём согласования. Выполняется после проверки
-предпосылок Landlock и фоновой работы, с сохранением ограничений из раздела 2.
+Production configuration реализуется в общем пакете до объединённого прогона.
+Допуск code path не означает release approval: реальные предпосылки Landlock,
+фоновой работы и ограничения раздела 2 проверяются отдельно на одном candidate.
 
 Файлы: `core_agent/auth.py`, `core_agent/app.py`, `core_agent/sandbox_landlock.py`;
 связанные `spec/cloudru.md`, `spec/releases/v1.md`, `spec/acceptance.md`,
 `spec/security-and-reliability.md`, Cloud config tests и `tests/test_spec_lock.py`.
 
-- [ ] Согласованно задать поддерживаемое сочетание Cloud auth + PostgreSQL + S3 + Landlock для production.
+- [x] Согласованно задать поддерживаемое сочетание Cloud auth + PostgreSQL + S3 + Landlock для production.
 - [ ] Обязать стабильные secrets, правильные storage roots, schema/runtime role и проверенный sandbox до readiness.
-- [ ] Сохранить отказ при ephemeral storage, недоступном sandbox/БД, неверных credentials/settings и неподдерживаемой комбинации режимов.
+- [x] Сохранить отказ при ephemeral storage, недоступном sandbox/БД, неверных credentials/settings и неподдерживаемой комбинации режимов.
 - [ ] Проверить прежний Keycloak/Bubblewrap профиль main и отсутствие автоматического переключения профилей при ошибках.
-- [ ] Удалить устаревшие сообщения о том, что S3 ещё не реализован; диагностика должна отражать реальную причину отказа.
+- [x] Удалить устаревшие сообщения о том, что S3 ещё не реализован; диагностика должна отражать реальную причину отказа.
 
 ### Этап 7. Общая регрессия и выпуск
 
-- [ ] Вновь сверить ancestry main и Cloud-ветки; новые main-исправления включать осознанно и проверять совместимость с адаптацией.
+- [x] Вновь сверить ancestry main и Cloud-ветки; новые main-исправления включать осознанно и проверять совместимость с адаптацией.
 - [ ] Поднять существующие disposable PostgreSQL, Keycloak, MinIO и native/browser fixtures согласно CI.
 - [ ] Выполнить полный ordinary suite, все затронутые native/security/browser gates и packaging/image checks.
 - [ ] Зафиксировать proof по каждому пункту матрицы; обновить implementation status только там, где доказательство действительно получено.
-- [ ] Обновить `AGENTS.md`, `docs/cloudru-trial.md` либо его назначение для завершённого профиля, ENV-инструкцию и документ сравнения Kubernetes/Cloud.ru.
+- [x] Обновить `AGENTS.md`, `docs/cloudru-trial.md` либо его назначение для завершённого профиля, ENV-инструкцию и документ сравнения Kubernetes/Cloud.ru.
 - [ ] Опубликовать проверенный образ под постоянным version tag и digest, затем проверить rollout и доступность на целевом endpoint.
 
 Базовые команды существующих gates:
@@ -202,15 +211,24 @@ npm run build
 Эти команды требуют настроенных fixtures; отсутствующая инфраструктура или
 skip обязательного native gate не считаются подтверждением готовности.
 
-## 4. Как выполнять после согласования
+## 4. Согласованный пакетный порядок
 
-1. Сначала этапы 1–2: конкретные необходимые изменения кода/CI.
-2. Затем этапы 3–5: проверки платформенной композиции; найденные дефекты исправляются отдельными проверяемыми коммитами.
-3. После доказанных предпосылок — этап 6 и финальная регрессия/выпуск.
+1. Собрать все необходимые изменения кода, CI, spec/acceptance, regression tests,
+   frozen hashes и эксплуатационных документов этапов 1–2/5–6 в рабочей ветке.
+2. Выполнить один объединённый набор затронутых и обязательных regression/native/
+   browser/package gates. Исправления выявленных дефектов включить в этот пакет;
+   повторять только проверки, необходимые после изменений или failures.
+3. Собрать и опубликовать один candidate image с постоянным tag/digest. Передать
+   единый rollout checklist; не обновлять Cloud deployment после каждой правки.
+4. Проверить этапы 3–5/7 на этом candidate. Существующий Cloud development
+   deployment сохраняет tenant, DB/S3 references и secrets; production switch
+   требует подготовленной отдельной migration и стабильного encryption key.
+   До этих условий candidate проверяется с действующим development profile.
+5. Зафиксировать реальные proofs и оставшиеся blockers. Code/CI support
+   production не объявлять завершённым release без target idle/security/recovery.
 
-Рабочая ветка остаётся `feat/cloudru-ai-agents`. Предлагаемый объём включает
-связанные изменения spec, acceptance, tests и frozen hashes для указанных
-доработок; реализация начнётся после явного согласования этого плана.
+Рабочая ветка остаётся `feat/cloudru-ai-agents`. Пользователь разрешил связанные
+изменения spec, acceptance, tests и frozen hashes для согласованных доработок.
 План не требует пересоздания проекта или изменения параметров кластера Cloud.ru.
 
 ## 5. Когда цель считается достигнутой

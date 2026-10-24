@@ -374,10 +374,12 @@ Phoenix. Запись содержимого в промышленном реж�
 
 Для сборки UI вне Docker нужен Node 22.12+; Dockerfile сам собирает UI на Node 24.
 
-Первый диагностический запуск в Cloud.ru описан в
-[короткой инструкции](docs/cloudru-trial.md): platform PostgreSQL, owner password,
-общий external scope и безопасные startup logs. Это `development` trial с
-временными RAM-файлами; S3 отложено, production Cloud.ru пока закрыт.
+Запуск Cloud.ru описан в [инструкции](docs/cloudru-trial.md): platform PostgreSQL,
+owner password, общий external scope, S3 и явный Landlock backend.
+Production-конфигурация требует постоянного S3-хранилища, стабильного ключа
+шифрования и отдельных миграций; включённая память Cloud.ru требует PostgreSQL
+даже в development. Полная проверка изоляции и жизненного цикла целевого Pod
+остаётся отдельным условием готовности выпуска.
 
 ### Локальный процесс на подготовленном Linux-хосте
 
@@ -759,7 +761,7 @@ uv run python -m unittest tests.test_end_to_end -v
 ## Документация
 
 - [Навигатор спецификации](spec/README.md)
-- [Первый диагностический запуск Cloud.ru](docs/cloudru-trial.md)
+- [Запуск, обновление и ограничения Cloud.ru](docs/cloudru-trial.md)
 - [Нормативный профиль Cloud.ru](spec/cloudru.md)
 - [Публичный контракт](spec/public-contract.md)
 - [Архитектура](spec/architecture.md)

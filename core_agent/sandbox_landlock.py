@@ -33,8 +33,8 @@ def validate_backend(value, *, cloud, environment):
     selected = value or 'bubblewrap'
     if selected not in {'bubblewrap', 'landlock'}:
         raise CoreError('CONFIG_INVALID', 'SANDBOX_BACKEND must be bubblewrap or landlock')
-    if selected == 'landlock' and (not cloud or environment != 'development'):
-        raise CoreError('CONFIG_INVALID', 'SANDBOX_BACKEND=landlock requires Cloud.ru development')
+    if selected == 'landlock' and (not cloud or environment not in {'development', 'production'}):
+        raise CoreError('CONFIG_INVALID', 'SANDBOX_BACKEND=landlock requires Cloud.ru development or production')
     return selected
 
 

@@ -23,11 +23,24 @@ PostgreSQL остаётся единственным production state store. И�
 `SESSION_STORAGE_TYPE=postgres`, `TASK_STORAGE_TYPE=postgres` и
 `SESSION_POSTGRES_*`; порядок DSN — `SESSION_DATABASE_URL`, составной DSN при
 непустом `SESSION_POSTGRES_HOST`, `TASK_POSTGRES_URL`, `DATABASE_URL`.
-При включённой памяти требуется `MEMORY_STORAGE_TYPE=postgres`; без отдельного
-`MEMORY_POSTGRES_HOST` она использует общий пул. Production auto-migration
+При включённой памяти (`optional` или `required`) требуется явно заданный
+`MEMORY_STORAGE_TYPE=postgres` во всех Cloud.ru environments, включая development;
+default `in-memory` отклоняется до serving. `disabled` не создаёт backend.
+Без отдельного `MEMORY_POSTGRES_HOST` память использует общий пул. Production auto-migration
 запрещена; operator запускает миграцию отдельно с `DATABASE_MIGRATION_URL`
 либо `DATABASE_URL`, так как migration CLI не собирает `SESSION_POSTGRES_*`.
 Нет fallback к in-memory/SQLite при ошибке БД или несовместимой схеме.
+
+`CORE_AGENT_ENVIRONMENT=production` поддерживает этот профиль только с
+`WORKSPACE_STORAGE_TYPE=s3`, полной валидной S3 configuration, отдельными
+`CHAT_WORKSPACE_ROOT`, `DURABLE_STORAGE_ROOT`, `LOCAL_WORKSPACE_ROOT`,
+`DATABASE_AUTO_MIGRATE=false` и валидным стабильным Fernet secret
+`PUSH_NOTIFICATION_ENCRYPTION_KEY`. Ключ хранится отдельно от backup БД и
+сохраняется между экземплярами/обновлениями; произвольная замена ключа не
+является миграцией encrypted state. Production POSIX/RAM-only storage запрещён.
+Выбранный `bubblewrap` либо явный `landlock` MUST пройти свой реальный preflight
+до serving. Эти config gates разрешают запуск candidate, но не закрывают
+платформенные release proofs CLD-05/06 и не приравнивают его security к Keycloak.
 
 MCP connections и credentials берутся только из сохранённых owner UI settings.
 Автоматически переданные платформой `MCP_URL`, `MCP_HEADERS_JSON` и credentials
@@ -162,10 +175,11 @@ Owner Tasks, owner-private вопросы/ответы, HITL, settings, private 
 
 Полный Cloud.ru release требует PostgreSQL для state/manifests/receipts, S3
 через SDK для immutable bytes и ограниченный RAM/POSIX cache для `/workspace`.
-Прямая работа команд на S3 mount и FUSE не требуются. Первый trial сохраняет
-временное POSIX-хранилище. Следующий этап включается явно через
-`WORKSPACE_STORAGE_TYPE=s3` только в Cloud.ru development profile с PostgreSQL;
-default `posix` сохраняет прежний режим. Ошибка S3 не включает временный fallback.
+Прямая работа команд на S3 mount и FUSE не требуются. Development trial MAY
+сознательно использовать временное POSIX-хранилище. Явный
+`WORKSPACE_STORAGE_TYPE=s3` поддержан в Cloud.ru development и production с
+PostgreSQL; в production он обязателен. Default `posix` сохраняет прежний
+development trial и отклоняется в production. Ошибка S3 не включает временный fallback.
 `WORKSPACE_S3_ENDPOINT_URL`, `WORKSPACE_S3_BUCKET`, `WORKSPACE_S3_REGION`,
 `WORKSPACE_S3_ACCESS_KEY_ID`, `WORKSPACE_S3_SECRET_ACCESS_KEY` задают S3 connection;
 в этом режиме для отсутствующих значений допускаются платформенные
@@ -309,7 +323,7 @@ immutable digest/size/mode/mtime выбранного файла; изменив
 По умолчанию `SANDBOX_BACKEND=bubblewrap`: существующие mount/PID/network
 isolation, seccomp и resource limits обязательны для terminal, Python,
 background и nested calls. Единственное исключение — явно выбранный
-development backend по CLD-05-L ниже. Недоступность выбранного профиля
+Cloud.ru backend по CLD-05-L ниже. Недоступность выбранного профиля
 блокирует запуск; прямой subprocess, автоматическая смена backend или тихое
 отключение инструментов не являются fallback.
 
@@ -324,14 +338,15 @@ S3 snapshot не доказывает остановку прежнего про
 shared owner sessions и одного writer workspace. A2A waits, cron, push и
 recovery не зависят от открытого браузера или HTTP stream.
 
-### CLD-05-L. Явный development backend Landlock
+### CLD-05-L. Явный Cloud.ru backend Landlock
 
 `SANDBOX_BACKEND` принимает только `bubblewrap` и `landlock`, default —
 `bubblewrap`. `landlock` разрешён только при одновременных
-`CORE_AGENT_ENVIRONMENT=development` и `CORE_AGENT_AUTH_MODE=cloudru`.
+`CORE_AGENT_ENVIRONMENT=development|production` и `CORE_AGENT_AUTH_MODE=cloudru`.
 Неизвестный backend или другой profile/environment завершается
 `CONFIG_INVALID` до запуска недоверенного кода. Отказ Bubblewrap никогда не
-выбирает Landlock автоматически; production этим backend не разрешён.
+выбирает Landlock автоматически. Production дополнительно требует все
+storage/secrets/migration gates CLD-01; `test` и Keycloak с Landlock запрещены.
 
 Это ограниченное исключение из требований Bubblewrap и его виртуальных
 mount/PID/IPC/network namespaces в остальных документах. Оно не обещает
@@ -436,14 +451,20 @@ execution tree, включая осиротевшие процессы; до э�
 CLD-AC-14–17 требуют автоматических проверок и настоящего preflight плюс
 terminal/Python/background smoke в целевом Cloud.ru Pod. Local/mock proof
 не закрывает этот deployment gate и не даёт статус `implemented` автоматически.
+Native Linux CI MUST выполнять существующие Landlock/seccomp isolation/network/
+cleanup suites с `CORE_AGENT_REQUIRE_LANDLOCK_TESTS=1` и
+`CORE_AGENT_REQUIRE_NATIVE_SECCOMP_TESTS=1` на каждой поддержанной архитектуре
+образа. Отсутствие kernel enforcement/fixtures завершает gate ошибкой, без skip;
+Bubblewrap CI остаётся обязательным для прежнего профиля. Прохождение native CI
+не подтверждает ограничения реальной Cloud.ru platform.
 
 ## Первый диагностический запуск
 
 Пользовательский первый trial включает Cloud auth, owner UI, platform PostgreSQL
 и выбранный обязательный sandbox. Он использует `CORE_AGENT_ENVIRONMENT=development` и
 `CORE_AGENT_AUTH_MODE=cloudru` с обязательной PostgreSQL, без дополнительного
-trial switch, и MAY использовать временные RAM/POSIX каталоги до реализации
-CLD-04. Production Cloud startup до реализации полного storage отклоняется. Это ограниченный nonproduction запуск: workspace,
+trial switch, и MAY использовать временные RAM/POSIX каталоги вместо S3
+по CLD-04. Production без обязательного S3 отклоняется. Это ограниченный nonproduction запуск: workspace,
 upload/quarantine/result/offload bytes не имеют гарантии сохранности при замене
 Pod, даже если metadata находится в PostgreSQL. Durable workflows/sessions в БД
 не делают эти bytes постоянными. Файловые acceptance criteria и готовность

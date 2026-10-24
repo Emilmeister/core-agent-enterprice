@@ -4,7 +4,7 @@ import json
 import os
 import unittest
 from urllib.error import HTTPError
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tests.app_support import create_app
 from core_agent.audit import InMemoryAuditLog
@@ -1357,6 +1357,61 @@ class MemoryConfigurationTests(unittest.TestCase):
         finally:
             for owned in state["owned_databases"]:
                 owned.close()
+
+    def test_cloud_memory_requires_postgres_even_in_development(self):
+        from core_agent.app import _memory_registry
+
+        for environment in ("development", "test", "production"):
+            for backend in (None, "in-memory", "unknown"):
+                values = {"CORE_AGENT_AUTH_MODE": "cloudru", "CORE_AGENT_ENVIRONMENT": environment}
+                if backend is not None:
+                    values["MEMORY_STORAGE_TYPE"] = backend
+                with self.subTest(environment=environment, backend=backend), patch.dict(os.environ, values, clear=True):
+                    with self.assertRaises(CoreError) as caught:
+                        _memory_registry(None, None, enabled=True)
+                    self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                    self.assertIn("MEMORY_STORAGE_TYPE", caught.exception.message)
+                    registry, configuration = _memory_registry(None, None, enabled=False)
+                    self.assertIsNone(registry)
+                    self.assertEqual(configuration["backend"], "disabled")
+
+    def test_cloud_postgres_memory_uses_the_shared_database(self):
+        from core_agent.app import _memory_registry
+
+        database = Mock()
+        state = {"database": database, "owned_databases": []}
+        with patch.dict(os.environ, {"CORE_AGENT_AUTH_MODE": "cloudru", "CORE_AGENT_ENVIRONMENT": "development",
+                "MEMORY_STORAGE_TYPE": "postgres"}, clear=True), \
+                patch.object(PostgresMemoryStore, "_prepare_vector_index", return_value=False):
+            registry, configuration = _memory_registry(state, None, enabled=True)
+        self.assertIsInstance(registry.store, PostgresMemoryStore)
+        self.assertIs(registry.store.database, database)
+        self.assertEqual(configuration["backend"], "postgres")
+        self.assertEqual(state["owned_databases"], [])
+
+    def test_separate_production_memory_database_never_automatically_migrates(self):
+        from core_agent.app import _memory_database
+
+        for auto_migrate in (None, "false", "true"):
+            database = Mock()
+            state = {"database": None, "owned_databases": []}
+            values = {"CORE_AGENT_ENVIRONMENT": "production", "MEMORY_POSTGRES_HOST": "memory.test"}
+            if auto_migrate is not None:
+                values["DATABASE_AUTO_MIGRATE"] = auto_migrate
+            with self.subTest(auto_migrate=auto_migrate), patch.dict(os.environ, values, clear=True), \
+                    patch("core_agent.app.PostgresDatabase.from_environment", return_value=database):
+                if auto_migrate == "true":
+                    with self.assertRaises(CoreError) as caught:
+                        _memory_database(state)
+                    self.assertEqual(caught.exception.code, "PRODUCTION_AUTO_MIGRATE_FORBIDDEN")
+                    database.close.assert_called_once()
+                    database.verify_schema.assert_not_called()
+                    self.assertEqual(state["owned_databases"], [])
+                else:
+                    self.assertIs(_memory_database(state), database)
+                    database.verify_schema.assert_called_once()
+                    self.assertEqual(state["owned_databases"], [database])
+                database.migrate.assert_not_called()
 
     def test_postgres_memory_without_any_dsn_names_both_variables(self):
         from core_agent.app import _memory_registry

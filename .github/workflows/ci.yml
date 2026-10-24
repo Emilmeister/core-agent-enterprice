@@ -50,6 +50,10 @@ jobs:
         env:
           CORE_AGENT_RESTART_TEST_IMAGE: core-agent:sandbox
         run: uv run python -m unittest tests.test_execution_restart_docker -v
+      - name: Verify required native Landlock and seccomp against the candidate image
+        env:
+          LANDLOCK_TEST_IMAGE: core-agent:sandbox
+        run: bash deploy/landlock-native.sh
       - name: Verify required sandbox through Docker Compose
         env:
           COMPOSE_PROJECT_NAME: core-sandbox-compose-${{ matrix.arch }}

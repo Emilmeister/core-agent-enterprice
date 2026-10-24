@@ -3,7 +3,7 @@
 ## Deployment constraint
 
 Этот документ задаёт стандартный `SANDBOX_BACKEND=bubblewrap`. Единственное
-явное исключение для Cloud.ru development — [CLD-05-L](cloudru.md#cld-05-l-явный-development-backend-landlock):
+явное исключение для Cloud.ru development/production — [CLD-05-L](cloudru.md#cld-05-l-явный-cloudru-backend-landlock):
 оно отдельно определяет Landlock/seccomp/proxy, реальные пути и process cleanup,
 не меняя гарантий стандартного профиля и не разрешая автоматический fallback.
 

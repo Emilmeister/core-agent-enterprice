@@ -261,15 +261,18 @@ def _reasoning_effort():
 
 
 def _workspace_storage():
-    """Explicit Cloud trial storage; platform artifact ENV alone never enables it."""
+    """Explicit Cloud storage; platform artifact ENV alone never enables it."""
     backend = _env("WORKSPACE_STORAGE_TYPE", "posix")
+    cloud = _env("CORE_AGENT_AUTH_MODE", "keycloak") == "cloudru"
+    environment = _env("CORE_AGENT_ENVIRONMENT")
+    if cloud and environment == "production" and backend != "s3":
+        raise CoreError("CONFIG_INVALID", "Cloud.ru production requires WORKSPACE_STORAGE_TYPE=s3")
     if backend == "posix":
         return None
     if backend != "s3":
         raise CoreError("CONFIG_INVALID", "WORKSPACE_STORAGE_TYPE must be posix or s3")
-    if (_env("CORE_AGENT_AUTH_MODE", "keycloak") != "cloudru"
-            or _env("CORE_AGENT_ENVIRONMENT") != "development"):
-        raise CoreError("CONFIG_INVALID", "S3 workspace storage requires Cloud.ru development profile")
+    if not cloud or environment not in {"development", "production"}:
+        raise CoreError("CONFIG_INVALID", "S3 workspace storage requires Cloud.ru development or production")
     settings = {}
     platform_fields = set()
     for suffix in ("ENDPOINT_URL", "BUCKET", "REGION", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY"):
@@ -465,15 +468,27 @@ def _task_storage_type(session_storage_type):
     return backend
 
 
+def _database_auto_migrate():
+    production = _env("CORE_AGENT_ENVIRONMENT", "development") == "production"
+    auto_migrate = _boolean("DATABASE_AUTO_MIGRATE", "false" if production else "true")
+    if production and auto_migrate:
+        raise CoreError(
+            "PRODUCTION_AUTO_MIGRATE_FORBIDDEN",
+            "production requires DATABASE_AUTO_MIGRATE=false; run the "
+            "migration job before starting the agent",
+        )
+    return auto_migrate
+
+
 def _state(database=None):
     environment = _env("CORE_AGENT_ENVIRONMENT", "development")
-    cloud_trial = _env("CORE_AGENT_AUTH_MODE", "keycloak") == "cloudru" and environment != "test"
+    cloud = _env("CORE_AGENT_AUTH_MODE", "keycloak") == "cloudru" and environment != "test"
     backend = _env(
         "SESSION_STORAGE_TYPE",
-        "postgres" if environment == "production" or database or cloud_trial else "in-memory",
+        "postgres" if environment == "production" or database or cloud else "in-memory",
     )
-    if cloud_trial and (backend != "postgres" or _env("TASK_STORAGE_TYPE", "postgres") != "postgres"):
-        raise CoreError("CONFIG_INVALID", "Cloud.ru trial requires PostgreSQL sessions and tasks")
+    if cloud and (backend != "postgres" or _env("TASK_STORAGE_TYPE", "postgres") != "postgres"):
+        raise CoreError("CONFIG_INVALID", "Cloud.ru requires PostgreSQL sessions and tasks")
     if environment == "production" and backend != "postgres":
         raise CoreError(
             "PRODUCTION_DATABASE_REQUIRED",
@@ -495,16 +510,7 @@ def _state(database=None):
         }
     database = database or PostgresDatabase.from_environment(_session_database_url())
     try:
-        auto_migrate = _boolean(
-            "DATABASE_AUTO_MIGRATE", "false" if environment == "production" else "true"
-        )
-        if environment == "production" and auto_migrate:
-            raise CoreError(
-                "PRODUCTION_AUTO_MIGRATE_FORBIDDEN",
-                "production requires DATABASE_AUTO_MIGRATE=false; run the "
-                "migration job before starting the agent",
-            )
-        database.migrate() if auto_migrate else database.verify_schema()
+        database.migrate() if _database_auto_migrate() else database.verify_schema()
     except Exception:
         database.close()
         raise
@@ -528,13 +534,13 @@ def _memory_registry(state, telemetry, *, enabled):
         return None, {"backend": "disabled", "embeddings": False, "ner": False}
     storage_type = _env("MEMORY_STORAGE_TYPE", "in-memory")
     if (
-        _env("CORE_AGENT_ENVIRONMENT", "development") == "production"
-        and storage_type == "in-memory"
+        (_env("CORE_AGENT_ENVIRONMENT", "development") == "production"
+         or _env("CORE_AGENT_AUTH_MODE", "keycloak") == "cloudru")
+        and storage_type != "postgres"
     ):
         raise CoreError(
             "CONFIG_INVALID",
-            "production requires MEMORY_STORAGE_TYPE=postgres; long-term memory "
-            "silently lost on restart is not a production configuration",
+            "Cloud.ru and production require MEMORY_STORAGE_TYPE=postgres when memory is enabled",
         )
     dimension = _number("EMBEDDING_DIMENSION", int, default="768")
     headers = {
@@ -644,7 +650,7 @@ def _memory_database(state):
         # The shared pool is migrated in `_state`; this one has no other owner, so
         # without the same gate the agent starts healthy and every memory call
         # fails on a missing table long after startup could have reported it.
-        if _boolean("DATABASE_AUTO_MIGRATE", "true"):
+        if _database_auto_migrate():
             owned.migrate()
         else:
             owned.verify_schema()

@@ -3,8 +3,12 @@
 ## Trust boundaries
 
 Стандартные требования Bubblewrap ниже имеют только одно явное исключение:
-[CLD-05-L](cloudru.md#cld-05-l-явный-development-backend-landlock) для выбранного
-Landlock backend в Cloud.ru development. Оно задаёт собственные обязательные
+[CLD-05-L](cloudru.md#cld-05-l-явный-cloudru-backend-landlock) для выбранного
+Landlock backend в Cloud.ru development/production. Production дополнительно
+требует PostgreSQL/S3, стабильный encryption key и отдельные миграции CLD-01.
+Общий owner password и external scope не дают Keycloak caller isolation;
+Landlock не обещает namespaces или произвольную TCP/UDP сеть Bubblewrap.
+Этот профиль задаёт собственные обязательные
 filesystem/syscall/network/process barriers; fallback и ослабление остальных
 tenant, policy, durability и recovery guarantees не разрешены.
 

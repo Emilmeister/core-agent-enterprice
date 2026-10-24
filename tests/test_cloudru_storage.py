@@ -33,9 +33,21 @@ class CloudStorageConfigurationTests(unittest.TestCase):
         self.assertEqual((settings["max_bytes"], settings["max_files"], settings["max_inflight"]),
                          (100_000_000, 10_000, 4))
 
+    def test_production_requires_explicit_complete_s3_configuration(self):
+        values = {**self.environment(), "CORE_AGENT_ENVIRONMENT": "production"}
+        with patch.dict(os.environ, values, clear=True):
+            self.assertEqual(_workspace_storage()["tenant_id"], "company")
+        for override in ({"WORKSPACE_STORAGE_TYPE": ""}, {"WORKSPACE_STORAGE_TYPE": "posix"},
+                         {"ARTIFACT_S3_SECRET_ACCESS_KEY": ""}, {"ARTIFACT_S3_BUCKET": ""}):
+            with self.subTest(override=override), patch.dict(os.environ, {**values, **override}, clear=True):
+                with self.assertRaises(CoreError) as caught:
+                    _workspace_storage()
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                self.assertNotIn("private-test-secret", str(caught.exception))
+
     def test_invalid_profile_and_limits_fail_without_secret_diagnostics(self):
         for override in ({"CORE_AGENT_AUTH_MODE": "keycloak"},
-                         {"CORE_AGENT_ENVIRONMENT": "production"},
+                         {"CORE_AGENT_ENVIRONMENT": "test"},
                          {"WORKSPACE_STORAGE_TYPE": "unknown"},
                          {"WORKSPACE_MAX_BYTES": "NaN"}, {"WORKSPACE_MAX_FILES": "0"},
                          {"WORKSPACE_S3_MAX_INFLIGHT": "17"},

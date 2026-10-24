@@ -38,8 +38,6 @@ class AuthSettings:
     def from_environment(cls, get, *, production=False, allow_legacy=False):
         mode = get("CORE_AGENT_AUTH_MODE", "keycloak")
         if mode == "cloudru":
-            if production:
-                raise CoreError("CONFIG_INVALID", "Cloud.ru trial requires development/test until durable file storage is implemented")
             from .cloudru_auth import CloudAuthSettings
 
             return CloudAuthSettings.from_environment(get)

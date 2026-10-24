@@ -264,7 +264,13 @@ Embedding изменённого документа вычисляется ро�
 | `in-memory` (default) | corpus и derived data живут в процессе и теряются при рестарте |
 | `postgres` | corpus и revisions лежат в общей БД агента |
 
-`CORE_AGENT_ENVIRONMENT=production` с `MEMORY_STORAGE_TYPE=in-memory` и включённой памятью MUST завершаться ошибкой конфигурации: тихая потеря долговременной памяти при рестарте недопустима в production.
+Production любого auth profile и Cloud.ru во всех environments с включённой
+памятью (`optional` или `required`) MUST требовать `MEMORY_STORAGE_TYPE=postgres`.
+Отсутствующее значение, default `in-memory` или другое значение отклоняется
+до serving: restart не должен молча терять долговременную память.
+При `CORE_AGENT_MEMORY=disabled` backend не создаётся. Без отдельного
+`MEMORY_POSTGRES_HOST` используется общий PostgreSQL pool; отдельный DSN
+сохраняет существующие проверки подключения/схемы без fallback.
 
 Backend является интеграцией и не управляет доменной семантикой: лимит 200 строк, revision-модель, hybrid retrieval и graph одинаковы для обоих значений.
 

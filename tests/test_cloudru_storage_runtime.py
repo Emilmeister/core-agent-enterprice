@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import httpx
 import psycopg
+from cryptography.fernet import Fernet
 from psycopg.conninfo import make_conninfo
 from psycopg.sql import Identifier, SQL
 from psycopg.types.json import Jsonb
@@ -104,6 +105,67 @@ class CloudStorageRuntimeFixture(unittest.IsolatedAsyncioTestCase):
 
 
 class CloudStorageRuntimeTests(CloudStorageRuntimeFixture):
+    async def test_production_persists_memory_and_tasks_across_restart(self):
+        os.environ.update(CORE_AGENT_ENVIRONMENT="production", DATABASE_AUTO_MIGRATE="false",
+                          PUSH_NOTIFICATION_ENCRYPTION_KEY=Fernet.generate_key().decode(),
+                          CORE_AGENT_MEMORY="required", MEMORY_STORAGE_TYPE="postgres")
+        document = None
+        task = None
+        for backend in ("landlock", "bubblewrap"):
+            os.environ["SANDBOX_BACKEND"] = backend
+            # The fixture checks production composition; native gates prove isolation.
+            with self.subTest(backend=backend), patch.object(PostgresDatabase, "migrate", side_effect=AssertionError("serving must not migrate")):
+                await self.restart([ModelResponse(message="Production ready")])
+                self.assertIs(self.agent.memory_registry.store.database, self.app.state.database)
+                self.assertIsInstance(self.agent.workspace_blob_store, PostgresS3BlobStore)
+                memory = self.agent.memory_registry.service("production-proof", "owner", tenant_id=self.tenant)
+                if document is None:
+                    document, _ = memory.create(title="Persistent note", body="Survives a new process.", namespace="subject/owner")
+                    task = await self.submit("production-proof")
+                    self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED", task)
+                else:
+                    self.assertEqual(memory.read(document.id).body, "Survives a new process.")
+                    history = await self.http.get("/api/chats/production-proof/history")
+                    self.assertEqual(history.status_code, 200, history.text)
+                    self.assertIn(task["id"], history.text)
+
+    async def test_production_rejects_incomplete_configuration(self):
+        values = {"CORE_AGENT_ENVIRONMENT": "production", "DATABASE_AUTO_MIGRATE": "false",
+                  "PUSH_NOTIFICATION_ENCRYPTION_KEY": Fernet.generate_key().decode(),
+                  "SESSION_DATABASE_URL": self.dsn}
+        for override, code in (
+            ({"WORKSPACE_STORAGE_TYPE": "posix"}, "CONFIG_INVALID"),
+            ({"WORKSPACE_STORAGE_TYPE": ""}, "CONFIG_INVALID"),
+            ({"ARTIFACT_S3_SECRET_ACCESS_KEY": ""}, "CONFIG_INVALID"),
+            ({"SESSION_STORAGE_TYPE": "in-memory"}, "CONFIG_INVALID"),
+            ({"TASK_STORAGE_TYPE": "in-memory"}, "CONFIG_INVALID"),
+            ({"DATABASE_AUTO_MIGRATE": "true"}, "PRODUCTION_AUTO_MIGRATE_FORBIDDEN"),
+            ({"PUSH_NOTIFICATION_ENCRYPTION_KEY": ""}, "PUSH_ENCRYPTION_KEY_REQUIRED"),
+            ({"PUSH_NOTIFICATION_ENCRYPTION_KEY": "invalid"}, "REMOTE_AGENT_CREDENTIAL_UNAVAILABLE"),
+            ({"DURABLE_STORAGE_ROOT": ""}, "DURABLE_STORAGE_REQUIRED"),
+            ({"CORE_AGENT_MEMORY": "required", "MEMORY_STORAGE_TYPE": "in-memory"}, "CONFIG_INVALID"),
+            ({"LOCAL_WORKSPACE_ROOT": os.environ["CHAT_WORKSPACE_ROOT"]}, "CONFIG_INVALID"),
+        ):
+            with self.subTest(override=override), patch.dict(os.environ, {**values, **override}):
+                with self.assertRaises(CoreError) as caught:
+                    create_app(model=self.model)
+                self.assertEqual(caught.exception.code, code)
+
+    async def test_production_fails_closed_when_sandbox_or_s3_preflight_fails(self):
+        values = {"CORE_AGENT_ENVIRONMENT": "production", "DATABASE_AUTO_MIGRATE": "false",
+                  "PUSH_NOTIFICATION_ENCRYPTION_KEY": Fernet.generate_key().decode()}
+        for target, code in (("sandbox", "SANDBOX_UNAVAILABLE"), ("s3", "STORAGE_UNAVAILABLE")):
+            launcher = UnsandboxedTestLauncher()
+            database = PostgresDatabase(self.dsn)
+            failed = (patch.object(launcher, "preflight", side_effect=CoreError(code)) if target == "sandbox"
+                      else patch("core_agent.s3_storage.S3BlobStore.check", side_effect=CoreError(code)))
+            with self.subTest(target=target), patch.dict(os.environ, values), failed:
+                with self.assertRaises(CoreError) as caught:
+                    create_app(model=self.model, database=database, sandbox_launcher=launcher)
+                self.assertEqual(caught.exception.code, code)
+                self.assertTrue(database._closed)
+                self.assertTrue(launcher._closed)
+
     async def test_history_after_restart_retains_published_file_after_move_and_edit(self):
         self.model._responses = [self.terminal("open('report.txt','w').write('published bytes')"),
             ModelResponse(tool_requests=(ToolRequest("publish", "core_response_files", {"paths": ["report.txt"]}),)),

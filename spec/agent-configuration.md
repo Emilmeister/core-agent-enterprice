@@ -116,7 +116,7 @@ Database credentials являются Platform/deployment config и никогд
 
 `DATABASE_AUTO_MIGRATE=false` обязателен production: migration job с DDL role выполняется до app rollout, выдаёт app role только необходимые DML grants, затем app role проверяет schema version. Production startup MUST reject `DATABASE_AUTO_MIGRATE=true`. Test profile MAY явно выбрать SQLite/in-memory adapter; implicit fallback при отсутствии PostgreSQL запрещён.
 
-Production deployment MUST задавать `DURABLE_STORAGE_ROOT` для immutable blobs, snapshots, manifests и artifacts; S3-backed mount допустим. `LOCAL_WORKSPACE_ROOT` MUST указывать на локальную ephemeral filesystem container-а. Авторизованное развёртывание MUST явно задавать `CHAT_WORKSPACE_ROOT`; в профиле `keycloak` это постоянный POSIX том, в явном [Cloud.ru профиле](cloudru.md) — RAM cache с обязательным S3 commit/restore для production release. Ограниченный первый диагностический запуск MAY использовать временную FS по явному trial-контракту Cloud.ru. Все три root MUST быть различны и не находиться друг внутри друга; startup отклоняет пересечение в любом направлении. Optional `LOCAL_BASE_SNAPSHOT` содержит content-addressed snapshot ID для ephemeral scratch; если он задан, startup проверяет commit manifest и все blobs до первого terminal call. Он не материализуется поверх постоянной папки чата. Active workspace никогда не размещается под `DURABLE_STORAGE_ROOT`.
+Production deployment MUST задавать `DURABLE_STORAGE_ROOT` для immutable blobs, snapshots, manifests и artifacts; в Keycloak S3-backed mount допустим. В явном [Cloud.ru профиле](cloudru.md) production требует `WORKSPACE_STORAGE_TYPE=s3`, а `DURABLE_STORAGE_ROOT` является только локальным cache для S3 bytes; S3 SDK settings и ограничения задаёт CLD-04. `LOCAL_WORKSPACE_ROOT` MUST указывать на локальную ephemeral filesystem container-а. Авторизованное развёртывание MUST явно задавать `CHAT_WORKSPACE_ROOT`; в профиле `keycloak` это постоянный POSIX том, в Cloud.ru — RAM cache с обязательным S3 commit/restore для production. Ограниченный development trial MAY использовать временную FS. Все три root MUST быть различны и не находиться друг внутри друга; startup отклоняет пересечение в любом направлении. Optional `LOCAL_BASE_SNAPSHOT` содержит content-addressed snapshot ID для ephemeral scratch; если он задан, startup проверяет commit manifest и все blobs до первого terminal call. Он не материализуется поверх постоянной папки чата и не поддержан в S3 workspace profile. Active workspace никогда не размещается под `DURABLE_STORAGE_ROOT`.
 
 ## Привязка исполнения к контейнеру
 
@@ -193,9 +193,9 @@ legacy routes только в явно выбранном development/test profi
 |---|---|---|
 | `CORE_AGENT_ENVIRONMENT` | обязательна | Ровно `production`, `development` или `test`; отсутствие и неизвестное значение завершают startup с `CONFIG_INVALID` |
 | `CORE_AGENT_TENANT_ID` | обязательна в enterprise | Trusted company scope, не берётся из prompt/metadata |
-| `CORE_AGENT_AUTH_MODE` | `keycloak` | Ровно `keycloak` или `cloudru`; явный auth profile, без автоматического fallback; до S3 доступен только диагностический development Cloud trial с PostgreSQL |
+| `CORE_AGENT_AUTH_MODE` | `keycloak` | Ровно `keycloak` или `cloudru`; явный auth profile, без автоматического fallback. Cloud production требует PostgreSQL/S3, валидный стабильный Fernet key, отдельные миграции и preflight выбранного sandbox; development допускает явный ephemeral trial по CLD-01/04 |
 | `CORE_AGENT_STARTUP_DIAGNOSTICS` | `false` | `true` включает безопасные finite startup stages по [первому trial](cloudru.md); ENV values/secrets не выводятся и проверки не отключаются |
-| `SANDBOX_BACKEND` | `bubblewrap` | Ровно `bubblewrap` или `landlock`; Landlock разрешён только при `development` + `cloudru` по [CLD-05-L](cloudru.md#cld-05-l-явный-development-backend-landlock), с обязательным preflight и без fallback; неизвестное значение или несовместимый профиль дают `CONFIG_INVALID` |
+| `SANDBOX_BACKEND` | `bubblewrap` | Ровно `bubblewrap` или `landlock`; Landlock разрешён только при `development`/`production` + `cloudru` по [CLD-05-L](cloudru.md#cld-05-l-явный-cloudru-backend-landlock), с обязательным preflight и без fallback; неизвестное значение или несовместимый профиль дают `CONFIG_INVALID` |
 | `CORE_AGENT_OWNER_PASSWORD` | пусто | Обязательный отдельный secret длиной не менее 16 символов в `cloudru`; password/cookie контракт в [CLD-02](cloudru.md) |
 | `KEYCLOAK_ISSUER_URL` | обязательна | Realm issuer, HTTPS; loopback HTTP только development/test |
 | `KEYCLOAK_CLIENT_ID` | обязательна | Confidential introspection client |
@@ -313,7 +313,7 @@ entries; file и values защищаются operator-ом как secrets.
 | Переменная | По умолчанию | Семантика |
 |---|---|---|
 | `RUNTIME_MAX_LLM_CALLS` | `100` | Hard limit числа model turns |
-| `USER_ID` | только explicit development/test | Не является identity fallback для enterprise endpoints; production identity получается только из проверенного Keycloak context |
+| `USER_ID` | только explicit development/test legacy | Не является identity fallback для enterprise endpoints; identity задаёт проверенный Keycloak context либо явный Cloud owner/external profile CLD-02/03 |
 | `MAX_RESPONSE_SIZE` | `100000000` | Legacy предел transport output; не заменяет единый лимит вложений одного сообщения из owner settings |
 | `MAX_CHUNK_SIZE` | `0` | Символов в одном чанке A2A Artifact; `0` означает один чанк |
 | `ENTITY_ID` | пусто | Добавляется заголовком `X-Internal-Entity-ID` к исходящим provider и MCP вызовам |
@@ -346,7 +346,7 @@ Prompt caching является полем запроса только у Anthro
 | `SESSION_POSTGRES_DATABASE` | пусто | Имя базы собираемого URL |
 | `TASK_STORAGE_TYPE` | значение `SESSION_STORAGE_TYPE` | Допустимы ровно `in-memory` и `postgres`. `postgres` при не-postgres сессиях завершается `CONFIG_CONFLICT` |
 | `TASK_POSTGRES_URL` | пусто | Fallback URL перед `DATABASE_URL` |
-| `MEMORY_STORAGE_TYPE` | `in-memory` | Допустимы ровно `in-memory` и `postgres`. Production с включённой памятью MUST использовать `postgres` |
+| `MEMORY_STORAGE_TYPE` | `in-memory` | Допустимы ровно `in-memory` и `postgres`. Production и Cloud.ru в любом environment с включённой памятью MUST явно использовать `postgres`; `disabled` не создаёт backend |
 | `MEMORY_POSTGRES_*` | см. [Память агента](memory-service.md) | Отдельный DSN памяти; непустой `MEMORY_POSTGRES_HOST` переопределяет общий пул агента целиком |
 | `EMBEDDING_MODEL`, `EMBEDDING_API_BASE`, `EMBEDDING_API_KEY` | пусто | Все три заданные включают слой эмбеддингов; иначе векторный канал поиска деградирует |
 | `EMBEDDING_DIMENSION` | `768` | Ожидаемая размерность вектора |
@@ -402,7 +402,7 @@ Config validation MUST обнаруживать как минимум:
 
 - `delegation: true` при отключённых background tasks или `core_delegate`;
 - `memory: required`, если tool filters не оставляют ни одного `core_memory_*` tool;
-- включённую память при `CORE_AGENT_ENVIRONMENT=production` и `MEMORY_STORAGE_TYPE=in-memory`;
+- включённую память в production или Cloud.ru в любом environment без `MEMORY_STORAGE_TYPE=postgres`;
 - advertised A2A capability без runtime/transport implementation;
 - tool allow pattern, полностью перекрытый deny policy;
 - skill/MCP requirement, несовместимый с execution/network profile.

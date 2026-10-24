@@ -14,12 +14,13 @@ from core_agent.sandbox_landlock import LandlockLauncher, LandlockProcess, valid
 
 
 class LandlockConfigurationTests(unittest.TestCase):
-    def test_explicit_cloud_development_only(self):
+    def test_explicit_cloud_development_or_production_only(self):
         self.assertEqual(validate_backend("", cloud=False, environment="production"), "bubblewrap")
         self.assertEqual(validate_backend("landlock", cloud=True, environment="development"), "landlock")
+        self.assertEqual(validate_backend("landlock", cloud=True, environment="production"), "landlock")
         for backend, cloud, environment in [
             ("auto", True, "development"), ("landlock", False, "development"),
-            ("landlock", True, "production"), ("landlock", True, "test"),
+            ("landlock", False, "production"), ("landlock", True, "test"),
         ]:
             with self.subTest(backend=backend, cloud=cloud, environment=environment):
                 with self.assertRaises(CoreError) as raised:
@@ -94,6 +95,20 @@ class LandlockNativeTests(unittest.TestCase):
             launcher.preflight()
         finally:
             launcher.close()
+
+    def test_outer_filter_denies_namespace_operations(self):
+        result = subprocess.run(["/usr/local/bin/python3", "-I", "-S", "-c", """
+import ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True)
+for operation in (
+    lambda: libc.unshare(0x10000000),
+    lambda: libc.setns(-1, 0x10000000),
+    lambda: libc.mount(b'none', b'/tmp', b'tmpfs', 0, None),
+):
+    ctypes.set_errno(0)
+    assert operation() == -1 and ctypes.get_errno() == errno.EPERM
+"""], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_persistent_workspace_and_process_tree_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -8,7 +8,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 from a2a.compat.v0_3.types import AgentCard as LegacyAgentCard, Task as LegacyTask
@@ -30,11 +30,13 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 
 class CloudAuthConfigurationTests(unittest.TestCase):
-    def test_cloud_development_defaults_to_required_postgres_without_injected_database(self):
-        with patch.dict(os.environ, {"CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_AUTH_MODE": "cloudru"}, clear=True):
-            with self.assertRaises(CoreError) as caught:
-                _state()
-        self.assertEqual(caught.exception.code, "DATABASE_URL_REQUIRED")
+    def test_cloud_defaults_to_required_postgres_without_injected_database(self):
+        for environment in ("development", "production"):
+            with self.subTest(environment=environment), patch.dict(os.environ, {
+                    "CORE_AGENT_ENVIRONMENT": environment, "CORE_AGENT_AUTH_MODE": "cloudru"}, clear=True):
+                with self.assertRaises(CoreError) as caught:
+                    _state()
+                self.assertEqual(caught.exception.code, "DATABASE_URL_REQUIRED")
 
     def test_cloud_development_rejects_either_in_memory_store_before_opening_database(self):
         for setting in ("SESSION_STORAGE_TYPE", "TASK_STORAGE_TYPE"):
@@ -63,9 +65,7 @@ class CloudAuthConfigurationTests(unittest.TestCase):
         self.assertNotIn(PASSWORD, repr(settings))
         alias = AuthSettings.from_environment({**base, "AGENT_URL": "", "URL_AGENT": ORIGIN}.get)
         self.assertEqual(alias.origin, ORIGIN)
-        with self.assertRaises(CoreError) as production:
-            AuthSettings.from_environment(base.get, production=True)
-        self.assertEqual(production.exception.code, "CONFIG_INVALID")
+        self.assertEqual(AuthSettings.from_environment(base.get, production=True), settings)
         for name, value in (("CORE_AGENT_AUTH_MODE", "unknown"), ("CORE_AGENT_TENANT_ID", ""),
                             ("CORE_AGENT_OWNER_PASSWORD", "short"), ("AGENT_URL", "http://agent.example.test"),
                             ("AGENT_URL", ORIGIN + "/path"), ("AGENT_URL", ORIGIN + "?key=secret"),
@@ -75,16 +75,45 @@ class CloudAuthConfigurationTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "CONFIG_INVALID")
             self.assertNotIn(PASSWORD, str(caught.exception))
 
-    def test_cloud_production_rejects_in_memory_tasks_before_allocating_runtime(self):
-        values = {"CORE_AGENT_ENVIRONMENT": "production", "CORE_AGENT_AUTH_MODE": "cloudru",
-                  "CORE_AGENT_OWNER_PASSWORD": PASSWORD, "CORE_AGENT_TENANT_ID": "company",
-                  "AGENT_URL": ORIGIN, "CHAT_WORKSPACE_ROOT": "/unused",
-                  "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "in-memory"}
-        with patch.dict(os.environ, values, clear=True), patch("core_agent.app._state") as allocate:
+    def test_cloud_production_rejects_ephemeral_stores_before_opening_database(self):
+        for setting in ("SESSION_STORAGE_TYPE", "TASK_STORAGE_TYPE"):
+            with self.subTest(setting=setting), patch.dict(os.environ, {
+                    "CORE_AGENT_ENVIRONMENT": "production", "CORE_AGENT_AUTH_MODE": "cloudru",
+                    setting: "in-memory"}, clear=True), patch("core_agent.app.PostgresDatabase.from_environment") as open_database:
+                with self.assertRaises(CoreError) as caught:
+                    _state()
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                open_database.assert_not_called()
+
+    def test_cloud_production_verifies_schema_without_automatic_migration(self):
+        for auto_migrate in (None, "false", "true"):
+            database = Mock()
+            values = {"CORE_AGENT_ENVIRONMENT": "production", "CORE_AGENT_AUTH_MODE": "cloudru"}
+            if auto_migrate is not None:
+                values["DATABASE_AUTO_MIGRATE"] = auto_migrate
+            with self.subTest(auto_migrate=auto_migrate), patch.dict(os.environ, values, clear=True):
+                if auto_migrate == "true":
+                    with self.assertRaises(CoreError) as caught:
+                        _state(database)
+                    self.assertEqual(caught.exception.code, "PRODUCTION_AUTO_MIGRATE_FORBIDDEN")
+                    database.close.assert_called_once()
+                    database.verify_schema.assert_not_called()
+                else:
+                    state = _state(database)
+                    self.assertIs(state["database"], database)
+                    self.assertIsInstance(state["tasks"], PostgresTaskStore)
+                    database.verify_schema.assert_called_once()
+                database.migrate.assert_not_called()
+
+    def test_cloud_production_schema_failure_closes_database(self):
+        database = Mock()
+        database.verify_schema.side_effect = CoreError("SCHEMA_VERSION_MISMATCH")
+        with patch.dict(os.environ, {"CORE_AGENT_ENVIRONMENT": "production", "CORE_AGENT_AUTH_MODE": "cloudru"}, clear=True):
             with self.assertRaises(CoreError) as caught:
-                create_app(model=ScriptedModel([]))
-            self.assertEqual(caught.exception.code, "CONFIG_INVALID")
-            allocate.assert_not_called()
+                _state(database)
+        self.assertEqual(caught.exception.code, "SCHEMA_VERSION_MISMATCH")
+        database.close.assert_called_once()
+        database.migrate.assert_not_called()
 
 
 class CloudAuthTests(unittest.IsolatedAsyncioTestCase):

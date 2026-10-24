@@ -1,11 +1,17 @@
-# Первый запуск в Cloud.ru Evolution AI Agents
+# Cloud.ru Evolution AI Agents: запуск и пакетный rollout
 
-Этот запуск нужен для проверки образа и получения диагностических logs из
-целевого Pod. Используйте `development` + `cloudru`: production Cloud.ru пока
-запрещён. PostgreSQL сохраняет состояние и owner-сессии. По умолчанию файлы
-временные; явный S3-режим ниже сохраняет рабочие папки чатов и опубликованные
-результаты, а также закрытые оригиналы входящих вложений до подтверждения приёма.
+Cloud.ru поддерживает development trial и production configuration с обязательными
+PostgreSQL/S3, стабильным encryption key и отдельными миграциями. Включённая
+память требует `MEMORY_STORAGE_TYPE=postgres` в обоих режимах; `CORE_AGENT_MEMORY=disabled`
+не создаёт backend. По умолчанию development файлы временные; явный S3 сохраняет
+рабочие папки, опубликованные результаты и закрытые оригиналы входящих вложений
+до подтверждения приёма. Production POSIX/RAM-only configuration отклоняется.
 Контракт: [spec/cloudru.md](../spec/cloudru.md).
+
+Работающий deployment можно обновить одним candidate image с прежней development
+configuration. Смена `CORE_AGENT_ENVIRONMENT` — отдельный подготовленный шаг:
+не меняйте этот флаг до проверки миграции, runtime role и encryption key ниже.
+Допуск production startup не означает, что все real Cloud release gates пройдены.
 
 Для первого запуска включите диагностические logs без содержимого запросов:
 
@@ -16,7 +22,7 @@ CORE_AGENT_LOG_CONTENT=false
 OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false
 ```
 
-## S3-режим для следующего прогона
+## S3 и сохранность данных
 
 Дополнительно к работающей конфигурации включите:
 
@@ -45,7 +51,9 @@ WORKSPACE_S3_MAX_INFLIGHT=4
 также поддержана. `CHAT_WORKSPACE_ROOT` и `DURABLE_STORAGE_ROOT` остаются локальными
 путями. При ошибке bucket/auth запуск завершается ошибкой, временного fallback нет.
 S3-режим не импортирует старые POSIX blobs и не восстанавливает уже потерянные
-файлы прошлого trial: используйте отдельный tenant/prefix для нового прогона.
+файлы прошлого trial. Только для нового изолированного trial выбирайте новый
+tenant/prefix; при обновлении действующего S3 deployment сохраните прежние
+tenant, bucket и prefix, иначе существующие ссылки не станут новой миграцией.
 `LOCAL_BASE_SNAPSHOT` здесь не поддержан.
 
 Сохраняются скрытые файлы, `.git`, permissions, изменения и удаления.
@@ -59,7 +67,11 @@ S3 blob; неизменные bytes переиспользуются. Общий
 приём подтверждается. Проверка материала может продолжаться после замены Pod.
 После разрешения агент получает рабочую копию: owner-файлы в Landlock —
 `inputs/<batch>/`, A2A — `a2a/`. Изменение/удаление копии сохраняется в workspace;
-скачивание оригинала из проверки материала всегда возвращает исходные bytes.
+скачивание оригинала из проверки материала и карточки принятого файла всегда
+возвращает исходные bytes, включая после изменения/удаления рабочей копии.
+Карточка использует серверный scoped `download_path`; приватные S3 object keys
+и подписанные URL не передаются модели или браузеру. Опубликованный результат —
+отдельный immutable snapshot, дальнейшая правка рабочего файла его не меняет.
 При ошибке S3 до приёма сообщение не принимается; после приёма временная
 недоступность original оставляет доставку pending. POSIX/Landlock по-прежнему
 не принимает protected owner uploads; старые `attachments/` не мигрируют.
@@ -71,8 +83,9 @@ S3 blob; неизменные bytes переиспользуются. Общий
 При `LOG_LEVEL=INFO` события `workspace.storage` и `storage.gc` показывают
 operation/outcome, число/размер файлов и безопасный код ошибки. В них нет
 имён файлов, содержимого, ключей и подписанных URL. Startup diagnostics
-показывают выбранный backend. Следующий отдельный этап — реальная замена Pod,
-проверка Cloud S3, A2A/MCP и доступов; локальные тесты не заменяют его.
+показывают выбранный backend. Реальные Cloud S3/restart и API/browser original
+downloads уже проверены отдельными сценариями; полный набор проверок доступа,
+storage failures, background/idle и recovery остаётся условием выпуска.
 
 ## Образ и окружение
 
@@ -80,7 +93,7 @@ operation/outcome, число/размер файлов и безопасный 
 репозитория:
 
 ```bash
-docker build --platform linux/amd64 -t core-agent:cloudru-trial-20261021 .
+docker build --platform linux/amd64 -t core-agent:cloudru-candidate-20261024 .
 ```
 
 Загрузите образ в доступный платформе registry. Для другого target architecture
@@ -138,26 +151,25 @@ MCP настраиваются в owner UI. Автоматические `MCP_UR
 явный `WORKSPACE_STORAGE_TYPE=s3` использует fallback `ARTIFACT_S3_*`. Default
 Keycloak profile продолжает отклонять эти retired artifact settings.
 
-## Ограниченный Landlock trial
+## Ограниченный профиль Landlock
 
-Для Cloud development можно явно выбрать альтернативный backend:
+Для Cloud development либо подготовленного production можно явно выбрать backend:
 
 ```dotenv
-CORE_AGENT_ENVIRONMENT=development
 CORE_AGENT_AUTH_MODE=cloudru
 SANDBOX_BACKEND=landlock
 ```
 
-Контракт и открытые проверки — [CLD-05-L](../spec/cloudru.md#cld-05-l-явный-development-backend-landlock)
+Контракт и открытые проверки — [CLD-05-L](../spec/cloudru.md#cld-05-l-явный-cloudru-backend-landlock)
 и [CLD-LANDLOCK](../spec/implementation-status.md). Это выбор оператора;
-отказ Bubblewrap сам его не включает. Production, Keycloak и test environment
-с этим выбором отклоняются. Без переменной остаётся Bubblewrap.
+отказ Bubblewrap сам его не включает. Keycloak и test environment с этим выбором
+отклоняются; production требует весь состав ниже. Без переменной остаётся Bubblewrap.
 
 Запускайте `core-agent` непосредственно как PID 1 выделенного container PID
 namespace, без init/supervisor wrapper и shared process namespace. Процесс
 должен работать под non-root UID и иметь нулевые
 effective/permitted/inheritable/ambient capabilities.
-Если платформа не обеспечивает эти условия, данный trial не запускается.
+Если платформа не обеспечивает эти условия, данный профиль не запускается.
 Preflight обязан реально применить Landlock ABI >= 4 и seccomp, создать
 notification listener и передать socket FD ограниченному child через ADDFD.
 Одних успешных диагностических probes недостаточно; отказ закрывает serving.
@@ -217,7 +229,62 @@ mount/unshare/setns. Это реальная kernel-проверка Landlock/se
 `LANDLOCK_VM_LOG` задаёт путь полного guest log; без него log остаётся во
 временной папке. Production image и target Cloud gate этим не заменяются.
 
-## Миграция и первый вход
+## Подготовка production и миграция
+
+Перед изменением работающего deployment проверьте полный набор:
+
+| Настройка/условие | Требование production |
+|---|---|
+| Auth | `CORE_AGENT_AUTH_MODE=cloudru`, прежний `CORE_AGENT_TENANT_ID`, canonical HTTPS `AGENT_URL`, отдельный `CORE_AGENT_OWNER_PASSWORD`; доступ только через platform ingress |
+| State | `SESSION_STORAGE_TYPE=postgres`, `TASK_STORAGE_TYPE=postgres`, доступная БД с текущей schema |
+| Workspace | `WORKSPACE_STORAGE_TYPE=s3`, полная S3 configuration, прежние bucket/prefix; три записываемых и непересекающихся local roots |
+| Encryption | Валидный стабильный Fernet `PUSH_NOTIFICATION_ENCRYPTION_KEY`, одинаковый у экземпляров; хранить отдельно от DB backup |
+| Migration | `DATABASE_AUTO_MIGRATE=false`; отдельный DDL credential выполняет migration до serving, runtime role получает только необходимые DML grants |
+| Memory | `CORE_AGENT_MEMORY=disabled` либо `optional|required` вместе с `MEMORY_STORAGE_TYPE=postgres`; без отдельного `MEMORY_POSTGRES_HOST` используется общий pool |
+| Sandbox | Явный Landlock либо default Bubblewrap с настоящим успешным preflight; его невозможность блокирует запуск |
+| Lifecycle | Один постоянно работающий экземпляр, CPU вне HTTP и отсутствие scale-to-zero; overlapping rollout требует подтверждения fencing |
+
+Сначала подтвердите текущий encryption key и читаемость существующих encrypted
+settings/credentials. Если прежний trial не задавал стабильный secret, нельзя
+просто подставить новый ключ и обещать сохранность: подготовьте перенос encrypted
+state и проверьте его на disposable копии. Не меняйте tenant, auth scope, bucket
+или prefix в качестве способа исправить startup.
+
+В операторском окружении заранее передайте полный `DATABASE_MIGRATION_URL`
+либо `DATABASE_URL`; при отдельной runtime-роли задайте `DATABASE_APP_ROLE`.
+Migration CLI не собирает `SESSION_POSTGRES_*`. Из checkout используются
+существующие команды [README](../README.md):
+
+```bash
+uv run core-agent-db migrate
+uv run core-agent-db check
+```
+
+Первую команду выполняйте с migration credential; перед `check` переключите
+окружение на runtime `DATABASE_URL` без `DATABASE_MIGRATION_URL`, чтобы проверить
+schema доступом приложения. В собранном образе доступны те же `core-agent-db
+migrate` и `core-agent-db check`. Serving process не получает migration secret.
+
+До rollout остановите новые admissions и writers, сохраните согласованный backup
+БД и всех referenced S3 objects, а ключ шифрования — отдельно. Восстановление
+проверяйте на disposable копии с пустым local cache и тем же ключом. Порядок и
+граница rollback заданы в [architecture](../spec/architecture.md): до новых writes
+допустим проверенный согласованный snapshot; после новых accepted records старый
+backup нельзя накладывать поверх данных. Старый image должен понимать текущие
+schema и storage manifests; простое переключение image не является downgrade.
+
+Если после смены Pod execution остался неизвестным, используйте существующую
+[процедуру восстановления](execution-recovery.md): внешне подтвердите остановку
+точного поколения и подготовьте приватный JSON, затем выполните:
+
+```bash
+uv run core-agent-db confirm-execution-stop --file /run/secrets/stop.json
+```
+
+CLI записывает evidence, но не останавливает процессы. Потеря lease/handle или
+новый пустой Pod не доказывают остановку; неизвестные команды не replay-ятся.
+
+## Первый development trial и вход
 
 Для первого trial используйте **новую выделенную БД** и credential с DDL правами:
 `DATABASE_AUTO_MIGRATE=true` в development применит схему при старте `core-agent`,
@@ -258,6 +325,39 @@ owner cookie не расширяет права внешних вызовов ч
 200 при исправном sandbox и доступной БД с совместимой schema, иначе 503.
 HEAD возвращает статус без body. `/health/live` остаётся отдельным liveness
 endpoint. Эти root routes включены только в Cloud.ru profile.
+
+## Один candidate и общий rollout
+
+1. Завершите весь пакет code/spec/tests/docs и frozen hashes в постоянной рабочей
+   копии. Выполните общий regression/native/browser/package прогон по
+   [CI](../.github/workflows/ci.yml); новый код после проверки требует относящихся
+   к нему checks, а не промежуточного Cloud deploy.
+2. Соберите один candidate image, опубликуйте постоянный tag и сохраните digest
+   вместе с Git revision, результатами gates и безопасными logs. Native
+   `sandbox-linux` amd64/arm64 запускает `deploy/landlock-native.sh` на candidate
+   с `CORE_AGENT_REQUIRE_LANDLOCK_TESTS=1` и
+   `CORE_AGENT_REQUIRE_NATIVE_SECCOMP_TESTS=1`; отсутствие enforcement — failure.
+3. Подготовьте migration, backup и secrets по разделу выше. Для действующего
+   development deployment сохраните текущие настройки и данные; если отдельная
+   migration или стабильный encryption key ещё не подготовлены, передайте тот
+   же candidate для проверки в development с явно записанными production blockers.
+4. Обновите deployment один раз этим digest. Сохраните `/health/live`,
+   `/health/ready`, root Agent Card, browser login и terminal/Python preflight
+   evidence; проверяйте оставшуюся матрицу на этом же образе в отдельных чатах.
+5. Для release нужны реальные idle/background/cron без открытого браузера,
+   owner/HITL/time/remote waits, SIGTERM во время активной команды, cold restore,
+   rolling overlap и отсутствие второго writer/повторных side effects. Добавьте
+   isolation/network/security, отзыв platform key, runtime grants, storage failures,
+   backup/restore и telemetry; результаты записывайте отдельно для каждого gate.
+6. При непрошедшем gate сохраните ограниченный статус candidate и конкретный
+   blocker. Выпуск подтверждается только evidence; статус config support не
+   превращает development smoke в production approval.
+
+Cloud.ru сохраняет согласованные отличия: общий пароль владельцев, общий внешний
+scope у платформенных peers, реальные workspace пути и proxy-aware HTTP(S)
+в Landlock. Он не обещает персональную Keycloak identity, namespaces Bubblewrap
+или произвольные TCP/UDP/syscalls. Secrets, cookies, DSN, private object keys и
+полные ENV dumps в отчёт проверки не включаются.
 
 ## Какие logs передать
 
