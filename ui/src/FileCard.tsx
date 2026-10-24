@@ -1,7 +1,7 @@
 import { DetailsIcon } from "./DetailsIcon";
 import { useId, useLayoutEffect, useRef, useState } from "react";
 import { Api, errorText } from "./api";
-import { formatFileSize, publicHistoryItems } from "./types";
+import { formatFileSize, isAttachmentDownloadPath, publicHistoryItems } from "./types";
 import { Markdown } from "./Markdown";
 import { CodeBlock } from "./Code";
 import type { AttachmentEntry, HistoryItem, ResponseFileEntry } from "./types";
@@ -24,6 +24,13 @@ export function FileCard({ api, contextId, taskId, file, downloadPath, available
   downloadPath?: string; available?: boolean; partLabel?: string;
 }) {
   const responseFile = "file_id" in file;
+  if (!responseFile) {
+    downloadPath ??= file.download_path;
+    // Old writable input receipts wait for the original link from history.
+    // A malformed original link must never fall back to the mutable copy.
+    available &&= (file.download_path === undefined || isAttachmentDownloadPath(file.download_path))
+      && (!file.relative_path.startsWith("inputs/") || !!downloadPath);
+  }
   const name = responseFile ? file.name : file.actual_name;
   const identity = responseFile ? file.file_id : file.relative_path;
   const extension = name.split(".").at(-1)?.toLowerCase() ?? "";

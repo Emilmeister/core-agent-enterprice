@@ -62,6 +62,15 @@ class S3IncomingRuntimeTests(storage.CloudStorageRuntimeFixture):
         await asyncio.to_thread(self.agent.resume_task, record.task_id)
         self.assertEqual(self.agent.workflow_store.lookup_task(record.task_id).state, "COMPLETED")
 
+    async def history_attachment(self, record):
+        response = await self.http.get(f"/api/chats/{record.context_id}/history", params={"limit": 100})
+        self.assertEqual(response.status_code, 200, response.text)
+        entries = [entry for item in response.json()["items"] if item["task_id"] == record.task_id
+                   for entry in item.get("attachments", [])]
+        self.assertEqual(len(entries), 1, entries)
+        self.assertIn("download_path", entries[0])
+        return entries[0]
+
     async def test_put_failure_precedes_root_and_followup_acceptance(self):
         service = self.agent.chat_file_service
         self.assertIs(service.blob_store, self.agent.workspace_blob_store)
@@ -89,6 +98,10 @@ class S3IncomingRuntimeTests(storage.CloudStorageRuntimeFixture):
     async def test_pending_review_downloads_original_after_restart_and_checks_scope_before_get(self):
         record, batch, path = await self.pending("review")
         await self.restart([])
+        with patch.object(self.agent.workspace_blob_store, "get", side_effect=AssertionError("quarantine S3 GET")) as get:
+            normal = await self.http.get(f"/api/chats/review/tasks/{record.task_id}/attachments/{batch['batch_id']}/0")
+            self.assertEqual(normal.status_code, 404, normal.text)
+            get.assert_not_called()
         downloaded = await self.http.get(f"/api/guardrails/{record.snapshot['wait_id']}/file")
         self.assertEqual(downloaded.status_code, 200, downloaded.text)
         self.assertEqual(downloaded.content, self.original)
@@ -131,11 +144,16 @@ class S3IncomingRuntimeTests(storage.CloudStorageRuntimeFixture):
         await self.decide(record, "allow")
 
     async def test_allowed_working_copy_edits_and_deletion_survive_restart_without_changing_original(self):
-        record, _, path = await self.pending("working-copy")
+        record, batch, path = await self.pending("working-copy")
         original_url = f"/api/guardrails/{record.snapshot['wait_id']}/file"
         await self.restart([ModelResponse(message="File accepted")])
         await self.decide(record, "allow")
         await self.restart([])
+        entry = await self.history_attachment(record)
+        download_path = f"/api/chats/working-copy/tasks/{record.task_id}/attachments/{batch['batch_id']}/0"
+        self.assertEqual(entry["download_path"], download_path)
+        self.assertEqual(entry["sha256"], batch["manifest"]["entries"][0]["sha256"])
+        self.assertEqual((await self.http.get(download_path)).content, self.original)
         copy = await self.http.get("/api/chats/working-copy/files/content", params={"path": path})
         self.assertEqual(copy.status_code, 200, copy.text)
         self.assertEqual(copy.content, self.original)
@@ -143,6 +161,8 @@ class S3IncomingRuntimeTests(storage.CloudStorageRuntimeFixture):
                                  ModelResponse(message="Edited")]
         await self.submit("working-copy")
         await self.restart([])
+        self.assertEqual(await self.history_attachment(record), entry)
+        self.assertEqual((await self.http.get(download_path)).content, self.original)
         copy = await self.http.get("/api/chats/working-copy/files/content", params={"path": path})
         self.assertEqual(copy.status_code, 200, copy.text)
         self.assertEqual(copy.content, b"edited")
@@ -151,16 +171,104 @@ class S3IncomingRuntimeTests(storage.CloudStorageRuntimeFixture):
                                  ModelResponse(message="Deleted")]
         await self.submit("working-copy")
         await self.restart([])
+        # A cold history/card download must not recreate the deleted working copy.
+        self.assertEqual(await self.history_attachment(record), entry)
+        downloaded = await self.http.get(download_path)
+        self.assertEqual(downloaded.status_code, 200, downloaded.text)
+        self.assertEqual(downloaded.content, self.original)
         self.assertEqual((await self.http.get("/api/chats/working-copy/files/content", params={"path": path})).status_code, 404)
         downloaded = await self.http.get(original_url)
         self.assertEqual(downloaded.status_code, 200, downloaded.text)
         self.assertEqual(downloaded.content, self.original)
 
+    async def test_original_download_without_review_checks_scope_and_never_uses_working_copy(self):
+        self.agent.agent_settings_store.update(self.tenant, {"guardrails_enabled": False},
+            expected_revision=0, actor_id="owner")
+        self.model._responses = [ModelResponse(message="Accepted without review")]
+        response = await self.upload("no-review")
+        self.assertEqual(response.status_code, 200, response.text)
+        task = response.json()["task"]
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        self.assertFalse(self.agent.workflow_store.list_interactions(record.task_id,
+            tenant_id=self.tenant, status="all"))
+        receipt = task["metadata"]["file_receipt"]["entries"][0]
+        self.assertIn("download_path", receipt)
+        self.assertEqual(await self.history_attachment(record), receipt)
+
+        self.model._responses = [ModelResponse(message="Other chat")]
+        other = await self.upload("other-chat")
+        self.assertEqual(other.status_code, 200, other.text)
+        other_task = other.json()["task"]
+        other_batch = other_task["metadata"]["file_batch_id"]
+        await self.restart([])
+        entry = await self.history_attachment(record)
+        self.assertEqual(entry, receipt)
+        url = entry["download_path"]
+        database, blobs = self.app.state.database, self.agent.workspace_blob_store
+        database.pool.resize(min_size=1, max_size=1)
+        original_get = blobs.get
+
+        def outside_transaction(digest, size):
+            with database.pool.connection(timeout=1) as connection:
+                connection.execute("SELECT 1")
+            return original_get(digest, size)
+
+        with patch.object(blobs, "get", side_effect=outside_transaction) as get:
+            downloaded = await self.http.get(url)
+        self.assertEqual(downloaded.status_code, 200, downloaded.text)
+        self.assertEqual(downloaded.content, self.original)
+        self.assertTrue(get.called)
+        for header, value in (("cache-control", "no-store"), ("x-content-type-options", "nosniff")):
+            self.assertEqual(downloaded.headers[header], value)
+        self.assertIn("attachment", downloaded.headers["content-disposition"])
+        self.assertIn("sandbox", downloaded.headers["content-security-policy"])
+
+        with patch.object(blobs, "get", side_effect=AssertionError("unauthorized S3 GET")) as get:
+            for denied in (url.replace("no-review", "other-chat"),
+                    url.replace(record.task_id, other_task["id"]),
+                    url.replace(task["metadata"]["file_batch_id"], other_batch),
+                    url.rsplit("/", 1)[0] + "/999"):
+                with self.subTest(path=denied):
+                    rejected = await self.http.get(denied)
+                    self.assertEqual(rejected.status_code, 404, rejected.text)
+            get.assert_not_called()
+
+        # Keep a valid local copy: neither unavailable nor corrupt S3 may fall back to it.
+        copy = await self.http.get("/api/chats/no-review/files/content", params={"path": entry["relative_path"]})
+        self.assertEqual(copy.content, self.original)
+        with patch.object(blobs, "get", side_effect=CoreError("STORAGE_UNAVAILABLE")):
+            unavailable = await self.http.get(url)
+        self.assertEqual(unavailable.status_code, 503, unavailable.text)
+        self.assertEqual(unavailable.json()["error"]["code"], "STORAGE_UNAVAILABLE")
+        with patch.object(blobs, "get", return_value=b"corrupt"):
+            corrupt = await self.http.get(url)
+        self.assertEqual(corrupt.status_code, 409, corrupt.text)
+        self.assertEqual(corrupt.json()["error"]["code"], "ARTIFACT_INTEGRITY_FAILED")
+        self.assertEqual(self.model.calls, ())
+
+        # Later rejection of the same bytes also revokes an earlier clear card.
+        self.agent.agent_settings_store.update(self.tenant, {"guardrails_enabled": True},
+            expected_revision=1, actor_id="owner")
+        later, _, _ = await self.pending("no-review")
+        self.model._responses = [ModelResponse(message="Continuing without the rejected file")]
+        await self.decide(later, "reject")
+        self.assertEqual(self.agent.chat_file_service.store.get(
+            task["metadata"]["file_batch_id"], self.tenant)["state"], "published")
+        with patch.object(blobs, "get", side_effect=AssertionError("revoked material S3 GET")) as get:
+            revoked = await self.http.get(url)
+            self.assertEqual(revoked.status_code, 404, revoked.text)
+            get.assert_not_called()
+
     async def test_rejected_batch_never_publishes_a_working_copy_after_restart(self):
-        record, _, path = await self.pending("reject")
+        record, batch, path = await self.pending("reject")
         await self.restart([ModelResponse(message="Continuing without the file")])
         await self.decide(record, "reject")
         await self.restart([])
+        with patch.object(self.agent.workspace_blob_store, "get", side_effect=AssertionError("excluded S3 GET")) as get:
+            normal = await self.http.get(f"/api/chats/reject/tasks/{record.task_id}/attachments/{batch['batch_id']}/0")
+            self.assertEqual(normal.status_code, 404, normal.text)
+            get.assert_not_called()
         self.assertEqual((await self.http.get("/api/chats/reject/files/content", params={"path": path})).status_code, 404)
         downloaded = await self.http.get(f"/api/guardrails/{record.snapshot['wait_id']}/file")
         self.assertEqual(downloaded.status_code, 200, downloaded.text)

@@ -251,6 +251,62 @@ async def final_response_file(agent, admission, actor, request):
     return WorkspaceDownload(io.BytesIO(content), len(content), entry["name"])
 
 
+async def incoming_attachment(agent, admission, actor, request):
+    require_owner(actor)
+    index = request.path_params["index"]
+    if request.query_params or not re.fullmatch(r"0|[1-9][0-9]{0,4}", index):
+        raise CoreError("REQUEST_INVALID")
+    index = int(index)
+    context_id, task_id, batch_id = (request.path_params[key] for key in ("context_id", "task_id", "batch_id"))
+    service = agent.chat_file_service
+    if service is None:
+        raise CoreError("FILE_NOT_FOUND")
+
+    def authorize():
+        def load(chat, connection=None):
+            from .chat_files import attachment_entries
+            from .history import title_source
+
+            if chat is None:
+                raise CoreError("FILE_NOT_FOUND")
+            chat = {"owner_id": chat["owner_id"], "context_id": context_id}
+            batch = service.store.get(batch_id, actor.tenant, connection=connection)
+            if ((batch["owner_id"], batch["context_id"], batch["task_id"], batch["state"])
+                    != (chat["owner_id"], context_id, task_id, "published")
+                    or not service._stored_original(batch["manifest"])
+                    or not 0 <= index < len(batch["manifest"]["entries"])):
+                raise CoreError("FILE_NOT_FOUND")
+            # Use the same bounded source and current material decisions as history.
+            source = title_source(admission, actor.tenant, chat,
+                {"run_id": batch["run_id"], "sequence": batch["sequence"]}, connection)
+            if (source is None or source["status"] != "available"
+                    or attachment_entries(batch)[index] not in source.get("attachments", ())):
+                raise CoreError("FILE_NOT_FOUND")
+            return batch
+
+        database = getattr(admission, "database", None)
+        if database is not None:
+            with database.transaction() as connection:
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                chat = connection.execute("SELECT owner_id,context_id FROM core_chats WHERE tenant_id=%s AND context_id=%s",
+                                          (actor.tenant, context_id)).fetchone()
+                return load(chat, connection)
+        with agent.workflow_store._lock:
+            return load(admission.chats.get((actor.tenant, context_id)))
+
+    def read():
+        batch = authorize()
+        binding = WorkspaceBinding(actor.tenant, batch["owner_id"], context_id)
+        # S3 reads and private cache cleanup run without an open DB transaction.
+        result = service.owner_download(batch_id, binding, index, run_id=batch["run_id"], task_id=task_id)
+        if authorize()["manifest"] != result["manifest"]:
+            raise CoreError("ARTIFACT_INTEGRITY_FAILED")
+        return result
+
+    result = await asyncio.to_thread(read)
+    return WorkspaceDownload(io.BytesIO(result["content"]), len(result["content"]), result["entry"]["actual_name"])
+
+
 async def workspace_files(agent, admission, actor, request):
     require_owner(actor)
     context_id, query = request.path_params["context_id"], request.query_params
@@ -587,6 +643,8 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
                     return JSONResponse(result, headers={"Cache-Control": "no-store"})
                 if "file_id" in request.path_params:
                     return await final_response_file(agent, admission, actor, request)
+                if "batch_id" in request.path_params:
+                    return await incoming_attachment(agent, admission, actor, request)
                 if request.url.path.endswith("/files") or request.url.path.endswith("/files/content"):
                     result = await workspace_files(agent, admission, actor, request)
                     if isinstance(result, Response):
@@ -633,7 +691,7 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
                       "CHAT_TITLE_CONFLICT": 409,
                       "TOOL_IDENTITY_CONFLICT": 409,
                       "MATERIAL_REVIEW_NOT_FOUND": 404, "MATERIAL_REVIEW_CONFLICT": 409,
-                      "FILE_BATCH_NOT_FOUND": 404, "ARTIFACT_INTEGRITY_FAILED": 409,
+                      "FILE_BATCH_NOT_FOUND": 404, "ARTIFACT_INTEGRITY_FAILED": 409, "STORAGE_UNAVAILABLE": 503,
                       "INTERACTION_CLOSED": 409, "SETTINGS_CONFLICT": 409,
                       "REMOTE_AGENT_NOT_FOUND": 404, "REMOTE_AGENT_CONFLICT": 409,
                       "REMOTE_AGENT_CREDENTIAL_UNAVAILABLE": 503,
@@ -662,6 +720,7 @@ def owner_routes(agent, store, *, admission=None, remote_registry=None, cron_sto
         routes.extend(peer_conversation_routes(agent, admission))
         routes.append(Route("/api/chats", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/tasks/{task_id}/files/{file_id}", endpoint))
+        routes.append(Route("/api/chats/{context_id:path}/tasks/{task_id}/attachments/{batch_id}/{index}", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/history", endpoint))
         routes.append(Route("/api/chats/{context_id:path}/title", endpoint, methods=["PUT"]))
         routes.append(Route("/api/chats/{context_id:path}/files/delete", endpoint, methods=["GET", "POST"]))

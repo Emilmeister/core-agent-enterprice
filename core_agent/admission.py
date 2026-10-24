@@ -183,9 +183,9 @@ def bind_files(agent, batch, task, run_id, context, *, sequence=None, connection
     # The receipt contains only server-owned values, safe for inbox JSONB too.
     receipt = {key: manifest[key] for key in (
         "schema_version", "batch_id", "created_at", "source", "total_bytes")}
-    receipt["entries"] = [{key: entry[key] for key in (
-        "index", "actual_name", "relative_path", "size_bytes", "sha256")}
-        for entry in manifest["entries"]]
+    from .chat_files import attachment_entries
+
+    receipt["entries"] = attachment_entries(bound)
     return {"file_batch_id": batch["batch_id"], "file_receipt": receipt}
 
 

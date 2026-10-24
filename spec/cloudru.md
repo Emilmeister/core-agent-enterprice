@@ -266,6 +266,15 @@ owner download читают original bytes с проверкой scope/digest/si
 Принятые и исключённые originals остаются referenced независимо от удаления
 или изменения рабочей копии. Незавершённый upload очищается bounded GC.
 
+Карточка опубликованного S3-вложения в owner UI скачивает этот original через
+`GET /api/chats/{context_id}/tasks/{task_id}/attachments/{batch_id}/{index}`.
+Сервер проверяет canonical chat/root Task, persisted scope и published S3 batch,
+индекс и целостность bytes; writable workspace не является fallback. Поле
+`download_path` в entry истории/receipt опционально и формируется сервером.
+Повторное чтение истории добавляет его и прежним S3 batches без миграции;
+POSIX/legacy entries сохраняют прежний контракт. Pending/rejected originals
+по-прежнему доступны только через owner review, а рабочая копия — через workspace API.
+
 После whole-batch allow рабочая копия публикуется вместе с workspace checkpoint
 и DB receipt. До этого модель не получает пути/содержимое. Сбой
 не оставляет незакреплённую копию доступной параллельным командам или tools

@@ -769,6 +769,7 @@ Tenant, owner, actor и права не принимаются из JSON. Неи
 | `PUT /api/chats/{context_id}/title` | Owner-only переименование: ровно `{title, expected_revision}`; trim, непустое название до 120 Unicode символов, неотрицательная integer revision. Ответ `{context_id, title, title_revision, updated_at}`. Неверное тело —400 `REQUEST_INVALID`, роль —403, missing/foreign chat —404 `TASK_NOT_FOUND`, stale revision —409 `CHAT_TITLE_CONFLICT`. Смена названия не меняет Task/context/workspace или prompt; все владельцы company видят сохранённое значение |
 | `DELETE /api/chats/{context_id}` | Owner-only удаление из общего списка: без body/query; ответ200 `{context_id, archived:true}` также при повторе. Missing/foreign404 `TASK_NOT_FOUND`, external/dual role403, любой canonical nonterminal root409 `CONTEXT_BUSY`. Архивирование и отключение всех связанных enabled cron выполняются атомарно. Старые Tasks, история, workspace и выданные transport files сохраняются |
 | `GET /api/chats/{context_id}/history` | Owner-only полная история canonical чата, включая предыдущие root Tasks и принятые уточнения во время ожидания. Limit 1–100 (default 50), newest-first, versioned cursor, привязанный к company/chat и сохранённой позиции; ответ `{items, next_cursor}`. Missing/foreign chat —404; неверные query/cursor —400; чтение не запускает runtime |
+| `GET /api/chats/{context_id}/tasks/{task_id}/attachments/{batch_id}/{index}` | Owner-only скачивание immutable original опубликованного S3-вложения. Без query; index — от 1 до 5 десятичных цифр без ведущих нулей, кроме `0`. Canonical chat/root Task и persisted batch/index проверяются в scope company и исходного owner до чтения bytes. Missing/foreign, index вне batch либо неопубликованный/не-S3 batch —404; malformed index/query —400. Проверяются digest/size original; integrity failure —409, `STORAGE_UNAVAILABLE` —503. Сетевое чтение не удерживает DB transaction. Ответ attachment, `application/octet-stream`, no-store, nosniff и sandbox CSP. Изменение/удаление рабочей копии не меняет original; fallback к workspace запрещён |
 | `GET /api/chats/{context_id}/files` | Owner-only preview обычных файлов постоянного workspace. Optional `directory` — относительный каталог (default корень), `older_than_days` — неотрицательное конечное десятичное число до 100000, `limit` 1–100 (default 50), `cursor`; неизвестные/повторные query запрещены. Ответ `{files, next_cursor, listed_at, active, cleanup_block_reason, workspace_revision}`; элемент содержит ровно `name`, `path`, `size`, `mtime_ns`, `identity_token`. Порядок lexicographic по относительному пути, cursor связан с company/chat/каталогом/фильтром, revision и server timestamp; чтение не создаёт папку и не запускает runtime |
 | `GET /api/chats/{context_id}/files/content?path=...` | Owner-only скачивание существующего обычного файла выбранного workspace; ровно один непустой относительный POSIX path. Свежая проверка company/chat и безопасное открытие по directory fds; symlinks, hardlinks и special files не выдаются. Attachment, `application/octet-stream`, no-store, nosniff и sandbox CSP. Missing/foreign file —404, malformed path/query —400; descriptor закрывается и при disconnect |
 | `POST /api/chats/{context_id}/files/delete` | Owner-only удаление явно выбранного набора: ровно `{request_id, files:[{path, identity_token}]}`. Не более 1000 уникальных относительных paths; request_id — непустая UTF-8 строка до 256 байт без NUL. Тот же company/chat/request_id и неизменное упорядоченное тело возвращают прежнюю операцию; другое тело —409 `CLEANUP_REQUEST_CONFLICT`. Empty selection не меняет файлы. Active Task —409 `CONTEXT_BUSY`, без создания/очереди операции. Completed receipt —200, pending/reconciliation —202 |
@@ -880,8 +881,9 @@ Error — safe code, без exception/provider text. Tool calls/results прое
 Текст отображается как данные и не разрешает использование материала моделью.
 
 После публикации входящего file batch доступная запись сообщения MAY включать
-`attachments`: ordered array объектов ровно с `index`, `actual_name`,
-`relative_path`, `size_bytes`, `sha256` из сохранённого server-owned receipt.
+`attachments`: ordered array объектов с `index`, `actual_name`,
+`relative_path`, `size_bytes`, `sha256` из сохранённого server-owned receipt
+и optional `download_path` для S3 original.
 History заново проверяет связь batch с company, chat owner, context, Task, run
 и input sequence. Исходные имена, media metadata и bytes не возвращаются этим
 полем. Для queued, pending, excluded или rejected материала имена не раскрываются
@@ -890,6 +892,15 @@ History заново проверяет связь batch с company, chat owner,
 Task metadata исходного принятого сообщения с файлами содержит `file_batch_id`
 и `file_receipt` с ровно `schema_version`, `batch_id`, `created_at`, `source`,
 `total_bytes`, `entries`.
+S3 entry в history и file receipt MAY дополнительно содержать `download_path` —
+относительный server-owned URL маршрута original attachment выше. Поле не меняет
+scope и не разрешает скачивание до публикации batch. Карточка входящего файла
+использует этот URL, поэтому изменение/удаление рабочей копии и restart не меняют
+скачиваемые bytes. При свежем чтении history URL вычисляется также для прежних
+S3 batches без изменения persisted receipt/schema; POSIX/legacy entries без
+этого поля сохраняют прежнее скачивание из workspace. Pending/rejected originals
+остаются на owner review endpoint; S3 route не подменяет original рабочей копией
+при отсутствии или ошибке storage.
 Успешный ACK follow-up MAY дополнительно включать `accepted_message_id` и
 `accepted_file_receipt` в response copy Task. ID должен совпадать с отправленным
 messageId; receipt берётся из canonical inbox provenance, включая dedup. Этот

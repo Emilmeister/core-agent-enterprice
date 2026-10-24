@@ -236,7 +236,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/interactions.py` | Company settings, per-origin tool policies, CAS и транзакционный запрет pending approvals |
 | `core_agent/agent_settings.py`, `core_agent/agent_settings_api.py` | Company profile/model/MCP settings, immutable encrypted revisions, fixed-provider model discovery и owner-only UI API |
 | `core_agent/peer_conversations.py` | Owner-only bounded public peer history, safe file projection, paginated chat/child ownership и expiring observation interest |
-| `core_agent/owner_api.py` | Owner-only settings, policy, HITL/guardrail decisions и приватные ответы на вопросы |
+| `core_agent/owner_api.py` | Owner-only settings, policy, HITL/guardrail decisions, приватные ответы на вопросы и scoped скачивание опубликованных S3 originals |
 | `core_agent/history.py` | Bounded owner-only проекция полной истории чата, stable cursors и текущие ограничения на материалы |
 | `core_agent/cron_expression.py` | Закреплённый croniter parser и ZoneInfo adapter: five-field dialect, bounded calendar search и gap/fold semantics |
 | `core_agent/cron.py` | Company schedule/event stores, CAS/receipts и shared atomic root admission, включая fenced agent tool creation |
@@ -1273,6 +1273,10 @@ run получает отдельные MCP session и negotiated version; пе�
   `DURABLE_STORAGE_ROOT` остаётся cache. Старые POSIX bytes автоматически не
   мигрируют; production не включается этим trial. Incoming PUT предшествует ACK,
   batch bind/pin атомарен с Task/inbox; original GET не удерживает DB locks.
+  Карточки входящих S3-файлов используют server-owned `download_path` из
+  history/receipt на `/api/chats/{context_id}/tasks/{task_id}/attachments/{batch_id}/{index}`;
+  маршрут проверяет canonical root/chat и published batch, читает original без
+  fallback к рабочей копии. Pending/rejected originals остаются на review API.
   Публикация копии и workspace manifest commit-ятся вместе; последующий recovery
   не копирует original поверх правок и удалений.
   Конфигурация и лимиты — `spec/cloudru.md`, CLD-04.

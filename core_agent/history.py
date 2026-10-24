@@ -647,9 +647,9 @@ def _project(admission, root, entry, connection, chat):
                     message["sequence"] if message else None):
                 raise CoreError("CHECKPOINT_INVALID")
             if batch["state"] == "published":
-                result.setdefault("attachments", []).extend({key: entry[key] for key in (
-                    "index", "actual_name", "relative_path", "size_bytes", "sha256")}
-                    for entry in batch["manifest"]["entries"])
+                from .chat_files import attachment_entries
+
+                result.setdefault("attachments", []).extend(attachment_entries(batch))
     if result["status"] == "available":
         if public_message:
             result["public_message"] = public_message

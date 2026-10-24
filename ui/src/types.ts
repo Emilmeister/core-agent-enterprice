@@ -19,6 +19,13 @@ export interface AttachmentEntry {
   relative_path: string;
   size_bytes: number;
   sha256: string;
+  download_path?: string;
+}
+
+export function isAttachmentDownloadPath(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 4096
+    && /^\/api\/chats\/[^/\\?#\s]+\/tasks\/[^/\\?#\s]+\/attachments\/[^/\\?#\s]+\/(?:0|[1-9]\d*)$/.test(value)
+    && new URL(value, "https://owner.invalid").pathname === value;
 }
 export interface ResponseFileEntry {
   file_id: string;
@@ -95,6 +102,7 @@ export function fileReceipt(value: unknown): FileReceipt | undefined {
       || !Number.isSafeInteger(entry.index) || entry.index < 0
       || typeof entry.actual_name !== "string" || typeof entry.relative_path !== "string"
       || !Number.isSafeInteger(entry.size_bytes) || entry.size_bytes < 0
+      || entry.download_path !== undefined && !isAttachmentDownloadPath(entry.download_path)
       || typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(entry.sha256))) return undefined;
   return receipt;
 }

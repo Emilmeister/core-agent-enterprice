@@ -25,6 +25,7 @@ import unicodedata
 import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import PurePosixPath
+from urllib.parse import quote
 
 from psycopg.types.json import Jsonb
 
@@ -42,6 +43,21 @@ _TRANSITIONS = {
     "accepted_ready": {"accepted_ready", "published", "excluded"},
     "published": {"published"}, "excluded": {"excluded"}, "rejected": {"rejected"},
 }
+
+
+def attachment_entries(batch):
+    """Public receipt fields and server-owned links, without storage credentials."""
+    manifest = batch["manifest"]
+    entries = [{key: entry[key] for key in (
+        "index", "actual_name", "relative_path", "size_bytes", "sha256")}
+        for entry in manifest["entries"]]
+    if manifest.get("storage") == {"version": 1, "backend": "s3"}:
+        context, task, identifier = (quote(batch[key], safe="")
+                                     for key in ("context_id", "task_id", "batch_id"))
+        for entry in entries:
+            entry["download_path"] = (f"/api/chats/{context}/tasks/{task}/attachments/"
+                                      f"{identifier}/{entry['index']}")
+    return entries
 
 
 def _check_update(old, new):
@@ -907,8 +923,8 @@ class ChatFileService:
     def owner_download(self, batch_id, binding, index, *, run_id, task_id):
         """Role-authorized owner API only; immutable logical scope, no host paths.
 
-        History remains readable after a Task closes. The API must derive batch
-        and index from its authorized persisted review, never caller overrides.
+        History remains readable after a Task closes. The API must authorize the
+        persisted review or published input before selecting a batch and index.
         """
         with self._accepted_files(batch_id, binding, run_id=run_id, task_id=task_id) as (row, directory):
             if type(index) is not int or not 0 <= index < len(row["manifest"]["entries"]):
