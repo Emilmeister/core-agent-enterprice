@@ -806,7 +806,9 @@ run получает отдельные MCP session и negotiated version; пе�
   workflow, модель или classifier. Cursor привязан к company/chat и сохраняет
   позицию при новых Task, compaction и доставке queued input. Server anchors и
   delivery provenance сохраняют identity сообщения без двойного отображения.
-  PostgreSQL читает проекцию в read-only repeatable-read transaction. Provider
+  PostgreSQL читает проекцию в read-only repeatable-read transaction. При холодном
+  S3 cache общий bounded prefetch загружает проверенные bytes после выхода из
+  transaction и повторяет всю проекцию с текущими access/material checks. Provider
   replay, hidden reasoning и private material bytes не выдаются. Current negative
   decisions проверяются для originals, dependencies и final text; digest всегда
   сопоставляется вместе с material kind. Запрещённый материал заменяется safe

@@ -104,6 +104,46 @@ class CloudStorageRuntimeFixture(unittest.IsolatedAsyncioTestCase):
 
 
 class CloudStorageRuntimeTests(CloudStorageRuntimeFixture):
+    async def test_history_after_restart_retains_published_file_after_move_and_edit(self):
+        self.model._responses = [self.terminal("open('report.txt','w').write('published bytes')"),
+            ModelResponse(tool_requests=(ToolRequest("publish", "core_response_files", {"paths": ["report.txt"]}),)),
+            ModelResponse(message="Published")]
+        task = await self.submit("cold-history")
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED", task)
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        artifact = record.snapshot["published_artifacts"][0]
+        reference = artifact["parts"][0]["ref"]
+        self.model._responses = [self.terminal("from pathlib import Path; Path('report.txt').rename('moved.txt'); Path('moved.txt').write_text('edited bytes')"),
+                                 ModelResponse(message="Moved and edited")]
+        changed = await self.submit("cold-history")
+        self.assertEqual(changed["status"]["state"], "TASK_STATE_COMPLETED", changed)
+        await self.restart([])
+        database = self.app.state.database
+        database.pool.resize(min_size=1, max_size=1)
+        blobs = self.agent.workspace_blob_store
+        get = blobs.get
+
+        def download_outside_transaction(digest, size):
+            with database.pool.connection(timeout=1) as connection:
+                connection.execute("SELECT 1")
+            return get(digest, size)
+
+        # This must be the first content projection: task/file reads can warm the cache.
+        with patch.object(blobs, "get", side_effect=download_outside_transaction) as fetched:
+            history = await self.http.get("/api/chats/cold-history/history", params={"limit": 50})
+        self.assertEqual(history.status_code, 200, history.text)
+        self.assertTrue(fetched.called)
+        publications = [value for item in history.json()["items"] for value in item.get("response_artifacts", [])]
+        self.assertTrue(any(value["artifact_id"] == artifact["artifact_id"]
+                            and value["parts"][0]["sha256"] == reference["sha256"] for value in publications))
+        download = await self.http.get(f"/api/chats/cold-history/tasks/{task['id']}/files/{reference['file_id']}")
+        self.assertEqual(download.status_code, 200, download.text)
+        self.assertEqual(download.content, b"published bytes")
+        moved = await self.http.get("/api/chats/cold-history/files/content", params={"path": "moved.txt"})
+        self.assertEqual(moved.status_code, 200, moved.text)
+        self.assertEqual(moved.content, b"edited bytes")
+        self.assertFalse(self.model.calls)
+
     @unittest.skipUnless(sys.platform == "linux", "Linux directory SGID inheritance is required")
     async def test_first_python_call_checkpoints_inherited_setgid_and_restores_files(self):
         workspaces = self.agent.tool_runtime.environment_manager.backend.chats

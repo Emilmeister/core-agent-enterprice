@@ -602,11 +602,13 @@ class PostgresRootAdmission:
         return await asyncio.to_thread(read)
 
     async def history(self, tenant_id, context_id, *, limit, after=None):
+        from .response_files import with_prefetched_artifacts
+
         def read():
             with self.database.transaction() as connection:
                 connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                 return read_history(self, tenant_id, context_id, limit=limit, after=after, connection=connection)
-        return await asyncio.to_thread(read)
+        return await asyncio.to_thread(with_prefetched_artifacts, self.agent.response_files_service, read)
 
     async def list_chats(self, tenant_id, *, limit, after=None):
         def read():
