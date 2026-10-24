@@ -201,6 +201,20 @@ Image skills/resources не копируются ради snapshot; пользо
 вне workspace в этот snapshot не входят. Quarantine/results/offload тоже требуют
 сохранения bytes до подтверждённого приёма/публикации и прежних access barriers.
 
+Snapshot MUST принимать и восстанавливать `setgid` у каталогов, в том числе
+унаследованный при обычном `mkdir` от родительского каталога платформы. Этот бит
+задаёт наследование группы; он не делает каталог исполняемым с другой identity.
+`setuid` у любой записи и `setgid` у файлов или symlinks MUST отклоняться при
+capture и validation manifest до restore. Исходное дерево не нормализуется
+через `chmod`; scope, nofollow и ограничения sandbox metadata не меняются.
+UID/GID не входят в snapshot и остаются определёнными deployment environment.
+Restore не вызывает `chmod`, если mode уже совпадает; после необходимого `chmod`
+проверяет фактический mode. Тихое снятие бита ядром даёт `WORKSPACE_UNAVAILABLE`
+до публикации восстановленного дерева, а не успешное восстановление с потерей прав.
+Формат manifest v1 и DB schema сохраняются; прежние manifests читаются без
+миграции. Старые readers, запрещающие directory `setgid`, отклоняют новые
+manifests с этим битом: откат к ним после такого checkpoint не поддерживается.
+
 Пустой чат/дерево не создаёт S3 archive/blob; удаление последнего файла сохраняет
 DB revision без пустого архива. Неизменный checkpoint переиспользует manifest,
 неизменные bytes не загружаются повторно. Полный snapshot фиксируется на безопасных

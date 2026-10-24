@@ -104,6 +104,33 @@ class CloudStorageRuntimeFixture(unittest.IsolatedAsyncioTestCase):
 
 
 class CloudStorageRuntimeTests(CloudStorageRuntimeFixture):
+    @unittest.skipUnless(sys.platform == "linux", "Linux directory SGID inheritance is required")
+    async def test_first_python_call_checkpoints_inherited_setgid_and_restores_files(self):
+        workspaces = self.agent.tool_runtime.environment_manager.backend.chats
+        workspaces.root.chmod(0o2700)
+        self.model._responses = [ModelResponse(tool_requests=(ToolRequest("write", "core_python_exec", {
+            "code": "from pathlib import Path; Path('report.txt').write_text('saved by Python')"}),)),
+            ModelResponse(message="Saved")]
+        task = await self.submit("inherited-mode")
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED", task)
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        binding = WorkspaceBinding(self.tenant, record.owner_id, "inherited-mode")
+        folder = workspaces.workspace(binding)
+        mode = (folder / "attachments").stat().st_mode & 0o7777
+        self.assertTrue(mode & 0o2000)
+        with self.agent.workflow_store.database.transaction() as connection:
+            manifest = connection.execute(
+                "SELECT manifest FROM core_workspace_manifests WHERE tenant_id=%s AND context_id=%s",
+                (self.tenant, "inherited-mode")).fetchone()["manifest"]
+        self.assertEqual(manifest["entries"]["attachments"]["mode"], mode)
+        await self.restart([])
+        restored = await self.http.get("/api/chats/inherited-mode/files/content", params={"path": "report.txt"})
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(restored.content, b"saved by Python")
+        folder = self.agent.tool_runtime.environment_manager.backend.chats.workspace(binding)
+        self.assertEqual((folder / "attachments").stat().st_mode & 0o7777, mode)
+        self.assertFalse(self.model.calls)
+
     async def test_invalid_tree_aborts_once_and_preserves_durable_files(self):
         self.model._responses = [self.terminal("open('report.txt','w').write('saved report')"),
             ModelResponse(tool_requests=(ToolRequest("publish", "core_response_files", {"paths": ["report.txt"]}),)),

@@ -368,6 +368,9 @@ Target spec может описывать больше текущего runtime.
   cleanup без публикации нового manifest; ранее сохранённые файлы/результаты
   сохраняются. Recovery не повторяет команды ради snapshot. Storage diagnostics
   сообщают только конечный reason, без путей и содержимого файлов (CLD-AC-29).
+  Workspace snapshot сохраняет унаследованный `setgid` только у каталогов;
+  `setuid` везде и `setgid` у остальных типов запрещены. Старый reader не читает
+  directory-SGID manifests; rollback limitation описан в CLD-04.
 - `SANDBOX_BACKEND` по умолчанию `bubblewrap`; `landlock` разрешён только для
   `CORE_AGENT_ENVIRONMENT=development` + `CORE_AGENT_AUTH_MODE=cloudru`.
   Его отдельный контракт — `spec/cloudru.md`, CLD-05-L: приложение PID 1 своего

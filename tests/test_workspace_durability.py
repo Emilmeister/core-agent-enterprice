@@ -3,8 +3,10 @@ import copy
 import hashlib
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from core_agent.errors import CoreError
 from core_agent.postgres_workspace import PostgresWorkspaceDurability
@@ -96,6 +98,54 @@ class WorkspaceDurabilityTests(unittest.TestCase):
         self.assertNotEqual(changed, manifest)
         self.assertEqual(len(self.blobs.puts), 1)
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux directory SGID inheritance")
+    def test_inherited_setgid_directories_preserve_modes_on_restore(self):
+        self.workspaces.root.chmod(0o2700)
+        folder = self.workspaces.workspace(self.binding)
+        # The runtime creates attachments before the first sandbox command.
+        (folder / "attachments").mkdir()
+        (folder / "project").mkdir()
+        (folder / "project/result").write_bytes(b"saved")
+        before = {name: (folder / name).stat().st_mode & 0o7777 for name in ("attachments", "project")}
+        self.assertEqual(folder.stat().st_mode & 0o7777, 0o2700)
+        self.assertTrue(all(mode & 0o2000 for mode in before.values()))
+        manifest = self.service.prepare(self.binding)
+        self.assertEqual({name: manifest["entries"][name]["mode"] for name in before}, before)
+        self.assertEqual({name: (folder / name).stat().st_mode & 0o7777 for name in before}, before)
+        workspaces, restored = self.fresh()
+        restored.restore(self.binding, manifest)
+        target = workspaces.workspace(self.binding)
+        self.assertEqual({name: (target / name).stat().st_mode & 0o7777 for name in before}, before)
+        self.assertEqual((target / "project/result").read_bytes(), b"saved")
+        self.assertEqual(restored.prepare(self.binding, manifest), manifest)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux directory SGID inheritance")
+    def test_restore_preserves_inherited_mode_or_rejects_silent_sgid_removal(self):
+        self.workspaces.root.chmod(0o2700)
+        folder = self.workspaces.workspace(self.binding)
+        (folder / "group_owned").mkdir(mode=0o700)
+        native_chmod = os.chmod
+
+        def chmod_without_group(path, mode, **kwargs):
+            # Linux silently clears SGID when the caller is not in the file's group.
+            native_chmod(path, mode & ~0o2000, **kwargs)
+
+        for mode in (0o2700, 0o2755):
+            with self.subTest(mode=oct(mode)):
+                (folder / "group_owned").chmod(mode)
+                manifest = self.service.prepare(self.binding)
+                workspaces = ChatWorkspaces(self.root / f"restore-{mode}")
+                workspaces.root.chmod(0o2700)
+                restored = WorkspaceDurability(workspaces, self.blobs)
+                with patch("core_agent.workspace_durability.os.chmod", side_effect=chmod_without_group):
+                    if mode == 0o2700:
+                        restored.restore(self.binding, manifest)
+                        self.assertEqual(restored.prepare(self.binding, manifest), manifest)
+                    else:
+                        self.assert_code("WORKSPACE_UNAVAILABLE", lambda: restored.restore(self.binding, manifest))
+                        with workspaces.open_workspace(self.binding) as root:
+                            self.assertIsNone(root)
+
     def test_invalid_scope_paths_types_and_links_fail_before_reads(self):
         empty = self.service.prepare(self.binding, None)
         invalid = []
@@ -108,6 +158,14 @@ class WorkspaceDurabilityTests(unittest.TestCase):
                 ("node", {"type": "device", "mode": 0o600, "mtime_ns": 1}, "manifest_metadata"),
                 ("time", {"type": "directory", "mode": 0o700, "mtime_ns": 1.5}, "manifest_metadata")):
             invalid.append(({**empty, "entries": {path: entry}}, reason))
+        for kind, mode in (("directory", 0o4700), ("file", 0o4600), ("file", 0o2600),
+                           ("symlink", 0o4777), ("symlink", 0o2777)):
+            entry = {"type": kind, "mode": mode, "mtime_ns": 1}
+            if kind == "file":
+                entry.update(size=0, sha256=hashlib.sha256(b"").hexdigest())
+            elif kind == "symlink":
+                entry["target"] = "safe-relative"
+            invalid.append(({**empty, "entries": {"privileged": entry}}, "manifest_metadata"))
         for manifest, reason in invalid:
             with self.subTest(manifest=manifest):
                 _, restored = self.fresh()
@@ -124,7 +182,8 @@ class WorkspaceDurabilityTests(unittest.TestCase):
         coordinator = PostgresWorkspaceDurability(None, self.service, None)
         coordinator.log = lambda event, **fields: events.append((event, fields))
         for kind, reason in (("symlink", "unsafe_symlink"), ("hardlink", "hardlink"),
-                             ("fifo", "unsupported_node"), ("setuid", "unsafe_mode")):
+                             ("fifo", "unsupported_node"), ("setuid", "unsafe_mode"),
+                             ("setgid", "unsafe_mode"), ("setuid_directory", "unsafe_mode")):
             with self.subTest(kind=kind):
                 target = folder / "unsafe"
                 if kind == "symlink":
@@ -133,11 +192,14 @@ class WorkspaceDurabilityTests(unittest.TestCase):
                     os.link(outside, target)
                 elif kind == "fifo":
                     os.mkfifo(target)
+                elif kind == "setuid_directory":
+                    target.mkdir()
+                    target.chmod(0o4700)
                 else:
                     target.write_bytes(b"private contents")
-                    target.chmod(0o4600)
+                    target.chmod(0o2600 if kind == "setgid" else 0o4600)
                 error = self.assert_code("WORKSPACE_SNAPSHOT_INVALID", lambda: self.service.prepare(self.binding, None))
-                target.unlink()
+                target.rmdir() if kind == "setuid_directory" else target.unlink()
                 self.assertEqual(error.data, {"reason": reason})
                 self.assertEqual(str(error), "WORKSPACE_SNAPSHOT_INVALID")
                 coordinator._report("checkpoint", error=error)

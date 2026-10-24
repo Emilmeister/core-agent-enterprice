@@ -81,7 +81,8 @@ def validate_manifest(manifest, binding=None, *, max_bytes=1_000_000_000, max_fi
             kind = entry["type"]
             keys = {"type", "mode", "mtime_ns"}
             keys |= {"sha256", "size"} if kind == "file" else {"target"} if kind == "symlink" else set()
-            if (entry.keys() != keys or type(entry["mode"]) is not int or not 0 <= entry["mode"] <= 0o1777
+            if (entry.keys() != keys or type(entry["mode"]) is not int
+                    or not 0 <= entry["mode"] <= (0o3777 if kind == "directory" else 0o1777)
                     or type(entry["mtime_ns"]) is not int or not -(2**63) <= entry["mtime_ns"] < 2**63):
                 raise _invalid("manifest_metadata")
             for index in range(1, len(parts)):
@@ -144,7 +145,8 @@ class WorkspaceDurability:
                 if len(parts) > self.workspaces.depth_limit or len(identities) > self.max_files:
                     raise CoreError("WORKSPACE_SNAPSHOT_LIMIT")
                 before = os.stat(name, dir_fd=directory, follow_symlinks=False)
-                if before.st_mode & 0o6000:
+                # Directory SGID inherits the parent group; it does not elevate execution.
+                if before.st_mode & (0o4000 if stat.S_ISDIR(before.st_mode) else 0o6000):
                     raise _invalid("unsafe_mode")
                 identities[path] = _identity(before)
                 metadata = {"mode": stat.S_IMODE(before.st_mode), "mtime_ns": before.st_mtime_ns}
@@ -283,10 +285,10 @@ class WorkspaceDurability:
                         parts = _parts(path)
                         directory = self.workspaces._directory(stage, parts[:-1])
                         try:
-                            if entry["type"] != "symlink":
+                            if os.stat(parts[-1], dir_fd=directory, follow_symlinks=False).st_mode & 0o7777 != entry["mode"]:
                                 os.chmod(parts[-1], entry["mode"], dir_fd=directory, follow_symlinks=False)
-                            elif os.stat(parts[-1], dir_fd=directory, follow_symlinks=False).st_mode & 0o7777 != entry["mode"]:
-                                os.chmod(parts[-1], entry["mode"], dir_fd=directory, follow_symlinks=False)
+                                if os.stat(parts[-1], dir_fd=directory, follow_symlinks=False).st_mode & 0o7777 != entry["mode"]:
+                                    raise CoreError("WORKSPACE_UNAVAILABLE")
                             os.utime(parts[-1], ns=(entry["mtime_ns"], entry["mtime_ns"]),
                                      dir_fd=directory, follow_symlinks=False)
                         finally:
