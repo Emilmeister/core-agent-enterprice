@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from unittest.mock import patch
@@ -363,6 +364,92 @@ class CloudStorageRuntimeTests(CloudStorageRuntimeFixture):
             self.agent.workspace_durability.ensure_restored(binding)
         self.assertEqual(caught.exception.code, "WORKSPACE_RESTORE_CONFLICT")
         self.assertEqual(target.read_bytes(), b"keep")
+
+    async def test_cancel_background_persists_known_result_after_cleanup_confirmation(self):
+        code = "import time; open('cancelled.txt','w').write('once'); time.sleep(60)"
+        self.model._responses = [ModelResponse(tool_requests=(ToolRequest("start", "core_task_start", {
+            "tool": "core_terminal_exec", "arguments": {"argv": [sys.executable, "-c", code]}}),)),
+            ModelResponse(message="Cancelled and observed")]
+        started, confirmed = threading.Event(), threading.Event()
+        manager = self.agent.tool_runtime.environment_manager
+        launcher, workflow = manager.backend.launcher, self.agent.workflow_store
+        start, execute, generate = launcher.start, self.agent.tool_runtime.execute, self.model.generate
+        confirm, checkpoint = workflow.confirm_execution, self.agent.workspace_durability.transition
+        stale_checkpoints = []
+        children = []
+
+        def spawn(*args, **kwargs):
+            process = start(*args, **kwargs)
+            marker = Path(kwargs["workspace_path"]) / "cancelled.txt"
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "background command did not start")
+            started.set()
+            return process
+
+        def dispatched(call, *args, **kwargs):
+            result = execute(call, *args, **kwargs)
+            if call.name == "core_task_start":
+                self.assertTrue(started.wait(5), "background process did not start")
+            elif call.name == "core_terminal_exec":
+                # Keep the worker's EXECUTING snapshot until the real cancel
+                # callback has stopped its process and persisted the receipt.
+                self.assertTrue(confirmed.wait(5), "cancel did not confirm cleanup")
+            return result
+
+        def confirmed_execution(record, owner, **kwargs):
+            current = confirm(record, owner, **kwargs)
+            if record.snapshot.get("background_tool") and current.cancel_requested:
+                self.assertTrue(current.snapshot["execution_owner"]["cleanup_confirmed"])
+                confirmed.set()
+            return current
+
+        def publish(record, token, operation):
+            if (record.snapshot.get("background_tool") and confirmed.is_set()
+                    and not record.snapshot["execution_owner"]["cleanup_confirmed"]):
+                current = workflow.lookup_task(record.task_id)
+                self.assertEqual(current.version, record.version)
+                self.assertEqual(current.snapshot["execution_owner"]["generation"], token)
+                self.assertTrue(current.snapshot["execution_owner"]["cleanup_confirmed"])
+                stale_checkpoints.append(record.task_id)
+            return checkpoint(record, token, operation)
+
+        def model(**kwargs):
+            if len(self.model.calls) == 1:
+                with workflow.database.transaction() as connection:
+                    row = connection.execute("SELECT latest_root_run_id FROM core_chats WHERE tenant_id=%s AND context_id='cancel-background'",
+                                             (self.tenant,)).fetchone()
+                children.extend(self.agent.task_scheduler.list(owner_id=row["latest_root_run_id"], tenant_id=self.tenant))
+                self.model._responses.insert(0, ModelResponse(tool_requests=(ToolRequest("cancel", "core_task_cancel", {
+                    "task_id": children[0].id}),)))
+            elif len(self.model.calls) == 2:
+                self.model._responses.insert(0, ModelResponse(tool_requests=(ToolRequest("wait", "core_task_wait", {
+                    "task_id": children[0].id}),)))
+            return generate(**kwargs)
+
+        with patch.object(launcher, "start", spawn), patch.object(self.agent.tool_runtime, "execute", dispatched), \
+                patch.object(workflow, "confirm_execution", confirmed_execution), \
+                patch.object(self.agent.workspace_durability, "transition", publish), patch.object(self.model, "generate", model):
+            task = await asyncio.wait_for(self.submit("cancel-background"), timeout=30)
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED", task)
+        self.assertEqual(stale_checkpoints, [children[0].id])
+        child = workflow.lookup_task(children[0].id)
+        self.assertEqual(child.state, "CANCELLED")
+        self.assertIsNone(child.error_code)
+        self.assertTrue(child.snapshot["execution_owner"]["cleanup_confirmed"])
+        # Cancellation can stop material review after the raw result is saved.
+        receipt = child.snapshot["pending_completed_result"]["outcome"]
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIsNotNone(receipt["output"]["exit_code"])
+        self.assertTrue(launcher.processes)
+        self.assertTrue(all(process.returncode is not None for process in launcher.processes))
+        scheduled = self.agent.task_scheduler.get(children[0].id, owner_id=child.parent_run_id, tenant_id=self.tenant)
+        self.assertEqual(scheduled.state, "canceled")
+        await self.restart([])
+        restored = await self.http.get("/api/chats/cancel-background/files/content", params={"path": "cancelled.txt"})
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(restored.content, b"once")
 
     async def pending_cleanup(self, context):
         self.model._responses = [self.terminal("open('remove.txt','w').write('old'); open('keep.txt','w').write('retained')"),

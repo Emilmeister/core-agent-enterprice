@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python/uv, PostgreSQL, S3, Landlock/seccomp, официальный A2A SDK, React/TypeScript, существующие unittest и native/browser проверки.
 
-**Статус:** пакет кода и документации завершён, 24 октября 2026; общий Cloud rollout и целевые проверки впереди.
+**Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. Текущий candidate — `cloudru-s3-cancel-20261025`; повтор его отмены в Cloud и остальные release proofs ещё не завершены (результаты ниже).
 
 Общий ordinary suite: 2404 tests, exit 0, 16 платформенных skips; PostgreSQL,
 Keycloak и MinIO работали в изолированных fixtures. В linux/amd64 candidate
@@ -38,7 +38,7 @@ Ruff, spec lock/quality, UI tests/typecheck/build и wheel/sdist/image build п�
 | Взаимодействия | Проверены отдельные сценарии вопроса владельцу, отмены и отказа от вложения |
 | Последнее исправление | 99 целевых Linux/PostgreSQL/MinIO проверок без пропусков; UI tests/typecheck/build |
 
-Последний образ: `blockchain.cr.cloud.ru/core-agent-gn:incoming-originals-20261024`;
+Образ на исходной точке: `blockchain.cr.cloud.ru/core-agent-gn:incoming-originals-20261024`;
 digest `sha256:539c38fa73bd38ba14331f09f916bb29bea2c991e8ccf0a189864835ae824f7b`.
 Эти результаты закрывают перечисленные сценарии, но не полный набор возможностей main.
 
@@ -283,6 +283,76 @@ build прошли. Пропуски не засчитываются как пр
 контролируемый доступный HTTPS fixture; для compaction — provider + две реальные
 compaction receipts; для production — runtime DB grants, coordinated backup,
 native amd64/arm64 gates и один согласованный restart/overlap сценарий.
+
+### Повторный Cloud-прогон 25 октября и причина S3 cancel race
+
+После rollout `cloudru-batch-fixes-20261025` безопасный отказ отмены до dispatch
+подтверждён в Cloud: `TASK_NOT_FOUND` сохранился в tool receipt, следующая
+terminal-команда выполнилась, root завершился `COMPLETED`.
+Отмена работающего background `sleep` повторно дала `SIDE_EFFECT_UNKNOWN`.
+В предоставленных оператором логах перед этим виден `LEASE_LOST` при checkpoint
+child; доказательств timeout остановки процесса в этих строках нет.
+
+Локальная детерминированная проверка с PostgreSQL выявила расхождение общего
+workflow store и S3 workspace coordinator: `confirm_execution` сохраняет
+подтверждение остановки без изменения версии run, lease token или generation.
+S3 guard сравнивал весь прежний `execution_owner` с новым receipt и отвергал
+checkpoint известного результата как `LEASE_LOST`. Обычный workflow transition
+с теми же record/token принимает результат и сохраняет актуальный receipt.
+Это воспроизведение дефекта компонента; приватное состояние live lease из
+публичного API не считывалось.
+
+После отдельного добавления стабильного `PUSH_NOTIFICATION_ENCRYPTION_KEY`
+обе health-проверки вернули 200. Создание собственного тестового peer с
+API-ключом прошло, `has_header_value=true`: прежний configuration blocker
+`REMOTE_AGENT_CREDENTIAL_UNAVAILABLE` снят. Функциональные Send/Get/Cancel
+пока не подтверждены: собственный root оставался `WORKING` 610 секунд без
+tool receipts и без исходящих операций. Один cancel-запрос завершился
+`ReadTimeout`; последующее чтение подтвердило `CANCELED`, запрос не повторялся.
+Собственное подключение удалено и отсутствие проверено, чужие настройки не
+менялись. Причина остановки продвижения root требует deployment logs, это ещё
+не доказательство ошибки исходящего A2A transport.
+Первая отправка не задавала `returnImmediately` и использовала blocking default
+SDK; HTTP timeout сам по себе не доказывает сбой admission. Повтор с явным
+`configuration.returnImmediately=true` получил Task за 1,35 секунды, но снова
+не дал tool/outgoing receipts за 312 секунд. Собственный root затем подтверждён
+как `CANCELED`, собственный peer удалён с readback. Простой отдельный запрос без
+инструментов вернул точный контрольный ответ за 101,63 секунды от начала пробы;
+его timed-out blocking Send не повторяли, результат нашли по исходному context.
+
+Безопасные receipts: `.enterprise-work/cloudru-batch-live-cancel-20261025.json`,
+`cloudru-cancel-ownership-repro-20261025.json` и
+`cloudru-batch-live-peer-key-20261025.json` рядом с worktree.
+Следующий пакет исправляет совместимость checkpoint с монотонным receipt
+подтверждённой остановки; tenant/scope/version/live lease/generation проверки и
+`ABORTED` для неизвестного результата orphan execution сохраняются.
+Целевое воспроизведение исправления: 14 тестов без skips, включая реальный
+процесс с PostgreSQL/MinIO, сохранённый результат отмены и восстановление файла
+после потери локальной рабочей копии. Независимое review блокеров не выявило.
+В собранном linux/amd64 candidate прошли 409 тестов без skips. Полный ordinary
+suite: 2414 тестов, exit 0, 16 платформенных skips с отдельными PostgreSQL,
+Keycloak и MinIO. Первый общий прогон выявил гонку прежнего timer-теста:
+assertion о `working` выполнялся до запуска child thread. Детерминированное
+воспроизведение подтвердило этот порядок; тест теперь ждёт `started` Event,
+сохраняя проверки отмены и завершения. Повторный полный прогон прошёл.
+Ruff, frozen spec lock, diff check и wheel/sdist build прошли. Native release
+gates и повтор отмены на целевом Cloud после rollout остаются отдельными.
+
+Опубликован один новый candidate под тегами
+`blockchain.cr.cloud.ru/core-agent-gn:cloudru-s3-cancel-20261025` и `latest`:
+index `sha256:ff6031cd5400bffb86df1389f265f2563fad04a8254bf11c302a6dda85aafa3a`.
+Readback registry подтвердил одинаковый index обоих тегов и совпадение runtime
+amd64 manifest/config с проверенным локальным образом. Общие результаты и
+digests сохранены в `.enterprise-work/cloudru-s3-cancel-20261025.json` рядом
+с worktree; дополнительные live receipts — `cloudru-batch-live-peer-key-v2-20261025.json`
+и `cloudru-batch-live-model-control-20261025.json`. Собственные regression fixtures
+остановлены; существующие пользовательские контейнеры не менялись.
+
+Дополнительные NER/summary probes использовали другой локально настроенный
+DeepSeek endpoint, а не Cloud Qwen. Четыре вызова не получили HTTP-статуса;
+отдельно обнаружено отсутствие CA в локальном Python default TLS context.
+Эти попытки не подтверждают несовместимость модели и не засчитываются как
+проверка deployed NER/compaction; обход TLS не применялся.
 
 ## 6. Когда цель считается достигнутой
 

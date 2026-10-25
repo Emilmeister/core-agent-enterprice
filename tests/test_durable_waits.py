@@ -99,9 +99,13 @@ class DurableTimerTests(unittest.TestCase):
                     arguments["timeout"] = timeout
                 agent, model = self.app(ModelResponse(tool_requests=(ToolRequest("wait", "core_task_wait", arguments),)), ModelResponse(message="continued"))
                 record, *_ = agent._new_workflow({"prompt": "wait"}, task_id="task", identity="owner", session_id="chat", tenant_id="company")
-                release = threading.Event()
+                started, release = threading.Event(), threading.Event()
                 self.addCleanup(release.set)
-                task = agent.task_scheduler.start(lambda: release.wait(5), task_id="child", owner_id=record.run_id, tenant_id="company")
+                def child():
+                    started.set()
+                    return release.wait(5)
+                task = agent.task_scheduler.start(child, task_id="child", owner_id=record.run_id, tenant_id="company")
+                self.assertTrue(started.wait(5), "child did not start")
                 sleeping = agent.resume_task("task")
                 agent.enqueue_message({"prompt": "new detail"}, task_id="task", message_id="detail", identity="owner", session_id="chat", tenant_id="company")
                 self.assertEqual(agent.resume_task("task").wait_id, sleeping.wait_id)

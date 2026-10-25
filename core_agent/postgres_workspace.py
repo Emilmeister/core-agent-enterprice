@@ -172,11 +172,22 @@ class PostgresWorkspaceDurability:
             raise CoreError("LEASE_LOST")
         owner = record.snapshot.get("execution_owner")
         actual = current["snapshot"].get("execution_owner")
+        expected = owner
+        # Stop confirmation is an operational receipt without a version bump.
+        # The same live generation may still checkpoint its known tool result;
+        # the canonical workflow transition preserves the confirmed receipt.
+        if (isinstance(owner, dict) and isinstance(actual, dict)
+                and owner.get("cleanup_confirmed") is False
+                and actual.get("cleanup_confirmed") is True
+                and actual.get("local_execution_pending") is False):
+            expected = {**owner, "cleanup_confirmed": True, "local_execution_pending": False}
+            if "cleanup_proof" not in owner and "cleanup_proof" in actual:
+                expected["cleanup_proof"] = actual["cleanup_proof"]
         # A retried terminal commit acquires a new lease without creating a new
         # process generation. Its persisted intent already retired this owner.
         retired_terminal = (owner is not None and owner.get("cleanup_confirmed") is True
                             and bool(record.snapshot.get("terminal_intent")))
-        if owner != actual or (owner is not None and token is not None
+        if expected != actual or (owner is not None and token is not None
                 and owner["generation"] != token and not retired_terminal):
             raise CoreError("LEASE_LOST")
 

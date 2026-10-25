@@ -6,6 +6,7 @@ import unittest
 import uuid
 import sys
 import asyncio
+import copy
 
 import psycopg
 from psycopg.conninfo import make_conninfo
@@ -105,6 +106,113 @@ class PostgresWorkspaceTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "LEASE_LOST")
         with self.database.transaction() as connection:
             self.assertIsNone(connection.execute("SELECT * FROM core_workspace_manifests").fetchone())
+
+    def execution_record(self):
+        record = self.workflow.register_execution(self.record, instance_id="instance", worker_id="worker",
+            generation=self.token, lease_token=self.token, execution_host={"container": "same-host"})
+        self.record = self.workflow.transition(record.run_id, tenant_id=record.tenant_id,
+            owner_id=record.owner_id, expected_version=record.version, state="EXECUTING",
+            snapshot={**record.snapshot, "pending_call": {"name": "core_terminal_exec"}},
+            event_kind="tool.intent", lease_token=self.token)
+        return copy.deepcopy(self.record.snapshot)
+
+    def test_confirmed_cleanup_during_checkpoint_preserves_receipt_without_reopening_execution(self):
+        original = self.execution_record()
+        for phase in ("before_upload", "after_upload"):
+            for proof_kind in ("none", "new", "existing"):
+                with self.subTest(phase=phase, proof=proof_kind):
+                    snapshot = copy.deepcopy(original)
+                    snapshot["execution_owner"]["future_receipt"] = {"opaque": "preserved"}
+                    proof = {"kind": "operator", "receipt_id": "stop-proof"}
+                    if proof_kind == "existing":
+                        snapshot["execution_owner"]["cleanup_proof"] = proof
+                    with self.database.transaction() as connection:
+                        connection.execute("UPDATE core_runs SET snapshot=%s,state='EXECUTING' WHERE run_id='run'",
+                                           (Jsonb(snapshot),))
+                    self.record = self.workflow.get("run", tenant_id="tenant", owner_id="owner")
+                    self.write((phase + proof_kind).encode())
+                    confirmed = []
+                    def confirm():
+                        confirmed.append(self.workflow.confirm_execution(self.record,
+                            self.record.snapshot["execution_owner"], proof=proof if proof_kind == "new" else None))
+                    self.blobs.after_put = confirm if phase == "after_upload" else None
+                    if phase == "before_upload":
+                        confirm()
+                    updated = self.coordinator.transition(self.record, self.token, self.outcome)
+                    self.assertEqual(len(confirmed), 1)
+                    self.assertEqual(confirmed[0].version, self.record.version)
+                    self.assertEqual(updated.snapshot["execution_owner"], confirmed[0].snapshot["execution_owner"])
+                    self.assertTrue(updated.snapshot["execution_owner"]["cleanup_confirmed"])
+                    self.assertFalse(updated.snapshot["execution_owner"]["local_execution_pending"])
+                    self.assertFalse(self.record.snapshot["execution_owner"]["cleanup_confirmed"])
+                    with self.assertRaises(CoreError) as caught:
+                        self.workflow.transition("run", tenant_id="tenant", owner_id="owner",
+                            expected_version=updated.version, state="EXECUTING", snapshot=updated.snapshot,
+                            event_kind="tool.intent", lease_token=self.token)
+                    self.assertEqual(caught.exception.code, "LEASE_LOST")
+                    self.record = updated
+
+    def test_cleanup_receipt_does_not_relax_checkpoint_fences(self):
+        snapshot = self.execution_record()
+        owner = snapshot["execution_owner"]
+        owner.update(future_receipt={"opaque": "original"}, cleanup_proof={"receipt_id": "original"})
+        confirmed = {**owner, "cleanup_confirmed": True, "local_execution_pending": False}
+        cases = [(field, {**confirmed, field: value}, {}, "LEASE_LOST") for field, value in (
+            ("instance_id", "other"), ("worker_id", "other"), ("generation", "other"),
+            ("execution_host", {"container": "other"}), ("future_receipt", {"opaque": "other"}),
+            ("cleanup_confirmed", False), ("local_execution_pending", True),
+            ("cleanup_confirmed", 1), ("local_execution_pending", 0),
+            ("cleanup_proof", {"receipt_id": "other"}))]
+        cases.extend((
+            ("removed-proof", {key: value for key, value in confirmed.items() if key != "cleanup_proof"}, {}, "LEASE_LOST"),
+            ("new-field", {**confirmed, "unknown_new_field": True}, {}, "LEASE_LOST"),
+            ("stale-token", confirmed, {"lease_token": "other"}, "LEASE_LOST"),
+            ("expired-token", confirmed, {"lease_expires_at": 0}, "LEASE_LOST"),
+            ("new-version", confirmed, {"version": self.record.version + 1}, "SESSION_CONFLICT"),
+        ))
+        for phase in ("before_upload", "after_upload"):
+            for name, actual, changes, code in cases:
+                with self.subTest(phase=phase, change=name):
+                    with self.database.transaction() as connection:
+                        connection.execute("""UPDATE core_runs SET snapshot=%s,version=%s,lease_token=%s,
+                            lease_expires_at=EXTRACT(EPOCH FROM clock_timestamp())+60 WHERE run_id='run'""",
+                            (Jsonb(snapshot), self.record.version, self.token))
+                    self.record = self.workflow.get("run", tenant_id="tenant", owner_id="owner")
+                    self.blobs.after_put = None
+                    self.write((phase + name).encode())
+                    def change_receipt():
+                        with self.database.transaction() as connection:
+                            connection.execute("""UPDATE core_runs SET snapshot=%s,version=%s,lease_token=%s,
+                                lease_expires_at=COALESCE(%s,lease_expires_at) WHERE run_id='run'""",
+                                (Jsonb({**snapshot, "execution_owner": actual}),
+                                 changes.get("version", self.record.version), changes.get("lease_token", self.token),
+                                 changes.get("lease_expires_at")))
+                    self.blobs.after_put = change_receipt if phase == "after_upload" else None
+                    if phase == "before_upload":
+                        change_receipt()
+                    with self.assertRaises(CoreError) as caught:
+                        self.coordinator.transition(self.record, self.token, self.outcome)
+                    self.assertEqual(caught.exception.code, code)
+                    with self.database.transaction() as connection:
+                        self.assertIsNone(connection.execute("SELECT * FROM core_workspace_manifests").fetchone())
+
+    def test_confirmed_cleanup_cannot_reverse_or_retire_another_generation(self):
+        snapshot = self.execution_record()
+        owner = snapshot["execution_owner"]
+        confirmed = {**owner, "cleanup_confirmed": True, "local_execution_pending": False}
+        for name, previous, actual in (
+            ("reverse", confirmed, owner),
+            ("other-generation", {**owner, "generation": "old"}, {**confirmed, "generation": "old"}),
+            ("false-like-flag", {**owner, "cleanup_confirmed": 0}, confirmed),
+        ):
+            for lock in (False, True):
+                with self.subTest(change=name, lock=lock), self.database.transaction() as connection:
+                    connection.execute("UPDATE core_runs SET snapshot=%s WHERE run_id='run'",
+                                       (Jsonb({**snapshot, "execution_owner": actual}),))
+                    self.record.snapshot["execution_owner"] = previous
+                    with self.assertRaises(CoreError) as caught:
+                        self.coordinator._run(connection, self.record, self.token, lock=lock)
+                    self.assertEqual(caught.exception.code, "LEASE_LOST")
 
     def test_cleanup_revision_survives_empty_cache_restore(self):
         self.write()
