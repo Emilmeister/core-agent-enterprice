@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python/uv, PostgreSQL, S3, Landlock/seccomp, официальный A2A SDK, React/TypeScript, существующие unittest и native/browser проверки.
 
-**Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. После rollout `cloudru-s3-cancel-20261025` отмена работающей background-задачи с S3 подтверждена в Cloud. Рекурсивное discovery собственной Agent Card исправлено и проверено локально в пакете `cloudru-card-discovery-20261025`; его Cloud-проверка и остальные release proofs ещё не завершены (результаты ниже).
+**Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. После rollout `cloudru-s3-cancel-20261025` отмена работающей background-задачи с S3 подтверждена в Cloud. Рекурсивное discovery собственной Agent Card исправлено в пакете `cloudru-card-discovery-20261025`; после его rollout реальный исходящий Send/Get/Cancel также прошёл в Cloud. Остальная матрица и release proofs ещё не завершены (результаты ниже).
 
 Общий ordinary suite: 2404 tests, exit 0, 16 платформенных skips; PostgreSQL,
 Keycloak и MinIO работали в изолированных fixtures. В linux/amd64 candidate
@@ -374,7 +374,7 @@ discovery self-peer повторно обращался к той же Card до
 доступность адресатов в model catalog/dispatch; wire versions, credential checks
 при вызове и tenant boundaries сохраняются. Это доказанный локальный дефект,
 но private logs прежних Cloud зависаний пока не подтверждают, что там был
-именно этот путь. Live-проверка исправления требует отдельного rollout.
+именно этот путь. Результат проверки после отдельного rollout приведён ниже.
 
 Regression proof: три новых теста сначала воспроизвели нарушение, затем прошли.
 Проверены self-peer без вложенного discovery, сохранение настоящего runtime
@@ -391,7 +391,31 @@ Ruff, шесть spec lock/quality проверок, diff check, wheel/sdist и 
 прошли. Публикация и digests candidate фиксируются в
 `cloudru-card-discovery-20261025.json` рядом с worktree; полный лог —
 `cloudru-batch4-full-suite-20261025.log`. Эти проверки не заменяют native release
-gates и фактический исходящий Send/Get/Cancel на Cloud после rollout.
+gates; фактический исходящий Send/Get/Cancel проверен отдельно после rollout.
+
+### Cloud Send/Get/Cancel после rollout Card discovery
+
+25 октября, 19:06–19:10 UTC: readiness и карточка вернули 200, собственный peer
+с API-ключом сохранился. Root `0019261a-23ef-48d4-960e-c769b9b9e341` принят за
+0,64 секунды с `returnImmediately=true`. Единственный реальный
+`core_agent_send_message` создал operation `d1e4516d-a646-5006-ae05-800cfc654865`;
+её `request_delivery=confirmed`. Пока root ждал точный ответ владельца и до
+отмены, `last_checked_at` той же операции вырос с 1792955303.982321 до
+1792955347.295846: подтверждён отдельный worker Get, а не только локальное
+чтение scheduler snapshot.
+
+После ответа владельца выполнены по одному `core_task_cancel` и `core_task_wait`.
+Четыре tool receipts успешны, root — `TASK_STATE_COMPLETED`, operation —
+`canceled`, remote — `TASK_STATE_CANCELED`, `outcome_unknown=false`, ошибок нет.
+Собственное подключение удалено; registry readback подтвердил его отсутствие.
+Повторных model Send/Cancel и повторной отправки root не было, общие настройки
+и чужие подключения не менялись. Report со всеми receipts:
+`cloudru-batch-live-peer-key-v3-20261025.json` рядом с worktree.
+
+Это proof протокольного Send/Get/Cancel через реальный ingress. Получатель
+находился в owner wait; запуск его `core_wait_until` и отмена активного таймера
+этой проверкой не доказаны. Live image digest не доступен через публичный API;
+проверка выполнена после подтверждённого пользователем rollout.
 
 ## 6. Когда цель считается достигнутой
 
