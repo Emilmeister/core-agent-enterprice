@@ -231,7 +231,17 @@ UI показывает эти обмены в контексте работы �
 Обязательное автоматическое получение исходящих OAuth-токенов не включено
 в согласованный блок: он предусматривает настройку имени и значения заголовка.
 
-Доверенный реестр хранит Agent Card и server-validated endpoint; model выбирает только зарегистрированного адресата. Card discovery использует bounded retry только для read-only retryable failures; недоступный/невалидный peer наблюдаемо исключается из доступных адресатов. При отсутствии доступных разрешённых адресатов tool отсутствует в catalog/Card. Изменения владельцев применяются к новым вызовам; уже принятая операция сохраняет своего remote адресата и исходные IDs.
+Доверенный реестр хранит Agent Card и server-validated endpoint; model выбирает только зарегистрированного адресата. Card discovery использует bounded retry только для read-only retryable failures; недоступный/невалидный peer наблюдаемо исключается из доступных новых адресатов model catalog. При отсутствии доступных разрешённых адресатов и ранее принятых операций, допускающих reply, tool отсутствует в model catalog. Изменения владельцев применяются к новым вызовам; уже принятая операция сохраняет своего remote адресата и исходные IDs, включая возможность reply по закреплённому binding.
+
+Публичное чтение собственной Agent Card MUST NOT выполнять исходящее discovery
+или расшифровывать credentials peers. Наличие `core_agent_send_message` в Card
+определяется platform ceiling, текущей owner policy и наличием хотя бы одного
+enabled, неудалённого адресата в реестре authenticated company, включая следующие
+страницы реестра. Чужие/disabled/deleted записи capability не включают.
+Карточка сообщает о настроенной возможности, а не о текущей сетевой доступности
+адресатов; bounded discovery и проверка credentials сохраняются в model catalog
+и dispatch. Такое разделение исключает рекурсивное discovery при self-peer и
+циклических связях агентов без нового wire version или миграции данных.
 
 Runtime использует A2A 1.0 `SendMessage`/`SendStreamingMessage`, объявленные карточкой binding/version. URL проходит trusted target policy; userinfo, header CR/LF/NUL и redirect на непроверенный host запрещены. Только явно настроенные для адресата секретные заголовки передаются adapter-ом; входящий Authorization не проксируется. Model description перечисляет доступных адресатов и их назначение без credentials.
 

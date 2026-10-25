@@ -2192,9 +2192,18 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
         if principal is not None and interaction_store is not None:
             skills = {name for name in skills if interaction_store.get_policy(
                 principal.tenant, name, tool_origin(name)).mode != "deny"}
-        if remote_registry_store is not None:
-            if principal is None or not agent._remote_peers(principal.tenant):
-                skills.discard("core_agent_send_message")
+        if remote_registry_store is not None and "core_agent_send_message" in skills:
+            # Card reads must not discover peers: self/cyclic registries recurse over HTTP.
+            cursor = None
+            while True:
+                peers = [] if principal is None else remote_registry_store.list(
+                    principal.tenant, limit=100, after_id=cursor)
+                if any(peer["enabled"] for peer in peers):
+                    break
+                if len(peers) < 100:
+                    skills.discard("core_agent_send_message")
+                    break
+                cursor = peers[-1]["id"]
         return skills
 
     with diagnostics.stage("routes"):

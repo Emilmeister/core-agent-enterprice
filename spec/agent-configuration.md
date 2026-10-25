@@ -276,7 +276,7 @@ settings по [CLD-01](cloudru.md); `MCP_URL` и `MCP_HEADERS_JSON` не имп�
 
 ### Удалённые A2A-агенты
 
-Реестр доверенных агентов и пары имя/значение исходящего auth header настраиваются владельцами в UI; default — `Authorization: Bearer …`. Значения хранятся защищённо и не выдаются модели/процессу/telemetry. Пустой effective registry скрывает `core_agent_send_message`. Runtime использует connection timeout и bounded read-only discovery retry; mutation не повторяется при неизвестном outcome.
+Реестр доверенных агентов и пары имя/значение исходящего auth header настраиваются владельцами в UI; default — `Authorization: Bearer …`. Значения хранятся защищённо и не выдаются модели/процессу/telemetry. Пустой разрешённый enabled registry company скрывает `core_agent_send_message` в Agent Card; чтение карточки использует только registry metadata и текущие policies, без исходящего discovery и расшифровки peer credentials. Model catalog дополнительно исключает недоступных/невалидных адресатов по bounded discovery. Runtime использует connection timeout и bounded read-only discovery retry; mutation не повторяется при неизвестном outcome.
 
 Company settings `remote_timeout_seconds` (default86400) и
 `remote_poll_interval_seconds` (default300) —положительные bounded integers

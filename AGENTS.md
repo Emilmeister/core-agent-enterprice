@@ -436,6 +436,9 @@ Target spec может описывать больше текущего runtime.
   `/api/identity`; старые корневые A2A routes закрыты. Probes остаются публичными.
   Agent Card на обоих A2A входах и обоих well-known путях фильтрует owner deny
   по company из authenticated principal при каждом чтении; allow/HITL видимы.
+  Remote Send в Card зависит только от enabled company registry metadata,
+  без исходящего discovery/decrypt; model catalog и dispatch отдельно проверяют
+  доступность peers и credentials. Self-peer не запускает рекурсивное чтение Card.
   Introspection выполняется один раз на HTTP request без кэша; уже открытый
   ответ не проверяется заново. Incoming credentials не передаются remote agents.
   В Keycloak owner browser uploads определяются подтверждённым introspection

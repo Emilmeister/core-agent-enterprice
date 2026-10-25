@@ -692,8 +692,18 @@ call сохраняет binding при owner rotation/disable. Повторны�
 attempt создаёт новое намерение, recovery прежнего attempt возвращает прежний
 handle. Top-level и вложенный Python используют один fenced dispatch flow.
 Remote wait отклоняет любое явно переданное `timeout`, не продлевая deadline;
-пустой effective registry скрывает Send в model catalog/Agent Card и блокирует
-новый dispatch. Scoped peer credentials/root identifiers не наследуются извне.
+пустой разрешённый enabled registry скрывает Send в Agent Card и блокирует
+новые поручения. Model catalog сохраняет Send только при наличии ранее принятых
+операций с закреплённым reply binding; без них скрывает его. Scoped peer
+credentials/root identifiers не наследуются извне.
+
+Agent Card registry proof: owner/external карточки используют только enabled,
+неудалённые metadata authenticated company и текущую tool policy. Пустой,
+disabled/deleted/чужой registry и deny скрывают Send; разрешённая запись после
+первой страницы включает его. Self-peer возвращает Card без вложенного HTTP
+discovery, без модели и без расшифровки credentials. Недоступность peer или
+его credentials не ломает Card; model catalog/dispatch сохраняют отказ по этим
+причинам. Wire versions и private scope не меняются.
 
 Remote file selection proof: workspace содержит выбранные и невыбранные файлы,
 а final response имеет свой выбор. Только явный `core_agent_send_message.files`

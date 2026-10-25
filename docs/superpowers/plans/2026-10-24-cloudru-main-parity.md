@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python/uv, PostgreSQL, S3, Landlock/seccomp, официальный A2A SDK, React/TypeScript, существующие unittest и native/browser проверки.
 
-**Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. Текущий candidate — `cloudru-s3-cancel-20261025`; повтор его отмены в Cloud и остальные release proofs ещё не завершены (результаты ниже).
+**Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. После rollout `cloudru-s3-cancel-20261025` отмена работающей background-задачи с S3 подтверждена в Cloud. Рекурсивное discovery собственной Agent Card исправлено и проверено локально в пакете `cloudru-card-discovery-20261025`; его Cloud-проверка и остальные release proofs ещё не завершены (результаты ниже).
 
 Общий ordinary suite: 2404 tests, exit 0, 16 платформенных skips; PostgreSQL,
 Keycloak и MinIO работали в изолированных fixtures. В linux/amd64 candidate
@@ -336,7 +336,7 @@ assertion о `working` выполнялся до запуска child thread. Д
 воспроизведение подтвердило этот порядок; тест теперь ждёт `started` Event,
 сохраняя проверки отмены и завершения. Повторный полный прогон прошёл.
 Ruff, frozen spec lock, diff check и wheel/sdist build прошли. Native release
-gates и повтор отмены на целевом Cloud после rollout остаются отдельными.
+gates остаются отдельными; результат повторной отмены после rollout приведён ниже.
 
 Опубликован один новый candidate под тегами
 `blockchain.cr.cloud.ru/core-agent-gn:cloudru-s3-cancel-20261025` и `latest`:
@@ -353,6 +353,45 @@ DeepSeek endpoint, а не Cloud Qwen. Четыре вызова не получ
 отдельно обнаружено отсутствие CA в локальном Python default TLS context.
 Эти попытки не подтверждают несовместимость модели и не засчитываются как
 проверка deployed NER/compaction; обход TLS не применялся.
+
+### Повтор после rollout S3 cancel и следующий пакет Card discovery
+
+После подтверждённого пользователем rollout проверены readiness и owner login.
+Новый root `128059a8-c9dd-4231-a325-cd76384a9cbf` принят с явным
+`configuration.returnImmediately=true`. Единственный background `sleep 300`
+`76ba5deb-9c27-5fa4-ab2a-ad23e7412412` имел `working` в реальном `core_task_get`
+до отмены и `canceled` в последующем `core_task_wait`. Все шесть tool receipts
+успешны; после отмены terminal вернул точный marker, exit 0 и
+`cleanup=sandbox_terminated`, root — `TASK_STATE_COMPLETED`.
+Проверены persisted receipts, не только текст модели; прямого доступа к OS
+handles child и digest работающего Pod нет. Новых политик, peers и файлов этот
+тест не создавал. Отчёт: `cloudru-live-s3-cancel-20261025-v2.json` рядом с worktree.
+
+Локальное ограниченное воспроизведение отдельно выявило цикл исходящего A2A:
+при чтении собственной Agent Card `card_skills` вызывал `_remote_peers`, а
+discovery self-peer повторно обращался к той же Card до model request.
+Нормативное исправление разделяет metadata capability Card и фактическую
+доступность адресатов в model catalog/dispatch; wire versions, credential checks
+при вызове и tenant boundaries сохраняются. Это доказанный локальный дефект,
+но private logs прежних Cloud зависаний пока не подтверждают, что там был
+именно этот путь. Live-проверка исправления требует отдельного rollout.
+
+Regression proof: три новых теста сначала воспроизвели нарушение, затем прошли.
+Проверены self-peer без вложенного discovery, сохранение настоящего runtime
+discovery, обе карточки owner/external, tenant/policy/platform ceiling,
+disabled/deleted peers и enabled запись после первой страницы. Карточки не
+читают credentials; ранее принятые reply bindings остаются доступны runtime.
+Независимое review блокеров не выявило.
+
+Полный ordinary suite: 2417 тестов, exit 0, 16 dedicated native/browser skips,
+563,189 секунды с реальными PostgreSQL 17, Keycloak и MinIO. В собранном
+linux/amd64 candidate прошёл 251 remote runtime/auth/Cloud/transport/registry/
+operations/progress/spec-lock тест без skips на отдельной тестовой БД и bucket.
+Ruff, шесть spec lock/quality проверок, diff check, wheel/sdist и image build
+прошли. Публикация и digests candidate фиксируются в
+`cloudru-card-discovery-20261025.json` рядом с worktree; полный лог —
+`cloudru-batch4-full-suite-20261025.log`. Эти проверки не заменяют native release
+gates и фактический исходящий Send/Get/Cancel на Cloud после rollout.
 
 ## 6. Когда цель считается достигнутой
 

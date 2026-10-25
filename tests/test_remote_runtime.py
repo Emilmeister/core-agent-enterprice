@@ -5,6 +5,7 @@ import json
 import threading
 from dataclasses import replace
 from contextvars import copy_context
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -166,6 +167,84 @@ class RemoteRuntimeTests(AuthAppTestCase):
         model = self.script(ModelResponse(message="done"))
         await self.submit("owner-a", "message-empty", "chat-empty")
         self.assertNotIn("core_agent_send_message", model.calls[0].tools)
+
+    async def test_self_peer_card_does_not_rediscover_itself(self):
+        self.registry.update(self.tenant, self.peer["id"], {
+            "url": "https://agent.example.test/a2a/external", "description": "Self peer",
+            "enabled": True, "header_name": "Authorization"}, expected_revision=1, actor_id="alice")
+        self.discovery.stop()
+        loop = asyncio.get_running_loop()
+        requests = []
+
+        def local_card(request, timeout, **kwargs):
+            requests.append(request.full_url)
+            if len(requests) >= 2:
+                raise CoreError("REMOTE_AGENT_UNAVAILABLE")
+            self.assertEqual(request.full_url,
+                             "https://agent.example.test/a2a/external/.well-known/agent-card.json")
+            response = asyncio.run_coroutine_threadsafe(self.http.get(
+                "/a2a/external/.well-known/agent-card.json", headers=self.headers("external-a")), loop).result(3)
+            self.assertEqual(response.status_code, 200)
+            return BytesIO(response.content)
+
+        with patch("core_agent.remote_agents._open", side_effect=local_card):
+            response = await self.http.get("/a2a/owner/.well-known/agent-card.json", headers=self.headers("owner-a"))
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("core_agent_send_message", {skill["id"] for skill in response.json()["skills"]})
+            self.assertEqual(requests, [], "Reading our Agent Card recursively discovers the self peer")
+            peers = await asyncio.to_thread(self.agent._remote_peers, self.tenant)
+        self.assertEqual(set(peers), {"delivery"})
+        self.assertEqual(len(requests), 1, "Runtime discovery must still validate the peer Card")
+        self.assertFalse(self.model.calls)
+
+    async def test_cards_filter_registry_metadata_and_policy_without_network_or_credentials(self):
+        from core_agent.interactions import tool_origin
+
+        async def check_cards(visible):
+            for kind, token in (("owner", "owner-a"), ("external", "external-a")):
+                for filename in ("agent-card.json", "agent.json"):
+                    response = await self.http.get(f"/a2a/{kind}/.well-known/{filename}", headers=self.headers(token))
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual("core_agent_send_message" in {skill["id"] for skill in response.json()["skills"]}, visible)
+
+        self.registry.create("another-company", {"name": "foreign", "url": "https://foreign.example/a2a",
+            "description": "Foreign peer", "enabled": True, "header_name": "Authorization"}, actor_id="foreign-owner")
+        peer = self.registry.disable(self.tenant, self.peer["id"], expected_revision=1, actor_id="alice")
+        with patch("core_agent.remote_agents.connect_peer", side_effect=AssertionError("Card made a network request")), patch.object(
+                self.registry, "resolve_headers", side_effect=AssertionError("Card resolved private credentials")):
+            await check_cards(False)
+            peer = self.registry.update(self.tenant, peer["id"], {
+                "url": peer["url"], "description": peer["description"], "enabled": True,
+                "header_name": peer["header_name"]}, expected_revision=peer["revision"], actor_id="alice")
+            self.assertFalse(peer["has_header_value"])
+            await check_cards(True)
+            for mode, visible in (("deny", False), ("require_hitl", True), ("allow", True)):
+                policy = self.agent.interaction_store.get_policy(self.tenant, "core_agent_send_message", tool_origin("core_agent_send_message"))
+                self.agent.interaction_store.update_policy(self.tenant, "core_agent_send_message", policy.origin,
+                    mode=mode, guardrails_exempt=False, expected_revision=policy.revision, actor_id="alice")
+                await check_cards(visible)
+            platform = self.agent.platform_config
+            with patch.object(self.agent, "platform_config", replace(platform,
+                    allowed_builtin_tools=platform.allowed_builtin_tools - {"core_agent_send_message"})):
+                await check_cards(False)
+            self.registry.delete(self.tenant, peer["id"], expected_revision=peer["revision"], actor_id="alice")
+            await check_cards(False)
+
+    async def test_card_finds_enabled_peer_after_first_metadata_page(self):
+        self.registry.disable(self.tenant, self.peer["id"], expected_revision=1, actor_id="alice")
+        for index in range(100):
+            self.registry.create(self.tenant, {"name": f"disabled-{index}", "url": "https://peer.example/a2a",
+                "description": "Disabled peer", "enabled": False, "header_name": "Authorization"}, actor_id="alice")
+        first_page = self.registry.list(self.tenant, limit=100)
+        peer = self.registry.list(self.tenant, limit=100, after_id=first_page[-1]["id"])[0]
+        self.registry.update(self.tenant, peer["id"], {
+            "url": peer["url"], "description": peer["description"], "enabled": True,
+            "header_name": peer["header_name"]}, expected_revision=peer["revision"], actor_id="alice")
+        with patch("core_agent.remote_agents.connect_peer", side_effect=AssertionError("Card made a network request")), patch.object(
+                self.registry, "resolve_headers", side_effect=AssertionError("Card resolved private credentials")):
+            response = await self.http.get("/a2a/owner/.well-known/agent-card.json", headers=self.headers("owner-a"))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("core_agent_send_message", {skill["id"] for skill in response.json()["skills"]})
 
     async def test_unavailable_peer_is_omitted_and_stale_send_has_structured_failure(self):
         with patch("core_agent.remote_agents.connect_peer", side_effect=CoreError("REMOTE_AGENT_UNAVAILABLE")):
