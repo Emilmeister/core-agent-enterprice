@@ -7,7 +7,7 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from core_agent.errors import CoreError
+from core_agent.errors import CoreError, ExecutionNotStarted
 from core_agent.tasks import TaskScheduler
 from core_agent.workflow import SuspendedRun
 
@@ -369,6 +369,48 @@ class TaskSuspensionTests(unittest.TestCase):
         self.assertEqual(self.get(task).result, "canceled result")
         self.assertEqual(len(self.mailbox()), 1)
         self.assertEqual(self.mailbox()[0].kind, "task.canceled")
+
+    def test_cancel_rejection_proves_no_cancellation_was_dispatched(self):
+        callbacks = []
+        task = self.start_suspended(on_cancel=lambda: callbacks.append(task.id))
+        for task_id, owner in (("missing", self.owner), (task.id, "another-owner")):
+            with self.subTest(task_id=task_id, owner=owner):
+                with self.assertRaises(CoreError) as rejected:
+                    self.scheduler.cancel(task_id, owner_id=owner, tenant_id=self.tenant)
+                code = "POLICY_DENIED" if owner != self.owner and not hasattr(self, "database") else "TASK_NOT_FOUND"
+                self.assertEqual(rejected.exception.code, code)
+                self.assertIsInstance(rejected.exception, ExecutionNotStarted)
+                self.assertEqual(callbacks, [])
+                self.assertEqual(self.get(task).state, "working")
+        self.scheduler.register("subagent", lambda *_: "completed")
+        self.scheduler.recover(ready=lambda *_: True)
+        self.settle_workers()
+        self.assertEqual(self.get(task).state, "completed")
+        with self.assertRaises(CoreError) as rejected:
+            self.scheduler.cancel(task.id, owner_id=self.owner, tenant_id=self.tenant)
+        self.assertEqual(rejected.exception.code, "TASK_NOT_CANCELABLE")
+        self.assertIsInstance(rejected.exception, ExecutionNotStarted)
+        self.assertEqual(callbacks, [])
+
+    def test_cancel_callback_cannot_claim_the_outer_cancel_did_not_start(self):
+        from core_agent.runtime import CoreAgent
+        from core_agent.tools import ToolCall
+
+        for error_type in (CoreError, ExecutionNotStarted):
+            for code in ("TASK_NOT_FOUND", "TASK_NOT_CANCELABLE", "TOOL_ARGUMENT_INVALID", "TOOL_START_FAILED"):
+                with self.subTest(error_type=error_type, code=code):
+                    callbacks = []
+                    def callback():
+                        callbacks.append("cancel committed")
+                        raise error_type(code)
+                    task = self.start_suspended(on_cancel=callback)
+                    with self.assertRaises(CoreError) as failed:
+                        self.scheduler.cancel(task.id, owner_id=self.owner, tenant_id=self.tenant)
+                    self.assertEqual(failed.exception.code, code)
+                    self.assertNotIsInstance(failed.exception, ExecutionNotStarted)
+                    self.assertEqual(callbacks, ["cancel committed"])
+                    self.assertFalse(CoreAgent._recoverable_tool_error(
+                        ToolCall("cancel", "core_task_cancel", {"task_id": task.id}), failed.exception))
 
     def test_recovery_thread_start_failure_retains_suspension(self):
         self.scheduler.register("subagent", lambda *_: "done")

@@ -9,7 +9,7 @@ from contextlib import nullcontext
 
 from psycopg.types.json import Jsonb
 
-from .errors import CoreError
+from .errors import CoreError, ExecutionNotStarted
 from .observability import TraceContext
 from .tasks import (
     BackgroundTask, Notification, RemoteTaskClaim, REMOTE_KIND, _remote_progress,
@@ -526,7 +526,11 @@ class PostgresTaskScheduler:
         with self._lock:
             callback = self._cancel_callbacks.pop((tenant_id, task_id), None)
         if callback is not None:
-            callback()
+            try:
+                callback()
+            except ExecutionNotStarted as error:
+                # The durable cancel is already committed; a callback cannot undo it.
+                raise CoreError(error.code, diagnostics=error.diagnostics) from error
 
     def start(
         self,
@@ -1036,13 +1040,18 @@ class PostgresTaskScheduler:
                 condition.wait(remaining)
 
     def cancel(self, task_id, *, owner_id=None, tenant_id="default"):
-        self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
+        try:
+            self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
+        except CoreError as error:
+            if error.code == "TASK_NOT_FOUND":
+                raise ExecutionNotStarted(error.code) from error
+            raise
         with self.database.transaction() as connection:
             remote = connection.execute("""SELECT * FROM core_background_tasks WHERE id = %s AND tenant_id = %s
                                            AND kind = %s FOR UPDATE""", (task_id, tenant_id, REMOTE_KIND)).fetchone()
             if remote is not None:
                 if owner_id is not None and remote["owner_run_id"] != owner_id:
-                    raise CoreError("TASK_NOT_FOUND")
+                    raise ExecutionNotStarted("TASK_NOT_FOUND")
                 _remote_checkpoint(remote["checkpoint"])
                 if remote["state"] in TERMINAL:
                     return self._task(remote)
@@ -1072,7 +1081,7 @@ class PostgresTaskScheduler:
                 values.append(owner_id)
             updated = connection.execute(sql, values)
             if updated.rowcount != 1:
-                raise CoreError("TASK_NOT_CANCELABLE")
+                raise ExecutionNotStarted("TASK_NOT_CANCELABLE")
         self._signal_cancel(task_id, tenant_id)
         return self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
 

@@ -1777,7 +1777,8 @@ class CoreAgent:
         except Exception as error:
             if isinstance(error, CoreError) and error.code == "LEASE_LOST":
                 raise
-            raise CoreError("EXECUTION_CLEANUP_PENDING", "Execution cleanup is not confirmed") from error
+            raise CoreError("EXECUTION_CLEANUP_PENDING", "Execution cleanup is not confirmed",
+                            diagnostics=getattr(error, "diagnostics", None)) from error
         if any(owner and not owner["cleanup_confirmed"] and owner.get("local_execution_pending") is not False
                and owner["instance_id"] != getattr(manager, "instance_id", None)
                for _, owner in owners):
@@ -1949,7 +1950,8 @@ class CoreAgent:
                     scope.__exit__(None, None, None)
                     self.workflow_store.confirm_execution(record, owner)
             except Exception as error:
-                raise CoreError("EXECUTION_CLEANUP_PENDING", "Execution generation cleanup is not confirmed") from error
+                raise CoreError("EXECUTION_CLEANUP_PENDING", "Execution generation cleanup is not confirmed",
+                                diagnostics=getattr(error, "diagnostics", None)) from error
             finally:
                 if runtime_token is not None:
                     self._runtime_owner.reset(runtime_token)
@@ -3418,6 +3420,9 @@ class CoreAgent:
 
     @staticmethod
     def _recoverable_tool_error(call, error):
+        if call.name == "core_task_cancel":
+            # A callback runs after cancellation; its code alone cannot prove no effect.
+            return isinstance(error, ExecutionNotStarted)
         return isinstance(error, CoreError) and (
             isinstance(error, ExecutionNotStarted)
             or error.code in {"TOOL_ARGUMENT_INVALID", "TOOL_START_FAILED"}
@@ -4344,6 +4349,7 @@ class CoreAgent:
                 unknown = CoreError(
                     "SIDE_EFFECT_UNKNOWN",
                     "mutating tool outcome is unknown and requires reconciliation",
+                    diagnostics=getattr(error, "diagnostics", None),
                 )
                 if span:
                     span.record_error(unknown)
@@ -7489,7 +7495,7 @@ class CoreAgent:
                 manager.destroy_execution(record.run_id, owner["worker_id"], owner["generation"])
                 self.workflow_store.confirm_execution(record, owner)
             except Exception as error:
-                raise CoreError("EXECUTION_CLEANUP_PENDING") from error
+                raise CoreError("EXECUTION_CLEANUP_PENDING", diagnostics=getattr(error, "diagnostics", None)) from error
         if record.parent_run_id:
             try:
                 self.task_scheduler.cancel(

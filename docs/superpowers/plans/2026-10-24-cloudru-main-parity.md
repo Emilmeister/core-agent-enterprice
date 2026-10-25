@@ -231,7 +231,60 @@ skip обязательного native gate не считаются подтве
 изменения spec, acceptance, tests и frozen hashes для согласованных доработок.
 План не требует пересоздания проекта или изменения параметров кластера Cloud.ru.
 
-## 5. Когда цель считается достигнутой
+## 5. Результаты общего live-прогона 24–25 октября 2026
+
+Проверки выполнены на существующем Cloud deployment после подтверждённого
+пользователем rollout. Ожидаемый candidate — `cloudru-batch-20261024`, index
+`sha256:35609371e1aab984f4f68c987fe35e92a0d1059ec23da1900580399e615a6dcc`.
+HTTP API не раскрывает revision/digest, поэтому точный запущенный image независимо
+не подтверждён. Это manual deployment proof, не основание менять CI implementation status.
+
+| Область | Полученное доказательство | Остаток / ограничение |
+|---|---|---|
+| Входящий A2A и доступ | 35 проверок: карточки 0.3/1.0, root/alias dedup, owner-only маршруты, Origin, запрет перечисления external Tasks; обе тестовые задачи завершились точными ответами | SSE reconnect, rotation/expiry и rolling overlap проверяются отдельно |
+| Owner UI | Настоящий Chromium: вход, чтение своей истории, отображение результата, история после reload, отсутствие JS errors, logout → identity 401 | Не заменяет обязательный native browser/Keycloak gate |
+| Cron и время | Создание, повтор запроса, ручной запуск без дублирования, CAS, disable/delete; новый Message прерывает timer, повтор Message не создаёт новый запуск | Автоматическое расписание при длительном idle ещё не доказано |
+| Idle | После подтверждённого закрытия UI — 300 секунд без наших HTTP-запросов. Timer проснулся в 19:57:30.834592 UTC; первое чтение после паузы в 19:58:15 UTC уже увидело COMPLETED | Доказывает один пятиминутный интервал; не гарантия отсутствия scale-to-zero или рестартов платформы |
+| Память и child | Create/read/update rev1→2, точный vector result, child с allowlist search/read прочитал ту же запись; delete committed и последующий поиск пуст | NER вернул degraded graph «1 document(s) not extracted». Причина требует безопасного provider error code из журнала; restart памяти отдельно |
+| Skills и исполнение | Активация skill с digest, Python `tools.call` → terminal, отсутствие пяти проверенных secret ENV, отказ чтения своего canary из соседнего чата с EACCES, timeout → cleanup → следующая команда | Не доказывает весь сетевой профиль, resource limits или остановку при смерти Pod |
+| Background cancel | Создание фоновой команды и mailbox message подтверждены | После разрешённого cancel root завершился SIDE_EFFECT_UNKNOWN. Публичных данных недостаточно для определения cleanup/lease причины; повторный запуск команды не выполнялся |
+| Исходящий peer | Карточка self-peer совместима с pinned A2A 1.0 alias | Сохранение подключения с ключом вернуло 503 REMOTE_AGENT_CREDENTIAL_UNAVAILABLE. Подключение/задача не созданы; требуется настроенный стабильный encryption secret |
+
+Исходные безопасные receipts находятся рядом с worktree в
+`.enterprise-work/cloudru-batch-live-*-20261024.json`: protocol, control-v2,
+tools, memory-child, browser-v2, idle и peer. Первые control/browser попытки
+содержат ошибки тестовой подготовки (несуществующий chat ID, чтение timer через
+owner interactions, строковый JS eval при CSP); они не считаются product defects.
+Сетевые ReadTimeout/ConnectTimeout сохранены как наблюдения без догадки о причине.
+Все собственные model roots завершены либо отменены; тестовые memory записи,
+canary-файлы и временное расписание удалены. Общие policies/settings не менялись.
+
+### Пакет исправлений по итогам прогона
+
+Отдельно подтверждены два дефекта общей реализации отмены: безопасный отказ
+до dispatch ошибочно превращался в unknown; cleanup wrappers теряли конечную
+приватную SandboxDiagnostics. Исправление сохраняет прежние public error
+codes, отличает pre-dispatch от callback после cancel и оставляет uncertain
+side effects закрытыми. В частности, `TOOL_ARGUMENT_INVALID`/`TOOL_START_FAILED`
+после dispatch не разрешают продолжить model loop. Оно не устанавливает причину
+упомянутого live incident.
+Дополнительная ARM64 native regression с реальным child, TerminalSessionManager
+и concurrent reaper прошла; исходный Cloud сбой в ней не воспроизведён.
+На итоговом коде прошли 205 targeted tests с отдельной PostgreSQL БД и 383 tests
+в собранном linux/amd64 candidate с PostgreSQL/MinIO, без skips; независимое
+повторное review блокеров не выявило. Это не заменяет native sandbox gates.
+Общий ordinary suite на итоговом коде: 2410 tests, exit 0, 16 платформенных skips,
+с настоящими PostgreSQL, Keycloak и MinIO. Ruff, frozen spec lock и wheel/sdist
+build прошли. Пропуски не засчитываются как прохождение соответствующих gates.
+
+Следующий rollout объединяет исправления и настройку encryption secret.
+После него повторяются failed/blocked случаи: active background cancel с точной
+диагностикой, peer credentials + Send/Get/Cancel, provider NER. Для MCP нужен
+контролируемый доступный HTTPS fixture; для compaction — provider + две реальные
+compaction receipts; для production — runtime DB grants, coordinated backup,
+native amd64/arm64 gates и один согласованный restart/overlap сценарий.
+
+## 6. Когда цель считается достигнутой
 
 Все основные возможности текущего main проходят согласованную матрицу на
 Cloud.ru; новые Cloud storage/auth/sandbox границы имеют обязательные proofs.

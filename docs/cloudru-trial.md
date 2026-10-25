@@ -138,6 +138,12 @@ LOCAL_WORKSPACE_ROOT=/tmp/core-agent/runs
   Остальные поддержанные model settings — в [ENV-примере](../.env.example).
 - Стабильный `PUSH_NOTIFICATION_ENCRYPTION_KEY` в формате Fernet для encrypted
   settings/credentials. Сохраняйте его отдельно от БД и между перезапусками.
+  Он нужен и в development для подключения внешнего агента или MCP с секретом:
+  без него сохранение peer credentials возвращает `REMOTE_AGENT_CREDENTIAL_UNAVAILABLE`,
+  даже если owner UI и обычные задачи работают. Перед следующим rollout проверьте
+  наличие этого secret именно в настройках Cloud deployment; локальный `.env`
+  платформа автоматически не читает. Используйте прежний ключ, если encrypted
+  state уже существует; изменение ключа не восстанавливает старые credentials.
 - `SANDBOX_DNS_SERVERS` и `SANDBOX_DENIED_CIDRS` с реальными защищёнными сетями
   deployment. Default `SANDBOX_BACKEND=bubblewrap` требует Linux namespaces,
   seccomp, TUN и resource limits;

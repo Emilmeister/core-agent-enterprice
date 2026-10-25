@@ -9,7 +9,7 @@ import math
 from dataclasses import dataclass, field
 
 from .config import MAX_SUBAGENT_DEPTH
-from .errors import CoreError
+from .errors import CoreError, ExecutionNotStarted
 from .mcp import mcp_tool_index
 from .workflow import SuspendedRun
 from .peer_conversations import initial_conversation, merge_observation, OBSERVATION_TTL, validate_request_provenance
@@ -1200,7 +1200,12 @@ class TaskScheduler:
         return task
 
     def cancel(self, task_id, *, owner_id=None, tenant_id="default"):
-        task = self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
+        try:
+            task = self.get(task_id, owner_id=owner_id, tenant_id=tenant_id)
+        except CoreError as error:
+            if error.code in {"TASK_NOT_FOUND", "POLICY_DENIED"}:
+                raise ExecutionNotStarted(error.code) from error
+            raise
         if task_id in self._remote:
             with self._lock:
                 row = self._remote[task_id]
@@ -1216,11 +1221,15 @@ class TaskScheduler:
             task.state in {"completed", "failed", "canceled"}
             or task.cancel_event.is_set()
         ):
-            raise CoreError("TASK_NOT_CANCELABLE")
+            raise ExecutionNotStarted("TASK_NOT_CANCELABLE")
         task.cancel_event.set()
         callback = self._cancel_callbacks.pop(task.id, None)
         if callback is not None:
-            callback()
+            try:
+                callback()
+            except ExecutionNotStarted as error:
+                # The outer cancel was dispatched even if a nested operation was not.
+                raise CoreError(error.code, diagnostics=error.diagnostics) from error
         return task
 
     def assert_can_complete_parent(self, owner_id, tenant_id="default"):

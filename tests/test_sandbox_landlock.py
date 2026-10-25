@@ -170,6 +170,50 @@ for operation in (
                 self.assertFalse(scratch.exists())
                 launcher.close()
 
+    def test_terminal_manager_cancels_child_with_concurrent_reaper(self):
+        import time
+        from core_agent.execution import EnvironmentSpec, LocalTerminalBackend, TerminalSessionManager
+        from core_agent.sandbox_landlock import _group_members
+
+        for operation in ("cancel", "close_execution_tree"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
+                launcher = LandlockLauncher(self.policy)
+                manager = TerminalSessionManager(LocalTerminalBackend(temporary, launcher=launcher))
+                try:
+                    session = manager.create(EnvironmentSpec("tenant", "child", "", (".",), (), {},
+                        owner_id="child", parent_run_id="root"))
+                    handle = manager.start(session.id, {"argv": ["sh", "-c", "sleep 120 & printf ready; wait"],
+                        "timeout": 120}, owner_id="child")
+                    scratch = handle._process._scratch
+                    deadline = time.monotonic() + 5
+                    while "ready" not in manager.read(session.id, handle.id, owner_id="child"):
+                        self.assertLess(time.monotonic(), deadline, "The child did not start")
+                        time.sleep(0.01)
+                    self.assertFalse(handle._process_done.is_set())
+                    started = time.monotonic()
+                    if operation == "cancel":
+                        manager.cancel(session.id, handle.id, owner_id="child")
+                    else:
+                        manager.close_execution_tree("root", "cancel-root", run_ids=("child",))
+                    self.assertLess(time.monotonic() - started, 10)
+                    self.assertTrue(handle._process_done.is_set())
+                    self.assertTrue(handle._done.is_set())
+                    self.assertIsNone(handle._error)
+                    self.assertEqual(handle._cleanup, "sandbox_terminated")
+                    self.assertFalse(any(not dead for _, dead in
+                        _group_members(handle.process_group_id, time.monotonic() + 1)))
+                    self.assertFalse(scratch.exists())
+                    self.assertFalse(launcher._unhealthy)
+                    next_session = manager.create(EnvironmentSpec("tenant", "next", "", (".",), (), {},
+                        owner_id="next"))
+                    result = manager.execute(next_session.id, {"argv": ["printf", "after-cancel"], "timeout": 5},
+                        owner_id="next")
+                    self.assertEqual(result.exit_code, 0)
+                    self.assertEqual(result.stdout, "after-cancel")
+                    self.assertEqual(result.cleanup, "sandbox_terminated")
+                finally:
+                    manager.close()
+
     def test_cleanup_stops_worker_after_its_main_thread_exits(self):
         import select
         import time

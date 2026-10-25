@@ -2877,6 +2877,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("diagnostics", result.__dict__)
 
     def test_mutating_tool_exception_aborts_with_unknown_side_effect(self):
+        exporter = RecordingExporter()
         model = ScriptedModel(
             [
                 ModelResponse(
@@ -2890,20 +2891,117 @@ class RuntimeTests(unittest.TestCase):
                 )
             ]
         )
-        agent = make_agent(model, memory="disabled", terminal_mutating=True)
+        agent = make_agent(model, memory="disabled", terminal_mutating=True,
+                           telemetry=Telemetry(exporter))
+
+        failure = RuntimeError("private-token-/private/company")
+        failure.diagnostics = SandboxDiagnostics("cleanup", "timeout", 3000, "unconfirmed")
 
         def lose_outcome(_arguments, _run_id):
-            raise RuntimeError("connection lost after dispatch")
+            raise failure
 
         agent.tool_runtime.handlers["core_terminal_exec"] = lose_outcome
         try:
-            with self.assertRaises((CoreError, RuntimeError)):
+            with self.assertRaises(CoreError) as caught:
                 agent.run(run_request(memory=False), task_id="mutating-tool-exception")
             record = agent.workflow_store.lookup_task("mutating-tool-exception")
         finally:
             agent.close()
         self.assertEqual(record.state, "ABORTED")
         self.assertEqual(record.error_code, "SIDE_EFFECT_UNKNOWN")
+        self.assertEqual(caught.exception.code, "SIDE_EFFECT_UNKNOWN")
+        self.assertIs(caught.exception.diagnostics, failure.diagnostics)
+        self.assertIs(caught.exception.__cause__, failure)
+        self.assertEqual(caught.exception.data, {})
+        span = next(item for item in exporter.spans if item.name == "core_agent.tool.execute")
+        self.assertEqual(span.attributes["core_agent.error.code"], "SIDE_EFFECT_UNKNOWN")
+        self.assertEqual(span.attributes["core_agent.sandbox.cleanup"], "unconfirmed")
+        self.assertEqual(span.attributes["core_agent.sandbox.reason"], "timeout")
+        self.assertTrue(any(name == "sandbox.failed" for name, _ in exporter.logs))
+        public = json.dumps({"snapshot": record.snapshot, "data": caught.exception.data})
+        self.assertNotIn('"diagnostics"', public)
+        self.assertNotIn("private-token", public + str(caught.exception) + json.dumps(exporter.logs)
+                         + json.dumps([item.attributes for item in exporter.spans]))
+
+    def test_task_cancel_only_recovers_proven_pre_dispatch_rejections(self):
+        from core_agent.errors import ExecutionNotStarted
+        from core_agent.workflow import SuspendedRun
+
+        cases = [(case, None, None) for case in ("missing", "foreign", "completed", "invalid")]
+        cases.extend(("callback", error_type, code) for error_type in (CoreError, ExecutionNotStarted)
+                     for code in ("TASK_NOT_FOUND", "TASK_NOT_CANCELABLE", "TOOL_ARGUMENT_INVALID", "TOOL_START_FAILED"))
+        for case, error_type, callback_code in cases:
+            with self.subTest(case=case, error_type=error_type, callback_code=callback_code):
+                model = ScriptedModel([
+                    ModelResponse(tool_requests=(ToolRequest("cancel", "core_task_cancel",
+                        {} if case == "invalid" else {"task_id": "child"}),)),
+                    ModelResponse(message="cancellation was rejected"),
+                ])
+                agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=())
+                self.addCleanup(agent.close)
+                agent.platform_config.allowed_builtin_tools.add("core_task_cancel")
+                agent.tool_runtime.registry.register(ToolDefinition("core_task_cancel", "cancel",
+                    {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]},
+                    mutating=True, risk_tags=frozenset()))
+                parent, *_ = agent._new_workflow(run_request(), task_id="parent", identity="owner",
+                                               tenant_id="default", session_id="chat")
+                callbacks = []
+                def callback():
+                    callbacks.append("dispatched")
+                    raise error_type(callback_code)
+                if case not in {"missing", "invalid"}:
+                    task = agent.task_scheduler.start(
+                        lambda: SuspendedRun("child-run", "child", "wait", 1) if case == "callback" else "done",
+                        task_id="child", owner_id="foreign" if case == "foreign" else parent.run_id,
+                        kind="test", contract={}, on_cancel=callback)
+                    with agent.task_scheduler._lock:
+                        threads = tuple(agent.task_scheduler._threads)
+                    for thread in threads:
+                        thread.join(2)
+                        self.assertFalse(thread.is_alive())
+                    self.assertEqual(task.state, "working" if case == "callback" else "completed")
+                if case == "callback":
+                    with self.assertRaises(CoreError) as failed:
+                        agent._continue_workflow(parent)
+                    self.assertEqual(failed.exception.code, "SIDE_EFFECT_UNKNOWN")
+                    self.assertEqual(callbacks, ["dispatched"])
+                    self.assertTrue(task.cancel_event.is_set())
+                    self.assertEqual(agent.workflow_store.lookup_task("parent").state, "ABORTED")
+                    self.assertEqual(len(model.calls), 1)
+                else:
+                    result = agent._continue_workflow(parent)
+                    self.assertEqual(result.message, "cancellation was rejected")
+                    code = {"completed": "TASK_NOT_CANCELABLE", "foreign": "POLICY_DENIED",
+                            "invalid": "TOOL_ARGUMENT_INVALID"}.get(case, "TASK_NOT_FOUND")
+                    self.assertIn('"error_code": "' + code + '"', model.calls[-1].context)
+                    self.assertEqual(callbacks, [])
+
+    def test_cancel_cleanup_keeps_private_diagnostics_and_exact_execution_owner(self):
+        agent = make_agent(ScriptedModel([]), memory="disabled", mcp=False, platform_mcp=())
+        self.addCleanup(agent.close)
+        manager, store = agent.tool_runtime.environment_manager, agent.workflow_store
+        record, *_ = agent._new_workflow(run_request(), task_id="cancel-cleanup", identity="owner",
+                                        tenant_id="default", session_id="chat")
+        token = store.acquire_lease(record.run_id, tenant_id="default", owner_id="owner", worker_id="worker", ttl=60)
+        record = store.register_execution(record, instance_id=manager.instance_id, worker_id="worker",
+                                          generation=token, lease_token=token)
+        failure = CoreError("SIDE_EFFECT_UNKNOWN", "private-token-/private/company",
+                            diagnostics=SandboxDiagnostics("cleanup", "timeout", 3000, "unconfirmed"))
+        try:
+            with patch.object(manager, "destroy_execution", side_effect=failure) as stop:
+                with self.assertRaises(CoreError) as caught:
+                    agent.cancel_task(record.task_id)
+            stop.assert_called_once_with(record.run_id, "worker", token)
+            self.assertEqual(caught.exception.code, "EXECUTION_CLEANUP_PENDING")
+            self.assertIs(caught.exception.diagnostics, failure.diagnostics)
+            self.assertIs(caught.exception.__cause__, failure)
+            self.assertEqual(caught.exception.data, {})
+            self.assertNotIn("private-token", str(caught.exception))
+            current = store.lookup_task(record.task_id)
+            self.assertTrue(current.cancel_requested)
+            self.assertFalse(current.snapshot["execution_owner"]["cleanup_confirmed"])
+        finally:
+            store.release_lease(record.run_id, tenant_id="default", worker_id="worker", token=token)
 
     def test_resume_task_does_not_redispatch_executing_mutation(self):
         agent = make_agent(
