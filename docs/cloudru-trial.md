@@ -271,6 +271,12 @@ uv run core-agent-db check
 schema доступом приложения. В собранном образе доступны те же `core-agent-db
 migrate` и `core-agent-db check`. Serving process не получает migration secret.
 
+При обновлении образа повторяйте `migrate` с `DATABASE_APP_ROLE`, даже если версия
+схемы уже актуальна: команда также выдаёт необходимые права runtime-роли, включая
+`SELECT, INSERT, UPDATE` на `core_workspace_manifests` и `core_s3_blobs`.
+Один перезапуск приложения эти права не обновляет. Успешный `check` подтверждает
+версию схемы, но не заменяет проверку записи и восстановления файлов от runtime-роли.
+
 До rollout остановите новые admissions и writers, сохраните согласованный backup
 БД и всех referenced S3 objects, а ключ шифрования — отдельно. Восстановление
 проверяйте на disposable копии с пустым local cache и тем же ключом. Порядок и

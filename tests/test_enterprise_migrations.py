@@ -14,9 +14,10 @@ from unittest.mock import patch
 
 from a2a.types import a2a_pb2
 from cryptography.fernet import Fernet
+from psycopg import connect
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
-from psycopg.errors import RaiseException
-from psycopg.sql import SQL, Identifier
+from psycopg.errors import InsufficientPrivilege, RaiseException
+from psycopg.sql import SQL, Identifier, Literal
 from psycopg.types.json import Jsonb
 
 from core_agent import database as database_module
@@ -67,6 +68,50 @@ class EnterpriseMigrationTests(unittest.TestCase):
             database.migrate()
         self.assertEqual(database.schema_version(), version)
         return database, url
+
+    def test_migration_grants_runtime_cloud_storage_without_delete_or_ddl(self):
+        suffix = uuid.uuid4().hex
+        name, role, password = "cloud_grants_" + suffix, "cloud_runtime_" + suffix, uuid.uuid4().hex
+        admin_url = os.environ["TEST_DATABASE_URL"]
+
+        def cleanup():
+            with connect(admin_url, autocommit=True) as connection:
+                connection.execute(SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(Identifier(name)))
+                connection.execute(SQL("DROP ROLE IF EXISTS {}").format(Identifier(role)))
+
+        self.addCleanup(cleanup)
+        with connect(admin_url, autocommit=True) as connection:
+            connection.execute(SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(Identifier(role), Literal(password)))
+            connection.execute(SQL("CREATE DATABASE {}").format(Identifier(name)))
+        migration_url = make_conninfo(admin_url, dbname=name)
+        runtime_url = make_conninfo(admin_url, dbname=name, user=role, password=password)
+        with patch.dict(os.environ, {"DATABASE_MIGRATION_URL": migration_url, "DATABASE_APP_ROLE": role,
+                                     "DATABASE_POOL_MIN": "0", "DATABASE_POOL_MAX": "1"}, clear=True):
+            database_module.main(["migrate"])
+        with patch.dict(os.environ, {"DATABASE_URL": runtime_url, "DATABASE_POOL_MIN": "0",
+                                     "DATABASE_POOL_MAX": "1"}, clear=True):
+            database_module.main(["check"])
+
+        with connect(runtime_url, autocommit=True) as connection:
+            self.assertEqual(connection.execute("SELECT current_user").fetchone()[0], role)
+            for table, insert, update in (
+                ("core_workspace_manifests",
+                 "INSERT INTO core_workspace_manifests VALUES ('tenant','owner','chat',1,'{}')",
+                 "UPDATE core_workspace_manifests SET revision=2"),
+                ("core_s3_blobs",
+                 "INSERT INTO core_s3_blobs VALUES ('tenant',repeat('a',64),1,'staging','generation',300,NULL,0)",
+                 "UPDATE core_s3_blobs SET state='live'"),
+            ):
+                with self.subTest(table=table):
+                    connection.execute(insert)
+                    self.assertEqual(connection.execute(update).rowcount, 1)
+                    self.assertEqual(connection.execute(SQL("SELECT count(*) FROM {}")
+                                                       .format(Identifier(table))).fetchone()[0], 1)
+                    for forbidden in ("DELETE FROM {}", "TRUNCATE {}", "ALTER TABLE {} ADD COLUMN forbidden text"):
+                        with self.assertRaises(InsufficientPrivilege):
+                            connection.execute(SQL(forbidden).format(Identifier(table)))
+            with self.assertRaises(InsufficientPrivilege):
+                connection.execute("CREATE TABLE forbidden_runtime_ddl (id integer)")
 
     def test_remote_registration_delete_upgrade_restart_and_tombstone(self):
         database, url = self.database_at(26)

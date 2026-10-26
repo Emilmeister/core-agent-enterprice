@@ -1195,6 +1195,8 @@ class PostgresDatabase:
             "core_tool_policies": "SELECT, INSERT, UPDATE",
             "core_chats": "SELECT, INSERT, UPDATE",
             "core_workspace_cleanups": "SELECT, INSERT, UPDATE",
+            "core_workspace_manifests": "SELECT, INSERT, UPDATE",
+            "core_s3_blobs": "SELECT, INSERT, UPDATE",
             "core_cron_schedules": "SELECT, INSERT, UPDATE",
             "core_cron_events": "SELECT, INSERT",
             "core_root_messages": "SELECT, INSERT",
