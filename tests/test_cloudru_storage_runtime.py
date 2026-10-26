@@ -566,6 +566,10 @@ class CloudStorageRuntimeTests(CloudStorageRuntimeFixture):
         self.assertEqual(restored.content, b"once")
 
     async def pending_cleanup(self, context):
+        # These crash fixtures advance recovery explicitly after restarting.
+        self.agent._recovery_stop.set()
+        await asyncio.to_thread(self.agent._recovery_thread.join, 5)
+        self.assertFalse(self.agent._recovery_thread.is_alive())
         self.model._responses = [self.terminal("open('remove.txt','w').write('old'); open('keep.txt','w').write('retained')"),
                                  ModelResponse(message="Written")]
         task = await self.submit(context)

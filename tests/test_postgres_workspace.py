@@ -301,6 +301,10 @@ class PostgresWorkspaceRuntimeTests(AuthAppTestCase):
         self.assertEqual(len(self.model.calls), 6)
 
     async def test_storage_failure_after_command_never_replays_the_command(self):
+        # This test advances recovery explicitly, without a competing periodic scan.
+        self.agent._recovery_stop.set()
+        await asyncio.to_thread(self.agent._recovery_thread.join, 5)
+        self.assertFalse(self.agent._recovery_thread.is_alive())
         self.model._responses = [ModelResponse(tool_requests=(ToolRequest("once", "core_terminal_exec", {
             "argv": [sys.executable, "-c", "open('counter','a').write('x')"]}),)), ModelResponse(message="done")]
         original = self.blobs.put
@@ -317,8 +321,8 @@ class PostgresWorkspaceRuntimeTests(AuthAppTestCase):
         binding = WorkspaceBinding(record.tenant_id, record.owner_id, record.context_id)
         counter = self.agent.tool_runtime.environment_manager.backend.chats.workspace(binding) / "counter"
         self.assertEqual(counter.read_text(), "x")
-        # Recovery may prepare the abort while storage is still unavailable.
-        # The following attempt owns a new lease but retires the same process.
+        # Recovery prepares the abort while storage is still unavailable.
+        # This attempt owns a new lease but retires the same process.
         with self.assertRaises(CoreError) as pending:
             await asyncio.to_thread(self.agent.resume_task, record.task_id)
         self.assertEqual(pending.exception.code, "STORAGE_UNAVAILABLE")
