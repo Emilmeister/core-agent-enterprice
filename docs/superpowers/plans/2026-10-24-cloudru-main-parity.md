@@ -156,7 +156,7 @@ uv run python -m unittest tests.test_landlock_policy tests.test_landlock_network
 
 ### Этап 5. Эксплуатация и данные
 
-- [ ] Проверить отдельную миграцию схемы и права runtime role на disposable копии; сохранить обязательный запрет production auto-migration.
+- [x] Проверить отдельную миграцию схемы и права runtime role на disposable копии; сохранить обязательный запрет production auto-migration. Подтверждено реальной PostgreSQL LOGIN-ролью 26 октября; права действующего Cloud deployment этим не проверены.
 - [ ] Проверить восстановление согласованного состояния PostgreSQL + referenced S3 objects со стабильным encryption key.
 - [ ] Описать откат образа/схемы: старый backup нельзя накатывать поверх новых записей без отдельной процедуры сохранения данных.
 - [ ] Проверить недоступность/таймаут S3, заполнение локального cache, ограничения размера/числа файлов и GC без удаления referenced originals/artifacts.
@@ -441,6 +441,56 @@ MCP root: `22a87d39-cec7-4f22-bd18-02673d16adfc`; NER root:
 остановлена: один запрос, ноль compactions, без повторов и без изменений Cloud.
 Отчёт `cloudru-batch-compaction-provider-20261025.json` не является проверкой
 deployed Qwen и не устанавливает дефект алгоритма сжатия.
+
+### Вложения, SSE и права runtime-роли: пакет 25–26 октября
+
+| Проверка | Фактический результат | Граница доказательства |
+|---|---|---|
+| Raw FilePart между версиями | Внешний A2A 0.3 принял собственный файл 75 bytes; идентичный Message через внешний 1.0 alias вернул ту же Task. Одна исходная запись, одно вложение, ноль tool calls, `COMPLETED`. | Один малый текстовый файл; Pod replacement и storage outage здесь не выполнялись. |
+| Оригинал и валидация | Owner API вернул original с `no-store`, точными bytes/SHA-256 и provenance `a2a/`; noncanonical base64 `YR==` отклонён как `INVALID_FILE_ENCODING`. | Owner authority сохранена; отрицательная проверка внешнего доступа к original в этом пакете не повторялась. |
+| Разрыв SSE | Одна внешняя Task, один Send: 0.3 subscription получила working event и была закрыта клиентом; подписка 1.0 через alias получила продолжение и `COMPLETED`, история содержит один исходный Message и точный ответ. | Подтверждён клиентский disconnect/resubscribe; это не замена Pod. |
+| Production runtime grants | Реальная отдельная LOGIN-роль после migration и успешного schema `check` не могла писать в `core_workspace_manifests` и `core_s3_blobs`. Regression воспроизвела две `InsufficientPrivilege`; добавлены только `SELECT, INSERT, UPDATE`. | Для уже существующей БД нужен повторный запуск обновлённого migration CLI с `DATABASE_APP_ROLE`; один rollout права не обновит. |
+| Проверка исправления | 11 migration/spec тестов без skips, включая настоящий dump/restore; проверены разрешённые DML и запреты DELETE/TRUNCATE/ALTER/CREATE. Ruff и независимое review прошли. | Backup gate покрывает PostgreSQL и локальные test blobs, а не согласованное восстановление Cloud PostgreSQL + S3. |
+| Docker restart | Существующий lifecycle test прошёл на amd64 candidate image в локальном ARM64 Docker. | Эмуляция не закрывает native amd64/arm64 matrix. |
+
+Raw FilePart root: `4e6f5716-cd5e-4d86-b9ac-97a8888b8ada`; SSE root:
+`f8bb2136-d6cf-4528-b44f-ddf6bc98d1fa`. Receipts:
+`cloudru-rawfile-alias-live-20261025.json`,
+`cloudru-batch-sse-resume-20261025.json`, `cloudru-release-gates-20261025.json`.
+
+Операторские логи compaction probe `057a6c52-6e4b-4767-a178-ad9ac4b1c13a`
+подтвердили успешную обработку первого ответа владельца и переход в RUNNING.
+Затем проверочный скрипт отменил задачу после одного неудачного чтения API;
+`task.canceled` содержит `requested=true`. Compaction в этих логах отсутствует:
+это незавершённая проверка, а не доказанный дефект сжатия. Следующий драйвер
+повторяет только чтения при transient errors и сохраняет точную причину отказа;
+мутации автоматически не повторяет.
+
+Экспорт OTEL по-прежнему получает HTTP 403 в целевом Cloud. Локальные 15
+observability tests прошли; причина отказа collector пока не установлена.
+Изменение формата credentials или отключение telemetry без подтверждения
+не выполнялись.
+
+Автоматический cron проверен 26 октября отдельным расписанием с единственным
+ближайшим annual occurrence: due `06:41:00 UTC`. Между `06:38:39.889406` и
+`06:42:30.003407 UTC` наши клиенты не отправляли запросов к агенту. Первое чтение
+нашло один automatic Message и задачу `d3aa9d0e-f1b9-4db2-8552-81305f27f320`,
+уже перешедшую в рабочее состояние в `06:41:04.952821 UTC`; исходный материал
+ожидал guardrail review. После разрешения только точного собственного текста
+задача завершилась ожидаемым ответом. Собственное расписание удалено, GET
+подтвердил 404. Это proof автоматического admission во время одного тихого
+интервала; завершение потребовало owner review, а отсутствие всех платформенных
+HTTP probes и scale-to-zero этим не доказано. Первичный script filter пропустил
+guardrail placeholder; отдельная reconciliation сохранила исходный результат
+и установила Task по automatic Message ID. Отчёт:
+`cloudru-cron-idle-20261026.json`.
+
+На source `1eb06a5` существующий `deploy/landlock-native-vm.sh` прошёл 40 tests
+без skips с обоими required flags: ARM64 Linux 6.12.113, ABI 6. Ещё один native
+ARM64 Docker restart test прошёл. Использованы закреплённый ARM64 rootfs и
+текущий source overlay; это не проверка всего содержимого опубликованного amd64
+candidate и не замена Bubblewrap/Pod/browser matrix. Временные VM/контейнеры
+удалены; отчёт `cloudru-native-head-20261026.json`.
 
 ## 6. Когда цель считается достигнутой
 
