@@ -10,8 +10,9 @@
 
 **Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. После rollout `cloudru-s3-cancel-20261025` отмена работающей background-задачи с S3 подтверждена в Cloud. Рекурсивное discovery собственной Agent Card исправлено в пакете `cloudru-card-discovery-20261025`; после его rollout реальный исходящий Send/Get/Cancel также прошёл в Cloud. Остальная матрица и release proofs ещё не завершены (результаты ниже).
 
-Общий ordinary suite: 2404 tests, exit 0, 16 платформенных skips; PostgreSQL,
-Keycloak и MinIO работали в изолированных fixtures. В linux/amd64 candidate
+Последний ordinary suite 26 октября: 2419 tests, exit 0, 16 skips; PostgreSQL,
+Keycloak и MinIO работали в изолированных fixtures. Подробности нового пакета
+и границы пропущенных gates приведены ниже. В исходном linux/amd64 candidate
 прошли 178 config/memory/S3 tests без skips. ARM64 Landlock VM: 39 tests без
 skips после повторного запуска; первая ошибка preflight не воспроизвелась,
 причина не установлена, добавлена конечная приватная диагностика.
@@ -158,7 +159,7 @@ uv run python -m unittest tests.test_landlock_policy tests.test_landlock_network
 
 - [x] Проверить отдельную миграцию схемы и права runtime role на disposable копии; сохранить обязательный запрет production auto-migration. Подтверждено реальной PostgreSQL LOGIN-ролью 26 октября; права действующего Cloud deployment этим не проверены.
 - [x] Проверить восстановление согласованного состояния PostgreSQL + referenced S3 objects со стабильным encryption key на disposable PostgreSQL/MinIO; operator restore целевого Cloud deployment остаётся отдельным gate.
-- [ ] Описать откат образа/схемы: старый backup нельзя накатывать поверх новых записей без отдельной процедуры сохранения данных.
+- [x] Описать откат образа/схемы: старый backup нельзя накатывать поверх новых записей без отдельной процедуры сохранения данных. Процедура и ограничения — `docs/cloudru-trial.md`, раздел подготовки production и миграции.
 - [ ] Проверить недоступность/таймаут S3, заполнение локального cache, ограничения размера/числа файлов и GC без удаления referenced originals/artifacts.
 - [ ] Проверить согласованную ротацию owner password и отзыв платформенного ключа на уровне Cloud ingress.
 - [ ] Проверить экспорт traces/metrics/logs. Исправлять прежний `403 Forbidden` только после подтверждения, что он остаётся на текущей конфигурации.
@@ -505,6 +506,54 @@ workspace, включая `.git/config`, а также состояние БД �
 Targeted run: один тест, exit 0, без skips; независимое review блокеров не нашло.
 Это локальный quiesced restore proof до новых writes, не восстановление
 production backup поверх продолжившей работать базы.
+
+### Проверка общего workspace и итоговый ordinary suite 26 октября
+
+Root `e63d4255-419e-4371-a930-cfdb0e0178f0` создал собственный файл, child
+`482ea6dd-d707-4348-b56f-e18d31259804` прочитал его и добавил свою строку.
+Повторное чтение родителем, immutable artifact и owner download совпали:
+37 bytes, SHA-256
+`1c82e8c59d4cbe5200bbd3b02285827df04eec4e59c5a297aa6817fe8bd5287d`.
+Обе задачи завершены, четыре root tool calls и один child call успешны,
+настройки не менялись. Это live proof общей папки и выдачи файла, не замена
+Pod во время child execution. Receipt: `cloudru-child-workspace-live-20261026-v2.json`.
+
+Полный `uv run python -m unittest discover -s tests -v` завершился за
+658,497 секунды: 2419 tests, exit 0, 16 skips. Первый прогон выявил две гонки
+fixtures: фоновый recovery успевал обработать намеренно оставленное pending
+состояние раньше явного вызова теста. Перед такой проверкой исходный poller
+теперь останавливается и дожидается завершения; реальные recovery paths и
+assertions сохранены, новая app после restart запускает свой poller.
+Targeted regression и повторный полный suite прошли; независимое review
+не обнаружило ослабления проверок. Ruff и diff-check также прошли.
+Receipt: `cloudru-coordinated-backup-proof-20261026.json`.
+
+Пропуски относятся к Linux SGID, native sandbox/seccomp, Docker restart,
+настоящему browser/Pod fixture и одному memory-only варианту cron loop.
+Отдельные ARM64 Landlock/restart proofs выше не заменяют весь native amd64/arm64
+CI. Публичный `origin/main` повторно получен: `6434a40` по-прежнему полностью
+входит в ветку. Публикация Git-ветки для CI пока недоступна: GitHub push требует
+отсутствующей локальной аутентификации. Это не успешный native CI gate.
+
+### Открытые диагностики текущего пакета
+
+Новая bounded compaction Task `6023385d-09ff-4533-8735-c734c2d90dcf`
+(run `9e7420e9-80ef-428a-b2a1-248e7eae4742`) завершилась
+`CONTEXT_UNRECOVERABLE` в `06:53:58 UTC` 26 октября. Проверочный клиент её
+не отменял; все 32 чтения вернули HTTP 200. Временное окно 20480 было закреплено
+в Task, а owner setting сразу восстановлено до прежних 128000, revision 11.
+Офлайн расчёт не установил причину; нужны уже записанные безопасные поля
+`reason`, `attempt`, `working_tokens`, `working_capacity` перехода
+`context.compaction.failed`. Новый запуск и изменение лимитов до диагностики
+не считаются исправлением. Receipt:
+`cloudru-batch-compaction-questions-20261026-v3.json`.
+
+Операторский startup log `08:23:15–17 UTC` подтверждает успешный запуск с S3
+и Landlock, один `/v1/traces`, `OTEL_API_KEY=missing` и
+`OTEL_ENDPOINT_API_KEY=set`. Следовательно, используется платформенный
+fallback key без перекрытия основным ключом. Эти строки не подтверждают его
+права и не показывают результат экспорта после данного rollout. Формат
+авторизации collector не менялся; подтверждённой причины прежнего 403 нет.
 
 ## 6. Когда цель считается достигнутой
 
