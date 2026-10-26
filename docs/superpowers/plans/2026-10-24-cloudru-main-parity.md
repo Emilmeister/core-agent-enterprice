@@ -621,6 +621,12 @@ VM на ARM64 host, с обоими required flags и точным rootfs без
 Все 73 application Python-файла образа совпали с проверенной рабочей копией.
 Wheel/sdist также собраны. Receipt: `cloudru-batch2-candidate-proof-20261026.json`.
 
+Пакет опубликован как
+`blockchain.cr.cloud.ru/core-agent-gn:cloudru-validation-batch2-20261026`
+и `blockchain.cr.cloud.ru/core-agent-gn:latest`. Оба registry index совпали
+с указанным проверенным image digest; native manifest/config также сверены.
+Эта запись подтверждает публикацию, не фактический rollout Cloud Pod.
+
 Для единого rollout подготовлены два собственных чата: A хранит проверенную
 memory-запись и owner question, B удерживает HITL на создании другой тестовой
 memory-записи. Python/terminal уже имеют policy allow, поэтому B не выдаётся
