@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python/uv, PostgreSQL, S3, Landlock/seccomp, официальный A2A SDK, React/TypeScript, существующие unittest и native/browser проверки.
 
-**Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. После rollout `cloudru-s3-cancel-20261025` отмена работающей background-задачи с S3 подтверждена в Cloud. Рекурсивное discovery собственной Agent Card исправлено в пакете `cloudru-card-discovery-20261025`; после его rollout реальный исходящий Send/Get/Cancel также прошёл в Cloud. 26 октября после следующего rollout подтверждены owner/HITL waits, сохранность памяти и повторная доставка файла из того же peer context. Две операции сжатия контекста прошли, но проверка сохранения задания после повторного сжатия не прошла; экспорт telemetry продолжает получать 403. Остальная матрица и release proofs ещё не завершены (результаты ниже).
+**Статус:** базовый пакет реализован 24 октября 2026; последующие Cloud-прогоны подтвердили отмену background-задачи с S3, исходящий Send/Get/Cancel, owner/HITL waits, сохранность памяти и повторную доставку файла из того же peer context. 26 октября пользователь подтвердил rollout `cloudru-validation-batch3-20261026` через `latest`; health endpoints вернули HTTP 200, owner Agent Card — protocol version `1.0`. Digest работающего образа через публичный API независимо не проверен. Текущая Qwen-задача завершилась без повторного вопроса и сохранила актуальные данные; JSON-only и точный release literal не прошли. Native `context.compacted` events и положительное доказательство OTLP-доставки после прежнего 403 ожидаются от оператора. Остальная матрица и release proofs ещё не завершены (результаты ниже).
 
-Последний завершённый ordinary suite опубликованного пакета 26 октября: 2424 tests, exit 0, 16 skips; PostgreSQL,
+Последний завершённый ordinary suite опубликованного пакета 26 октября: 2442 tests, exit 0, 16 skips; PostgreSQL,
 Keycloak и MinIO работали в изолированных fixtures. Подробности нового пакета
 и границы пропущенных gates приведены ниже. В исходном linux/amd64 candidate
 прошли 178 config/memory/S3 tests без skips. ARM64 Landlock VM: 39 tests без
@@ -853,11 +853,56 @@ Receipts: `cloudru-batch3-image-build-20261026.json`,
 `cloudru-batch3-image-smoke-20261026.json` и
 `cloudru-batch3-image-published-20261026.json` в ignored `.enterprise-work/`.
 
-Rollout этого candidate в Cloud не подтверждён. Native/browser и target Cloud
-gates, успешный экспорт с настоящим injected
-telemetry key и Cloud Qwen replay остаются отдельными обязательствами.
+Rollout этого candidate в Cloud подтверждён пользователем; digest работающего
+образа через публичный API независимо не проверен. Native/browser и target Cloud
+gates, успешный экспорт с настоящим injected telemetry key и native compaction
+evidence остаются отдельными обязательствами. Текущий Cloud Qwen replay описан ниже.
 Локальный DeepSeek replay выше не доказывает Cloud behavior или strict JSON-only
 ответ. Стабильность kernel snapshots через upgrade также остаётся открытым gap.
+
+### Cloud Qwen replay после rollout batch3
+
+Публичные `/health/live`, `/health/ready` и owner Agent Card вернули HTTP 200;
+Card объявляет A2A protocol version `1.0`. Пользователь подтвердил rollout
+`latest`, но публичный API не позволяет независимо сверить deployed image digest.
+
+Задача `dd8d992c-793f-402a-bd86-fb8769128936` выполнялась 26 октября
+`17:57:24–18:01:39 UTC` на `Qwen/Qwen3.5-397B-A17B` и достигла
+`TASK_STATE_COMPLETED`. Её snapshot использовал `context_window=20480`,
+`reasoning=off`, `compatibility=chat_template`. Подтверждены ровно два вопроса
+владельцу и оба ответа, без повторного вопроса. Исходный prompt и оба follow-up
+по 39300 bytes сохранились в owner history с точным совпадением bytes/SHA-256.
+Итог сохранил последний маршрут `ROUTE_C_CMP_8f5e065ed5af`,
+`artifact-CMP_8f5e065ed5af`, `427.50 EUR` и ожидание approval.
+
+Exact final-format checks не прошли: вместо JSON-only получены Markdown fence
+и поясняющий текст; `release` содержит `PENDING` вместо требуемого
+`PENDING; NOT RELEASED`. Reconciliation отделяет сохранённый pending-смысл
+от проваленного exact-literal check. Owner settings восстановлены:
+`context_window=128000`, structured output `auto/auto`; logout — HTTP 200.
+
+Public owner API не показывает summary events, поэтому сохранение данных и
+завершение задачи не доказывают число native compactions. Operator evidence
+для `context.compacted`/`context.compaction.failed` уже запрошено. Положительное
+доказательство OTLP-доставки после rollout также отсутствует: локального
+collector credential и публичного exporter-status API нет, health 200 не
+проверяет exporter. Native/browser gates и полная main parity остаются открыты.
+
+Receipts в ignored `.enterprise-work/`:
+`cloudru-batch-compaction-questions-20261026-v6.json` и
+`cloudru-batch-compaction-questions-20261026-v6-reconciliation.json`.
+
+Короткий контроль без давления на context выполнился на той же Qwen
+в `18:08:00–18:09:04 UTC`: Task `360f6b10-b6f6-4bd7-bb3d-b42fd38fbbcf`
+завершена за 64,5 секунды. Строгий `json.loads` всего финального текста
+подтвердил один точный JSON-объект, включая `release: "PENDING; NOT RELEASED"`,
+без fences и пояснений. Выполнен один `core_response_begin`, два model turns;
+settings не менялись, root admission не повторялся, logout — HTTP 200.
+Receipt: `cloudru-short-json-control-20261026.json`.
+Это исключает обязательное добавление prose самим `core_response_begin`,
+но один короткий контроль не отделяет влияние compaction от сложности
+длинного контекста или поведения модели. Причина нарушения формата в v6
+не установлена; его exact checks не объявляются пройденными.
 
 ## 6. Когда цель считается достигнутой
 

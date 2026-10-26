@@ -380,6 +380,14 @@ scope у платформенных peers, реальные workspace пути �
 
 ## Подтверждённые результаты 26 октября 2026
 
+Пользователь подтвердил rollout `cloudru-validation-batch3-20261026` через
+`latest`. После него `/health/live` и `/health/ready` вернули HTTP 200, owner
+Agent Card — HTTP 200 и protocol version `1.0`. Точный digest работающего образа
+через публичный API независимо не проверен. Live Qwen replay завершился без
+повторного вопроса и сохранил актуальные данные, но exact final-format checks
+не прошли; native compaction и успешная OTLP-доставка ещё требуют operator
+evidence. Подробности текущего replay приведены в конце документа.
+
 После сообщённого оператором rollout пакета
 `cloudru-validation-batch2-20261026` проверены прежний owner cookie без нового
 login, неизменность settings, точные owner-question и memory-create HITL waits,
@@ -392,16 +400,16 @@ login, неизменность settings, точные owner-question и memory-
 Их результаты и файл после обновления сохранились, но эти сценарии не доказывают
 ожидание через rollout или восстановление после прерывания активной команды.
 
-Проверка длинного контекста остаётся незавершённой. В старом snapshot summary
+До batch3 проверка длинного контекста не завершилась. В старом snapshot summary
 дважды исчерпал output limit без текста (`no_text`, `finish_reason=length`,
 `response_format=json_schema`); это не доказанный timeout или расход лимита
 именно на reasoning. В отдельном snapshot `reasoning=off` /
 `compatibility=chat_template` подтверждены два успешных `context.compacted`,
 но затем агент повторил уже отвеченный вопрос и не выдал итоговый ответ.
-Генерация summary доказана, сохранение задания после повторного сжатия — нет.
+Тот прогон доказал генерацию summary, но не сохранение задания после повторного сжатия.
 Общие owner settings после подготовки snapshot восстановлены.
 
-Telemetry после rollout получает 403; startup-логи подтверждают
+До batch3 telemetry после rollout получала 403; startup-логи подтверждали
 `OTEL_ENDPOINT_API_KEY=set` в Pod. Отдельный GET к этому collector с заведомо
 неверным диагностическим ключом установил: `Authorization: Bearer` даёт 403
 `Invalid authorization header format`, а `Authorization: Api-Key` и
@@ -410,7 +418,7 @@ Telemetry после rollout получает 403; startup-логи подтве
 `OTEL_ENDPOINT_API_KEY` требуется формат `Authorization: Api-Key`.
 Выбор Api-Key для этого alias исправлен и проверен локально; исправление вошло
 в опубликованный candidate `cloudru-validation-batch3-20261026`.
-Rollout этого пакета в Cloud пока не подтверждён.
+Пользователь подтвердил rollout этого пакета в Cloud; новых exporter logs пока нет.
 Настоящий ключ не использовался: его права и успешную доставку spans после
 исправления ещё предстоит подтвердить. Доступность значения ключа в UI
 не проверялась.
@@ -492,7 +500,7 @@ seccomp и другие ограничения могут вернуть оди�
 Полный финальный локальный replay также прошёл: два реальных summary подряд
 сохранили оба ответа, следующий model call выдал актуальные значения без нового
 вопроса. Это три HTTP200 вызова с явными output caps; итог содержит JSON и
-поясняющий текст. Проверка Cloud.ru Qwen на новом образе ещё не выполнена.
+поясняющий текст. Результат последующего Cloud.ru Qwen replay приведён ниже.
 
 ### Опубликованный candidate и полная регрессия
 
@@ -514,9 +522,10 @@ Registry-проверка подтвердила этот tag и `latest` с о�
 Image smoke завершился с exit 0: проверены HTTP output caps обоих provider
 formats, framing текущей summary и отказ от полностью пустой summary.
 Checksum шести изменённых implementation-файлов совпал с рабочей копией.
-Rollout этого candidate в Cloud не подтверждён. Этот smoke и локальный
-DeepSeek replay не закрывают native/browser gates, Cloud Qwen replay или
-экспорт telemetry с настоящим injected key.
+Rollout этого candidate в Cloud подтверждён пользователем; digest работающего
+образа через публичный API независимо не проверен. Этот smoke и локальный
+DeepSeek replay не закрывают native/browser gates или экспорт telemetry
+с настоящим injected key. Отдельный Cloud Qwen replay описан ниже.
 
 Безопасные receipts в ignored `.enterprise-work/`:
 `cloudru-batch3-full-local-20261026.json`,
@@ -524,3 +533,43 @@ DeepSeek replay не закрывают native/browser gates, Cloud Qwen replay 
 `cloudru-batch3-image-build-20261026.json`,
 `cloudru-batch3-image-smoke-20261026.json` и
 `cloudru-batch3-image-published-20261026.json`.
+
+### Cloud Qwen replay после rollout batch3
+
+26 октября в `17:57:24–18:01:39 UTC` задача
+`dd8d992c-793f-402a-bd86-fb8769128936` на `Qwen/Qwen3.5-397B-A17B`
+достигла `TASK_STATE_COMPLETED`. Её snapshot использовал `context_window=20480`,
+`reasoning=off`, `compatibility=chat_template`. Агент задал ровно два вопроса
+владельцу, оба ответа подтверждены, повторного вопроса не было. Owner history
+сохранила исходный prompt и оба follow-up по 39300 bytes с точным совпадением
+bytes/SHA-256. В финальном JSON-блоке сохранились актуальные
+`ROUTE_C_CMP_8f5e065ed5af`, `artifact-CMP_8f5e065ed5af`, `427.50 EUR`
+и ожидание approval.
+
+Две проверки формата не прошли: ответ содержит Markdown fence и поясняющий
+текст вместо JSON-only; поле `release` равно `PENDING`, а требовалось точное
+`PENDING; NOT RELEASED`. Reconciliation подтверждает сохранение pending-смысла,
+но не заменяет провал exact-literal check. Owner settings восстановлены
+(`context_window=128000`, structured output `auto/auto`); logout вернул HTTP 200.
+
+Публичный API не раскрывает события `context.compacted`, поэтому этот результат
+доказывает сохранение данных и завершение задачи, но не число native compactions.
+Безопасные operator logs уже запрошены. Положительное доказательство OTLP-доставки
+после rollout также ожидается; HTTP health 200 его не заменяет. Native/browser
+gates и остальная матрица main parity не объявляются завершёнными.
+
+Receipts в ignored `.enterprise-work/`:
+`cloudru-batch-compaction-questions-20261026-v6.json` и
+`cloudru-batch-compaction-questions-20261026-v6-reconciliation.json`.
+
+Короткий контроль без давления на context выполнился на той же Qwen
+в `18:08:00–18:09:04 UTC`: Task `360f6b10-b6f6-4bd7-bb3d-b42fd38fbbcf`
+завершена за 64,5 секунды. Строгий `json.loads` всего финального текста
+подтвердил один точный JSON-объект, включая `release: "PENDING; NOT RELEASED"`,
+без fences и пояснений. Выполнен один `core_response_begin`, два model turns;
+settings не менялись, root admission не повторялся, logout — HTTP 200.
+Receipt: `cloudru-short-json-control-20261026.json`.
+Это исключает обязательное добавление prose самим `core_response_begin`,
+но один короткий контроль не отделяет влияние compaction от сложности
+длинного контекста или поведения модели. Причина нарушения формата в v6
+не установлена; его exact checks не объявляются пройденными.
