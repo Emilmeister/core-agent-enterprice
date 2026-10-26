@@ -82,7 +82,10 @@ class OtlpExporter:
         log_endpoint=None,
         service_name="core-agent",
         api_key=None,
+        api_key_scheme="Bearer",
     ):
+        if api_key_scheme not in ("Bearer", "Api-Key"):
+            raise CoreError("CONFIG_INVALID", "Invalid OTLP API key authorization scheme")
         for value, setting in (
             (endpoint, "OTEL_ENDPOINT"),
             (trace_endpoint, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
@@ -115,7 +118,7 @@ class OtlpExporter:
         # traces and answers 403 on logs — so metrics and logs travel exclusively
         # to an endpoint the operator named on purpose.
         trace_endpoint = trace_endpoint or (f"{base}/v1/traces" if base else None)
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        headers = {"Authorization": f"{api_key_scheme} {api_key}"} if api_key else None
         # The SDK reports an export failure by status code alone; without the
         # resolved address a 403 on one signal cannot be told from a wrong URL.
         self.configuration = {
@@ -353,6 +356,7 @@ class Telemetry:
         service_name="core-agent",
         content_enabled=False,
         api_key=None,
+        api_key_scheme="Bearer",
     ):
         return cls(
             OtlpExporter(
@@ -362,6 +366,7 @@ class Telemetry:
                 log_endpoint=log_endpoint,
                 service_name=service_name,
                 api_key=api_key,
+                api_key_scheme=api_key_scheme,
             ),
             content_enabled=content_enabled,
         )
@@ -382,13 +387,17 @@ class Telemetry:
             content_enabled = os.getenv(
                 "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "false"
             ).lower() in {"1", "true", "yes"}
+        api_key = os.getenv("OTEL_API_KEY")
         return cls.otlp(
             **endpoints,
             service_name=os.getenv("OTEL_PROJECT_NAME")
             or os.getenv("OTEL_SERVICE_NAME")
             or service_name,
             content_enabled=content_enabled,
-            api_key=os.getenv("OTEL_API_KEY") or os.getenv("OTEL_ENDPOINT_API_KEY"),
+            api_key=api_key or os.getenv("OTEL_ENDPOINT_API_KEY"),
+            # Cloud.ru injects a gateway API key; ordinary OTLP/Phoenix keys
+            # retain their Bearer scheme and explicit-key precedence.
+            api_key_scheme="Bearer" if api_key else "Api-Key",
         )
 
     def extract(self, carrier):

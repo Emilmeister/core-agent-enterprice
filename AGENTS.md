@@ -1373,6 +1373,7 @@ run получает отдельные MCP session и negotiated version; пе�
   экспортируются. Operator boundary повторно проверяет finite typed payload.
 - `THINKING_LEVEL` optional и маппится в native OpenAI-compatible/Anthropic request; пустое значение сохраняет provider default и никогда не управляется через RunRequest/prompt.
 - Provider-visible reasoning остаётся operator-only content: stdout требует `CORE_AGENT_LOG_CONTENT=true`, Phoenix — `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`; hidden/opaque thinking не экспортируется.
+- OTEL headers общие для всех настроенных signals: `OTEL_API_KEY` использует Bearer и имеет приоритет; platform `OTEL_ENDPOINT_API_KEY` использует Api-Key.
 - Incoming A2A call не создаёт отдельный transport/submission trace: agent processing сразу начинается `core_agent.task.execute`, продолжая валидный incoming W3C parent или становясь local root.
 - Child-agent span продолжает parent trace; независимая background/durable
   работа использует новый trace со Span Link. Trace context не является auth.
