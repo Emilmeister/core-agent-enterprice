@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
@@ -1058,7 +1059,9 @@ class PostgresDatabase:
         except (PostgresError, TypeError, ValueError):
             # Pool workers log parse errors, which can contain credential bytes.
             raise CoreError("CONFIG_INVALID", "DATABASE_URL must contain valid PostgreSQL connection settings") from None
-        if min_size < 0 or max_size < 1 or min_size > max_size or timeout <= 0:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise CoreError("CONFIG_INVALID", "DATABASE_CONNECT_TIMEOUT_SECONDS must be finite and positive")
+        if min_size < 0 or max_size < 1 or min_size > max_size:
             raise CoreError("CONFIG_INVALID", "invalid database pool configuration")
         self._closed = False
         self.pool = ConnectionPool(
@@ -1087,14 +1090,14 @@ class PostgresDatabase:
     def from_environment(cls, url=None):
         def integer(name, default):
             try:
-                return int(os.getenv(name, default))
+                return int(os.getenv(name, "").strip() or default)
             except ValueError:
                 raise CoreError(
                     "CONFIG_INVALID", f"{name} must be an integer"
                 ) from None
 
         try:
-            timeout = float(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "10"))
+            timeout = float(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "").strip() or "10")
         except ValueError:
             raise CoreError(
                 "CONFIG_INVALID", "DATABASE_CONNECT_TIMEOUT_SECONDS must be numeric"
