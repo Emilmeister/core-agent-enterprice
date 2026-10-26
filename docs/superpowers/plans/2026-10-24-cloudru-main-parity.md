@@ -157,7 +157,7 @@ uv run python -m unittest tests.test_landlock_policy tests.test_landlock_network
 ### Этап 5. Эксплуатация и данные
 
 - [x] Проверить отдельную миграцию схемы и права runtime role на disposable копии; сохранить обязательный запрет production auto-migration. Подтверждено реальной PostgreSQL LOGIN-ролью 26 октября; права действующего Cloud deployment этим не проверены.
-- [ ] Проверить восстановление согласованного состояния PostgreSQL + referenced S3 objects со стабильным encryption key.
+- [x] Проверить восстановление согласованного состояния PostgreSQL + referenced S3 objects со стабильным encryption key на disposable PostgreSQL/MinIO; operator restore целевого Cloud deployment остаётся отдельным gate.
 - [ ] Описать откат образа/схемы: старый backup нельзя накатывать поверх новых записей без отдельной процедуры сохранения данных.
 - [ ] Проверить недоступность/таймаут S3, заполнение локального cache, ограничения размера/числа файлов и GC без удаления referenced originals/artifacts.
 - [ ] Проверить согласованную ротацию owner password и отзыв платформенного ключа на уровне Cloud ingress.
@@ -491,6 +491,20 @@ ARM64 Docker restart test прошёл. Использованы закрепл�
 текущий source overlay; это не проверка всего содержимого опубликованного amd64
 candidate и не замена Bubblewrap/Pod/browser matrix. Временные VM/контейнеры
 удалены; отчёт `cloudru-native-head-20261026.json`.
+
+В обычный suite добавлена одна regression
+`CloudStorageRuntimeTests.test_quiesced_backup_restores_referenced_s3_generations_and_encrypted_peer`.
+Она останавливает собственных writers, сохраняет PostgreSQL schema через
+настоящий `pg_dump` и копирует только referenced S3 generations собственного
+tenant. Затем удаляет исходные objects/schema/local cache, восстанавливает БД
+через `pg_restore` и подтверждает ошибку `NOT_FOUND` до возврата S3 objects.
+После возврата objects сверяет точные bytes опубликованного файла и двух файлов
+workspace, включая `.git/config`, а также состояние БД и encrypted peer.
+Расшифрованный SQL dump не содержит key/plaintext credential; старый key работает,
+другой key даёт `REMOTE_AGENT_CREDENTIAL_UNAVAILABLE`. Новых model calls нет.
+Targeted run: один тест, exit 0, без skips; независимое review блокеров не нашло.
+Это локальный quiesced restore proof до новых writes, не восстановление
+production backup поверх продолжившей работать базы.
 
 ## 6. Когда цель считается достигнутой
 

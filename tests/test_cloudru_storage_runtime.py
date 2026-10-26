@@ -2,6 +2,8 @@
 import asyncio
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -13,7 +15,7 @@ from unittest.mock import patch
 import httpx
 import psycopg
 from cryptography.fernet import Fernet
-from psycopg.conninfo import make_conninfo
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.sql import Identifier, SQL
 from psycopg.types.json import Jsonb
 
@@ -22,13 +24,20 @@ from core_agent.errors import CoreError
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
 from core_agent.owner_api import policy_catalog
 from core_agent.postgres_workspace import PostgresWorkspaceDurability
+from core_agent.remote_registry import PostgresRemoteRegistry
 from core_agent.s3_ledger import PostgresS3BlobStore
+from core_agent.s3_storage import S3BlobStore
 from core_agent.workspace import WorkspaceBinding
 from tests.app_support import UnsandboxedTestLauncher, create_app
 
 _SETTINGS = ("TEST_DATABASE_URL", "TEST_S3_ENDPOINT", "TEST_S3_BUCKET",
              "TEST_S3_ACCESS_KEY_ID", "TEST_S3_SECRET_ACCESS_KEY")
 _CONFIG = {name: os.getenv(name) for name in _SETTINGS}
+_POSTGRES_CONTAINER = os.getenv("TEST_POSTGRES_CONTAINER")
+_DOCKER = shutil.which("docker")
+_DOCKER_ENV = {name: os.environ[name] for name in (
+    "PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
+) if name in os.environ}
 _ORIGIN = "https://agent.example.test"
 _PASSWORD = "local-storage-owner-password"
 
@@ -68,7 +77,7 @@ class CloudStorageRuntimeFixture(unittest.IsolatedAsyncioTestCase):
 
     def drop_schema(self):
         with psycopg.connect(_CONFIG["TEST_DATABASE_URL"], autocommit=True) as connection:
-            connection.execute(SQL("DROP SCHEMA {} CASCADE").format(Identifier(self.schema)))
+            connection.execute(SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(Identifier(self.schema)))
 
     async def restart(self, responses):
         if self.apps:
@@ -106,6 +115,111 @@ class CloudStorageRuntimeFixture(unittest.IsolatedAsyncioTestCase):
 
 
 class CloudStorageRuntimeTests(CloudStorageRuntimeFixture):
+    @unittest.skipUnless(_POSTGRES_CONTAINER, "TEST_POSTGRES_CONTAINER is required for coordinated backup proof")
+    async def test_quiesced_backup_restores_referenced_s3_generations_and_encrypted_peer(self):
+        key = Fernet.generate_key()
+        os.environ["PUSH_NOTIFICATION_ENCRYPTION_KEY"] = key.decode()
+        transport = S3BlobStore(endpoint_url=_CONFIG["TEST_S3_ENDPOINT"], bucket=_CONFIG["TEST_S3_BUCKET"],
+            region="us-east-1", access_key_id=_CONFIG["TEST_S3_ACCESS_KEY_ID"],
+            secret_access_key=_CONFIG["TEST_S3_SECRET_ACCESS_KEY"], tenant_id=self.tenant)
+        self.addCleanup(transport.close)
+
+        def cleanup_objects():
+            for app in self.apps:
+                app.state.close()
+            for page in transport.client.get_paginator("list_objects_v2").paginate(
+                    Bucket=transport.bucket, Prefix=transport.prefix + "/"):
+                for item in page.get("Contents", []):
+                    transport.client.delete_object(Bucket=transport.bucket, Key=item["Key"])
+            remaining = transport.client.list_objects_v2(Bucket=transport.bucket, Prefix=transport.prefix + "/")
+            self.assertEqual(remaining.get("Contents", []), [])
+
+        self.addCleanup(cleanup_objects)
+        content = "Согласованный snapshot\n".encode()
+        await self.restart([
+            self.terminal("from pathlib import Path; Path('.git').mkdir(); "
+                          "Path('.git/config').write_bytes(b'hidden project'); "
+                          f"Path('report.txt').write_bytes({content!r})"),
+            ModelResponse(tool_requests=(ToolRequest("publish", "core_response_files", {"paths": ["report.txt"]}),)),
+            ModelResponse(message="Published"),
+        ])
+        task = await self.submit("backup")
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED", task)
+        record = self.agent.workflow_store.lookup_task(task["id"])
+        reference = record.snapshot["published_artifacts"][0]["parts"][0]["ref"]
+        download = f"/api/chats/backup/tasks/{task['id']}/files/{reference['file_id']}"
+        self.assertEqual((await self.http.get(download)).content, content)
+        peer_secret = "backup-peer-secret-canary"
+        peer = self.agent.remote_registry.create(self.tenant,
+            {"name": "backup-peer", "url": "https://peer.example/a2a", "description": "Local restore proof",
+             "enabled": True, "header_name": "X-Api-Key", "header_value": peer_secret}, actor_id="local-test")
+        await self.http.aclose()
+        self.app.state.close()  # No application writers remain during either snapshot.
+        tables = ("core_runs", "core_a2a_tasks", "core_artifacts", "core_workspace_manifests",
+                  "core_s3_blobs", "core_remote_agents", "core_remote_agent_revisions")
+        with psycopg.connect(self.dsn, row_factory=psycopg.rows.dict_row) as connection:
+            before = {table: connection.execute(SQL("SELECT * FROM {}").format(Identifier(table))).fetchall()
+                      for table in tables}
+        referenced = {row["digest"][7:] for row in before["core_artifacts"] if row["state"] == "active"}
+        referenced.update(entry["sha256"] for row in before["core_workspace_manifests"]
+                          for entry in row["manifest"]["entries"].values() if entry["type"] == "file")
+        blobs = [row for row in before["core_s3_blobs"] if row["state"] == "live" and row["digest"] in referenced]
+        self.assertTrue(referenced)
+        self.assertEqual({row["digest"] for row in blobs}, referenced)
+        self.assertTrue(all(row["tenant_id"] == self.tenant for row in blobs))
+        keys = {transport.key(row["digest"], object_id=row["generation"]):
+                f"{transport.prefix}/backup-{self.schema}/{row['digest']}/{row['generation']}" for row in blobs}
+        parameters = conninfo_to_dict(self.dsn)
+        self.assertIsNotNone(_DOCKER, "Docker is required for TEST_POSTGRES_CONTAINER")
+        command = [_DOCKER, "exec", "-i", _POSTGRES_CONTAINER]
+        target = ["--username", parameters["user"], "--dbname", parameters["dbname"]]
+        dump = subprocess.run(command + ["pg_dump", *target, "--format=custom", "--schema", self.schema],
+                              check=True, capture_output=True, timeout=30, env=_DOCKER_ENV).stdout
+        sql_dump = subprocess.run(command + ["pg_restore", "--file=-"], input=dump,
+                                  check=True, capture_output=True, timeout=30, env=_DOCKER_ENV).stdout
+        self.assertNotIn(key, sql_dump)
+        self.assertNotIn(peer_secret.encode(), sql_dump)
+        for source, backup in keys.items():
+            transport.client.copy_object(Bucket=transport.bucket, Key=backup,
+                CopySource={"Bucket": transport.bucket, "Key": source}, MetadataDirective="COPY")
+        for source in keys:
+            transport.client.delete_object(Bucket=transport.bucket, Key=source)
+        with psycopg.connect(_CONFIG["TEST_DATABASE_URL"], autocommit=True) as connection:
+            connection.execute(SQL("DROP SCHEMA {} CASCADE").format(Identifier(self.schema)))
+        shutil.rmtree(self.temp.name)
+        Path(self.temp.name).mkdir()
+        self.assertEqual(list(Path(self.temp.name).iterdir()), [])
+        subprocess.run(command + ["pg_restore", *target, "--exit-on-error"], input=dump,
+                       check=True, capture_output=True, timeout=30, env=_DOCKER_ENV)
+        with psycopg.connect(self.dsn, row_factory=psycopg.rows.dict_row) as connection:
+            for table in tables:
+                restored = connection.execute(SQL("SELECT * FROM {}").format(Identifier(table))).fetchall()
+                self.assertCountEqual(restored, before[table], table)
+
+        await self.restart([])
+        missing = await self.http.get(download)
+        self.assertGreaterEqual(missing.status_code, 400, missing.text)
+        self.assertEqual(missing.json(), {"error": {"code": "NOT_FOUND"}})
+        self.assertEqual(self.agent.workflow_store.lookup_task(task["id"]), record)
+        for source, backup in keys.items():
+            transport.client.copy_object(Bucket=transport.bucket, Key=source,
+                CopySource={"Bucket": transport.bucket, "Key": backup}, MetadataDirective="COPY")
+        restored = await self.http.get(download)
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(restored.content, content)
+        for path, expected in (("report.txt", content), (".git/config", b"hidden project")):
+            response = await self.http.get("/api/chats/backup/files/content", params={"path": path})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.content, expected)
+        registry = self.agent.remote_registry
+        self.assertEqual(registry.get_revision(self.tenant, peer["id"], 1), peer)
+        self.assertEqual(registry.resolve_headers(self.tenant, peer["id"], 1), {"X-Api-Key": peer_secret})
+        with self.assertRaises(CoreError) as wrong_key:
+            PostgresRemoteRegistry(self.app.state.database, Fernet.generate_key()).resolve_headers(self.tenant, peer["id"], 1)
+        self.assertEqual(wrong_key.exception.code, "REMOTE_AGENT_CREDENTIAL_UNAVAILABLE")
+        self.assertEqual(self.agent.workflow_store.lookup_task(task["id"]), record)
+        self.assertFalse(self.model.calls)
+
     async def test_production_persists_memory_and_tasks_across_restart(self):
         os.environ.update(CORE_AGENT_ENVIRONMENT="production", DATABASE_AUTO_MIGRATE="false",
                           PUSH_NOTIFICATION_ENCRYPTION_KEY=Fernet.generate_key().decode(),
