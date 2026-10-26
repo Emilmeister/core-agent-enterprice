@@ -17,6 +17,7 @@ import json
 import re
 
 from .config import (
+    CAPABILITY_FILTER_VERSION,
     MAX_SUBAGENT_DEPTH,
     AgentConfig,
     RunRequest,
@@ -940,7 +941,15 @@ class CoreAgent:
             max_tool_calls=min(admitted.max_tool_calls, current.max_tool_calls),
         )
 
+    @staticmethod
+    def _validate_capability_filter_version(snapshot):
+        if "capability_filter_version" in snapshot:
+            version = snapshot["capability_filter_version"]
+            if type(version) is not int or version != CAPABILITY_FILTER_VERSION:
+                raise CoreError("CHECKPOINT_INVALID")
+
     def _admission_inputs(self, record, raw=None):
+        self._validate_capability_filter_version(record.snapshot)
         admission = record.snapshot.get("admission", {})
         raw = copy.deepcopy(admission.get("agent_config", raw))
         if raw is None:
@@ -2211,6 +2220,7 @@ class CoreAgent:
             "context_run_id": run_id,
             "previous_root_run_id": previous_root_run_id,
             "skill_contract_version": SKILL_CONTRACT_VERSION,
+            "capability_filter_version": CAPABILITY_FILTER_VERSION,
             "admission": {
                 "agent_config": copy.deepcopy(raw),
                 "platform_config": self._platform_snapshot(platform),
@@ -2367,6 +2377,7 @@ class CoreAgent:
             )
             snapshot = copy.deepcopy(record.snapshot)
             snapshot["initializing"] = False
+            snapshot["capability_filter_version"] = CAPABILITY_FILTER_VERSION
             snapshot.pop("mcp_cold_start_expires_at", None)
             snapshot["effective_config_digest"] = effective.digest
             snapshot["effective_platform_config"] = self._platform_snapshot(
@@ -2489,6 +2500,7 @@ class CoreAgent:
         raise error
 
     def _load_workflow_runtime(self, record, *, cancel_event=None, lease_token=None):
+        self._validate_capability_filter_version(record.snapshot)
         self._validate_remote_snapshot(record)
         self._bind_workspace(record.run_id, record.tenant_id, record.owner_id, record.context_id)
         request = RunRequest.from_dict(record.request)
@@ -2550,29 +2562,26 @@ class CoreAgent:
                 live_discovered if persisted_catalogs is None else persisted_catalogs
             )
             frozen_platform = self._admitted_platform(record.snapshot, narrow=False)
-            frozen_effective = compile_effective_config(
-                frozen_platform, admitted_agent, admitted_mcp, discovered
-            )
-            if frozen_effective.digest != record.snapshot["effective_config_digest"]:
-                if "skill_contract_version" in record.snapshot:
-                    raise CoreError("CHECKPOINT_INVALID")
-                legacy_effective = compile_effective_config(
-                    frozen_platform,
-                    admitted_agent,
-                    admitted_mcp,
-                    discovered,
-                    legacy_ungated_skills=True,
-                )
-                if (
-                    legacy_effective.digest
-                    != record.snapshot["effective_config_digest"]
-                ):
-                    raise CoreError("CHECKPOINT_INVALID")
+            # Missing markers admit only historical digest verification. Never
+            # reuse a legacy candidate as the effective execution configuration.
+            skill_versions = (False,) if "skill_contract_version" in record.snapshot else (False, True)
+            filter_versions = (False,) if "capability_filter_version" in record.snapshot else (False, True)
+            if not any(
+                compile_effective_config(
+                    frozen_platform, admitted_agent, admitted_mcp, discovered,
+                    legacy_ungated_skills=legacy_skills,
+                    legacy_feature_gates=legacy_gates,
+                ).digest == record.snapshot["effective_config_digest"]
+                for legacy_skills in skill_versions
+                for legacy_gates in filter_versions
+            ):
+                raise CoreError("CHECKPOINT_INVALID")
             effective = compile_effective_config(
                 admitted_platform, admitted_agent, admitted_mcp, discovered
             )
             snapshot = copy.deepcopy(record.snapshot)
             snapshot["skill_contract_version"] = SKILL_CONTRACT_VERSION
+            snapshot["capability_filter_version"] = CAPABILITY_FILTER_VERSION
             snapshot.pop("mcp_reconnect_started", None)
             snapshot.pop("mcp_reconnect_expires_at", None)
             snapshot["effective_config_digest"] = effective.digest
@@ -5720,6 +5729,7 @@ class CoreAgent:
             "output_contract_version": output_contract_version(parent),
             "published_artifacts": [], "public_messages": [],
             "initializing": False, "skill_contract_version": SKILL_CONTRACT_VERSION,
+            "capability_filter_version": CAPABILITY_FILTER_VERSION,
             "skill_catalog": [], "skills": [], "mcp_catalogs": {},
             "effective_config_digest": effective.digest,
             "effective_platform_config": self._platform_snapshot(platform),

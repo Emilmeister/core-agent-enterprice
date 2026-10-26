@@ -520,6 +520,9 @@ Target spec может описывать больше текущего runtime.
   AgentConfig и Task/delegation contract. Deny сильнее allow.
 - Disabled capability отсутствует в Agent Card/model catalog и повторно
   отклоняется при dispatch. Prompt или stale tool call не расширяет policy.
+- Новые workflow фиксируют `capability_filter_version`; recovery старых snapshots
+  проверяет legacy digest, затем атомарно сохраняет текущие ограничения и версию.
+  Legacy compiler служит только проверке digest, не разрешает исполнение tools.
 - `LLM_EXTRA_BODY_JSON` не задаёт каталог или выбор tools: adapter удаляет
   оттуда `tools`, `tool_choice`, legacy `functions` и `function_call` и передаёт
   только текущий runtime catalog, в том числе пустой каталог детектора.

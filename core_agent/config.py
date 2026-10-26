@@ -16,6 +16,7 @@ A2A_INTERFACES = (("HTTP+JSON", "1.0"), ("JSONRPC", "1.0"))
 
 
 MAX_SUBAGENT_DEPTH = 2
+CAPABILITY_FILTER_VERSION = 1
 RUNTIME_MODES = frozenset({"with_terminal", "without_terminal"})
 TERMINAL_MODE_TOOLS = frozenset({"core_terminal_exec", "core_task_start"})
 RETIRED_ARTIFACT_TOOLS = frozenset({"core_artifact_save", "core_artifact_load", "core_artifact_list"})
@@ -78,6 +79,8 @@ class AgentConfig:
         if not required <= set(raw):
             raise CoreError("CONFIG_INVALID")
         features = raw.get("features", {})
+        if features.get("memory", "disabled") not in ("disabled", "optional", "required"):
+            raise CoreError("CONFIG_INVALID", "CORE_AGENT_MEMORY/features.memory must be disabled, optional or required")
         if features.get("delegation") and not features.get("background_tasks"):
             raise CoreError("CONFIG_CONFLICT")
         runtime_mode = raw.get("execution", {}).get(
@@ -163,7 +166,8 @@ def _expand(patterns, choices):
 
 
 def compile_effective_config(
-    platform, agent, declared_mcp, discovered, *, legacy_ungated_skills=False
+    platform, agent, declared_mcp, discovered, *, legacy_ungated_skills=False,
+    legacy_feature_gates=False,
 ):
     raw = agent.to_dict()
     features = raw["features"]
@@ -180,7 +184,11 @@ def compile_effective_config(
     # Feature values are a mix of booleans and mode strings, and "disabled" is a
     # non-empty string: a truthiness test on the raw value would let a disabled
     # capability through every gate below.
-    gates = {name: value not in (False, "disabled") for name, value in features.items()}
+    gates = {
+        name: value not in (False, "disabled")
+        and (legacy_feature_gates or name in platform.supported_features)
+        for name, value in features.items()
+    }
     memory_mode = features.get("memory", "disabled")
 
     builtins = raw["tools"]["builtins"]
@@ -206,10 +214,14 @@ def compile_effective_config(
         "core_delegate": "delegation",
         "core_ask_owner": "human_input",
         "core_message_send": "public_messages",
+        "core_response_files": "response_files",
         "core_response_artifacts": "response_files",
         "core_agent_": "remote_agents",
         "core_memory_": "memory",
     }
+    if legacy_feature_gates:
+        # Reproduce old checkpoint digests only; execution always uses strict gates.
+        capability_for_prefix.pop("core_response_files")
     allowed = {
         tool
         for tool in allowed
