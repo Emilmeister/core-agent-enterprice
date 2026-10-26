@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import copy
 import hashlib
@@ -11,6 +12,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError, URLError
 
 from core_agent.audit import InMemoryAuditLog
 from core_agent.artifacts import InMemoryArtifactStore
@@ -3107,6 +3109,111 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsInstance(terminal.error, CoreError)
         self.assertEqual(terminal.error.code, "SIDE_EFFECT_UNKNOWN")
 
+    def test_model_failures_preserve_private_finite_transport_and_response_diagnostics(self):
+        from core_agent.model import model_failure_metadata
+
+        secret = "provider-secret-must-not-be-diagnostic"
+        class TimeoutBody(io.BytesIO):
+            def read(self, *args):
+                raise TimeoutError(secret)
+
+        for api_format in ("openai", "anthropic"):
+            empty = ({"choices": [{"message": {"content": "", "reasoning_content": secret},
+                                   "finish_reason": "length"}]} if api_format == "openai" else
+                     {"content": [{"type": "thinking", "thinking": secret}], "stop_reason": "max_tokens"})
+            cases = [
+                (HTTPError("https://model.test/" + secret, 504, secret, {"Authorization": secret},
+                           io.BytesIO(secret.encode())), "http", "HTTPError", True, 504),
+                (TimeoutError(secret), "timeout", "TimeoutError", True, None),
+                (URLError(TimeoutError(secret)), "timeout", "TimeoutError", True, None),
+                (URLError(secret), "transport", "URLError", True, None),
+                (TimeoutBody(), "timeout", "TimeoutError", True, None),
+                (io.BytesIO(secret.encode()), "invalid_json", "JSONDecodeError", False, None),
+                (io.BytesIO(json.dumps(empty).encode()), "no_public_text", "CoreError", False, None),
+            ]
+            for reply, kind, exception_type, retryable, status in cases:
+                with self.subTest(api_format=api_format, kind=kind, exception_type=exception_type):
+                    options = ({"response_format": {"type": "json_schema", "json_schema": {"schema": {}}}}
+                               if api_format == "openai" else {"output_config": {"format": {"type": "json_schema"}}})
+                    model = CompatibleHttpModel(api_format=api_format, model="test", api_key=secret, extra_body=options)
+                    patch_options = ({"side_effect": reply} if isinstance(reply, Exception) else {"return_value": reply})
+                    with patch("core_agent.model.urlopen", **patch_options) as opened, self.assertRaises(CoreError) as caught:
+                        model.generate(context="synthetic", instructions="summary", tools={})
+                    opened.assert_called_once()
+                    error = caught.exception
+                    self.assertEqual(error.code, "MODEL_UNAVAILABLE")
+                    self.assertEqual(error.retryable, retryable)
+                    self.assertEqual(error.data, {})
+                    expected = {"kind": kind, "exception_type": exception_type, "response_format": "json_schema"}
+                    if status is not None:
+                        expected["http_status"] = status
+                    if kind == "no_public_text":
+                        expected["finish_reason"] = "length" if api_format == "openai" else "max_tokens"
+                    self.assertEqual(model_failure_metadata(error), expected)
+                    self.assertNotIn(secret, json.dumps(model_failure_metadata(error)))
+
+    def test_http_error_body_is_not_read_and_close_cannot_mask_status(self):
+        from core_agent.model import model_failure_metadata
+
+        secret = "private-http-error-body-and-close-message"
+        class UnreadableBody(io.BytesIO):
+            def __init__(self, close_error):
+                super().__init__(secret.encode())
+                self.close_error, self.read_calls = close_error, 0
+
+            def read(self, *args):
+                self.read_calls += 1
+                raise TimeoutError(secret)
+
+            def close(self):
+                was_closed = self.closed
+                super().close()
+                if self.close_error and not was_closed:
+                    raise OSError(secret)
+
+        for api_format in ("openai", "anthropic"):
+            for stream in (False, True):
+                for status in (403, 504):
+                    for close_error in (False, True):
+                        with self.subTest(api_format=api_format, stream=stream, status=status, close_error=close_error):
+                            body = UnreadableBody(close_error)
+                            provider_error = HTTPError("https://model.test/" + secret, status, secret,
+                                                       {"Authorization": secret}, body)
+                            model = CompatibleHttpModel(api_format=api_format, model="test", api_key=secret, stream=stream)
+                            with patch("core_agent.model.urlopen", side_effect=provider_error) as opened, self.assertRaises(CoreError) as caught:
+                                model.generate(context="synthetic", instructions="test", tools={})
+                            opened.assert_called_once()
+                            self.assertEqual(body.read_calls, 0)
+                            self.assertTrue(body.closed)
+                            error = caught.exception
+                            self.assertIs(error.__cause__, provider_error)
+                            self.assertEqual(error.code, "MODEL_UNAVAILABLE")
+                            self.assertEqual(error.retryable, status == 504)
+                            self.assertEqual(error.data, {})
+                            self.assertEqual(str(error), f"model HTTP {status}")
+                            self.assertEqual(model_failure_metadata(error), {
+                                "kind": "http", "http_status": status, "exception_type": "HTTPError", "response_format": "none"})
+                            self.assertNotIn(secret, json.dumps(model_failure_metadata(error)))
+
+    def test_model_failure_metadata_revalidates_untrusted_private_attributes(self):
+        from core_agent.model import model_failure_metadata
+
+        error = CoreError("MODEL_UNAVAILABLE")
+        self.assertEqual(model_failure_metadata(error), {})
+        for invalid in (None, [], "secret", True):
+            error.model_failure = invalid
+            self.assertEqual(model_failure_metadata(error), {})
+        error.model_failure = {"kind": "http", "http_status": 403, "exception_type": "HTTPError",
+                               "response_format": "json_object", "finish_reason": "stop", "body": "secret"}
+        self.assertEqual(model_failure_metadata(error), {
+            "kind": "http", "http_status": 403, "exception_type": "HTTPError",
+            "response_format": "json_object", "finish_reason": "stop"})
+        for invalid in ("secret", [], {}, True, 99, 600):
+            error.model_failure = {"kind": invalid, "http_status": invalid, "exception_type": invalid,
+                                   "response_format": invalid, "finish_reason": invalid, "headers": "secret"}
+            self.assertEqual(model_failure_metadata(error), {"kind": "unknown"})
+        self.assertEqual(error.data, {})
+
     def test_provider_adapters_preserve_native_tool_call_and_result_messages(self):
         tools = {
             "core_terminal_exec": {
@@ -6104,6 +6211,66 @@ class SemanticRuntimeTests(unittest.TestCase):
                     self.assertEqual(record.snapshot['compaction_operation']['failure_reason'], failure)
                     self.assertFalse(any(item['kind'] == 'summary' for item in record.snapshot['context']['active']))
                     self.assertIn('confirmed result', script.calls[-1].context)
+
+    def test_summary_failures_log_only_private_finite_provider_diagnostics(self):
+        from core_agent.context import CompactionError
+
+        secret = "summary-provider-secret-and-private-reasoning"
+        for api_format in ("openai", "anthropic"):
+            for failure in ("http", "no_public_text"):
+                with self.subTest(api_format=api_format, failure=failure):
+                    class HttpModel(CompatibleHttpModel):
+                        def generate(inner, **call):
+                            if call["instructions"].startswith("SEMANTIC CONTEXT SUMMARY"):
+                                return super().generate(**call)
+                            return inner.script.generate(**call)
+
+                    parent_errors = []
+                    class CapturedCompactionError(CompactionError):
+                        def __init__(inner, reason):
+                            super().__init__(reason)
+                            parent_errors.append(inner)
+
+                    agent, script, _ = self.semantic_agent(lambda call: self.fail("use actual HTTP adapter"))
+                    model = HttpModel(api_format=api_format, model="test", api_key=secret)
+                    model.script = script
+                    agent.model = model
+                    requests = []
+                    def respond(request, **kwargs):
+                        requests.append(json.loads(request.data))
+                        if failure == "http":
+                            raise HTTPError("https://model.test/" + secret, 504, secret, {}, io.BytesIO(secret.encode()))
+                        payload = ({"choices": [{"message": {"content": "", "reasoning_content": secret},
+                                                 "finish_reason": "length"}]} if api_format == "openai" else
+                                   {"content": [{"type": "thinking", "thinking": secret}], "stop_reason": "max_tokens"})
+                        return io.BytesIO(json.dumps(payload).encode())
+                    with patch("core_agent.model.urlopen", side_effect=respond), \
+                            patch("core_agent.runtime.CompactionError", CapturedCompactionError), \
+                            self.assertLogs("core_agent.runtime", level="INFO") as captured:
+                        result = agent.run(run_request(), task_id="private-summary-failure")
+                    self.assertEqual(len(requests), 2)
+                    self.assertEqual(len(parent_errors), 2)
+                    self.assertTrue(all(error.data == {} and error.code == "CONTEXT_UNRECOVERABLE" for error in parent_errors))
+                    events = [json.loads(record.getMessage()) for record in captured.records]
+                    failures = [event for event in events if event.get("transition_event") == "context.compaction.failed"]
+                    self.assertEqual(len(failures), 2)
+                    for event, request in zip(failures, requests):
+                        self.assertEqual(event["reason"], "provider_unavailable")
+                        expected = {"kind": failure, "response_format": "json_schema",
+                                    "exception_type": "HTTPError" if failure == "http" else "CoreError"}
+                        if failure == "http":
+                            expected["http_status"] = 504
+                        else:
+                            expected["finish_reason"] = "length" if api_format == "openai" else "max_tokens"
+                        self.assertEqual(event["provider_failure"], expected)
+                        if api_format == "openai":
+                            self.assertTrue(request["response_format"]["json_schema"]["strict"])
+                        else:
+                            self.assertEqual(request["output_config"]["format"]["type"], "json_schema")
+                    self.assertNotIn(secret, " ".join(captured.output))
+                    self.assertNotIn(secret, json.dumps(result.to_dict()))
+                    self.assertNotIn("provider_failure", json.dumps(result.to_dict()))
+                    self.assertEqual(result.message, "verified partial")
 
     def test_recovered_summary_attempt_stops_when_new_window_cannot_fit_provider_request(self):
         class Crash(BaseException):

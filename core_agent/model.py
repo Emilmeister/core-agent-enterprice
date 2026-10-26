@@ -17,6 +17,79 @@ from .streaming import integrate_stream_chunk
 from .structured_output import normalize_structured_output_body, validate_structured_output
 
 
+_MODEL_FAILURE_VALUES = {
+    "kind": frozenset({"http", "timeout", "transport", "response_too_large", "invalid_json",
+                       "invalid_response", "no_text", "no_public_text", "unknown"}),
+    "exception_type": frozenset({"HTTPError", "TimeoutError", "URLError", "HTTPException", "OSError",
+                                 "JSONDecodeError", "UnicodeDecodeError", "KeyError", "IndexError", "TypeError", "CoreError"}),
+    "response_format": frozenset({"none", "json_schema", "json_object"}),
+    "finish_reason": frozenset({"stop", "length", "tool_calls", "function_call", "content_filter",
+                                "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"}),
+}
+
+
+def model_failure_metadata(error):
+    """Revalidate private adapter metadata at the operator logging boundary."""
+    value = getattr(error, "model_failure", None)
+    if type(value) is not dict:
+        return {}
+    result = {"kind": "unknown"}
+    for key, allowed in _MODEL_FAILURE_VALUES.items():
+        item = value.get(key)
+        if type(item) is str and item in allowed:
+            result[key] = item
+    status = value.get("http_status")
+    if type(status) is int and 100 <= status <= 599:
+        result["http_status"] = status
+    return result
+
+
+def _model_failure(error, body, response):
+    messages = {
+        "model response is too large": "response_too_large",
+        "invalid model JSON response": "invalid_json",
+        "invalid model stream frame": "invalid_response",
+        "invalid chat completion": "invalid_response",
+        "invalid Anthropic message": "invalid_response",
+        "invalid tool arguments": "invalid_response",
+        "tool arguments must be an object": "invalid_response",
+        "unknown model tool": "invalid_response",
+        "model returned no text": "no_text",
+        "model returned no public text": "no_public_text",
+    }
+    details = {"kind": messages.get(error.message, "unknown") if type(error.message) is str else "unknown",
+               "response_format": "none"}
+    cause = error.__cause__ or error
+    if isinstance(cause, URLError) and isinstance(cause.reason, TimeoutError):
+        cause = cause.reason
+    for kind in (HTTPError, TimeoutError, URLError, HTTPException, json.JSONDecodeError,
+                 UnicodeDecodeError, OSError, KeyError, IndexError, TypeError, CoreError):
+        if isinstance(cause, kind):
+            details["exception_type"] = kind.__name__
+            break
+    if isinstance(cause, HTTPError):
+        details["kind"] = "http"
+        if type(cause.code) is int and 100 <= cause.code <= 599:
+            details["http_status"] = cause.code
+    elif isinstance(cause, TimeoutError):
+        details["kind"] = "timeout"
+    elif isinstance(cause, (OSError, URLError, HTTPException)):
+        details["kind"] = "transport"
+    output_config = body.get("output_config")
+    format_options = body.get("response_format") or (output_config.get("format") if type(output_config) is dict else None)
+    if type(format_options) is dict:
+        value = format_options.get("type")
+        if type(value) is str and value in _MODEL_FAILURE_VALUES["response_format"]:
+            details["response_format"] = value
+    if type(response) is dict:
+        choices = response.get("choices")
+        finish = (choices[0].get("finish_reason") if type(choices) is list and choices and type(choices[0]) is dict
+                  else response.get("stop_reason"))
+        if type(finish) is str and finish in _MODEL_FAILURE_VALUES["finish_reason"]:
+            details["finish_reason"] = finish
+    return details
+
+
 @dataclass(frozen=True)
 class ToolRequest:
     id: str
@@ -453,11 +526,14 @@ class CompatibleHttpModel:
         try:
             return urlopen(request, timeout=self.timeout)
         except HTTPError as error:
-            detail = error.read(4096).decode(errors="replace")
+            # The status determines the failure; an error body can stall or
+            # replace it with a secondary transport error, and is not needed.
+            with contextlib.suppress(OSError, HTTPException):
+                error.close()
             retryable = error.code in {408, 409, 429} or error.code >= 500
             raise CoreError(
                 "MODEL_UNAVAILABLE",
-                f"model HTTP {error.code}: {detail}",
+                f"model HTTP {error.code}",
                 retryable=retryable,
             ) from error
         except (OSError, TimeoutError, URLError) as error:
@@ -835,16 +911,22 @@ class CompatibleHttpModel:
         body, headers, reverse = self._request(
             context, instructions, tools, messages=messages
         )
-        if self.stream:
-            body["stream"] = True
+        response = None
+        try:
+            if self.stream:
+                body["stream"] = True
+                if self.api_format == "openai":
+                    body.setdefault("stream_options", {"include_usage": True})
+                response = self._post_stream(body, headers, reverse, on_delta)
+            else:
+                response = self._post(body, headers)
             if self.api_format == "openai":
-                body.setdefault("stream_options", {"include_usage": True})
-            response = self._post_stream(body, headers, reverse, on_delta)
-        else:
-            response = self._post(body, headers)
-        if self.api_format == "openai":
-            return self._parse_openai(response, reverse)
-        return self._parse_anthropic(response, reverse)
+                return self._parse_openai(response, reverse)
+            return self._parse_anthropic(response, reverse)
+        except CoreError as error:
+            if error.code == "MODEL_UNAVAILABLE":
+                error.model_failure = _model_failure(error, body, response)
+            raise
 
 
 @dataclass(frozen=True)

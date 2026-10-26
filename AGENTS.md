@@ -1374,6 +1374,10 @@ run получает отдельные MCP session и negotiated version; пе�
 - Child-agent span продолжает parent trace; независимая background/durable
   работа использует новый trace со Span Link. Trace context не является auth.
 - Логи используют canonical tool names, correlation IDs и bounded one-line JSON.
+- Summary failure сохраняет приватную finite `provider_failure` metadata из
+  model adapter, повторно проверенную на границе runtime log. HTTP status и
+  разрешённые category/exception/format/finish значения не заменяются raw
+  exception text; публичные error data не содержат этих деталей.
 - Provider-hidden/private/opaque reasoning, credentials, secret values, auth
   headers и raw provider errors никогда не попадают в public errors, logs,
   spans или artifacts; provider-visible reasoning подчиняется explicit

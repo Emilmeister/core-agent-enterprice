@@ -1040,6 +1040,14 @@ implemented. Automated proofs MUST входить в обычные applicable g
 
 ## Строгий формат суммаризации
 
+- CTX-AC-PROVIDER-DIAGNOSTICS: настоящий summary adapter различает в приватном
+  `context.compaction.failed` HTTP отказ, timeout, transport failure, неверный
+  ответ и отсутствие public text; сохраняет только проверенный status и конечные
+  enum metadata. Проверяются OpenAI-compatible и Anthropic ответы, отказ при
+  чтении body, reasoning-only response и поддельная metadata custom adapter.
+  Raw provider content/credentials отсутствуют в событиях и публичной ошибке;
+  прежние коды, число попыток, strict schema и terminal semantics сохраняются.
+
 - STRUCTURED-REASONING: owner UI/API сохраняет nullable политику `auto/off/inherit`
   и finite compatibility через CAS; проверены default/reset, старые revisions,
   malformed input, tenant/owner isolation и недоступный каталог моделей.

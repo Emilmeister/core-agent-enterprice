@@ -26,6 +26,16 @@ Runtime MUST писать в stdout контейнера однострочны�
 
 Без content mode model record показывает только безопасное состояние решения (`continue_reasoning`, `request_tools`, `final_answer`), наличие reasoning, finish reason и token usage. При `CORE_AGENT_LOG_CONTENT=true` provider-returned visible reasoning/summary MAY записываться отдельным полем `reasoning` после redaction и truncation. Provider-hidden chain-of-thought, encrypted/redacted thinking, signatures и opaque replay data не логируются никогда.
 
+При отказе HTTP model adapter во время суммаризации переход
+`context.compaction.failed` MUST дополнять
+общий reason безопасным `provider_failure`: конечная категория HTTP/timeout/
+transport/response validation либо `unknown`, проверенный числовой HTTP status
+при наличии, allowlisted exception type, response format и finish reason.
+Поля повторно проверяются перед записью; произвольные строки и неизвестные
+ключи исключаются. Текст исключения, provider body, URL и headers не входят в
+эту диагностику. Она остаётся приватной операторской metadata: публичные
+error code/data, лимиты попыток и правила проверки summary не меняются.
+
 ## Диагностика конфигурации при старте
 
 Runtime MUST записать при старте одну структурированную запись `startup.configuration`, описывающую фактически собранную конфигурацию. Она отвечает на вопрос «почему capability отсутствует» без чтения кода и без повторного развёртывания.

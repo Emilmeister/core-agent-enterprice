@@ -46,7 +46,7 @@ from .skills import (
 from .kernel import KernelCompiler
 from .python_exec import PythonContinuationStopped, execute_python
 from .mcp import mcp_tool_index
-from .model import CompatibleHttpModel, ModelResponse
+from .model import CompatibleHttpModel, ModelResponse, model_failure_metadata
 from .remote_agents import build_forwarded_headers
 from . import remote_agents as remote_transport
 from .remote_operations import RemoteA2AExecutor
@@ -2904,10 +2904,12 @@ class CoreAgent:
                 reason = error.reason if isinstance(error, CompactionError) else "unclassified"
                 snapshot["compaction_operation"] = {**operation, "outcome": "failed",
                     "finished_turn": snapshot["turns"], "failure_reason": reason}
+                provider_failure = model_failure_metadata(error.__cause__)
                 record = self._record_transition(record, state="RUNNING", snapshot=snapshot,
                     event_kind="context.compaction.failed", event_data={"attempt": operation["attempts"],
                         "reason": reason, "working_tokens": context.working_tokens,
-                        "working_capacity": compactor.budget.working_capacity}, lease_token=lease_token)
+                        "working_capacity": compactor.budget.working_capacity,
+                        **({"provider_failure": provider_failure} if provider_failure else {})}, lease_token=lease_token)
                 if self.compactor is not None or operation["attempts"] == attempts_before:
                     break
         if pressure:
