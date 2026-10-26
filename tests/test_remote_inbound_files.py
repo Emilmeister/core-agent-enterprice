@@ -153,13 +153,25 @@ class RemoteInboundContract:
 
     def test_v3_complete_marked_working_artifact_enters_quarantine_without_completion(self):
         self.responses.append(self.marked_snapshot([("report", "early-content-canary")]))
-        task = self.start(version=3, attachment_limit_bytes=10000)
+        task = self.start(version=3, attachment_limit_bytes=10000, timeout_seconds=86400, poll_interval_seconds=300)
         self.assertEqual(task.state, "working", getattr(task.error, "code", None))
         self.assertEqual(len(task.result.get("file_batch_ids", [])), 1)
         batch = self.store.get(task.result["file_batch_ids"][0], self.tenant)
         self.assertEqual(batch["state"], "accepted_quarantine")
         self.assertNotIn("early-content-canary", json.dumps(task.result))
         self.assertEqual(batch["manifest"]["artifacts"][0]["artifact_id"], "report")
+        if hasattr(self, "database"):
+            with self.database.pool.connection() as connection:
+                row = connection.execute("SELECT checkpoint,updated_at FROM core_background_tasks WHERE id=%s",
+                                         (task.id,)).fetchone()
+            checkpoint = row["checkpoint"]
+            delay = checkpoint["next_poll_at"] - row["updated_at"]
+        else:
+            checkpoint = self.scheduler._remote[task.id]["checkpoint"]
+            delay = checkpoint["next_poll_at"] - self.now
+        # Quarantine publication can finish after the scheduled poll is due.
+        self.assertGreater(checkpoint["next_poll_at"], checkpoint["deadline"] - 86400)
+        self.assertLessEqual(delay, 10)
 
     def test_v3_marked_snapshots_append_once_keep_stable_paths_and_survive_failure(self):
         first = self.marked_snapshot([("first", "first-content")])
@@ -707,6 +719,36 @@ class MemoryRemoteInboundTests(RemoteInboundContract, unittest.TestCase):
         self.scheduler = TaskScheduler(clock=lambda: self.now)
         self.addCleanup(self.scheduler.close)
         self.setup_remote()
+
+    def test_marked_progress_uses_adaptive_polling_observation_and_deadline(self):
+        for age, interval, timeout, observed, delay in (
+            (0, 300, 86400, False, 10), (175, 300, 86400, False, 5),
+            (180, 300, 86400, False, 30), (779, 300, 86400, False, 1),
+            (780, 300, 86400, False, 300), (800, 300, 86400, True, 15),
+            (800, 5, 86400, False, 5), (785, 300, 790, False, 5),
+        ):
+            with self.subTest(age=age, interval=interval, observed=observed, timeout=timeout):
+                started, task_id = self.now, uuid.uuid4().hex
+                def response():
+                    self.now = started + age
+                    if observed:
+                        self.scheduler.observe_remote(task_id, owner_id=self.source.run_id,
+                                                      tenant_id=self.tenant, visible=True)
+                    return self.marked_snapshot([("report", "early-content-canary")])
+                self.responses.append(response)
+                self.scheduler.start_remote(self.contract(version=3, attachment_limit_bytes=10000,
+                    timeout_seconds=timeout, poll_interval_seconds=interval),
+                    owner_id=self.source.run_id, tenant_id=self.tenant, task_id=task_id)
+                self.settle()
+                task = self.scheduler.get(task_id, owner_id=self.source.run_id, tenant_id=self.tenant)
+                self.assertEqual(task.state, "working", getattr(task.error, "code", None))
+                checkpoint = self.scheduler._remote[task_id]["checkpoint"]
+                self.assertEqual(checkpoint["next_poll_at"], self.now + delay)
+                self.assertEqual(checkpoint["deadline"], started + timeout)
+                self.assertEqual(len(task.result["file_batch_ids"]), 1)
+                batch = self.store.get(task.result["file_batch_ids"][0], self.tenant)
+                self.assertEqual(batch["state"], "accepted_quarantine")
+        self.assertEqual([call[0] for call in self.calls], ["Send"] * 8)
 
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "TEST_DATABASE_URL is required")

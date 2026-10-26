@@ -370,7 +370,7 @@ class RemoteA2AExecutor:
             elif version == 3 and event.owner_wait:
                 progress["owner_wait"] = True
             if version == 3 and checkpoint["version"] == 3 and event.artifacts:
-                checkpoint["next_poll_at"] = min(current["now"] + current["contract"]["poll_interval_seconds"], checkpoint["deadline"])
+                checkpoint["next_poll_at"] = self._next_poll_at(current, checkpoint)
                 try:
                     self._accept_files(claim, current, checkpoint, event, result, headers, observation, progress=progress)
                 except CoreError as error:
@@ -378,8 +378,8 @@ class RemoteA2AExecutor:
             else:
                 self._poll_later(claim, current, checkpoint, progress=progress, conversation_observation=observation)
 
-    def _poll_later(self, claim, current, checkpoint=None, progress=None, conversation_observation=None):
-        checkpoint = current["checkpoint"] if checkpoint is None else checkpoint
+    @staticmethod
+    def _next_poll_at(current, checkpoint):
         contract, now = current["contract"], current["now"]
         started_at = checkpoint["deadline"] - contract["timeout_seconds"]
         next_poll = min(now + contract["poll_interval_seconds"], checkpoint["deadline"])
@@ -390,5 +390,9 @@ class RemoteA2AExecutor:
                 break
         if (current.get("observed_until") or 0) > now:
             next_poll = min(next_poll, now + 15)
-        self._commit(claim, current, {**checkpoint, "next_poll_at": next_poll}, progress=progress,
+        return next_poll
+
+    def _poll_later(self, claim, current, checkpoint=None, progress=None, conversation_observation=None):
+        checkpoint = current["checkpoint"] if checkpoint is None else checkpoint
+        self._commit(claim, current, {**checkpoint, "next_poll_at": self._next_poll_at(current, checkpoint)}, progress=progress,
                      conversation_observation=conversation_observation)
