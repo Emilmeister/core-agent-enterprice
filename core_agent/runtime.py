@@ -3713,7 +3713,7 @@ class CoreAgent:
             event_kind="python.completed_result.recovered", lease_token=lease_token)
 
     def _note_next_steps(self, snapshot, name, succeeded):
-        """Count tool calls since the last successful core_next_steps and mark when to force it."""
+        """Count tool calls since the last successful core_next_steps and mark when the next turn must call it."""
         if self.next_steps_every is None:
             return
         if name == NEXT_STEPS_TOOL:

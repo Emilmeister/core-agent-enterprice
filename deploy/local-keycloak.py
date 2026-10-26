@@ -31,9 +31,8 @@ def main():
     if not issuer.path.startswith(prefix) or not realm or not all(c.isalnum() or c in "-_" for c in realm):
         raise LocalConfigError("Invalid local setting: KEYCLOAK_ISSUER_URL")
     origin = urlsplit(os.environ["AGENT_URL"])
-    # Allow loopback and the local peer-alias hostnames (agent-a / agent-b) so
-    # two on-host instances can address each other by compose-network alias.
-    # Keycloak web origins below only use the port, staying on localhost for UI.
+    # AGENT_URL may be loopback or a local peer alias (agent-a / agent-b).
+    # Keycloak web origins below use only its port, so the UI stays on localhost.
     if (origin.scheme != "http"
             or (origin.hostname not in ("localhost", "127.0.0.1") and origin.hostname not in ("agent-a", "agent-b"))
             or origin.username or origin.password or origin.query or origin.fragment

@@ -2091,8 +2091,8 @@ def create_app(
             skills = {name for name in skills if interaction_store.get_policy(
                 principal.tenant, name, tool_origin(name)).mode != "deny"}
         if remote_registry_store is not None:
-            # Registry-only probe: never dial peers while rendering OUR card, or two
-            # agents configured as peers deadlock on each other's discovery.
+            # Reads only the registry: building this card must not call peers, whose
+            # cards in turn are built by calling this agent.
             has_peer = principal is not None and any(
                 p.get("enabled") for p in remote_registry_store.list(principal.tenant, limit=101))
             if not has_peer:

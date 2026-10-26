@@ -1,3 +1,6 @@
+# Local two-agent stand (buyer A and seller B on one host), see LOCAL_A2A_MULTI_INSTANCE.md.
+# Self-contained: the full stack of one instance, including its MCP servers. Values come from .env.
+
 services:
   database:
     image: pgvector/pgvector:pg17@sha256:7ae6051efd0e60444282c27c7e141af07f322ce033300e727a49c3dd11075e38
@@ -152,6 +155,7 @@ services:
       LLM_MODEL: ${LLM_MODEL}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-4096}
+      LLM_SUMMARY_MAX_TOKENS: ${LLM_SUMMARY_MAX_TOKENS:-32768}
       LLM_CONTEXT_WINDOW: ${LLM_CONTEXT_WINDOW:-128000}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-120}
       LLM_TOTAL_TIMEOUT: ${LLM_TOTAL_TIMEOUT:-300}
@@ -223,6 +227,7 @@ services:
       CORE_AGENT_MAX_DEPTH: ${CORE_AGENT_MAX_DEPTH:-2}
       CORE_AGENT_MAX_FAN_OUT: ${CORE_AGENT_MAX_FAN_OUT:-4}
       CORE_AGENT_RUNTIME_MODE: ${CORE_AGENT_RUNTIME_MODE:-with_terminal}
+      CORE_AGENT_TERMINAL_MAX_SECONDS: ${CORE_AGENT_TERMINAL_MAX_SECONDS:-600}
       CORE_AGENT_ALLOWED_BUILTIN_TOOLS: ${CORE_AGENT_ALLOWED_BUILTIN_TOOLS:-}
       CORE_AGENT_NEXT_STEPS: ${CORE_AGENT_NEXT_STEPS:-true}
       CORE_AGENT_NEXT_STEPS_EVERY: ${CORE_AGENT_NEXT_STEPS_EVERY:-5}
@@ -284,17 +289,16 @@ services:
         aliases:
           - agent-a
 
-  # --- Buyer (FOSAGRO) role MCP, served inside the agent network namespace so
-  # that the core-agent MCP client sees a loopback (127.0.0.1) address, which is
-  # the only form of plain-http the kernel's MCP connector allows. The server
-  # name in MCP_URL derives from the last path segment (see _mcp_name).
+  # Buyer (FOSAGRO) MCP servers. They share the agent's network namespace, so the agent
+  # reaches them on 127.0.0.1 (plain http MCP is allowed only on loopback).
+  # Recreate them together with `agent`.
   fosagro-mcp:
     image: fosagro-mock-mcp:local
     network_mode: service:agent
     environment:
       HOST: "0.0.0.0"
       PORT: "8012"
-      # Request numbers unique across restarts
+      # Purchase request numbers stay unique across restarts
       FOSAGRO_REQUEST_NUMBERING: time
     depends_on:
       agent:
@@ -316,7 +320,7 @@ services:
       AUTH_TOKEN: ""
       ENABLE_PHOENIX: "false"
       ENABLE_MONITORING: "false"
-      # GN business constants of this deployment (agents do not pass them)
+      # GN constants of this deployment; agents do not pass them
       AMITY_CONTRACT_TEMPLATE_ID: pmefContract
       AMITY_SELLER_AGENT_ID: etmVendr
       AMITY_BUYER_FEED_ID: fosagroEtmBuyerFeed

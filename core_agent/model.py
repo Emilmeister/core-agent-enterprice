@@ -435,7 +435,7 @@ class CompatibleHttpModel:
             )
         if schemas:
             body["tools"] = schemas
-            # The runtime may force one tool from the current catalog, by canonical name.
+            # The runtime may require a call of one tool from the current catalog, by canonical name.
             forced = next((wire for wire, name in reverse.items() if name == tool_choice), None)
             if forced is not None:
                 body["tool_choice"] = (

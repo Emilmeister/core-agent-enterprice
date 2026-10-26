@@ -66,10 +66,8 @@ class RemoteAgentCard:
     streaming: bool
     skills: tuple[dict, ...]
     binding: str = A2A_BINDING
-    # Trusted local-dev peers only (http + Docker host aliases). Set True when
-    # this card comes from the company peer registry, which already permitted
-    # the endpoint through _trusted_endpoint(..., allow_local_insecure=True).
-    # Legacy/env-backed peers stay strict (default False).
+    # True for peers from the company peer registry: their endpoint may use plain http
+    # on a local Docker host alias. Peers from REMOTE_AGENTS keep the strict check.
     allow_local_insecure: bool = False
 
 
@@ -458,9 +456,7 @@ def _validate_endpoint(url, *, allow_local_insecure=False):
         loopback = loopback or ipaddress.ip_address(hostname or "").is_loopback
     except ValueError:
         pass
-    # Local-dev peers only: besides loopback, allow the Docker Desktop host
-    # alias over plain http. This flag is only passed from the trusted-peer
-    # registry; external REMOTE_AGENTS, MCP and other consumers stay strict.
+    # With allow_local_insecure, plain http is also accepted for the local Docker host aliases.
     local_host_alias = allow_local_insecure and hostname in (
         "host.docker.internal", "gateway.docker.internal", "agent-a", "agent-b")
     if parsed.scheme != "https" and not (parsed.scheme == "http" and (loopback or local_host_alias)):
