@@ -10,7 +10,7 @@
 
 **Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. После rollout `cloudru-s3-cancel-20261025` отмена работающей background-задачи с S3 подтверждена в Cloud. Рекурсивное discovery собственной Agent Card исправлено в пакете `cloudru-card-discovery-20261025`; после его rollout реальный исходящий Send/Get/Cancel также прошёл в Cloud. Остальная матрица и release proofs ещё не завершены (результаты ниже).
 
-Последний ordinary suite 26 октября: 2419 tests, exit 0, 16 skips; PostgreSQL,
+Последний ordinary suite 26 октября: 2424 tests, exit 0, 16 skips; PostgreSQL,
 Keycloak и MinIO работали в изолированных fixtures. Подробности нового пакета
 и границы пропущенных gates приведены ниже. В исходном linux/amd64 candidate
 прошли 178 config/memory/S3 tests без skips. ARM64 Landlock VM: 39 tests без
@@ -467,7 +467,7 @@ Raw FilePart root: `4e6f5716-cd5e-4d86-b9ac-97a8888b8ada`; SSE root:
 повторяет только чтения при transient errors и сохраняет точную причину отказа;
 мутации автоматически не повторяет.
 
-Экспорт OTEL по-прежнему получает HTTP 403 в целевом Cloud. Локальные 15
+В предоставленных операторских логах OTEL получает HTTP 403. Локальные 15
 observability tests прошли; причина отказа collector пока не установлена.
 Изменение формата credentials или отключение telemetry без подтверждения
 не выполнялись.
@@ -539,13 +539,18 @@ CI. Публичный `origin/main` повторно получен: `6434a40` 
 
 Новая bounded compaction Task `6023385d-09ff-4533-8735-c734c2d90dcf`
 (run `9e7420e9-80ef-428a-b2a1-248e7eae4742`) завершилась
-`CONTEXT_UNRECOVERABLE` в `06:53:58 UTC` 26 октября. Проверочный клиент её
+`CONTEXT_UNRECOVERABLE` 26 октября. Проверочный клиент её
 не отменял; все 32 чтения вернули HTTP 200. Временное окно 20480 было закреплено
 в Task, а owner setting сразу восстановлено до прежних 128000, revision 11.
-Офлайн расчёт не установил причину; нужны уже записанные безопасные поля
-`reason`, `attempt`, `working_tokens`, `working_capacity` перехода
-`context.compaction.failed`. Новый запуск и изменение лимитов до диагностики
-не считаются исправлением. Receipt:
+Операторские логи уточнили время terminal commit — `06:53:32.967551 UTC`;
+`06:53:58 UTC` было временем первого чтения итогового состояния клиентом.
+Обе попытки summary дали `provider_unavailable` при working capacity 9617;
+вторая заняла около 50 секунд. Этот общий код adapter также обозначает
+invalid response и отсутствие public text, поэтому он не доказывает timeout.
+Пакет добавляет конечную приватную классификацию причины с проверенным HTTP
+status/exception/response format/finish reason; публичная ошибка, strict schema,
+лимиты и reasoning settings сохраняются. Изменение лимитов без этой диагностики
+не считается исправлением. Receipt:
 `cloudru-batch-compaction-questions-20261026-v3.json`.
 
 Операторский startup log `08:23:15–17 UTC` подтверждает успешный запуск с S3
@@ -554,6 +559,75 @@ CI. Публичный `origin/main` повторно получен: `6434a40` 
 fallback key без перекрытия основным ключом. Эти строки не подтверждают его
 права и не показывают результат экспорта после данного rollout. Формат
 авторизации collector не менялся; подтверждённой причины прежнего 403 нет.
+
+В Cloud также проверен запрет чтения между собственными тестовыми чатами:
+Task `f743cfbc-f538-4058-96ec-c7ff37b6dd8c` получила `PermissionError/EACCES`
+при попытке прочитать ровно один известный canary соседнего чата. Собственный
+файл записан и прочитан с точными bytes/SHA; canary соседа до и после совпал.
+Общие настройки и политики не менялись. Это проверка одного scoped path,
+не одновременных writers или rollout. Receipt: `cloudru-chat-isolation-20261026.json`.
+
+Содержимое amd64 candidate `sha256:47a59c1de29a7b8128b91365b96b7ae573c7bd3ea54f1301771e022e2e87e2bd`
+проверено в отдельном x86_64 Linux guest QEMU TCG: 40 Landlock/seccomp tests,
+39,192 секунды, exit 0, ноль skips, оба required flags. Runtime взят из точного
+rootfs образа без source overlay. Guest исполнялся на ARM64 Docker host;
+это emulated amd64 proof, не native hardware CI и не профиль Cloud host.
+Fixture и rootfs containers удалены. Receipt: `cloudru-landlock-amd64-proof-20261026.json`.
+
+Повторные обращения к собственному тестовому A2A peer подтвердили server-owned
+remote context binding: второй remote Task прочитал файл первого без явного
+`context_id` в model arguments. Оба remote Task завершились; исходный файл и
+повторно опубликованный результат совпали, 25 bytes. Первый parent получил
+результат; второй был отменён проверочным клиентом по его deadline до следующего
+Get. Поэтому полная повторная доставка parent в этом прогоне не подтверждена.
+Все созданные этим сценарием задачи сверены, собственный peer удалён.
+Receipts: `cloudru-peer-context-files-20261026-v3.json` и
+`cloudru-peer-context-files-reconciled-20261026.json`.
+
+Разбор выявил общий дефект: ранний artifact нетерминального remote Task обходил
+адаптивный polling и назначал следующий Get через pinned interval (300 секунд).
+Теперь обе ветки используют один расчёт 10/30/300 секунд, observation interest
+и deadline, сохраняя атомарную публикацию quarantine и единственный Send.
+Regression воспроизвела исходный дефект; 208 целевых Memory/PostgreSQL тестов
+прошли без skips. После уточнения timing assertion два затронутых Memory/PG
+сценария также прошли. Полная регрессия и live-проверка нового образа ещё нужны.
+Receipt: `cloudru-early-artifact-poll-proof-20261026.json`.
+
+В том же пакете HTTP adapter перестал читать тело уже отклонённого HTTP-ответа:
+ошибка чтения могла маскировать известный status сырым transport exception.
+Ответ закрывается; прежние `MODEL_UNAVAILABLE` и retryable-классификация status
+сохраняются. 141 целевая проверка HTTP/model/runtime прошла без skips, включая
+OpenAI/Anthropic, streaming и ошибку закрытия. Это локальное доказательство
+обработки ошибок, а не установление причины прежнего Cloud compaction failure.
+
+### Проверенный пакет диагностики и polling 26 октября
+
+Финальный ordinary suite текущего пакета: 2424 tests за 577,198 секунды,
+exit 0, 16 skips; Ruff и diff-check прошли. Использованы новые изолированные
+PostgreSQL database и S3 bucket, реальные Keycloak/MinIO. Предыдущий прогон
+выявил ещё одну гонку test fixture: periodic recovery забирал lease у явного
+`resume_task` и тест получал `LEASE_LOST` вместо ожидаемого
+`SIDE_EFFECT_UNKNOWN`. Остановка и join scanner до подготовки прерванного
+состояния устранили гонку без изменения production recovery или assertions;
+11 целевых тестов и полный повторный прогон прошли.
+Receipt: `cloudru-provider-remote-final-retry-20261026.json`.
+
+15 skips требуют Linux/native Docker/browser fixtures; ещё один намеренно
+не повторяет PostgreSQL leader ownership проверку в memory-only loop fixture.
+Они не объявляются пройденными native CI gates. Новый linux/amd64 image index
+`sha256:b3ca335bd3823742c41bb7098857c75250627e10a8fd22c961a99384a42f677b`
+прошёл 40 Landlock/seccomp tests без skips за 38,722 секунды в x86_64 QEMU TCG
+VM на ARM64 host, с обоими required flags и точным rootfs без source overlay.
+Все 73 application Python-файла образа совпали с проверенной рабочей копией.
+Wheel/sdist также собраны. Receipt: `cloudru-batch2-candidate-proof-20261026.json`.
+
+Для единого rollout подготовлены два собственных чата: A хранит проверенную
+memory-запись и owner question, B удерживает HITL на создании другой тестовой
+memory-записи. Python/terminal уже имеют policy allow, поэтому B не выдаётся
+за проверку сохранения sandbox approval. Глобальные policies не менялись.
+Проверочный процесс хранит исходный owner cookie только в памяти и ожидает
+явного подтверждения rollout; итогов восстановления пока нет. Receipt:
+`cloudru-rollout-ab-20261026-v2.json`.
 
 ## 6. Когда цель считается достигнутой
 
