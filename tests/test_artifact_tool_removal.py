@@ -148,6 +148,11 @@ class ArtifactRemovalRecoveryTests(unittest.TestCase):
             self.addCleanup(database.close)
         self.app, self.model = ArtifactToolRemovalTests.build(self, database=database,
             SESSION_STORAGE_TYPE="postgres" if self.use_postgres else "in-memory")
+        # These fixtures stage an interrupted run and advance recovery explicitly.
+        agent = self.app.state.core_agent
+        agent._recovery_stop.set()
+        agent._recovery_thread.join(5)
+        self.assertFalse(agent._recovery_thread.is_alive())
         if self.use_postgres:
             self.assertIsInstance(self.app.state.core_agent.workflow_store, PostgresWorkflowStore)
         self.tenant = "removal-recovery-" + uuid.uuid4().hex
