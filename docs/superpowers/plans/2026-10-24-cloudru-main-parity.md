@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python/uv, PostgreSQL, S3, Landlock/seccomp, официальный A2A SDK, React/TypeScript, существующие unittest и native/browser проверки.
 
-**Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. После rollout `cloudru-s3-cancel-20261025` отмена работающей background-задачи с S3 подтверждена в Cloud. Рекурсивное discovery собственной Agent Card исправлено в пакете `cloudru-card-discovery-20261025`; после его rollout реальный исходящий Send/Get/Cancel также прошёл в Cloud. Остальная матрица и release proofs ещё не завершены (результаты ниже).
+**Статус:** базовый пакет реализован 24 октября 2026; 25 октября выполнен live-прогон и опубликованы исправления отмены. После rollout `cloudru-s3-cancel-20261025` отмена работающей background-задачи с S3 подтверждена в Cloud. Рекурсивное discovery собственной Agent Card исправлено в пакете `cloudru-card-discovery-20261025`; после его rollout реальный исходящий Send/Get/Cancel также прошёл в Cloud. 26 октября после следующего rollout подтверждены owner/HITL waits, сохранность памяти и повторная доставка файла из того же peer context. Две операции сжатия контекста прошли, но проверка сохранения задания после повторного сжатия не прошла; экспорт telemetry продолжает получать 403. Остальная матрица и release proofs ещё не завершены (результаты ниже).
 
-Последний ordinary suite 26 октября: 2424 tests, exit 0, 16 skips; PostgreSQL,
+Последний завершённый ordinary suite опубликованного пакета 26 октября: 2424 tests, exit 0, 16 skips; PostgreSQL,
 Keycloak и MinIO работали в изолированных fixtures. Подробности нового пакета
 и границы пропущенных gates приведены ниже. В исходном linux/amd64 candidate
 прошли 178 config/memory/S3 tests без skips. ARM64 Landlock VM: 39 tests без
@@ -162,7 +162,7 @@ uv run python -m unittest tests.test_landlock_policy tests.test_landlock_network
 - [x] Описать откат образа/схемы: старый backup нельзя накатывать поверх новых записей без отдельной процедуры сохранения данных. Процедура и ограничения — `docs/cloudru-trial.md`, раздел подготовки production и миграции.
 - [ ] Проверить недоступность/таймаут S3, заполнение локального cache, ограничения размера/числа файлов и GC без удаления referenced originals/artifacts.
 - [ ] Проверить согласованную ротацию owner password и отзыв платформенного ключа на уровне Cloud ingress.
-- [ ] Проверить экспорт traces/metrics/logs. Исправлять прежний `403 Forbidden` только после подтверждения, что он остаётся на текущей конфигурации.
+- [ ] Проверить экспорт traces/metrics/logs после исправления подтверждённого несовместимого формата Bearer у Cloud collector gateway; права настоящего ключа и успешная доставка ещё не подтверждены.
 - [ ] Проверить readiness/liveness и записать фактические настройки ресурсов/фонового исполнения, доступные в AI Agents.
 
 Использовать существующие `core-agent-db`, S3 ledger/GC и тесты миграций;
@@ -187,11 +187,13 @@ Production configuration реализуется в общем пакете до 
 ### Этап 7. Общая регрессия и выпуск
 
 - [x] Вновь сверить ancestry main и Cloud-ветки; новые main-исправления включать осознанно и проверять совместимость с адаптацией.
-- [ ] Поднять существующие disposable PostgreSQL, Keycloak, MinIO и native/browser fixtures согласно CI.
-- [ ] Выполнить полный ordinary suite, все затронутые native/security/browser gates и packaging/image checks.
+- [x] Для опубликованного пакета поднять disposable PostgreSQL, Keycloak, MinIO и выполнить полный ordinary suite и packaging/image checks.
+- [ ] Выполнить оставшиеся native/security/browser gates на требуемых fixtures; новые изменения после опубликованного пакета проверить отдельно.
 - [ ] Зафиксировать proof по каждому пункту матрицы; обновить implementation status только там, где доказательство действительно получено.
-- [x] Обновить `AGENTS.md`, `docs/cloudru-trial.md` либо его назначение для завершённого профиля, ENV-инструкцию и документ сравнения Kubernetes/Cloud.ru.
-- [ ] Опубликовать проверенный образ под постоянным version tag и digest, затем проверить rollout и доступность на целевом endpoint.
+- [x] Обновить `AGENTS.md`, `docs/cloudru-trial.md` и ENV-инструкцию по фактическим границам профиля.
+- [ ] Подтвердить наличие итогового документа сравнения Kubernetes/Cloud.ru; ранее запрошенный Desktop-артефакт сейчас не найден.
+- [x] Опубликовать проверенный пакет под постоянным version tag и digest; после сообщённого оператором rollout проверить целевой endpoint.
+- [ ] Закрыть оставшиеся release proofs; HTTP API не подтверждает точный digest запущенного Pod.
 
 Базовые команды существующих gates:
 
@@ -468,9 +470,9 @@ Raw FilePart root: `4e6f5716-cd5e-4d86-b9ac-97a8888b8ada`; SSE root:
 мутации автоматически не повторяет.
 
 В предоставленных операторских логах OTEL получает HTTP 403. Локальные 15
-observability tests прошли; причина отказа collector пока не установлена.
-Изменение формата credentials или отключение telemetry без подтверждения
-не выполнялись.
+observability tests прошли; на том этапе причина отказа collector ещё не была
+установлена. Формат credentials и telemetry тогда не менялись. Позднейшая
+проверка gateway без настоящего ключа описана ниже.
 
 Автоматический cron проверен 26 октября отдельным расписанием с единственным
 ближайшим annual occurrence: due `06:41:00 UTC`. Между `06:38:39.889406` и
@@ -557,8 +559,9 @@ status/exception/response format/finish reason; публичная ошибка,
 и Landlock, один `/v1/traces`, `OTEL_API_KEY=missing` и
 `OTEL_ENDPOINT_API_KEY=set`. Следовательно, используется платформенный
 fallback key без перекрытия основным ключом. Эти строки не подтверждают его
-права и не показывают результат экспорта после данного rollout. Формат
-авторизации collector не менялся; подтверждённой причины прежнего 403 нет.
+права. Более поздние операторские логи `11:43–11:47 UTC` подтверждают 403
+после следующего rollout. Сами startup-логи не определяют причину отказа;
+отдельная проверка gateway ниже установила несовместимость формата Bearer.
 
 В Cloud также проверен запрет чтения между собственными тестовыми чатами:
 Task `f743cfbc-f538-4058-96ec-c7ff37b6dd8c` получила `PermissionError/EACCES`
@@ -590,7 +593,8 @@ Receipts: `cloudru-peer-context-files-20261026-v3.json` и
 и deadline, сохраняя атомарную публикацию quarantine и единственный Send.
 Regression воспроизвела исходный дефект; 208 целевых Memory/PostgreSQL тестов
 прошли без skips. После уточнения timing assertion два затронутых Memory/PG
-сценария также прошли. Полная регрессия и live-проверка нового образа ещё нужны.
+сценария также прошли. Полная регрессия опубликованного пакета и успешная
+live-проверка повторной доставки v5 описаны ниже.
 Receipt: `cloudru-early-artifact-poll-proof-20261026.json`.
 
 В том же пакете HTTP adapter перестал читать тело уже отклонённого HTTP-ответа:
@@ -602,7 +606,7 @@ OpenAI/Anthropic, streaming и ошибку закрытия. Это локал�
 
 ### Проверенный пакет диагностики и polling 26 октября
 
-Финальный ordinary suite текущего пакета: 2424 tests за 577,198 секунды,
+Финальный ordinary suite опубликованного пакета: 2424 tests за 577,198 секунды,
 exit 0, 16 skips; Ruff и diff-check прошли. Использованы новые изолированные
 PostgreSQL database и S3 bucket, реальные Keycloak/MinIO. Предыдущий прогон
 выявил ещё одну гонку test fixture: periodic recovery забирал lease у явного
@@ -625,15 +629,124 @@ Wheel/sdist также собраны. Receipt: `cloudru-batch2-candidate-proof-
 `blockchain.cr.cloud.ru/core-agent-gn:cloudru-validation-batch2-20261026`
 и `blockchain.cr.cloud.ru/core-agent-gn:latest`. Оба registry index совпали
 с указанным проверенным image digest; native manifest/config также сверены.
-Эта запись подтверждает публикацию, не фактический rollout Cloud Pod.
+Оператор сообщил о rollout около `11:39 UTC` 26 октября; последующие проверки
+целевого endpoint приведены ниже. HTTP API не раскрывает revision/digest Pod,
+поэтому соответствие фактически запущенного Pod этому digest независимо не подтверждено.
 
-Для единого rollout подготовлены два собственных чата: A хранит проверенную
-memory-запись и owner question, B удерживает HITL на создании другой тестовой
-memory-записи. Python/terminal уже имеют policy allow, поэтому B не выдаётся
-за проверку сохранения sandbox approval. Глобальные policies не менялись.
-Проверочный процесс хранит исходный owner cookie только в памяти и ожидает
-явного подтверждения rollout; итогов восстановления пока нет. Receipt:
-`cloudru-rollout-ab-20261026-v2.json`.
+### Результаты после rollout 26 октября
+
+AB v2 завершён успешно в `11:42:41 UTC`: прежний owner cookie без повторного
+login сохранил доступ, company settings совпали. В A сохранился исходный owner
+question с теми же wait/generation/deadline/digest; после ответа прочитана и
+найдена та же memory-запись с прежними ID/body/revision. Собственная запись
+удалена, последующий поиск пуст без degraded channels. В B сохранился точный
+HITL на memory-create; после одного approval выполнены create/read/delete.
+Python/terminal уже имели policy allow, поэтому это не proof sandbox approval.
+Общие policies не менялись, cookie оставался только в памяти клиента; logout
+вернул 200. Receipt: `cloudru-rollout-ab-20261026-v2.json`.
+
+CD reconciliation подтвердил нормальное завершение 20-минутного timer
+(`woke_at=11:15:28.049456 UTC`) и восьмиминутной background-команды
+(exit 0, duration 480,2279 секунды, cleanup `sandbox_terminated`). Оба завершились
+до сообщённого rollout. После rollout сохранённый task-wait HITL родителя был
+разрешён один раз; новый запуск команды не выполнялся. Canary после обновления
+доступен: 28 bytes, прежний SHA-256
+`81969ecf795e619d0814e69b3bf7d6de0dd39f42acb19b4d33f9d96e0c282ba4`.
+Это proof нормального завершения и сохранности файла, но не ожидания таймера
+через rollout, прерывания активной команды или подтверждённой остановки
+прежнего process generation. Эти gates открыты. Receipt:
+`cloudru-rollout-cd-reconciliation-20261026.json`.
+
+Peer v5 завершён в `11:58:48 UTC`: обе операции и оба parent/remote Task
+завершились, remote Tasks различны и используют один server-owned context.
+Первая операция создала файл, вторая только прочитала его; model arguments
+не задавали context ID. Оба parent download вернули 200/no-store и точные
+25 bytes с SHA-256
+`9b3adc80271b6bdc3b4252c2d44a96a263eb697bbe4d83010cf12bbe2225e815`.
+Все семь proof-полей receipt истинны; собственный peer удалён (200), logout 200.
+Это закрывает повторную доставку файла из того же remote context. В предыдущем
+v4 первая фаза прошла, но driver ошибочно отклонил разрешённый
+`core_response_begin`; это не product failure. Receipt:
+`cloudru-peer-context-files-20261026-v5.json`.
+
+### Сжатие контекста и telemetry: оставшиеся ограничения
+
+В v4 Task `2983f413-8f7e-46ad-9d5f-6fa2377b51f6` обе попытки summary
+завершились с `provider_failure={kind:no_text, finish_reason:length,
+response_format:json_schema, exception_type:CoreError}`, working capacity 9102.
+Terminal commit `11:47:05.567502 UTC`: `CONTEXT_UNRECOVERABLE`,
+reason `provider_unavailable`. Теперь подтверждено исчерпание output limit
+без текста ответа. Расход всего лимита на reasoning остаётся гипотезой;
+usage-доказательства нет. Это не подтверждённый timeout. Receipt:
+`cloudru-compaction-provider-failure-20261026-v4.json`.
+
+В v5 Task `2418a00a-0535-40a3-a45d-e8b530a61494` закреплён временный snapshot:
+context window 20480 и structured output `reasoning=off`,
+`compatibility=chat_template`. Общие настройки сразу восстановлены до прежних
+128000/auto (revision 15). Операторские логи подтвердили два `context.compacted`:
+
+| UTC | Working tokens до → после | Capacity | Заменённые sequence |
+|---|---|---|---|
+| 13:01:14.817412 | 15417 → 2373 | 9617 | 1–4 |
+| 13:04:22.646762 | 15864 → 2353 | 9617 | 1–7 |
+
+В предоставленном интервале `context.compaction.failed` нет: генерация и commit
+двух summary в этом snapshot доказаны. Но проверка сохранения задания не прошла:
+после двух точных follow-up по 39300 bytes и двух ответов на вопросы появился
+третий `core_ask_owner`, повторяющий первый вопрос с новым call ID. Дубликатов
+истории нет, финальный ответ пуст. Driver остановил сценарий и отменил только
+собственную Task; состояние CANCELED, logout 200. Содержимое summary недоступно,
+поэтому место потери задания пока не установлено. Успешное сжатие не закрывает
+gate сохранения фактов/задания после повторного сжатия. Receipts:
+`cloudru-batch-compaction-questions-20261026-v5-reconciliation.json`,
+`cloudru-compaction-events-20261026-v5.json`.
+
+Экспорт spans после rollout получает 403 (`11:43–11:47 UTC`). Startup-логи
+подтверждают `OTEL_ENDPOINT_API_KEY=set` в Pod; доступность его значения
+в интерфейсе не проверена. Отдельный GET к точному `/v1/traces` без настоящих
+credentials, с проверкой TLS и без redirect, установил поведение gateway:
+
+| Переданный формат | Ответ |
+|---|---|
+| Без ключа | 401, `WWW-Authenticate: X-API-KEY`, `Server: Evolution API Gateway` |
+| `Authorization: Bearer` с заведомо неверным ключом | 403, `Invalid authorization header format` |
+| `Authorization: Api-Key` с тем же неверным ключом | 400, `invalid api key secret` |
+| `X-API-KEY` с тем же неверным ключом | 400, `invalid api key secret` |
+
+Это подтверждает несовместимость Bearer с конкретным Cloud gateway и разбор
+форматов Api-Key/X-API-KEY. Для платформенного alias `OTEL_ENDPOINT_API_KEY`
+нужен формат `Authorization: Api-Key`. Настоящий injected key в этой проверке
+не использовался: его права и успешный экспорт spans после исправления ещё
+не доказаны. Receipt: `cloudru-otel-auth-format-20261026.json`.
+
+Эти результаты относятся к опубликованному пакету и конкретным live snapshot.
+Они не подтверждают новые незавершённые правки, native/browser release gates,
+реальные CPU/min-replica настройки deployment или весь production-профиль.
+
+### Новый локальный пакет после live-диагностики
+
+Локально проверены валидация настроек database pool (`962c5ad`), пересечение
+capabilities с поддерживаемыми platform features и gate `core_response_files`,
+а также совместимая загрузка прежних checkpoints. Старые digest проверяются
+в историческом режиме, но execution/dispatch всегда использует строгие текущие
+gates; новые snapshots сохраняют версию фильтра. Платформенный alias
+`OTEL_ENDPOINT_API_KEY` теперь выбирает `Authorization: Api-Key`; явный
+`OTEL_API_KEY` сохраняет приоритет и прежний Bearer для обычного OTLP/Phoenix.
+
+Итоговый локальный `uv run python -m unittest discover -s tests -v` завершён
+`13:48:01 UTC`: 2424 tests за 448,156 секунды, exit 0, 16 skips; полный запуск
+занял 451,452 секунды. Receipt подтверждает `source_unchanged=true` для четырёх
+изменённых implementation-файлов. `uv run ruff check core_agent tests` и
+`git diff --check` также завершились с exit 0. Независимый review не выявил
+замечаний; отдельная inline-проверка подтвердила историческую проверку digest
+при строгом dispatch. Receipt: `cloudru-final-local-batch-20261026.json`.
+
+Использованы существующие tests: frozen tests/spec не менялись, поскольку
+свежее разрешение на их изменение ещё ожидается. Новые regression checks
+пока не включены в CI. Skips не закрывают обязательные native/browser gates.
+Новый образ с этими изменениями не опубликован и Cloud deployment не обновлён.
+Успешный экспорт с настоящим injected key и сохранение задания после повторного
+сжатия по-прежнему не доказаны; локальный suite не закрывает эти live gates.
 
 ## 6. Когда цель считается достигнутой
 

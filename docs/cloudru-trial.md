@@ -250,6 +250,13 @@ mount/unshare/setns. Это реальная kernel-проверка Landlock/se
 | Sandbox | Явный Landlock либо default Bubblewrap с настоящим успешным preflight; его невозможность блокирует запуск |
 | Lifecycle | Один постоянно работающий экземпляр, CPU вне HTTP и отсутствие scale-to-zero; overlapping rollout требует подтверждения fencing |
 
+Для постоянного экземпляра задайте минимум одну реплику. Согласно
+[документации масштабирования Cloud.ru](https://cloud.ru/docs/ai-agents/ug/topics/concepts__scaling),
+при минимуме больше нуля минимальное число реплик работает постоянно; при нуле
+экземпляр удаляется после 40 секунд без HTTP-запросов. Это описание платформы,
+а не доказательство фактической настройки deployment или доступности CPU
+вне HTTP; оба условия следует подтвердить отдельно.
+
 Сначала подтвердите текущий encryption key и читаемость существующих encrypted
 settings/credentials. Если прежний trial не задавал стабильный secret, нельзя
 просто подставить новый ключ и обещать сохранность: подготовьте перенос encrypted
@@ -370,6 +377,45 @@ scope у платформенных peers, реальные workspace пути �
 в Landlock. Он не обещает персональную Keycloak identity, namespaces Bubblewrap
 или произвольные TCP/UDP/syscalls. Secrets, cookies, DSN, private object keys и
 полные ENV dumps в отчёт проверки не включаются.
+
+## Подтверждённые результаты 26 октября 2026
+
+После сообщённого оператором rollout пакета
+`cloudru-validation-batch2-20261026` проверены прежний owner cookie без нового
+login, неизменность settings, точные owner-question и memory-create HITL waits,
+а также чтение/поиск/удаление прежней memory-записи. Повторное обращение к peer
+завершилось в том же server-owned remote context: обе операции и parent Tasks
+завершились, оба скачивания совпали с исходными bytes/SHA-256. Точный digest
+запущенного Pod через HTTP API не наблюдается.
+
+20-минутный timer и восьмиминутная background-команда завершились до rollout.
+Их результаты и файл после обновления сохранились, но эти сценарии не доказывают
+ожидание через rollout или восстановление после прерывания активной команды.
+
+Проверка длинного контекста остаётся незавершённой. В старом snapshot summary
+дважды исчерпал output limit без текста (`no_text`, `finish_reason=length`,
+`response_format=json_schema`); это не доказанный timeout или расход лимита
+именно на reasoning. В отдельном snapshot `reasoning=off` /
+`compatibility=chat_template` подтверждены два успешных `context.compacted`,
+но затем агент повторил уже отвеченный вопрос и не выдал итоговый ответ.
+Генерация summary доказана, сохранение задания после повторного сжатия — нет.
+Общие owner settings после подготовки snapshot восстановлены.
+
+Telemetry после rollout получает 403; startup-логи подтверждают
+`OTEL_ENDPOINT_API_KEY=set` в Pod. Отдельный GET к этому collector с заведомо
+неверным диагностическим ключом установил: `Authorization: Bearer` даёт 403
+`Invalid authorization header format`, а `Authorization: Api-Key` и
+`X-API-KEY` — 400 `invalid api key secret`. Без ключа gateway отвечает 401
+с `WWW-Authenticate: X-API-KEY`. Таким образом, для платформенного alias
+`OTEL_ENDPOINT_API_KEY` требуется формат `Authorization: Api-Key`.
+Выбор Api-Key для этого alias исправлен и проверен локально; новый образ
+с исправлением ещё не опубликован, Cloud deployment не обновлён.
+Настоящий ключ не использовался: его права и успешную доставку spans после
+исправления ещё предстоит подтвердить. Доступность значения ключа в UI
+не проверялась.
+Полные границы доказательств и ссылки на безопасные receipts находятся в
+[плане завершения адаптации](superpowers/plans/2026-10-24-cloudru-main-parity.md).
+Native/browser gates и остальные production-проверки выше остаются обязательными.
 
 ## Какие logs передать
 
