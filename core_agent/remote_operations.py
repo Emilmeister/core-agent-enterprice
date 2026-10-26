@@ -83,7 +83,8 @@ class RemoteA2AExecutor:
             raise CoreError("CHECKPOINT_INVALID")
         headers = _trusted_headers(self.registry.resolve_headers(
             contract["tenant_id"], contract["peer_id"], contract["peer_revision"]))
-        card = RemoteAgentCard(peer["name"], peer["description"], contract["url"], False, (), contract["binding"])
+        card = RemoteAgentCard(peer["name"], peer["description"], contract["url"], False, (), contract["binding"],
+                               allow_local_insecure=True)
         return RemoteAgentConnection(card, timeout=30), headers
 
     def _secrets(self, headers):

@@ -65,6 +65,10 @@ WORKFLOW_LEASE_HEARTBEAT_INTERVAL = WORKFLOW_LEASE_TTL / 3
 WORKFLOW_RECOVERY_POLL_SECONDS = 0.5
 RECOVERABLE_WORKFLOW_STATES = frozenset({"RUNNING", "MODEL_RESPONDED", "EXECUTING", "WAITING_TASK", "WAITING_INPUT"})
 DEFAULT_BUDGET_CANCEL_GRACE_SECONDS = 5.0
+# Delays between recovery attempts of a task after consecutive model provider failures.
+RECOVERY_BACKOFF_SECONDS = (30, 60, 120, 240, 300)
+# A task that ran this long since its last allowed retry starts counting failures anew.
+RECOVERY_BACKOFF_RESET_SECONDS = 600
 BUDGET_FINALIZATION_INSTRUCTION = (
     "BUDGET FINALIZATION: The work budget is exhausted. Return a concise, truthful "
     "verified intermediate result and explicitly list what you intended to do but "
@@ -88,6 +92,10 @@ LEGACY_RESPONSE_FILES_INSTRUCTION = (
     "A failed selection preserves the previous set; reduce files after an aggregate-limit error."
 )
 SKILL_CONTRACT_VERSION = 3
+NEXT_STEPS_TOOL = "core_next_steps"
+NEXT_STEPS_RESULT = "Принято. Выполни current_step."
+# Results of these tools carry a new message from a peer or an owner.
+NEXT_STEPS_TRIGGERS = frozenset({"core_task_wait", "core_ask_owner"})
 
 
 class _MaterialSuspended(Exception):
@@ -340,8 +348,10 @@ class CoreAgent:
         model_retries=0,
         budget_cancel_grace_seconds=DEFAULT_BUDGET_CANCEL_GRACE_SECONDS,
         reply_hub=None,
+        next_steps_every=None,
     ):
         self.platform_config = platform_config
+        self.next_steps_every = next_steps_every
         self.agent_config = agent_config
         self.model = model
         self.tool_runtime = tool_runtime
@@ -408,6 +418,7 @@ class CoreAgent:
         self._recovery_lock = threading.Lock()
         self._recovery_thread = None
         self._recovery_workers = {}
+        self._recovery_backoff = {}
         self._recovery_callback = None
         self._task_wait_cursor = None
         self._task_streams = {}
@@ -3255,6 +3266,8 @@ class CoreAgent:
         if not messages:
             return record, snapshot, 0
         snapshot = copy.deepcopy(snapshot)
+        if self.next_steps_every is not None and state not in TERMINAL_STATES:
+            snapshot["next_steps_due"] = True
         if snapshot.get("response_phase") == "answer" and state not in TERMINAL_STATES:
             self._supersede_public_reply(record, snapshot, lease_token=lease_token)
             snapshot["response_phase"] = "work"
@@ -3699,6 +3712,20 @@ class CoreAgent:
         return self._record_transition(record, state="MODEL_RESPONDED", snapshot=snapshot,
             event_kind="python.completed_result.recovered", lease_token=lease_token)
 
+    def _note_next_steps(self, snapshot, name, succeeded):
+        """Count tool calls since the last successful core_next_steps and mark when to force it."""
+        if self.next_steps_every is None:
+            return
+        if name == NEXT_STEPS_TOOL:
+            if succeeded:
+                snapshot["next_steps_calls_since"] = 0
+                snapshot["next_steps_due"] = False
+            return
+        count = snapshot.get("next_steps_calls_since", 0) + 1
+        snapshot["next_steps_calls_since"] = count
+        if name in NEXT_STEPS_TRIGGERS or count >= self.next_steps_every:
+            snapshot["next_steps_due"] = True
+
     def _record_tool_outcome(
         self,
         record,
@@ -3711,7 +3738,7 @@ class CoreAgent:
         active_result_token_limit=None,
     ):
         self._apply_response_files(snapshot, call, not isinstance(outcome, ToolResult) or outcome.status == "succeeded")
-        if self.material_review_store is not None and call.name != RESPONSE_BEGIN_TOOL.name:
+        if self.material_review_store is not None and call.name not in {RESPONSE_BEGIN_TOOL.name, NEXT_STEPS_TOOL}:
             completed = snapshot.get("pending_completed_result")
             if completed is None:
                 if call.name in {"core_agent_send_message", "core_task_get", "core_task_list", "core_task_wait"}:
@@ -3867,6 +3894,7 @@ class CoreAgent:
             **({"error_code": error_code} if error_code else {}),
             **({"output": self._value(output)} if self.log_content else {}),
         )
+        self._note_next_steps(snapshot, call.name, succeeded)
         updated = self._record_transition(
             record,
             state="RUNNING",
@@ -4127,6 +4155,9 @@ class CoreAgent:
         if call.name == RESPONSE_BEGIN_TOOL.name:
             snapshot["response_phase"] = "answer"
             return self._record_tool_outcome(record, snapshot, call, {"phase": "answer"},
+                lease_token=lease_token, span=span, active_result_token_limit=active_result_token_limit)
+        if call.name == NEXT_STEPS_TOOL:
+            return self._record_tool_outcome(record, snapshot, call, NEXT_STEPS_RESULT,
                 lease_token=lease_token, span=span, active_result_token_limit=active_result_token_limit)
         if call.name == "core_agent_send_message" and self.remote_registry is not None:
             try:
@@ -4879,6 +4910,10 @@ class CoreAgent:
                             else self._tool_catalog(effective, discovered, snapshot, tenant_id=record.tenant_id,
                                                     root_run=record.parent_run_id is None, owner_id=record.owner_id)
                         )
+                        force_next_steps = (NEXT_STEPS_TOOL in model_tools and self.next_steps_every is not None
+                                            and record.parent_run_id is None and snapshot.get("next_steps_due", True))
+                        if not force_next_steps:
+                            model_tools.pop(NEXT_STEPS_TOOL, None)
                         model_instructions = (self._compile_instructions(raw, effective, snapshot, model_tools=model_tools, owner_id=record.owner_id).text
                                               if self.reply_hub is not None or (record.owner_id or "").startswith("external-")
                                               else self._instructions(snapshot))
@@ -4993,6 +5028,7 @@ class CoreAgent:
                                     instructions=model_instructions,
                                     messages=model_messages,
                                     **delta,
+                                    **({"tool_choice": NEXT_STEPS_TOOL} if force_next_steps else {}),
                                 )
                                 if call_finalizer_model
                                 else ModelResponse()
@@ -5122,6 +5158,16 @@ class CoreAgent:
                             else {}
                         ),
                     )
+                    if force_next_steps and not any(
+                            item["name"] == NEXT_STEPS_TOOL for item in response_data["tool_requests"]):
+                        self._log(
+                            "next_steps.ignored",
+                            run_id=record.run_id,
+                            task_id=record.task_id,
+                            turn=snapshot["turns"],
+                            action=action,
+                            tool_calls=[item["tool_name"] for item in tool_calls],
+                        )
                     for item in response.tool_requests:
                         if not finalizing:
                             if self.material_review_store is None:
@@ -7552,10 +7598,25 @@ class CoreAgent:
                 error_code=getattr(error, "code", type(error).__name__),
             )
 
+    def _delay_recovery(self, task_id):
+        """Pause recovery of a task whose model provider keeps failing, with a growing delay."""
+        now = time.monotonic()
+        with self._recovery_lock:
+            failures, retry_at = self._recovery_backoff.get(task_id, (0, now))
+            if now - retry_at > RECOVERY_BACKOFF_RESET_SECONDS:
+                failures = 0
+            delay = RECOVERY_BACKOFF_SECONDS[min(failures, len(RECOVERY_BACKOFF_SECONDS) - 1)]
+            self._recovery_backoff[task_id] = (failures + 1, now + delay)
+        self._log("workflow.recovery.delayed", task_id=task_id, failures=failures + 1, delay_seconds=delay)
+
     def _resume_recovered_workflow(self, candidate, control):
         try:
             self.resume_task(candidate.task_id, cancel_event=control)
+            with self._recovery_lock:
+                self._recovery_backoff.pop(candidate.task_id, None)
         except CoreError as error:
+            if error.code == "MODEL_UNAVAILABLE":
+                self._delay_recovery(candidate.task_id)
             if error.code not in {
                 "WORKER_STOPPED",
                 "TASK_CANCELLED",
@@ -7566,6 +7627,8 @@ class CoreAgent:
                     run_id=candidate.run_id,
                     task_id=candidate.task_id,
                     error_code=error.code,
+                    # Provider status and error body; never includes the request or credentials.
+                    **({"error_message": error.message[:300]} if error.code == "MODEL_UNAVAILABLE" else {}),
                 )
         except Exception as error:
             self._log(
@@ -7588,6 +7651,7 @@ class CoreAgent:
             if (
                 self._recovery_stop.is_set()
                 or candidate.task_id in self._recovery_workers
+                or time.monotonic() < self._recovery_backoff.get(candidate.task_id, (0, 0.0))[1]
             ):
                 return False
             control = _TaskControlEvent()

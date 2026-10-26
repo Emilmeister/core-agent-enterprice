@@ -86,7 +86,7 @@ def _validate(values, *, create=False):
     if not _text(url, 4096) or any(char.isspace() or ord(char) < 32 or 127 <= ord(char) < 160 for char in url):
         raise _invalid()
     try:
-        parsed = _validate_endpoint(url)
+        parsed = _validate_endpoint(url, allow_local_insecure=True)
         port = parsed.port
         if (not parsed.hostname or parsed.username is not None or parsed.password is not None
                 or "?" in url or "#" in url or (port is not None and not 1 <= port <= 65535)

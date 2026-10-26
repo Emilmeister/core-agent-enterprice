@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import json
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from http.client import HTTPException
@@ -44,6 +45,7 @@ class ModelCall:
     tools: frozenset[str]
     instructions: str
     messages: tuple[dict, ...] = ()
+    tool_choice: str | None = None
 
 
 class ScriptedModel:
@@ -55,9 +57,9 @@ class ScriptedModel:
     def calls(self):
         return tuple(self._calls)
 
-    def generate(self, *, context, tools, instructions, messages=None):
+    def generate(self, *, context, tools, instructions, messages=None, tool_choice=None):
         self._calls.append(
-            ModelCall(context, frozenset(tools), instructions, tuple(messages or ()))
+            ModelCall(context, frozenset(tools), instructions, tuple(messages or ()), tool_choice)
         )
         if not self._responses:
             raise CoreError("MODEL_UNAVAILABLE")
@@ -89,6 +91,7 @@ class CompatibleHttpModel:
         endpoint=None,
         api_key=None,
         timeout=120,
+        total_timeout=None,
         max_tokens=4096,
         headers=None,
         extra_body=None,
@@ -135,6 +138,9 @@ class CompatibleHttpModel:
         self.configured_provider = provider
         self.api_key = api_key
         self.timeout = float(timeout)
+        self.total_timeout = None if total_timeout is None else float(total_timeout)
+        if self.total_timeout is not None and self.total_timeout <= 0:
+            raise CoreError("CONFIG_INVALID", "LLM_TOTAL_TIMEOUT must be positive")
         self.max_tokens = int(max_tokens)
         self.headers = dict(headers or {})
         self.extra_body = dict(extra_body or {})
@@ -389,7 +395,7 @@ class CompatibleHttpModel:
             }
         ]
 
-    def _request(self, context, instructions, tools, messages=None):
+    def _request(self, context, instructions, tools, messages=None, tool_choice=None):
         schemas, reverse = self._tools(tools)
         messages = list(messages or ({"role": "user", "content": context},))
         # Historical protocol is replay data, not the current dispatch authority.
@@ -429,6 +435,14 @@ class CompatibleHttpModel:
             )
         if schemas:
             body["tools"] = schemas
+            # The runtime may force one tool from the current catalog, by canonical name.
+            forced = next((wire for wire, name in reverse.items() if name == tool_choice), None)
+            if forced is not None:
+                body["tool_choice"] = (
+                    {"type": "function", "function": {"name": forced}}
+                    if self.api_format == "openai"
+                    else {"type": "tool", "name": forced}
+                )
         body = normalize_structured_output_body(
             body, self.structured_output, provider=self.configured_provider,
             native_anthropic=self.api_format == "anthropic",
@@ -617,10 +631,20 @@ class CompatibleHttpModel:
             on_delta(public, self._canonical_text(reasoning, reverse) or embedded)
 
         headers = {**headers, "Accept": "text/event-stream"}
-        with self._opened(body, headers) as stream:
+        deadline = None if self.total_timeout is None else time.monotonic() + self.total_timeout
+        with self._opened(body, headers) as response:
+            stream = response if deadline is None else self._until(response, deadline)
             if self.api_format == "openai":
                 return self._stream_openai(stream, publish)
             return self._stream_anthropic(stream, publish)
+
+    @staticmethod
+    def _until(stream, deadline):
+        """Yield stream lines until the whole response exceeds LLM_TOTAL_TIMEOUT."""
+        for raw in stream:
+            if time.monotonic() > deadline:
+                raise CoreError("MODEL_UNAVAILABLE", "model response exceeded LLM_TOTAL_TIMEOUT", retryable=True)
+            yield raw
 
     def _post(self, body, headers):
         with self._opened(body, headers) as response:
@@ -831,9 +855,9 @@ class CompatibleHttpModel:
             **usage_fields,
         )
 
-    def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+    def generate(self, *, context, tools, instructions, messages=None, on_delta=None, tool_choice=None):
         body, headers, reverse = self._request(
-            context, instructions, tools, messages=messages
+            context, instructions, tools, messages=messages, tool_choice=tool_choice
         )
         if self.stream:
             body["stream"] = True
