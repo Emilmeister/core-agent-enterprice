@@ -408,8 +408,9 @@ Telemetry после rollout получает 403; startup-логи подтве
 `X-API-KEY` — 400 `invalid api key secret`. Без ключа gateway отвечает 401
 с `WWW-Authenticate: X-API-KEY`. Таким образом, для платформенного alias
 `OTEL_ENDPOINT_API_KEY` требуется формат `Authorization: Api-Key`.
-Выбор Api-Key для этого alias исправлен и проверен локально; новый образ
-с исправлением ещё не опубликован, Cloud deployment не обновлён.
+Выбор Api-Key для этого alias исправлен и проверен локально; исправление вошло
+в опубликованный candidate `cloudru-validation-batch3-20261026`.
+Rollout этого пакета в Cloud пока не подтверждён.
 Настоящий ключ не использовался: его права и успешную доставку spans после
 исправления ещё предстоит подтвердить. Доступность значения ключа в UI
 не проверялась.
@@ -476,3 +477,50 @@ seccomp и другие ограничения могут вернуть оди�
 только проверенные действия, а готовность sandbox определяет полный preflight
 выбранного backend. Локальные tests и успешная сборка образа не заменяют эту
 проверку реального Pod.
+
+Локальная диагностика повторного вопроса выполнена на собственной PostgreSQL
+в Docker и модели из локальной `.env` (DeepSeek, не deployed Qwen). Подтверждены
+сохранность ответов/summary через два app/pool reopen и два отдельных дефекта:
+приём полностью пустой summary и отсутствие пояснения о продолжении по
+сохранённому прогрессу. Пустая summary теперь отвергается без потери context,
+а model-facing summary текущей задачи поясняет продолжение без повторения
+завершённых шагов, с учётом framing в base budget.
+На одинаковой корректной summary живая модель после такого пояснения выдала
+ожидаемый итог без нового вопроса. Облачный Qwen gate остаётся отдельной
+проверкой; локальный результат не подтверждает состояние Cloud deployment.
+
+Полный финальный локальный replay также прошёл: два реальных summary подряд
+сохранили оба ответа, следующий model call выдал актуальные значения без нового
+вопроса. Это три HTTP200 вызова с явными output caps; итог содержит JSON и
+поясняющий текст. Проверка Cloud.ru Qwen на новом образе ещё не выполнена.
+
+### Опубликованный candidate и полная регрессия
+
+Первый полный прогон нового пакета 26 октября завершился с exit 1:
+2442 tests за 516,423 секунды, 2 errors и 16 skips; receipt подтверждает
+`source_unchanged=true`. Два теста с маленькими контекстными окнами перестали
+помещаться после добавления framing reserve и расширения summary instructions.
+Только их fixture windows пересчитаны с 870 до 917 и с 2000 до 2161;
+прежние assertions и runtime budget guards сохранены. Обе целевые проверки
+после изменения прошли за 0,011 секунды. Повторный полный suite v2 завершился
+в `15:47:23 UTC`: 2442 tests за 421,077 секунды, exit 0, 16 skips;
+receipt подтверждает `source_unchanged=true` и отсутствие изменённых source files.
+Пропуски не считаются успешным прохождением соответствующих release gates.
+
+В `15:49:21 UTC` опубликован linux/amd64 candidate
+`blockchain.cr.cloud.ru/core-agent-gn:cloudru-validation-batch3-20261026`.
+Registry-проверка подтвердила этот tag и `latest` с одинаковым digest
+`sha256:fa86321ac341570c4f8664e26c7b697658851cda74fb106a30df7dbe0201bd96`.
+Image smoke завершился с exit 0: проверены HTTP output caps обоих provider
+formats, framing текущей summary и отказ от полностью пустой summary.
+Checksum шести изменённых implementation-файлов совпал с рабочей копией.
+Rollout этого candidate в Cloud не подтверждён. Этот smoke и локальный
+DeepSeek replay не закрывают native/browser gates, Cloud Qwen replay или
+экспорт telemetry с настоящим injected key.
+
+Безопасные receipts в ignored `.enterprise-work/`:
+`cloudru-batch3-full-local-20261026.json`,
+`cloudru-batch3-full-local-v2-20261026.json`,
+`cloudru-batch3-image-build-20261026.json`,
+`cloudru-batch3-image-smoke-20261026.json` и
+`cloudru-batch3-image-published-20261026.json`.

@@ -114,6 +114,13 @@ Database credentials являются Platform/deployment config и никогд
 
 Пул MUST проверять соединение перед выдачей и заменять непригодное. Managed PostgreSQL и сетевые посредники закрывают простаивающие соединения молча, поэтому без проверки первый запрос после паузы падает с транспортной ошибкой, хотя база доступна. Отказ MUST NOT доходить до caller как сбой задачи: замена соединения относится к обслуживанию пула, а не к семантике запроса.
 
+Defaults пула: `DATABASE_POOL_MIN=1`, `DATABASE_POOL_MAX=10`,
+`DATABASE_CONNECT_TIMEOUT_SECONDS=10`. Пустые и состоящие из пробелов значения
+MUST использовать эти defaults. Minimum — целое не меньше нуля, maximum —
+положительное целое не меньше minimum; timeout — конечное положительное число.
+Невалидные значения MUST отклоняться с `CONFIG_INVALID` до создания pool и
+подключения, без раскрытия исходного значения или credentials.
+
 `DATABASE_AUTO_MIGRATE=false` обязателен production: migration job с DDL role выполняется до app rollout, выдаёт app role только необходимые DML grants, затем app role проверяет schema version. Production startup MUST reject `DATABASE_AUTO_MIGRATE=true`. Test profile MAY явно выбрать SQLite/in-memory adapter; implicit fallback при отсутствии PostgreSQL запрещён.
 
 Production deployment MUST задавать `DURABLE_STORAGE_ROOT` для immutable blobs, snapshots, manifests и artifacts; в Keycloak S3-backed mount допустим. В явном [Cloud.ru профиле](cloudru.md) production требует `WORKSPACE_STORAGE_TYPE=s3`, а `DURABLE_STORAGE_ROOT` является только локальным cache для S3 bytes; S3 SDK settings и ограничения задаёт CLD-04. `LOCAL_WORKSPACE_ROOT` MUST указывать на локальную ephemeral filesystem container-а. Авторизованное развёртывание MUST явно задавать `CHAT_WORKSPACE_ROOT`; в профиле `keycloak` это постоянный POSIX том, в Cloud.ru — RAM cache с обязательным S3 commit/restore для production. Ограниченный development trial MAY использовать временную FS. Все три root MUST быть различны и не находиться друг внутри друга; startup отклоняет пересечение в любом направлении. Optional `LOCAL_BASE_SNAPSHOT` содержит content-addressed snapshot ID для ephemeral scratch; если он задан, startup проверяет commit manifest и все blobs до первого terminal call. Он не материализуется поверх постоянной папки чата и не поддержан в S3 workspace profile. Active workspace никогда не размещается под `DURABLE_STORAGE_ROOT`.
@@ -160,6 +167,14 @@ Enterprise v1 включает owner HITL поверх неизменного pl
 - Core Agent не выполняет implicit memory retrieval/write.
 
 `optional` включает память, если backend доступен. `required` требует работоспособный backend до первого model turn: его отсутствие является ошибкой старта, а не тихой деградацией.
+
+Любое явно заданное значение `features.memory` вне этих трёх режимов MUST
+отклоняться с `CONFIG_INVALID`, включая boolean и null; ошибка не отражает
+исходное значение. Явно включённая optional capability MUST входить в
+`PlatformConfig.supported_features`, иначе её tools и kernel policy отсутствуют.
+`response_files: false` отключает оба имени: `core_response_files` и
+`core_response_artifacts`, в том числе в финальной фазе ответа. Пропущенные
+переключатели сохраняют существующие defaults и остальные tool filters.
 
 ## Deployment variables
 
@@ -240,6 +255,14 @@ legacy routes только в явно выбранном development/test profi
 | `LLM_EXTRA_BODY_JSON` | `{}` | Дополнительные поля тела; explicit `THINKING_LEVEL` имеет приоритет над совпадающим полем. `tools`, `tool_choice`, legacy `functions` и `function_call` из этого объекта игнорируются: каталог задаётся только текущими разрешёнными tools runtime |
 | `THINKING_ENABLED` | `true` | `false` MUST отправлять явный effort `none` |
 | `THINKING_LEVEL` | provider default | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+
+Выходной лимит MUST попадать в каждый HTTP request, включая streaming. OpenAI
+использует `max_tokens`, либо `max_completion_tokens`, если это имя явно задано
+в дополнительных параметрах; одновременно оба поля не отправляются. Anthropic
+использует `max_tokens`. Положительный целочисленный provider cap MAY уменьшить
+лимит adapter, но MUST NOT увеличить его; неверный тип, нулевой или отрицательный
+cap отклоняется до запроса без raw value в ошибке. Summary сохраняет собственный
+лимит и ограничение свободным местом по [context.md](context.md).
 
 Guardrails использует отдельный context без tools. Если четыре connection
 переменные ниже пусты, используется подключение модели агента с отдельным
@@ -454,6 +477,17 @@ Snapshot содержит versions/digests profile prompt, kernel policy packs, 
   A2A входах и обоих well-known путях; `allow` и `require_hitl` остаются видимыми
   внутри platform ceiling. Изменение policy не требует перезапуска приложения.
 - Audit/OTel записывают config version/digest без secret values.
+
+Новые root, delegated и background snapshots MUST сохранять
+`capability_filter_version=1`. Recovery snapshot без этого поля MAY проверить
+сохранённый digest по прежним правилам feature filtering, включая сочетание с
+legacy skill digest. Такой расчёт служит только проверке согласованности snapshot:
+каталог модели и dispatch MUST использовать текущий строгий compiler внутри
+admission ceiling. Новый digest и version сохраняются атомарно с восстановленным
+состоянием. Snapshot с version 1 не принимает legacy feature digest; неизвестная
+или нецелочисленная version, включая boolean/null, даёт `CHECKPOINT_INVALID`
+до workspace/discovery и до использования runtime cache. Legacy проверка не
+возвращает запрещённые инструменты и не меняет output-contract pin задачи.
 
 ## Границы гибкости
 

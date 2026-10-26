@@ -1,8 +1,12 @@
+import asyncio
 import copy
+import io
 import json
 import os
+import tempfile
 import threading
 import unittest
+import uuid
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -156,3 +160,185 @@ class PostgresCompactionFailureTests(CompactionFailureTests):
         agent.checkpoint_store = PostgresCheckpointStore(database)
         agent.audit_log = PostgresAuditLog(database)
         return agent, model, connector, summaries
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "TEST_DATABASE_URL is required")
+class PostgresOwnerAnswerCompactionTests(unittest.TestCase):
+    def test_two_answered_questions_survive_pressure_compaction_and_restart_on_model_wire(self):
+        """Prove runtime dataflow with valid summaries, not model retention quality."""
+        import psycopg
+        from psycopg.conninfo import make_conninfo
+        from psycopg.sql import Identifier, SQL
+        from a2a.types import Message, Role
+        from core_agent.auth import AuthenticatedCallContext, Principal, ScopeUser
+        from core_agent.context import SUMMARY_SECTIONS
+        from core_agent.database import PostgresDatabase
+        from core_agent.model import CompatibleHttpModel
+        from core_agent.runtime import CURRENT_TASK_SUMMARY_PREFIX
+        from tests.app_support import create_app
+
+        class ProcessStopped(BaseException):
+            pass
+
+        summary_inputs, normal_wires, summaries, rendered_summaries = [], [], [], []
+        final = {"route": "ROUTE_C", "artifact": "artifact-retention",
+                 "amount": "427.50 EUR", "release": "PENDING; NOT RELEASED"}
+        questions = [{"question": f"Ready for batch {index}?", "options": [f"GO{index}"]}
+                     for index in (1, 2)]
+
+        class Model(CompatibleHttpModel):
+            def _open(inner, body, headers):
+                if "response_format" in body:
+                    self.assertNotIn("tools", body)
+                    data = json.loads(body["messages"][-1]["content"])
+                    summary_inputs.append(data)
+                    index = len(summary_inputs)
+                    records = json.dumps(data["records"])
+                    answered = [json.loads(item["content"]) for item in data["records"] if item["kind"] == "tool_result"]
+                    answered = [item for item in answered if item["tool_call_id"] == f"ask-{index}"]
+                    self.assertEqual(answered, [{"tool_call_id": f"ask-{index}", "tool_name": "core_ask_owner",
+                                                "status": "succeeded", "output": {"answer": f"GO{index}"}}])
+                    calls = [call for item in data["records"] if item["kind"] == "assistant_tool_calls"
+                             for call in json.loads(item["content"]) if call["id"] == f"ask-{index}"]
+                    self.assertEqual(calls, [{"id": f"ask-{index}", "function": {
+                        "name": "core_ask_owner", "arguments": questions[index - 1]}}])
+                    self.assertTrue(f"ROUTE_{'B' if index == 1 else 'C'}" in records, f"summary {index} lost latest route")
+                    if index == 2:
+                        self.assertTrue("Question 1 answered GO1" in records,
+                                        "second summary input lost the completed first question")
+                    sources = list(dict.fromkeys(source for item in data["records"]
+                                                 for source in item["sources"]))
+                    value = {section: [] for section in SUMMARY_SECTIONS}
+                    facts = {
+                        "Decisions": f"Latest route ROUTE_{'B' if index == 1 else 'C'}; amount 427.50 EUR.",
+                        "Completed": "; ".join(f"Question {i} answered GO{i}; batch {i} received" for i in range(1, index + 1)),
+                        "Artifacts": "artifact-retention",
+                        "Pending": "Ask question 2" if index == 1 else "Both questions answered; return final JSON. Release PENDING; NOT RELEASED.",
+                    }
+                    for section, text in facts.items():
+                        evidence = ([source for source in sources if source.rsplit(":", 1)[1] in {"3", "4", "6", "7"}]
+                                    if section == "Completed" else sources[-1:])
+                        value[section] = [{"text": text, "basis": "fact", "sources": evidence}]
+                    content = json.dumps(value, separators=(",", ":"))
+                    summaries.append(content)
+                    message = {"role": "assistant", "content": content}
+                else:
+                    normal_wires.append(copy.deepcopy(body))
+                    index = len(normal_wires)
+                    if index > 1:
+                        self.assertTrue(any(message.get("content") == rendered_summaries[index - 2]
+                                            for message in body["messages"]))
+                    if index < 3:
+                        message = {"role": "assistant", "content": None, "tool_calls": [{
+                            "id": f"ask-{index}", "type": "function", "function": {
+                                "name": "core_ask_owner", "arguments": json.dumps(questions[index - 1])}}]}
+                    else:
+                        message = {"role": "assistant", "content": json.dumps(final)}
+                return io.BytesIO(json.dumps({"choices": [{"message": message,
+                    "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]}).encode())
+
+        url = os.environ["TEST_DATABASE_URL"]
+        schema = "owner_compaction_" + uuid.uuid4().hex
+        with psycopg.connect(url, autocommit=True) as connection:
+            connection.execute(SQL("CREATE SCHEMA {}").format(Identifier(schema)))
+        def remove_schema():
+            with psycopg.connect(url, autocommit=True) as connection:
+                connection.execute(SQL("DROP SCHEMA {} CASCADE").format(Identifier(schema)))
+        self.addCleanup(remove_schema)
+        dsn = make_conninfo(url, options="-c search_path=" + schema)
+        model = Model(api_format="openai", model="local-retention", base_url="https://model.test/v1")
+        prompt = ("Ask exactly two owner questions, in order: " + json.dumps(questions)
+                  + ". After each answer read its batch. Batch 2 supersedes batch 1. Return latest route, "
+                  "artifact, amount, release as JSON. Do not repeat answered questions. ")
+        prompt += "Inert archive padding. " * ((5409 - len(prompt)) // 22 + 1)
+        prompt = prompt[:5409]
+        batches = [(f"Batch {index}: latest ROUTE_{route}; artifact-retention; 427.50 EUR; "
+                    "release PENDING; NOT RELEASED. " + "Inert archive padding. " * 1800)[:39300]
+                   for index, route in ((1, "B"), (2, "C"))]
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+            "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+            "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/blobs",
+            "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "CORE_AGENT_ALLOWED_BUILTIN_TOOLS": "core_ask_owner",
+            "CHAT_WORKSPACE_ROOT": root + "/chats", "CORE_AGENT_TENANT_ID": "tenant",
+            "KEYCLOAK_ISSUER_URL": "https://issuer.test/realms/test", "KEYCLOAK_CLIENT_ID": "test-agent",
+            "KEYCLOAK_CLIENT_SECRET": "test-only-secret", "KEYCLOAK_AUDIENCE": "test-agent",
+            "CORE_AGENT_ALLOWED_SKILLS": "", "LLM_CONTEXT_WINDOW": "20480", "LLM_MAX_TOKENS": "4096",
+            "EVENTS_COMPACTION_INTERVAL": "0", "LOG_LEVEL": "ERROR",
+        }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
+            def reopen():
+                database = PostgresDatabase(dsn, min_size=0, max_size=3)
+                self.addCleanup(database.close)
+                database.migrate()
+                app = create_app(model=model, database=database)
+                self.addCleanup(app.state.close)
+                store = app.state.core_agent.interaction_store
+                policy = store.get_policy("tenant", "core_ask_owner", "builtin:core_ask_owner")
+                if policy.mode != "allow":
+                    store.update_policy("tenant", "core_ask_owner", "builtin:core_ask_owner", mode="allow",
+                                        guardrails_exempt=False, expected_revision=policy.revision, actor_id="test-owner")
+                return app, app.state.core_agent
+
+            app, agent = reopen()
+            actor = Principal("owner", "tenant", True, False)
+            call_context = AuthenticatedCallContext(user=ScopeUser(actor.owner_id), tenant="tenant",
+                                                    state={"principal": actor})
+            admitted = asyncio.run(app.state.a2a_request_handler.admission_handler(
+                Message(message_id="retention-input", context_id="retention-chat", role=Role.ROLE_USER,
+                        parts=[{"text": prompt}]), call_context))
+            task_id = admitted.task.id
+            agent.workflow_store.release_lease(admitted.run_id, tenant_id="tenant",
+                                               worker_id=agent._worker_id, token=admitted.lease_token)
+            agent.resume_task(task_id)
+            instructions = agent.workflow_store.lookup_task(task_id).snapshot["compiled_instructions"]
+            transcripts = []
+            for index, batch in enumerate(batches, 1):
+                record = agent.workflow_store.lookup_task(task_id)
+                self.assertEqual(record.state, "WAITING_INPUT")
+                wait = agent.workflow_store.get_wait(record.snapshot["wait_id"], tenant_id="tenant")
+                self.assertEqual(wait.subject, questions[index - 1])
+                agent.enqueue_message({"prompt": batch}, task_id=record.task_id, message_id=f"batch-{index}",
+                                      identity=actor.owner_id, session_id=record.context_id, tenant_id="tenant")
+                agent.workflow_store.resolve_wait(wait.wait_id, tenant_id="tenant",
+                                                  outcome={"reason": "answer", "answer": f"GO{index}"})
+                compact = agent._compact_context
+                def stop_after_commit(*args, **kwargs):
+                    self.assertEqual(args[2].budget.system_and_kernel_tokens,
+                                     agent.token_counter(agent._request_instructions(instructions))
+                                     + agent.token_counter(CURRENT_TASK_SUMMARY_PREFIX))
+                    saved = compact(*args, **kwargs)
+                    if len(summaries) == index:
+                        raise ProcessStopped()
+                    return saved
+                with patch.object(agent, "_compact_context", side_effect=stop_after_commit):
+                    with self.assertRaises(ProcessStopped):
+                        agent.resume_task(record.task_id)
+                saved = agent.workflow_store.lookup_task(record.task_id)
+                context = copy.deepcopy(saved.snapshot["context"])
+                transcripts.append(context["transcript"])
+                summary = next(item for item in context["active"] if item["kind"] == "summary")
+                self.assertEqual(json.loads(summary["content"]), json.loads(summaries[-1]))
+                rendered_summaries.append(agent._model_content(next(
+                    item for item in agent._context_from_dict(context).active if item.kind == "summary")))
+                self.assertEqual(next(item["content"] for item in context["active"] if item["kind"] == "prompt"), prompt)
+                self.assertEqual(len(context["transcript"]), 1 + 3 * index)
+                self.assertEqual(set(summary["provenance"]["sources"]),
+                                 {f"{record.run_id}:{sequence}" for sequence in range(1, 2 + 3 * index)})
+                app.state.close()
+                app, agent = reopen()
+                restored = agent.workflow_store.lookup_task(record.task_id).snapshot
+                self.assertEqual(restored["context"], context)
+                self.assertEqual(restored["compiled_instructions"], instructions)
+                result = agent.resume_task(record.task_id)
+                self.assertEqual(len(summaries), index, "Restart must reuse the committed summary")
+            self.assertEqual(json.loads(result.message), final)
+            self.assertEqual((result.usage.model_turns, result.usage.tool_calls), (5, 2))
+            self.assertEqual(transcripts[1][:len(transcripts[0])], transcripts[0])
+            record = agent.workflow_store.lookup_task(task_id)
+            events = [event.data for event in agent.event_store.events(record.run_id, tenant_id="tenant")
+                      if event.kind == "context.compacted"]
+            self.assertEqual([event["replaced_sequence_range"] for event in events], [[1, 4], [1, 7]])
+            self.assertTrue(all(event["before"] >= 0.90 * event["working_capacity"] for event in events))
+            self.assertEqual(len(normal_wires), 3)
+            self.assertTrue(all(wire["messages"][0]["content"].startswith(instructions + "\n\n")
+                                for wire in normal_wires))

@@ -184,7 +184,8 @@ criterion должны войти в тот же завершённый change. 
   `KEYCLOAK_*`. Agent environment явно передаёт поддержанные model/guardrails,
   runtime/compaction, memory и telemetry настройки из `.env.example`. Выход summary
   отдельно ограничен `LLM_SUMMARY_MAX_TOKENS` (32768), обычные ответы —
-  `LLM_MAX_TOKENS`. Owner override `context_window` сохраняется в snapshot новых
+  `LLM_MAX_TOKENS`; HTTP adapter передаёт cap и для streaming, а provider options
+  могут только уменьшить его. Owner override `context_window` сохраняется в snapshot новых
   задач и наследуется children; `null` использует `LLM_CONTEXT_WINDOW`.
   Образ включает Git; отсутствие исполняемой команды внутри sandbox даёт
   `COMMAND_NOT_FOUND`, невозможность запуска существующего файла —
@@ -756,9 +757,14 @@ run получает отдельные MCP session и negotiated version; пе�
   lease/storage ошибки не поглощаются. Overlap освобождается, если занимает
   всю цель; pinned выше цели получает реальное оставшееся место для summary.
 - Production `StructuredSummarizer` получает отдельный model callback без tools
-  и проверяет семь JSON-секций, basis и immutable source IDs. Runtime до каждой
+  и проверяет семь JSON-секций, basis и immutable source IDs; полностью пустая
+  summary не заменяет исходный context. Ответы владельца сохраняются как
+  завершённые действия со связью вопроса, ответа и call ID. Runtime до каждой
   физической попытки сохраняет marker и списывает общий/local model budget;
   максимум две попытки, reserved finalization turn не расходуется на summary.
+- Model-facing summary текущей задачи помечается как ранее выполненная работа;
+  история прежних задач не получает это пояснение и не возобновляет свои цели.
+  Fixed framing учитывается в base budget, persisted JSON/provenance не меняются.
 - Provenance и current material decisions проверяются до compaction и model
   call. Summary с запрещённым источником целиком исключается; допустимые originals
   восстанавливаются без provider replay и недоставленных failure/cancel inputs.

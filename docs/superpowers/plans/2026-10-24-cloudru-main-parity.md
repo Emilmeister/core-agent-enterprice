@@ -741,12 +741,123 @@ gates; новые snapshots сохраняют версию фильтра. Пл
 замечаний; отдельная inline-проверка подтвердила историческую проверку digest
 при строгом dispatch. Receipt: `cloudru-final-local-batch-20261026.json`.
 
-Использованы существующие tests: frozen tests/spec не менялись, поскольку
-свежее разрешение на их изменение ещё ожидается. Новые regression checks
-пока не включены в CI. Skips не закрывают обязательные native/browser gates.
-Новый образ с этими изменениями не опубликован и Cloud deployment не обновлён.
+На момент этого прогона использованы существующие tests. Позднее пользователь
+явно разрешил изменение frozen tests/spec; в следующем локальном пакете
+добавлены regression checks и обновлены нормативные документы. Skips не закрывают
+обязательные native/browser gates.
+Сборка и публикация candidate по итогам дополнительной регрессии описаны ниже;
+rollout этого пакета в Cloud пока не подтверждён.
 Успешный экспорт с настоящим injected key и сохранение задания после повторного
 сжатия по-прежнему не доказаны; локальный suite не закрывает эти live gates.
+
+### Локальная диагностика на собственной PostgreSQL в Docker
+
+По явному указанию пользователя диагностика продолжена локально. Cloud.ru
+Kubernetes и platform PostgreSQL недоступны оператору напрямую; доступ к ним
+для этой проверки не требуется. Локальная тестовая schema изолирована и удаляется
+fixture после проверки; credentials production не используются для базы.
+
+Новый PostgreSQL regression воспроизводит два вопроса владельцу, два больших
+follow-up, два pressure compaction и два открытия нового app/pool. Он проверяет
+точные пары вызов/успешный ответ `GO1` и `GO2`, сохранённый kernel и его budget,
+original provenance, неизменный transcript и следующий HTTP model payload.
+Валидные scripted summaries сохраняются корректно; это доказательство persistence
+и assembly, отдельно от качества живой модели.
+
+Локальная `.env` предоставляет DeepSeek endpoint, отличный от deployed Qwen.
+На захваченных PostgreSQL model inputs живая модель сначала выдала summary со
+всеми семью пустыми секциями. Старый валидатор принял её. Новый валидатор
+отклоняет такую summary как `invalid_summary`, оставляя исходный context;
+отдельные пустые секции допустимы. Prompt суммаризации теперь явно сохраняет
+подтверждённые ответы владельца и call IDs как завершённые действия.
+
+После этого обе summary содержали ответы и актуальные значения, но ordinary
+model call всё равно повторял первый вопрос. Контролируемое сравнение одной
+и той же summary при temperature=0 подтвердило: raw JSON приводит к повтору,
+пояснение о сохранённом ходе задачи — к правильному итоговому JSON без tools.
+Такое пояснение добавляется к model-facing summary текущей задачи; previous-task
+history его не получает и не возобновляет старые цели, summary не выдаёт permissions.
+Fixed framing учитывается в base budget, persisted summary JSON не меняется.
+Изменение base kernel для этого исправления не требуется.
+
+При проверке actual HTTP body также выявлен отсутствующий ordinary OpenAI
+output cap. Общий adapter теперь передаёт единственный корректный cap для
+OpenAI/Anthropic и streaming; extra-body может только уменьшить ceiling.
+Отдельный summary output limit сохраняется. Regression checks сначала дали
+ожидаемые ошибки на прежнем коде, затем прошли с исправлениями.
+
+Диагностические receipts в ignored `.enterprise-work/`:
+`cloudru-regression-prefixed-20261026.receipt.json`,
+`cloudru-local-pg-compaction-wire-framed-20261026.json`,
+`cloudru-local-summary-framing-ab-20261026.json`,
+`cloudru-local-summary-kernel-guidance-20261026.json`.
+Первый model replay не передавал output cap; v2/v3 использовали окно 20000
+вместо 20480 в PostgreSQL fixture. Они сохраняются как диагностические попытки,
+а не доказательство точного production request. Финальная проверка использует
+обновлённый capture с framing, окно 20480 и явные HTTP caps. Локальный узкий tool catalog
+оставляет pinned prompt чуть ниже целевой доли context, поэтому его summary
+budget значительно меньше Cloud-сценария; `summary_too_large` при этом не
+обходится увеличением лимита или усечением данных.
+
+Review выявил отдельный прежний gap: cold recovery и динамический rebuild
+инструкций используют текущий KernelCompiler, а не snapshot исходных kernel
+segments. Повторное открытие той же версии приложения не доказывает неизменность
+kernel через upgrade. Этот gap не исправлен и не закрыт данным локальным proof;
+текущий пакет не меняет base kernel.
+
+Финальный локальный model replay с actual framed PostgreSQL inputs прошёл:
+две summary с первой попытки (364 и 424 оценочных токена), затем финальный
+ответ без tools и повторного вопроса. В обеих summary сохранились подтверждённые
+ответы с original source IDs; итоговый JSON содержит ROUTE_C, artifact-retention,
+427.50 EUR и PENDING/NOT RELEASED. Ответ также содержит поясняющий текст —
+strict JSON-only формат этим запуском не подтверждён. Всего три HTTP200 вызова,
+явные output caps 3996/3486/4096, TLS verification и запрет redirects.
+Receipt: `cloudru-local-pg-summary-model-replay-framed-20261026.json`.
+Это локальная DeepSeek-проверка, а не завершённый Cloud.ru Qwen gate.
+
+### Полная регрессия и опубликованный candidate нового пакета
+
+Первый полный `uv run python -m unittest discover -s tests -v` завершился
+26 октября в `15:23:24 UTC`: 2442 tests за 516,423 секунды, exit 1,
+2 errors и 16 skips; полный запуск занял 519,695 секунды.
+Receipt `cloudru-batch3-full-local-20261026.json` подтверждает
+`source_unchanged=true`. Обе ошибки относятся к прежним узким fixture budgets:
+
+- `test_public_reply_tools_free_context_fits_without_spending_summary_turn`:
+  новое резервирование framing заняло ещё 47 оценочных токенов; окно
+  пересчитано с 870 до 917.
+- `test_runtime_compacts_twice_and_keeps_prompt_and_full_transcript`:
+  расширенные summary instructions добавили 161 оценочный токен; окно
+  пересчитано с 2000 до 2161.
+
+Изменены только эти два fixture windows и поясняющие комментарии; assertions
+о двух compactions, полном transcript и ответе без дополнительного summary
+turn сохранены. Runtime validation и budget guards не ослаблены. Обе целевые
+проверки прошли за 0,011 секунды. Повторный полный suite v2 завершился
+в `15:47:23 UTC`: 2442 tests за 421,077 секунды, exit 0, 16 skips;
+полный запуск занял 424,752 секунды. Receipt
+`cloudru-batch3-full-local-v2-20261026.json` подтверждает
+`source_unchanged=true` и `changed_sources=[]`. Ordinary suite прошёл;
+пропущенные проверки не объявляются пройденными release gates.
+
+В `15:49:21 UTC` опубликован linux/amd64 candidate
+`blockchain.cr.cloud.ru/core-agent-gn:cloudru-validation-batch3-20261026`.
+Registry-проверка подтвердила этот tag и `blockchain.cr.cloud.ru/core-agent-gn:latest`
+с одинаковым digest
+`sha256:fa86321ac341570c4f8664e26c7b697658851cda74fb106a30df7dbe0201bd96`.
+Image smoke завершился с exit 0 в `15:21:29 UTC`: HTTP caps OpenAI/Anthropic,
+framing текущей summary и all-empty summary rejection проверены. SHA-256
+шести implementation-файлов (`config.py`, `database.py`, `observability.py`,
+`context.py`, `model.py`, `runtime.py`) внутри образа совпали с рабочей копией.
+Receipts: `cloudru-batch3-image-build-20261026.json`,
+`cloudru-batch3-image-smoke-20261026.json` и
+`cloudru-batch3-image-published-20261026.json` в ignored `.enterprise-work/`.
+
+Rollout этого candidate в Cloud не подтверждён. Native/browser и target Cloud
+gates, успешный экспорт с настоящим injected
+telemetry key и Cloud Qwen replay остаются отдельными обязательствами.
+Локальный DeepSeek replay выше не доказывает Cloud behavior или strict JSON-only
+ответ. Стабильность kernel snapshots через upgrade также остаётся открытым gap.
 
 ## 6. Когда цель считается достигнутой
 

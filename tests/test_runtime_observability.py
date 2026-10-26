@@ -260,6 +260,148 @@ def locked_skill_declaration(path, name):
 
 
 class RuntimeTests(unittest.TestCase):
+    def _legacy_capability_checkpoint(self, model):
+        agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=())
+        self.addCleanup(agent.close)
+        agent.platform_config.supported_features.discard("terminal")
+        agent.platform_config.supported_features.add("response_files")
+        agent.platform_config.allowed_builtin_tools.add("core_response_files")
+        raw = agent.agent_config.to_dict()
+        raw["features"]["response_files"] = False
+        raw["tools"]["builtins"]["allow"].append("core_response_files")
+        agent.agent_config = AgentConfig.from_dict(raw)
+        agent.tool_runtime.registry.register(ToolDefinition(
+            "core_response_files", "select files", {"type": "object"},
+            mutating=False, risk_tags=frozenset(),
+        ))
+        record, _raw, _discovered, effective = agent._new_workflow(
+            run_request(), task_id="legacy-capabilities", identity="owner",
+            session_id="legacy-context", tenant_id="default",
+        )
+        snapshot = copy.deepcopy(record.snapshot)
+        snapshot.pop("capability_filter_version", None)
+        # Historical checkpoints exposed these tools despite their feature gates.
+        historical = json.loads(effective.audit_snapshot)
+        historical["builtin_tools"] = sorted(set(historical["builtin_tools"]) | {
+            "core_terminal_exec", "core_response_files",
+        })
+        historical["policies"] = sorted(set(historical["policies"]) | {"response_files"})
+        snapshot["effective_config_digest"] = hashlib.sha256(
+            json.dumps(historical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        record = agent._record_transition(
+            record, state="RUNNING", snapshot=snapshot, event_kind="test.legacy-capabilities",
+        )
+        agent._runtime_cache.clear()
+        return agent, record, effective
+
+    def test_legacy_capability_digest_only_verifies_and_recovers_strict_dispatch(self):
+        for tool, arguments in (("core_terminal_exec", {"argv": ["check"]}), ("core_response_files", {})):
+            with self.subTest(tool=tool):
+                model = ScriptedModel([ModelResponse(tool_requests=(ToolRequest("old-tool", tool, arguments),))])
+                agent, record, effective = self._legacy_capability_checkpoint(model)
+                historical_digest = record.snapshot["effective_config_digest"]
+                committed = []
+                transition = agent._record_transition
+
+                def capture_transition(current, **change):
+                    saved = transition(current, **change)
+                    committed.append((change["event_kind"], copy.deepcopy(saved.snapshot)))
+                    return saved
+
+                with patch.object(agent, "_record_transition", side_effect=capture_transition), \
+                        patch.dict(agent.tool_runtime.handlers, {
+                            "core_terminal_exec": lambda *_: self.fail("disabled terminal dispatched"),
+                            "core_response_files": lambda *_: self.fail("disabled files dispatched"),
+                        }):
+                    with self.assertRaises(CoreError) as caught:
+                        agent.resume_task(record.task_id)
+
+                self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
+                self.assertNotIn("core_terminal_exec", model.calls[0].tools)
+                self.assertNotIn("core_response_files", model.calls[0].tools)
+                self.assertEqual(agent.tool_runtime.execution_count, 0)
+                self.assertNotEqual(historical_digest, effective.digest)
+                rewritten = [snapshot for kind, snapshot in committed if kind == "mcp.reconnect.completed"]
+                self.assertEqual(len(rewritten), 1)
+                self.assertEqual(rewritten[0]["capability_filter_version"], 1)
+                self.assertEqual(rewritten[0]["effective_config_digest"], effective.digest)
+                for _kind, snapshot in committed:
+                    if "capability_filter_version" in snapshot:
+                        self.assertEqual(snapshot["effective_config_digest"], effective.digest)
+                    else:
+                        self.assertEqual(snapshot["effective_config_digest"], historical_digest)
+
+    def test_current_capability_marker_rejects_historical_digest(self):
+        agent, record, _effective = self._legacy_capability_checkpoint(ScriptedModel([]))
+        snapshot = copy.deepcopy(record.snapshot)
+        snapshot["capability_filter_version"] = 1
+        record = agent._record_transition(
+            record, state=record.state, snapshot=snapshot, event_kind="test.current-marker",
+        )
+        with self.assertRaises(CoreError) as caught:
+            agent._load_workflow_runtime(record)
+        self.assertEqual(caught.exception.code, "CHECKPOINT_INVALID")
+
+    def test_invalid_capability_marker_rejected_before_workspace_and_discovery(self):
+        agent = make_agent(ScriptedModel([]), memory="disabled", mcp=False, platform_mcp=())
+        self.addCleanup(agent.close)
+        record, _raw, _discovered, _effective = agent._new_workflow(
+            run_request(), task_id="invalid-capability-marker", identity="owner",
+            session_id="marker-context", tenant_id="default",
+        )
+        cached = agent._runtime_cache[record.run_id]
+        for marker in (None, False, True, "1", 1.0, 0, 2):
+            for use_cache in (False, True):
+                with self.subTest(marker=repr(marker), cached=use_cache):
+                    if use_cache:
+                        agent._runtime_cache[record.run_id] = cached
+                    else:
+                        agent._runtime_cache.clear()
+                    invalid = copy.deepcopy(record)
+                    invalid.snapshot["capability_filter_version"] = marker
+                    with patch.object(agent, "_bind_workspace") as bind, \
+                            patch.object(agent, "_resolve_capabilities") as discover, \
+                            patch.object(agent, "_fork_mcp_connector") as connector:
+                        for load in (agent._admission_inputs, agent._load_workflow_runtime):
+                            with self.assertRaises(CoreError) as caught:
+                                load(invalid)
+                            self.assertEqual(caught.exception.code, "CHECKPOINT_INVALID")
+                        bind.assert_not_called()
+                        discover.assert_not_called()
+                        connector.assert_not_called()
+
+    def test_background_tool_checkpoint_records_capability_filter_version(self):
+        model = ScriptedModel([
+            ModelResponse(tool_requests=(ToolRequest("start", "core_task_start", {
+                "tool": "core_terminal_exec", "arguments": {"argv": ["check"]},
+                "required": True,
+            }),)),
+            ModelResponse(message="background complete"),
+        ])
+        agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=())
+        self.addCleanup(agent.close)
+        agent.tool_runtime.registry.register(ToolDefinition(
+            "core_task_start", "start background tool", {"type": "object"},
+            mutating=False, risk_tags=frozenset(),
+        ))
+        generate = model.generate
+
+        def finish_after_background(**call):
+            if model.calls:
+                parent = agent.workflow_store.lookup_task("background-marker")
+                agent.task_scheduler.wait(parent.snapshot["background_admission"]["task_id"], timeout=2)
+            return generate(**call)
+
+        with patch.object(model, "generate", side_effect=finish_after_background):
+            result = agent.run(run_request(), task_id="background-marker")
+        parent = agent.workflow_store.lookup_task("background-marker")
+        child = agent.workflow_store.lookup_task(parent.snapshot["background_admission"]["task_id"])
+        self.assertEqual(result.message, "background complete")
+        self.assertEqual(child.state, "COMPLETED")
+        self.assertEqual(child.snapshot["capability_filter_version"], 1)
+        self.assertTrue(child.snapshot["effective_config_digest"])
+
     def test_runtime_clock_refreshes_on_retry_and_recovered_finalization(self):
         model = ScriptedModel([ModelResponse(continue_reasoning=True), ModelResponse(message="Unfinished checks")])
         agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=(), max_turns=3, model_retries=1)
@@ -350,7 +492,8 @@ class RuntimeTests(unittest.TestCase):
             def generate_summary(self, **kwargs):
                 raise AssertionError("tools-free answer fits; compaction must not consume a turn")
 
-        agent = make_agent(ReplyModel(), reply_hub=ReplyHub(min_chars=1), context_window=870,
+        # Preserve the working capacity after reserving 47 summary-framing tokens.
+        agent = make_agent(ReplyModel(), reply_hub=ReplyHub(min_chars=1), context_window=917,
                            output_reserve=128, max_turns=3)
         self.addCleanup(agent.close)
         result = agent.run(RunRequest("x" * 1200), task_id="small-window-reply", identity="alice")
@@ -1905,6 +2048,7 @@ class RuntimeTests(unittest.TestCase):
             first.agent_config = AgentConfig.from_dict(raw)
             first.platform_config.allowed_skills.add("legacy-skill")
             first.platform_config.supported_features.add("skills")
+            first.platform_config.supported_features.discard("terminal")
             record, raw, discovered, effective = first._new_workflow(
                 {"prompt": "Resume legacy work"},
                 task_id="legacy-skill-task",
@@ -1914,6 +2058,7 @@ class RuntimeTests(unittest.TestCase):
             )
             snapshot = copy.deepcopy(record.snapshot)
             snapshot.pop("skill_contract_version", None)
+            snapshot.pop("capability_filter_version", None)
             snapshot.pop("skill_catalog", None)
             snapshot.pop("effective_platform_config", None)
             snapshot["admission"]["platform_config"]["supported_features"] = [
@@ -1939,7 +2084,11 @@ class RuntimeTests(unittest.TestCase):
                 discovered,
                 legacy_ungated_skills=True,
             )
-            snapshot["effective_config_digest"] = legacy_effective.digest
+            historical = json.loads(legacy_effective.audit_snapshot)
+            historical["builtin_tools"] = sorted(set(historical["builtin_tools"]) | {"core_terminal_exec"})
+            snapshot["effective_config_digest"] = hashlib.sha256(
+                json.dumps(historical, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
             compiled = first._compile_instructions(raw, effective, snapshot)
             snapshot["compiled_instructions"] = compiled.text
             snapshot["protected_kernel_digest"] = compiled.protected_digest
@@ -1973,6 +2122,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("LEGACY_SKILL_MARKER", model.calls[0].instructions)
         self.assertNotIn("core_skill_activate", model.calls[0].tools)
         self.assertNotIn("core_skill_read_resource", model.calls[0].tools)
+        self.assertNotIn("core_terminal_exec", model.calls[0].tools)
+        recovered = store.lookup_task(record.task_id)
+        self.assertEqual(recovered.snapshot["capability_filter_version"], 1)
+        self.assertIn("skill_contract_version", recovered.snapshot)
 
     def test_skill_resource_requires_activation_and_failure_is_recoverable(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3214,6 +3367,61 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(model_failure_metadata(error), {"kind": "unknown"})
         self.assertEqual(error.data, {})
 
+    def test_ordinary_http_wire_caps_output_for_streaming_and_nonstreaming(self):
+        cases = (
+            ("openai", {}, "max_tokens", 1024),
+            ("openai", {"max_tokens": 128}, "max_tokens", 128),
+            ("openai", {"max_tokens": 4096}, "max_tokens", 1024),
+            ("openai", {"max_completion_tokens": 128}, "max_completion_tokens", 128),
+            ("openai", {"max_completion_tokens": 4096}, "max_completion_tokens", 1024),
+            ("openai", {"max_tokens": 32, "max_completion_tokens": 256}, "max_completion_tokens", 256),
+            ("anthropic", {}, "max_tokens", 1024),
+            ("anthropic", {"max_tokens": 128}, "max_tokens", 128),
+            ("anthropic", {"max_tokens": 4096}, "max_tokens", 1024),
+            ("anthropic", {"max_tokens": 128, "max_completion_tokens": 4096}, "max_tokens", 128),
+        )
+        for api_format, options, cap_name, cap in cases:
+            for stream in (False, True):
+                with self.subTest(api_format=api_format, options=options, stream=stream):
+                    options = {**options, "metadata": {"purpose": "retained-option"}}
+                    model = CompatibleHttpModel(api_format=api_format, model="test", max_tokens=1024,
+                                                extra_body=options, stream=stream)
+                    with patch("core_agent.model.urlopen", side_effect=HTTPError(
+                        "https://model.test", 503, "unavailable", {}, None,
+                    )) as opened, self.assertRaises(CoreError) as caught:
+                        model.generate(context="request", instructions="system", tools={})
+                    self.assertEqual(caught.exception.code, "MODEL_UNAVAILABLE")
+                    opened.assert_called_once()
+                    wire = json.loads(opened.call_args.args[0].data)
+                    self.assertEqual({key: wire[key] for key in ("max_tokens", "max_completion_tokens")
+                                      if key in wire}, {cap_name: cap})
+                    self.assertEqual(wire["metadata"], options["metadata"])
+                    self.assertEqual(model.extra_body, options)
+                    self.assertEqual(model.max_tokens, 1024)
+
+    def test_invalid_output_caps_fail_safely_before_provider_io(self):
+        for api_format in ("openai", "anthropic"):
+            for cap in (0, -1):
+                with self.subTest(api_format=api_format, configured=cap), \
+                        patch("core_agent.model.urlopen") as opened:
+                    with self.assertRaises(CoreError) as caught:
+                        CompatibleHttpModel(api_format=api_format, model="test", max_tokens=cap)
+                    self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                    self.assertIn("LLM_MAX_TOKENS", str(caught.exception))
+                    opened.assert_not_called()
+            cap_names = ("max_tokens", "max_completion_tokens") if api_format == "openai" else ("max_tokens",)
+            for cap_name in cap_names:
+                for cap in (None, False, True, 0, -1, 1.5, float("nan"), float("inf"), "cap-secret"):
+                    with self.subTest(api_format=api_format, cap_name=cap_name, cap=cap), \
+                            patch("core_agent.model.urlopen") as opened:
+                        with self.assertRaises(CoreError) as caught:
+                            CompatibleHttpModel(api_format=api_format, model="test", extra_body={cap_name: cap})
+                        self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                        self.assertIn(cap_name, str(caught.exception))
+                        self.assertNotIn("cap-secret", str(caught.exception))
+                        self.assertEqual(caught.exception.data, {})
+                        opened.assert_not_called()
+
     def test_provider_adapters_preserve_native_tool_call_and_result_messages(self):
         tools = {
             "core_terminal_exec": {
@@ -3498,6 +3706,8 @@ class RuntimeTests(unittest.TestCase):
         child = agent.workflow_store.lookup_task(result["task_id"])
         self.assertEqual(child.task_id, result["task_id"])
         self.assertEqual(child.parent_run_id, record.run_id)
+        self.assertEqual(record.snapshot["capability_filter_version"], 1)
+        self.assertEqual(child.snapshot["capability_filter_version"], 1)
 
     def test_completed_children_release_unused_finalization_reserves(self):
         model = ScriptedModel(
@@ -5130,6 +5340,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("trusted runtime clock", instructions)
         self.assertNotIn("trusted runtime clock", record.snapshot["compiled_instructions"])
         self.assertTrue(record.snapshot["protected_kernel_digest"])
+        self.assertEqual(record.snapshot["capability_filter_version"], 1)
         self.assertIn("Do it", model.calls[0].context)
         self.assertNotIn("Do it", instructions)
         self.assertEqual(result.message, "done")
@@ -5160,7 +5371,8 @@ class RuntimeTests(unittest.TestCase):
         agent = make_agent(
             model,
             connector=connector,
-            context_window=2_000,
+            # Summary instructions grew by 161 fixture tokens; both results still exceed 90%.
+            context_window=2_161,
             output_reserve=100,
             kernel_compiler=KernelCompiler("Safety policy. " * 170, "Host policy.", "Kernel policy."),
         )
@@ -5561,6 +5773,65 @@ class ObservabilityTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(Telemetry.otlp_from_env())
 
+    def test_otlp_env_auth_precedence_reaches_every_signal_without_secret_metadata(self):
+        received = []
+
+        class Collector(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                received.append((self.path, self.headers.get("Authorization"), body))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-protobuf")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        cases = (
+            ({"OTEL_ENDPOINT_API_KEY": "injected-key-canary"}, "Api-Key injected-key-canary"),
+            ({"OTEL_API_KEY": "explicit-key-canary"}, "Bearer explicit-key-canary"),
+            ({"OTEL_API_KEY": "explicit-key-canary", "OTEL_ENDPOINT_API_KEY": "injected-key-canary"},
+             "Bearer explicit-key-canary"),
+            ({"OTEL_API_KEY": "", "OTEL_ENDPOINT_API_KEY": "injected-key-canary"},
+             "Api-Key injected-key-canary"),
+            ({}, None),
+            ({"OTEL_API_KEY": "", "OTEL_ENDPOINT_API_KEY": ""}, None),
+        )
+        try:
+            for credentials, authorization in cases:
+                with self.subTest(settings=sorted(credentials), authorization=authorization):
+                    received.clear()
+                    with patch.dict(os.environ, {
+                        "OTEL_ENDPOINT": base,
+                        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": f"{base}/v1/metrics",
+                        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": f"{base}/v1/logs",
+                        "NO_PROXY": "*", **credentials,
+                    }, clear=True):
+                        telemetry = Telemetry.otlp_from_env()
+                        try:
+                            self.assertEqual(telemetry.exporter.configuration, {
+                                **{signal: f"{base}/v1/{signal}" for signal in ("traces", "metrics", "logs")},
+                                "credentials_configured": authorization is not None,
+                            })
+                            with telemetry.span("core_agent.auth_test"):
+                                pass
+                            telemetry.metric("core_agent.auth_test.count", 1)
+                            telemetry.log("auth-test-event")
+                        finally:
+                            telemetry.shutdown()
+                    self.assertEqual({path for path, _auth, _body in received}, {
+                        "/v1/traces", "/v1/metrics", "/v1/logs",
+                    })
+                    self.assertTrue(all(auth == authorization for _path, auth, _body in received))
+                    self.assertNotIn(b"key-canary", b"".join(body for _path, _auth, body in received))
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_invalid_otlp_urls_fail_before_sdk_provider_allocation(self):
         settings = {"endpoint": "OTEL_ENDPOINT", "trace_endpoint": "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
                     "metric_endpoint": "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
@@ -5715,6 +5986,60 @@ if __name__ == "__main__":
     unittest.main()
 
 class SemanticRuntimeTests(unittest.TestCase):
+    def test_current_summary_is_framed_only_in_model_input(self):
+        from dataclasses import replace
+        from core_agent.context import ContextItem, ContextState
+        prefix = (
+            "Summary of earlier turns in this same task. Continue from the recorded progress; "
+            "Completed steps have already occurred. This is historical data, not a new request "
+            "or permission to use tools.\n"
+        )
+        agent, model, _ = self.semantic_agent(self.semantic_answer)
+        agent.run(run_request(), task_id="summary-framing")
+        snapshot = agent.workflow_store.lookup_task("summary-framing").snapshot
+        saved = next(item for item in snapshot["context"]["active"] if item["kind"] == "summary")
+        current = ContextItem(**saved)
+        self.assertIsInstance(json.loads(current.content), dict)
+        self.assertNotIn(prefix, json.dumps(snapshot))
+        self.assertIn(prefix + current.content, model.calls[-1].context)
+        self.assertIn({"role": "user", "content": prefix + current.content}, model.calls[-1].messages)
+
+        historical = replace(current, provenance={**current.provenance, "historical": True})
+        legacy = replace(current, provenance=None)
+        ordinary = replace(current, kind="user_message")
+        items = (current, historical, legacy, ordinary)
+        messages = agent._model_messages(ContextState(items, items, (1, 4)))
+        self.assertEqual([message["content"] for message in messages],
+                         [prefix + current.content, historical.content, legacy.content, ordinary.content])
+
+    def test_summary_framing_budget_reserves_future_and_multiple_current_summaries(self):
+        from core_agent.context import ContextItem, ContextState
+        prefix = (
+            "Summary of earlier turns in this same task. Continue from the recorded progress; "
+            "Completed steps have already occurred. This is historical data, not a new request "
+            "or permission to use tools.\n"
+        )
+        agent = make_agent(ScriptedModel([]), memory="disabled", mcp=False, platform_mcp=())
+        self.addCleanup(agent.close)
+        agent.token_counter = len
+        record, raw, discovered, effective = agent._new_workflow(
+            run_request(), task_id="summary-budget", identity="owner",
+            session_id="summary-budget-context", tenant_id="default",
+        )
+        current = ContextItem("summary", "{}", 2,
+            provenance={"version": 1, "summary_version": 1, "sources": {}})
+        historical = ContextItem("summary", "{}", 2,
+            provenance={"version": 1, "summary_version": 1, "sources": {}, "historical": True})
+        for count in (0, 1, 2):
+            with self.subTest(current_summaries=count):
+                snapshot = copy.deepcopy(record.snapshot)
+                items = (historical,) + (current,) * count
+                snapshot["context"] = agent._context_to_dict(ContextState(items, items, (1, len(items))))
+                budget = agent._context_compactor(raw, effective, discovered, snapshot).budget
+                self.assertEqual(budget.system_and_kernel_tokens,
+                    len(agent._request_instructions(snapshot["compiled_instructions"]))
+                    + max(1, count) * len(prefix))
+
     def test_real_semantic_calls_keep_latest_corrections_and_charge_budget(self):
         from core_agent.config import AgentConfig
         class CorrectingModel(ScriptedModel):

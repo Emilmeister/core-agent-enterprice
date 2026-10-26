@@ -223,6 +223,8 @@ class CompatibleHttpModel:
             if isinstance(reasoning_effort, str) and reasoning_effort.strip()
             else None
         )
+        if self.max_tokens < 1:
+            raise CoreError("CONFIG_INVALID", "LLM_MAX_TOKENS must be a positive integer")
         if self.context_window <= self.max_tokens or self.token_chars <= 0:
             raise CoreError("CONFIG_INVALID")
         if (
@@ -269,6 +271,14 @@ class CompatibleHttpModel:
     @property
     def invocation_parameters(self):
         parameters = dict(self.extra_body)
+        limit_key = ("max_completion_tokens" if self.api_format == "openai"
+                     and "max_completion_tokens" in parameters else "max_tokens")
+        limit = parameters.get(limit_key, self.max_tokens)
+        if type(limit) is not int or limit < 1:
+            raise CoreError("CONFIG_INVALID", f"{limit_key} must be a positive integer")
+        parameters.pop("max_tokens", None)
+        parameters.pop("max_completion_tokens", None)
+        parameters[limit_key] = min(limit, self.max_tokens)
         parameters.update(self.sampling)
         if self.api_format == "openai":
             if self.provider.lower() == "minimax":
@@ -495,7 +505,6 @@ class CompatibleHttpModel:
             body.update(
                 {
                     "model": self.model,
-                    "max_tokens": self.max_tokens,
                     "system": self._system_blocks(instructions),
                     "messages": self._anthropic_messages(messages, replay_names),
                 }

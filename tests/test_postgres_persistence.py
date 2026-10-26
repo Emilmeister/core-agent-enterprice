@@ -44,6 +44,67 @@ from psycopg.types.json import Jsonb
 
 
 class ProductionConfigurationTests(unittest.TestCase):
+    def test_database_pool_missing_or_blank_environment_uses_defaults(self):
+        names = ("DATABASE_POOL_MIN", "DATABASE_POOL_MAX", "DATABASE_CONNECT_TIMEOUT_SECONDS")
+        for value in (None, "", " \t\n "):
+            with self.subTest(value=value), patch.dict(
+                os.environ,
+                {} if value is None else dict.fromkeys(names, value),
+                clear=True,
+            ), patch("core_agent.database.ConnectionPool") as pool:
+                database = PostgresDatabase.from_environment("postgresql://localhost/agent")
+                try:
+                    self.assertEqual(pool.call_args.kwargs["min_size"], 1)
+                    self.assertEqual(pool.call_args.kwargs["max_size"], 10)
+                    self.assertEqual(pool.call_args.kwargs["timeout"], 10)
+                    pool.return_value.open.assert_called_once_with(wait=True, timeout=10)
+                finally:
+                    database.close()
+
+    def test_database_pool_accepts_zero_minimum_and_equal_size_boundaries(self):
+        for minimum, maximum, timeout in ((0, 1, 0.125), (1, 1, 10), (2, 2, 30.5)):
+            with self.subTest(minimum=minimum, maximum=maximum, timeout=timeout), patch.dict(
+                os.environ,
+                {
+                    "DATABASE_POOL_MIN": f" {minimum} ",
+                    "DATABASE_POOL_MAX": f" {maximum} ",
+                    "DATABASE_CONNECT_TIMEOUT_SECONDS": f" {timeout} ",
+                },
+                clear=True,
+            ), patch("core_agent.database.ConnectionPool") as pool:
+                database = PostgresDatabase.from_environment("postgresql://localhost/agent")
+                try:
+                    self.assertEqual(pool.call_args.kwargs["min_size"], minimum)
+                    self.assertEqual(pool.call_args.kwargs["max_size"], maximum)
+                    self.assertEqual(pool.call_args.kwargs["timeout"], timeout)
+                    pool.return_value.open.assert_called_once_with(wait=True, timeout=timeout)
+                finally:
+                    database.close()
+
+    def test_invalid_database_pool_environment_fails_safely_before_pool_creation(self):
+        invalid = [
+            {name: value}
+            for name in ("DATABASE_POOL_MIN", "DATABASE_POOL_MAX")
+            for value in ("pool-secret", "1.5", "nan", "inf", "-inf")
+        ] + [
+            {"DATABASE_CONNECT_TIMEOUT_SECONDS": value}
+            for value in ("pool-secret", "nan", "inf", "-inf", "0", "-0.5")
+        ] + [
+            {"DATABASE_POOL_MIN": "-1"},
+            {"DATABASE_POOL_MAX": "0"},
+            {"DATABASE_POOL_MIN": "2", "DATABASE_POOL_MAX": "1"},
+        ]
+        for settings in invalid:
+            with self.subTest(settings=settings), patch.dict(
+                os.environ, settings, clear=True
+            ), patch("core_agent.database.ConnectionPool") as pool:
+                with self.assertRaises(CoreError) as caught:
+                    PostgresDatabase.from_environment("postgresql://localhost/agent")
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                self.assertNotIn("pool-secret", str(caught.exception))
+                self.assertEqual(caught.exception.data, {})
+                pool.assert_not_called()
+
     def test_health_routes_precede_a2a_catch_all(self):
         model = type("Model", (), {"model": "test-model"})()
         with patch.dict(

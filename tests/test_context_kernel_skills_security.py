@@ -242,12 +242,15 @@ class CompactionTests(unittest.TestCase):
             "[]",
             20,
             provider_replay={"signature": "opaque-provider-replay"},
+            provenance={"version": 1, "sources": {"run:1": {"run_id": "run", "sequence": 1}}},
         )
         import json
         from core_agent.model import ModelResponse
+        payload = {key: [] for key in
+            ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")}
+        payload["Completed"] = [{"text": "No tool calls in this record", "basis": "fact", "sources": ["run:1"]}]
         summary = StructuredSummarizer(lambda text: max(1, len(text) // 4),
-            lambda **kw: ModelResponse(message=json.dumps({key: [] for key in
-                ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")}),
+            lambda **kw: ModelResponse(message=json.dumps(payload),
                 finish_reason="stop"))((item,), 1_000)
         self.assertNotIn("opaque-provider-replay", summary.content)
 
@@ -508,6 +511,32 @@ if __name__ == "__main__":
     unittest.main()
 
 class SemanticSummaryTests(unittest.TestCase):
+    def test_all_empty_summary_is_rejected_without_replacing_context(self):
+        import json
+        from core_agent.model import ModelResponse
+        payload = {key: [] for key in
+            ("Goal", "Constraints", "Decisions", "Completed", "Artifacts", "Pending", "Failures")}
+        summarizer = StructuredSummarizer(len,
+            lambda **kw: ModelResponse(message=json.dumps(payload), finish_reason="stop"))
+        item = ContextItem("history", "The owner selected B; do not ask again.", 400,
+            provenance={"version": 1, "sources": {"run:1": {"run_id": "run", "sequence": 1}}})
+        with self.assertRaises(CoreError) as caught:
+            summarizer((item,), 2000)
+        self.assertEqual(caught.exception.code, "CONTEXT_UNRECOVERABLE")
+        self.assertEqual(caught.exception.reason, "invalid_summary")
+        self.assertEqual(caught.exception.data, {})
+
+        compactor = Compactor(ContextBudget(1200, 100, 50, 50), summarizer, interval=2)
+        state = ContextState((item,), (item,), (1, 1))
+        self.assertIs(compactor.maybe_compact(state, turns=2), state)
+        full = ContextState((item,) * 3, (item,) * 3, (1, 3))
+        with self.assertRaises(CoreError) as caught:
+            compactor.maybe_compact(full, turns=2)
+        self.assertEqual(caught.exception.reason, "invalid_summary")
+        self.assertEqual(full.active, (item,) * 3)
+        self.assertEqual(full.transcript, (item,) * 3)
+        self.assertIsNone(full.event)
+
     def test_complete_sources_corrections_and_strict_output(self):
         import json
         from core_agent.model import ModelResponse

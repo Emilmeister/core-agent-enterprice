@@ -225,6 +225,89 @@ class RunRequestTests(unittest.TestCase):
         self.assertNotIn("decision", parsed.to_dict())
 
 class ConfigurationTests(unittest.TestCase):
+    def test_invalid_memory_modes_are_rejected_without_echoing_values(self):
+        for value in (None, True, False, 0, "", "enabled", "OPTIONAL", [], {}, "memory-secret"):
+            with self.subTest(value=value):
+                raw = agent_config().to_dict()
+                raw["features"]["memory"] = value
+                with self.assertRaises(CoreError) as caught:
+                    AgentConfig.from_dict(raw)
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                self.assertIn("memory", caught.exception.message)
+                self.assertNotIn("memory-secret", str(caught.exception))
+                self.assertEqual(caught.exception.data, {})
+
+    def test_explicit_builtin_features_cannot_exceed_platform_support(self):
+        tools_by_feature = {
+            "terminal": {"core_terminal_exec", "core_terminal_write"},
+            "python": {"core_python_exec"},
+            "filesystem_mutation": {"core_fs_apply_patch"},
+            "background_tasks": {"core_task_start", "core_task_wait"},
+            "delegation": {"core_delegate"},
+            "human_input": {"core_ask_owner"},
+            "public_messages": {"core_message_send"},
+            "response_files": {"core_response_files", "core_response_artifacts"},
+            "remote_agents": {"core_agent_send_message", "core_agent_list"},
+            "memory": {"core_memory_search", "core_memory_read"},
+        }
+        tools = set().union(*tools_by_feature.values())
+        raw = agent_config().to_dict()
+        raw["features"] = dict.fromkeys(tools_by_feature, True)
+        raw["features"]["memory"] = "optional"
+        raw["tools"]["builtins"] = {"default": "allow"}
+        for feature, filtered_tools in tools_by_feature.items():
+            with self.subTest(feature=feature):
+                effective = compile_effective_config(
+                    platform_config(
+                        allowed_builtin_tools=tools,
+                        supported_features=set(tools_by_feature) - {feature},
+                    ),
+                    AgentConfig.from_dict(raw),
+                    (),
+                    {},
+                )
+                self.assertEqual(effective.builtin_tools, tools - filtered_tools)
+                self.assertEqual(effective.model_tool_catalog, tools - filtered_tools)
+                self.assertNotIn(feature, effective.enabled_capability_policies)
+                self.assertTrue(any(
+                    warning.code == "CAPABILITY_FILTERED" and warning.capability == feature
+                    for warning in effective.warnings
+                ))
+
+    def test_response_files_false_removes_both_aliases_and_final_policy(self):
+        raw = agent_config().to_dict()
+        raw["features"]["response_files"] = False
+        raw["tools"]["builtins"] = {"default": "allow"}
+        effective = compile_effective_config(
+            platform_config(
+                allowed_builtin_tools={
+                    "core_response_files", "core_response_artifacts", "core_python_exec"
+                },
+                supported_features=platform_config().supported_features | {"response_files"},
+            ),
+            AgentConfig.from_dict(raw),
+            (),
+            {},
+        )
+        self.assertEqual(effective.builtin_tools, {"core_python_exec"})
+        self.assertEqual(effective.model_tool_catalog, {"core_python_exec"})
+        self.assertNotIn("response_files", effective.enabled_capability_policies)
+        self.assertNotIn("response_files", json.loads(effective.audit_snapshot)["policies"])
+
+    def test_omitted_features_preserve_builtin_allowlist_compatibility(self):
+        tools = {"core_terminal_exec", "core_response_files", "core_response_artifacts"}
+        raw = agent_config(features={}).to_dict()
+        raw["tools"]["builtins"] = {"default": "allow"}
+        effective = compile_effective_config(
+            platform_config(allowed_builtin_tools=tools, supported_features=set()),
+            AgentConfig.from_dict(raw),
+            (),
+            {},
+        )
+        self.assertEqual(effective.builtin_tools, tools)
+        self.assertEqual(effective.model_tool_catalog, tools)
+        self.assertIn("response_files", effective.enabled_capability_policies)
+
     def test_owner_mcp_discovery_requires_platform_feature_and_exact_child_subset(self):
         raw = agent_config().to_dict()
         raw["tools"]["mcp"]["owner_servers"] = ["repo"]

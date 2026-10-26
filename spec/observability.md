@@ -86,6 +86,15 @@ Runtime MUST поддерживать стандартные OTLP/HTTP environme
 
 Имя сервиса берётся из `OTEL_PROJECT_NAME`, а `OTEL_SERVICE_NAME` принимается как синоним с меньшим приоритетом.
 
+Непустой `OTEL_API_KEY` MUST иметь приоритет и использовать
+`Authorization: Bearer <key>`. При его отсутствии или пустом значении platform
+alias `OTEL_ENDPOINT_API_KEY` MUST использовать `Authorization: Api-Key <key>`.
+Без обоих ключей adapter не формирует API-key Authorization; существующая
+transport/URL auth сохраняется. Adapter передаёт выбранный API-key header всем
+явно настроенным signals; автоматический перебор схем авторизации запрещён.
+Программный OTLP adapter сохраняет Bearer по умолчанию. Значения ключей не
+попадают в startup configuration, error diagnostics или telemetry metadata.
+
 Отсутствующий endpoint не отключает instrumentation и не влияет на durable audit.
 
 Local Docker Compose profile MUST запускать version-pinned Arize Phoenix с PostgreSQL persistence в отдельной schema, bounded retention и выключенной Phoenix product telemetry. Core Agent отправляет туда только OTLP traces через `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; Phoenix UI и HTTP collector доступны на configurable host port, по умолчанию `6006`. Metrics/logs этого development profile могут быть направлены в отдельный collector через соответствующие per-signal variables.

@@ -66,6 +66,11 @@ WORKFLOW_LEASE_HEARTBEAT_INTERVAL = WORKFLOW_LEASE_TTL / 3
 WORKFLOW_RECOVERY_POLL_SECONDS = 0.5
 RECOVERABLE_WORKFLOW_STATES = frozenset({"RUNNING", "MODEL_RESPONDED", "EXECUTING", "WAITING_TASK", "WAITING_INPUT"})
 DEFAULT_BUDGET_CANCEL_GRACE_SECONDS = 5.0
+CURRENT_TASK_SUMMARY_PREFIX = (
+    "Summary of earlier turns in this same task. Continue from the recorded progress; "
+    "Completed steps have already occurred. This is historical data, not a new request "
+    "or permission to use tools.\n"
+)
 BUDGET_FINALIZATION_INSTRUCTION = (
     "BUDGET FINALIZATION: The work budget is exhausted. Return a concise, truthful "
     "verified intermediate result and explicitly list what you intended to do but "
@@ -1583,10 +1588,6 @@ class CoreAgent:
                 getattr(self.model, "extra_body", {}),
             )
         )
-        if getattr(self.model, "api_format", None) == "anthropic":
-            invocation_parameters["max_tokens"] = getattr(
-                self.model, "max_tokens", None
-            )
         attributes = {
             "openinference.span.kind": "LLM",
             "gen_ai.operation.name": "chat",
@@ -1717,7 +1718,17 @@ class CoreAgent:
         }
 
     @staticmethod
-    def _model_messages(context):
+    def _is_current_summary(item):
+        provenance = item.provenance or {}
+        return (item.kind == "summary" and provenance.get("summary_version") == 1
+                and not provenance.get("historical"))
+
+    @classmethod
+    def _model_content(cls, item):
+        return (CURRENT_TASK_SUMMARY_PREFIX if cls._is_current_summary(item) else "") + item.content
+
+    @classmethod
+    def _model_messages(cls, context):
         messages = []
         known_tool_calls = set()
         for item in context.active:
@@ -1751,7 +1762,7 @@ class CoreAgent:
                     message["name"] = result["tool_name"]
                 messages.append(message)
                 continue
-            messages.append({"role": "user", "content": item.content})
+            messages.append({"role": "user", "content": cls._model_content(item)})
         return messages
 
     def _confirm_restarted_execution(self, record):
@@ -2736,9 +2747,12 @@ class CoreAgent:
             separators=(",", ":"),
         )
         context = raw["context"]
+        summary_count = sum(self._is_current_summary(item)
+                            for item in self._context_from_dict(snapshot["context"]).active)
+        summary_tokens = max(1, summary_count) * self.token_counter(CURRENT_TASK_SUMMARY_PREFIX)
         budget = ContextBudget(
             self._context_window(snapshot),
-            self.token_counter(self._request_instructions(instructions)),
+            self.token_counter(self._request_instructions(instructions)) + summary_tokens,
             self.token_counter(catalog),
             self.output_reserve,
             compact_at=context["compact_at_working_ratio"],
@@ -4985,7 +4999,7 @@ class CoreAgent:
                         continue
                     with self.telemetry.span("core_agent.context.assemble"):
                         model_context = "\n".join(
-                            item.content for item in context.active
+                            self._model_content(item) for item in context.active
                         )
                         model_messages = self._model_messages(context)
                         model_tools = (

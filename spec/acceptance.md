@@ -89,6 +89,8 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
 - [ ] AgentConfig может отключить memory, terminal, filesystem mutations, background tasks, delegation, отдельные built-in/MCP tools и skills.
 - [ ] Disabled tool отсутствует в discovery/model context и stale call получает `CAPABILITY_DISABLED`.
 - [ ] Memory modes `disabled`, `optional`, `required` корректно фильтруют/требуют встроенный memory backend.
+- [ ] Неверные memory modes, включая boolean/null, отклоняются без отражения значения; явно включённая capability вне platform support не добавляет tools или policy. `response_files: false` исключает оба response-file имени и их policy, включая answer phase; пропущенные switches сохраняют прежние defaults.
+- [ ] Root/delegated/background snapshots закрепляют `capability_filter_version=1`. Legacy digest без marker допускает recovery, включая старый skill digest, но модель и dispatch получают текущие ограничения; version/digest обновляются атомарно. Современный marker отклоняет старый feature digest; malformed/unknown marker отклоняется до workspace/discovery/cache.
 - [ ] MCP tool filters применяются после discovery, но до model context; deny имеет приоритет.
 - [ ] Admission ceiling и config/tool snapshot immutable внутри Task; текущая owner policy применяется к последующим calls, все использованные versions/digests сохраняются в audit.
 - [ ] Agent Card не рекламирует capability, отключённую AgentConfig или текущим
@@ -98,6 +100,7 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
   и получает документированный default, кроме явно документированных allowlist:
   пустой `CORE_AGENT_ALLOWED_SKILLS` отключает навыки.
 - [ ] Невалидная конфигурация не поднимает listener, завершает процесс ненулевым кодом и печатает ровно одну строку с именем настройки и стабильным кодом, без traceback и без значений secret-переменных.
+- [ ] Пустые/whitespace pool settings сохраняют defaults 1/10/10; minimum 0 и minimum=maximum допустимы. Неразбираемые числа, неверные size bounds и nonfinite/nonpositive timeout отклоняются до создания PostgreSQL pool, без исходных значений и credentials.
 - [ ] Неразбираемые числовые deployment values, `NaN`/infinite floats, неверный `LOG_LEVEL`, неизвестные `TASK_STORAGE_TYPE`/`A2A_CAPABILITIES` и нечисловые HTTP retry codes отклоняются с `CONFIG_INVALID`, именем настройки и без введённого значения; пустые значения сохраняют documented defaults, listener не запускается. Ошибка старта остаётся видимой при `LOG_LEVEL=CRITICAL/FATAL`.
 
 ## Kernel instructions
@@ -179,6 +182,10 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
 - [ ] Summary имеет отдельный выходной cap 32768 по умолчанию, ограниченный
   свободным входным окном; обычный model output reserve не меняется, проверка
   размера и provenance summary не ослабляется; provider extra_body не снимает cap.
+- [ ] Обычные OpenAI/Anthropic HTTP requests, включая streaming, содержат
+  выходной cap adapter; меньший явный provider cap сохраняется, больший ограничен.
+  OpenAI поддерживает явный `max_completion_tokens` без второго cap-поля;
+  неправильный тип и неположительный cap отвергаются до отправки.
 
 
 - [ ] Два отказа обязательного сжатия и recovery checkpoint с attempts=2
@@ -221,6 +228,10 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
 - [ ] Semantic summary сохраняет поздние исправления и различает факт, вывод,
   предположение и план; malformed/truncated/unknown-source ответ не заменяет
   исходный context. Из active provider context не исчезает половина tool-call/result пары.
+- [ ] Summary со всеми семью пустыми секциями отвергается как `invalid_summary`;
+  прежний context и transcript сохраняются. Отдельные пустые секции допустимы.
+  Подтверждённый ответ владельца остаётся завершённым шагом после повторного
+  сжатия; вопрос связан с точным ответом и call ID, а план вопроса не считается ответом.
 - [ ] Compaction attempt заранее оплачена из root model budget; restart между
   attempt и commit не сбрасывает максимум двух попыток и не меняет source boundary.
 - [ ] Ошибка interval compaction ниже pressure сохраняет прежний context;
@@ -276,6 +287,7 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
 - [ ] Слой эмбеддингов включается только при заданных `EMBEDDING_MODEL`, `EMBEDDING_API_KEY` и базе; незаданная `EMBEDDING_API_BASE` берётся из `LLM_API_BASE`, а ключ не выводится ниоткуда.
 - [ ] `OTEL_ENDPOINT` выводит только `/v1/traces`; metrics и logs уходят исключительно по явным per-signal endpoints, а `ENABLE_OTEL=false` отключает экспорт целиком.
 - [ ] Имя сервиса в телеметрии берётся из `OTEL_PROJECT_NAME`, `OTEL_SERVICE_NAME` — синоним с меньшим приоритетом.
+- [ ] На реальном OTLP HTTP receiver без иной transport/URL auth каждый настроенный signal получает Bearer для непустого `OTEL_API_KEY`, Api-Key для fallback `OTEL_ENDPOINT_API_KEY`, либо отсутствие auth header без ключей. Explicit key имеет приоритет, пустой explicit использует fallback; безопасная exporter metadata не содержит ключей.
 - [ ] Любая ошибка embedding endpoint не роняет tool call; текст запроса и ключ не попадают в error, audit и telemetry.
 - [ ] Embedding документа вычисляется один раз при публикации и сохраняется; search эмбеддит только запрос.
 
