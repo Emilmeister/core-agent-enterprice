@@ -96,6 +96,7 @@ NEXT_STEPS_TOOL = "core_next_steps"
 NEXT_STEPS_RESULT = "Принято. Выполни current_step."
 # Results of these tools carry a new message from a peer or an owner.
 NEXT_STEPS_TRIGGERS = frozenset({"core_task_wait", "core_ask_owner"})
+NEXT_STEPS_MAX_FAILURES = 2
 
 
 class _MaterialSuspended(Exception):
@@ -3712,14 +3713,23 @@ class CoreAgent:
         return self._record_transition(record, state="MODEL_RESPONDED", snapshot=snapshot,
             event_kind="python.completed_result.recovered", lease_token=lease_token)
 
-    def _note_next_steps(self, snapshot, name, succeeded):
-        """Count tool calls since the last successful core_next_steps and mark when the next turn must call it."""
+    def _note_next_steps(self, snapshot, name, succeeded, *, task_id=None):
+        """Count tool calls since the last successful core_next_steps and mark when the next turn must call it.
+
+        After NEXT_STEPS_MAX_FAILURES failed core_next_steps calls in a row the requirement is
+        dropped until the next trigger, so invalid arguments cannot loop the task.
+        """
         if self.next_steps_every is None:
             return
         if name == NEXT_STEPS_TOOL:
-            if succeeded:
+            failures = 0 if succeeded else snapshot.get("next_steps_failures", 0) + 1
+            if succeeded or failures >= NEXT_STEPS_MAX_FAILURES:
                 snapshot["next_steps_calls_since"] = 0
                 snapshot["next_steps_due"] = False
+                failures = 0
+                if not succeeded:
+                    self._log("next_steps.invalid", task_id=task_id, failures=NEXT_STEPS_MAX_FAILURES)
+            snapshot["next_steps_failures"] = failures
             return
         count = snapshot.get("next_steps_calls_since", 0) + 1
         snapshot["next_steps_calls_since"] = count
@@ -3894,7 +3904,7 @@ class CoreAgent:
             **({"error_code": error_code} if error_code else {}),
             **({"output": self._value(output)} if self.log_content else {}),
         )
-        self._note_next_steps(snapshot, call.name, succeeded)
+        self._note_next_steps(snapshot, call.name, succeeded, task_id=record.task_id)
         updated = self._record_transition(
             record,
             state="RUNNING",

@@ -8,7 +8,7 @@ from core_agent.model import CompatibleHttpModel, ModelResponse, ScriptedModel, 
 from tests.app_support import create_app
 
 NEXT_STEPS = "core_next_steps"
-PLAN = {"previous_steps": [], "deal": "none", "stage": None, "current_step": "list tasks"}
+PLAN = {"previous_steps": [], "deal": "none", "stage": "", "current_step": "list tasks"}
 
 
 def next_steps(call_id="plan"):
@@ -89,7 +89,21 @@ class NextStepsRuntimeTests(unittest.TestCase):
         agent._note_next_steps(snapshot, NEXT_STEPS, False)
         self.assertTrue(snapshot["next_steps_due"])
         agent._note_next_steps(snapshot, NEXT_STEPS, True)
-        self.assertEqual(snapshot, {"next_steps_due": False, "next_steps_calls_since": 0})
+        self.assertEqual(snapshot, {"next_steps_due": False, "next_steps_calls_since": 0, "next_steps_failures": 0})
+
+    def test_null_stage_is_rejected_and_two_invalid_calls_stop_the_requirement(self):
+        invalid = {key: value for key, value in PLAN.items() if key != "stage"}
+        broken = [ModelResponse(tool_requests=(ToolRequest(f"bad{index}", NEXT_STEPS, dict(invalid)),))
+                  for index in range(2)]
+        agent, model = self.app(*broken, ModelResponse(message="done"))
+        with patch.object(agent, "_log", wraps=agent._log) as log:
+            self.assertEqual(agent.run({"prompt": "hi"}).message, "done")
+        self.assertEqual(self.choices(model), [NEXT_STEPS, NEXT_STEPS, None])
+        self.assertIn("TOOL_ARGUMENT_INVALID", model.calls[1].context)
+        self.assertEqual([call.args[0] for call in log.call_args_list].count("next_steps.invalid"), 1)
+
+    def test_provider_null_stage_is_dropped_before_validation(self):
+        self.assertEqual(CompatibleHttpModel._arguments('{"stage": null, "deal": "none"}'), {"deal": "none"})
 
     def test_ignored_force_is_executed_and_logged(self):
         agent, model = self.app(task_list("t1"), next_steps(), ModelResponse(message="done"))

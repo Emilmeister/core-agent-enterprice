@@ -1166,10 +1166,10 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                                    "этапы закрыты; abandoned — продолжить сделку невозможно",
                 },
                 "stage": {
-                    "type": ["string", "null"],
+                    "type": "string",
                     "description": "Этап, на котором сделка после этого шага: текущий — если его критерий ещё не "
                                    "выполнен; следующий — если выполнен; один из пройденных — если факты показали, "
-                                   "что его результат больше не годится; null — если deal == none",
+                                   "что его результат больше не годится; пустая строка — если deal == none",
                 },
                 "stage_results": {
                     "type": "object", "additionalProperties": {"type": "string"},
