@@ -23,6 +23,7 @@ class ToolRequest:
     id: str
     name: str
     arguments: dict
+    unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -659,6 +660,15 @@ class CompatibleHttpModel:
             ) from error
 
     @staticmethod
+    def _tool_name(value, reverse):
+        if not isinstance(value, str) or not value or len(value) > 256:
+            raise CoreError("MODEL_RESPONSE_INVALID", "invalid model tool name")
+        # Preserve an unrecognised call for durable pre-dispatch feedback. A
+        # successful provider response is not an inference outage; only the
+        # runtime's current catalog can grant authority to execute this name.
+        return reverse.get(value, value)
+
+    @staticmethod
     def _arguments(value):
         if isinstance(value, str):
             try:
@@ -732,15 +742,15 @@ class CompatibleHttpModel:
         calls = []
         for call in message.get("tool_calls") or ():
             function = call.get("function", {})
-            try:
-                name = reverse[function["name"]]
-            except (KeyError, TypeError) as error:
-                raise CoreError("MODEL_UNAVAILABLE", "unknown model tool") from error
+            if not isinstance(function, dict):
+                raise CoreError("MODEL_RESPONSE_INVALID", "invalid model tool function")
+            name = self._tool_name(function.get("name"), reverse)
             calls.append(
                 ToolRequest(
                     call.get("id") or str(uuid.uuid4()),
                     name,
                     self._arguments(function.get("arguments", {})),
+                    unavailable=function.get("name") not in reverse,
                 )
             )
         content = message.get("content")
@@ -815,17 +825,13 @@ class CompatibleHttpModel:
                 if visible:
                     reasoning.append(visible)
             elif block.get("type") == "tool_use":
-                try:
-                    name = reverse[block["name"]]
-                except KeyError as error:
-                    raise CoreError(
-                        "MODEL_UNAVAILABLE", "unknown model tool"
-                    ) from error
+                name = self._tool_name(block.get("name"), reverse)
                 calls.append(
                     ToolRequest(
                         block.get("id") or str(uuid.uuid4()),
                         name,
                         self._arguments(block.get("input", {})),
+                        unavailable=block.get("name") not in reverse,
                     )
                 )
         usage = response.get("usage") or {}

@@ -1704,7 +1704,8 @@ class CoreAgent:
         return {
             "message": response.message,
             "tool_requests": [
-                {"id": item.id, "name": item.name, "arguments": item.arguments}
+                {"id": item.id, "name": item.name, "arguments": item.arguments,
+                 **({"model_tool_unavailable": True} if item.unavailable else {})}
                 for item in response.tool_requests
             ],
             "continue_reasoning": response.continue_reasoning,
@@ -5293,9 +5294,19 @@ class CoreAgent:
                             active_result_token_limit=active_result_token_limit,
                         )
                         continue
-                    self._require_tool(pending["name"], effective)
                     definition = None
                     try:
+                        if pending.get("model_tool_unavailable"):
+                            available_tools = self._tool_catalog(
+                                effective, discovered, snapshot, tenant_id=record.tenant_id,
+                                root_run=record.parent_run_id is None, owner_id=record.owner_id,
+                            )
+                            raise CoreError(
+                                "TOOL_UNAVAILABLE",
+                                "This tool is not available. Choose a tool from the current catalog or answer directly.",
+                                data={"available_tools": sorted(available_tools)},
+                            )
+                        self._require_tool(pending["name"], effective)
                         definition, _is_mcp = self._definition(
                             call, effective, discovered, record
                         )
