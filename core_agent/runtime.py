@@ -2224,6 +2224,8 @@ class CoreAgent:
         )
         snapshot = {
             "initializing": True,
+            "kernel_instructions": (copy.deepcopy(self._pin_kernel_instructions(parent).snapshot["kernel_instructions"])
+                                    if parent_run_id is not None else self._kernel_snapshot(2)),
             "guardrails_enabled": guardrails_enabled,
             "output_contract_version": (output_contract_version(self.workflow_store.get(parent_run_id,
                 tenant_id=tenant_id, owner_id=owner_id, connection=connection)) if parent_run_id is not None else 2),
@@ -2351,6 +2353,7 @@ class CoreAgent:
     def _initialize_workflow(
         self, record, *, raw=None, cancel_event=None, lease_token=None
     ):
+        record = self._pin_kernel_instructions(record)
         if record.snapshot.get("file_batch_id") and not record.snapshot.get("initial_material_checked"):
             raise CoreError("MATERIAL_REVIEW_REQUIRED")
         request = RunRequest.from_dict(record.request)
@@ -2512,6 +2515,7 @@ class CoreAgent:
         raise error
 
     def _load_workflow_runtime(self, record, *, cancel_event=None, lease_token=None):
+        record = self._pin_kernel_instructions(record)
         self._validate_capability_filter_version(record.snapshot)
         self._validate_remote_snapshot(record)
         self._bind_workspace(record.run_id, record.tenant_id, record.owner_id, record.context_id)
@@ -2631,6 +2635,42 @@ class CoreAgent:
         self._runtime_cache[record.run_id] = (raw, discovered, effective)
         return record, request, raw, discovered, effective
 
+    def _kernel_snapshot(self, output_version):
+        compiler = copy.copy(self.kernel_compiler)
+        if output_version == 1:
+            compiler.capability_policies = {**compiler.capability_policies,
+                                           "response_files": LEGACY_RESPONSE_FILES_INSTRUCTION}
+        return compiler.snapshot()
+
+    def _pin_kernel_instructions(self, record):
+        snapshot = record.snapshot
+        if "kernel_instructions" in snapshot:
+            KernelCompiler.from_snapshot(snapshot["kernel_instructions"])
+            return record
+        # Legacy merged text cannot reveal the original capability/phase sources.
+        # Migrate only when this build reproduces its exact admitted compilation.
+        raw = snapshot.get("admission", {}).get("agent_config")
+        if (snapshot.get("initializing") or not isinstance(raw, dict)
+                or not isinstance(snapshot.get("compiled_instructions"), str)):
+            raise CoreError("CHECKPOINT_INVALID")
+        candidate = {**snapshot, "kernel_instructions": self._kernel_snapshot(snapshot.get("output_contract_version", 1))}
+        for legacy_skills in ((False,) if "skill_contract_version" in snapshot else (False, True)):
+            for legacy_gates in ((False,) if "capability_filter_version" in snapshot else (False, True)):
+                effective = compile_effective_config(
+                    self._admitted_platform(snapshot, narrow=False), AgentConfig.from_dict(raw),
+                    tuple(snapshot.get("admission", {}).get("mcp", ())), snapshot.get("mcp_catalogs", {}),
+                    legacy_ungated_skills=legacy_skills, legacy_feature_gates=legacy_gates)
+                if effective.digest != snapshot.get("effective_config_digest"):
+                    continue
+                phases = (snapshot.get("response_phase", "work"), "work")
+                for phase in dict.fromkeys(phases):
+                    compiled = self._compile_instructions(raw, effective, {**candidate, "response_phase": phase},
+                                                          owner_id=record.owner_id)
+                    if (compiled.text == snapshot["compiled_instructions"]
+                            and compiled.protected_digest == snapshot.get("protected_kernel_digest")):
+                        return replace(record, snapshot=candidate)
+        raise CoreError("CHECKPOINT_INVALID")
+
     def _compile_instructions(self, raw, effective, snapshot, *, model_tools=None, owner_id=None):
         catalog = sorted(
             (
@@ -2666,11 +2706,8 @@ class CoreAgent:
         )
         capabilities = set(effective.enabled_capability_policies)
         version = snapshot.get("output_contract_version", 1)
-        compiler = self.kernel_compiler
+        compiler = KernelCompiler.from_snapshot(snapshot.get("kernel_instructions"))
         if version == 1:
-            compiler = copy.copy(compiler)
-            compiler.capability_policies = {**compiler.capability_policies,
-                                           "response_files": LEGACY_RESPONSE_FILES_INSTRUCTION}
             capabilities.discard("public_messages")
         if model_tools is not None:
             if not {"core_response_files", "core_response_artifacts"}.intersection(model_tools):
@@ -4765,6 +4802,7 @@ class CoreAgent:
                     record = self._apply_material_wait(record, lease_token=lease_token)
                     wait = None
             if record.snapshot.get("initializing") and self.material_review_store is not None and not record.snapshot.get("initial_material_checked"):
+                record = self._pin_kernel_instructions(record)
                 record = self._guard_initial_input(record, lease_token=lease_token)
             if record.snapshot.get("initializing"):
                 record, raw, discovered, effective = self._initialize_workflow(
@@ -5751,6 +5789,7 @@ class CoreAgent:
         snapshot = {
             "admission": {"agent_config": raw, "platform_config": self._platform_snapshot(platform),
                           "mcp": [], "declared_skills": []},
+            "kernel_instructions": copy.deepcopy(self._pin_kernel_instructions(parent).snapshot["kernel_instructions"]),
             "output_contract_version": output_contract_version(parent),
             "published_artifacts": [], "public_messages": [],
             "initializing": False, "skill_contract_version": SKILL_CONTRACT_VERSION,

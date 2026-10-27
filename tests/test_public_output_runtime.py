@@ -377,6 +377,8 @@ class NestedPublicOutputRuntimeTests(unittest.TestCase):
                                     skills={"known"})
         for snapshot in ({}, {"skills": [{"name": "known", "instructions": "Read scoped files"}]}):
             with self.subTest(snapshot=snapshot):
+                # Direct compilation follows validated admission/recovery pinning.
+                snapshot["kernel_instructions"] = agent._kernel_snapshot(1)
                 compiled = agent._compile_instructions({"agent": {}}, effective, snapshot,
                     model_tools={"core_response_files": {}})
                 self.assertIn("replaces your previous selection", compiled.text)

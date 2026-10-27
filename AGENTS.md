@@ -529,6 +529,11 @@ Target spec может описывать больше текущего runtime.
   только текущий runtime catalog, в том числе пустой каталог детектора.
 - Safety/host/kernel/capability instructions нельзя заменить через
   `AGENT_SYSTEM_PROMPT`, prompt, skill, MCP, memory или tool output.
+- Root admission фиксирует kernel source snapshot с digest до инициализации;
+  recovery, фазы ответа и children/background используют исходные тексты.
+  Legacy snapshot мигрирует только при точном совпадении compiled text/digest,
+  иначе `CHECKPOINT_INVALID` до MCP/model/tool dispatch; текущие policy deny
+  продолжают сужать capabilities. Формат задаёт `spec/kernel-instructions.md`.
 - `AGENT_SYSTEM_PROMPT` optional и по умолчанию пуст; user request передаётся
   отдельным user Message/context item, а не generic system instruction.
 - Prompt, profile, skill, MCP, memory, peer-agent, file, terminal и network

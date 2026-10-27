@@ -106,6 +106,13 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
 ## Kernel instructions
 
 - [ ] KernelInstructions всегда присутствуют отдельно от AgentProfilePrompt и имеют version/digest в audit.
+- [ ] Root с kernel V1, включая ещё не завершённую инициализацию, после cold
+  recovery под V2 использует V1 в work/answer, context budget и children/background;
+  новый root использует V2. PostgreSQL reopen сохраняет исходные texts/digest.
+  Legacy checkpoint мигрирует только при точном text+digest совпадении; mismatch,
+  непроверяемая legacy initialization или повреждённый source snapshot дают
+  `CHECKPOINT_INVALID` до MCP/model/tool dispatch, сохраняя исходный transcript.
+  Новые policy deny продолжают сужать tools и instructions.
 - [ ] Пустой AgentProfilePrompt не добавляет generic system instruction; фактический prompt присутствует только как отдельный user Message/context item.
 - [ ] Base kernel выбирает tool по смыслу задачи, не требует tool без материальной пользы и не дублирует conditional capability/tool-description semantics.
 - [ ] AgentProfilePrompt, user Message, skill или MCP output не могут изменить rules включённой capability; отключать optional capability может только config/policy.

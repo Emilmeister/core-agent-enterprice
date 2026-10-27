@@ -79,6 +79,24 @@ AgentProfilePrompt MAY задавать:
 - Context Engine MUST учитывать KernelInstructions как protected tokens, исключённые из рабочего occupancy threshold.
 - Если protected layer вместе с provider reserve не помещается в model window, route отклоняется до первого turn.
 
+Root admission сохраняет `kernel_instructions` snapshot version 1 до MCP
+инициализации: исходные safety/host/base/capability texts, guidance фаз
+work/answer и digest всего набора. Child и background workflow наследуют этот
+набор от parent. Cold recovery, активация skills, смена фазы и расчёт context
+budget используют сохранённые тексты; новый deployment kernel применяется
+только к новым root tasks. Текущие запреты capabilities продолжают сужать
+доступные tools и соответствующие instructions.
+
+Reader проверяет версию, структуру и digest до MCP reconnect, model или tool
+dispatch. Legacy checkpoint без этого поля мигрирует только если текущий
+compiler воспроизводит точные сохранённые `compiled_instructions` и
+`protected_kernel_digest` по frozen admission, skills и сохранённой фазе
+компиляции. Уже начатая answer phase MAY иметь сохранённую work compilation.
+Если соответствие не доказано, включая legacy незавершённую инициализацию без
+compiled text, runtime возвращает `CHECKPOINT_INVALID`; исходные text/digest
+и transcript не заменяются новой версией. Terminal tasks читаются без такой
+миграции. Downgrade допустим только на reader, поддерживающий этот snapshot.
+
 ## Проверка соблюдения
 
 Runtime MUST отклонить proposed action, если она требует нарушения kernel protocol, даже когда модель уверенно утверждает обратное. Policy decision возвращается модели как structured result с безопасной причиной, чтобы она могла выбрать допустимую альтернативу.
