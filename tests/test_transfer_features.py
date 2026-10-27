@@ -2916,20 +2916,29 @@ class ConfigurationTransferTests(unittest.TestCase):
             ),
             "",
         )
-        with patch.dict(
-            os.environ,
-            {
-                **BASE_ENVIRONMENT,
-                **blank,
-                "LLM_MODEL": "blank-defaults",
-                "LLM_API_BASE": "https://provider.test/v1",
-            },
-            clear=True,
+        for environment, expected_cap in (
+            ({}, 16384), (blank, 16384), ({"LLM_MAX_TOKENS": "8192"}, 8192),
         ):
-            model = _model()
-        self.assertEqual(model.api_format, "openai")
-        self.assertEqual(model.max_tokens, 4096)
-        self.assertEqual(model.context_window, 128000)
+            with self.subTest(environment=environment), patch.dict(
+                os.environ,
+                {
+                    **BASE_ENVIRONMENT,
+                    **environment,
+                    "LLM_MODEL": "blank-defaults",
+                    "LLM_API_BASE": "https://provider.test/v1",
+                },
+                clear=True,
+            ):
+                model = _model()
+                self.assertEqual(model.api_format, "openai")
+                self.assertEqual(model.max_tokens, expected_cap)
+                self.assertEqual(model.context_window, 128000)
+                app = create_app(model=model)
+                try:
+                    self.assertEqual(app.state.core_agent.output_reserve, expected_cap)
+                    self.assertEqual(app.state.core_agent.summary_max_tokens, 32768)
+                finally:
+                    app.state.close()
 
     def test_config_error_reports_the_setting_instead_of_a_traceback(self):
         """A misconfigured deployment must exit 1 with one readable line."""

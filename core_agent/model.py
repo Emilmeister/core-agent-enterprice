@@ -164,7 +164,7 @@ class CompatibleHttpModel:
         endpoint=None,
         api_key=None,
         timeout=120,
-        max_tokens=4096,
+        max_tokens=16384,
         headers=None,
         extra_body=None,
         anthropic_version="2023-06-01",

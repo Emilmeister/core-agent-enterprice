@@ -184,7 +184,7 @@ criterion должны войти в тот же завершённый change. 
   `KEYCLOAK_*`. Agent environment явно передаёт поддержанные model/guardrails,
   runtime/compaction, memory и telemetry настройки из `.env.example`. Выход summary
   отдельно ограничен `LLM_SUMMARY_MAX_TOKENS` (32768), обычные ответы —
-  `LLM_MAX_TOKENS`; HTTP adapter передаёт cap и для streaming, а provider options
+  `LLM_MAX_TOKENS` (16384), с таким же резервом контекста; HTTP adapter передаёт cap и для streaming, а provider options
   могут только уменьшить его. Owner override `context_window` сохраняется в snapshot новых
   задач и наследуется children; `null` использует `LLM_CONTEXT_WINDOW`.
   Образ включает Git; отсутствие исполняемой команды внутри sandbox даёт

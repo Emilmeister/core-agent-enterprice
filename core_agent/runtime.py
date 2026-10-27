@@ -333,7 +333,7 @@ class CoreAgent:
         response_files_service=None,
         kernel_compiler=None,
         context_window=128_000,
-        output_reserve=4_096,
+        output_reserve=16_384,
         summary_max_tokens=32_768,
         artifact_store=None,
         retention_manager=None,

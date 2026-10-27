@@ -366,7 +366,7 @@ def _model():
         endpoint=_env("LLM_ENDPOINT"),
         api_key=_env("LLM_API_KEY"),
         timeout=_number("LLM_TIMEOUT", float, default="120"),
-        max_tokens=_number("LLM_MAX_TOKENS", int, default="4096"),
+        max_tokens=_number("LLM_MAX_TOKENS", int, default="16384"),
         headers={**_entity_headers(), **_json("LLM_HEADERS_JSON")},
         extra_body=_json("LLM_EXTRA_BODY_JSON"),
         anthropic_version=_env("ANTHROPIC_VERSION", "2023-06-01"),
@@ -400,7 +400,7 @@ def _guardrail_classifier(model):
             api_format="anthropic" if provider.lower() == "anthropic" else "openai",
             provider=provider, model=name, base_url=base_url, api_key=api_key,
             timeout=timeout, context_window=getattr(model, "context_window", 128000),
-            max_tokens=getattr(model, "max_tokens", 4096), stream=False,
+            max_tokens=getattr(model, "max_tokens", 16384), stream=False,
         )
     elif isinstance(model, CompatibleHttpModel):
         detector = copy.copy(model)
@@ -1671,7 +1671,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         guardrail_classifier=guardrail_classifier,
         kernel_compiler=kernel,
         context_window=_number("LLM_CONTEXT_WINDOW", int, default=getattr(model, "context_window", 128_000)),
-        output_reserve=_number("LLM_MAX_TOKENS", int, default=getattr(model, "max_tokens", 4_096)),
+        output_reserve=_number("LLM_MAX_TOKENS", int, default=getattr(model, "max_tokens", 16_384)),
         summary_max_tokens=_number("LLM_SUMMARY_MAX_TOKENS", int, default="32768"),
         token_counter=token_counter,
         artifact_store=artifact_store,

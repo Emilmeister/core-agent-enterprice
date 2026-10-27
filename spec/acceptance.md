@@ -222,6 +222,8 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
   размера и provenance summary не ослабляется; provider extra_body не снимает cap.
 - [ ] Обычные OpenAI/Anthropic HTTP requests, включая streaming, содержат
   выходной cap adapter; меньший явный provider cap сохраняется, больший ограничен.
+  Без `LLM_MAX_TOKENS` или при пустом значении cap и резерв контекста равны
+  16384; явный ENV override меняет оба значения, не меняя summary cap 32768.
   OpenAI поддерживает явный `max_completion_tokens` без второго cap-поля;
   неправильный тип и неположительный cap отвергаются до отправки.
 
