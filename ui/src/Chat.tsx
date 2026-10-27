@@ -11,7 +11,7 @@ import { Attachments, ConversationFiles, History, pendingAction, useChatHistory 
 import { awaitingModelReply, executionCleanupPending } from "./toolPresentation";
 import { WorkspaceFiles } from "./WorkspaceFiles";
 import { Markdown } from "./Markdown";
-import { chatStreamEvent, nextLiveAnswer } from "./chatStream";
+import { chatStreamEvent } from "./chatStream";
 import { PeerConversationCard, PeerConversationPanel, peerOperationId, usePeerConversations } from "./PeerConversations";
 import type { PeerConversation } from "./PeerConversations";
 import { historyEntries } from "./ActionCard";
@@ -24,10 +24,10 @@ import {
   publicHistoryItems,
   withLocalMessages,
 } from "./types";
-import type { ChatRow, FileReceipt, LiveAnswerSnapshot, LocalMessage, Message, Part, Settings, Task } from "./types";
+import type { ChatRow, FileReceipt, LocalMessage, Message, Part, Settings, Task } from "./types";
 
 // App remounts the first submitted chat when it receives its context ID.
-const liveHandoff = new WeakMap<Api, { taskId: string; messages: LocalMessage[] }>();
+const messageHandoff = new WeakMap<Api, { taskId: string; messages: LocalMessage[] }>();
 
 function settingsLimit(settings: Settings): number {
   const value = settings.attachment_limit_bytes;
@@ -69,7 +69,7 @@ export function Chat({
   const [task, setTask] = useState<Task>();
   const [draft, setDraft] = useState("");
   const [localMessages, setLocalMessages] = useState<LocalMessage[]>(() =>
-    row?.latest_task_id && liveHandoff.get(api)?.taskId === row.latest_task_id ? liveHandoff.get(api)!.messages : []);
+    row?.latest_task_id && messageHandoff.get(api)?.taskId === row.latest_task_id ? messageHandoff.get(api)!.messages : []);
   const submittedDraft = useRef<{ text: string; files: File[] }>({ text: "", files: [] });
   const [attachments, setAttachments] = useState<File[]>([]);
   const [attachmentLimit, setAttachmentLimit] = useState(25_000_000);
@@ -84,11 +84,6 @@ export function Chat({
   const [reconnecting, setReconnecting] = useState(false);
   const [cancelConfirm, setCancelConfirm] = useState(false);
   const [directAnswer, setDirectAnswer] = useState("");
-  const [liveAnswer, setLiveAnswer] = useState<LiveAnswerSnapshot>();
-  const liveTask = useRef<{ api: Api; id: string } | undefined>(
-    row?.latest_task_id && liveHandoff.get(api)?.taskId === row.latest_task_id
-      ? { api, id: row.latest_task_id } : undefined,
-  );
   const [filesOpen, setFilesOpen] = useState(false);
   const [peerSelection, setPeerSelection] = useState<string>();
   const [peerWidth, setPeerWidth] = useState(380);
@@ -165,7 +160,7 @@ export function Chat({
       if (trigger?.isConnected) trigger.focus(); else peerButton.current?.focus();
     });
   }
-  useLayoutEffect(() => { liveHandoff.delete(api); }, [api]);
+  useLayoutEffect(() => { messageHandoff.delete(api); }, [api]);
   useLayoutEffect(() => {
     const dialog = deleteDialog.current;
     if (deleteConfirm && dialog && !dialog.open) dialog.showModal();
@@ -185,13 +180,6 @@ export function Chat({
   const linkedPeers = new Set(historyEntries(history.page.items).map((entry) => peerOperationId(entry.action)));
   const unlinkedPeers = peerHistory.conversations.filter((value) => !linkedPeers.has(value.operation_id));
   const loadHistory = history.load;
-  const liveText = liveTask.current?.api === api && liveTask.current.id === taskId
-    && liveAnswer && liveAnswer.taskId === taskId && !liveAnswer.superseded
-    && (!terminal(task) || task?.status.state === "TASK_STATE_COMPLETED")
-    && !history.page.items.some((item) => item.task_id === taskId && (item.outcome
-      || item.public_message?.text === liveAnswer.text
-      || (item.kind === "agent_message" && item.status === "available" && item.text === liveAnswer.text)))
-    ? liveAnswer.text : "";
   useLayoutEffect(() => {
     if (row?.latest_task_id !== observedRoot.current) {
       observedRoot.current = row?.latest_task_id;
@@ -202,8 +190,6 @@ export function Chat({
           terminal: false,
         };
         setTask(undefined);
-        liveTask.current = undefined;
-        setLiveAnswer(undefined);
         setAcceptedFiles(undefined);
         setCancelConfirm(false);
       }
@@ -220,8 +206,6 @@ export function Chat({
       view.current.revision++;
       setCancelConfirm(false);
       setAcceptedFiles(undefined);
-      liveTask.current = undefined;
-      setLiveAnswer(undefined);
     }
     view.current.taskId = next.id;
     view.current.terminal = terminal(next);
@@ -230,7 +214,7 @@ export function Chat({
   useLayoutEffect(() => {
     const element = thread.current;
     if (!element) return;
-    const signature = JSON.stringify([history.page.items, history.waits, directAnswer, liveText, localMessages]);
+    const signature = JSON.stringify([history.page.items, history.waits, directAnswer, localMessages]);
     if (olderAnchor.current) {
       element.scrollTop = olderAnchor.current.top + element.scrollHeight - olderAnchor.current.height;
       olderAnchor.current = null;
@@ -239,7 +223,7 @@ export function Chat({
       setNewMessages(false);
     } else if (signature !== historySignature.current) setNewMessages(true);
     historySignature.current = signature;
-  }, [history.page.items, history.waits, directAnswer, liveText, localMessages]);
+  }, [history.page.items, history.waits, directAnswer, localMessages]);
   useLayoutEffect(() => {
     const input = composerInput.current;
     if (!input) return;
@@ -323,18 +307,7 @@ export function Chat({
               async (payload) => {
                 if (abort.signal.aborted || !mounted.current || !api.session.valid
                   || view.current.taskId !== taskId || view.current.revision !== revision) return;
-                const event = chatStreamEvent(payload, taskId!, contextId);
-                if (!event) return;
-                if (event.kind === "partial") {
-                  if (event.snapshot && !view.current.terminal
-                    && liveTask.current?.api === api && liveTask.current.id === taskId) {
-                    const snapshot = event.snapshot;
-                    setLiveAnswer((current) => view.current.taskId === taskId && !view.current.terminal
-                      && liveTask.current?.api === api && liveTask.current.id === taskId
-                      ? nextLiveAnswer(current, snapshot) : current);
-                  }
-                  return;
-                }
+                if (!chatStreamEvent(payload, taskId!, contextId)) return;
                 await refresh(abort.signal);
               },
               abort.signal,
@@ -400,7 +373,6 @@ export function Chat({
     setDraft("");
     setAttachments([]);
     setDirectAnswer("");
-    if (!task || terminal(task)) setLiveAnswer(undefined);
     stickToBottom.current = true;
     function failedDelivery(delivery: "failed" | "uncertain") {
       setLocalMessages(current => current.map(message => message.id === messageId ? { ...message, delivery } : message));
@@ -482,8 +454,7 @@ export function Chat({
       }
       if (result.task) {
         acceptTask(result.task);
-        liveTask.current = { api, id: result.task.id };
-        if (!row?.context_id) liveHandoff.set(api, { taskId: result.task.id, messages: echoes });
+        if (!row?.context_id) messageHandoff.set(api, { taskId: result.task.id, messages: echoes });
         onTask(result.task);
         if (result.task.id === taskId) await refresh();
       } else if (result.message)
@@ -736,10 +707,7 @@ export function Chat({
             await refresh(undefined, true);
           }}
         />
-        {liveText && <article className="message live-answer" aria-label="Предварительный ответ">
-          <div className="prose">{liveText}</div>
-        </article>}
-        {!liveText && !directAnswer && !activeWait && !error && (localMessages.some(message => message.delivery === "sending" || !task && message.delivery === "accepted")
+        {!directAnswer && !activeWait && !error && (localMessages.some(message => message.delivery === "sending" || !task && message.delivery === "accepted")
           || awaitingModelReply(task, peers.length > 0 || !!timerUntil)) && (
           <div className="typing-indicator" role="status" aria-label="Агент готовит ответ">
             <span aria-hidden="true" /><span aria-hidden="true" /><span aria-hidden="true" />

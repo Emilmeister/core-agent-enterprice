@@ -7,7 +7,6 @@ from unittest.mock import patch
 from core_agent.errors import CoreError
 from core_agent.kernel import KernelCompiler
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
-from core_agent.streaming import ReplyHub
 from core_agent.tools import ToolDefinition
 from tests.test_runtime_observability import make_agent, run_request
 
@@ -23,17 +22,13 @@ class StreamingScriptedModel(ScriptedModel):
 def kernel(version):
     compiler = KernelCompiler(f"SAFETY {version}", f"HOST {version}", f"KERNEL {version}",
                               {"memory": f"MEMORY {version}"})
-    compiler.response_phase_instructions = {
-        "answer": f"ANSWER {version}", "work_v1": f"LEGACY WORK {version}",
-        "work_v2": f"WORK {version}",
-    }
     return compiler
 
 
 class KernelRecoveryTests(unittest.TestCase):
     def admit(self, *, deferred=False, store=None):
         first = make_agent(StreamingScriptedModel([]), kernel_compiler=kernel("V1"),
-                           workflow_store=store, reply_hub=ReplyHub())
+                           workflow_store=store)
         self.addCleanup(first.close)
         record, *_ = first._new_workflow(run_request(), task_id="kernel-task", identity="anonymous",
                                         session_id="kernel-chat", tenant_id="default",
@@ -41,29 +36,28 @@ class KernelRecoveryTests(unittest.TestCase):
         first.close()
         return first, record
 
-    def test_upgrade_uses_admitted_kernel_for_work_answer_and_budget(self):
+    def test_upgrade_uses_admitted_kernel_for_generation_and_budget(self):
         for deferred in (False, True):
             with self.subTest(deferred=deferred):
                 first, record = self.admit(deferred=deferred)
                 model = StreamingScriptedModel([
-                    ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),)),
                     ModelResponse(message="done"),
                     ModelResponse(message="new task"),
                 ])
                 second = make_agent(model, workflow_store=first.workflow_store,
-                                    kernel_compiler=kernel("V2"), reply_hub=ReplyHub())
+                                    kernel_compiler=kernel("V2"))
                 self.addCleanup(second.close)
                 self.assertEqual(second.resume_task(record.task_id).message, "done")
-                for call, phase in zip(model.calls, ("WORK V1", "ANSWER V1")):
+                for call in model.calls:
                     self.assertIn("KERNEL V1", call.instructions)
-                    self.assertIn(phase, call.instructions)
+                    self.assertNotIn("core_response_begin", call.instructions)
                     self.assertNotIn("V2", call.instructions)
-                self.assertFalse(model.calls[1].tools)
+                self.assertTrue(model.calls[0].tools)
                 resumed = first.workflow_store.lookup_task(record.task_id)
                 self.assertEqual(resumed.snapshot["kernel_instructions"], record.snapshot["kernel_instructions"])
                 raw, discovered, effective = second._resolve_capabilities(run_request())
                 budget = second._context_compactor(raw, effective, discovered, resumed.snapshot).budget
-                frozen = second._compile_instructions(raw, effective, resumed.snapshot, model_tools={}).text
+                frozen = second._compile_instructions(raw, effective, resumed.snapshot, model_tools=model.calls[0].tools).text
                 from core_agent.runtime import CURRENT_TASK_SUMMARY_PREFIX
                 self.assertEqual(budget.system_and_kernel_tokens,
                     second.token_counter(second._request_instructions(frozen))
@@ -82,7 +76,7 @@ class KernelRecoveryTests(unittest.TestCase):
                                                  event_kind="test.legacy-kernel")
                 model = StreamingScriptedModel([ModelResponse(message="done")])
                 second = make_agent(model, workflow_store=first.workflow_store,
-                                    kernel_compiler=kernel(version), reply_hub=ReplyHub())
+                                    kernel_compiler=kernel(version))
                 self.addCleanup(second.close)
                 if version == "V1" and not deferred:
                     second.platform_config.denied_builtin_tools.add("core_memory_search")
@@ -100,6 +94,113 @@ class KernelRecoveryTests(unittest.TestCase):
                     for name in ("compiled_instructions", "protected_kernel_digest", "context"):
                         self.assertEqual(after.get(name), snapshot.get(name))
                 second.close()
+
+    def test_legacy_phase_instructions_are_validated_but_not_sent_after_upgrade(self):
+        for pinned in (False, True):
+            for phase in ("work", "answer"):
+                with self.subTest(pinned=pinned, phase=phase):
+                    first, record = self.admit()
+                    snapshot = copy.deepcopy(record.snapshot)
+                    snapshot["kernel_instructions"] = kernel("V1").snapshot(legacy=True)
+                    snapshot["response_phase"] = phase
+                    raw, _discovered, effective = first._resolve_capabilities(run_request())
+                    compiled = first._compile_instructions(raw, effective, snapshot, legacy_response_phase=phase)
+                    snapshot["compiled_instructions"] = compiled.text
+                    snapshot["protected_kernel_digest"] = compiled.protected_digest
+                    if not pinned:
+                        del snapshot["kernel_instructions"]
+                    first._record_transition(record, state=record.state, snapshot=snapshot,
+                                             event_kind="test.legacy-phase")
+                    model = ScriptedModel([ModelResponse(message="done")])
+                    second = make_agent(model, workflow_store=first.workflow_store,
+                                        kernel_compiler=kernel("V2" if pinned else "V1"))
+                    self.addCleanup(second.close)
+                    result = second.resume_task(record.task_id)
+                    self.assertTrue(result.complete)
+                    self.assertEqual(result.usage.model_turns, 1)
+                    self.assertEqual(result.usage.tool_calls, 0)
+                    self.assertIn("KERNEL V1", model.calls[0].instructions)
+                    self.assertNotIn("KERNEL V2", model.calls[0].instructions)
+                    self.assertNotIn("core_response_begin", model.calls[0].instructions)
+                    self.assertNotIn("public answer phase", model.calls[0].instructions)
+                    self.assertTrue(model.calls[0].tools)
+                    second.close()
+
+    def test_old_kernel_snapshot_requires_exact_shape_and_digest(self):
+        legacy = kernel("V1").snapshot(legacy=True)
+        self.assertEqual(KernelCompiler.from_snapshot(legacy).snapshot(legacy=True), legacy)
+        variants = []
+        changed = copy.deepcopy(legacy)
+        changed["response_phase_instructions"]["answer"] = "changed"
+        variants.append(changed)
+        extra = {**legacy, "unexpected": "field"}
+        variants.append(extra)
+        missing = copy.deepcopy(legacy)
+        del missing["response_phase_instructions"]["work_v1"]
+        variants.append(missing)
+        for snapshot in variants:
+            with self.subTest(snapshot=snapshot), self.assertRaises(CoreError) as error:
+                KernelCompiler.from_snapshot(snapshot)
+            self.assertEqual(error.exception.code, "CHECKPOINT_INVALID")
+
+    def test_legacy_answer_phase_keeps_new_tool_batch_when_input_arrives(self):
+        for source in ("followup", "notification"):
+            with self.subTest(source=source):
+                first, record = self.admit()
+                snapshot = copy.deepcopy(record.snapshot)
+                snapshot["kernel_instructions"] = kernel("V1").snapshot(legacy=True)
+                snapshot["response_phase"] = "answer"
+                first._record_transition(record, state=record.state, snapshot=snapshot,
+                                         event_kind="test.legacy-answer")
+
+                class InputModel(ScriptedModel):
+                    def generate(inner, **kwargs):
+                        response = super().generate(**kwargs)
+                        if len(inner.calls) == 1:
+                            if source == "followup":
+                                second.enqueue_message(run_request(), task_id=record.task_id,
+                                    message_id="late-input", identity=record.owner_id,
+                                    session_id=record.context_id, tenant_id=record.tenant_id)
+                            else:
+                                task = second.task_scheduler.start(lambda: {"message": "child done"},
+                                    owner_id=record.run_id, tenant_id=record.tenant_id,
+                                    required=False, kind="test", contract={})
+                                second.task_scheduler.wait(task.id, timeout=2, owner_id=record.run_id,
+                                                           tenant_id=record.tenant_id)
+                        return response
+
+                model = InputModel([
+                    ModelResponse(tool_requests=tuple(ToolRequest(name, "core_terminal_exec", {"argv": [name]})
+                                                      for name in ("first", "second"))),
+                    ModelResponse(message="done"),
+                ])
+                second = make_agent(model, workflow_store=first.workflow_store, kernel_compiler=kernel("V2"))
+                self.addCleanup(second.close)
+                result = second.resume_task(record.task_id)
+                self.assertTrue(result.complete)
+                self.assertEqual(result.usage.tool_calls, 2)
+                self.assertEqual(second.tool_runtime.execution_count, 2)
+                self.assertEqual([message["tool_call_id"] for message in model.calls[-1].messages
+                                  if message["role"] == "tool"], ["first", "second"])
+                second.close()
+
+    def test_legacy_saved_final_is_reconsidered_after_late_input(self):
+        first, record = self.admit()
+        snapshot = copy.deepcopy(record.snapshot)
+        snapshot["kernel_instructions"] = kernel("V1").snapshot(legacy=True)
+        snapshot["response_phase"] = "answer"
+        snapshot["pending_response"] = first._response_dict(ModelResponse(message="old answer"))
+        first._record_transition(record, state="MODEL_RESPONDED", snapshot=snapshot,
+                                 event_kind="test.legacy-final")
+        model = ScriptedModel([ModelResponse(message="updated answer")])
+        second = make_agent(model, workflow_store=first.workflow_store, kernel_compiler=kernel("V2"))
+        self.addCleanup(second.close)
+        second.enqueue_message(run_request(), task_id=record.task_id, message_id="late-input",
+            identity=record.owner_id, session_id=record.context_id, tenant_id=record.tenant_id)
+        result = second.resume_task(record.task_id)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.message, "updated answer")
+        self.assertEqual(len(model.calls), 1)
 
     def test_corrupt_kernel_snapshot_fails_before_reconnect(self):
         first, record = self.admit()
@@ -189,7 +290,7 @@ class KernelRecoveryTests(unittest.TestCase):
         self.addCleanup(reopened.close)
         model = StreamingScriptedModel([ModelResponse(message="done")])
         second = make_agent(model, workflow_store=PostgresWorkflowStore(reopened),
-                            kernel_compiler=kernel("V2"), reply_hub=ReplyHub())
+                            kernel_compiler=kernel("V2"))
         self.addCleanup(second.close)
         self.assertEqual(second.resume_task(record.task_id).message, "done")
         self.assertIn("KERNEL V1", model.calls[0].instructions)

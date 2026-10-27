@@ -365,7 +365,7 @@ class NamedUser(User):
     "set TEST_DATABASE_URL to run PostgreSQL restart tests",
 )
 class PostgresRestartTests(unittest.TestCase):
-    def test_public_reply_phase_survives_database_reopen_with_charged_attempt(self):
+    def test_buffered_reply_survives_database_reopen_with_charged_attempt(self):
         import uuid
 
         database_url = os.environ["TEST_DATABASE_URL"]
@@ -376,21 +376,18 @@ class PostgresRestartTests(unittest.TestCase):
 
             def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
                 self.calls += 1
-                if self.calls == 1:
-                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
-                on_delta("abandoned public prefix", "private reasoning")
+                if on_delta:
+                    on_delta("abandoned partial answer", "private reasoning")
                 raise CoreError("LEASE_LOST")
 
         class RecoveredModel:
             model = "reply-restart-test"
 
             def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
-                if tools:
-                    raise AssertionError("persisted answer phase lost")
-                on_delta("recovered public prefix", "private reasoning")
-                preview = second.state.core_agent.reply_hub.latest("company", task_id)
-                if preview["generation"] != 3 or preview["text"] != "recovered public prefix":
-                    raise AssertionError("recovery did not publish charged public generation")
+                if not tools or "core_response_begin" in tools:
+                    raise AssertionError("recovery must retain the ordinary tool catalog")
+                if on_delta:
+                    on_delta("recovered partial answer", "private reasoning")
                 return ModelResponse(message="Recovered complete answer")
 
         database = self._database()
@@ -416,13 +413,13 @@ class PostgresRestartTests(unittest.TestCase):
             second = create_app(model=RecoveredModel(), database=reopened)
             try:
                 record = second.state.core_agent.workflow_store.lookup_task(task_id)
-                self.assertEqual(record.snapshot["response_phase"], "answer")
-                self.assertEqual(record.snapshot["turns"], 2)
-                self.assertEqual(record.snapshot["tool_calls"], 1)
+                self.assertNotIn("response_phase", record.snapshot)
+                self.assertEqual(record.snapshot["turns"], 1)
+                self.assertEqual(record.snapshot["tool_calls"], 0)
                 result = second.state.core_agent.resume_task(task_id)
                 self.assertTrue(result.complete)
-                self.assertEqual(result.usage.model_turns, 3)
-                self.assertEqual(result.usage.tool_calls, 1)
+                self.assertEqual(result.usage.model_turns, 2)
+                self.assertEqual(result.usage.tool_calls, 0)
                 self.assertEqual(result.message, "Recovered complete answer")
             finally:
                 second.state.close()

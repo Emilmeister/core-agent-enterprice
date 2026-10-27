@@ -233,34 +233,6 @@ class ModelTransportFailureTests(unittest.TestCase):
 
 
 class StreamBufferTests(unittest.TestCase):
-    def test_public_reply_hub_is_bounded_scoped_and_closes_superseded_generations(self):
-        from core_agent.streaming import ReplyHub
-
-        hub = ReplyHub(min_chars=2, max_tasks=2, max_bytes=6)
-        self.assertIsNone(hub.update("a", "task", "chat", 2, "x"))
-        prefix = hub.update("a", "task", "chat", 2, "éééé")
-        self.assertEqual(prefix["text"], "ééé")
-        self.assertIsNone(hub.latest("b", "task"))
-        reset = hub.supersede("a", "task")
-        self.assertTrue(reset["superseded"])
-        self.assertGreater(reset["sequence"], prefix["sequence"])
-        self.assertIsNone(hub.update("a", "task", "chat", 2, "stale", force=True))
-        self.assertIsNone(hub.update("a", "task", "chat", 1, "older", force=True))
-        fresh = hub.update("a", "task", "chat", 3, "new", force=True)
-        self.assertGreater(fresh["sequence"], reset["sequence"])
-        hub.update("b", "task", "chat", 1, "other", force=True)
-        hub.update("c", "task", "chat", 1, "third", force=True)
-        self.assertIsNone(hub.latest("a", "task"))
-        evicted_reset = hub.supersede("a", "task", generation=3, context_id="chat")
-        self.assertTrue(evicted_reset["superseded"])
-        self.assertGreater(evicted_reset["sequence"], fresh["sequence"])
-        self.assertIsNone(hub.update("a", "task", "chat", 3, "stale", force=True))
-        hub.discard("a", "task")
-        restored = hub.update("a", "task", "chat", 3, "newer", force=True)
-        self.assertGreater(restored["sequence"], fresh["sequence"])
-        hub.discard("b", "task")
-        self.assertIsNone(hub.latest("b", "task"))
-
     def test_snapshot_replaces_while_every_delta_is_appended(self):
         self.assertEqual(integrate_stream_chunk("", "abc"), "abc")
         self.assertEqual(integrate_stream_chunk("abc", "def"), "abcdef")
@@ -402,7 +374,7 @@ class RemoteAgentConnectionTests(unittest.TestCase):
 
 
 class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
-    """The A2A 1.0 JSON-RPC binding must carry ADK-typed progress frames."""
+    """A2A lifecycle streams expose canonical output without model drafts."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -510,39 +482,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         final = await store.get(task.id)
         self.assertEqual(final.status.message.parts[0].text, "Canonical complete answer")
 
-    async def test_slow_initial_stream_reads_only_latest_public_snapshot(self):
-        from a2a.types import Task, TaskState
-
-        app = self._app()
-        handler = app.state.a2a_request_handler
-        hub = handler.reply_hub
-        finish = asyncio.Event()
-
-        async def source():
-            task = Task(id="slow-reply", context_id="slow-chat")
-            task.status.state = TaskState.TASK_STATE_WORKING
-            yield task
-            await finish.wait()
-            task.status.state = TaskState.TASK_STATE_COMPLETED
-            yield task
-
-        stream = handler._stream_with_public_replies(source(), None)
-        first = await anext(stream)
-        self.assertEqual(first.id, "slow-reply")
-        # The reader is suspended while the producer updates its one snapshot.
-        for number in range(1, 2050):
-            hub.update("default", "slow-reply", "slow-chat", 2, "x" * (number * 4), force=True)
-        latest = hub.latest("default", "slow-reply")
-        event = await asyncio.wait_for(anext(stream), 2)
-        self.assertEqual(event.status.message.parts[0].text, latest["text"])
-        self.assertEqual(len(event.status.message.parts[0].text), 2049 * 4)
-        finish.set()
-        terminal = await asyncio.wait_for(anext(stream), 2)
-        self.assertEqual(terminal.status.state, TaskState.TASK_STATE_COMPLETED)
-        with self.assertRaises(StopAsyncIteration):
-            await anext(stream)
-
-    async def test_real_tcp_public_prefix_precedes_provider_completion(self):
+    async def test_real_tcp_reply_is_buffered_until_provider_completion(self):
         import socket
         import uvicorn
 
@@ -550,7 +490,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         prefix_sent = threading.Event()
 
         class GatedHandler(ModelHandler):
-            tool_call = ("core_response_begin", {})
+            tool_call = None
             answer = "Public prefix and final answer."
             requests = []
 
@@ -559,7 +499,7 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                 if delta.get("content") == "Public ":
                     prefix_sent.set()
                     if not release.wait(10):
-                        raise TimeoutError("test did not observe public prefix")
+                        raise TimeoutError("test did not release buffered reply")
 
         provider = ThreadingHTTPServer(("127.0.0.1", 0), GatedHandler)
         threading.Thread(target=provider.serve_forever, daemon=True).start()
@@ -583,36 +523,42 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         thread.start()
         self.assertTrue(await asyncio.to_thread(ready.wait, 5), "ASGI listener did not start")
         frames = []
-        saw_prefix = False
         payload = {"jsonrpc": "2.0", "id": "live", "method": "SendStreamingMessage", "params": {
             "message": {"role": "ROLE_USER", "messageId": str(uuid.uuid4()), "parts": [{"text": "hello"}]}}}
         try:
             async with httpx.AsyncClient(timeout=10) as http:
-                async with http.stream("POST", url + "/", json=payload,
-                    headers={"A2A-Version": "1.0", "Accept": "text/event-stream"}) as response:
-                    self.assertEqual(response.status_code, 200)
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        frame = json.loads(line[5:])
-                        self.assertNotIn("error", frame, frame)
-                        event = frame["result"]
-                        frames.append(event)
-                        message = self._status(event).get("message") or {}
-                        marker = (message.get("metadata") or {}).get("core_agent_stream")
-                        if marker and not marker.get("superseded") and not saw_prefix:
-                            self.assertTrue(prefix_sent.is_set())
-                            self.assertFalse(release.is_set(), "generation already completed")
-                            self.assertEqual(message["parts"][0]["text"], "Public")
-                            self.assertEqual(marker["generation"], 2)
-                            self.assertEqual(marker["sequence"], 1)
-                            self.assertEqual(len(GatedHandler.requests), 2)
-                            self.assertEqual(GatedHandler.requests[1].get("tools", []), [])
-                            saw_prefix = True
-                            release.set()
-            self.assertTrue(saw_prefix, "no real-time public prefix arrived")
-            self.assertEqual(len(self._terminal(frames)), 1)
-            self.assertIs(self._terminal(frames)[0], frames[-1])
+                async def consume():
+                    async with http.stream("POST", url + "/", json=payload,
+                        headers={"A2A-Version": "1.0", "Accept": "text/event-stream"}) as response:
+                        self.assertEqual(response.status_code, 200)
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            frame = json.loads(line[5:])
+                            self.assertNotIn("error", frame, frame)
+                            frames.append(frame["result"])
+
+                reader = asyncio.create_task(consume())
+                try:
+                    self.assertTrue(await asyncio.to_thread(prefix_sent.wait, 5))
+                    self.assertFalse(release.is_set())
+                    self.assertFalse(reader.done(), "stream ended before provider completion")
+                    self.assertNotIn("Public", json.dumps(frames))
+                    self.assertNotIn("core_response_begin", json.dumps(GatedHandler.requests[0]))
+                    release.set()
+                    await reader
+                finally:
+                    release.set()
+                    if not reader.done():
+                        reader.cancel()
+                    await asyncio.gather(reader, return_exceptions=True)
+            terminal = self._terminal(frames)
+            self.assertEqual(len(terminal), 1)
+            self.assertIs(terminal[0], frames[-1])
+            self.assertEqual(self._status(terminal[0])["state"], "TASK_STATE_COMPLETED")
+            self.assertEqual([part["text"] for frame in frames for part in self._parts(frame)], [GatedHandler.answer])
+            self.assertEqual(len(GatedHandler.requests), 1)
+            self.assertNotIn("core_agent_stream", json.dumps(frames))
             self.assertNotIn("Deciding what to do", json.dumps(frames))
         finally:
             release.set()
@@ -640,7 +586,6 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_guarded_stream_keeps_reasoning_private_and_publishes_final_text(self):
-        ModelHandler.tool_call = ("core_response_begin", {})
         frames = await self._frames(self._app(), "hello")
         thoughts = [
             part["text"]
@@ -657,19 +602,9 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
                 (self._status(frame).get("message") or {}).get("metadata") or {}
             ).get("partial")
         ]
-        snapshots = [
-            part["text"]
-            for frame in partials
-            for part in self._parts(frame)
-            if not (part.get("metadata") or {}).get("adk_thought")
-        ]
-        self.assertEqual(snapshots, sorted(snapshots, key=len))
-        if snapshots:
-            self.assertTrue(snapshots[-1].startswith(snapshots[0]))
-        # A fast provider may complete before the bounded hub is polled. The
-        # gated real-TCP test separately proves delivery before completion.
-        self.assertEqual(len(ModelHandler.requests), 2)
-        self.assertNotIn("tools", ModelHandler.requests[-1])
+        self.assertEqual(partials, [])
+        self.assertEqual(len(ModelHandler.requests), 1)
+        self.assertNotIn("core_response_begin", json.dumps(ModelHandler.requests[0]))
 
         terminal = self._terminal(frames)
         self.assertEqual(len(terminal), 1)
@@ -700,35 +635,41 @@ class StreamingA2ATests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["tool_name"], "core_task_list")
 
 
-    async def test_guarded_remote_result_reaches_model_without_raw_progress_relay(self):
+    async def test_remote_result_reaches_model_without_raw_progress_relay(self):
         peer = ThreadingHTTPServer(("127.0.0.1", 0), RemoteAgentHandler)
         threading.Thread(target=peer.serve_forever, daemon=True).start()
         self.addCleanup(peer.server_close)
         self.addCleanup(peer.shutdown)
-        ModelHandler.tool_call = (
-            "core_agent_send_message",
-            {"agent_name": "weather-agent", "task": "What is the weather?"},
-        )
-        frames = await self._frames(
-            self._app(REMOTE_AGENTS=f"http://127.0.0.1:{peer.server_port}"),
-            "ask the weather agent",
-        )
-        relayed = [
-            part["text"]
-            for frame in frames
-            for part in self._parts(frame)
-            if "text" in part
-            and not (part.get("metadata") or {}).get("adk_thought")
-        ]
-        self.assertNotIn("looking it up", relayed)
-        response = next(json.loads(message["content"]) for message in ModelHandler.requests[-1]["messages"]
-                        if message.get("role") == "tool")
-        self.assertEqual(response["output"]["result"], "24 degrees")
-        self.assertTrue(response["output"]["success"])
-        _body, headers = RemoteAgentHandler.seen
-        lowered = {key.lower(): value for key, value in headers.items()}
-        self.assertEqual(lowered["authorization"], "Bearer caller-token")
-        self.assertNotIn("cookie", lowered)
+        for guarded in (True, False):
+            with self.subTest(material_reviews=guarded):
+                ModelHandler.requests = []
+                ModelHandler.tool_call = (
+                    "core_agent_send_message",
+                    {"agent_name": "weather-agent", "task": "What is the weather?"},
+                )
+                app = self._app(REMOTE_AGENTS=f"http://127.0.0.1:{peer.server_port}")
+                if not guarded:
+                    # An embedded CoreAgent may run without material reviews.
+                    app.state.core_agent.material_review_store = None
+                    app.state.core_agent.guardrail_classifier = None
+                frames = await self._frames(app, "ask the weather agent")
+                public_text = [
+                    part["text"]
+                    for frame in frames
+                    for part in self._parts(frame)
+                    if "text" in part
+                ]
+                self.assertEqual(public_text, [ModelHandler.answer])
+                self.assertFalse(any((self._status(frame).get("message") or {})
+                    .get("metadata", {}).get("partial") for frame in frames))
+                response = next(json.loads(message["content"]) for message in ModelHandler.requests[-1]["messages"]
+                                if message.get("role") == "tool")
+                self.assertEqual(response["output"]["result"], "24 degrees")
+                self.assertTrue(response["output"]["success"])
+                _body, headers = RemoteAgentHandler.seen
+                lowered = {key.lower(): value for key, value in headers.items()}
+                self.assertEqual(lowered["authorization"], "Bearer caller-token")
+                self.assertNotIn("cookie", lowered)
 
     async def test_send_message_is_absent_when_no_remote_agent_is_configured(self):
         app = self._app()

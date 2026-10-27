@@ -226,13 +226,6 @@ export interface Task {
   artifacts?: { artifactId: string; name?: string; parts: Part[]; metadata?: Record<string, unknown> }[];
   metadata?: Record<string, unknown>;
 }
-export interface LiveAnswerSnapshot {
-  taskId: string;
-  generation: number;
-  sequence: number;
-  text: string;
-  superseded: boolean;
-}
 export interface RemoteProgress {
   task_id: string;
   revision: number;

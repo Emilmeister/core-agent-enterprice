@@ -413,7 +413,7 @@ continuation, deploy upgrade или обработке follow-up. Legacy accepte
 results завершаются и читаются по прежней семантике; v2 не восстанавливает
 публикации из workspace, Markdown или старых result Artifacts.
 
-Обычный final tools-free model response сохраняется как canonical agent
+Обычный final model response без tool calls сохраняется как canonical agent
 Message v2. Его identity, ordered Parts, completion provenance и terminal
 transition коммитятся durable до publication; configured push delivery входит
 в тот же terminal commit. SDK, Get/history, live stream, passive Subscribe,
@@ -433,24 +433,37 @@ model turn и повторного budget charge.
 budget exhaustion не меняют previously published immutable Artifacts.
 Uncommitted либо rejected batch не добавляется при terminalization.
 Child outputs не становятся root публичными Messages/Artifacts автоматически.
-Transient token previews не становятся history entries либо selected output;
-private owner correspondence и hidden reasoning не публикуются.
+Частично сгенерированный текст не публикуется и не становится history entries
+либо selected output; private owner correspondence и hidden reasoning приватны.
 
-## Фаза публичного ответа
+## Публикация готового ответа
 
-Условный main-run model-only `core_response_begin({})` доступен для owner-задач при включённом live reply sink и поддержке adapter `on_delta`. В задаче внешнего A2A caller этот инструмент и служебные инструкции answer phase отсутствуют; финальный ответ формируется обычным buffered model turn без дополнительного control call. Он MUST списывать обычный local/shared tool call и атомарно закреплять `response_phase=answer` под существующим lease/CAS. Сигнал является границей: текст данного work turn отбрасывается, co-issued calls после него получают безопасный blocked tool result, затем следующий ordinary model call MUST иметь пустой tools catalog. Активированные protected/skill instructions сохраняются, а ответ адресуется intended Task recipient. Child runs, прямой dispatch и nested Python broker MUST NOT включать эту фазу.
+Owner, external и child runs формируют итог обычным model turn. Финальный текст
+MUST публиковаться только после завершения генерации и durable commit canonical
+результата. Provider streaming MAY использоваться внутри adapter/runtime;
+его частичные text/reasoning deltas MUST NOT становиться публичным ответом.
+Отдельной answer phase, control tool, обязательного JSON envelope или
+дополнительного model call для перехода к ответу нет. Каталог и protected/skill
+instructions определяются обычными capabilities и текущими policy.
 
-Answer call MUST списывать обычный local/shared model turn, использовать обычную complete provenance и соблюдать pending child/inbound guards. Existing reserved budget finalizer остаётся отдельным incomplete/budget_exhausted путём; он не становится бесплатным обычным ответом. Durable phase/attempt markers восстанавливаются существующим workflow без новой lifecycle state machine или БД migration. Retry/unknown attempt закрывает прежний preview generation и списывает следующий обычный model turn. Принятый follow-up на safe boundary закрывает прежний preview, возвращает фазу work и заставляет модель учесть новое input перед ответом.
+Итоговый turn MUST списывать обычный local/shared model budget, использовать
+обычную completion provenance и соблюдать pending child/inbound guards.
+Existing reserved budget finalizer остаётся отдельным incomplete/budget_exhausted
+путём. Follow-up учитывается на существующей safe boundary; retry неизвестного
+model attempt сохраняет прежний учёт бюджета. Уже сохранённый final response
+MUST NOT генерироваться повторно только ради публикации.
 
-Выбор owner/external режима определяется уже сохранённым execution owner,
-связанным с authenticated caller, а не prompt, request metadata или читателем
-Task; новая persisted настройка не требуется. Owner-просмотр либо follow-up
-не включает live-режим для external-owned задачи. Существующая external Task
-с уже сохранённой answer phase завершает tools-free turn по прежнему durable
-lifecycle, но без инструкции этой фазы и token preview; текст буферизуется.
-Сохранённый pending `core_response_begin`, как и новая попытка вызвать его,
-получает обычный linked tool result `TOOL_UNAVAILABLE`, после чего loop может
-продолжиться. Скрытого исполнения удалённого control tool, повторных side effects
-или сброса бюджета нет; control tool модели не предлагается.
+`core_response_begin` удалён из model catalog, kernel guidance, dispatch и
+delegation; canonical name остаётся reserved tombstone, недоступным MCP.
+Сохранённый pending call либо новый вызов этого имени получает обычный linked
+tool result `TOOL_UNAVAILABLE` с актуальным catalog, после чего loop может
+продолжиться. Проверка pinned kernel snapshot и точного legacy compiled text
+предшествует адаптации, как задано в [kernel instructions](kernel-instructions.md).
 
-Только tools-free answer turn owner-задачи MAY подавать public text в scoped transient reply hub. Work turn с activation/control catalog MUST сохранять discard-on-activation staging. Обычный final answer без signal совместим с прежним buffered путём без дополнительного generation call.
+Legacy `response_phase=answer` и attempt markers MUST NOT включать preview,
+возвращать удалённый tool/guidance или сужать следующий обычный catalog.
+Recovery сохраняет уже записанный final model response, usage, completed tool
+results и output-contract version. Calls, ранее заблокированные после control
+boundary, остаются failed; они MUST NOT исполняться заново. Старый незавершённый
+attempt продолжается существующим recovery без новой state machine, migration
+БД, повторных side effects либо сброса выполненной работы.

@@ -89,7 +89,7 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
 - [ ] AgentConfig может отключить memory, terminal, filesystem mutations, background tasks, delegation, отдельные built-in/MCP tools и skills.
 - [ ] Disabled tool отсутствует в discovery/model context и stale call получает `CAPABILITY_DISABLED`.
 - [ ] Memory modes `disabled`, `optional`, `required` корректно фильтруют/требуют встроенный memory backend.
-- [ ] Неверные memory modes, включая boolean/null, отклоняются без отражения значения; явно включённая capability вне platform support не добавляет tools или policy. `response_files: false` исключает оба response-file имени и их policy, включая answer phase; пропущенные switches сохраняют прежние defaults.
+- [ ] Неверные memory modes, включая boolean/null, отклоняются без отражения значения; явно включённая capability вне platform support не добавляет tools или policy. `response_files: false` исключает оба response-file имени и их policy во всех обычных model turns; пропущенные switches сохраняют прежние defaults.
 - [ ] Root/delegated/background snapshots закрепляют `capability_filter_version=1`. Legacy digest без marker допускает recovery, включая старый skill digest, но модель и dispatch получают текущие ограничения; version/digest обновляются атомарно. Современный marker отклоняет старый feature digest; malformed/unknown marker отклоняется до workspace/discovery/cache.
 - [ ] MCP tool filters применяются после discovery, но до model context; deny имеет приоритет.
 - [ ] Admission ceiling и config/tool snapshot immutable внутри Task; текущая owner policy применяется к последующим calls, все использованные versions/digests сохраняются в audit.
@@ -106,9 +106,12 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
 ## Kernel instructions
 
 - [ ] KernelInstructions всегда присутствуют отдельно от AgentProfilePrompt и имеют version/digest в audit.
-- [ ] Root с kernel V1, включая ещё не завершённую инициализацию, после cold
-  recovery под V2 использует V1 в work/answer, context budget и children/background;
-  новый root использует V2. PostgreSQL reopen сохраняет исходные texts/digest.
+- [ ] Root с kernel revision A, включая ещё не завершённую инициализацию, после
+  cold recovery под revision B использует исходные safety/host/base/capability
+  texts в model turns, context budget и children/background; новый root
+  использует revision B. PostgreSQL reopen сохраняет исходные texts/digest.
+  Поддержка snapshot v1 проверяет прежнюю phase guidance в digest, но не
+  возвращает её в model context; новые snapshots используют version 2.
   Legacy checkpoint мигрирует только при точном text+digest совпадении; mismatch,
   непроверяемая legacy initialization или повреждённый source snapshot дают
   `CHECKPOINT_INVALID` до MCP/model/tool dispatch, сохраняя исходный transcript.
@@ -794,33 +797,35 @@ Synthetic static fixture доказывает routing/security, но не SPA bu
   activation source или непроверенный legacy lock дают безопасную ошибку.
   Исторический activation receipt не является источником новой инструкции.
 
-- ENT-AC-84: поток модели owner-задачи достигает owner UI
-  до окончания фактической генерации. Служебный сигнал списывает tool budget и
-  закрепляет answer phase; следующий turn tools-free и списывает model budget.
-  Reasoning, work/tool stream и private owner conversation не раскрываются.
-  Реальный TCP и native browser доказывают первый prefix при заблокированном
-  provider, накопительные scope/generation/sequence, passive reconnect без нового
-  model call у owner A2A-клиента и однократную замену сохранённым итогом. В UI повторное
-  открытие страницы использует canonical историю без восстановления preview;
-  отправка из текущего окна включает live текст без сохранения признака в storage.
-  Неполный Markdown остаётся
-  plain text, finished answer получает безопасный существующий renderer.
-  Superseded/retry/follow-up, cancel, HITL/recovery и budget exhaustion не создают
-  ложного final, повторного side effect или бесплатного model/tool call. Legacy
-  tools-free reply корректно воспроизводит прежние tool turns без расширения
-  каталога. Restart сохраняет phase/usage; transient preview не обязан пережить
-  рестарт и не становится history, push, Artifact или источником полномочий.
+- ENT-AC-84: owner, external и child runs получают обычный catalog без
+  `core_response_begin` и guidance answer phase. При заблокированном streaming
+  provider частично сгенерированный ответ отсутствует в публичном A2A stream,
+  Get/history/push и owner UI. После окончания генерации один canonical итог
+  появляется с теми же ID/Parts на всех paths, без дополнительного model/tool
+  call или искусственного replay токенов. Reasoning, work/tool stream и private
+  owner conversation не раскрываются. UI показывает статус работы и безопасно
+  рендерит готовый ответ; reconnect/reload не дублирует его и не запускает работу.
+  Явные Messages/Artifacts, lifecycle events, follow-up guards, HITL, cancel,
+  обычные budgets и отдельный emergency budget finalizer сохраняются.
+  Legacy pending control call даёт linked `TOOL_UNAVAILABLE` с текущими tools.
+  Legacy answer marker не включает preview, удалённые инструкции или tools-free
+  catalog; сохранённый final response не теряется и не генерируется повторно.
+  Ранее blocked co-issued calls остаются failed без повторного dispatch.
+  Restart сохраняет usage и completed effects; kernel snapshot v1 и legacy
+  compiled text проверяются строго до адаптации, повреждение даёт
+  `CHECKPOINT_INVALID`. Новые kernel snapshots имеют version 2 без phase guidance.
 
 - EXT-AC-BUFFERED: external-owned root не получает `core_response_begin` и
-  инструкцию для answer phase при наличии live reply sink/streaming adapter.
+  инструкцию для answer phase при наличии streaming adapter.
   Обычный финальный model response сохраняется canonical Message без control
   turn и token preview, включая подписку и owner-просмотр external Task.
   Явные `core_message_send`, Artifacts и lifecycle events продолжают работать.
-  Prompt/metadata не меняют trusted режим. Owner-задача сохраняет прежний live
-  ответ. Recovery external legacy answer phase сохраняет tools-free buffered
-  завершение и бюджеты; pending control и новый вызов дают linked TOOL_UNAVAILABLE
-  с продолжением loop. Нет скрытого исполнения control tool, повторных side
-  effects, нового tool в каталоге или сброса уже выполненной работы.
+  Prompt/metadata и owner-просмотр не меняют caller scope. Owner-задача использует
+  то же buffered поведение. Recovery external legacy answer phase использует
+  обычный catalog и сохраняет ready final response и бюджеты; pending control
+  и новый вызов дают linked `TOOL_UNAVAILABLE` с продолжением loop. Нет скрытого
+  исполнения control tool, повторных side effects, нового tool в каталоге
+  или сброса уже выполненной работы.
 
 - ENT-AC-85: owner UI «Доступ к агенту» выдаёт внешний доступ через текущую
   сессию владельца и реальный Keycloak; отдельные provisioning credentials и
@@ -943,7 +948,7 @@ implemented. Automated proofs MUST входить в обычные applicable g
 - [ ] ENT-AC-96: `core_message_send({text})` публикует public Message до receipt
   и оставляет Task working. Crash до/после commit и accepted-call replay дают
   соответственно ноль/один history Message и один charge, без второго ID.
-  Два distinct calls с одинаковым текстом дают два сообщения. Transient previews,
+  Два distinct calls с одинаковым текстом дают два сообщения. Частичные model deltas,
   superseded token generations и repeated polling не становятся duplicate replies.
 - [ ] ENT-AC-97: `core_response_artifacts` выбирает text/data-object/file Parts
   в заданном порядке, с optional bounded name и valid text media type. File bytes

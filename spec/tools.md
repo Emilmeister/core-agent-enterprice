@@ -501,6 +501,12 @@ timeout — linked tool result `OWNER_ANSWER_TIMEOUT`. Отказ/timeout approv
 `OWNER_APPROVAL_REJECTED`/`OWNER_APPROVAL_TIMEOUT`, позволяют модели продолжить
 задачу и не создают owner question. Обычный A2A follow-up не является ответом.
 
-### Служебный переход к публичному ответу
+### Удалённый переход к публичному ответу
 
-`core_response_begin` — условный model-only control tool основного owner-запуска с закрытой пустой object schema, без side effects и пользовательских аргументов. В catalog и служебных инструкциях задач внешних A2A callers его нет: финальный текст отправляется обычным buffered ответом. Он отсутствует в operator capability allowlist, Agent Card и `core_delegate.tools`; его reserved canonical name не может быть заменён MCP tool. Модель вызывает его после завершения работы, необходимых approvals/guardrails и явной публикации нужных v2 Artifacts (legacy — выбора response files), вместо генерации final draft в рабочем turn. Следующий обычный model turn имеет tools-free catalog и формирует предназначенный Task recipient публичный ответ. Вызов расходует обычный tool budget, следующий model call — обычный model budget. Прямой/nested dispatch и child run не меняют фазу. Семантика durable boundary и fallback определена в [runtime](runtime.md), transport preview — в [A2A](a2a-protocol.md).
+`core_response_begin` не является доступным инструментом: он отсутствует в
+catalog, instructions, operator capability allowlist, Agent Card и
+`core_delegate.tools` для всех callers. Canonical name остаётся reserved
+tombstone и MUST NOT заменяться MCP tool. Pending legacy call либо новая
+попытка вызова возвращает linked `TOOL_UNAVAILABLE` с актуальными доступными
+tools; прямой/nested dispatch не включает особую фазу. Ответ формируется обычным
+model turn и публикуется целиком по [runtime contract](runtime.md#публикация-готового-ответа).

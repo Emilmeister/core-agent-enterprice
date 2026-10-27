@@ -178,7 +178,9 @@ print({marker!r})
 
         def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
             index = len(self.calls)
-            if index == 33:
+            assert "core_response_begin" not in tools
+            assert "core_response_begin" not in str(instructions)
+            if index == 32:
                 response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
                 self.public_waiting.set()
                 try:
@@ -186,26 +188,25 @@ print({marker!r})
                 finally:
                     self.public_waiting.clear()
                 return response
-            if index == 15:
+            if index == 14:
                 assert self.model == "browser-model-two", "new root did not use owner model selection"
                 assert "Native owner profile proof" in str(instructions), "new root did not use owner profile"
-            if index == 14:
-                assert not tools, "public answer turn still exposes tools"
-                assert on_delta is not None, "model streaming callback is absent"
+            if index == 13:
+                assert "core_response_files" in tools, "ordinary answer turn lost its tools"
                 response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
-                on_delta("# Native streamed reply\n\n```python\nprint('live", "private-native-reasoning")
+                if on_delta is not None:
+                    on_delta("# Native streamed reply\n\n```python\nprint('live", "private-native-reasoning")
                 self.reply_started.set()
                 self.reply_waiting.set()
                 try:
                     assert self.reply_release.wait(120), "browser did not release the blocked provider"
                 finally:
                     self.reply_waiting.clear()
-                on_delta(response.message, "private-native-reasoning")
+                if on_delta is not None:
+                    on_delta(response.message, "private-native-reasoning")
                 self.reply_finished.set()
                 return response
             assert "core_response_files" in tools
-            if index == 13:
-                assert "core_response_begin" in tools, "public answer signal is absent"
             if index == 0:
                 assert "core_cron_create" in tools
             else:
@@ -228,7 +229,7 @@ print({marker!r})
                 assert "Native file reads completed." in context, "manual cron lost original chat history"
             response = super().generate(context=context, tools=tools, instructions=instructions, messages=messages)
             assert "artifact-content-canary" not in context and "json-value-canary" not in context, "Artifact contents entered model context automatically"
-            if index == 15:
+            if index == 14:
                 attached = next(message["content"] for message in reversed(messages)
                                 if message.get("role") == "user" and "Attached files: " in message.get("content", ""))
                 folder = attached.rsplit("; folder: /workspace/", 1)[1].strip()
@@ -326,7 +327,6 @@ flowchart LR
         ModelResponse(tool_requests=(ToolRequest("browser-background-wait", "core_task_wait", {"task_id": "from-actual-admission"}),)),
         ModelResponse(tool_requests=(ToolRequest("browser-preview-files", "core_response_files", {"paths": ["preview-proof/" + name for name in preview_files]}),)),
         ModelResponse(message="Owner clarification received; the command failed with exit code 3."),
-        ModelResponse(tool_requests=(ToolRequest("browser-public-reply", "core_response_begin", {}),)),
         ModelResponse(message="# Native streamed reply\n\n```python\nprint('live reply complete')\n```\n\nNative streaming completed."),
         ModelResponse(tool_requests=(ToolRequest("browser-peer-send", "core_agent_send_message", {
             "agent_name": "browser-peer", "task": "Подготовь краткий отчёт по поручению."}),)),

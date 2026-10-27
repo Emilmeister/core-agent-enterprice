@@ -102,15 +102,10 @@ and [pinned package/types](https://github.com/keycloak/keycloak-js/tree/26.2.2).
   Issued tokens appear once and are cleared when the dialog closes. Permanent
   deletion removes the identity, while existing task/file data remains available
   to owners. This screen requires the documented realm-management permissions.
-- Live public replies arrive as scoped cumulative A2A snapshots and render as
-  provisional plain text until canonical history supplies the final answer.
-  Partial frames do not fetch history individually. Live text is enabled only
-  for a message accepted in the current open chat; reopening the page reads
-  canonical history/status without restoring an earlier preview. Temporary
-  disconnection within that open chat may restore its process-local preview
-  without starting work; a server restart may discard
-  this transient preview while the durable Task continues. Reasoning and private
-  owner exchanges do not enter this public stream.
+- Public replies appear only after generation finishes and canonical
+  history supplies the complete answer. Scoped A2A events update task status
+  and refresh history; reconnecting and reopening the page use those same
+  canonical records. Reasoning and private owner exchanges remain excluded.
   Persisted replies render CommonMark/GFM with tables, lists
   and fenced code through react-markdown. Mermaid blocks load the local bundle
   on demand and display static SVG Blob images; invalid diagrams keep source.

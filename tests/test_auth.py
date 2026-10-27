@@ -157,7 +157,6 @@ class AuthBoundaryTests(AuthAppTestCase):
                 return ModelResponse(message="Complete external answer")
 
         agent.model = ReplyModel()
-        agent._model_streams_deltas = True
         ready = threading.Event()
 
         class Server(uvicorn.Server):
@@ -191,7 +190,6 @@ class AuthBoundaryTests(AuthAppTestCase):
                             break
                 self.assertTrue(await asyncio.to_thread(generating.wait, 5))
                 self.assertIsNotNone(task_id)
-                self.assertIsNone(agent.reply_hub.latest(self.app.state.authenticator.settings.tenant, task_id))
                 foreign = await http.get(url + f"/a2a/external/tasks/{task_id}:subscribe", headers=self.headers("external-b"))
                 self.assertEqual(foreign.status_code, 404)
                 during = await http.get(url + f"/a2a/external/tasks/{task_id}", headers=self.headers("external-a"))
@@ -232,36 +230,30 @@ class AuthBoundaryTests(AuthAppTestCase):
             listener.close()
             self.assertFalse(thread.is_alive())
 
-    async def test_owner_keeps_response_control_and_tools_free_live_reply(self):
-        from core_agent.model import ToolRequest
+    async def test_owner_reply_is_buffered_without_response_control(self):
         catalogs = []
 
         class ReplyModel:
             def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
                 catalogs.append(tools)
-                if len(catalogs) == 1:
-                    if "core_response_begin" not in tools or "core_response_begin" not in instructions:
-                        raise AssertionError("owner response control is unavailable")
-                    if on_delta:
-                        on_delta("PRIVATE work", "PRIVATE reasoning")
-                    return ModelResponse(tool_requests=(ToolRequest("begin", "core_response_begin", {}),))
-                if tools:
-                    raise AssertionError("owner answer must be tools-free")
-                on_delta("Owner public prefix", "PRIVATE reasoning")
-                return ModelResponse(message="Owner public prefix and complete answer")
+                if "core_response_begin" in tools or "core_response_begin" in instructions:
+                    raise AssertionError("removed response control is still offered")
+                if not tools:
+                    raise AssertionError("final response keeps the ordinary tool catalog")
+                if on_delta:
+                    on_delta("PRIVATE unfinished prefix", "PRIVATE reasoning")
+                return ModelResponse(message="Owner complete answer")
 
         agent = self.app.state.core_agent
         agent.model = ReplyModel()
-        agent._model_streams_deltas = True
-        with patch.object(agent.reply_hub, "update", wraps=agent.reply_hub.update) as published:
-            response = await self.http.post("/a2a/owner/message:stream", headers=self.headers("owner-a"), json={
-                "message": {"role": "ROLE_USER", "messageId": uuid.uuid4().hex, "parts": [{"text": "Reply"}]}})
+        response = await self.http.post("/a2a/owner/message:stream", headers=self.headers("owner-a"), json={
+            "message": {"role": "ROLE_USER", "messageId": uuid.uuid4().hex, "parts": [{"text": "Reply"}]}})
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertIn("Owner public prefix", [call.args[4] for call in published.call_args_list])
-        self.assertIn("Owner public prefix and complete answer", response.text)
+        self.assertEqual(response.text.count("Owner complete answer"), 1)
+        self.assertNotIn('"partial": true', response.text)
+        self.assertNotIn("core_agent_stream", response.text)
         self.assertNotIn("PRIVATE", response.text)
-        self.assertEqual(len(catalogs), 2)
-        self.assertEqual(catalogs[1], {})
+        self.assertEqual(len(catalogs), 1)
 
     async def test_browser_bootstrap_is_absent_when_not_configured(self):
         response = await self.http.get("/ui/config")

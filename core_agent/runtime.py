@@ -3,7 +3,6 @@ from __future__ import annotations
 import fnmatch
 import copy
 import hashlib
-import inspect
 import logging
 import math
 import threading
@@ -56,7 +55,7 @@ from .security import redact
 from .streaming import NullStreamPublisher
 from .tasks import DelegationContract, _remote_contract, remote_file_batch_ids, remote_result_projection
 from .tools import (CRON_CREATE_TOOL, MESSAGE_SEND_TOOL, RESPONSE_ARTIFACTS_TOOL, RESPONSE_FILES_TOOL,
-                    RESPONSE_BEGIN_TOOL, ToolCall, ToolDefinition, ToolResult)
+                    ToolCall, ToolDefinition, ToolResult)
 from .workflow import InMemoryWorkflowStore, SuspendedRun, WorkflowRecord, TERMINAL_STATES
 from .workspace import WorkspaceBinding
 
@@ -345,7 +344,6 @@ class CoreAgent:
         declared_skills=(),
         model_retries=0,
         budget_cancel_grace_seconds=DEFAULT_BUDGET_CANCEL_GRACE_SECONDS,
-        reply_hub=None,
     ):
         self.platform_config = platform_config
         self.agent_config = agent_config
@@ -418,8 +416,6 @@ class CoreAgent:
         self._task_wait_cursor = None
         self._task_streams = {}
         self._task_headers = {}
-        self._model_streams_deltas = self._accepts_deltas(self.model)
-        self.reply_hub = reply_hub
         self.memory_registry = memory_registry
         self.platform_mcp = tuple(platform_mcp)
         self.declared_skills = tuple(declared_skills)
@@ -472,21 +468,6 @@ class CoreAgent:
                 self.remote_executor = RemoteA2AExecutor(self.task_scheduler, self.remote_registry,
                     response_files_service=self.response_files_service, chat_file_service=self.chat_file_service)
                 self.task_scheduler.register("remote_a2a", self.remote_executor)
-
-    @staticmethod
-    def _accepts_deltas(model):
-        """Only adapters that declare `on_delta` receive live token callbacks."""
-        generate = getattr(model, "generate", None)
-        if generate is None:
-            return False
-        try:
-            parameters = inspect.signature(generate).parameters
-        except (TypeError, ValueError):
-            return False
-        return "on_delta" in parameters or any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        )
 
     def _bounded_log_value(self, value):
         if isinstance(value, str):
@@ -1230,10 +1211,6 @@ class CoreAgent:
             schema["properties"]["skills"]["maxItems"] = 0
         return schema
 
-    def _can_stream_reply(self, owner_id):
-        return (self.reply_hub is not None and self._model_streams_deltas and self.depth == 0
-                and not (owner_id or "").startswith("external-"))
-
     def _tool_catalog(self, effective, discovered, snapshot=None, *, tenant_id=None, root_run=True, owner_id=None):
         catalog = {}
         index = mcp_tool_index(effective.mcp_tools)
@@ -1343,12 +1320,6 @@ class CoreAgent:
                        if "files" in catalog["core_agent_send_message"]["input_schema"].get("properties", {}) else "")
                     + "Available agents: "
                     + "; ".join(peer["name"] + ": " + peer["description"] for peer in peers.values()))
-        if (self._can_stream_reply(owner_id)
-                and root_run and (snapshot or {}).get("response_root", True)):
-            catalog[RESPONSE_BEGIN_TOOL.name] = {
-                "description": RESPONSE_BEGIN_TOOL.description,
-                "input_schema": RESPONSE_BEGIN_TOOL.input_schema,
-            }
         return catalog
 
     def _remote_peers(self, tenant_id):
@@ -2132,8 +2103,6 @@ class CoreAgent:
             transition_event=event_kind,
             **transition_data,
         )
-        if state in TERMINAL_STATES and self.reply_hub is not None:
-            self.reply_hub.discard(record.tenant_id, record.task_id)
         if connection is None:
             self._flush_guardrail_events(updated)
         if (connection is None and output_contract_version(updated) == 2
@@ -2253,7 +2222,6 @@ class CoreAgent:
                 else ContextState((prompt,), (prompt,), (1, 1))
             ),
             "skills": [],
-            "response_root": parent_run_id is None,
             "pending_response": None,
             "tool_queue": [],
             "pending_call": None,
@@ -2635,12 +2603,12 @@ class CoreAgent:
         self._runtime_cache[record.run_id] = (raw, discovered, effective)
         return record, request, raw, discovered, effective
 
-    def _kernel_snapshot(self, output_version):
+    def _kernel_snapshot(self, output_version, *, legacy=False):
         compiler = copy.copy(self.kernel_compiler)
         if output_version == 1:
             compiler.capability_policies = {**compiler.capability_policies,
                                            "response_files": LEGACY_RESPONSE_FILES_INSTRUCTION}
-        return compiler.snapshot()
+        return compiler.snapshot(legacy=legacy)
 
     def _pin_kernel_instructions(self, record):
         snapshot = record.snapshot
@@ -2662,16 +2630,19 @@ class CoreAgent:
                     legacy_ungated_skills=legacy_skills, legacy_feature_gates=legacy_gates)
                 if effective.digest != snapshot.get("effective_config_digest"):
                     continue
-                phases = (snapshot.get("response_phase", "work"), "work")
-                for phase in dict.fromkeys(phases):
-                    compiled = self._compile_instructions(raw, effective, {**candidate, "response_phase": phase},
-                                                          owner_id=record.owner_id)
+                for phase in dict.fromkeys((None, snapshot.get("response_phase", "work"), "work")):
+                    # Reproduce the old protected text exactly before retiring its
+                    # phase guidance. Never infer original instructions from text.
+                    candidate["kernel_instructions"] = self._kernel_snapshot(
+                        snapshot.get("output_contract_version", 1), legacy=phase is not None)
+                    compiled = self._compile_instructions(raw, effective, candidate,
+                                                          legacy_response_phase=phase)
                     if (compiled.text == snapshot["compiled_instructions"]
                             and compiled.protected_digest == snapshot.get("protected_kernel_digest")):
                         return replace(record, snapshot=candidate)
         raise CoreError("CHECKPOINT_INVALID")
 
-    def _compile_instructions(self, raw, effective, snapshot, *, model_tools=None, owner_id=None):
+    def _compile_instructions(self, raw, effective, snapshot, *, model_tools=None, owner_id=None, legacy_response_phase=None):
         catalog = sorted(
             (
                 {
@@ -2719,9 +2690,7 @@ class CoreAgent:
             agent_profile=raw["agent"].get("profile_prompt", ""),
             user_prompt="",
             skill_instructions=tuple(skill_instructions),
-            response_phase=(snapshot.get("response_phase", "work")
-                            if self._can_stream_reply(owner_id)
-                            and snapshot.get("response_root", True) else None),
+            legacy_response_phase=legacy_response_phase,
             output_contract_version=version,
         )
 
@@ -2774,11 +2743,8 @@ class CoreAgent:
     def _context_compactor(self, raw, effective, discovered, snapshot, *, tenant_id=None, owner_id=None):
         if self.compactor:
             return self.compactor
-        model_tools = ({} if snapshot.get("response_phase") == "answer" else
-                       self._tool_catalog(effective, discovered, snapshot, tenant_id=tenant_id, owner_id=owner_id))
-        instructions = (self._compile_instructions(raw, effective, snapshot, model_tools=model_tools, owner_id=owner_id).text
-                        if self.reply_hub is not None or (owner_id or "").startswith("external-")
-                        else self._instructions(snapshot))
+        model_tools = self._tool_catalog(effective, discovered, snapshot, tenant_id=tenant_id, owner_id=owner_id)
+        instructions = self._compile_instructions(raw, effective, snapshot, model_tools=model_tools, owner_id=owner_id).text
         catalog = json.dumps(
             model_tools,
             sort_keys=True,
@@ -2985,17 +2951,6 @@ class CoreAgent:
     def _definition(self, call, effective, discovered, record):
         if call.name in {"core_response_artifacts", "core_message_send"} and output_contract_version(record) != 2:
             raise ExecutionNotStarted("CAPABILITY_DISABLED")
-        if call.name == RESPONSE_BEGIN_TOOL.name:
-            if (record.owner_id or "").startswith("external-"):
-                raise CoreError("TOOL_UNAVAILABLE", "External A2A tasks return their final answer directly")
-            pending = record.snapshot.get("pending_call")
-            if (self.reply_hub is None or not self._model_streams_deltas or self.depth != 0
-                    or record.parent_run_id is not None or record.snapshot.get("python_execution")
-                    or pending is None or pending.get("id") != call.id
-                    or not any(item.get("id") == call.id and item.get("name") == call.name
-                               for item in record.snapshot.get("tool_queue", ()))):
-                raise CoreError("CAPABILITY_DISABLED")
-            return RESPONSE_BEGIN_TOOL, False
         target = self._mcp_target(call.name, effective)
         if target:
             server, remote_tool = target
@@ -3026,7 +2981,7 @@ class CoreAgent:
 
     @staticmethod
     def _require_tool(name, effective):
-        if name not in SKILL_TOOLS and name != RESPONSE_BEGIN_TOOL.name:
+        if name not in SKILL_TOOLS:
             effective.require_tool(name)
 
     def _activate_skill_call(self, call, record, snapshot, raw, effective):
@@ -3337,9 +3292,7 @@ class CoreAgent:
                 consumed.append(notification)
         snapshot["task_notification_revisions"] = [list(item) for item in sorted(seen)]
         if consumed:
-            if snapshot.get("response_phase") == "answer":
-                self._supersede_public_reply(record, snapshot, lease_token=lease_token)
-                snapshot["response_phase"] = "work"
+            if snapshot.pop("response_phase", None) == "answer":
                 snapshot["pending_response"] = None
                 snapshot["tool_queue"] = []
             record = self._record_transition(
@@ -3387,9 +3340,7 @@ class CoreAgent:
         if not messages:
             return record, snapshot, 0
         snapshot = copy.deepcopy(snapshot)
-        if snapshot.get("response_phase") == "answer" and state not in TERMINAL_STATES:
-            self._supersede_public_reply(record, snapshot, lease_token=lease_token)
-            snapshot["response_phase"] = "work"
+        if snapshot.pop("response_phase", None) == "answer" and state not in TERMINAL_STATES:
             discard_pending_response = not snapshot.get("finalizing_response")
         if discard_pending_response:
             snapshot["pending_response"] = None
@@ -3869,7 +3820,7 @@ class CoreAgent:
         active_result_token_limit=None,
     ):
         self._apply_response_files(snapshot, call, not isinstance(outcome, ToolResult) or outcome.status == "succeeded")
-        if self.material_review_store is not None and call.name != RESPONSE_BEGIN_TOOL.name:
+        if self.material_review_store is not None:
             completed = snapshot.get("pending_completed_result")
             if completed is None:
                 if call.name in {"core_agent_send_message", "core_task_get", "core_task_list", "core_task_wait"}:
@@ -4287,10 +4238,6 @@ class CoreAgent:
             **({"arguments": call.arguments} if self.log_content else {}),
         )
         self.tool_runtime.validate(call, definition)
-        if call.name == RESPONSE_BEGIN_TOOL.name:
-            snapshot["response_phase"] = "answer"
-            return self._record_tool_outcome(record, snapshot, call, {"phase": "answer"},
-                lease_token=lease_token, span=span, active_result_token_limit=active_result_token_limit)
         if call.name == "core_agent_send_message" and self.remote_registry is not None:
             try:
                 record, snapshot = self._pin_remote_call(record, snapshot, call, lease_token=lease_token)
@@ -4480,30 +4427,6 @@ class CoreAgent:
 
     def _stream(self, record):
         return self._scoped_stream(record.task_id, record.owner_id)
-
-    def _publish_public_reply(self, record, snapshot, text, *, lease_token, force=False):
-        if (self.reply_hub is None or record.parent_run_id is not None
-                or (record.owner_id or "").startswith("external-")):
-            return
-        with self.workflow_store._execution_lock(record, lease_token) as (current, _connection):
-            if (current.state in TERMINAL_STATES or current.snapshot.get("response_phase") != "answer"
-                    or current.snapshot.get("turns") != snapshot["turns"]):
-                return
-            preview = self.reply_hub.update(record.tenant_id, record.task_id, record.context_id,
-                                            snapshot["turns"], text, force=force)
-        return preview
-
-    def _supersede_public_reply(self, record, snapshot, *, lease_token):
-        if (self.reply_hub is None or record.parent_run_id is not None
-                or (record.owner_id or "").startswith("external-")
-                or snapshot.get("response_phase") != "answer"):
-            return
-        with self.workflow_store._execution_lock(record, lease_token) as (current, _connection):
-            if (current.state in TERMINAL_STATES or current.snapshot.get("response_phase") != "answer"
-                    or current.snapshot.get("turns") != snapshot["turns"]):
-                return
-            return self.reply_hub.supersede(record.tenant_id, record.task_id, generation=snapshot["turns"],
-                                           context_id=record.context_id)
 
     def _scoped_stream(self, task_id, owner_id):
         if owner_id and owner_id.startswith("external-"):
@@ -4867,7 +4790,6 @@ class CoreAgent:
                     record = self._resume_completed_material(record, snapshot, lease_token=lease_token,
                                                              active_result_token_limit=active_result_token_limit)
                     snapshot = copy.deepcopy(record.snapshot)
-                phase_before_input = snapshot.get("response_phase")
                 record, snapshot = self._consume_task_notifications(
                     record, snapshot, lease_token=lease_token
                 )
@@ -4879,13 +4801,8 @@ class CoreAgent:
                 if delivered_at_boundary and snapshot.get("finalizing_response"):
                     snapshot["pending_response"]["message"] = BUDGET_FOLLOWUP_MESSAGE
                     snapshot["budget_followup_unprocessed"] = True
-                if snapshot.get("response_phase") != phase_before_input:
-                    compactor = self._context_compactor(raw, effective, discovered, snapshot, tenant_id=record.tenant_id, owner_id=record.owner_id)
-                    active_result_token_limit = min(compactor.budget.output_reserve,
-                        max(64, int(compactor.budget.working_capacity * 0.10)))
                 in_flight = snapshot.get("model_attempt_in_flight")
                 if in_flight and not in_flight.get("finalizing", False):
-                    self._supersede_public_reply(record, snapshot, lease_token=lease_token)
                     snapshot["model_attempt_in_flight"] = None
                     record = self._record_transition(
                         record,
@@ -5043,17 +4960,12 @@ class CoreAgent:
                         model_messages = self._model_messages(context)
                         model_tools = (
                             {}
-                            if finalizing or snapshot.get("response_phase") == "answer"
+                            if finalizing
                             else self._tool_catalog(effective, discovered, snapshot, tenant_id=record.tenant_id,
                                                     root_run=record.parent_run_id is None, owner_id=record.owner_id)
                         )
-                        model_instructions = (self._compile_instructions(raw, effective, snapshot, model_tools=model_tools, owner_id=record.owner_id).text
-                                              if self.reply_hub is not None or (record.owner_id or "").startswith("external-")
-                                              else self._instructions(snapshot))
-                        if "response_files" in effective.enabled_capability_policies and "core_response_files" not in model_tools:
-                            model_instructions = self._compile_instructions(
-                                raw, effective, snapshot, model_tools=model_tools, owner_id=record.owner_id
-                            ).text
+                        model_instructions = self._compile_instructions(
+                            raw, effective, snapshot, model_tools=model_tools, owner_id=record.owner_id).text
                     if finalizing:
                         model_instructions = (
                             f"{model_instructions}\n\n{BUDGET_FINALIZATION_INSTRUCTION}"
@@ -5064,39 +4976,9 @@ class CoreAgent:
                             call_finalizer_model = False
                     retry_limit = max_turns if finalizing else max_turns - 1
                     stream = self._stream(record)
-                    answering = (not finalizing and snapshot.get("response_phase") == "answer"
-                                 and self._can_stream_reply(record.owner_id) and record.parent_run_id is None)
-                    buffered_delta = (
-                        [None, None]
-                        if (
-                            not finalizing
-                            and stream.enabled
-                            and self._model_streams_deltas
-                            and (SKILL_ACTIVATE_TOOL in model_tools or RESPONSE_BEGIN_TOOL.name in model_tools)
-                        )
-                        else None
-                    )
-
-                    def publish_or_buffer_delta(response_text, reasoning_text):
-                        if answering:
-                            if heartbeat_failures:
-                                raise heartbeat_failures[0]
-                            self._cancel_at_boundary(record, snapshot, cancel_event, lease_token=lease_token)
-                            self._publish_public_reply(record, snapshot, response_text, lease_token=lease_token)
-                            return
-                        if self.material_review_store is not None:
-                            reasoning_text = None
-                        if buffered_delta is None:
-                            stream.text(response_text, reasoning_text)
-                        else:
-                            buffered_delta[:] = [response_text, reasoning_text]
 
                     def reserve_retry():
                         nonlocal record, snapshot
-                        if answering:
-                            self._supersede_public_reply(record, snapshot, lease_token=lease_token)
-                        if buffered_delta is not None:
-                            buffered_delta[:] = [None, None]
                         if snapshot["turns"] >= retry_limit:
                             raise self._budget_error(
                                 "model_turns", max_turns, max_turns
@@ -5142,15 +5024,6 @@ class CoreAgent:
                             session_id=record.context_id,
                         ),
                     ) as model_span:
-                        delta = (
-                            {"on_delta": publish_or_buffer_delta}
-                            if (
-                                not finalizing
-                                and (stream.enabled or answering)
-                                and self._model_streams_deltas
-                            )
-                            else {}
-                        )
                         try:
                             response = (
                                 self._generate(
@@ -5163,7 +5036,6 @@ class CoreAgent:
                                     tools=model_tools,
                                     instructions=model_instructions,
                                     messages=model_messages,
-                                    **delta,
                                 )
                                 if call_finalizer_model
                                 else ModelResponse()
@@ -5204,6 +5076,9 @@ class CoreAgent:
                     self._cancel_at_boundary(
                         record, snapshot, cancel_event, lease_token=lease_token
                     )
+                    # A new ordinary response supersedes the legacy answer phase;
+                    # late input must not discard its linked tool-call batch.
+                    snapshot.pop("response_phase", None)
                     if finalizing:
                         text = (
                             response.message.strip()
@@ -5217,11 +5092,9 @@ class CoreAgent:
                         response_data = self._response_dict(response)
                         response_data["message"] = text
                         response_data["tool_requests"] = []
-                        stream.text(text, None)
                     else:
                         response_data = self._response_dict(response)
                     activation_call_id = None
-                    response_begin_id = None
                     for requested in response_data["tool_requests"]:
                         if activation_call_id is not None:
                             requested["blocked_by_skill_activation"] = (
@@ -5229,24 +5102,11 @@ class CoreAgent:
                             )
                         elif requested["name"] == SKILL_ACTIVATE_TOOL:
                             activation_call_id = requested["id"]
-                        if response_begin_id is not None:
-                            requested["blocked_by_response_begin"] = response_begin_id
-                        elif requested["name"] == RESPONSE_BEGIN_TOOL.name:
-                            response_begin_id = requested["id"]
-                    if activation_call_id is not None or response_begin_id is not None:
+                    if activation_call_id is not None:
                         # The text and any later calls were produced without the
                         # activated instructions. Preserve provider tool protocol,
                         # but force a fresh model decision before accepting either.
                         response_data["message"] = None
-                    elif buffered_delta is not None and any(
-                        value is not None for value in buffered_delta
-                    ):
-                        stream.text(*buffered_delta)
-                    stream.flush()
-                    if answering:
-                        if response_data["tool_requests"]:
-                            raise CoreError("MODEL_PROTOCOL_INVALID", "Public answer turn cannot call tools")
-                        self._publish_public_reply(record, snapshot, response_data["message"], lease_token=lease_token, force=True)
                     action = (
                         "request_tools"
                         if response_data["tool_requests"]
@@ -5383,7 +5243,7 @@ class CoreAgent:
                     activation_call_id = pending.get("blocked_by_skill_activation")
                     response_begin_id = pending.get("blocked_by_response_begin")
                     if response_begin_id is not None:
-                        error = CoreError("RESPONSE_BEGIN_BOUNDARY", "Reconsider this call before beginning a public answer")
+                        error = CoreError("RESPONSE_BEGIN_BOUNDARY", "Reconsider this legacy blocked call using the current tools")
                         record = self._record_tool_outcome(record, snapshot, call, self._failed_tool_outcome(call, error),
                             lease_token=lease_token, active_result_token_limit=active_result_token_limit)
                         continue
@@ -5410,7 +5270,7 @@ class CoreAgent:
                         continue
                     definition = None
                     try:
-                        if pending.get("model_tool_unavailable"):
+                        if pending.get("model_tool_unavailable") or call.name == "core_response_begin":
                             available_tools = self._tool_catalog(
                                 effective, discovered, snapshot, tenant_id=record.tenant_id,
                                 root_run=record.parent_run_id is None, owner_id=record.owner_id,
@@ -6880,7 +6740,6 @@ class CoreAgent:
                 ),
             }
         scope = self._run_scopes.get(run_id, {})
-        stream = self._scoped_stream(scope.get("task_id"), scope.get("identity"))
         headers = build_forwarded_headers(
             self._task_headers.get(scope.get("task_id")) or {},
             api_key=self.send_message_api_key,
@@ -6894,7 +6753,7 @@ class CoreAgent:
         }
         try:
             if connection.supports_streaming:
-                result = self._relay_remote_stream(connection, call, stream)
+                result = self._collect_remote_stream(connection, call)
             else:
                 result = connection.send_message(**call).text
         except CoreError as error:
@@ -6974,14 +6833,12 @@ class CoreAgent:
             task = self.task_scheduler.get(identifier, owner_id=parent.run_id, tenant_id=parent.tenant_id)
         return receipt(task)
 
-    def _relay_remote_stream(self, connection, call, stream):
-        """Republish the child's progress into this task and keep its final text."""
+    def _collect_remote_stream(self, connection, call):
+        """Collect the peer's tool result without publishing its progress."""
         final_text = ""
         last_text = ""
         try:
             for event in connection.stream_message(**call):
-                if event.parts and self.material_review_store is None:
-                    stream.relay(event.parts)
                 if not event.text:
                     continue
                 last_text = event.text

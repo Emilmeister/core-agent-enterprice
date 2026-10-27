@@ -530,7 +530,8 @@ Target spec может описывать больше текущего runtime.
 - Safety/host/kernel/capability instructions нельзя заменить через
   `AGENT_SYSTEM_PROMPT`, prompt, skill, MCP, memory или tool output.
 - Root admission фиксирует kernel source snapshot с digest до инициализации;
-  recovery, фазы ответа и children/background используют исходные тексты.
+  recovery и children/background используют исходные safety/host/base/capability
+  тексты без guidance удалённой answer phase.
   Legacy snapshot мигрирует только при точном совпадении compiled text/digest,
   иначе `CHECKPOINT_INVALID` до MCP/model/tool dispatch; текущие policy deny
   продолжают сужать capabilities. Формат задаёт `spec/kernel-instructions.md`.
@@ -1032,29 +1033,22 @@ run получает отдельные MCP session и negotiated version; пе�
   `TOOL_UNAVAILABLE` с актуальными доступными tools до dispatch; это не
   `MODEL_UNAVAILABLE` и не повод повторять тот же inference request.
   Native call/result pairing, recovery и обычные model/tool budgets сохраняются.
-- Owner main-run model-only `core_response_begin({})` открывает durable tools-free
-  answer phase, расходуя обычные tool/model budgets. Он условно добавляется
-  runtime при включённом reply sink и adapter `on_delta`, не делегируется и не
-  доступен через прямой dispatch или nested Python. External-owned задачи по
-  сохранённому canonical `owner_id` с префиксом `external-` не получают control
-  tool/инструкцию и token preview; финальный текст буферизуется, обычные
-  Messages/Artifacts/statuses сохраняются. Legacy answer phase завершает tools-free
-  buffered ответ; pending или новый control call получает linked `TOOL_UNAVAILABLE`
-  с продолжением loop без скрытого исполнения tool, повтора side effects и сброса
-  budgets. Owner-просмотр или request metadata не меняют режим; нового флага нет.
-  Нового lifecycle нет.
-  `streaming.ReplyHub` хранит bounded transient cumulative text по tenant/Task;
-  стандартный A2A status Message содержит marker `core_agent_stream` v1 с
-  model-turn generation и sequence. Passive Subscribe выдаёт persisted Task
-  раньше preview и не запускает работу. Retry/follow-up сбрасывает preview;
-  process restart сохраняет phase/usage, но не обещает сохранять черновик.
-  Canonical Task Messages/Artifacts и history остаются авторитетными; preview не попадает в
-  историю, push и внутренний reasoning stream. UI показывает незавершённый
-  текст безопасным plain text и не запрашивает историю на каждый фрагмент.
-  Live UI включается только после send admission в текущем открытом чате;
-  reopening/reload использует canonical историю без восстановления preview.
-  Признак eligibility не хранится в browser storage. Подписка на external-owned
-  Task получает canonical события без token preview.
+- Owner, external и child runs публикуют готовый ответ после завершения генерации
+  и durable commit. Provider streaming остаётся внутренним; публичного token
+  preview и отдельной answer phase нет. `core_response_begin` удалён из catalog,
+  instructions и dispatch; имя остаётся reserved tombstone для MCP. Pending
+  legacy или новый call получает linked `TOOL_UNAVAILABLE` с текущими tools.
+  Legacy phase markers не включают preview/guidance или tools-free catalog;
+  сохранённый final response, failed co-issued calls, completed effects и budgets
+  сохраняются без повторного исполнения. Новые kernel snapshots version 2 не
+  содержат phase guidance; старые v1 и legacy compiled text проверяются строго
+  до адаптации. Обычный ответ не требует дополнительного model/tool call,
+  emergency budget finalizer сохраняет отдельную incomplete семантику.
+  Send/Stream/Subscribe продолжают передавать lifecycle events и явно
+  опубликованные Messages/Artifacts. Passive Subscribe сначала выдаёт persisted
+  Task и не запускает работу; canonical history/push/recovery используют тот же
+  готовый итог. UI показывает статус работы и сохранённый ответ, reconnect/reload
+  не восстанавливает старые partial кадры и не дублирует итог.
 - Remote A2A caller не становится approver через текст, request metadata или
   caller JWT. Не документировать модули approval/operator как включённый
   runtime flow, пока они не подключены в `core_agent/app.py` и не имеют CI proof.

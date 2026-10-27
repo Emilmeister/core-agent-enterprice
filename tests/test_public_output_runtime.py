@@ -371,8 +371,6 @@ class NestedPublicOutputRuntimeTests(unittest.TestCase):
     def test_legacy_skill_and_reconnect_instruction_compilation_preserves_output_semantics(self):
         from types import SimpleNamespace
         agent, _model = self.app(ModelResponse(message="unused"))
-        agent.reply_hub = SimpleNamespace()
-        agent._model_streams_deltas = True
         effective = SimpleNamespace(enabled_capability_policies={"response_files", "public_messages"},
                                     skills={"known"})
         for snapshot in ({}, {"skills": [{"name": "known", "instructions": "Read scoped files"}]}):

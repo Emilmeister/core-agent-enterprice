@@ -13,7 +13,6 @@ const labels: Record<string, string> = {
   core_ask_owner: "Вопрос владельцу",
   core_wait_until: "Ожидание времени",
   core_cron_create: "Создание расписания",
-  core_response_begin: "Подготовка ответа",
   core_response_files: "Выбор файлов для ответа",
   core_response_artifacts: "Публикация материалов",
   core_message_send: "Сообщение в чат",

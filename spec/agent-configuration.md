@@ -173,7 +173,7 @@ Enterprise v1 включает owner HITL поверх неизменного pl
 исходное значение. Явно включённая optional capability MUST входить в
 `PlatformConfig.supported_features`, иначе её tools и kernel policy отсутствуют.
 `response_files: false` отключает оба имени: `core_response_files` и
-`core_response_artifacts`, в том числе в финальной фазе ответа. Пропущенные
+`core_response_artifacts`, во всех обычных model turns. Пропущенные
 переключатели сохраняют существующие defaults и остальные tool filters.
 
 ## Deployment variables

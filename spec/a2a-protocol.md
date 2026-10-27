@@ -359,19 +359,28 @@ Owner и external A2A endpoints используют один A2A lifecycle и �
 
 Исходящие файлы используют стандартные A2A FileParts/Artifact parts или авторизованные transport references; общий лимит применяется до публикации всего набора, scope проверяется при каждом download. Байты не передаются через RunRequest; v2 explicit publication использует `core_response_artifacts`, а named artifact CRUD service не требуется. Потоковый прогресс и function args/results проходят ту же visibility policy до публикации; существующий ADK format не разрешает раскрыть внутренние owner данные.
 
-## Публичный live preview ответа
+## Публикация готового ответа
 
-Основной owner workflow MAY использовать служебный `core_response_begin`, чтобы следующий обычный tools-free model turn передавал реальный публичный ответ во время генерации. Его cumulative snapshots MUST использовать стандартный нетерминальный `statusUpdate.status.message`, agent role, только публичные text Parts и metadata `{"partial":true,"core_agent_stream":{"version":1,"generation":N,"sequence":S}}`. `generation` — положительный durable номер model turn данной Task; `sequence` — положительный возрастающий номер внутри generation. Новый generation заменяет прежний preview. `superseded:true` с пустыми Parts закрывает generation; дальнейший текст этого generation MUST NOT публиковаться.
+Ответ owner, external и child runs публикуется только после завершения
+генерации. Provider streaming остаётся внутренним механизмом; частичный текст,
+reasoning, рабочий draft, tool arguments/results и raw owner question/answer
+MUST NOT выдаваться как token preview в публичном A2A transport.
 
-Preview MUST NOT содержать hidden reasoning, work draft, arguments/results инструментов или raw owner question/answer. Для owner-задач Fresh Subscribe MUST сначала выдать persisted Task, затем доступный preview и durable изменения; первый terminal event закрывает stream. Owner Initial SendStreamingMessage и passive Subscribe MUST поддерживать этот preview, включая direct workflow recovery, cron и продолжение durable waits. Subscribe не запускает workflow.
+Send, SendStreamingMessage и Subscribe сохраняют стандартные lifecycle status
+events, явно опубликованные Messages и immutable Artifacts. Fresh Subscribe
+MUST сначала выдать persisted Task, затем durable изменения; первый terminal
+event закрывает stream. Subscribe не запускает workflow; disconnect не отменяет
+Task, а reconnect использует canonical состояние без нового model call.
 
-Для external-owned Task `core_response_begin` и его служебные инструкции не
-предлагаются модели; частично сгенерированный текст не публикуется. Внешний caller
-получает предназначенный ему canonical итог после генерации. Send/Subscribe
-сохраняют обычные статусы и явно опубликованные Messages/Artifacts; отключение
-token preview не отключает A2A lifecycle или long-running взаимодействия.
-Режим закреплён trusted execution scope и не меняется request metadata либо
-подключением владельца к external-задаче. Recovery ранее сохранённой answer phase
-завершает её buffered путём с прежним учётом budgets и без повторных side effects.
+Final Message v2 имеет прежние stable identity, Parts и completion provenance;
+durable Get/history/push, stream и recovery используют одну canonical запись.
+Ранее принятый output contract v1 и уже опубликованные immutable Artifacts
+сохраняются. Public API version не меняется: удалён только optional transient
+preview, canonical wire shapes и Task lifecycle прежние. Сервер больше не
+создаёт preview metadata `core_agent_stream`; клиент MUST NOT восстанавливать
+ответ из старых partial кадров. Применяется одинаковое поведение независимо
+от prompt/metadata, reader identity или восстановления legacy answer phase.
 
-Preview является transient transport state: один bounded hub live serving process с ключом `(tenant,task)`, максимум 64 Task и 256KiB UTF-8 публичного префикса на Task. Eviction, process restart или обращение к другому serving process MAY потерять preview; durable Get/history/push, canonical final Message v2 и уже published immutable Artifacts остаются authoritative, не сохраняют partial progress и содержат полный итог; legacy final Artifacts неизменны. Медленный subscriber получает последний cumulative snapshot, а не неограниченный backlog токенов. Legacy plain final answer без control signal сохраняет buffered совместимость; runtime MUST NOT повторно генерировать готовый draft или изображать streaming задержанным replay.
+Runtime MUST NOT повторно генерировать уже сохранённый готовый ответ либо
+изображать streaming задержанным replay. Scope, visibility и durable waits
+действуют на всех transport paths, включая cron и direct workflow recovery.

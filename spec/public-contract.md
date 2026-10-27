@@ -243,9 +243,8 @@ Message и не добавляет второй history entry. Одинаков�
 успешных calls остаётся двумя сообщениями с разными IDs. Message предназначен
 только текущему Task recipient; tool не принимает client-selected scope/IDs.
 
-Незаконченный cumulative preview не является отдельным canonical reply.
-Он MAY быть transient по существующему streaming contract; завершённый Message
-не дублирует preview как набор history сообщений. Final state, complete/partial
+Частично сгенерированный текст не публикуется. Завершённый Message появляется
+один раз с сохранённой canonical identity. Final state, complete/partial
 outcome, budgets и usage не полагаются на потерянный stream: terminal Task,
 финальный Message и configured push delivery фиксируются атомарно.
 Полное завершение использует `complete: true`,
@@ -1031,53 +1030,35 @@ subject (включая schema/origin/исходные аргументы для
 другого MCP tool из устаревшей UI-вкладки при повторном использовании alias,
 даже если оба origin имеют revision=0. Поле `origin` в запросе запрещено.
 
-### Поток публичного ответа модели
+### Публикация готового ответа модели
 
-Owner UI MAY получать текст ответа owner-задачи до завершения генерации.
-Задачи внешних A2A callers получают итоговый текст после завершения генерации,
-без `core_response_begin` в каталоге/служебных инструкциях и без token preview.
-Обычные A2A статусы и явно опубликованные Messages/Artifacts сохраняются.
-Режим определяется trusted scope задачи; metadata и owner-просмотр его не меняют.
-Поток owner-ответа MUST содержать только публичный ответ адресату
-Task: reasoning, tool arguments/results, промежуточный рабочий текст и внутренняя
-переписка с владельцами MUST NOT попадать в этот поток. Наличие файлов в потоке
-не выводится из workspace: выдаются только явно выбранные scoped результаты.
+Owner UI, внешние A2A callers и parent дочерней задачи получают итоговый текст
+только после завершения генерации и durable publication. Обычный model response
+не требует control tool, отдельной answer phase, дополнительной генерации или
+нового обязательного JSON envelope. `core_response_begin` отсутствует в
+каталоге и служебных инструкциях всех запусков.
 
-Модель owner-задачи MAY открыть фазу ответа условным служебным `core_response_begin({})`.
-Следующий обычный model turn получает пустой каталог инструментов; сохранённые
-инструкции и активированные навыки остаются в контексте. Сигнал расходует обычный
-tool budget, следующий turn — обычный model budget. Прежний final text без сигнала
-сохраняет buffered поведение; добавочная генерация уже готового текста запрещена.
+Provider streaming MAY использоваться внутри runtime, но частичные text/reasoning
+deltas не публикуются. Reasoning, tool arguments/results, рабочий draft и
+внутренняя переписка с владельцами MUST NOT становиться ответом адресату Task.
+Файлы не выводятся из workspace автоматически: выдаются только явно выбранные
+scoped результаты. Явные Messages через `core_message_send`, immutable Artifacts
+и стандартные A2A статусы сохраняются, включая long-running задачи.
 
-Публичный preview передаётся стандартным A2A `statusUpdate` со state `working`,
-agent Message, правильными `taskId`/`contextId`, накопительным text и metadata
-`partial: true`, `core_agent_stream: {version: 1, generation, sequence}`.
-Оба номера — положительные целые; generation соответствует списанному model turn,
-sequence растёт в её пределах. `superseded: true` с пустым текстом отменяет прежний
-preview. Старые, повторные и foreign кадры MUST NOT заменять новый preview.
+Passive subscription MUST сначала выдать persisted Task, затем canonical события;
+она не запускает новую работу. Disconnect не отменяет Task; reconnect/reload
+получает сохранённый статус и историю без повторной генерации. GetTask, история,
+push, финальный canonical Message v2 и явно published Artifacts (legacy — final
+Artifact) остаются авторитетными. После первого terminal кадра подписка MUST
+закрыться без последующих кадров. Scope и видимость не меняются prompt/metadata
+или подключением владельца к external-owned Task.
 
-Preview ограничен по памяти, tenant/Task-scoped и transient. Passive subscription
-MUST сначала выдать persisted Task, затем актуальный preview и последующие события;
-она не запускает новую работу. Disconnect не отменяет Task, повторное подключение
-в том же процессе получает накопленный preview. После рестарта процесса preview
-MAY исчезнуть, но durable фаза, usage, Task и workflow continuation сохраняются.
-GetTask, история, push, финальный canonical Message v2 и явно published Artifacts (legacy — final Artifact) остаются авторитетными и не хранят черновик.
-Follow-up, retry и отмена сбрасывают устаревший preview на существующей safe boundary.
-После первого terminal кадра подписка MUST закрыться без последующих кадров.
-
-UI MUST показывать preview с доступным именем «Предварительный ответ», без отдельной
-служебной подписи в ленте, и безопасным plain text: неполные Markdown/Mermaid/code fences не исполняются и не перерисовывают
-диаграммы. Каждый partial обновляет текст непосредственно, без GET истории на каждый
-фрагмент; canonical polling остаётся механизмом восстановления. Persisted итог
-заменяет preview один раз; completed preview остаётся до получения сохранённого
-итога, failed/canceled/rejected скрывают его. Обновления сохраняют позицию чтения,
-выбор чата, focus и session boundaries. Live preview включается только для
-сообщения, принятого в текущем открытом окне. Повторное открытие страницы или
-чата MUST использовать сохранённую историю и canonical статусы без восстановления
-прежнего preview; новая отправка в этом окне вновь включает live текст. Признак
-не сохраняется в browser storage. Временный обрыв подписки без закрытия чата MAY
-восстановить preview; подписка на external-owned Task передаёт canonical события
-без частично сгенерированного текста ответа.
+UI показывает существующий статус работы до готового ответа и затем рендерит
+сохранённый итог безопасным Markdown renderer. Панели «Предварительный ответ»
+и восстановления старого token preview нет; поздние legacy partial кадры не
+создают сообщение. Canonical polling остаётся механизмом восстановления.
+Повторный terminal event не дублирует итог. Обновления сохраняют позицию чтения,
+выбор чата, focus и session boundaries.
 
 ### Безопасный прогресс внешних операций
 
