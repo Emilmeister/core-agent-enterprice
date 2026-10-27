@@ -4716,11 +4716,14 @@ class RuntimeTests(unittest.TestCase):
                             ),
                         )
                     )
-                grandchild_started.set()
+                if "core_delegate" not in tools:
+                    grandchild_started.set()
                 release.wait(2)
                 return ModelResponse(message="must be discarded after cancel")
 
         agent = make_agent(NestedBlockingModel(), memory="disabled")
+        self.addCleanup(agent.close)
+        self.addCleanup(release.set)
         agent.tool_runtime.registry.register(delegate_definition())
         parent, _raw, _discovered, _effective = agent._new_workflow(
             run_request(memory=False),
@@ -4744,8 +4747,18 @@ class RuntimeTests(unittest.TestCase):
         grandchildren = agent.task_scheduler.list(owner_id=child_record.run_id)
         self.assertEqual(len(grandchildren), 1)
         grandchild_id = grandchildren[0].id
-        agent.cancel_task("recursive-cancel-parent")
-        release.set()
+        request_cancel = agent.workflow_store.request_cancel
+
+        def release_after_cancel_intent(*args, **kwargs):
+            record = request_cancel(*args, **kwargs)
+            if record.task_id == grandchild_id:
+                self.assertTrue(record.cancel_requested)
+                release.set()
+            return record
+
+        with patch.object(agent.workflow_store, "request_cancel", side_effect=release_after_cancel_intent):
+            agent.cancel_task("recursive-cancel-parent")
+        self.assertTrue(release.is_set())
         child_task = agent.task_scheduler.wait(child["task_id"], timeout=1)
         grandchild_task = agent.task_scheduler.wait(grandchild_id, timeout=1)
         try:
