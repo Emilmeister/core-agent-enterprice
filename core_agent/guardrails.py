@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .errors import CoreError
+from .errors import CoreError, log_error
 
 
 DETECTOR_RESPONSE_SCHEMA = {
@@ -98,25 +98,38 @@ class GuardrailClassifier:
         return best
 
     def _invoke(self, payload, remaining):
+        started = time.monotonic()
         completed = threading.Event()
         answer = {}
 
         def invoke():
             try:
                 answer["response"] = self.model.generate(context=payload, tools={}, instructions=DETECTOR_INSTRUCTION)
-            except Exception:
+            except Exception as error:
                 # Provider messages can contain request data or credentials.
                 answer["error"] = "provider_error"
+                log_error("guardrail.provider.failed", error)
             finally:
                 self._slot.release()
                 completed.set()
 
         try:
             threading.Thread(target=invoke, name="guardrail-classifier", daemon=True).start()
-        except Exception:
+        except Exception as error:
             self._slot.release()
+            log_error("guardrail.worker.failed", error)
             return None, "provider_error"
         if not completed.wait(remaining):
+            details = {"reason": "timeout", "wait_seconds": remaining,
+                       "elapsed_ms": min(2**31 - 1, max(0, int((time.monotonic() - started) * 1000))),
+                       "timeout_seconds": self.timeout_seconds}
+            try:
+                timeout = getattr(self.model, "timeout", None)
+                if type(timeout) in {int, float} and 0 < timeout <= 2**31 - 1 and math.isfinite(timeout):
+                    details["model_timeout_seconds"] = timeout
+            except Exception:
+                pass
+            log_error("guardrail.wait.timeout", None, **details)
             return None, "timeout"
         return answer.get("response"), answer.get("error")
 

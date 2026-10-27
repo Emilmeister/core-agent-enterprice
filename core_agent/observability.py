@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from requests import Session
 from requests.exceptions import RequestException
 
-from .errors import CoreError, SandboxDiagnostics
+from .errors import CoreError, error_log_fields
 from .security import safe_url, validate_http_url
 
 
@@ -289,19 +289,20 @@ class Span:
     def record_error(self, error):
         if self.ended:
             return
+        details = error_log_fields(error)
         self.status_code = "ERROR"
-        self.status_message = type(error).__name__
-        self.set_attribute("error.type", type(error).__name__)
-        code = getattr(error, "code", None)
+        self.status_message = details["error_type"]
+        self.set_attribute("error.type", details["error_type"])
+        code = details.get("error_code")
         if code:
             self.set_attribute("core_agent.error.code", code)
-        diagnostics = getattr(error, "diagnostics", None)
-        if type(diagnostics) is SandboxDiagnostics:
-            try:
-                safe = SandboxDiagnostics(**diagnostics.as_dict()).as_dict()
-            except (TypeError, ValueError):
-                return
-            fields = {"core_agent.sandbox." + key: value for key, value in safe.items()}
+        for key, value in details.items():
+            if key not in {"error_type", "error_code", "sandbox_diagnostics"}:
+                self.set_attribute("core_agent.error." + key,
+                                   json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else value)
+        diagnostics = details.get("sandbox_diagnostics")
+        if diagnostics:
+            fields = {"core_agent.sandbox." + key: value for key, value in diagnostics.items()}
             self.set_attributes(fields)
             self.telemetry._operator_log("sandbox.failed", {
                 **fields, "trace_id": self.context.trace_id, "span_id": self.context.span_id,

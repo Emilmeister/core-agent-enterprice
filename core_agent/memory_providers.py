@@ -14,7 +14,7 @@ from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .errors import CoreError
+from .errors import CoreError, log_error
 from .structured_output import normalize_structured_output_body, validate_structured_output
 
 MAX_PROVIDER_TEXT = 8000
@@ -156,13 +156,13 @@ class HttpEmbeddingProvider:
             )
             vector = response["data"][0]["embedding"]
         except CoreError as error:
-            self.logger.warning("embedding unavailable (%s)", error.code)
+            log_error("memory.embedding.unavailable", error, logger=self.logger)
             return None
         except Exception as error:
             # The spec is unconditional: any embedding failure degrades the
             # vector channel. A tool call must never die because a similarity
             # could not be computed.
-            self.logger.warning("embedding failed (%s)", type(error).__name__)
+            log_error("memory.embedding.failed", error, logger=self.logger)
             return None
         if (
             not isinstance(vector, list)
@@ -255,9 +255,8 @@ class LlmEntityExtractor:
                 self._disabled_models[key] = reason
                 if model == self.model and policy is None:
                     self.disabled_reason = reason
-                self.logger.warning(
-                    "memory entity extraction disabled: %s", reason
-                )
+                log_error("memory.entity_extraction.disabled", error, logger=self.logger,
+                          http_status=status)
             raise
         return {"entities": self._ground(response, text), "relations": []}
 

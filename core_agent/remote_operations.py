@@ -5,7 +5,7 @@ import hashlib
 import json
 from dataclasses import replace
 
-from .errors import CoreError, ExecutionNotStarted
+from .errors import CoreError, ExecutionNotStarted, log_error
 from .remote_agents import RemoteAgentCard, RemoteAgentConnection, _trusted_headers, _validate_response_files
 from .security import redact
 from .peer_conversations import public_identity
@@ -28,6 +28,7 @@ class RemoteA2AExecutor:
         except Exception as error:
             code = error.code if isinstance(error, CoreError) else "REMOTE_AGENT_UNAVAILABLE"
             if code not in {"LEASE_LOST", "WORKER_STOPPED", "SESSION_CONFLICT"}:
+                log_error("remote_agent.step.failed", error, task_id=claim.task_id)
                 try:
                     current = self.scheduler.read_remote_claim(claim)
                     if code == "CANCEL_REQUESTED" and not current["checkpoint"]["send_started"]:
@@ -36,10 +37,10 @@ class RemoteA2AExecutor:
                         self._unknown(claim, current)
                     else:
                         self._finish(claim, current, "failed", {"reason": code.lower()}, code)
-                except Exception:
+                except Exception as recovery_error:
                     # Storage/claim failure leaves recovery to the saved dispatch marker.
                     # Never expose an adapter/database exception containing credentials.
-                    pass
+                    log_error("remote_agent.recovery.failed", recovery_error, task_id=claim.task_id)
         return REMOTE_TASK_PENDING
 
     def _commit(self, claim, current, checkpoint, outcome=None, progress=None, prepared_file_batch=None, conversation_observation=None):
@@ -248,6 +249,7 @@ class RemoteA2AExecutor:
             event = getattr(connection, method)(**arguments, headers=headers, timeout=timeout)
         except Exception as error:
             # No exception text can cross the trust boundary or include private headers.
+            log_error("remote_agent.transport.failed", error, operation=method, task_id=claim.task_id)
             current = self.scheduler.read_remote_claim(claim)
             if isinstance(error, ExecutionNotStarted):
                 self._finish(claim, current, "failed", {"reason": error.code.lower(),

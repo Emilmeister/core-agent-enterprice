@@ -18,7 +18,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from google.protobuf.json_format import MessageToDict, MessageToJson, Parse
 from psycopg.types.json import Jsonb
 
-from .errors import CoreError
+from .errors import CoreError, log_error
 from .streaming import PARTIAL_KEY
 
 
@@ -362,6 +362,10 @@ class DurablePushNotificationSender(PushNotificationSender):
                     )
                     response.raise_for_status()
                 except Exception as error:
+                    if self.telemetry:
+                        span.record_error(error)
+                    log_error("push.delivery.failed", error, attempts=attempts,
+                              task_id=row["task_id"], delivery_id=row["id"])
                     code = (
                         error.code
                         if isinstance(error, CoreError)

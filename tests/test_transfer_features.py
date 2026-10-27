@@ -3039,6 +3039,20 @@ class ConfigurationTransferTests(unittest.TestCase):
         ipv6 = CompatibleHttpModel(api_format="anthropic", model="m", base_url="http://[::1]:8000/v1")
         self.assertEqual(ipv6.endpoint, "http://[::1]:8000/v1/messages")
 
+    def test_unexpected_startup_error_keeps_private_diagnostics_without_raw_text(self):
+        from core_agent.app import main
+
+        with patch.dict(os.environ, BASE_ENVIRONMENT, clear=True), \
+                patch("core_agent.app._configure_logging"), \
+                patch("core_agent.app.create_app", side_effect=ConnectionRefusedError(111, "startup-secret")), \
+                self.assertLogs("core_agent.runtime", "CRITICAL") as logs, \
+                self.assertRaises(SystemExit) as caught:
+            main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn('"error_type": "ConnectionRefusedError"', logs.output[0])
+        self.assertIn('"errno": 111', logs.output[0])
+        self.assertNotIn("startup-secret", str(logs.output))
+
     def test_invalid_database_url_never_reaches_pool_diagnostics_or_listener(self):
         script = (
             "from core_agent import app; from tests.app_support import create_app; "

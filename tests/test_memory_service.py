@@ -597,15 +597,19 @@ class ExtractionAndDegradationTests(unittest.TestCase):
             version = "broken-ner-v1"
 
             def extract(self, text):
-                raise RuntimeError("model unreachable")
+                raise ConnectionRefusedError(111, "PRIVATE model unreachable")
 
         service, registry = make_service(entity_extractor=BrokenExtractor())
         try:
-            with self.assertLogs("core_agent.runtime", "WARNING"):
+            with self.assertLogs("core_agent.runtime", "WARNING") as captured:
                 document, result = service.create(
                     title="Note", body="migration detail", namespace=NAMESPACE
                 )
             self.assertTrue(result.committed)
+            logged = "\n".join(captured.output)
+            self.assertIn('"errno": 111', logged)
+            self.assertNotIn("PRIVATE", logged)
+            self.assertNotIn("migration detail", logged)
             self.assertEqual(service.repository_revision, 1)
             response = service.search("migration", namespace=NAMESPACE)
             self.assertEqual(
@@ -735,6 +739,8 @@ class EmbeddingProviderTests(unittest.TestCase):
         encoded = "\n".join(captured.output)
         self.assertNotIn("sk-secret-key-value", encoded)
         self.assertNotIn("confidential", encoded)
+        self.assertIn("TimeoutError", encoded)
+        self.assertIn("error_type", encoded)
 
     def test_a_truncated_body_or_a_malformed_base_url_yields_no_vector(self):
         """The spec says any embedding failure degrades; any means any."""

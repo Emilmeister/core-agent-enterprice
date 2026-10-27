@@ -260,6 +260,70 @@ def locked_skill_declaration(path, name):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_failed_model_attempt_and_recovery_logs_keep_private_diagnostics(self):
+        secret = "private-model-error-canary"
+        model = CompatibleHttpModel(api_format="openai", model="m", api_key=secret)
+        agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=())
+        self.addCleanup(agent.close)
+        response = {"choices": [{"message": {"content": "", "reasoning_content": secret},
+                                  "finish_reason": "length"}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 16384,
+                              "completion_tokens_details": {"reasoning_tokens": 16384}}}
+        with patch("core_agent.model.CompatibleHttpModel._post", return_value=response), \
+                self.assertLogs(agent.logger, "INFO") as logs:
+            with self.assertRaises(CoreError):
+                agent.run(run_request(memory=False), task_id="failed-model-logs")
+            record = agent.workflow_store.lookup_task("failed-model-logs")
+            agent._resume_recovered_workflow(record, threading.Event())
+        records = [json.loads(item.getMessage()) for item in logs.records
+                   if item.getMessage().startswith("{")]
+        failures = [item for item in records if item["event"] == "model.failed"]
+        self.assertEqual([item["turn"] for item in failures], [1, 2])
+        recovered = next(item for item in records if item["event"] == "workflow.recovery.failed")
+        for item in [*failures, recovered]:
+            self.assertEqual(item["error_code"], "MODEL_UNAVAILABLE")
+            self.assertEqual(item["provider_failure"]["kind"], "no_public_text")
+            self.assertEqual(item["provider_failure"]["finish_reason"], "length")
+            self.assertEqual(item["provider_failure"]["completion_tokens"], 16384)
+            self.assertEqual(item["provider_failure"]["reasoning_tokens"], 16384)
+            self.assertFalse(item["retryable"])
+        self.assertTrue(all(item["elapsed_ms"] >= 0 for item in failures))
+        self.assertTrue(all(item["attempt"] == 1 for item in failures))
+        self.assertTrue(all(item["finalization"] is False for item in failures))
+        self.assertTrue(all(item["retry_scheduled"] is False for item in failures))
+        self.assertNotIn(secret, json.dumps(records))
+
+    def test_failed_model_finalizer_is_logged_before_partial_fallback(self):
+        agent = make_agent(ScriptedModel([]),
+                           memory="disabled", mcp=False, platform_mcp=(), max_turns=1)
+        self.addCleanup(agent.close)
+        with patch.object(agent.model, "generate", side_effect=CoreError("MODEL_UNAVAILABLE", "private-finalizer")), \
+                self.assertLogs(agent.logger, "INFO") as logs:
+            result = agent.run(run_request(memory=False), task_id="finalizer-logs")
+        failures = [json.loads(item.getMessage()) for item in logs.records
+                    if '"event": "model.failed"' in item.getMessage()]
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0]["finalization"])
+        self.assertEqual(failures[0]["turn"], 1)
+        self.assertNotIn("private-finalizer", str(result))
+        self.assertNotIn("private-finalizer", str(logs.output))
+
+    def test_each_provider_retry_has_its_own_failure_diagnostics(self):
+        model = CompatibleHttpModel(api_format="openai", model="m")
+        agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=(), model_retries=1)
+        self.addCleanup(agent.close)
+        with patch("core_agent.model.urlopen", side_effect=TimeoutError("private-timeout")), \
+                patch("core_agent.runtime.time.sleep"), self.assertLogs(agent.logger, "INFO") as logs:
+            with self.assertRaises(CoreError):
+                agent.run(run_request(memory=False), task_id="retry-logs")
+        failures = [json.loads(item.getMessage()) for item in logs.records
+                    if '"event": "model.failed"' in item.getMessage()]
+        self.assertEqual([item["attempt"] for item in failures], [1, 2])
+        self.assertEqual([item["turn"] for item in failures], [1, 2])
+        self.assertEqual([item["retry_scheduled"] for item in failures], [True, False])
+        self.assertTrue(all(item["provider_failure"]["kind"] == "timeout" for item in failures))
+        self.assertNotIn("private-timeout", str(logs.output))
+
     def _legacy_capability_checkpoint(self, model):
         agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=())
         self.addCleanup(agent.close)
@@ -3037,7 +3101,14 @@ class RuntimeTests(unittest.TestCase):
                         expected["http_status"] = status
                     if kind == "no_public_text":
                         expected["finish_reason"] = "length" if api_format == "openai" else "max_tokens"
-                    self.assertEqual(model_failure_metadata(error), expected)
+                        expected["reasoning_available"] = True
+                    metadata = model_failure_metadata(error)
+                    self.assertIs(type(metadata["elapsed_ms"]), int)
+                    self.assertGreaterEqual(metadata["elapsed_ms"], 0)
+                    expected.update(elapsed_ms=metadata["elapsed_ms"], timeout_seconds=120.0, max_tokens=16384,
+                                    request_phase="parse" if kind == "no_public_text" else
+                                    "response" if kind == "invalid_json" or isinstance(reply, TimeoutBody) else "request")
+                    self.assertEqual(metadata, expected)
                     self.assertNotIn(secret, json.dumps(model_failure_metadata(error)))
 
     def test_http_error_body_is_not_read_and_close_cannot_mask_status(self):
@@ -3079,8 +3150,13 @@ class RuntimeTests(unittest.TestCase):
                             self.assertEqual(error.retryable, status == 504)
                             self.assertEqual(error.data, {})
                             self.assertEqual(str(error), f"model HTTP {status}")
-                            self.assertEqual(model_failure_metadata(error), {
-                                "kind": "http", "http_status": status, "exception_type": "HTTPError", "response_format": "none"})
+                            metadata = model_failure_metadata(error)
+                            self.assertIs(type(metadata["elapsed_ms"]), int)
+                            self.assertGreaterEqual(metadata["elapsed_ms"], 0)
+                            self.assertEqual(metadata, {
+                                "kind": "http", "http_status": status, "exception_type": "HTTPError", "response_format": "none",
+                                "elapsed_ms": metadata["elapsed_ms"], "timeout_seconds": 120.0,
+                                "max_tokens": 16384, "request_phase": "request"})
                             self.assertNotIn(secret, json.dumps(model_failure_metadata(error)))
 
     def test_model_failure_metadata_revalidates_untrusted_private_attributes(self):
@@ -6335,6 +6411,12 @@ class SemanticRuntimeTests(unittest.TestCase):
                             expected["http_status"] = 504
                         else:
                             expected["finish_reason"] = "length" if api_format == "openai" else "max_tokens"
+                            expected["reasoning_available"] = True
+                        metadata = event["provider_failure"]
+                        self.assertIs(type(metadata["elapsed_ms"]), int)
+                        self.assertGreaterEqual(metadata["elapsed_ms"], 0)
+                        expected.update(elapsed_ms=metadata["elapsed_ms"], timeout_seconds=120.0,
+                                        max_tokens=request["max_tokens"], request_phase="request" if failure == "http" else "parse")
                         self.assertEqual(event["provider_failure"], expected)
                         if api_format == "openai":
                             self.assertTrue(request["response_format"]["json_schema"]["strict"])

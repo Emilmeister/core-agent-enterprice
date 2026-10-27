@@ -26,6 +26,21 @@ Runtime MUST писать в stdout контейнера однострочны�
 
 Без content mode model record показывает только безопасное состояние решения (`continue_reasoning`, `request_tools`, `final_answer`), наличие reasoning, finish reason и token usage. При `CORE_AGENT_LOG_CONTENT=true` provider-returned visible reasoning/summary MAY записываться отдельным полем `reasoning` после redaction и truncation. Provider-hidden chain-of-thought, encrypted/redacted thinking, signatures и opaque replay data не логируются никогда.
 
+Каждая запись о пойманном исключении в runtime, SDK, tools, guardrails, memory,
+remote agents и фоновых сервисах MUST сохранять приватную диагностику причины:
+тип и code, retryable для CoreError, ограниченную цепочку cause/context, числовые
+HTTP status/errno и SQLSTATE при наличии. Ограниченный stack содержит только
+имя файла проекта, функцию и строку; source, locals и полные пути исключены.
+Диагностика не изменяет публичный ответ, retry policy или состояние задачи.
+
+Каждый неудачный обычный model attempt, включая retry и finalizer, MUST иметь
+`model.failed` с run/task/context IDs, turn, номером попытки, finalization,
+elapsed_ms и признаком запланированного retry. Доступные сведения HTTP adapter
+включают phase, настроенный timeout, фактический output cap, finish reason,
+token usage и наличие reasoning; они MUST доходить до task/recovery/SDK logs,
+даже если исключение обёрнуто. Произвольный exception message/data, provider
+body, credentials и private content не логируются автоматически.
+
 При отказе HTTP model adapter во время суммаризации переход
 `context.compaction.failed` MUST дополнять
 общий reason безопасным `provider_failure`: конечная категория HTTP/timeout/

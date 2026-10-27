@@ -24,7 +24,7 @@ from a2a.utils.errors import (
 from google.protobuf.message import Message as ProtoMessage
 from starlette.responses import JSONResponse
 
-from .errors import CoreError
+from .errors import CoreError, error_log_fields
 
 
 class RequestTooLargeError(A2AError):
@@ -63,17 +63,19 @@ def _omit_sdk_payload(record):
         or any(isinstance(arg, (ProtoMessage, ServerCallContext)) for arg in args)
     ):
         return False
-    if record.exc_info:
-        record.msg, record.args = "SDK operation failed (%s)", (record.exc_info[0].__name__,)
+    error = record.exc_info[1] if record.exc_info else next(
+        (arg for arg in args if isinstance(arg, BaseException)), None)
+    if error is not None:
+        record.msg = json.dumps({"event": "sdk.operation.failed", **error_log_fields(error)}, sort_keys=True)
+        record.args = ()
         record.exc_info = record.exc_text = None
+        record.stack_info = None
     elif record.msg == "Parse error: %s":
         record.args = ("invalid request",)
     elif isinstance(record.msg, str) and record.msg.startswith("Request Error (ID:"):
         record.msg, record.args = "SDK request error: code=%s", (record.args[1],)
     elif isinstance(record.msg, str) and record.msg.startswith("Request error: Code="):
         record.msg, record.args = "SDK request error: code=%s", (record.args[0],)
-    elif isinstance(record.args, tuple):
-        record.args = tuple(type(arg).__name__ if isinstance(arg, BaseException) else arg for arg in record.args)
     return True
 
 

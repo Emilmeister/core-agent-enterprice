@@ -18,7 +18,7 @@ from a2a.types.a2a_pb2 import SendMessageResponse, Task
 from google.protobuf.json_format import MessageToDict, ParseDict, ParseError
 
 from .a2a_input import _check_depth, _decode_raw, _invalid_constant, _unique_object
-from .errors import CoreError, ExecutionNotStarted
+from .errors import CoreError, ExecutionNotStarted, error_log_fields
 from .security import redact
 
 AGENT_CARD_WELL_KNOWN_PATH = "/.well-known/agent-card.json"
@@ -922,6 +922,7 @@ class RemoteAgentRegistry:
         self.api_key = api_key
         self._connections = {}
         self._failures = ()
+        self.failure_diagnostics = {}
 
 
     @property
@@ -931,6 +932,7 @@ class RemoteAgentRegistry:
     def connect(self) -> dict[str, RemoteAgentConnection]:
         connections = {}
         failures = []
+        diagnostics = {}
         for index, url in enumerate(self.urls):
             base_url = url.rstrip("/")
             try:
@@ -940,6 +942,7 @@ class RemoteAgentRegistry:
                 )
             except CoreError as error:
                 failures.append((base_url, error.code))
+                diagnostics[base_url] = error_log_fields(error)
                 continue
             if card.name in connections:
                 failures.append((base_url, "REMOTE_AGENT_DUPLICATE_NAME"))
@@ -947,6 +950,7 @@ class RemoteAgentRegistry:
             connections[card.name] = connection
         self._connections = connections
         self._failures = tuple(failures)
+        self.failure_diagnostics = diagnostics
         return dict(connections)
 
     def _fallback_name(self, base_url, index):

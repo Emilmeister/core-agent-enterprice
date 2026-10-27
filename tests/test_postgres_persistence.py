@@ -38,6 +38,7 @@ from core_agent.push import (
     PostgresPushNotificationConfigStore,
 )
 from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
+from core_agent.observability import RecordingExporter, Telemetry
 from core_agent.lifecycle import PostgresRetentionManager
 from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, SuspendedRun, WorkflowRecord
 from psycopg.types.json import Jsonb
@@ -1482,17 +1483,29 @@ class PostgresRestartTests(unittest.TestCase):
             status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
         )
         client = httpx.AsyncClient(transport=httpx.MockTransport(webhook))
+        exporter = RecordingExporter()
         first = DurablePushNotificationSender(
-            database, store, client=client, retry_seconds=0
+            database, store, client=client, retry_seconds=0, telemetry=Telemetry(exporter)
         )
         with patch("core_agent.push.socket.getaddrinfo", return_value=public_dns):
-            asyncio.run(first.send_notification("task-push", event))
+            with self.assertLogs("core_agent.runtime", "WARNING") as captured:
+                asyncio.run(first.send_notification("task-push", event))
             restarted = DurablePushNotificationSender(
                 database, store, client=client, retry_seconds=0
             )
             asyncio.run(restarted.dispatch_pending())
             asyncio.run(restarted.send_notification("task-push", event))
         asyncio.run(client.aclose())
+        failed = [span for span in exporter.spans if span.name == "core_agent.notification.deliver"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].status_code, "ERROR")
+        logged = "\n".join(captured.output)
+        self.assertIn("503", logged)
+        self.assertNotIn("push-secret", logged)
+        self.assertNotIn("push.example", logged)
+        diagnostic = json.loads(captured.records[0].getMessage())
+        self.assertEqual(diagnostic["task_id"], "task-push")
+        self.assertEqual(diagnostic["delivery_id"], deliveries[0].headers["X-Core-Delivery-Id"])
 
         with database.pool.connection() as connection:
             row = connection.execute(

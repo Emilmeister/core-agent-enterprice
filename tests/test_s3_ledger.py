@@ -169,9 +169,11 @@ class S3LedgerTests(unittest.TestCase):
         digest = self.ledger.put(b"replace")
         old_generation = self.rows()[0]["generation"]
         self.now += 100_000
-        with patch.object(self.blobs, "delete", side_effect=CoreError("STORAGE_UNAVAILABLE", retryable=True)):
-            with self.assertLogs("core_agent.s3_ledger", level="WARNING"):
+        with patch.object(self.blobs, "delete", side_effect=CoreError("STORAGE_UNAVAILABLE", "PRIVATE", retryable=True)):
+            with self.assertLogs("core_agent.s3_ledger", level="WARNING") as captured:
                 self.assertEqual(self.ledger.sweep(), 0)
+        self.assertIn("STORAGE_UNAVAILABLE", "\n".join(captured.output))
+        self.assertNotIn("PRIVATE", "\n".join(captured.output))
         self.assertEqual(self.rows()[0]["state"], "deleting")
         self.store.put(self.tenant, b"replace", media_type="text/plain", provenance={})
         live, = [row for row in self.rows() if row["state"] == "live"]

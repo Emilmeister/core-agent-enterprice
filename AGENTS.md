@@ -287,7 +287,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/security.py` | Redaction, safe paths, retry и tenant helpers |
 | `core_agent/skills.py` | Обнаружение, закрепление и безопасное чтение ресурсов навыков |
 | `core_agent/observability.py` | OpenTelemetry/OpenInference spans и exporters |
-| `core_agent/errors.py` | Public errors и отдельная finite private `SandboxDiagnostics`, не входящая в error data |
+| `core_agent/errors.py` | Public errors, finite private model/sandbox diagnostics и общий `error_log_fields`: ограниченная цепочка причин и project stack без exception text, source, locals или публичной error data |
 | `core_agent/push.py` | Durable encrypted A2A push delivery |
 | `core_agent/memory.py` | Markdown revisions, hybrid retrieval, NER, graph index и `core_memory_*` tools |
 | `core_agent/memory_store.py` | In-memory и PostgreSQL backends memory corpus |

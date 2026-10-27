@@ -20,6 +20,8 @@ from pydantic import ValidationError
 from sse_starlette.sse import EventSourceResponse
 from starlette.responses import JSONResponse
 
+from .errors import error_log_fields
+
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +38,7 @@ def cloud_a2a_version(request, default="0.3"):
 
 
 def _unexpected_error(error):
-    logger.warning("Legacy A2A operation failed (%s)", type(error).__name__)
+    logger.warning(json.dumps({"event": "sdk.legacy_operation.failed", **error_log_fields(error)}, sort_keys=True))
     return InternalError()
 
 

@@ -8,7 +8,7 @@ import math
 import time
 import uuid
 
-from .errors import CoreError
+from .errors import CoreError, log_error
 
 _LOG = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class PostgresS3BlobStore:
             try:
                 self.transport.delete(row["digest"], object_id=row["generation"])
             except CoreError as error:
-                _LOG.warning("storage.s3", extra={"operation": "gc", "outcome": "retry", "code": error.code})
+                log_error("storage.s3", error, logger=_LOG, operation="gc", outcome="retry")
                 continue
             with self.database.transaction() as connection:
                 connection.execute("""UPDATE core_s3_blobs SET state = 'deleted', updated_at = %s

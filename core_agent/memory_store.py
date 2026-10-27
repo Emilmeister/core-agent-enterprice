@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 from psycopg import errors
 
-from .errors import CoreError
+from .errors import CoreError, log_error
 
 
 @dataclass(frozen=True)
@@ -124,11 +124,8 @@ class PostgresMemoryStore:
                 with self.database.transaction() as connection:
                     connection.execute(statement)
             except Exception as error:
-                self.logger.warning(
-                    "pgvector index unavailable (%s); the vector channel falls back "
-                    "to in-process cosine",
-                    type(error).__name__,
-                )
+                log_error("memory.pgvector.unavailable", error, logger=self.logger,
+                          fallback="in_process_cosine")
                 return False
         return True
 

@@ -5,43 +5,17 @@ import contextlib
 import hashlib
 import json
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .errors import CoreError
+from .errors import CoreError, _MODEL_FAILURE_VALUES, model_failure_metadata as model_failure_metadata
 from .security import validate_http_url
 from .streaming import integrate_stream_chunk
 from .structured_output import normalize_structured_output_body, validate_structured_output
-
-
-_MODEL_FAILURE_VALUES = {
-    "kind": frozenset({"http", "timeout", "transport", "response_too_large", "invalid_json",
-                       "invalid_response", "no_text", "no_public_text", "unknown"}),
-    "exception_type": frozenset({"HTTPError", "TimeoutError", "URLError", "HTTPException", "OSError",
-                                 "JSONDecodeError", "UnicodeDecodeError", "KeyError", "IndexError", "TypeError", "CoreError"}),
-    "response_format": frozenset({"none", "json_schema", "json_object"}),
-    "finish_reason": frozenset({"stop", "length", "tool_calls", "function_call", "content_filter",
-                                "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"}),
-}
-
-
-def model_failure_metadata(error):
-    """Revalidate private adapter metadata at the operator logging boundary."""
-    value = getattr(error, "model_failure", None)
-    if type(value) is not dict:
-        return {}
-    result = {"kind": "unknown"}
-    for key, allowed in _MODEL_FAILURE_VALUES.items():
-        item = value.get(key)
-        if type(item) is str and item in allowed:
-            result[key] = item
-    status = value.get("http_status")
-    if type(status) is int and 100 <= status <= 599:
-        result["http_status"] = status
-    return result
 
 
 def _model_failure(error, body, response):
@@ -54,6 +28,8 @@ def _model_failure(error, body, response):
         "invalid tool arguments": "invalid_response",
         "tool arguments must be an object": "invalid_response",
         "unknown model tool": "invalid_response",
+        "invalid model tool name": "invalid_response",
+        "invalid model tool function": "invalid_response",
         "model returned no text": "no_text",
         "model returned no public text": "no_public_text",
     }
@@ -87,6 +63,25 @@ def _model_failure(error, body, response):
                   else response.get("stop_reason"))
         if type(finish) is str and finish in _MODEL_FAILURE_VALUES["finish_reason"]:
             details["finish_reason"] = finish
+        usage = response.get("usage")
+        if type(usage) is dict:
+            completion_details = usage.get("completion_tokens_details")
+            details.update({
+                "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens")),
+                "completion_tokens": usage.get("completion_tokens", usage.get("output_tokens")),
+                "total_tokens": usage.get("total_tokens"),
+                "reasoning_tokens": completion_details.get("reasoning_tokens") if type(completion_details) is dict else None,
+            })
+        if type(choices) is list and choices and type(choices[0]) is dict:
+            message = choices[0].get("message")
+            if type(message) is dict:
+                content = message.get("content")
+                details["reasoning_available"] = bool(message.get("reasoning_content") or message.get("reasoning_details")
+                    or (type(content) is str and "<think>" in content))
+        elif type(response.get("content")) is list:
+            details["reasoning_available"] = any(type(block) is dict and type(block.get("type")) is str
+                                                  and block["type"] in {"thinking", "redacted_thinking"}
+                                                  for block in response["content"][:1000])
     return details
 
 
@@ -571,12 +566,15 @@ class CompatibleHttpModel:
         with self._open(body, headers) as response:
             try:
                 yield response
-            except CoreError:
+            except CoreError as error:
+                error.model_request_phase = "response"
                 raise
             except (OSError, TimeoutError, URLError, HTTPException) as error:
-                raise CoreError(
+                failure = CoreError(
                     "MODEL_UNAVAILABLE", str(error), retryable=True
-                ) from error
+                )
+                failure.model_request_phase = "response"
+                raise failure from error
 
     @staticmethod
     def _server_sent_events(stream):
@@ -936,6 +934,8 @@ class CompatibleHttpModel:
             context, instructions, tools, messages=messages, tool_choice=tool_choice
         )
         response = None
+        started = time.monotonic()
+        phase = "request"
         try:
             if self.stream:
                 body["stream"] = True
@@ -944,12 +944,22 @@ class CompatibleHttpModel:
                 response = self._post_stream(body, headers, reverse, on_delta)
             else:
                 response = self._post(body, headers)
+            phase = "parse"
             if self.api_format == "openai":
                 return self._parse_openai(response, reverse)
             return self._parse_anthropic(response, reverse)
         except CoreError as error:
-            if error.code == "MODEL_UNAVAILABLE":
-                error.model_failure = _model_failure(error, body, response)
+            if error.code in {"MODEL_UNAVAILABLE", "MODEL_RESPONSE_INVALID"}:
+                details = _model_failure(error, body, response)
+                if details["kind"] in {"invalid_json", "response_too_large"}:
+                    phase = "response"
+                error.model_failure = {
+                    **details,
+                    "elapsed_ms": min(2**31 - 1, max(0, int((time.monotonic() - started) * 1000))),
+                    "timeout_seconds": self.timeout,
+                    "max_tokens": body.get("max_completion_tokens", body.get("max_tokens")),
+                    "request_phase": getattr(error, "model_request_phase", phase),
+                }
             raise
 
 

@@ -15,6 +15,7 @@ from a2a.server.context import ServerCallContext
 
 from .auth import ScopeUser
 from .cron import _text
+from .errors import error_log_fields
 
 
 class CronCoordinator:
@@ -47,7 +48,8 @@ class CronCoordinator:
     def _log(self, event, error):
         if self.log:
             try:
-                self.log(event, error_code=getattr(error, "code", type(error).__name__))
+                fields = error_log_fields(error)
+                self.log(event, **{"error_code": fields["error_type"], **fields})
             except Exception:
                 pass
 

@@ -1033,6 +1033,13 @@ implemented. Automated proofs MUST входить в обычные applicable g
 
 ## Диагностика guardrails и sandbox
 
+- [ ] OBS-ERROR: Ошибки model attempts (включая retry/finalizer), task/recovery и SDK logs
+  сохраняют finite cause/status/phase/usage diagnostics и ограниченные project
+  stack frames. Guardrails, memory, remote и фоновые обработчики сохраняют
+  причину до её преобразования в verdict/code. Secret canaries из messages,
+  provider body/headers/URL, SQL/DSN и locals отсутствуют; public errors и retry
+  semantics не меняются.
+
 - [ ] ENT-AC-105: memory и PostgreSQL сохраняют committed classification/wait
   events атомарно, включая clear без workflow-version bump. Rollback убирает
   событие и решение; повторное finish/resolve/recovery не создаёт нового durable

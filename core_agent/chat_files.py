@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 from psycopg.types.json import Jsonb
 
-from .errors import CoreError
+from .errors import CoreError, log_error
 from .workflow import TERMINAL_STATES
 from .interactions import DEFAULT_ATTACHMENT_LIMIT
 
@@ -850,14 +850,14 @@ class ChatFileService:
                 if stage is not None:
                     try:
                         self.reject(stage["batch_id"], stage["tenant_id"], stage["lease_token"], "FILE_CACHE_RELEASED")
-                    except Exception:
+                    except Exception as error:
                         # A committed result is not undone by disposable-cache
                         # bookkeeping. Its durable lease remains sweepable.
                         try:
                             self._remove(stage["batch_id"])
                         except OSError:
                             pass
-                        logging.getLogger(__name__).warning("file.cache.cleanup_pending")
+                        log_error("file.cache.cleanup_pending", error, logger=logging.getLogger(__name__))
             finally:
                 self._original_gate.release()
 

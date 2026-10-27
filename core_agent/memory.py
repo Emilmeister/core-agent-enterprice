@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
 
-from .errors import CoreError
+from .errors import CoreError, log_error
 from .memory_providers import LlmEntityExtractor
 from .memory_store import StoredDocument
 
@@ -434,10 +434,7 @@ class MemoryService:
 
     def _log_extraction_failure(self, error):
         if self.logger:
-            code = getattr(error, "code", type(error).__name__)
-            # The code, never the note: the text is the whole reason memory is
-            # kept out of logs by default.
-            self.logger.warning("memory entity extraction failed (%s)", code)
+            log_error("memory.entity_extraction.failed", error, logger=self.logger)
 
     def _embed(self, text):
         if self.embedding_provider is None:

@@ -1,6 +1,7 @@
 import io
 import base64
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -487,7 +488,12 @@ class RemoteOperationTests(unittest.TestCase):
 
     def test_transport_proven_predispatch_error_is_known_failure_after_send_marker(self):
         self.responses.append(ExecutionNotStarted("ATTACHMENTS_TOO_LARGE", data={"allowed_bytes": 1, "actual_bytes": 2}))
-        task = self.start()
+        logger = logging.getLogger("core_agent.runtime")
+        handler = logging.StreamHandler()
+        with patch.object(logger, "handlers", [handler]), patch.object(logger, "level", logging.WARNING), \
+                patch.object(handler, "emit", side_effect=RuntimeError("PRIVATE logging failure")) as emitted:
+            task = self.start()
+        emitted.assert_called()
         self.assertEqual((task.state, task.error.code), ("failed", "ATTACHMENTS_TOO_LARGE"))
         self.assertNotEqual(task.result.get("remote_outcome"), "unknown")
         self.assertEqual(self.recover(), 0)
@@ -797,12 +803,18 @@ class RemoteOperationTests(unittest.TestCase):
         self.assertEqual([call[0] for call in self.calls], ["Send", "Cancel"])
 
     def test_unknown_credential_error_is_safe_and_never_dispatches(self):
-        with patch.object(self.registry, "resolve_headers", side_effect=RuntimeError("private-key")):
+        with self.assertLogs("core_agent.runtime", "WARNING") as captured, patch.object(
+                self.registry, "resolve_headers", side_effect=RuntimeError("private-key")):
             task = self.start()
         self.assertEqual(task.state, "failed")
         self.assertEqual(task.error.code, "REMOTE_AGENT_UNAVAILABLE")
         self.assertNotIn("private-key", str(task.result))
         self.assertEqual(self.calls, [])
+        logged = "\n".join(captured.output)
+        self.assertIn("RuntimeError", logged)
+        self.assertIn("error_type", logged)
+        self.assertNotIn("private-key", logged)
+        self.assertEqual(json.loads(captured.records[0].getMessage())["task_id"], task.id)
 
     def test_structured_parts_are_not_silently_dropped(self):
         self.responses.append(RemoteEvent("message", None, "", True, ({"data": {"result": 42}},)))

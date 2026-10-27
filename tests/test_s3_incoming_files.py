@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 from core_agent.chat_files import ChatFileService, MemoryChatFileStore
 from core_agent.errors import CoreError
@@ -97,6 +98,18 @@ class S3IncomingFilesTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "STORAGE_UNAVAILABLE")
         self.assertEqual([row["state"] for row in self.store.rows.values()], ["rejected"])
         self.assertTrue(all(row["task_id"] is None for row in self.store.rows.values()))
+
+    def test_materialization_cleanup_failure_preserves_result_and_logs_finite_cause(self):
+        batch = self.prepare()
+        self.bind(batch)
+        with self.assertLogs("core_agent.chat_files", "WARNING") as captured, patch.object(
+                self.service, "reject", side_effect=PermissionError(13, "PRIVATE")):
+            material = self.service.review_material(batch["batch_id"], self.binding, run_id="run", task_id="task")
+        self.assertEqual(material["documents"][0]["text"], "original")
+        logged = "\n".join(captured.output)
+        self.assertIn('"errno": 13', logged)
+        self.assertNotIn("PRIVATE", logged)
+        self.assertEqual(list((Path(self.temp.name) / "first/private/uploads").iterdir()), [])
 
     def test_crashed_materialization_is_bounded_and_swept_before_another_read(self):
         batch = self.prepare()

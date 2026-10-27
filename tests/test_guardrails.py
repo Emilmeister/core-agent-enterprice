@@ -163,6 +163,7 @@ class GuardrailClassifierTests(unittest.TestCase):
         entered = queue.Queue()
         self.addCleanup(release.set)
         model = ScriptedModel([])
+        model.timeout = 0.25
 
         def blocked(**_):
             entered.put(threading.current_thread())
@@ -177,7 +178,16 @@ class GuardrailClassifierTests(unittest.TestCase):
         threads = []
         try:
             for _ in range(5):
-                result = classifier.classify(("source",), source_kind="message", record_attempt=attempts.append)
+                with self.assertLogs("core_agent.runtime", "WARNING") as captured:
+                    result = classifier.classify(("source",), source_kind="message", record_attempt=attempts.append)
+                diagnostic = json.loads(captured.records[0].getMessage())
+                self.assertEqual(diagnostic["event"], "guardrail.wait.timeout")
+                self.assertEqual(diagnostic["reason"], "timeout")
+                self.assertGreater(diagnostic["wait_seconds"], 0)
+                self.assertLessEqual(diagnostic["wait_seconds"], 0.02)
+                self.assertGreaterEqual(diagnostic["elapsed_ms"], 0)
+                self.assertEqual(diagnostic["model_timeout_seconds"], 0.25)
+                self.assertNotIn("error_type", diagnostic)
                 results.append(result)
                 self.assertEqual((result.verdict, result.reason), ("unverified", "timeout"))
                 threads.append(entered.get(timeout=1))

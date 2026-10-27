@@ -35,7 +35,7 @@ from .structured_output import STRUCTURED_OUTPUT_DEFAULT, validate_structured_ou
 from .chat_files import _destination
 from .execution_identity import stopped_by_restart
 from .a2a import output_contract_version, workflow_public_output
-from .errors import CoreError, ExecutionNotStarted
+from .errors import CoreError, ExecutionNotStarted, error_log_fields
 from .interactions import tool_origin
 from .skills import (
     SKILL_ACTIVATE_TOOL,
@@ -493,7 +493,7 @@ class CoreAgent:
             return self._bounded_log_value(asdict(value))
         return value
 
-    def _log(self, event, *, level=logging.INFO, **fields):
+    def _log(self, event, *, level=logging.INFO, error=None, **fields):
         try:
             context = self.telemetry.current_context()
             payload = {
@@ -503,6 +503,7 @@ class CoreAgent:
                 "component": "runtime",
                 "event": event,
                 "agent_depth": self.depth,
+                **(error_log_fields(error) if error is not None else {}),
                 **fields,
             }
             if context:
@@ -526,6 +527,13 @@ class CoreAgent:
                     isinstance(value, int) and not isinstance(value, bool)
                 ):
                     cleaned[key] = value
+            # These counters have already passed the finite diagnostics validator.
+            provider = payload.get("provider_failure")
+            if type(provider) is dict and type(cleaned.get("provider_failure")) is dict:
+                for key in ("max_tokens", "prompt_tokens", "completion_tokens", "reasoning_tokens", "total_tokens"):
+                    value = provider.get(key)
+                    if type(value) is int and 0 <= value <= 2**63 - 1:
+                        cleaned["provider_failure"][key] = value
             payload = cleaned
             self.logger.log(
                 level,
@@ -1044,12 +1052,7 @@ class CoreAgent:
         )
 
     def _warn_mcp_unavailable(self, server, error):
-        self.logger.warning(
-            "mcp server %r did not connect (%s: %s); its tools are unavailable",
-            server,
-            getattr(error, "code", type(error).__name__),
-            error,
-        )
+        self._log("mcp.connection.failed", level=logging.WARNING, server=server, error=error)
 
     def _warn_silent_mcp(self, server, catalog):
         if server in self._silent_mcp_warned:
@@ -1351,7 +1354,7 @@ class CoreAgent:
                     if error.code not in {"REMOTE_AGENT_DENIED", "REMOTE_AGENT_UNAVAILABLE", "REMOTE_AGENT_PROTOCOL_ERROR",
                                            "REMOTE_AGENT_CARD_INVALID", "REMOTE_AGENT_RESPONSE_TOO_LARGE", "REMOTE_AGENT_CREDENTIAL_UNAVAILABLE"}:
                         raise
-                    self._log("remote.discovery.failed", peer_id=peer["id"], error_code=error.code)
+                    self._log("remote.discovery.failed", error=error, peer_id=peer["id"], error_code=error.code)
                     continue
                 peers[peer["name"]] = {**peer, "binding": connection.card.binding}
             if len(page) < 100:
@@ -2121,7 +2124,7 @@ class CoreAgent:
                 self._stream(updated).public_output(workflow_public_output(updated, self.response_files_service))
             except Exception as error:
                 # Durable output remains available through Get/recovery after stream loss.
-                self._log("public_output.delivery_failed", run_id=updated.run_id, task_id=updated.task_id,
+                self._log("public_output.delivery_failed", error=error, run_id=updated.run_id, task_id=updated.task_id,
                           error_code=getattr(error, "code", None) or type(error).__name__)
         return updated
 
@@ -4503,18 +4506,27 @@ class CoreAgent:
         model.context_window = self._context_window(snapshot)
         return model
 
-    def _generate(self, *, before_retry=None, on_request=None, model=None, **call):
+    def _generate(self, *, before_retry=None, on_request=None, model=None, request_context=None, **call):
         """Retry a retryable provider failure REFLECT_AND_RETRY_MAX_RETRIES times."""
         for attempt in range(self.model_retries + 1):
+            started = time.monotonic()
+            phase = "prepare"
             try:
                 instructions = self._request_instructions(call["instructions"])
                 if on_request is not None:
                     on_request(instructions)
+                phase = "generate"
                 return (model or self.model).generate(**{**call, "instructions": instructions})
-            except CoreError as error:
-                if attempt == self.model_retries or not getattr(
-                    error, "retryable", False
-                ):
+            except Exception as error:
+                retry = isinstance(error, CoreError) and error.retryable and attempt < self.model_retries
+                fields = dict(request_context or {})
+                if "turn" in fields:
+                    fields["turn"] += attempt
+                self._log("model.failed", level=logging.WARNING if retry else logging.ERROR,
+                          error=error, **fields, phase=phase, attempt=attempt + 1,
+                          max_attempts=self.model_retries + 1, retry_scheduled=bool(retry),
+                          elapsed_ms=max(0, int((time.monotonic() - started) * 1000)))
+                if not retry:
                     raise
                 time.sleep(min(2**attempt, 8))
                 if before_retry is not None:
@@ -4588,7 +4600,7 @@ class CoreAgent:
                     close()
                 except Exception as error:
                     self._log(
-                        "mcp.close.failed",
+                        "mcp.close.failed", error=error,
                         run_id=run_id,
                         error_code=getattr(error, "code", type(error).__name__),
                     )
@@ -5091,6 +5103,9 @@ class CoreAgent:
                             response = (
                                 self._generate(
                                     model=self._model_for_snapshot(snapshot),
+                                    request_context={"run_id": record.run_id, "task_id": record.task_id,
+                                                     "context_id": record.context_id, "turn": snapshot["turns"],
+                                                     "finalization": finalizing},
                                     before_retry=reserve_retry,
                                     on_request=lambda instructions: model_span.set_attributes(self._llm_input_attributes(
                                         model=raw["model"].get("route", "unknown"), messages=model_messages,
@@ -6401,7 +6416,7 @@ class CoreAgent:
                 tenant_id=tenant_id,
             )
             self._log(
-                "tool.failed",
+                "tool.failed", error=error,
                 run_id=run_id,
                 task_id=scope.get("task_id"),
                 tool_call_id=call.id,
@@ -6557,7 +6572,7 @@ class CoreAgent:
                 tenant_id=tenant_id,
             )
             self._log(
-                "tool.failed",
+                "tool.failed", error=error,
                 run_id=run_id,
                 task_id=scope.get("task_id"),
                 tool_call_id=call.id,
@@ -7652,7 +7667,7 @@ class CoreAgent:
             callback(task_id)
         except Exception as error:
             self._log(
-                "workflow.recovery.reconcile_failed",
+                "workflow.recovery.reconcile_failed", error=error,
                 task_id=task_id,
                 error_code=getattr(error, "code", type(error).__name__),
             )
@@ -7667,14 +7682,14 @@ class CoreAgent:
                 "SIDE_EFFECT_UNKNOWN",
             }:
                 self._log(
-                    "workflow.recovery.failed",
+                    "workflow.recovery.failed", error=error,
                     run_id=candidate.run_id,
                     task_id=candidate.task_id,
                     error_code=error.code,
                 )
         except Exception as error:
             self._log(
-                "workflow.recovery.failed",
+                "workflow.recovery.failed", error=error,
                 run_id=candidate.run_id,
                 task_id=candidate.task_id,
                 error_code=getattr(error, "code", type(error).__name__),
@@ -7715,7 +7730,7 @@ class CoreAgent:
                 self._log("storage.gc", operation="delete", outcome="succeeded", count=removed)
                 delay = 2 if blobs.last_sweep_scanned == 100 else 3600
             except Exception as error:
-                self._log("storage.gc", operation="delete", outcome="failed",
+                self._log("storage.gc", error=error, operation="delete", outcome="failed",
                           error_code=getattr(error, "code", "STORAGE_UNAVAILABLE"))
                 delay = 60
             self._blob_sweep_due = time.monotonic() + delay
@@ -7731,7 +7746,7 @@ class CoreAgent:
                 cleanup.recover(limit=100, **scope)
             except Exception as error:
                 # Keep unresolved chat barriers while other workflow recovery proceeds.
-                self._log("workspace.cleanup.scan_failed", error_code=getattr(error, "code", type(error).__name__))
+                self._log("workspace.cleanup.scan_failed", error=error, error_code=getattr(error, "code", type(error).__name__))
         if self.chat_file_service is not None and time.monotonic() >= self._file_sweep_due:
             while not self._recovery_stop.is_set():
                 result = self.chat_file_service.sweep(startup=self._file_sweep_startup,
@@ -7822,7 +7837,7 @@ class CoreAgent:
                     self._recover_workflows_once()
                 except Exception as error:
                     self._log(
-                        "workflow.recovery.scan_failed",
+                        "workflow.recovery.scan_failed", error=error,
                         error_code=getattr(error, "code", type(error).__name__),
                     )
                 self._recovery_settled(None)

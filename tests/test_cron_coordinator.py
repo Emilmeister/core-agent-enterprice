@@ -142,6 +142,7 @@ class CronCoordinatorTests(AuthAppTestCase):
         self.assertFalse(self.admitted)
         self.assertIsNone(self.store.get(self.tenant, row["id"])["active_task_id"])
         self.assertNotIn("PRIVATE", repr(self.logs))
+        self.assertTrue(any(data.get("error_type") == "RuntimeError" for _, data in self.logs))
         await self.tick()
         self.assertEqual(len(self.admitted), 1)
 

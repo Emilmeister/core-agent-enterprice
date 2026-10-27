@@ -10,7 +10,7 @@ from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core_agent.errors import CoreError, ExecutionNotStarted
-from core_agent.remote_agents import RemoteAgentCard, RemoteAgentConnection, connect_peer
+from core_agent.remote_agents import RemoteAgentCard, RemoteAgentConnection, RemoteAgentRegistry, connect_peer
 from tests.test_auth import AuthAppTestCase
 
 
@@ -19,6 +19,18 @@ def task_payload(state="TASK_STATE_WORKING", **changes):
 
 
 class RemoteTransportTests(unittest.TestCase):
+    def test_registry_preserves_private_failure_diagnostics_without_changing_failure_contract(self):
+        registry = RemoteAgentRegistry(["https://peer.test/a2a"], timeout=1, max_retries=0,
+                                       retry_delay=0, retry_backoff=1, retryable_status_codes=(503,))
+        error = HTTPError("https://peer.test/a2a?token=PRIVATE", 403, "PRIVATE", {}, io.BytesIO())
+        with patch("core_agent.remote_agents._OPENER.open", side_effect=error):
+            self.assertEqual(registry.connect(), {})
+        self.assertEqual(registry.failures, (("https://peer.test/a2a", "REMOTE_AGENT_UNAVAILABLE"),))
+        diagnostics = registry.failure_diagnostics["https://peer.test/a2a"]
+        self.assertIn("403", json.dumps(diagnostics))
+        self.assertIn("HTTPError", json.dumps(diagnostics))
+        self.assertNotIn("PRIVATE", json.dumps(diagnostics))
+
     def connection(self, binding="JSONRPC"):
         return RemoteAgentConnection(RemoteAgentCard("peer", "Peer", "https://peer.test/a2a", True, (), binding),
                                      api_key="LEGACY-MUST-NOT-FORWARD")

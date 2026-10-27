@@ -41,7 +41,7 @@ from .database import (
     PostgresEventStore,
     PostgresTaskStore,
 )
-from .errors import CoreError
+from .errors import CoreError, error_log_fields
 from .execution import (
     LocalTerminalBackend,
     TerminalSessionManager,
@@ -713,7 +713,8 @@ def _remote_agents():
     )
     connections = registry.connect()
     failures = tuple(
-        {"url": _safe_url(url), "error_code": code} for url, code in registry.failures
+        {**registry.failure_diagnostics.get(url, {}), "url": _safe_url(url), "error_code": code}
+        for url, code in registry.failures
     )
     for failure in failures:
         logging.getLogger("core_agent.runtime").warning(
@@ -1930,7 +1931,7 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
                 result = function()
             except Exception as error:
                 agent._log(
-                    "task.exception",
+                    "task.exception", error=error,
                     level=logging.ERROR,
                     task_id=context.task_id,
                     context_id=context.context_id,
@@ -2134,7 +2135,7 @@ def _create_app(*, model, mcp_connector, base_url, database, push_client, auth_t
             )
         except Exception as error:
             # Admission has committed. Ordinary recovery can reclaim an expired lease.
-            agent._log("cron.handoff_failed", error_code=getattr(error, "code", type(error).__name__))
+            agent._log("cron.handoff_failed", error=error, error_code=getattr(error, "code", type(error).__name__))
 
     def close():
         nonlocal closed
@@ -2406,12 +2407,14 @@ def main():
     except CoreError as error:
         # A misconfigured deployment is an operator problem, not a bug: report the
         # offending setting on one readable line instead of a Python traceback.
-        logger.critical("startup failed: %s [%s]", error.message, error.code)
+        logger.critical("startup failed: %s [%s]; diagnostics=%s", error.message, error.code,
+                        json.dumps(error_log_fields(error), sort_keys=True))
         # The inventory matters most on the path where startup did not finish.
         _log_environment(logger)
         raise SystemExit(1) from None
-    except Exception:
-        logger.critical("startup failed: unexpected startup error [STARTUP_FAILED]; enable CORE_AGENT_STARTUP_DIAGNOSTICS for the failing stage")
+    except Exception as error:
+        logger.critical("startup failed: unexpected startup error [STARTUP_FAILED]; diagnostics=%s",
+                        json.dumps(error_log_fields(error), sort_keys=True))
         _log_environment(logger)
         raise SystemExit(1) from None
     host, port = app.state.bind

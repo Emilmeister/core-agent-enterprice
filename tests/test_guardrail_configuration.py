@@ -81,7 +81,7 @@ class GuardrailConfigurationTests(unittest.TestCase):
             with self.subTest(api_format=api_format), patch.dict(os.environ, {}, clear=True):
                 classifier = _guardrail_classifier(self.model(api_format))
                 attempts = []
-                with patch.object(classifier.model, "_post", side_effect=CoreError(
+                with self.assertLogs("core_agent.runtime", "WARNING") as captured, patch.object(classifier.model, "_post", side_effect=CoreError(
                         "MODEL_UNAVAILABLE", "private schema rejection")) as post:
                     result = classifier.classify(("ordinary material",), source_kind="tool_arguments",
                                                  record_attempt=attempts.append)
@@ -92,6 +92,11 @@ class GuardrailConfigurationTests(unittest.TestCase):
                 post.assert_called_once()
                 self.assert_verdict_schema(post.call_args.args[0], api_format)
                 self.assertNotIn("private", str(result))
+                logged = "\n".join(captured.output)
+                self.assertIn("MODEL_UNAVAILABLE", logged)
+                self.assertIn("error_type", logged)
+                self.assertNotIn("private schema rejection", logged)
+                self.assertNotIn("ordinary material", logged)
 
     def test_invalid_inherited_anthropic_output_config_fails_safely(self):
         for value in (None, "private invalid options", ["private invalid options"]):

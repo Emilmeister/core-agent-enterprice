@@ -173,6 +173,52 @@ class A2AInputTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(raw, "\n".join(logs.output))
         self.assertEqual(self.messages, [])
 
+    async def test_sdk_failure_logs_keep_diagnostics_without_exception_payload(self):
+        secret = "private-provider-body-and-key-never-log"
+        error = CoreError("MODEL_UNAVAILABLE", secret, retryable=True, data={"body": secret})
+        error.model_failure = {"kind": "http", "exception_type": "HTTPError",
+                               "http_status": 503, "response_format": "none", "body": secret}
+        logger = logging.getLogger("a2a.server.agent_execution.active_task")
+        for mode in ("exc_info", "argument", "mapping"):
+            with self.subTest(mode=mode), self.assertLogs(logger, logging.ERROR) as logs:
+                if mode == "exc_info":
+                    try:
+                        raise error
+                    except CoreError:
+                        logger.exception("SDK failure with payload %s", secret)
+                elif mode == "argument":
+                    logger.error("SDK failure with payload %s: %s", secret, error)
+                else:
+                    logger.error("SDK failure %(error)s with %(payload)s", {"error": error, "payload": secret})
+            record = logs.records[0]
+            payload = json.loads(record.getMessage())
+            self.assertEqual(payload["event"], "sdk.operation.failed")
+            self.assertEqual(payload["error_code"], "MODEL_UNAVAILABLE")
+            self.assertEqual(payload["error_type"], "CoreError")
+            self.assertTrue(payload["retryable"])
+            self.assertEqual(payload["provider_failure"]["http_status"], 503)
+            self.assertEqual(payload["provider_failure"]["kind"], "http")
+            self.assertIsNone(record.exc_info)
+            self.assertNotIn(secret, "\n".join(logs.output))
+
+    async def test_legacy_failure_logs_keep_diagnostics_and_public_error_is_generic(self):
+        from a2a.utils.errors import InternalError
+        from core_agent.a2a_compat import _unexpected_error
+
+        secret = "private-legacy-provider-key-never-log"
+        error = CoreError("MODEL_UNAVAILABLE", secret)
+        error.model_failure = {"kind": "no_text", "finish_reason": "length", "body": secret}
+        with self.assertLogs("core_agent.a2a_compat", logging.WARNING) as logs:
+            public = _unexpected_error(error)
+        payload = json.loads(logs.records[0].getMessage())
+        self.assertEqual(payload["event"], "sdk.legacy_operation.failed")
+        self.assertEqual(payload["error_code"], "MODEL_UNAVAILABLE")
+        self.assertEqual(payload["provider_failure"]["kind"], "no_text")
+        self.assertEqual(payload["provider_failure"]["finish_reason"], "length")
+        self.assertIsInstance(public, InternalError)
+        self.assertNotIn(secret, str(public))
+        self.assertNotIn(secret, "\n".join(logs.output))
+
     async def test_unknown_rpc_field_names_are_not_logged_or_retained(self):
         from core_agent.a2a_sdk import _reported_extra_fields
         _reported_extra_fields.clear()
