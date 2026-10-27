@@ -8,9 +8,11 @@
 
 **Tech Stack:** Python/uv, PostgreSQL, S3, Landlock/seccomp, официальный A2A SDK, React/TypeScript, существующие unittest и native/browser проверки.
 
-**Статус:** базовый пакет реализован 24 октября 2026; последующие Cloud-прогоны подтвердили отмену background-задачи с S3, исходящий Send/Get/Cancel, owner/HITL waits, сохранность памяти и повторную доставку файла из того же peer context. 26 октября пользователь подтвердил rollout `cloudru-validation-batch3-20261026` через `latest`; health endpoints вернули HTTP 200, owner Agent Card — protocol version `1.0`. Digest работающего образа через публичный API независимо не проверен. Текущая Qwen-задача завершилась без повторного вопроса и сохранила актуальные данные; JSON-only и точный release literal не прошли. Native `context.compacted` events и положительное доказательство OTLP-доставки после прежнего 403 ожидаются от оператора. Остальная матрица и release proofs ещё не завершены (результаты ниже).
+**Статус:** после подтверждённого пользователем rollout batch3 проверены Cloud owner/HITL waits, память, peer files и завершение Qwen-задачи без повторного вопроса; её exact-format checks не прошли. 27 октября подтверждены 174 разные локальные PostgreSQL/S3/recovery проверки и ещё 56 security/config/restart проверок с указанными ниже границами. После исправления прежних fixtures полный suite batch4 v3 прошёл: 2451 tests, exit 0, 16 skips, исходники за прогон не изменились. Batch4 опубликован под version tag и `latest`, одинаковый digest подтверждён registry readback. Rollout batch4 в Cloud ещё не подтверждён. Native amd64/browser, целевые Cloud replacement/overlap и остальные release proofs не закрыты; digest работающего Cloud image публично не проверен.
 
-Последний завершённый ordinary suite опубликованного пакета 26 октября: 2442 tests, exit 0, 16 skips; PostgreSQL,
+**Исключение текущего этапа:** 27 октября пользователь исключил telemetry из работ. Её проверки и изменения не выполняются; прежняя неопределённость доставки не объявляется устранённой. Native `context.compacted` events остаются отдельным ожидаемым operator evidence.
+
+Последний завершённый ordinary suite опубликованного пакета 27 октября: 2451 tests, exit 0, 16 skips; PostgreSQL,
 Keycloak и MinIO работали в изолированных fixtures. Подробности нового пакета
 и границы пропущенных gates приведены ниже. В исходном linux/amd64 candidate
 прошли 178 config/memory/S3 tests без skips. ARM64 Landlock VM: 39 tests без
@@ -162,7 +164,7 @@ uv run python -m unittest tests.test_landlock_policy tests.test_landlock_network
 - [x] Описать откат образа/схемы: старый backup нельзя накатывать поверх новых записей без отдельной процедуры сохранения данных. Процедура и ограничения — `docs/cloudru-trial.md`, раздел подготовки production и миграции.
 - [ ] Проверить недоступность/таймаут S3, заполнение локального cache, ограничения размера/числа файлов и GC без удаления referenced originals/artifacts.
 - [ ] Проверить согласованную ротацию owner password и отзыв платформенного ключа на уровне Cloud ingress.
-- [ ] Проверить экспорт traces/metrics/logs после исправления подтверждённого несовместимого формата Bearer у Cloud collector gateway; права настоящего ключа и успешная доставка ещё не подтверждены.
+- [ ] Проверить экспорт traces/metrics/logs после исправления подтверждённого несовместимого формата Bearer у Cloud collector gateway; права настоящего ключа и успешная доставка ещё не подтверждены. Исключено пользователем из текущего этапа 27 октября: работы по telemetry не выполняются.
 - [ ] Проверить readiness/liveness и записать фактические настройки ресурсов/фонового исполнения, доступные в AI Agents.
 
 Использовать существующие `core-agent-db`, S3 ledger/GC и тесты миграций;
@@ -191,8 +193,9 @@ Production configuration реализуется в общем пакете до 
 - [ ] Выполнить оставшиеся native/security/browser gates на требуемых fixtures; новые изменения после опубликованного пакета проверить отдельно.
 - [ ] Зафиксировать proof по каждому пункту матрицы; обновить implementation status только там, где доказательство действительно получено.
 - [x] Обновить `AGENTS.md`, `docs/cloudru-trial.md` и ENV-инструкцию по фактическим границам профиля.
-- [ ] Подтвердить наличие итогового документа сравнения Kubernetes/Cloud.ru; ранее запрошенный Desktop-артефакт сейчас не найден.
-- [x] Опубликовать проверенный пакет под постоянным version tag и digest; после сообщённого оператором rollout проверить целевой endpoint.
+- [x] Подтвердить наличие итогового документа сравнения Kubernetes/Cloud.ru: `Desktop/Core_Agent_Kubernetes_Cloudru_Comparison.md` и `.docx`; наличие обоих артефактов проверено 27 октября. Постоянное сравнение не переписывается ради текущего статуса suite/image.
+- [x] Опубликовать проверенный batch4 под постоянным version tag и digest; version tag и `latest` подтверждены registry readback 27 октября.
+- [ ] После сообщённого оператором rollout batch4 проверить целевой endpoint; предыдущая live-проверка относилась к batch3.
 - [ ] Закрыть оставшиеся release proofs; HTTP API не подтверждает точный digest запущенного Pod.
 
 Базовые команды существующих gates:
@@ -903,6 +906,129 @@ Receipt: `cloudru-short-json-control-20261026.json`.
 но один короткий контроль не отделяет влияние compaction от сложности
 длинного контекста или поведения модели. Причина нарушения формата в v6
 не установлена; его exact checks не объявляются пройденными.
+
+### Локальные proofs и текущий batch4: 27 октября
+
+| Проверка | Результат | Граница доказательства |
+|---|---|---|
+| PostgreSQL/S3/storage/recovery/cron | 149 tests за 114,354 s, exit 0: 146 прошли, 3 SGID skips на macOS | Собственные PostgreSQL/MinIO fixtures; обычные runtime fixtures используют ScriptedModel/test launcher |
+| Те же три SGID-сценария в Linux | 3 tests за 2,210 s, exit 0, без skips | Existing amd64 image с read-only source/test overlay; не native security proof |
+| PostgreSQL waits/leases/owner sessions | 25 tests за 9,444 s, exit 0, без skips | Реальные локальные database state, leases, password rotation и session fencing |
+| Landlock/seccomp в ARM64 VM | 40 tests за 50,889 s, exit 0, без skips; оба required flags | Linux 6.12.113, ABI 6, QEMU TCG, current Landlock sources и старый cached ARM64 rootfs; не exact candidate или Cloud host |
+| Docker restart identity на ARM64 | 1 test за 3,063 s, exit 0, без skips | Реальный container restart и current mounted execution identity; не замена Cloud Pod |
+| Production configuration | 14 tests за 0,186 s, exit 0, без skips | Config/schema validation, без доказательства настроек действующего deployment |
+| Compose Bubblewrap composition root | 1 test за 23,648 s, exit 0, без skips, required sandbox flag | Реальные terminal/Python/background launcher; cached ARM64 rootfs с current source overlay |
+
+Storage-набор покрывает 174 разные проверки после отдельного закрытия SGID
+skips; security/config/restart-набор — ещё 56 tests. Это targeted proofs,
+не полный suite актуального пакета. Проверены quiesced pg_dump/pg_restore со
+ссылочными S3 objects и encrypted peer, runtime role grants, сохранность originals
+и результатов, GC, limits, cleanup, waits, leases и owner sessions. Fault cases
+S3 outage/timeout используют инъекцию ошибки adapter/SDK: физическое отключение
+S3/сети, disk-full/OOM и поведение Cloud deployment этим не проверены.
+Первая SGID-попытка ошиблась адресацией fixture; loopback relay исправил её без
+ослабления S3 validation. Её failed receipt сохранён.
+
+Прямой required Landlock gate на Docker LinuxKit 6.12.54 не прошёл: 34 tests,
+1 failure и 1 error, exit 1. Filesystem probe вернул 77 для
+`ENOSYS`/`EOPNOTSUPP`, обязательный preflight отказал. Успешная VM не закрывает
+native matrix. Дополнительный amd64 batch3 VM fixture остановлен через 15 минут
+на скачивании Debian index, до tests (exit 137); новый amd64 proof не получен.
+Dedicated browser/native Pod fixture отсутствует; native amd64/browser gates
+не объявляются пройденными. Временные собственные VM/Compose fixtures удалены.
+
+Receipts: `cloudru-parity-local-gates-20261027.json` и каталог
+`cloudru-parity-storage-20261027/` (`storage-recovery-tests.json`,
+`waits-leases-sessions.json`, `linux-sgid.json`, `linux-sgid-attempt1.json`)
+в ignored `.enterprise-work/`. Точные commands, logs и source scopes находятся
+в receipts; source overlay не считается проверкой состава поставляемого image.
+
+Первый полный ordinary suite batch4 завершился в `10:35:19 UTC`: 2451 tests
+за 461,393 s, exit 1, 2 failures, 2 errors и 16 skips; `source_unchanged=true`.
+Failures — два provider subcases прежнего ожидания исключения для unknown tool
+в `test_transfer_features`; errors — два private compile snapshots без нового
+kernel pin в `test_public_output_runtime`. Fixtures приведены к новому контракту.
+Повторный suite v2, начатый в `10:38:44 UTC`, выполнил 2451 tests за 445,589 s:
+exit 1, 1 error, 16 skips, `source_unchanged=true`. Прежние четыре отказа отсутствуют.
+`RuntimeTests.test_root_cancel_recursively_cancels_child_and_grandchild_workflows`
+получил `TimeoutError` в `scheduler.wait(child, timeout=1)`. Fixture теперь
+освобождает блокирующую model stub после сохранения cancel intent grandchild,
+не ожидая возврата всего recursive cancel. Проверки отмены descendants и
+запрета позднего результата, а также таймауты assertions сохранены.
+Изменение не меняет production cancellation behavior.
+
+Последовательный полный suite v3 выполнен в `11:46:30–11:55:28 UTC`:
+2451 tests за 534,738 s, exit 0, 16 skips; полный запуск занял 538,223 s.
+`source_unchanged=true`, `changed_sources=[]`; независимый review блокеров
+не обнаружил. Предыдущие failures сохранены как история проверки fixtures,
+а skips не объявляются пройденными native/browser gates.
+Receipts: `cloudru-batch4-full-local-20261027.json` и
+`cloudru-batch4-full-local-v2-20261027.json`, итоговый
+`cloudru-batch4-full-local-v3-20261027.json`.
+
+Локальный `core-agent-gn:cloudru-validation-batch4-20261027` имеет image ID
+`sha256:14f3a3d4d62d4511fec5b6aaf2d9c98db3c400984ccd234981ef9fa609457a1e`.
+Это linux/amd64 delta от опубликованного batch3 `sha256:fa86321ac341570c4f8664e26c7b697658851cda74fb106a30df7dbe0201bd96`:
+все base layers сохранены, один COPY layer заменяет только `kernel.py`,
+`model.py`, `runtime.py`. Их source/image hashes совпали, actual-import smoke
+без сети прошёл. Полный Dockerfile rebuild не удался из-за недоступного registry
+mirror; daemon settings не менялись. Recipe и evidence:
+`cloudru-batch4-delta-20261027.Dockerfile`, `cloudru-batch4-delta-build-20261027.json`,
+`cloudru-batch4-delta-smoke-20261027.py/.json`.
+
+После успешного suite и review image опубликован: registry readback
+в `12:00:27 UTC` подтвердил для
+`blockchain.cr.cloud.ru/core-agent-gn:cloudru-validation-batch4-20261027`
+и `blockchain.cr.cloud.ru/core-agent-gn:latest` один immutable manifest digest
+`sha256:14f3a3d4d62d4511fec5b6aaf2d9c98db3c400984ccd234981ef9fa609457a1e`.
+`latest` обновлён только после успешной публикации и проверки version tag;
+затем оба tags прочитаны из registry повторно. Receipt:
+`cloudru-batch4-image-published-20261027.json` с push logs и registry readbacks.
+Публикация не доказывает rollout batch4, native/platform gates или readiness
+целевого Cloud deployment. SGR image не собирался и не публиковался в этом этапе.
+
+### Уточнение уже выполненных Cloud-проверок
+
+Receipt `cloudru-chat-isolation-20261026.json` подтверждает четыре проверки:
+исходный файл проверен до пробы, доступ к соседнему workspace отклонён,
+свой файл совпал с ожидаемыми bytes, исходный соседний файл не изменён.
+Это реальная ограниченная Cloud isolation proof, но не полный сценарий двух
+одновременно работающих root/child задач или replacement/overlap.
+
+В `cloudru-cron-idle-20261026.json` первоначальный top-level check был false.
+Последующая reconciliation доказала `automatic_state_before_first_read=true`:
+задача начала работу в `06:41:04 UTC`, первое чтение выполнено в `06:42:30 UTC`.
+Затем требовалось подтверждение начального guardrail; после exact approval
+задача стала `COMPLETED` с точным marker. Это автоматический admission за
+три минуты тишины, без запроса, запускающего выполнение; unattended completion,
+длительный idle и гарантированный CPU вне HTTP не доказаны.
+
+27 октября выполнен дополнительный Qwen control с теми же смысловыми
+инструкциями, двумя вопросами и двумя пакетами данных, но без инертного padding.
+Task `8fe86ca6-615e-4047-a55c-f7bf4dea2454` выполнялась
+`10:34:31–10:42:27 UTC` и завершилась: два вопроса, оба ответа, точные originals,
+актуальные route/artifact/amount, восстановленные settings и logout HTTP 200.
+Inputs уменьшены до 1192/364/342 bytes. Учёт показывает 4 model turns и
+3 tool calls — минимум для двух вопросов, `core_response_begin` и final;
+отсутствие учтённого summary следует из этого учёта, native events недоступны.
+Ответ вновь содержал fenced JSON и `release="PENDING"`: JSON-only и exact
+literal checks не прошли. Validator ожидал `PENDING; NOT RELEASED`, но prompt
+говорил `release must be PENDING; NOT RELEASED if approval is absent.` — без
+кавычек вокруг literal и без JSON-примера. Эта естественно-язычная формулировка
+допускает неоднозначное прочтение; возвращённое `PENDING` сохраняет pending-смысл.
+Отрицательный exact check сохранён, однако он не доказывает потерю release-факта
+или дефект модели/суммаризации. Compaction не является необходимым условием
+наблюдаемого несоответствия валидатору; его конкретная причина не установлена.
+Receipts:
+`cloudru-no-pressure-questions-20261027.json` и
+`cloudru-no-pressure-questions-20261027-reconciliation.json`.
+
+Ordinary suite, review, сверка source/image hashes и публикация batch4 завершены.
+Без оператора доступна дальнейшая сверка матрицы с существующими receipts.
+Dedicated native/browser CI требует подходящего отдельного fixture. Фактические
+Cloud CPU/min-replica настройки, Pod replacement/overlap, ingress revocation,
+target backup/restore и native compaction events требуют платформенного evidence;
+локальные tests не закрывают эти пункты. Telemetry исключена из текущих работ.
 
 ## 6. Когда цель считается достигнутой
 

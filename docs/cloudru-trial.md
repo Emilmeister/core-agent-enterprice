@@ -13,6 +13,13 @@ configuration. Смена `CORE_AGENT_ENVIRONMENT` — отдельный под
 не меняйте этот флаг до проверки миграции, runtime role и encryption key ниже.
 Допуск production startup не означает, что все real Cloud release gates пройдены.
 
+Состояние на 27 октября: batch3 развёрнут по подтверждению пользователя;
+batch4 прошёл image smoke и полный suite v3 (2451 tests, exit 0, 16 skips),
+опубликован под version tag и `latest` с одинаковым registry digest.
+Rollout batch4 в Cloud ещё не подтверждён. Подтверждены 174 локальные PostgreSQL/S3/recovery
+проверки и 56 security/config/restart проверок с ограничениями ниже.
+Пользователь исключил telemetry из текущих работ; её готовность не утверждается.
+
 Для первого запуска включите диагностические logs без содержимого запросов:
 
 ```dotenv
@@ -573,3 +580,82 @@ Receipt: `cloudru-short-json-control-20261026.json`.
 но один короткий контроль не отделяет влияние compaction от сложности
 длинного контекста или поведения модели. Причина нарушения формата в v6
 не установлена; его exact checks не объявляются пройденными.
+
+## Локальные проверки и текущий пакет 27 октября
+
+Storage/recovery/cron suite на собственных PostgreSQL/MinIO: 149 tests,
+exit 0, 114,354 s; три Linux SGID skips отдельно закрыты в Linux (3 tests,
+exit 0, 2,210 s). Ещё 25 PostgreSQL waits/leases/session tests прошли за
+9,444 s без skips. Итого 174 разные проверки подтверждают локальные persistence,
+restore, grants, GC, limits и recovery. S3 outage/timeout задавались ошибкой
+adapter/SDK; физическое отключение S3, disk-full/OOM и target Cloud поведение
+этим не проверены. Первый failed SGID fixture исправлен loopback relay,
+без изменения validation приложения.
+
+Ещё 56 tests прошли без skips: ARM64 Landlock/seccomp VM — 40; native ARM64
+Docker restart identity — 1; production configuration — 14; обязательный
+Compose Bubblewrap smoke terminal/Python/background — 1. VM и Compose
+использовали cached ARM64 rootfs с current source, поэтому не доказывают
+состав нового candidate. Прямой Landlock gate на LinuxKit не прошёл:
+filesystem enforcement недоступен, required preflight отказал. Дополнительный
+amd64 VM fixture остановлен до tests во время загрузки пакетов.
+Native amd64/browser и целевые Cloud security gates остаются открыты.
+
+Первый полный suite batch4: 2451 tests за 461,393 s, exit 1, 2 failures,
+2 errors, 16 skips, `source_unchanged=true`. Прежние unknown-tool expectations
+и private compile snapshots приведены к новому контракту. Suite v2 выполнил
+2451 tests за 445,589 s: exit 1, 1 error, 16 skips, `source_unchanged=true`.
+Прежние отказы устранены; recursive-cancel test получил `TimeoutError`
+в `scheduler.wait(child, timeout=1)`. Fixture освобождает блокирующую model stub
+после сохранения cancel intent grandchild; проверки отмены и позднего результата
+сохранены, production cancellation не менялась. Последовательный suite v3
+завершился в `11:55:28 UTC`: 2451 tests за 534,738 s, exit 0, 16 skips,
+`source_unchanged=true`, `changed_sources=[]`. Независимый review блокеров
+не обнаружил; skips не закрывают native/browser gates.
+
+`core-agent-gn:cloudru-validation-batch4-20261027` собран от точного batch3 base:
+один COPY layer заменяет только `kernel.py`, `model.py`, `runtime.py`, остальные
+base layers сохранены. Source/image hashes и offline actual-import smoke
+совпали. Полный Dockerfile rebuild блокирован недоступным registry mirror.
+В `12:00:27 UTC` registry readback подтвердил публикацию
+`blockchain.cr.cloud.ru/core-agent-gn:cloudru-validation-batch4-20261027`
+и `blockchain.cr.cloud.ru/core-agent-gn:latest` с одинаковым immutable digest
+`sha256:14f3a3d4d62d4511fec5b6aaf2d9c98db3c400984ccd234981ef9fa609457a1e`.
+`latest` обновлён после проверки version tag. Rollout batch4 и целевые
+native/platform gates ещё не подтверждены; SGR publication не выполнялась.
+
+Существующий Cloud isolation receipt подтверждает отказ доступа в соседний
+workspace, точные bytes собственного файла и неизменность соседнего файла.
+Cron reconciliation подтверждает автоматическое начало задачи в
+`06:41:04 UTC` до первого чтения в `06:42:30 UTC` после трёх минут тишины.
+Начальный guardrail потребовал owner approval; лишь после него задача
+завершилась с точным marker. Это не unattended completion, long-idle,
+replacement или overlap proof; прежний top-level false check сохранён
+и уточнён reconciliation.
+
+Дополнительный Qwen control 27 октября (`10:34:31–10:42:27 UTC`) сохранил
+те же смысловые инструкции, два вопроса и два пакета, удалив только инертный
+padding. Task `8fe86ca6-615e-4047-a55c-f7bf4dea2454` завершилась, оба ответа
+и inputs сохранены, route/artifact/amount верны, settings восстановлены,
+logout — HTTP 200. Учёт 4 model turns/3 tool calls соответствует минимуму
+обычного сценария без учтённого summary; это вывод из budget accounting,
+а не native event proof. Финал вновь содержит fenced JSON и `PENDING`:
+JSON-only и exact literal checks не прошли. Validator ожидал
+`PENDING; NOT RELEASED`, но prompt говорил
+`release must be PENDING; NOT RELEASED if approval is absent.` без кавычек
+вокруг literal или JSON-примера. Формулировка допускает неоднозначное прочтение;
+`PENDING` сохраняет pending-смысл. Exact check не ослаблен, но его отказ
+не доказывает потерю release-факта или дефект модели/суммаризации. Compaction
+не требуется для наблюдаемого несоответствия валидатору; причина не установлена.
+
+Receipts в ignored `.enterprise-work/`: `cloudru-parity-local-gates-20261027.json`,
+`cloudru-parity-storage-20261027/`, `cloudru-batch4-full-local-20261027.json`,
+`cloudru-batch4-full-local-v2-20261027.json`, `cloudru-batch4-full-local-v3-20261027.json`,
+`cloudru-batch4-delta-build-20261027.json`, `cloudru-batch4-image-published-20261027.json`,
+`cloudru-batch4-delta-smoke-20261027.json`, `cloudru-chat-isolation-20261026.json`,
+`cloudru-cron-idle-20261026.json`, `cloudru-no-pressure-questions-20261027.json`
+и `cloudru-no-pressure-questions-20261027-reconciliation.json`. Сравнение
+профилей доступно на Desktop в `Core_Agent_Kubernetes_Cloudru_Comparison.md`
+и `.docx`; постоянные артефакты не переписывались ради rolling suite статуса.
+Telemetry явно исключена пользователем из текущего этапа; новых выводов
+о её доставке эти проверки не дают.
