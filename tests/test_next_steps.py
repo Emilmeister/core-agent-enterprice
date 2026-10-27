@@ -8,7 +8,7 @@ import uuid
 from unittest.mock import patch
 
 from core_agent.model import CompatibleHttpModel, ModelResponse, ScriptedModel, ToolRequest
-from core_agent.config import AgentConfig
+from core_agent.config import AgentConfig, compile_effective_config
 from core_agent.errors import CoreError
 from core_agent.interactions import InMemoryInteractionStore
 from core_agent.workflow import SuspendedRun
@@ -58,9 +58,43 @@ class NextStepsRuntimeTests(unittest.TestCase):
 
     def test_disabled_never_offers_or_forces_next_steps(self):
         agent, model = self.app(ModelResponse(message="done"), CORE_AGENT_NEXT_STEPS="false")
-        self.assertEqual(agent.run({"prompt": "hi"}).message, "done")
+        self.assertEqual(approvals.ToolApprovalTests.start(agent).message, "done")
         self.assertIsNone(model.calls[0].tool_choice)
         self.assertNotIn(NEXT_STEPS, model.calls[0].tools)
+        record = agent.workflow_store.lookup_task("task")
+        _, config, platform, declarations, _ = agent._admission_inputs(record)
+        effective = compile_effective_config(platform, config, declarations, {})
+        self.assertNotIn(NEXT_STEPS, effective.builtin_tools)
+        with self.assertRaises(CoreError) as caught:
+            effective.require_tool(NEXT_STEPS)
+        self.assertEqual(caught.exception.code, "CAPABILITY_DISABLED")
+
+    def test_owner_can_enable_planning_from_disabled_deployment_default(self):
+        from core_agent.agent_settings import AgentSettingsStore
+
+        agent, model = self.app(next_steps("p1"), task_list("t1"), task_list("t2"),
+                                next_steps("p2"), ModelResponse(message="done"),
+                                CORE_AGENT_NEXT_STEPS="false", CORE_AGENT_NEXT_STEPS_EVERY="9")
+        agent.agent_settings_store = AgentSettingsStore(agent.workflow_store)
+        agent.agent_settings_store.update("default", {"next_steps": {"enabled": True, "every": 2}},
+                                         expected_revision=0, actor_id="owner")
+        self.assertEqual(agent.run({"prompt": "hi"}).message, "done")
+        self.assertEqual(self.choices(model), [NEXT_STEPS, None, None, NEXT_STEPS, None])
+        self.assertIsNone(agent.next_steps_every)
+
+    def test_owner_disabled_setting_and_deployment_deny_do_not_activate_planning(self):
+        from core_agent.agent_settings import AgentSettingsStore
+
+        for available, enabled in ((True, False), (False, True)):
+            with self.subTest(available=available, enabled=enabled):
+                agent, model = self.app(ModelResponse(message="done"),
+                    CORE_AGENT_ALLOWED_BUILTIN_TOOLS="core_task_list,core_next_steps" if available else "core_task_list")
+                agent.agent_settings_store = AgentSettingsStore(agent.workflow_store)
+                agent.agent_settings_store.update("default", {"next_steps": {"enabled": enabled, "every": 2}},
+                                                 expected_revision=0, actor_id="owner")
+                self.assertEqual(agent.run({"prompt": "hi"}).message, "done")
+                self.assertEqual(self.choices(model), [None])
+                self.assertNotIn(NEXT_STEPS, model.calls[0].tools)
 
     def test_first_turn_is_forced_and_next_turn_is_not(self):
         agent, model = self.app(next_steps(), ModelResponse(message="done"))
@@ -382,6 +416,7 @@ class NextStepsRuntimeTests(unittest.TestCase):
         from psycopg.conninfo import make_conninfo
         from psycopg.sql import SQL, Identifier
         from core_agent.database import PostgresDatabase
+        from core_agent.agent_settings import AgentSettingsStore
 
         schema = "next_steps_" + uuid.uuid4().hex
         with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as connection:
@@ -400,16 +435,21 @@ class NextStepsRuntimeTests(unittest.TestCase):
             model = ScriptedModel(responses)
             model.model = "next-steps-test"
             with patch.dict(os.environ, {"CORE_AGENT_NEXT_STEPS_EVERY": str(interval),
+                    "CORE_AGENT_NEXT_STEPS": "false",
                     "DURABLE_STORAGE_ROOT": self.temp.name + "/durable"}), \
                     patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()):
                 app = create_app(model=model, database=database)
             self.addCleanup(app.state.close)
+            app.state.core_agent.agent_settings_store = AgentSettingsStore(app.state.core_agent.workflow_store,
+                                                                           database=database)
             return app, app.state.core_agent, model
 
         class Crash(BaseException):
             pass
 
         first, agent, before_model = postgres_app(2, next_steps("p1"), task_list("t1"))
+        agent.agent_settings_store.update("company", {"next_steps": {"enabled": True, "every": 2}},
+                                         expected_revision=0, actor_id="owner")
         agent.kernel_compiler.base_kernel = "KERNEL PLANNING V1"
         transition = agent._record_transition
 
@@ -423,10 +463,14 @@ class NextStepsRuntimeTests(unittest.TestCase):
             approvals.ToolApprovalTests.start(agent)
         admitted_kernel = copy.deepcopy(agent.workflow_store.lookup_task("task").snapshot["kernel_instructions"])
         self.assertEqual(self.choices(before_model), [NEXT_STEPS, None])
+        agent.agent_settings_store.update("company", {"next_steps": {"enabled": False, "every": 9}},
+                                         expected_revision=1, actor_id="owner")
         first.state.close()
 
         _, reopened, model = postgres_app(100, task_list("t2"), next_steps("p2"), ModelResponse(message="done"))
         reopened.kernel_compiler.base_kernel = "KERNEL PLANNING V2"
+        self.assertEqual(reopened.agent_settings_store.get("company")["config"]["next_steps"],
+                         {"enabled": False, "every": 9})
         persisted = reopened.workflow_store.lookup_task("task").snapshot
         self.assertEqual(persisted["next_steps_every"], 2)
         self.assertEqual(persisted["next_steps_calls_since"], 1)

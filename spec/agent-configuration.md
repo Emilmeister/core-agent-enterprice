@@ -18,14 +18,27 @@ AgentConfig создаёт конкретный экземпляр Core Agent и
 
 ## Optional planning
 
-`CORE_AGENT_NEXT_STEPS` — boolean, default `false`. При `true`
+`CORE_AGENT_NEXT_STEPS` — boolean, default `false`.
 `CORE_AGENT_NEXT_STEPS_EVERY` — положительное целое число, default `5`;
 malformed/неположительное значение отклоняется с `CONFIG_INVALID` до serving.
-Настройка включает доступность `core_next_steps` в обоих runtime modes, но
-не отменяет явный built-in allowlist, current owner policy и admission ceiling.
+ENV задаёт defaults планирования в обоих runtime modes. Owner UI/API MAY
+переопределить их для новых root задач через nullable `next_steps`: объект ровно
+с полями `enabled` (строгий boolean) и `every` (положительное целое число).
+`null` и прежние revisions без поля наследуют ENV; пропуск поля при PUT сохраняет
+текущее значение. Некорректные/неизвестные поля отклоняются атомарно с
+`SETTINGS_INVALID`; сохранение использует общий CAS revision без model discovery.
+GET возвращает effective `next_steps`, `inherits.next_steps` и boolean
+`next_steps_available`, отражающий deployment capability ceiling.
+Owner MAY включить планирование при ENV=false без перезапуска. Явный built-in
+allowlist, current owner policy и admission ceiling сохраняют ограничения;
+недоступный deployment tool нельзя включить через UI/API.
 Период фиксируется при root admission; children и legacy snapshots без поля
 не получают автоматического включения. Название зарезервировано для built-in.
-Owner profile, prompt и сообщения не меняют deployment setting.
+Owner profile, prompt и сообщения не меняют настройку. Уже admitted задачи,
+follow-up и recovery сохраняют закреплённое значение независимо от UI updates.
+UI показывает переключатель, период в завершённых вызовах tools, сохранение и
+возврат к ENV; при отсутствии capability объясняет ограничение развёртывания.
+JSON settings расширяются обратно совместимо без SQL migration.
 
 ## Model reasoning
 
@@ -627,6 +640,7 @@ serving role не изменяет/удаляет revisions. Откат посл
 |---|---|---|
 | Tool policy | HITL для нового tool | `allow`, `require_hitl`, `deny` внутри platform ceiling |
 | Guardrails enabled | включено | Только owner; LLM-проверка новых материалов, значение закрепляется при приёме Task |
+| Планирование шагов | ENV defaults: выключено, период 5 | Owner override `next_steps` для новых root; период в завершённых tool calls, `null` возвращает ENV, deployment allowlist сохраняет потолок |
 | Guardrails exception | выключена | Только owner; отдельно для результатов конкретного tool |
 | HITL timeout | 24 часа | Абсолютный срок конкретного запроса |
 | Owner-answer timeout | 24 часа | Отдельный срок вопроса владельцу |

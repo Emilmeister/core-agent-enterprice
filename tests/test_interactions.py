@@ -433,6 +433,87 @@ class OwnerAgentConfigurationAPITests(AuthAppTestCase):
     automatic_tools = False
     push_encryption_key = "gLgFI-gLRDHqUBOd7HGWKfdBLZuYX-m3t_k78ohw0Aw="
 
+    async def test_next_steps_override_cas_reset_and_pinned_admission(self):
+        from core_agent.agent_settings import AgentSettingsStore
+
+        endpoint = "/api/agent-settings"
+        agent = self.app.state.core_agent
+        tenant = self.app.state.authenticator.settings.tenant
+        initial = await self.http.get(endpoint, headers=self.headers("owner-a"))
+        self.assertEqual(initial.json().get("next_steps"), {"enabled": False, "every": 5})
+        self.assertTrue(initial.json()["next_steps_available"])
+        self.assertTrue(initial.json()["inherits"]["next_steps"])
+        enabled = {"enabled": True, "every": 2}
+        denied = await self.http.put(endpoint, headers=self.headers("external-a"),
+            json={"expected_revision": 0, "next_steps": enabled})
+        self.assertEqual(denied.status_code, 403)
+        with patch("core_agent.agent_settings_api.provider_models", side_effect=AssertionError("discovery forbidden")):
+            saved = await self.http.put(endpoint, headers=self.headers("owner-a"),
+                json={"expected_revision": 0, "next_steps": enabled})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["next_steps"], enabled)
+        self.assertFalse(saved.json()["inherits"]["next_steps"])
+        stale = await self.http.put(endpoint, headers=self.headers("owner-b"),
+            json={"expected_revision": 0, "next_steps": None, "profile_prompt": "stale"})
+        self.assertEqual(stale.status_code, 409)
+        unchanged = await self.http.put(endpoint, headers=self.headers("owner-b"),
+            json={"expected_revision": 1, "profile_prompt": "profile"})
+        self.assertEqual(unchanged.json()["next_steps"], enabled)
+        store = agent.agent_settings_store
+        if store.database is not None:
+            store = AgentSettingsStore(agent.workflow_store, self.push_encryption_key, database=store.database)
+        self.assertEqual(store.get(tenant)["config"]["next_steps"], enabled)
+        self.assertEqual(store.get(tenant, 1)["config"]["next_steps"], enabled)
+        self.assertFalse(store.public(store.get(tenant + "-other"), agent)["next_steps"]["enabled"])
+        root, *_ = agent._new_workflow({"prompt": "inspect"}, task_id="planning-root",
+            identity="owner", session_id="planning-chat", tenant_id=tenant, defer_initialization=True)
+        self.assertEqual(root.snapshot["next_steps_every"], 2)
+        reset = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 2, "next_steps": None})
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertEqual(reset.json()["next_steps"], {"enabled": False, "every": 5})
+        self.assertTrue(reset.json()["inherits"]["next_steps"])
+        child, *_ = agent._new_workflow({"prompt": "child"}, task_id="planning-child",
+            identity="owner", session_id="planning-child-chat", tenant_id=tenant,
+            parent_run_id=root.run_id, defer_initialization=True)
+        later, *_ = agent._new_workflow({"prompt": "later"}, task_id="planning-later",
+            identity="owner", session_id="planning-later-chat", tenant_id=tenant, defer_initialization=True)
+        self.assertIsNone(child.snapshot["next_steps_every"])
+        self.assertIsNone(later.snapshot["next_steps_every"])
+        self.assertEqual(agent.workflow_store.get(root.run_id, tenant_id=tenant).snapshot["next_steps_every"], 2)
+        legacy = store.get(tenant)
+        legacy["config"].pop("next_steps", None)
+        self.assertEqual(store.public(legacy, agent)["next_steps"], reset.json()["next_steps"])
+
+    async def test_next_steps_validation_and_deployment_ceiling_are_atomic(self):
+        endpoint = "/api/agent-settings"
+        agent = self.app.state.core_agent
+        invalid = [True, [], {}, {"enabled": True}, {"enabled": "true", "every": 2},
+                   {"enabled": 1, "every": 2}, {"enabled": None, "every": 2},
+                   {"enabled": True, "every": 2, "extra": 1}]
+        invalid += [{"enabled": enabled, "every": value} for enabled in (True, False)
+                    for value in (None, True, 0, -1, 1.5, "2")]
+        for value in invalid:
+            with self.subTest(value=value):
+                failed = await self.http.put(endpoint, headers=self.headers("owner-a"),
+                    json={"expected_revision": 0, "next_steps": value, "profile_prompt": "must not persist"})
+                self.assertEqual(failed.status_code, 400, failed.text)
+                self.assertEqual(failed.json()["error"]["code"], "SETTINGS_INVALID")
+        agent.platform_config = replace(agent.platform_config,
+            allowed_builtin_tools=agent.platform_config.allowed_builtin_tools - {"core_next_steps"})
+        rejected = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 0, "next_steps": {"enabled": True, "every": 2},
+                  "profile_prompt": "must not persist"})
+        self.assertEqual(rejected.status_code, 400, rejected.text)
+        current = (await self.http.get(endpoint, headers=self.headers("owner-a"))).json()
+        self.assertEqual(current["revision"], 0)
+        self.assertEqual(current["profile_prompt"], "")
+        self.assertFalse(current["next_steps_available"])
+        disabled = await self.http.put(endpoint, headers=self.headers("owner-a"),
+            json={"expected_revision": 0, "next_steps": {"enabled": False, "every": 7}})
+        self.assertEqual(disabled.status_code, 200, disabled.text)
+
+
     async def test_profile_defaults_cas_and_owner_authority(self):
         endpoint = "/api/agent-settings"
         initial = await self.http.get(endpoint, headers=self.headers("owner-a"))

@@ -18,7 +18,7 @@ from .security import safe_url
 from .structured_output import STRUCTURED_OUTPUT_DEFAULT, validate_structured_output
 
 
-CONFIG_FIELDS = frozenset({"profile_prompt", "model_id", "mcp_servers", "context_window", "structured_output", "guardrails_enabled"})
+CONFIG_FIELDS = frozenset({"profile_prompt", "model_id", "mcp_servers", "context_window", "structured_output", "guardrails_enabled", "next_steps"})
 RESERVED_HEADERS = RESERVED_MCP_HEADERS | frozenset({
     "host", "content-length", "connection", "transfer-encoding", "upgrade", "trailer", "te",
     "proxy-authorization", "traceparent", "tracestate", "baggage",
@@ -37,7 +37,14 @@ def _revision(value):
 def _default(tenant):
     return {"tenant_id": tenant, "revision": 0, "storage_version": 1,
             "config": {"profile_prompt": None, "model_id": None, "mcp_servers": None, "context_window": None,
-                       "structured_output": None}, "encrypted_payload": None}
+                       "structured_output": None, "next_steps": None}, "encrypted_payload": None}
+
+
+def validate_next_steps(value):
+    if value is not None and (not isinstance(value, dict) or set(value) != {"enabled", "every"}
+            or type(value["enabled"]) is not bool or type(value["every"]) is not int or value["every"] < 1):
+        raise CoreError("SETTINGS_INVALID")
+    return copy.deepcopy(value)
 
 
 class AgentSettingsStore:
@@ -117,6 +124,8 @@ class AgentSettingsStore:
         if "structured_output" in values:
             policy = values["structured_output"]
             config["structured_output"] = validate_structured_output(policy) if policy is not None else None
+        if "next_steps" in values:
+            config["next_steps"] = validate_next_steps(values["next_steps"])
         if "guardrails_enabled" in values:
             if type(values["guardrails_enabled"]) is not bool:
                 raise CoreError("SETTINGS_INVALID")
@@ -203,6 +212,11 @@ class AgentSettingsStore:
 
     def public(self, row, agent):
         config = row["config"]
+        next_steps = copy.deepcopy(config.get("next_steps") or {
+            "enabled": agent.next_steps_every is not None,
+            "every": agent.next_steps_every or agent.next_steps_default_every,
+        })
+        next_steps["enabled"] = next_steps["enabled"] and agent.next_steps_available
         servers = config["mcp_servers"]
         if servers is None:
             servers = [{"name": item["name"], "url": safe_url(item["transport"]["url"]), "enabled": True,
@@ -215,6 +229,7 @@ class AgentSettingsStore:
                 "context_window": config.get("context_window") or agent.context_window,
                 "structured_output": copy.deepcopy(config.get("structured_output") or STRUCTURED_OUTPUT_DEFAULT),
                 "guardrails_enabled": config.get("guardrails_enabled", True),
+                "next_steps": next_steps, "next_steps_available": agent.next_steps_available,
                 "inherits": {key: config.get(key) is None for key in CONFIG_FIELDS}}
 
     def catalogs(self, tenant, declarations, workflow_store):

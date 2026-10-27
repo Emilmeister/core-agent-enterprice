@@ -646,7 +646,7 @@ class NextStepsConfigurationTests(unittest.TestCase):
 
     def test_disabled_by_default_but_read_only_schema_remains_registered(self):
         agent = self.app()
-        self.assertNotIn("core_next_steps", agent.platform_config.allowed_builtin_tools)
+        self.assertIn("core_next_steps", agent.platform_config.allowed_builtin_tools)
         self.assertIn("core_next_steps", agent.tool_runtime.registry.names())
         definition = agent.tool_runtime.registry.get("core_next_steps")
         self.assertFalse(definition.mutating)
@@ -663,18 +663,24 @@ class NextStepsConfigurationTests(unittest.TestCase):
                     self.assertIn("core_next_steps", agent.platform_config.allowed_builtin_tools)
                     self.assertEqual(agent.next_steps_every, expected)
 
-    def test_allowlist_and_feature_flag_both_limit_availability(self):
-        for enabled, allowed in (("true", "core_task_list"), ("false", "core_next_steps")):
+    def test_allowlist_limits_availability_while_flag_only_sets_default(self):
+        for enabled, allowed in (("true", "core_task_list"), ("false", "core_task_list")):
             with self.subTest(enabled=enabled, allowed=allowed):
                 agent = self.app(CORE_AGENT_NEXT_STEPS=enabled, CORE_AGENT_ALLOWED_BUILTIN_TOOLS=allowed)
                 self.assertNotIn("core_next_steps", agent.platform_config.allowed_builtin_tools)
                 self.assertIsNone(agent.next_steps_every)
         agent = self.app(CORE_AGENT_NEXT_STEPS="true", CORE_AGENT_ALLOWED_BUILTIN_TOOLS="core.next_steps")
         self.assertEqual(agent.platform_config.allowed_builtin_tools, {"core_next_steps"})
+        agent = self.app(CORE_AGENT_NEXT_STEPS="false", CORE_AGENT_NEXT_STEPS_EVERY="7",
+                         CORE_AGENT_ALLOWED_BUILTIN_TOOLS="core_next_steps")
+        self.assertTrue(agent.next_steps_available)
+        self.assertIsNone(agent.next_steps_every)
+        self.assertEqual(agent.next_steps_default_every, 7)
 
-    def test_invalid_boolean_or_enabled_interval_fails_startup(self):
+    def test_invalid_boolean_or_interval_fails_startup(self):
         invalid = [{"CORE_AGENT_NEXT_STEPS": "maybe"}] + [
-            {"CORE_AGENT_NEXT_STEPS": "true", "CORE_AGENT_NEXT_STEPS_EVERY": value}
+            {"CORE_AGENT_NEXT_STEPS": enabled, "CORE_AGENT_NEXT_STEPS_EVERY": value}
+            for enabled in ("true", "false")
             for value in ("0", "-1", "1.5", "nan", "private-invalid-value")
         ]
         for environment in invalid:
@@ -683,7 +689,6 @@ class NextStepsConfigurationTests(unittest.TestCase):
                     self.app(**environment)
                 self.assertEqual(caught.exception.code, "CONFIG_INVALID")
                 self.assertNotIn("private-invalid-value", str(caught.exception))
-        self.assertIsNone(self.app(CORE_AGENT_NEXT_STEPS_EVERY="ignored-while-disabled").next_steps_every)
 
     def test_disabled_builtin_name_is_reserved_against_mcp_collision(self):
         config = agent_config(tools={

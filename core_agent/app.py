@@ -811,8 +811,8 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
     allowed_skills = set(_csv("CORE_AGENT_ALLOWED_SKILLS"))
     mcp_tools = _allowed_mcp_tools(servers)
     next_steps_enabled = _boolean("CORE_AGENT_NEXT_STEPS", "false")
-    next_steps_every = _number("CORE_AGENT_NEXT_STEPS_EVERY", int, default="5") if next_steps_enabled else None
-    if next_steps_every is not None and next_steps_every <= 0:
+    next_steps_every = _number("CORE_AGENT_NEXT_STEPS_EVERY", int, default="5")
+    if next_steps_every <= 0:
         raise CoreError("CONFIG_INVALID", "CORE_AGENT_NEXT_STEPS_EVERY must be a positive integer")
     builtin_tools_without_terminal = {
         "core_next_steps",
@@ -849,9 +849,6 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         | {"core_terminal_exec", "core_python_exec", "core_task_start"},
         "without_terminal": builtin_tools_without_terminal | {"core_python_exec"},
     }
-    if not next_steps_enabled:
-        for tools in builtin_tools_by_mode.values():
-            tools.discard("core_next_steps")
     if not remote_connections and remote_registry is None:
         # Never advertise a delegation tool with nothing to delegate to.
         for tools in builtin_tools_by_mode.values():
@@ -1692,7 +1689,8 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         if _boolean("REFLECT_AND_RETRY_ENABLED", "true")
         else 0,
         budget_cancel_grace_seconds=_number("CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS", float, default="5"),
-        next_steps_every=next_steps_every if "core_next_steps" in builtin_tools else None,
+        next_steps_every=next_steps_every if next_steps_enabled and "core_next_steps" in builtin_tools else None,
+        next_steps_default_every=next_steps_every,
     )
     agent.workspace_durability = workspace_durability
     agent.workspace_blob_store = blob_store

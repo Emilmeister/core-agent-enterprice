@@ -46,7 +46,7 @@ function ScreenContent({ screen, mode, working, settingsScenario }: { screen: Sc
 }
 const meta = { title: "Экраны/Приложение", component: ScreenExample,
   args: { screen: "Чат", mode: "normal", working: false, settingsScenario: "default" },
-  argTypes: { screen: { control: "select", options: screens }, mode: { control: "select", options: ["normal", "empty", "loading", "error"] }, working: { control: "boolean" }, settingsScenario: { control: "select", options: ["default", "off", "inherit", "discovery-error", "conflict", "guardrails-off"] } },
+  argTypes: { screen: { control: "select", options: screens }, mode: { control: "select", options: ["normal", "empty", "loading", "error"] }, working: { control: "boolean" }, settingsScenario: { control: "select", options: ["default", "off", "inherit", "discovery-error", "conflict", "guardrails-off", "next-steps-on", "next-steps-unavailable"] } },
 } satisfies Meta<typeof ScreenExample>;
 export default meta;
 type Story = StoryObj<typeof meta>;
@@ -60,6 +60,73 @@ export const Connections: Story = { name: "Внешние агенты", args: {
 export const Access: Story = { name: "Доступ к агенту", args: { screen: "Доступ к агенту" } };
 export const Configuration: Story = { name: "Настройки", args: { screen: "Настройки" } };
 export const GuardrailsOff: Story = { name: "Настройки — проверка материалов выключена", args: { screen: "Настройки", settingsScenario: "guardrails-off" } };
+export const NextStepsOn: Story = { name: "Настройки — планирование включено", args: { screen: "Настройки", settingsScenario: "next-steps-on" } };
+export const NextStepsUnavailable: Story = {
+  name: "Настройки — планирование недоступно", args: { screen: "Настройки", settingsScenario: "next-steps-unavailable" },
+  play: async ({ canvas }) => {
+    const toggle = await canvas.findByRole("switch", { name: "Планировать следующие шаги" }) as HTMLInputElement;
+    const period = canvas.getByLabelText("Период, завершённых вызовов инструментов") as HTMLInputElement;
+    if (!toggle.disabled || toggle.checked || !period.disabled)
+      throw new globalThis.Error("Unavailable planning controls must remain disabled");
+    canvas.getByText("Планирование недоступно: инструмент запрещён конфигурацией развёртывания.");
+  },
+};
+export const NextStepsConfiguration: Story = {
+  name: "Настройки — сохранение и сброс планирования", args: { screen: "Настройки" },
+  play: async ({ canvas }) => {
+    const toggle = await canvas.findByRole("switch", { name: "Планировать следующие шаги" }) as HTMLInputElement;
+    const period = canvas.getByLabelText("Период, завершённых вызовов инструментов") as HTMLInputElement;
+    const save = canvas.getByRole("button", { name: "Сохранить планирование" }) as HTMLButtonElement;
+    const reset = canvas.getByRole("button", { name: "Использовать планирование развёртывания" }) as HTMLButtonElement;
+    if (toggle.checked || period.value !== "5" || !save.disabled || !reset.disabled)
+      throw new globalThis.Error("Planning must initially inherit the disabled deployment default");
+    await userEvent.click(toggle);
+    await userEvent.clear(period);
+    if (!save.disabled) throw new globalThis.Error("An empty planning period cannot be saved");
+    await userEvent.type(period, "0");
+    if (!save.disabled) throw new globalThis.Error("A nonpositive planning period cannot be saved");
+    await userEvent.clear(period);
+    await userEvent.type(period, "1.5");
+    if (!save.disabled) throw new globalThis.Error("A fractional planning period cannot be saved");
+    await userEvent.clear(period);
+    await userEvent.type(period, "3");
+    await userEvent.click(save);
+    await waitFor(() => {
+      canvas.getByText("Настройки планирования заданы вручную.");
+      if (!toggle.checked || period.value !== "3" || !save.disabled || reset.disabled)
+        throw new globalThis.Error("Saved planning settings must clear the draft and allow reset");
+    });
+    await userEvent.click(reset);
+    await waitFor(() => {
+      if (toggle.checked || period.value !== "5" || !reset.disabled)
+        throw new globalThis.Error("Reset must restore both deployment planning defaults");
+    });
+  },
+};
+export const NextStepsConflict: Story = {
+  name: "Настройки — конфликт планирования", args: { screen: "Настройки", settingsScenario: "conflict" },
+  play: async ({ canvas }) => {
+    const toggle = await canvas.findByRole("switch", { name: "Планировать следующие шаги" }) as HTMLInputElement;
+    const period = canvas.getByLabelText("Период, завершённых вызовов инструментов") as HTMLInputElement;
+    const save = canvas.getByRole("button", { name: "Сохранить планирование" }) as HTMLButtonElement;
+    await userEvent.click(toggle);
+    await userEvent.clear(period);
+    await userEvent.type(period, "2");
+    await userEvent.click(save);
+    await canvas.findByRole("alert");
+    await waitFor(() => {
+      const model = canvas.getByLabelText("Модель провайдера") as HTMLSelectElement;
+      if (save.disabled || !toggle.checked || period.value !== "2" || model.value !== "demo-fast")
+        throw new globalThis.Error("Conflict must refresh unchanged settings and retain the planning draft");
+    });
+    await userEvent.click(save);
+    await waitFor(() => {
+      canvas.getByText("Настройки планирования заданы вручную.");
+      if (!save.disabled || !toggle.checked || period.value !== "2")
+        throw new globalThis.Error("Planning retry must save the draft with the current revision");
+    });
+  },
+};
 export const StructuredReasoningOff: Story = { name: "Настройки — рассуждения выключены", args: { screen: "Настройки", settingsScenario: "off" } };
 export const StructuredReasoningInherited: Story = { name: "Настройки — без переопределения рассуждений", args: { screen: "Настройки", settingsScenario: "inherit" } };
 export const ModelsUnavailable: Story = { name: "Настройки — каталог моделей недоступен", args: { screen: "Настройки", settingsScenario: "discovery-error" } };

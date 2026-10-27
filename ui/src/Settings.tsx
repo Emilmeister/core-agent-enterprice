@@ -136,6 +136,8 @@ function AgentConfiguration({ api }: { api: Api }) {
   const [contextWindow, setContextWindow] = useState<string | null>(null);
   const [structuredOutput, setStructuredOutput] = useState<AgentSettings["structured_output"] | null>(null);
   const [guardrailsEnabled, setGuardrailsEnabled] = useState<boolean | null>(null);
+  const [nextStepsEnabled, setNextStepsEnabled] = useState<boolean | null>(null);
+  const [nextStepsEvery, setNextStepsEvery] = useState<string | null>(null);
   const [servers, setServers] = useState<(McpConnection & { header_value?: string | null; original_name?: string })[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -159,6 +161,8 @@ function AgentConfiguration({ api }: { api: Api }) {
       setContextWindow(null);
       setStructuredOutput(null);
       setGuardrailsEnabled(null);
+      setNextStepsEnabled(null);
+      setNextStepsEvery(null);
       setServers(result.mcp_servers.map((server) => ({ ...server, original_name: server.name })));
     }).catch((failure) => {
       if (!controller.signal.aborted) setError(errorText(failure));
@@ -183,6 +187,10 @@ function AgentConfiguration({ api }: { api: Api }) {
         setStructuredOutput(null);
       }
       if (section === "guardrails") setGuardrailsEnabled(null);
+      if (section === "next_steps") {
+        setNextStepsEnabled(null);
+        setNextStepsEvery(null);
+      }
       if (section === "mcp") setServers((previous) => mcpName === undefined
         ? result.mcp_servers.map((server) => ({ ...server, original_name: server.name }))
         : previous.flatMap((server) => {
@@ -238,6 +246,10 @@ function AgentConfiguration({ api }: { api: Api }) {
   const selectedContextWindow = contextWindow ?? (current.inherits.context_window ? "" : String(current.context_window));
   const structuredSettings = structuredOutput ?? current.structured_output;
   const modelDirty = (model !== null && model !== current.model_id) || contextWindow !== null || structuredOutput !== null;
+  const planningEnabled = nextStepsEnabled ?? current.next_steps.enabled;
+  const planningEvery = nextStepsEvery ?? String(current.next_steps.every);
+  const planningValid = Number.isSafeInteger(Number(planningEvery)) && Number(planningEvery) > 0;
+  const planningDirty = nextStepsEnabled !== null || nextStepsEvery !== null;
   return <>
     {error && <p className="error" role="alert">{error}</p>}
     {notice && <p className="success" role="status">{notice}</p>}
@@ -321,6 +333,37 @@ function AgentConfiguration({ api }: { api: Api }) {
       <button disabled={!!busy || guardrailsEnabled === null || guardrailsEnabled === current.guardrails_enabled}>
         {busy === "guardrails" ? "Сохраняем…" : "Сохранить проверку материалов"}
       </button>
+    </form>
+    <form className="form-sheet agent-next-steps-settings" onSubmit={(event) => {
+      event.preventDefault();
+      if (planningDirty && planningValid && current.next_steps_available)
+        void save("next_steps", { next_steps: { enabled: planningEnabled, every: Number(planningEvery) } });
+    }}>
+      <h2>Планирование шагов</h2>
+      <label className="check">
+        <input type="checkbox" role="switch" checked={planningEnabled}
+          disabled={!!busy || !current.next_steps_available} aria-describedby="next-steps-help next-steps-availability"
+          onChange={(event) => setNextStepsEnabled(event.target.checked)} />
+        Планировать следующие шаги
+      </label>
+      <label>Период, завершённых вызовов инструментов
+        <input type="number" min={1} max={Number.MAX_SAFE_INTEGER} step={1} required value={planningEvery}
+          disabled={!!busy || !current.next_steps_available} aria-describedby="next-steps-help next-steps-availability"
+          onChange={(event) => setNextStepsEvery(event.target.value)} />
+      </label>
+      <p className="muted" id="next-steps-help">Агент составляет план и обновляет его после указанного числа завершённых вызовов инструментов.
+        {" "}Изменения применяются только к новым задачам. Уже запущенные задачи сохраняют свои настройки.
+        {" "}Разрешения на использование инструмента управляются отдельно.</p>
+      <p className="muted" id="next-steps-availability">{!current.next_steps_available
+        ? "Планирование недоступно: инструмент запрещён конфигурацией развёртывания."
+        : current.inherits.next_steps ? "Используются настройки планирования развёртывания." : "Настройки планирования заданы вручную."}</p>
+      <div className="actions">
+        <button disabled={!!busy || !current.next_steps_available || !planningDirty || !planningValid}>
+          {busy === "next_steps" ? "Сохраняем…" : "Сохранить планирование"}
+        </button>
+        <button type="button" className="secondary" disabled={!!busy || (current.inherits.next_steps && !planningDirty)}
+          onClick={() => void save("next_steps", { next_steps: null })}>Использовать планирование развёртывания</button>
+      </div>
     </form>
     <section className="form-sheet agent-mcp-settings">
       <h2>MCP-серверы</h2>

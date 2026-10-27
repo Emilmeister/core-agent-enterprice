@@ -116,3 +116,63 @@ test("settings scenarios allow changes without discovery and retry after a confl
   assert.equal(retried.context_window, 65536);
   assert.deepEqual(retried.structured_output, saved.structured_output);
 });
+
+test("planning defaults, save, unrelated updates and reset survive settings refresh", async () => {
+  const request = createDemoRequest("normal", undefined, "discovery-error");
+  const initial = await (await request("/api/agent-settings")).json();
+  assert.deepEqual(initial.next_steps, { enabled: false, every: 5 });
+  assert.equal(initial.next_steps_available, true);
+  assert.equal(initial.inherits.next_steps, true);
+  const next_steps = { enabled: true, every: 3 };
+  const saved = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: initial.revision, next_steps }),
+  })).json();
+  assert.deepEqual(saved.next_steps, next_steps);
+  assert.equal(saved.inherits.next_steps, false);
+  assert.equal(saved.model_id, initial.model_id);
+  const unrelated = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: saved.revision, profile_prompt: "Новый профиль" }),
+  })).json();
+  assert.deepEqual((await (await request("/api/agent-settings")).json()).next_steps, next_steps);
+  const reset = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: unrelated.revision, next_steps: null }),
+  })).json();
+  assert.deepEqual(reset.next_steps, initial.next_steps);
+  assert.equal(reset.inherits.next_steps, true);
+  assert.equal(reset.profile_prompt, "Новый профиль");
+});
+
+test("planning rejects invalid values atomically and respects deployment availability", async () => {
+  const request = createDemoRequest();
+  for (const next_steps of [true, [], {}, { enabled: true }, { every: 5 },
+    { enabled: "true", every: 5 }, { enabled: true, every: true },
+    { enabled: true, every: 0 }, { enabled: true, every: -1 },
+    { enabled: true, every: 1.5 }, { enabled: true, every: "5" },
+    { enabled: true, every: 5, extra: true }]) {
+    assert.equal((await request("/api/agent-settings", {
+      method: "PUT", body: JSON.stringify({ expected_revision: 1, next_steps }),
+    })).status, 400);
+  }
+  assert.equal((await (await request("/api/agent-settings")).json()).revision, 1);
+  const blocked = createDemoRequest("normal", undefined, "next-steps-unavailable");
+  assert.equal((await (await blocked("/api/agent-settings")).json()).next_steps_available, false);
+  assert.equal((await blocked("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: 1, next_steps: { enabled: true, every: 5 } }),
+  })).status, 400);
+});
+
+test("planning conflict preserves latest unrelated settings on retry", async () => {
+  const request = createDemoRequest("normal", undefined, "conflict");
+  const next_steps = { enabled: true, every: 2 };
+  assert.equal((await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: 1, next_steps }),
+  })).status, 409);
+  const refreshed = await (await request("/api/agent-settings")).json();
+  assert.deepEqual(refreshed.next_steps, { enabled: false, every: 5 });
+  const retried = await (await request("/api/agent-settings", {
+    method: "PUT", body: JSON.stringify({ expected_revision: refreshed.revision, next_steps }),
+  })).json();
+  assert.deepEqual(retried.next_steps, next_steps);
+  assert.equal(retried.model_id, "demo-fast");
+  assert.equal(retried.context_window, 65536);
+});

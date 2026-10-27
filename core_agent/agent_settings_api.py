@@ -8,7 +8,7 @@ import httpx
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .agent_settings import CONFIG_FIELDS, valid_model_id
+from .agent_settings import CONFIG_FIELDS, valid_model_id, validate_next_steps
 from .errors import CoreError
 from .model import CompatibleHttpModel
 from .owner_api import read_payload, require_owner
@@ -70,6 +70,10 @@ def agent_settings_routes(agent, store):
             else:
                 payload = await read_payload(request, {"expected_revision"}, optional_fields=CONFIG_FIELDS)
                 values = {key: value for key, value in payload.items() if key != "expected_revision"}
+                if "next_steps" in values:
+                    planning = validate_next_steps(values["next_steps"])
+                    if planning is not None and planning["enabled"] and not agent.next_steps_available:
+                        raise CoreError("SETTINGS_INVALID")
                 if values.get("context_window") is not None:
                     window = values["context_window"]
                     if type(window) is not int or window <= agent.output_reserve:

@@ -349,9 +349,11 @@ class CoreAgent:
         model_retries=0,
         budget_cancel_grace_seconds=DEFAULT_BUDGET_CANCEL_GRACE_SECONDS,
         next_steps_every=None,
+        next_steps_default_every=5,
     ):
         self.platform_config = platform_config
         self.next_steps_every = next_steps_every
+        self.next_steps_default_every = next_steps_default_every
         self.agent_config = agent_config
         self.model = model
         self.tool_runtime = tool_runtime
@@ -2158,6 +2160,7 @@ class CoreAgent:
         admitted_window = None
         structured_output = None
         guardrails_enabled = True
+        admitted_next_steps_every = self.next_steps_every if self.next_steps_available else None
         if parent_run_id is not None:
             parent = self.workflow_store.get(parent_run_id, tenant_id=tenant_id or "default", connection=connection)
             admitted_window = parent.snapshot.get("context_window")
@@ -2178,8 +2181,14 @@ class CoreAgent:
                     admitted_window = settings["config"].get("context_window")
                     structured_output = validate_structured_output(
                         settings["config"].get("structured_output") or STRUCTURED_OUTPUT_DEFAULT)
+                    planning = settings["config"].get("next_steps")
+                    if planning is not None:
+                        admitted_next_steps_every = planning["every"] if planning["enabled"] and self.next_steps_available else None
                 raw, platform, declarations = self.agent_settings_store.configure(settings, raw, platform, declarations,
                     profile=parent_run_id is None)
+        if parent_run_id is not None or admitted_next_steps_every is None:
+            builtins = raw["tools"]["builtins"]
+            builtins["deny"] = list(dict.fromkeys([*builtins.get("deny", ()), NEXT_STEPS_TOOL]))
         budgets = raw.get("budgets", {})
         max_model_turns = min(
             budgets.get("model_turns", self.platform_config.max_model_turns),
@@ -2204,7 +2213,7 @@ class CoreAgent:
             "kernel_instructions": (copy.deepcopy(self._pin_kernel_instructions(parent).snapshot["kernel_instructions"])
                                     if parent_run_id is not None else self._kernel_snapshot(2)),
             "guardrails_enabled": guardrails_enabled,
-            "next_steps_every": self.next_steps_every if parent_run_id is None else None,
+            "next_steps_every": admitted_next_steps_every if parent_run_id is None else None,
             "output_contract_version": (output_contract_version(self.workflow_store.get(parent_run_id,
                 tenant_id=tenant_id, owner_id=owner_id, connection=connection)) if parent_run_id is not None else 2),
             "published_artifacts": [],
@@ -3818,6 +3827,16 @@ class CoreAgent:
         snapshot.pop("approved_tool_call", None)
         return self._record_transition(record, state="MODEL_RESPONDED", snapshot=snapshot,
             event_kind="python.completed_result.recovered", lease_token=lease_token)
+
+    @property
+    def next_steps_available(self):
+        builtins = self.agent_config.tools["builtins"]
+        return (NEXT_STEPS_TOOL in self.platform_config.allowed_builtin_tools
+                and NEXT_STEPS_TOOL not in self.platform_config.denied_builtin_tools
+                and NEXT_STEPS_TOOL in self.tool_runtime.registry.names()
+                and (builtins.get("default") == "allow"
+                     or any(fnmatch.fnmatchcase(NEXT_STEPS_TOOL, pattern) for pattern in builtins.get("allow", ())))
+                and not any(fnmatch.fnmatchcase(NEXT_STEPS_TOOL, pattern) for pattern in builtins.get("deny", ())))
 
     @staticmethod
     def _next_steps_interval(snapshot):

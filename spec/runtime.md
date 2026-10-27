@@ -86,7 +86,7 @@ provider игнорирует tool choice, runtime фиксирует `next_step
 обрабатывает фактический ответ обычным путём; дополнительной provider retry нет.
 
 Период закрепляется в snapshot нового root; due/counters сохраняются вместе
-с workflow и переживают compaction/recovery. Изменение deployment setting
+с workflow и переживают compaction/recovery. Изменение owner UI или deployment setting
 не меняет принятую задачу и не расширяет admission ceiling. Legacy snapshots
 без настройки сохраняют отключённое планирование. Обычный transcript с планом
 подчиняется существующему progress-preserving compaction; отдельного механизма

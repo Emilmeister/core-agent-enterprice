@@ -58,6 +58,16 @@ OpenAI/Anthropic tool choice и history replay;
 name collision. Proofs входят в обычный прошедший unittest suite. Совместимость
 forced tool choice конкретного live provider требует его deployment-проверки.
 
+Owner override `next_steps` и возврат к ENV проверяются
+`tests.test_interactions.OwnerAgentConfigurationAPITests` и PostgreSQL subclass:
+owner/external access, validation, CAS, legacy/reset, tenant isolation и pinned
+root/child. `tests.test_next_steps` проверяет включение при ENV=false, explicit
+deployment ceiling, disabled nested tool capability и реальное PostgreSQL
+close/reopen при изменённых UI/ENV defaults. Эти proofs входят в ordinary CI
+suite. UI typecheck/build и локальный Chromium со Storybook проверяют
+переключатель, период, invalid input, save/reset, conflict/retry и узкий экран;
+локальные demo-сценарии не заменяют native browser/platform rollout gate.
+
 | ID | Требование v1 | Доказательство | Статус |
 |---|---|---|---|
 | A2A-01 | Agent Card и version negotiation без собственного расширения протокола | `test_a2a_config`, `test_advanced_protocols` | implemented |

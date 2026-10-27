@@ -293,11 +293,13 @@ export interface AgentSettings {
   mcp_servers: McpConnection[];
   context_window: number;
   guardrails_enabled: boolean;
+  next_steps: { enabled: boolean; every: number };
+  next_steps_available: boolean;
   structured_output: {
     reasoning: "auto" | "off" | "inherit";
     compatibility: "auto" | "chat_template" | "thinking" | "reasoning_effort";
   };
-  inherits: { profile_prompt: boolean; model_id: boolean; mcp_servers: boolean; context_window: boolean; structured_output: boolean; guardrails_enabled: boolean };
+  inherits: { profile_prompt: boolean; model_id: boolean; mcp_servers: boolean; context_window: boolean; structured_output: boolean; guardrails_enabled: boolean; next_steps: boolean };
 }
 export interface Peer {
   id: string;

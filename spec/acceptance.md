@@ -19,6 +19,14 @@
   deployment cadence не меняет admitted задачу, legacy без поля остаётся disabled.
 - Обычный final answer остаётся текстом и публикуется после полной генерации;
   `core_response_begin`, новый model timeout и recovery backoff не появляются.
+- Owner сохраняет/сбрасывает UI planning toggle и период через общий settings
+  CAS. ENV=false не мешает включить доступный tool для новой root; явный
+  deployment allowlist нельзя расширить. External caller не меняет settings.
+  Invalid/null/legacy/partial update и конфликт revision сохраняют определённую
+  семантику; успешное сохранение не зависит от model discovery. PostgreSQL reopen
+  сохраняет override, а прежняя Task, child и recovery не получают новый период.
+  UI использует effective значения, объясняет единицу периода, валидирует ввод
+  и позволяет вернуть defaults развёртывания.
 
 ## Cloud.ru: PostgreSQL, S3 и общий внешний scope
 
