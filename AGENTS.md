@@ -408,6 +408,10 @@ Target spec может описывать больше текущего runtime.
   AgentConfig и Task/delegation contract. Deny сильнее allow.
 - Disabled capability отсутствует в Agent Card/model catalog и повторно
   отклоняется при dispatch. Prompt или stale tool call не расширяет policy.
+- Валидное имя tool вне объявленного provider catalog сохраняется в durable
+  очереди с marker `model_tool_unavailable`; до dispatch модель получает
+  `TOOL_UNAVAILABLE` с текущим каталогом. Это не `MODEL_UNAVAILABLE` и не повод
+  повторять provider request. Marker не разрешает handler или обход capability.
 - `LLM_EXTRA_BODY_JSON` не задаёт каталог или выбор tools: adapter удаляет
   оттуда `tools`, `tool_choice`, legacy `functions` и `function_call` и передаёт
   только текущий runtime catalog, в том числе пустой каталог детектора.

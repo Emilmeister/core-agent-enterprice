@@ -108,7 +108,7 @@ def _remote_contract(contract, tenant_id, owner_id):
                 raise CoreError("CHECKPOINT_INVALID")
     from .remote_agents import _trusted_endpoint
     try:
-        _trusted_endpoint(contract["url"])
+        _trusted_endpoint(contract["url"], allow_local_insecure=True)
     except CoreError:
         raise CoreError("CHECKPOINT_INVALID") from None
 

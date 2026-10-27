@@ -66,6 +66,9 @@ class RemoteAgentCard:
     streaming: bool
     skills: tuple[dict, ...]
     binding: str = A2A_BINDING
+    # True for peers from the company peer registry: their endpoint may use plain http
+    # on a local Docker host alias. Peers from REMOTE_AGENTS keep the strict check.
+    allow_local_insecure: bool = False
 
 
 @dataclass(frozen=True)
@@ -102,10 +105,10 @@ def _trusted_text(value, *, code="REMOTE_AGENT_DENIED"):
     return value
 
 
-def _trusted_endpoint(url):
+def _trusted_endpoint(url, *, allow_local_insecure=False):
     _trusted_text(url)
     try:
-        parsed = _validate_endpoint(url)
+        parsed = _validate_endpoint(url, allow_local_insecure=allow_local_insecure)
         if (not parsed.hostname or parsed.username is not None or parsed.password is not None
                 or "?" in url or "#" in url or any(char.isspace() for char in url)
                 or "\\" in parsed.netloc or parsed.netloc.endswith(":")
@@ -358,7 +361,7 @@ def connect_peer(peer, *, headers=None, timeout=30, max_retries=2, retry_delay=0
     if not isinstance(peer, Mapping) or peer.get("enabled") is not True:
         raise CoreError("REMOTE_AGENT_DENIED")
     base = peer.get("url")
-    registered = _trusted_endpoint(base)
+    registered = _trusted_endpoint(base, allow_local_insecure=True)
     timeout = _request_timeout(timeout)
     private_headers = _trusted_headers(headers)
     if type(max_retries) is not int or not 0 <= max_retries <= 10:
@@ -387,7 +390,7 @@ def connect_peer(peer, *, headers=None, timeout=30, max_retries=2, retry_delay=0
             if (not isinstance(interface, dict) or interface.get("protocolBinding") not in {"JSONRPC", "HTTP+JSON"}
                     or interface.get("protocolVersion") != A2A_PROTOCOL_VERSION):
                 continue
-            target = _trusted_endpoint(interface.get("url"))
+            target = _trusted_endpoint(interface.get("url"), allow_local_insecure=True)
             def identity(url):
                 return (url.scheme, url.hostname, url.port or (443 if url.scheme == "https" else 80), url.path.rstrip("/"))
             if identity(target) != identity(registered):
@@ -400,6 +403,7 @@ def connect_peer(peer, *, headers=None, timeout=30, max_retries=2, retry_delay=0
                 name=_trusted_text(peer.get("name")), description=peer.get("description", ""),
                 url=base, streaming=capabilities.get("streaming") is True,
                 skills=tuple(skills), binding=interface["protocolBinding"],
+                allow_local_insecure=True,
             ), timeout=timeout)
     except (ValueError, TypeError, RecursionError, CoreError):
         raise CoreError("REMOTE_AGENT_CARD_INVALID") from None
@@ -438,7 +442,7 @@ def _sequence(values, detail):
         raise CoreError("CONFIG_INVALID", detail) from error
 
 
-def _validate_endpoint(url):
+def _validate_endpoint(url, *, allow_local_insecure=False):
     _require_text(url, "CONFIG_INVALID", "agent url is required")
     try:
         parsed = urlparse(url)
@@ -452,7 +456,10 @@ def _validate_endpoint(url):
         loopback = loopback or ipaddress.ip_address(hostname or "").is_loopback
     except ValueError:
         pass
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
+    # With allow_local_insecure, plain http is also accepted for the local Docker host aliases.
+    local_host_alias = allow_local_insecure and hostname in (
+        "host.docker.internal", "gateway.docker.internal", "agent-a", "agent-b")
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and (loopback or local_host_alias)):
         raise CoreError("REMOTE_AGENT_DENIED", "insecure agent url")
     return parsed
 
@@ -640,7 +647,7 @@ class RemoteAgentConnection:
         timeout = _number(
             timeout, "timeout must be positive", minimum=0, exclusive=True
         )
-        _validate_endpoint(card.url)
+        _validate_endpoint(card.url, allow_local_insecure=card.allow_local_insecure)
         if api_key is not None:
             _require_text(api_key, "CONFIG_INVALID", "api key must be text")
         self.card = card
@@ -655,7 +662,7 @@ class RemoteAgentConnection:
         try:
             _attachment_limit(attachment_limit_bytes)
             body_limit = MAX_RESPONSE_BYTES if attachment_limit_bytes is None else MAX_FILE_RESPONSE_BYTES
-            _trusted_endpoint(self.card.url)
+            _trusted_endpoint(self.card.url, allow_local_insecure=self.card.allow_local_insecure)
             timeout = _request_timeout(self.timeout if timeout is None else timeout)
             private_headers = _trusted_headers(headers)
             request_id = request_id or str(uuid.uuid4())

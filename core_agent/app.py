@@ -313,6 +313,7 @@ def _model():
         endpoint=_env("LLM_ENDPOINT"),
         api_key=_env("LLM_API_KEY"),
         timeout=_number("LLM_TIMEOUT", float, default="120"),
+        total_timeout=_number("LLM_TOTAL_TIMEOUT", float, default="600"),
         max_tokens=_number("LLM_MAX_TOKENS", int, default="4096"),
         headers={**_entity_headers(), **_json("LLM_HEADERS_JSON")},
         extra_body=_json("LLM_EXTRA_BODY_JSON"),
@@ -771,6 +772,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         "core_terminal_exec",
         "core_python_exec",
         "core_task_start",
+        "core_next_steps",
     }
     if response_files_enabled:
         builtin_tools_without_terminal.add("core_response_files")
@@ -796,6 +798,13 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
             tools -= {
                 name for name in all_builtin_tools if name.startswith("core_memory_")
             }
+    next_steps_every = None
+    if _boolean("CORE_AGENT_NEXT_STEPS", "false"):
+        next_steps_every = _number("CORE_AGENT_NEXT_STEPS_EVERY", int, default="5")
+        if next_steps_every is None or next_steps_every < 1:
+            raise CoreError("CONFIG_INVALID", "CORE_AGENT_NEXT_STEPS_EVERY must be positive")
+        for tools in builtin_tools_by_mode.values():
+            tools.add("core_next_steps")
     runtime_mode = _env("CORE_AGENT_RUNTIME_MODE", "with_terminal")
     if runtime_mode not in builtin_tools_by_mode:
         raise CoreError("CONFIG_INVALID", "unknown CORE_AGENT_RUNTIME_MODE")
@@ -1137,6 +1146,46 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "background": {"type": "boolean"},
             },
             ["instruction", "tools", "skills", "budget"],
+        ),
+        "core_next_steps": (
+            (
+                "Обдумать ситуацию перед следующими действиями. Сам ничего не выполняет: "
+                "действия делай обычными вызовами инструментов после этого шага, ответ — "
+                "обычным текстом."
+            ),
+            {
+                "previous_steps": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Что уже сделано и чем закончилось — кратко, по фактам из результатов "
+                                   "инструментов и сообщений собеседника",
+                },
+                "deal": {
+                    "type": "string", "enum": ["none", "active", "finished", "abandoned"],
+                    "description": "none — в этом чате сделки нет и сообщение её не начинает (разговор, справка, "
+                                   "проверка); active — сделка идёт или начинается этим сообщением; finished — все "
+                                   "этапы закрыты; abandoned — продолжить сделку невозможно",
+                },
+                "stage": {
+                    "type": "string",
+                    "description": "Этап, на котором сделка после этого шага: текущий — если его критерий ещё не "
+                                   "выполнен; следующий — если выполнен; один из пройденных — если факты показали, "
+                                   "что его результат больше не годится; пустая строка — если deal == none",
+                },
+                "stage_results": {
+                    "type": "object", "additionalProperties": {"type": "string"},
+                    "description": "При переходе на следующий этап: значения, которые фиксирует закрытый этап, "
+                                   "только из результатов инструментов",
+                },
+                "current_step": {
+                    "type": "string",
+                    "description": "Одно действие, которое делаю сразу после этого шага",
+                },
+                "next_steps": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 3,
+                    "description": "Следующие шаги после текущего, кратко",
+                },
+            },
+            ["previous_steps", "deal", "stage", "current_step"],
         ),
     }
     remote_agent_names = (
@@ -1553,6 +1602,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         reply_hub=(ReplyHub(min_chars=_number("A2A_STREAMING_BUFFER_SIZE", int, default="10"))
                    if _boolean("A2A_STREAMING_ENABLED", "true") and "streaming" in _advertised_capabilities()
                    and getattr(model, "stream", True) else None),
+        next_steps_every=next_steps_every if "core_next_steps" in builtin_tools else None,
     )
     agent._log(
         "startup.configuration",
@@ -1747,6 +1797,9 @@ def create_app(
                     context_id=context.context_id,
                     error_code=getattr(error, "code", type(error).__name__),
                     error_type=type(error).__name__,
+                    # Provider status and error body; never includes the request or credentials.
+                    **({"error_message": error.message[:300]}
+                       if getattr(error, "code", None) == "MODEL_UNAVAILABLE" else {}),
                 )
                 raise
             if hasattr(result, "run_id"):
@@ -2038,7 +2091,11 @@ def create_app(
             skills = {name for name in skills if interaction_store.get_policy(
                 principal.tenant, name, tool_origin(name)).mode != "deny"}
         if remote_registry_store is not None:
-            if principal is None or not agent._remote_peers(principal.tenant):
+            # Reads only the registry: building this card must not call peers, whose
+            # cards in turn are built by calling this agent.
+            has_peer = principal is not None and any(
+                p.get("enabled") for p in remote_registry_store.list(principal.tenant, limit=101))
+            if not has_peer:
                 skills.discard("core_agent_send_message")
         return skills
 
