@@ -93,6 +93,10 @@ LEGACY_RESPONSE_FILES_INSTRUCTION = (
     "A failed selection preserves the previous set; reduce files after an aggregate-limit error."
 )
 SKILL_CONTRACT_VERSION = 3
+NEXT_STEPS_TOOL = "core_next_steps"
+NEXT_STEPS_RESULT = "Принято. Выполни current_step."
+NEXT_STEPS_TRIGGERS = frozenset({"core_task_wait", "core_ask_owner"})
+NEXT_STEPS_MAX_FAILURES = 2
 
 
 class _MaterialSuspended(Exception):
@@ -344,8 +348,10 @@ class CoreAgent:
         declared_skills=(),
         model_retries=0,
         budget_cancel_grace_seconds=DEFAULT_BUDGET_CANCEL_GRACE_SECONDS,
+        next_steps_every=None,
     ):
         self.platform_config = platform_config
+        self.next_steps_every = next_steps_every
         self.agent_config = agent_config
         self.model = model
         self.tool_runtime = tool_runtime
@@ -442,6 +448,7 @@ class CoreAgent:
                 "core_task_list": self._task_list,
                 "core_task_wait": self._task_wait,
                 "core_task_cancel": self._task_cancel,
+                NEXT_STEPS_TOOL: lambda arguments, run_id: NEXT_STEPS_RESULT,
                 "core_python_exec": self._python_exec,
                 "core_delegate": self._delegate,
                 "core_agent_send_message": self._send_message,
@@ -936,6 +943,7 @@ class CoreAgent:
 
     def _admission_inputs(self, record, raw=None):
         self._validate_capability_filter_version(record.snapshot)
+        self._next_steps_interval(record.snapshot)
         admission = record.snapshot.get("admission", {})
         raw = copy.deepcopy(admission.get("agent_config", raw))
         if raw is None:
@@ -2196,6 +2204,7 @@ class CoreAgent:
             "kernel_instructions": (copy.deepcopy(self._pin_kernel_instructions(parent).snapshot["kernel_instructions"])
                                     if parent_run_id is not None else self._kernel_snapshot(2)),
             "guardrails_enabled": guardrails_enabled,
+            "next_steps_every": self.next_steps_every if parent_run_id is None else None,
             "output_contract_version": (output_contract_version(self.workflow_store.get(parent_run_id,
                 tenant_id=tenant_id, owner_id=owner_id, connection=connection)) if parent_run_id is not None else 2),
             "published_artifacts": [],
@@ -3340,6 +3349,8 @@ class CoreAgent:
         if not messages:
             return record, snapshot, 0
         snapshot = copy.deepcopy(snapshot)
+        if self._next_steps_interval(snapshot) is not None and state not in TERMINAL_STATES:
+            snapshot["next_steps_due"] = True
         if snapshot.pop("response_phase", None) == "answer" and state not in TERMINAL_STATES:
             discard_pending_response = not snapshot.get("finalizing_response")
         if discard_pending_response:
@@ -3808,6 +3819,32 @@ class CoreAgent:
         return self._record_transition(record, state="MODEL_RESPONDED", snapshot=snapshot,
             event_kind="python.completed_result.recovered", lease_token=lease_token)
 
+    @staticmethod
+    def _next_steps_interval(snapshot):
+        interval = snapshot.get("next_steps_every")
+        if interval is not None and (type(interval) is not int or interval < 1):
+            raise CoreError("CHECKPOINT_INVALID", "Invalid planning interval")
+        return interval
+
+    def _note_next_steps(self, snapshot, name, succeeded, *, task_id=None):
+        interval = self._next_steps_interval(snapshot)
+        if interval is None:
+            return
+        if name == NEXT_STEPS_TOOL:
+            failures = 0 if succeeded else snapshot.get("next_steps_failures", 0) + 1
+            if succeeded or failures >= NEXT_STEPS_MAX_FAILURES:
+                snapshot["next_steps_calls_since"] = 0
+                snapshot["next_steps_due"] = False
+                failures = 0
+                if not succeeded:
+                    self._log("next_steps.invalid", task_id=task_id, failures=NEXT_STEPS_MAX_FAILURES)
+            snapshot["next_steps_failures"] = failures
+            return
+        count = snapshot.get("next_steps_calls_since", 0) + 1
+        snapshot["next_steps_calls_since"] = count
+        if name in NEXT_STEPS_TRIGGERS or count >= interval:
+            snapshot["next_steps_due"] = True
+
     def _record_tool_outcome(
         self,
         record,
@@ -3862,6 +3899,7 @@ class CoreAgent:
             sources[call.id] = identities
         if frame and frame["phase"] == "stopped" and call.id == frame["nested_call"]["id"]:
             nested = json.loads(self._result_text(call.id, outcome, call.name))
+            self._note_next_steps(snapshot, call.name, nested["status"] == "succeeded", task_id=record.task_id)
             original = frame["outer_call"]
             call = ToolCall(original["id"], original["name"], original["arguments"])
             outcome = ToolResult(call.id, "failed", {
@@ -3976,6 +4014,7 @@ class CoreAgent:
             **({"error_code": error_code} if error_code else {}),
             **({"output": self._value(output)} if self.log_content else {}),
         )
+        self._note_next_steps(snapshot, call.name, succeeded, task_id=record.task_id)
         updated = self._record_transition(
             record,
             state="RUNNING",
@@ -4964,6 +5003,11 @@ class CoreAgent:
                             else self._tool_catalog(effective, discovered, snapshot, tenant_id=record.tenant_id,
                                                     root_run=record.parent_run_id is None, owner_id=record.owner_id)
                         )
+                        force_next_steps = (NEXT_STEPS_TOOL in model_tools
+                                            and self._next_steps_interval(snapshot) is not None
+                                            and record.parent_run_id is None and snapshot.get("next_steps_due", True))
+                        if not force_next_steps:
+                            model_tools.pop(NEXT_STEPS_TOOL, None)
                         model_instructions = self._compile_instructions(
                             raw, effective, snapshot, model_tools=model_tools, owner_id=record.owner_id).text
                     if finalizing:
@@ -5036,6 +5080,7 @@ class CoreAgent:
                                     tools=model_tools,
                                     instructions=model_instructions,
                                     messages=model_messages,
+                                    **({"tool_choice": NEXT_STEPS_TOOL} if force_next_steps else {}),
                                 )
                                 if call_finalizer_model
                                 else ModelResponse()
@@ -5153,6 +5198,11 @@ class CoreAgent:
                             else {}
                         ),
                     )
+                    if force_next_steps and not any(
+                            item["name"] == NEXT_STEPS_TOOL for item in response_data["tool_requests"]):
+                        self._log("next_steps.ignored", run_id=record.run_id, task_id=record.task_id,
+                                  turn=snapshot["turns"], action=action,
+                                  tool_calls=[item["tool_name"] for item in tool_calls])
                     for item in response.tool_requests:
                         if not finalizing:
                             if self.material_review_store is None:
@@ -6036,6 +6086,9 @@ class CoreAgent:
             frame["completed"].pop(0)
             frame["omitted_completed_calls"] = frame.get("omitted_completed_calls", 0) + 1
         snapshot["nested_dispatch"]["state"] = "completed"
+        self._note_next_steps(snapshot, call.name,
+                              not isinstance(outcome, ToolResult) or outcome.status == "succeeded",
+                              task_id=context["record"].task_id)
         try:
             updated = self._record_transition(
                 context["record"], state="EXECUTING", snapshot=snapshot,

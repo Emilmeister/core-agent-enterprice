@@ -287,7 +287,7 @@ def compile_effective_config(
     # Keep the retired control name unavailable to MCP aliases and old checkpoints.
     model_catalog = set(allowed)
     model_catalog.update(
-        mcp_tool_index(mcp_tools, reserved_names=model_catalog | SKILL_TOOLS | {"core_response_begin"})
+        mcp_tool_index(mcp_tools, reserved_names=model_catalog | SKILL_TOOLS | {"core_response_begin", "core_next_steps"})
     )
     snapshot_value = {
         "builtin_tools": sorted(allowed),

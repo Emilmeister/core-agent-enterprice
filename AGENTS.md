@@ -553,6 +553,10 @@ Target spec может описывать больше текущего runtime.
   будит текущий таймер, повтор сообщения не будит следующую generation;
 - `core_ask_owner` — private вопрос владельцам при подключённом owner plane;
 - `core_delegate`;
+- `core_next_steps` — optional read-only планирование root при
+  `CORE_AGENT_NEXT_STEPS=true` (default `false`), с положительным периодом
+  `CORE_AGENT_NEXT_STEPS_EVERY` (default `5`). Флаг не расширяет allowlist/policy;
+  период закрепляется при admission, children и legacy snapshots его не включают;
 - `core_message_send` — публичный промежуточный Message без завершения Task;
 - `core_response_artifacts` и compatibility alias `core_response_files` при
   подключённых trusted workspace и transport storage;

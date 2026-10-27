@@ -118,6 +118,7 @@ class ModelCall:
     tools: frozenset[str]
     instructions: str
     messages: tuple[dict, ...] = ()
+    tool_choice: str | None = None
 
 
 class ScriptedModel:
@@ -129,9 +130,9 @@ class ScriptedModel:
     def calls(self):
         return tuple(self._calls)
 
-    def generate(self, *, context, tools, instructions, messages=None):
+    def generate(self, *, context, tools, instructions, messages=None, tool_choice=None):
         self._calls.append(
-            ModelCall(context, frozenset(tools), instructions, tuple(messages or ()))
+            ModelCall(context, frozenset(tools), instructions, tuple(messages or ()), tool_choice)
         )
         if not self._responses:
             raise CoreError("MODEL_UNAVAILABLE")
@@ -473,7 +474,7 @@ class CompatibleHttpModel:
             }
         ]
 
-    def _request(self, context, instructions, tools, messages=None):
+    def _request(self, context, instructions, tools, messages=None, tool_choice=None):
         schemas, reverse = self._tools(tools)
         messages = list(messages or ({"role": "user", "content": context},))
         # Historical protocol is replay data, not the current dispatch authority.
@@ -512,6 +513,14 @@ class CompatibleHttpModel:
             )
         if schemas:
             body["tools"] = schemas
+            # Only the current catalog can authorize a forced canonical tool name.
+            forced = next((wire for wire, name in reverse.items() if name == tool_choice), None)
+            if forced is not None:
+                body["tool_choice"] = (
+                    {"type": "function", "function": {"name": forced}}
+                    if self.api_format == "openai"
+                    else {"type": "tool", "name": forced}
+                )
         body = normalize_structured_output_body(
             body, self.structured_output, provider=self.configured_provider,
             native_anthropic=self.api_format == "anthropic",
@@ -922,9 +931,9 @@ class CompatibleHttpModel:
             **usage_fields,
         )
 
-    def generate(self, *, context, tools, instructions, messages=None, on_delta=None):
+    def generate(self, *, context, tools, instructions, messages=None, on_delta=None, tool_choice=None):
         body, headers, reverse = self._request(
-            context, instructions, tools, messages=messages
+            context, instructions, tools, messages=messages, tool_choice=tool_choice
         )
         response = None
         try:

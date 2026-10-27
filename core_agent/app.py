@@ -810,7 +810,12 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
     )
     allowed_skills = set(_csv("CORE_AGENT_ALLOWED_SKILLS"))
     mcp_tools = _allowed_mcp_tools(servers)
+    next_steps_enabled = _boolean("CORE_AGENT_NEXT_STEPS", "false")
+    next_steps_every = _number("CORE_AGENT_NEXT_STEPS_EVERY", int, default="5") if next_steps_enabled else None
+    if next_steps_every is not None and next_steps_every <= 0:
+        raise CoreError("CONFIG_INVALID", "CORE_AGENT_NEXT_STEPS_EVERY must be a positive integer")
     builtin_tools_without_terminal = {
+        "core_next_steps",
         "core_task_get",
         "core_task_list",
         "core_task_wait",
@@ -844,6 +849,9 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         | {"core_terminal_exec", "core_python_exec", "core_task_start"},
         "without_terminal": builtin_tools_without_terminal | {"core_python_exec"},
     }
+    if not next_steps_enabled:
+        for tools in builtin_tools_by_mode.values():
+            tools.discard("core_next_steps")
     if not remote_connections and remote_registry is None:
         # Never advertise a delegation tool with nothing to delegate to.
         for tools in builtin_tools_by_mode.values():
@@ -1206,6 +1214,46 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
                 "background": {"type": "boolean"},
             },
             ["instruction", "tools", "skills", "budget"],
+        ),
+        "core_next_steps": (
+            (
+                "Обдумать ситуацию перед следующими действиями. Сам ничего не выполняет: "
+                "действия делай обычными вызовами инструментов после этого шага, ответ — "
+                "обычным текстом."
+            ),
+            {
+                "previous_steps": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Что уже сделано и чем закончилось — кратко, по фактам из результатов "
+                                   "инструментов и сообщений собеседника",
+                },
+                "deal": {
+                    "type": "string", "enum": ["none", "active", "finished", "abandoned"],
+                    "description": "none — в этом чате сделки нет и сообщение её не начинает (разговор, справка, "
+                                   "проверка); active — сделка идёт или начинается этим сообщением; finished — все "
+                                   "этапы закрыты; abandoned — продолжить сделку невозможно",
+                },
+                "stage": {
+                    "type": "string",
+                    "description": "Этап, на котором сделка после этого шага: текущий — если его критерий ещё не "
+                                   "выполнен; следующий — если выполнен; один из пройденных — если факты показали, "
+                                   "что его результат больше не годится; пустая строка — если deal == none",
+                },
+                "stage_results": {
+                    "type": "object", "additionalProperties": {"type": "string"},
+                    "description": "При переходе на следующий этап: значения, которые фиксирует закрытый этап, "
+                                   "только из результатов инструментов",
+                },
+                "current_step": {
+                    "type": "string",
+                    "description": "Одно действие, которое делаю сразу после этого шага",
+                },
+                "next_steps": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 3,
+                    "description": "Следующие шаги после текущего, кратко",
+                },
+            },
+            ["previous_steps", "deal", "stage", "current_step"],
         ),
     }
     remote_agent_names = (
@@ -1644,6 +1692,7 @@ def _agent(model, mcp_connector=None, *, state=None, interaction_store=None,
         if _boolean("REFLECT_AND_RETRY_ENABLED", "true")
         else 0,
         budget_cancel_grace_seconds=_number("CORE_AGENT_BUDGET_CANCEL_GRACE_SECONDS", float, default="5"),
+        next_steps_every=next_steps_every if "core_next_steps" in builtin_tools else None,
     )
     agent.workspace_durability = workspace_durability
     agent.workspace_blob_store = blob_store

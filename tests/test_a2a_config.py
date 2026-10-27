@@ -1,7 +1,10 @@
 import dataclasses
 import json
+import os
+import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from core_agent.a2a import (
     LEGACY_RUN_CAPABILITIES_URI as CORE_EXTENSION_URI,
@@ -21,6 +24,8 @@ from core_agent.config import (
     compile_effective_config,
 )
 from core_agent.errors import CoreError
+from core_agent.model import ModelResponse, ScriptedModel
+from tests.app_support import create_app
 
 
 def platform_config(**changes):
@@ -621,6 +626,75 @@ class A2ATests(unittest.TestCase):
             service.cancel_task(terminal.id)
         self.assertEqual(caught.exception.code, "TASK_NOT_CANCELABLE")
         service.close()
+
+
+class NextStepsConfigurationTests(unittest.TestCase):
+    def app(self, **environment):
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        model = ScriptedModel([ModelResponse(message="ok")])
+        model.model = "planning-config-test"
+        with patch.dict(os.environ, {
+            "CORE_AGENT_ENVIRONMENT": "test", "SESSION_STORAGE_TYPE": "in-memory",
+            "CORE_AGENT_MEMORY": "disabled", "LOCAL_WORKSPACE_ROOT": workspace.name,
+            "LOG_LEVEL": "CRITICAL",
+            **environment,
+        }, clear=True):
+            app = create_app(model=model)
+        self.addCleanup(app.state.close)
+        return app.state.core_agent
+
+    def test_disabled_by_default_but_read_only_schema_remains_registered(self):
+        agent = self.app()
+        self.assertNotIn("core_next_steps", agent.platform_config.allowed_builtin_tools)
+        self.assertIn("core_next_steps", agent.tool_runtime.registry.names())
+        definition = agent.tool_runtime.registry.get("core_next_steps")
+        self.assertFalse(definition.mutating)
+        self.assertEqual(definition.risk_tags, frozenset())
+        self.assertEqual(definition.input_schema["properties"]["stage"]["type"], "string")
+        self.assertIsNone(getattr(agent, "next_steps_every", None))
+
+    def test_opt_in_enables_both_modes_with_default_or_explicit_period(self):
+        for mode in ("with_terminal", "without_terminal"):
+            for interval, expected in (("", 5), ("3", 3)):
+                with self.subTest(mode=mode, interval=interval):
+                    agent = self.app(CORE_AGENT_RUNTIME_MODE=mode, CORE_AGENT_NEXT_STEPS="true",
+                                     CORE_AGENT_NEXT_STEPS_EVERY=interval)
+                    self.assertIn("core_next_steps", agent.platform_config.allowed_builtin_tools)
+                    self.assertEqual(agent.next_steps_every, expected)
+
+    def test_allowlist_and_feature_flag_both_limit_availability(self):
+        for enabled, allowed in (("true", "core_task_list"), ("false", "core_next_steps")):
+            with self.subTest(enabled=enabled, allowed=allowed):
+                agent = self.app(CORE_AGENT_NEXT_STEPS=enabled, CORE_AGENT_ALLOWED_BUILTIN_TOOLS=allowed)
+                self.assertNotIn("core_next_steps", agent.platform_config.allowed_builtin_tools)
+                self.assertIsNone(agent.next_steps_every)
+        agent = self.app(CORE_AGENT_NEXT_STEPS="true", CORE_AGENT_ALLOWED_BUILTIN_TOOLS="core.next_steps")
+        self.assertEqual(agent.platform_config.allowed_builtin_tools, {"core_next_steps"})
+
+    def test_invalid_boolean_or_enabled_interval_fails_startup(self):
+        invalid = [{"CORE_AGENT_NEXT_STEPS": "maybe"}] + [
+            {"CORE_AGENT_NEXT_STEPS": "true", "CORE_AGENT_NEXT_STEPS_EVERY": value}
+            for value in ("0", "-1", "1.5", "nan", "private-invalid-value")
+        ]
+        for environment in invalid:
+            with self.subTest(environment=environment):
+                with self.assertRaises(CoreError) as caught:
+                    self.app(**environment)
+                self.assertEqual(caught.exception.code, "CONFIG_INVALID")
+                self.assertNotIn("private-invalid-value", str(caught.exception))
+        self.assertIsNone(self.app(CORE_AGENT_NEXT_STEPS_EVERY="ignored-while-disabled").next_steps_every)
+
+    def test_disabled_builtin_name_is_reserved_against_mcp_collision(self):
+        config = agent_config(tools={
+            "builtins": {"default": "deny", "allow": [], "deny": []},
+            "mcp": {"default": "deny", "allow_servers": ["core"],
+                    "allow_tools": {"core": ["next_steps"]}},
+        })
+        with self.assertRaises(CoreError) as caught:
+            compile_effective_config(platform_config(allowed_mcp_servers={"core"}), config,
+                                     [{"name": "core"}], {"core": {"next_steps": {"type": "object"}}})
+        self.assertEqual(caught.exception.code, "TOOL_NAME_COLLISION")
 
 
 if __name__ == "__main__":

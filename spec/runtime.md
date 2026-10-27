@@ -67,6 +67,31 @@
 
 Последовательность является базовой семантикой. Runtime MAY построить dependency graph и параллельно исполнить доказуемо независимые read-only calls или изолированные child Tasks. Каждый call всё равно получает отдельные policy decision, lifecycle и audit. Порядок слияния результатов должен быть стабильным.
 
+## NEXT-01. Периодическое планирование
+
+Если `core_next_steps` включён и доступен root по EffectiveConfig и текущей
+policy, runtime предлагает его и передаёт provider tool choice перед первым
+обычным model turn, после доставки нового inbound Message, после результатов
+`core_ask_owner`/`core_task_wait` (включая ошибки) и после N завершённых tool calls
+с предыдущего успешного планирования. Учитываются также завершённые вложенные
+Python `tools.call(...)`; возобновление по сохранённому result не считает их
+повторно. В остальные ходы tool отсутствует в
+model catalog. Сам вызов планирования расходует обычные model/tool budgets;
+сабагенты и budget finalization не получают принудительного планирования.
+
+Успешный вызов сбрасывает счётчик и due marker. После двух подряд неуспешных
+вызовов планирования требование снимается до следующего триггера, чтобы
+ошибочные arguments или отказ policy не создавали бесконечный цикл. Если
+provider игнорирует tool choice, runtime фиксирует `next_steps.ignored` и
+обрабатывает фактический ответ обычным путём; дополнительной provider retry нет.
+
+Период закрепляется в snapshot нового root; due/counters сохраняются вместе
+с workflow и переживают compaction/recovery. Изменение deployment setting
+не меняет принятую задачу и не расширяет admission ceiling. Legacy snapshots
+без настройки сохраняют отключённое планирование. Обычный transcript с планом
+подчиняется существующему progress-preserving compaction; отдельного механизма
+суммаризации нет. Таймауты модели и recovery backoff этот контракт не меняет.
+
 ## Live steering
 
 Новый A2A Message не является interrupt текущей операции. Adapter durable-фиксирует его в inbox существующего non-terminal run; orchestrator забирает committed Messages перед следующим model turn. Если Message приходит между последним model response и terminal commit, completion gate обязан либо включить его в следующий turn, либо проиграть race уже committed terminal state и отклонить SendMessage. При `failed` или `canceled` принятый раньше Message не запускает новый model/tool call: runtime атомарно переносит его в transcript с явной пометкой `unprocessed_due_to_failure` или `unprocessed_due_to_cancel`, затем повторяет terminal commit.

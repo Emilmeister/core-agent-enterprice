@@ -132,6 +132,14 @@ LOCAL_WORKSPACE_ROOT=/tmp/core-agent/runs
 для trial. Три filesystem root должны быть записываемыми и не пересекаться.
 Используйте platform `PORT`, если она задаёт его самостоятельно.
 
+Для периодического планирования основного агента включите optional
+`CORE_AGENT_NEXT_STEPS=true` (default `false`); `CORE_AGENT_NEXT_STEPS_EVERY=5`
+задаёт положительный интервал завершённых tool calls. При явном
+`CORE_AGENT_ALLOWED_BUILTIN_TOOLS` добавьте `core_next_steps` в allowlist.
+Период закрепляется для новых root tasks; текущие задачи и сабагенты не
+переключаются. План сохраняется в обычном transcript, финальный ответ остаётся
+текстом. Оба runtime modes, owner policy и обычные бюджеты сохраняют действие.
+
 Дополнительно обязательны:
 
 - `CORE_AGENT_OWNER_PASSWORD`: отдельный secret длиной 16–1024 символа. При

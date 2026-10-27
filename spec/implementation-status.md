@@ -46,6 +46,18 @@ rolling overlap, runtime grants и согласованный backup/restore о�
 
 ## Существующие foundations и изменённые контракты
 
+NEXT-01: optional root planning по [tools](tools.md#next-01-core_next_steps),
+[runtime](runtime.md#next-01-периодическое-планирование) и
+[acceptance](acceptance.md#next-01-optional-планирование). Статус `implemented`:
+`tests.test_next_steps` проверяет cadence, policy/HITL/live deny, children,
+finalizer, compaction, pinned kernel/settings, legacy snapshots, реальные
+PostgreSQL close/reopen и вложенные Python calls/ожидания без повторного
+подсчёта. `tests.test_transfer_features.NextStepsWireTests` проверяет текущий
+OpenAI/Anthropic tool choice и history replay;
+`tests.test_a2a_config.NextStepsConfigurationTests` — switches, allowlist и
+name collision. Proofs входят в обычный прошедший unittest suite. Совместимость
+forced tool choice конкретного live provider требует его deployment-проверки.
+
 | ID | Требование v1 | Доказательство | Статус |
 |---|---|---|---|
 | A2A-01 | Agent Card и version negotiation без собственного расширения протокола | `test_a2a_config`, `test_advanced_protocols` | implemented |

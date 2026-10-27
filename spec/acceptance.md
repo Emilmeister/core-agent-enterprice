@@ -1,5 +1,25 @@
 # Критерии готовности целевого продукта
 
+## NEXT-01: optional планирование
+
+- При отключении tool отсутствует в model catalog; включение и положительный
+  период валидируются до serving и не обходят явный built-in allowlist.
+- Разрешённый root получает planning choice на первом ходу, после N результатов
+  tools и после owner/wait/inbound триггеров. После успешного планирования tool
+  скрыт до следующего триггера; после двух ошибок требование снимается.
+- OpenAI/Anthropic получают выбор только текущего разрешённого wire tool;
+  history replay сохраняет прежние planning calls. Игнорирование выбора не
+  вызывает provider retries и не заменяет обычную обработку ответа.
+- HITL реально приостанавливает planning call; отказ или live deny не допускает
+  handler. Planning расходует обычный бюджет, children/finalizer исключены.
+- Пять завершённых Python `tools.call(...)` достигают периода пять; результат
+  вложенного owner/wait call также включает planning перед следующим model turn,
+  в том числе после durable ожидания, без повторного подсчёта сохранённого result.
+- Persisted root сохраняет период/counters через restart и compaction; изменение
+  deployment cadence не меняет admitted задачу, legacy без поля остаётся disabled.
+- Обычный final answer остаётся текстом и публикуется после полной генерации;
+  `core_response_begin`, новый model timeout и recovery backoff не появляются.
+
 ## Cloud.ru: PostgreSQL, S3 и общий внешний scope
 
 CLD-AC-01–12 и CLD-AC-18–32 обязательны для production профиля [Cloud.ru](cloudru.md).

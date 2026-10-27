@@ -16,6 +16,17 @@ AgentConfig создаёт конкретный экземпляр Core Agent и
 
 `agent.profile_prompt` optional и по умолчанию пуст. Он задаёт роль/стиль, но не повторяет Task prompt: фактический запрос передаётся отдельным user Message.
 
+## Optional planning
+
+`CORE_AGENT_NEXT_STEPS` — boolean, default `false`. При `true`
+`CORE_AGENT_NEXT_STEPS_EVERY` — положительное целое число, default `5`;
+malformed/неположительное значение отклоняется с `CONFIG_INVALID` до serving.
+Настройка включает доступность `core_next_steps` в обоих runtime modes, но
+не отменяет явный built-in allowlist, current owner policy и admission ceiling.
+Период фиксируется при root admission; children и legacy snapshots без поля
+не получают автоматического включения. Название зарезервировано для built-in.
+Owner profile, prompt и сообщения не меняют deployment setting.
+
 ## Model reasoning
 
 `THINKING_LEVEL` является optional deployment setting. Допустимый provider-neutral vocabulary: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; конкретный provider/model MAY поддерживать подмножество и возвращает model error для неподдерживаемого значения. Пустое значение означает provider default. Эта настройка не входит в RunRequest и не может быть изменена prompt-ом.

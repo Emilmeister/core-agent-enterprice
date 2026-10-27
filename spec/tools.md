@@ -22,6 +22,24 @@ Model-facing description кратко задаёт назначение, кри�
 
 Ядро предоставляет базовый набор, но AgentConfig MAY отключить любой model-callable built-in или целую optional feature. Модель видит только EffectiveConfig catalog:
 
+### NEXT-01. `core_next_steps`
+
+Optional read-only planning tool фиксирует краткий план основного агента в
+обычном transcript. Обязательные аргументы: `previous_steps` (array строк),
+`deal` (`none`, `active`, `finished`, `abandoned`), `stage` (строка, пустая при
+отсутствии сделки), `current_step` (строка). Optional `stage_results` отображает
+имена результатов в строки; `next_steps` содержит не более трёх строк.
+Результат — постоянное подтверждение «Принято. Выполни current_step.».
+Вызов не выполняет `current_step`, не проверяет завершение этапов сделки и не
+создаёт отдельную бизнес-машину состояний. Финальный ответ остаётся обычным
+текстом без response-control tool или обязательного JSON.
+
+Schema, admission capability ceiling, текущая owner policy/HITL, общий бюджет,
+audit и обработка ошибок MUST действовать как для других built-ins. Новые
+аргументы модели следуют общей guardrail policy; постоянный результат MAY
+не проходить material classification. Инструмент не рекламируется детям и
+при budget finalization. Правила cadence заданы в [runtime](runtime.md#next-01-периодическое-планирование).
+
 ### Служебные инструменты skills
 
 `core_skill_activate` и `core_skill_read_resource` реализуют progressive

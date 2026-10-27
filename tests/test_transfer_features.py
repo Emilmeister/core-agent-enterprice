@@ -99,6 +99,69 @@ class ModelHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+class NextStepsWireTests(unittest.TestCase):
+    CATALOG = {
+        "core_next_steps": {"description": "plan", "input_schema": {"type": "object"}},
+        "erp.order": {"description": "order", "input_schema": {"type": "object"}},
+    }
+
+    def model(self, api_format):
+        return CompatibleHttpModel(api_format=api_format, model="m", base_url="http://model.test/v1",
+                                   extra_body={"tool_choice": "required"})
+
+    def test_provider_choice_is_dropped_and_runtime_choice_uses_current_wire_name(self):
+        for api_format in ("openai", "anthropic"):
+            model = self.model(api_format)
+            for name, wire in (("core_next_steps", "core_next_steps"), ("erp.order", "erp_order")):
+                with self.subTest(api_format=api_format, name=name):
+                    body, _headers, reverse = model._request("ctx", "sys", self.CATALOG, tool_choice=name)
+                    expected = ({"type": "function", "function": {"name": wire}} if api_format == "openai"
+                                else {"type": "tool", "name": wire})
+                    self.assertEqual(body["tool_choice"], expected)
+                    self.assertEqual(reverse[wire], name)
+                    for choice in ({}, {"tool_choice": None}):
+                        body, _headers, _reverse = model._request("ctx", "sys", self.CATALOG, **choice)
+                        self.assertNotIn("tool_choice", body)
+
+    def test_choice_outside_catalog_is_not_sent_and_history_still_replays(self):
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "plan", "function": {
+                "name": "core_next_steps", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "plan", "name": "core_next_steps", "content": "ok"},
+        ]
+        for api_format in ("openai", "anthropic"):
+            for catalog in ({}, {"erp.order": self.CATALOG["erp.order"]}):
+                with self.subTest(api_format=api_format, catalog=tuple(catalog)):
+                    body, _headers, reverse = self.model(api_format)._request(
+                        "ctx", "sys", catalog, messages=messages, tool_choice="core_next_steps")
+                    self.assertNotIn("tool_choice", body)
+                    self.assertNotIn("core_next_steps", reverse.values())
+                    self.assertIn("core_next_steps", json.dumps(body["messages"]))
+                    self.assertEqual(set(reverse.values()), set(catalog))
+
+    def test_generate_passes_runtime_choice_to_provider_request(self):
+        for api_format in ("openai", "anthropic"):
+            with self.subTest(api_format=api_format):
+                model = self.model(api_format)
+                response = ({"choices": [{"message": {"content": "done"}}]} if api_format == "openai"
+                            else {"content": [{"type": "text", "text": "done"}]})
+                with patch.object(model, "_post", return_value=response) as post:
+                    result = model.generate(context="ctx", instructions="sys", tools=self.CATALOG,
+                                            tool_choice="core_next_steps")
+                self.assertEqual(result.message, "done")
+                expected = ({"type": "function", "function": {"name": "core_next_steps"}}
+                            if api_format == "openai" else {"type": "tool", "name": "core_next_steps"})
+                self.assertEqual(post.call_args.args[0]["tool_choice"], expected)
+
+    def test_scripted_model_records_only_the_current_call_choice(self):
+        from core_agent.model import ModelResponse, ScriptedModel
+
+        model = ScriptedModel([ModelResponse(message="done")] * 2)
+        model.generate(context="ctx", instructions="sys", tools=self.CATALOG, tool_choice="core_next_steps")
+        model.generate(context="ctx", instructions="sys", tools=self.CATALOG)
+        self.assertEqual([call.tool_choice for call in model.calls], ["core_next_steps", None])
+
+
 class StreamedReasoningTests(unittest.TestCase):
     def test_tools_free_turn_replays_historical_calls_without_reauthorizing_them(self):
         messages = [
