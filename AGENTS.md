@@ -1022,6 +1022,11 @@ run получает отдельные MCP session и negotiated version; пе�
   External-owned Task публикует generic status и
   buffered публичный ответ; внутренние вопросы, варианты, ответы,
   reasoning и промежуточный tool/model stream остаются приватными.
+- Неизвестное имя tool в успешном ответе OpenAI/Anthropic сохраняется вместе с
+  call ID и признаком отсутствия в переданном catalog. Runtime возвращает
+  `TOOL_UNAVAILABLE` с актуальными доступными tools до dispatch; это не
+  `MODEL_UNAVAILABLE` и не повод повторять тот же inference request.
+  Native call/result pairing, recovery и обычные model/tool budgets сохраняются.
 - Owner main-run model-only `core_response_begin({})` открывает durable tools-free
   answer phase, расходуя обычные tool/model budgets. Он условно добавляется
   runtime при включённом reply sink и adapter `on_delta`, не делегируется и не

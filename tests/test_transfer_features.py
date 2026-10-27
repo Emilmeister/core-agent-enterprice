@@ -113,13 +113,16 @@ class StreamedReasoningTests(unittest.TestCase):
                 self.assertNotIn("tools", body)
                 self.assertEqual(authority, {})
                 self.assertIn("core_response_begin", json.dumps(body["messages"]))
-                with self.assertRaises(CoreError):
-                    if api_format == "openai":
-                        model._parse_openai({"choices": [{"message": {"tool_calls": [{"id": "forged",
-                            "function": {"name": "core_response_begin", "arguments": "{}"}}]}}]}, authority)
-                    else:
-                        model._parse_anthropic({"content": [{"type": "tool_use", "id": "forged",
-                            "name": "core_response_begin", "input": {}}]}, authority)
+                if api_format == "openai":
+                    response = model._parse_openai({"choices": [{"message": {"tool_calls": [{"id": "forged",
+                        "function": {"name": "core_response_begin", "arguments": "{}"}}]}}]}, authority)
+                else:
+                    response = model._parse_anthropic({"content": [{"type": "tool_use", "id": "forged",
+                        "name": "core_response_begin", "input": {}}]}, authority)
+                call, = response.tool_requests
+                self.assertEqual((call.id, call.name), ("forged", "core_response_begin"))
+                self.assertTrue(call.unavailable)
+                self.assertEqual(authority, {})
 
     def test_a_reasoning_delta_keeps_the_space_it_arrived_with(self):
         """Trimming each token glues the words of the assembled reasoning."""

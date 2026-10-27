@@ -6650,3 +6650,136 @@ class SemanticRuntimeTests(unittest.TestCase):
         record = agent.workflow_store.lookup_task('followup-during-summary')
         self.assertEqual(agent.workflow_store.pending_inbound(record), ())
         self.assertEqual([item['content'] for item in record.snapshot['context']['transcript']].count(correction), 1)
+
+
+class UnknownModelToolTests(unittest.TestCase):
+    def test_malformed_function_is_a_safe_nonretryable_protocol_error(self):
+        model = CompatibleHttpModel(api_format="openai", model="test")
+        for function in (None, [], 42, {}, {"name": []}, {"name": ""}):
+            with self.subTest(function=function), self.assertRaises(CoreError) as caught:
+                model._parse_openai({"choices": [{"message": {"tool_calls": [{
+                    "id": "bad-call", "function": function}]}}]}, {})
+            self.assertEqual(caught.exception.code, "MODEL_RESPONSE_INVALID")
+            self.assertFalse(caught.exception.retryable)
+
+    def test_http_200_unknown_tool_is_saved_and_corrected_without_provider_retry(self):
+        for api_format in ("openai", "anthropic"):
+            for streaming, recover in ((False, False), (True, False), (False, True)):
+                with self.subTest(api_format=api_format, streaming=streaming, recover=recover):
+                    bodies = []
+
+                    class Provider(BaseHTTPRequestHandler):
+                        def log_message(self, *_args):
+                            pass
+
+                        def do_POST(self):
+                            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                            bodies.append(body)
+                            name = "invented_tool" if len(bodies) == 1 else "docs_search"
+                            call_id = "bad-call" if len(bodies) == 1 else "corrected-call"
+                            final = len(bodies) >= 3
+                            if api_format == "openai":
+                                message = {"content": "corrected"} if final else {"tool_calls": [{
+                                    "id": call_id, "type": "function",
+                                    "function": {"name": name, "arguments": "{}"}}]}
+                                reason = "stop" if final else "tool_calls"
+                                reply = {"choices": [{"message": message, "finish_reason": reason}]}
+                                frames = [{"choices": [{"delta": message, "finish_reason": reason}]}]
+                            else:
+                                block = {"type": "text", "text": "corrected"} if final else {
+                                    "type": "tool_use", "id": call_id, "name": name, "input": {}}
+                                reason = "end_turn" if final else "tool_use"
+                                reply = {"content": [block], "stop_reason": reason}
+                                frames = [{"type": "content_block_start", "index": 0, "content_block": block},
+                                          {"type": "content_block_stop", "index": 0},
+                                          {"type": "message_delta", "delta": {"stop_reason": reason}}]
+                            payload = ("".join("data: " + json.dumps(frame) + "\n\n" for frame in frames)
+                                       if streaming else json.dumps(reply)).encode()
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/event-stream" if streaming else "application/json")
+                            self.send_header("Content-Length", str(len(payload)))
+                            self.end_headers()
+                            self.wfile.write(payload)
+
+                    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    model = CompatibleHttpModel(api_format=api_format, model="test", stream=streaming,
+                                                endpoint=f"http://127.0.0.1:{server.server_port}/model")
+                    connector = InMemoryMcpConnector(catalogs={"docs": {"search": {"type": "object"}}},
+                                                    results={"docs.search": "found"})
+                    agent = make_agent(model, connector=connector, model_retries=5)
+                    try:
+                        with patch("core_agent.runtime.time.sleep") as sleep, patch.object(
+                                connector, "call", wraps=connector.call) as dispatch:
+                            if recover:
+                                class WorkerStopped(BaseException):
+                                    pass
+
+                                transition = agent._record_transition
+
+                                def stop_after_saved_call(*args, **kwargs):
+                                    saved = transition(*args, **kwargs)
+                                    if kwargs["event_kind"] == "model.completed":
+                                        raise WorkerStopped()
+                                    return saved
+
+                                with patch.object(agent, "_record_transition", side_effect=stop_after_saved_call):
+                                    with self.assertRaises(WorkerStopped):
+                                        agent.run(run_request(), task_id="unknown-http")
+                                self.assertEqual(len(bodies), 1)
+                                pending = agent.workflow_store.lookup_task("unknown-http").snapshot["tool_queue"][0]
+                                self.assertEqual((pending["id"], pending["name"]), ("bad-call", "invented_tool"))
+                                agent._runtime_cache.clear()
+                                result = agent.resume_task("unknown-http")
+                            else:
+                                result = agent.run(run_request(), task_id="unknown-http")
+                        self.assertTrue(result.complete)
+                        self.assertEqual(result.message, "corrected")
+                        self.assertEqual(result.usage.model_turns, 3)
+                        self.assertEqual(result.usage.tool_calls, 2)
+                        self.assertEqual(len(bodies), 3)
+                        sleep.assert_not_called()
+                        dispatch.assert_called_once()
+                        if api_format == "openai":
+                            feedback = next(item for item in bodies[1]["messages"] if item["role"] == "tool")
+                            self.assertEqual(feedback["tool_call_id"], "bad-call")
+                            feedback = json.loads(feedback["content"])
+                            offered = [item["function"]["name"] for item in bodies[1]["tools"]]
+                        else:
+                            feedback = next(block for item in bodies[1]["messages"]
+                                            if isinstance(item["content"], list) for block in item["content"]
+                                            if block["type"] == "tool_result")
+                            self.assertEqual(feedback["tool_use_id"], "bad-call")
+                            feedback = json.loads(feedback["content"])
+                            offered = [item["name"] for item in bodies[1]["tools"]]
+                        self.assertEqual(feedback["error_code"], "TOOL_UNAVAILABLE")
+                        self.assertEqual(feedback["status"], "failed")
+                        self.assertEqual(feedback["output"]["error"]["details"]["available_tools"], sorted(offered))
+                        self.assertNotIn("invented_tool", offered)
+                        record = agent.workflow_store.lookup_task("unknown-http")
+                        transcript = json.dumps(record.snapshot["context"]["transcript"])
+                        self.assertIn("invented_tool", transcript)
+                        self.assertIn("bad-call", transcript)
+                        self.assertEqual(record.state, "COMPLETED")
+                        agent._recover_workflows_once()
+                        self.assertEqual(len(bodies), 3)
+                    finally:
+                        agent.close()
+                        server.shutdown()
+                        server.server_close()
+                        thread.join(timeout=2)
+
+    def test_repeated_unknown_calls_consume_budget_without_dispatch(self):
+        model = ScriptedModel([ModelResponse(tool_requests=(ToolRequest(str(i), "invented_tool", {}, unavailable=True),))
+                               for i in range(3)] + [ModelResponse(message="Could not find a suitable tool")])
+        agent = make_agent(model, max_turns=4, model_retries=5)
+        self.addCleanup(agent.close)
+        with patch("core_agent.runtime.time.sleep") as sleep:
+            result = agent.run(run_request(), task_id="unknown-budget")
+        sleep.assert_not_called()
+        self.assertFalse(result.complete)
+        self.assertEqual(result.completion_reason, "budget_exhausted")
+        self.assertEqual(result.usage.model_turns, 4)
+        self.assertEqual(result.usage.tool_calls, 3)
+        self.assertIn("TOOL_UNAVAILABLE", model.calls[-1].context)

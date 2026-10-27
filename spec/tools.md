@@ -288,6 +288,16 @@ workflow lease и не повторяется после unknown outcome. Рез
 
 Детерминированная ошибка schema/contract validation до dispatch, ошибка запуска process, доказанно произошедшая до dispatch, и завершившийся outcome со статусом `failed` или `timed_out` MUST возвращаться модели как обычный tool result с безопасным стабильным error code и ограниченной диагностикой. Такой result сам по себе MUST NOT переводить родительскую A2A Task в `failed`: loop продолжается, чтобы модель могла исправить arguments, выбрать другой tool или объяснить проблему пользователю.
 
+Ответ провайдера с корректно сформированным tool call, имя которого отсутствует
+в переданном ему tools catalog, MUST сохраняться с исходным call ID и именем.
+Он не является `MODEL_UNAVAILABLE` и не запускает повтор того же model request
+по правилам недоступности провайдера. До dispatch runtime возвращает связанный
+failed result `TOOL_UNAVAILABLE` со списком текущих доступных инструментов;
+следующий обычный model turn получает нативную пару assistant call → tool result.
+Отказ не запускает handler и не расширяет capability/policy. Вызовы и последующие
+model turns расходуют обычный бюджет; сохранённый отказ переживает recovery без
+повторного запроса отклонённого model response.
+
 Исчерпанный tool-call budget является такой pre-dispatch ошибкой. Runtime
 возвращает `BUDGET_EXCEEDED` для каждого неисполненного request в assistant
 batch, не запускает handler и предписывает модели перейти к честному
