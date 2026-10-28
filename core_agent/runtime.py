@@ -5146,7 +5146,7 @@ class CoreAgent:
                                         lease_token=lease_token,
                                     )
                                     continue
-                            elif not finalizing or error.code != "MODEL_UNAVAILABLE":
+                            elif not finalizing or error.code not in {"MODEL_UNAVAILABLE", "MODEL_RESPONSE_INVALID"}:
                                 raise
                             else:
                                 model_span.record_error(error)
@@ -5552,12 +5552,19 @@ class CoreAgent:
         except _MaterialSuspended as suspended:
             return suspended.result
         except CoreError as error:
-            if error.code == "CONTEXT_UNRECOVERABLE":
+            if error.code in {"CONTEXT_UNRECOVERABLE", "MODEL_UNAVAILABLE", "MODEL_RESPONSE_INVALID"}:
                 current = self.workflow_store.get(record.run_id, tenant_id=record.tenant_id, owner_id=record.owner_id)
                 if current.state not in TERMINAL_STATES:
-                    self._record_transition(current, state="FAILED", snapshot=copy.deepcopy(current.snapshot),
-                        event_kind="task.failed", event_data={"error_code": error.code,
-                            "reason": error.reason if isinstance(error, CompactionError) else "unclassified"},
+                    failed_snapshot = copy.deepcopy(current.snapshot)
+                    failed_snapshot["model_attempt_in_flight"] = None
+                    # A cooperative worker stop must not discard an observed
+                    # failure; explicit task cancellation still takes priority.
+                    if getattr(cancel_event, "error_code", None) != "WORKER_STOPPED":
+                        self._cancel_at_boundary(current, failed_snapshot, cancel_event, lease_token=lease_token)
+                    self._record_transition(current, state="FAILED", snapshot=failed_snapshot,
+                        event_kind="task.failed", event_data={"error_code": error.code, **(
+                            {"reason": error.reason if isinstance(error, CompactionError) else "unclassified"}
+                            if error.code == "CONTEXT_UNRECOVERABLE" else {})},
                         error_code=error.code, lease_token=lease_token)
                 raise
             if error.code != "CANCEL_REQUESTED":

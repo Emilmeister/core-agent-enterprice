@@ -37,7 +37,7 @@ from core_agent.push import (
     DurablePushNotificationSender,
     PostgresPushNotificationConfigStore,
 )
-from core_agent.model import ModelResponse, ScriptedModel, ToolRequest
+from core_agent.model import CompatibleHttpModel, ModelResponse, ScriptedModel, ToolRequest
 from core_agent.observability import RecordingExporter, Telemetry
 from core_agent.lifecycle import PostgresRetentionManager
 from core_agent.workflow import OutboxDispatcher, PostgresWorkflowStore, SuspendedRun, WorkflowRecord
@@ -366,6 +366,50 @@ class NamedUser(User):
     "set TEST_DATABASE_URL to run PostgreSQL restart tests",
 )
 class PostgresRestartTests(unittest.TestCase):
+    def test_provider_failure_remains_terminal_after_database_reopen(self):
+        from urllib.error import HTTPError
+
+        database = self._database()
+        database.migrate()
+        self._reset(database)
+        database_url = os.environ["TEST_DATABASE_URL"]
+        task_id = "failed-provider-restart"
+        model = CompatibleHttpModel(api_format="openai", model="test")
+        failure = HTTPError("https://model.test", 404, "not found", {}, None)
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "CORE_AGENT_ENVIRONMENT": "development", "CORE_AGENT_MEMORY": "disabled",
+            "SESSION_STORAGE_TYPE": "postgres", "TASK_STORAGE_TYPE": "postgres",
+            "DATABASE_AUTO_MIGRATE": "false", "DURABLE_STORAGE_ROOT": root + "/blobs",
+            "LOCAL_WORKSPACE_ROOT": root + "/workspaces", "LOG_LEVEL": "ERROR",
+            "TEST_DATABASE_URL": database_url,
+        }, clear=True), patch("core_agent.runtime.CoreAgent.recover_workflows", return_value=()), \
+                patch("core_agent.model.urlopen", side_effect=failure) as provider:
+            first = create_app(model=model, database=database)
+            try:
+                with self.assertRaises(CoreError) as caught:
+                    first.state.core_agent.run({"prompt": "reply"}, task_id=task_id, identity="owner",
+                                               session_id="chat", tenant_id="company")
+                self.assertEqual(caught.exception.code, "MODEL_UNAVAILABLE")
+            finally:
+                first.state.close()
+            second = create_app(model=model, database=self._database())
+            try:
+                agent = second.state.core_agent
+                record = agent.workflow_store.lookup_task(task_id)
+                self.assertEqual(record.state, "FAILED")
+                self.assertEqual(record.error_code, "MODEL_UNAVAILABLE")
+                self.assertEqual(record.snapshot["turns"], 1)
+                self.assertIsNone(record.snapshot["model_attempt_in_flight"])
+                self.assertFalse(record.snapshot["finalization_turn_reserved"])
+                self.assertNotIn(record.run_id, {item.run_id for item in agent.workflow_store.recoverable()})
+                with self.assertRaises(CoreError) as cached:
+                    agent.resume_task(task_id)
+                self.assertEqual(cached.exception.code, "MODEL_UNAVAILABLE")
+                provider.assert_called_once()
+                self.assertEqual(agent.workflow_store.lookup_task(task_id).version, record.version)
+            finally:
+                second.state.close()
+
     def test_buffered_reply_survives_database_reopen_with_charged_attempt(self):
         import uuid
 

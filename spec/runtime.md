@@ -303,7 +303,8 @@ runtime MUST вернуть reserve в общий ledger атомарно с ter
 
 Модель MUST NOT достраивать отсутствующие tool results, выдавать намерение за
 выполненное действие или продолжать работу в финализирующем turn. Если модель не
-вернула пригодный text либо после разрешённых retry вернула `MODEL_UNAVAILABLE`,
+вернула пригодный text либо после разрешённых retry вернула `MODEL_UNAVAILABLE`
+или `MODEL_RESPONSE_INVALID`,
 runtime создаёт только детерминированное безопасное сообщение об исчерпанном
 budget и отсутствии финальной сводки; hidden reasoning и raw tool output не
 становятся публичным результатом.
@@ -353,6 +354,17 @@ A2A protocol version. При чтении результата, записанн
 
 ## Повторные попытки
 
+- Неповторяемая ошибка основного model request и исчерпание разрешённых
+  provider retries MUST завершать workflow как `FAILED` с исходным безопасным
+  error code. Известный отказ фиксируется под действующим lease до его
+  освобождения; marker незавершённой попытки очищается. Recovery MUST NOT
+  трактовать такой отказ как неизвестный исход и запускать новый model turn.
+  Уже принятая отмена, fencing, cleanup и disposition входящих Messages
+  сохраняют обычные гарантии. Настоящий crash с неизвестным outcome остаётся
+  отдельным recovery-сценарием. Исчерпание hard budget и fallback уже начатого
+  budget finalizer сохраняют существующую incomplete семантику. Cooperative
+  worker shutdown не отменяет фиксацию уже наблюдаемого отказа модели; явная
+  отмена задачи по-прежнему имеет приоритет.
 - Read-only и идемпотентные provider/MCP операции MAY повторяться при временной ошибке с ограниченным exponential backoff. MCP initialize/discovery при cold start начинается после durable создания workflow и immutable admission snapshot, ограничивается единым для всех MCP данного run `MCP_COLD_START_TIMEOUT_SECONDS`, прерывается отменой и не расходует model/tool budget. Срок ожидания сохраняется в checkpoint и не начинается заново после recovery; reconnect уже инициализированного workflow получает отдельный сохраняемый срок, но не меняет его EffectiveConfig.
 - Мутирующий tool call MUST NOT повторяться автоматически, если нет достоверного idempotency key или подтверждения, что действие не началось.
 - Каждая попытка сохраняется в аудите под одним логическим `tool_call_id` и отдельным `attempt`.

@@ -1039,6 +1039,10 @@ run получает отдельные MCP session и negotiated version; пе�
   `TOOL_UNAVAILABLE` с актуальными доступными tools до dispatch; это не
   `MODEL_UNAVAILABLE` и не повод повторять тот же inference request.
   Native call/result pairing, recovery и обычные model/tool budgets сохраняются.
+- Известный отказ модели после разрешённых retries фиксирует `FAILED` и очищает
+  in-flight marker до освобождения lease; recovery не начинает новый цикл
+  provider calls. Отмена, cleanup и настоящий crash с неизвестным outcome
+  сохраняют свои пути; budget finalizer сохраняет incomplete fallback.
 - Owner, external и child runs публикуют готовый ответ после завершения генерации
   и durable commit. Provider streaming остаётся внутренним; публичного token
   preview и отдельной answer phase нет. `core_response_begin` удалён из catalog,

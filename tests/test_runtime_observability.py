@@ -38,7 +38,7 @@ from core_agent.model import (
     ToolRequest,
 )
 from core_agent.observability import FailingExporter, RecordingExporter, Telemetry
-from core_agent.runtime import CoreAgent, _DurableCancelEvent
+from core_agent.runtime import CoreAgent, _DurableCancelEvent, _TaskControlEvent
 from core_agent.tasks import TaskScheduler
 from core_agent.tools import (
     ToolDefinition,
@@ -269,18 +269,23 @@ class RuntimeTests(unittest.TestCase):
                                   "finish_reason": "length"}],
                     "usage": {"prompt_tokens": 12, "completion_tokens": 16384,
                               "completion_tokens_details": {"reasoning_tokens": 16384}}}
-        with patch("core_agent.model.CompatibleHttpModel._post", return_value=response), \
+        with patch("core_agent.model.CompatibleHttpModel._post", return_value=response) as provider, \
                 self.assertLogs(agent.logger, "INFO") as logs:
-            with self.assertRaises(CoreError):
+            with self.assertRaises(CoreError) as caught:
                 agent.run(run_request(memory=False), task_id="failed-model-logs")
+            self.assertEqual(caught.exception.code, "MODEL_UNAVAILABLE")
             record = agent.workflow_store.lookup_task("failed-model-logs")
+            self.assertEqual(record.state, "FAILED")
+            self.assertIsNone(record.snapshot["model_attempt_in_flight"])
             agent._resume_recovered_workflow(record, threading.Event())
+            self.assertEqual(provider.call_count, 1)
         records = [json.loads(item.getMessage()) for item in logs.records
                    if item.getMessage().startswith("{")]
         failures = [item for item in records if item["event"] == "model.failed"]
-        self.assertEqual([item["turn"] for item in failures], [1, 2])
+        self.assertEqual([item["turn"] for item in failures], [1])
         recovered = next(item for item in records if item["event"] == "workflow.recovery.failed")
-        for item in [*failures, recovered]:
+        self.assertEqual(recovered["error_code"], "MODEL_UNAVAILABLE")
+        for item in failures:
             self.assertEqual(item["error_code"], "MODEL_UNAVAILABLE")
             self.assertEqual(item["provider_failure"]["kind"], "no_public_text")
             self.assertEqual(item["provider_failure"]["finish_reason"], "length")
@@ -293,20 +298,132 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(all(item["retry_scheduled"] is False for item in failures))
         self.assertNotIn(secret, json.dumps(records))
 
-    def test_failed_model_finalizer_is_logged_before_partial_fallback(self):
-        agent = make_agent(ScriptedModel([]),
-                           memory="disabled", mcp=False, platform_mcp=(), max_turns=1)
+    def test_http_model_failure_is_terminal_after_only_configured_attempts(self):
+        for status, attempts in ((404, 1), (503, 3)):
+            with self.subTest(status=status):
+                model = CompatibleHttpModel(api_format="openai", model="m")
+                agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=(),
+                                   model_retries=2, max_turns=6)
+                self.addCleanup(agent.close)
+                task_id = f"terminal-model-http-{status}"
+                failure = HTTPError("https://model.test", status, "private-provider-message", {}, None)
+                with patch("core_agent.model.urlopen", side_effect=failure) as provider, \
+                        patch("core_agent.runtime.time.sleep"), self.assertLogs(agent.logger, "WARNING"):
+                    with self.assertRaises(CoreError) as caught:
+                        agent.run(run_request(memory=False), task_id=task_id)
+                    self.assertEqual(caught.exception.code, "MODEL_UNAVAILABLE")
+                    self.assertEqual(caught.exception.retryable, status == 503)
+                    self.assertEqual(provider.call_count, attempts)
+                    record = agent.workflow_store.lookup_task(task_id)
+                    self.assertEqual(record.state, "FAILED")
+                    self.assertEqual(record.error_code, "MODEL_UNAVAILABLE")
+                    self.assertEqual(record.snapshot["turns"], attempts)
+                    self.assertIsNone(record.snapshot["model_attempt_in_flight"])
+                    self.assertFalse(record.snapshot["finalization_turn_reserved"])
+                    self.assertEqual(agent.workflow_store._budgets[record.snapshot["budget_root_id"]][2], attempts)
+                    agent._resume_recovered_workflow(record, threading.Event())
+                    self.assertEqual(provider.call_count, attempts)
+                    self.assertEqual(agent.workflow_store.lookup_task(task_id).version, record.version)
+
+    def test_invalid_model_response_fails_and_consumes_accepted_followup(self):
+        model = CompatibleHttpModel(api_format="openai", model="m")
+        agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=())
         self.addCleanup(agent.close)
-        with patch.object(agent.model, "generate", side_effect=CoreError("MODEL_UNAVAILABLE", "private-finalizer")), \
-                self.assertLogs(agent.logger, "INFO") as logs:
-            result = agent.run(run_request(memory=False), task_id="finalizer-logs")
-        failures = [json.loads(item.getMessage()) for item in logs.records
-                    if '"event": "model.failed"' in item.getMessage()]
-        self.assertEqual(len(failures), 1)
-        self.assertTrue(failures[0]["finalization"])
-        self.assertEqual(failures[0]["turn"], 1)
-        self.assertNotIn("private-finalizer", str(result))
-        self.assertNotIn("private-finalizer", str(logs.output))
+        task_id = "invalid-model-followup"
+
+        def invalid_response(*args):
+            record = agent.workflow_store.lookup_task(task_id)
+            agent.enqueue_message({"prompt": "accepted correction"}, task_id=task_id,
+                                  message_id="correction", identity=record.owner_id,
+                                  session_id=record.context_id, tenant_id=record.tenant_id)
+            return {"choices": [{"message": {"tool_calls": [{"id": "bad-call", "function": None}]}}]}
+
+        with patch("core_agent.model.CompatibleHttpModel._post", side_effect=invalid_response) as provider, \
+                self.assertLogs(agent.logger, "ERROR"):
+            with self.assertRaises(CoreError) as caught:
+                agent.run(run_request(memory=False), task_id=task_id)
+            self.assertEqual(caught.exception.code, "MODEL_RESPONSE_INVALID")
+            record = agent.workflow_store.lookup_task(task_id)
+            self.assertEqual(record.state, "FAILED")
+            self.assertEqual(record.error_code, "MODEL_RESPONSE_INVALID")
+            self.assertIsNone(record.snapshot["model_attempt_in_flight"])
+            self.assertEqual(agent.workflow_store.pending_inbound(record), ())
+            transcript = [item["content"] for item in record.snapshot["context"]["transcript"]]
+            self.assertEqual(transcript.count("accepted correction"), 1)
+            agent._resume_recovered_workflow(record, threading.Event())
+            provider.assert_called_once()
+
+    def test_cancellation_wins_over_a_returned_model_failure(self):
+        cancel = threading.Event()
+        model = CompatibleHttpModel(api_format="openai", model="m")
+        agent = make_agent(model, memory="disabled", mcp=False, platform_mcp=())
+        self.addCleanup(agent.close)
+
+        def fail_after_cancel(*args, **kwargs):
+            cancel.set()
+            raise HTTPError("https://model.test", 404, "not found", {}, None)
+
+        with patch("core_agent.model.urlopen", side_effect=fail_after_cancel) as provider, \
+                self.assertLogs(agent.logger, "ERROR"):
+            with self.assertRaises(CoreError) as caught:
+                agent.run(run_request(memory=False), task_id="cancel-model-failure", cancel_event=cancel)
+        self.assertEqual(caught.exception.code, "TASK_CANCELLED")
+        self.assertEqual(agent.workflow_store.lookup_task("cancel-model-failure").state, "CANCELLED")
+        provider.assert_called_once()
+
+    def test_worker_stop_preserves_a_known_model_failure_before_recovery(self):
+        control = _TaskControlEvent()
+        agent = make_agent(CompatibleHttpModel(api_format="openai", model="m"),
+                           memory="disabled", mcp=False, platform_mcp=(), max_turns=6)
+        self.addCleanup(agent.close)
+        task_id = "stopped-model-failure"
+
+        def fail_after_stop(*args, **kwargs):
+            control.stop()
+            raise HTTPError("https://model.test", 404, "not found", {}, None)
+
+        with patch("core_agent.model.urlopen", side_effect=fail_after_stop) as provider, \
+                self.assertLogs(agent.logger, "ERROR"):
+            with self.assertRaises(CoreError) as caught:
+                agent.run(run_request(memory=False), task_id=task_id, cancel_event=control)
+            self.assertEqual(caught.exception.code, "MODEL_UNAVAILABLE")
+            record = agent.workflow_store.lookup_task(task_id)
+            self.assertEqual(record.state, "FAILED")
+            self.assertEqual(record.error_code, "MODEL_UNAVAILABLE")
+            self.assertEqual(record.snapshot["turns"], 1)
+            self.assertIsNone(record.snapshot["model_attempt_in_flight"])
+            self.assertFalse(record.snapshot["finalization_turn_reserved"])
+            with self.assertRaises(CoreError) as cached:
+                agent.resume_task(task_id)
+            self.assertEqual(cached.exception.code, "MODEL_UNAVAILABLE")
+            self.assertEqual(agent.workflow_store.lookup_task(task_id).version, record.version)
+            provider.assert_called_once()
+
+    def test_failed_model_finalizer_is_logged_before_partial_fallback(self):
+        for code in ("MODEL_UNAVAILABLE", "MODEL_RESPONSE_INVALID"):
+            with self.subTest(code=code):
+                agent = make_agent(ScriptedModel([]),
+                                   memory="disabled", mcp=False, platform_mcp=(), max_turns=1)
+                self.addCleanup(agent.close)
+                task_id = f"finalizer-logs-{code}"
+                with patch.object(agent.model, "generate", side_effect=CoreError(code, "private-finalizer")) as provider, \
+                        self.assertLogs(agent.logger, "INFO") as logs:
+                    result = agent.run(run_request(memory=False), task_id=task_id)
+                    self.assertFalse(result.complete)
+                    self.assertEqual(result.completion_reason, "budget_exhausted")
+                    self.assertIn("no verified final summary", result.message)
+                    record = agent.workflow_store.lookup_task(task_id)
+                    self.assertEqual(record.state, "COMPLETED")
+                    self.assertEqual(record.snapshot["turns"], 1)
+                    self.assertEqual(agent.resume_task(task_id), result)
+                    provider.assert_called_once()
+                failures = [json.loads(item.getMessage()) for item in logs.records
+                            if '"event": "model.failed"' in item.getMessage()]
+                self.assertEqual(len(failures), 1)
+                self.assertTrue(failures[0]["finalization"])
+                self.assertEqual(failures[0]["turn"], 1)
+                self.assertNotIn("private-finalizer", str(result))
+                self.assertNotIn("private-finalizer", str(logs.output))
 
     def test_each_provider_retry_has_its_own_failure_diagnostics(self):
         model = CompatibleHttpModel(api_format="openai", model="m")
