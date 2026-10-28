@@ -321,6 +321,36 @@ uv run core-agent-db confirm-execution-stop --file /run/secrets/stop.json
 CLI записывает evidence, но не останавливает процессы. Потеря lease/handle или
 новый пустой Pod не доказывают остановку; неизвестные команды не replay-ятся.
 
+### Доступ только через UI платформы
+
+Команды выше задают необходимую процедуру, но не предполагают наличие у владельца
+AI Agents shell, `kubectl` или прямого подключения к БД. На 28 октября 2026 для
+нашего deployment не подтверждены отдельная среда выполнения migration CLI,
+её сетевой доступ к инжектируемой БД, DDL credential и выделение runtime-роли.
+До подтверждения этих условий production migration gate остаётся открытым.
+
+В отдельном сервисе [Container Jobs](https://cloud.ru/docs/container-apps-evolution/ug/topics/guides__job-create)
+можно запускать образ с заданной командой, аргументами, ENV и конечным таймаутом;
+результат виден в [статусе запуска](https://cloud.ru/docs/container-apps-evolution/ug/topics/concepts__jobs-status).
+Это ещё не доступный путь к нашей БД: [FAQ Container Apps](https://cloud.ru/docs/container-apps-evolution/ug/topics/faq__database-connection)
+указывает отсутствие подключения к Managed PostgreSQL. Принадлежность нашей
+инжектируемой `SESSION_POSTGRES_*` БД к этому сервису и доступ к ней из Container
+Jobs не установлены. Не следует выдавать описание отдельного сервиса за готовый
+способ миграции AI Agents или открывать БД в интернет ради такой проверки.
+
+Остальные operator proofs также требуют привязки к фактическим ресурсам агента:
+
+| Gate | Что доступно в документации платформы | Что должно быть подтверждено для нашего deployment |
+|---|---|---|
+| Runtime role | [Роли пользователей Managed PostgreSQL](https://cloud.ru/docs/paas-postgresql/ug/topics/guides__users__assigning-roles) | Управление именно используемой БД; необходимые table grants, успешные app reads/writes и запрет DDL. IAM-роль и версия schema этих проверок не заменяют |
+| Restore | [Восстановление PostgreSQL в новый кластер](https://cloud.ru/docs/paas-postgresql/ug/topics/guides__backups__restore) и отдельно [версии S3 objects](https://cloud.ru/docs/s3e/ug/topics/guides__versioning__manage-versions) | Доступ к backup фактической БД и согласованным referenced objects; восстановление копии с прежним encryption key и пустым cache. Общая атомарность этих двух сервисов не установлена |
+| Secrets | [Переменные AI Agents](https://cloud.ru/docs/ai-agents/ug/topics/concepts__variables-agents) задаются при запуске; Secret Management поддерживает [версии](https://cloud.ru/docs/scsm/ug/topics/guides__add-version-secret) | Контролируемый переход consumers и отзыв старых credentials. Новая версия секрета не доказывает hot reload или re-encryption; encryption key при обычном rollout сохраняется |
+| Rollout | [Аудит AI Agents](https://cloud.ru/docs/ai-agents/ug/topics/monitoring__audit-logging-events) содержит UpdateAgent/SuspendAgent/ResumeAgent; [мониторинг](https://cloud.ru/docs/ai-agents/ug/topics/monitoring__monitoring-metrics) показывает число экземпляров | Action timestamps, выбранный image/revision и lifecycle receipts. Метрика экземпляров не доказывает overlap writers, fencing или остановку точного execution generation |
+
+Отсутствие нужного workflow в рассмотренной документации не означает, что
+платформа его не предоставляет. До получения проверяемого механизма от оператора
+это конкретный незакрытый prerequisite; обычный UI restart его не закрывает.
+
 ## Первый development trial и вход
 
 Для первого trial используйте **новую выделенную БД** и credential с DDL правами:
