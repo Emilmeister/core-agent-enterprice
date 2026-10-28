@@ -677,6 +677,34 @@ Receipt: `.enterprise-work/cloudru-local-verified-image-20261029-99a5de6/publish
 в основном репозитории; рядом `inputs.json`, `candidate-check.json`, build/push logs
 и registry readback. Cloud deployment агентом не изменялся.
 
+29 октября дополнительно выполнен полный штатный Dockerfile build для native
+Linux ARM64 из `git archive 4c79949`: runtime, UI, dependency inputs и tests
+не изменились относительно `99a5de6`. Compose повторно собрал тот же committed
+context; окончательный локальный образ —
+`core-agent-native:99a5de6-arm64-20261029`,
+`sha256:f84620f46ed1e7c251c741436b483964fa5b964a50ed526952d529fe36b1ce7a`.
+Он работает как `agent` на native `linux/aarch64`, kernel `6.12.54-linuxkit`.
+Полный набор 138 runtime/UI файлов и импортированная summary instruction
+совпали с опубликованным AMD64 candidate. Это отдельный ARM64 binary, а не
+повторная проверка идентичного опубликованного образа; версия не публиковалась.
+
+Внутри образа прошли 35 context/runtime tests; обязательный Compose
+composition-root test прошёл за 25,067 s. Неизменённый shell body CI restart
+step с собственным PostgreSQL выполнил оба теста за 20,695 s: новая PID-1
+identity и активная замена с exact stop confirmation без replay команды.
+Все три проверки завершились exit 0, без skips. Compose и context tests
+не подменяли runtime-файлы. Identity subtest монтирует один `execution_identity.py`,
+чьи bytes совпадают с образом; active replacement использует packaged runtime.
+Собственные Compose volumes/network и restart containers удалены штатными
+cleanup. Receipts и logs: `.enterprise-work/native-current-arm64-20261029/`
+основного репозитория (`inputs.json`, `candidate-check.json`, `compose.json`,
+`restart.json`). Native Landlock/kind/browser для этой сборки, native AMD64,
+original-data provider fidelity и Cloud rollout остаются отдельными открытыми gates.
+Отдельный DSH reviewer завершил разбор после одного timeout; подтверждённых
+нарушений не нашёл. Ведущий уточнил provenance ARM64 Compose environment и
+расчёт SHA-256 импортированного текста инструкции (это не hash manifest файлов).
+Отчёт и проверка замечаний сохранены в `review.md` и `lead-verification.json`.
+
 В Cloud worktree подготовлена `.enterprise-work/controlled-mcp-rollout-20261029/`:
 owner/peer scripts побайтово скопированы из ранее проверенного стенда, новая
 конфигурация и nonce появятся только при запуске. Peer/tunnel и Cloud operations
