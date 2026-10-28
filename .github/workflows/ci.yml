@@ -22,9 +22,10 @@ jobs:
     timeout-minutes: 35
     env:
       SANDBOX_CLUSTER: core-sandbox-${{ matrix.arch }}
-      KUBECONFIG: ${{ runner.temp }}/core-sandbox/kubeconfig
       SANDBOX_ARCH: ${{ matrix.arch }}
     steps:
+      - name: Set isolated Kubernetes configuration path
+        run: printf 'KUBECONFIG=%s/core-sandbox/kubeconfig\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
