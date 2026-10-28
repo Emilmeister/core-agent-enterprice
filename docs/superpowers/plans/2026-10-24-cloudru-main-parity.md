@@ -10,8 +10,11 @@
 
 ## Актуальный план — 28 октября 2026
 
-**Статус:** version candidate `948bae1` с исправлением неоднозначного GetTask HTTP 404
-опубликован и проверен локально. После публикации владелец сообщил об обновлении
+**Статус:** по отдельному поручению владельца после локальных проверок опубликован
+linux/amd64 candidate `174dec5` с исправлениями UI; version tag и digest подтверждены
+registry readback. Его развёртывание владелец выполнит позже; `latest` не обновлялся.
+Предыдущий version candidate `948bae1` с исправлением неоднозначного GetTask HTTP 404
+опубликован и проверен локально. После той публикации владелец сообщил об обновлении
 образа в Cloud. Контролируемый live GetTask 404 → COMPLETED прошёл без повторной
 отправки; фактический deployed tag/digest ещё не прочитан. `latest` при
 нашей публикации оставался на `83edd16`. Ранее владелец подтвердил обновление
@@ -44,6 +47,9 @@ release proofs открыты. Дополнительный локальный A
 проверки, затем возвращаться к Cloud.ru. Новые Cloud API-прогоны, обновления
 и запросы перезапуска в этом локальном этапе не выполняются. Сравнительный
 DOCX больше не обновляется по отдельному указанию владельца.
+Позднее владелец отдельно поручил опубликовать готовый образ для самостоятельного
+развёртывания. Это разрешение на публикацию version tag, без нового live-прогона
+или изменения Cloud deployment со стороны агента.
 
 Проверяется текущий код `948bae1`: recovery активной команды, ожидания,
 полный цикл cron без HTTP, изоляция, PostgreSQL/S3 restore и настоящий browser
@@ -223,7 +229,27 @@ deployed digest, ingress, idle CPU, production credentials или Cloud backup/r
 
 | Cloud idle cron 28 октября | Один automatic root создан в 09:07:01.599 UTC, через 1,599 s после due и до первого reconnect в 09:08:30 UTC. Наша тишина — 11m57s; владелец подтвердил закрытый UI к 09:00:38 UTC. Постоянно включённый 1 экземпляр подтверждён владельцем | Initial-input classifier за 0,507 s дал `suspicious`, поэтому unattended completion не доказан; timeout/provider error отсутствовал. Собственное расписание удалено, Task отменена. Receipt: `cloudru-cron-idle-20261028.json`; фактический HTTP-трафик платформы независимо не захватывался |
 
-Новый candidate опубликован отдельным version tag. Владелец сообщил об обновлении
+После локального этапа по явному поручению владельца опубликован новый candidate:
+
+```text
+blockchain.cr.cloud.ru/core-agent-gn:cloudru-local-verified-20261028-174dec5
+sha256:99d59d07bc94ce4d607cc8e607962f9c801d0cc3c7e00f16349c39f4bd568e69
+```
+
+Registry readback подтвердил linux/amd64, revision `174dec5`, user `agent`,
+совпадение manifest digest и слоёв с локальным candidate. База — pinned image
+`948bae1`; полностью заменён `ui_dist` из проверенной браузером сборки.
+Совпали все 138 packaged files: 74 неизменных runtime-файла и 64 UI assets;
+29 UI source/build inputs также совпали с browser receipt. Базовые слои сохранены,
+прежних UI assets в итоговом inventory нет. Import smoke `app/a2a_sdk/runtime/ui`
+прошёл внутри amd64 image без сети, source overlay и root-запуска.
+Это derived image, не полный rebuild Dockerfile; amd64 smoke на ARM64 Docker
+использует emulation и не закрывает native amd64 gate. `latest` оставлен прежним,
+Cloud deployment не изменялся. Receipt и build/push/readback logs:
+`cloudru-local-verified-image-20261028-174dec5/published.json` и соседние файлы
+в приватном `.enterprise-work/` основного репозитория.
+
+Предыдущий candidate опубликован отдельным version tag. Владелец сообщил об обновлении
 образа в Cloud; точная revision пока не подтверждена независимо:
 
 ```text
