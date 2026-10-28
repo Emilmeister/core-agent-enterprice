@@ -427,8 +427,8 @@ check: raw JSON не разбирается из-за fences; даже диаг�
 Два native compaction events и их границы подтверждены прежними логами повторно;
 новых обращений к Cloud или provider эта сверка не выполняла.
 
-Следующий шаг для этого пункта — локальный прогон с настоящим provider и записью
-обеих промежуточных summaries и входа финального model call. Существующий
+Локальный прогон с настоящим provider и записью обеих промежуточных summaries
+и входа финального model call выполнен 29 октября; результат приведён ниже. Существующий
 `PostgresOwnerAnswerCompactionTests.test_two_answered_questions_survive_pressure_compaction_and_restart_on_model_wire`
 подставляет и summaries, и конечный JSON; его зелёный результат доказывает
 dataflow/restart, но не качество сохранения фактов моделью. Повторять его для
@@ -437,6 +437,65 @@ dataflow/restart, но не качество сохранения фактов �
 отрицательный результат. Отсутствие `NOT RELEASED` в промежуточном planning text
 до сжатия тоже не доказывает потерю исходного значения или причину ошибки.
 Проверенные критерии и ограничения: `.enterprise-work/compaction-facts-audit-20261028/lead-evidence.json`.
+
+29 октября, локальная диагностика на `Qwen/Qwen3.5-397B-A17B` через Foundation
+Models выявила отдельный отказ `compacted_context_too_small`: короткая summary
+не достигала 10% W, а выбор дополнительных целых записей прекращался на первой
+слишком большой записи. Более ранние подходящие call/result segments оставались
+неиспользованными. Минимальное исправление продолжает поиск и располагает
+сохранённые старые записи перед summary с поздними исправлениями. Transcript,
+целостность segments, pinned data и границы бюджета не меняются; если целого
+подходящего segment нет, остаётся явный отказ. Обновление связанных tests
+разрешено пользователем; spec и hash lock не изменялись.
+
+Три regression checks проверяют порядок целого call/result segment, пропуск
+прежней summary и отказ при возможности вместить только часть segment.
+До исправления первые две проверки падали с ожидаемым `compacted_context_too_small`,
+третья проходила; после исправления проходят все три. Независимый DSH reviewer
+с отдельным prompt/session проверил diff и не нашёл нарушения заданных критериев.
+Lead выполнил точные команды targeted suite (205 tests, 0 skips) и Ruff успешно.
+Обычный `uv run python -m unittest discover -s tests -v` также завершился с exit 0:
+2509 tests за 565,337 s, 17 skips для отдельных native Linux/Docker/browser
+fixtures. PostgreSQL был отдельным disposable container; локальные тестовые
+S3/Keycloak были доступны. Созданный PostgreSQL удалён после проверки, source
+hashes совпали с проверенными. Пропущенные native/browser gates этим запуском
+не закрываются. Receipt с командами, exits и logs: `verification.json` в той же
+диагностической папке. Факты в AGENTS.md не изменились.
+
+Повторный bounded provider-прогон после правки получил по два успешных compactions
+в обоих вариантах: исходный 8071→946 и 8857→874, с явно заключёнными в JSON значениями
+8071→873 и 8784→856, W=8016. Однако strict exact JSON **не прошёл в обоих**.
+В исходном варианте `NOT RELEASED` отсутствует уже в первой summary. В JSON-control
+оно есть в первой summary и исчезает во второй; там же artifact второго batch
+подменён идентификатором ответа `GO2_…`. Это наблюдаемая потеря/подмена значений
+при повторной суммаризации в данном прогоне, а не вывод только по финальному тексту.
+Финальные ответы также не соответствуют ожидаемому единому объекту: исходный —
+массив двух объектов, control — fenced batch_1/batch_2. Никакая нормализация ответа
+не применяется к pass criterion.
+
+Receipt: `.enterprise-work/compaction-provider-local-20261029/lead-results.json`,
+исходные public model inputs/outputs — `live-original/run.json`, `live-quoted/run.json`,
+`fixed-original/run.json`, `fixed-quoted/run.json` в той же папке. Это локальная
+реконструкция сохранённого синтетического сценария с явно заданным бюджетом,
+не persisted snapshot Cloud. Финальный model call использует сохранённый owner
+instruction layer без полного kernel/tool catalog. Поэтому прогон локализует
+дефект, но не закрывает Cloud, runtime/restart или полный acceptance gate.
+Следующий шаг — исправить сохранение точных значений при повторной summary,
+отдельно проверить final format, затем повторить полный сценарий на согласованном
+candidate. Исправление выбора целых записей само по себе этих гарантий не даёт.
+
+Один отдельный counterfactual с уточнением только `SUMMARY_INSTRUCTION` в процессе
+диагностики сохранил все четыре значения через обе summaries в JSON-control,
+включая полный release и поздний route. Финальный объект тоже содержит точные
+значения, но обёрнут в Markdown fences, поэтому strict gate остаётся отрицательным.
+Правила требуют сохранять literal values как quoted JSON внутри text entry,
+применять только явно названные исправления и отличать IDs ответов от task data.
+Это кандидат для следующей правки, а не внесённое изменение продукта и не гарантия
+устойчивости модели. Receipt: `instruction-counterfactual.json` и
+`instruction-control-quoted/run.json` в той же диагностической папке; три provider
+calls, без повторных попыток. Повторять успешный выбор whole segments для этого
+пункта не нужно: следующий эксперимент должен отдельно различить сохранение
+значений и соблюдение raw final format с действующими runtime instruction layers.
 
 28 октября, 20:05–20:11 UTC, выполнен ограниченный сценарий двух чатов через
 owner API без изменения settings/policies. Parent A

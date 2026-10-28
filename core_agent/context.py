@@ -205,10 +205,11 @@ class Compactor:
                 break
             size = sum(item.tokens for item in segment)
             if after + size > limit or any(item.kind == "summary" for item in segment):
-                break
+                continue
             extra.insert(0, segment)
             after += size
-        active = pinned + (summary,) + tuple(item for segment in extra for item in segment) + overlap
+        # Kept older records precede the summary of later corrections.
+        active = pinned + tuple(item for segment in extra for item in segment) + (summary,) + overlap
         if after > limit:
             raise CompactionError("compacted_context_too_large")
         if not forced and after < int(self.budget.working_capacity * 0.10):

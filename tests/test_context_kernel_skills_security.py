@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -105,6 +106,62 @@ class CompactionTests(unittest.TestCase):
             "Artifacts: a\nPending: p\nFailures: f",
             tokens,
         )
+
+    def test_short_summary_keeps_whole_older_tool_segment_before_summary(self):
+        prompt = ContextItem("prompt", "keep exactly", 20, pinned=True)
+        call = ContextItem("assistant_tool_calls", json.dumps([
+            {"id": "lookup", "function": {"name": "lookup", "arguments": {}}}
+        ]), 25)
+        result = ContextItem("tool_result", json.dumps({
+            "tool_call_id": "lookup", "status": "succeeded", "output": "old value"
+        }), 35)
+        latest = ContextItem("history", "latest correction in a large record", 900)
+        items = (prompt, call, result, latest)
+        state = ContextState(items, items, (1, 4))
+        summary = self._summary(50)
+        summarized = []
+
+        def summarize(candidates, limit):
+            summarized.append(candidates)
+            return summary
+
+        compacted = Compactor(self.budget, summarize).compact(state)
+        self.assertEqual(summarized, [(call, result, latest)])
+        self.assertEqual(compacted.active, (prompt, call, result, summary))
+        self.assertEqual(compacted.working_tokens, 130)
+        self.assertEqual(compacted.transcript, items)
+        self.assertEqual(compacted.event.replaced_sequence_range, (1, 4))
+
+    def test_short_summary_does_not_retain_superseded_summary_for_the_floor(self):
+        prompt = ContextItem("prompt", "keep exactly", 20, pinned=True)
+        older = ContextItem("history", "original evidence", 50)
+        previous = self._summary(900)
+        items = (prompt, older, previous)
+        state = ContextState(items, items, (1, 3))
+        summary = self._summary(50)
+
+        compacted = Compactor(self.budget, lambda items, limit: summary).compact(state)
+        self.assertEqual(compacted.active, (prompt, older, summary))
+        self.assertEqual(compacted.working_tokens, 120)
+        self.assertEqual(compacted.transcript, items)
+
+    def test_short_summary_fails_when_only_part_of_a_tool_segment_would_fit(self):
+        prompt = ContextItem("prompt", "keep exactly", 20, pinned=True)
+        call = ContextItem("assistant_tool_calls", json.dumps([
+            {"id": "lookup", "function": {"name": "lookup", "arguments": {}}}
+        ]), 50)
+        result = ContextItem("tool_result", json.dumps({
+            "tool_call_id": "lookup", "status": "succeeded", "output": "evidence"
+        }), 50)
+        latest = ContextItem("history", "large latest record", 900)
+        items = (prompt, call, result, latest)
+        state = ContextState(items, items, (1, 4))
+
+        with self.assertRaises(CoreError) as caught:
+            Compactor(self.budget, lambda items, limit: self._summary(50)).compact(state)
+        self.assertEqual(caught.exception.reason, "compacted_context_too_small")
+        self.assertEqual(state.active, items)
+        self.assertEqual(state.transcript, items)
 
     def test_failed_interval_compaction_preserves_context_below_pressure_threshold(self):
         items = (ContextItem("history", "latest corrected decision", 400),)
