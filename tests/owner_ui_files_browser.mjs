@@ -471,7 +471,12 @@ try {
   await page.call('Fetch.enable',{patterns:[{urlPattern:config.origin+'/api/chats/*/tasks/*/files/*',requestStage:'Response'}]});
   await page.click('Скачать','.response-files button');
   await waitFor(()=>!!pausedDownload,'actual response download paused');
-  check(await page.evaluate("(()=>{return [...document.querySelectorAll('.response-files li:first-child button')].every(button=>button.disabled)&&[...document.querySelectorAll('.response-files li:nth-child(2) button')].every(button=>!button.disabled);})()"),'only the clicked actual file download is disabled');
+  check(await page.evaluate(`(()=>{
+    const cards=[...document.querySelectorAll('.response-files li')];
+    const actions=cards.map(card=>[...card.querySelectorAll(':scope > .file-card-actions > button[aria-label^="Открыть "], :scope > .file-card-actions > button[aria-label^="Скачать "]')]);
+    return actions.length===2&&actions.every(buttons=>buttons.length===2)
+      &&actions[0].every(button=>button.disabled)&&actions[1].every(button=>!button.disabled);
+  })()`),'only the clicked actual file download is disabled');
   await page.click('Новый чат');
   await page.wait("!!document.querySelector('.welcome')&&!document.querySelector('.response-files')",'actual chat switch during pending download');
   await page.call('Fetch.disable');
@@ -596,6 +601,8 @@ try {
   await page.call('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13});
   check(await page.evaluate(`(()=>{const history=document.getElementById(${JSON.stringify(ownerQuestion.id)});return history.open && history.querySelector('.question-answer').textContent.includes(${JSON.stringify(ownerQuestion.text)}) && history.querySelector('.question-answer').textContent.includes('Заказ 42');})()`),'resolved owner question opens by keyboard with the original question and answer');
   await page.call('Page.reload',{ignoreCache:true});
+  await page.wait("!!document.querySelector('.chat-link')",'owner-answer chat retained after reload');
+  await page.evaluate("document.querySelector('.chat-link').click()");
   await page.wait(`(()=>{const history=document.getElementById(${JSON.stringify(ownerQuestion.id)});return history?.matches('details.owner-question-history') && !history.open && history.querySelector('summary').textContent.trim()==='Ответ отправлен' && history.querySelector('.question-answer').textContent.includes('Заказ 42');})()`,'saved owner answer remains collapsed after a full reload');
   check(await page.evaluate("(()=>{const card=[...document.querySelectorAll('.action-error')].find(card=>card.textContent.includes('Ожидание задачи'));return card && card.textContent.includes('Ошибка') && card.closest('.execution-group')?.querySelector('summary')?.textContent.includes('Ошибок:');})()"),'actual failed background task is included and advertised in collapsed execution group despite successful status read');
   await waitFor(()=>history.at(-1)?.some(item=>item.kind==='placeholder'&&item.status==='available'&&!item.review&&!item.outcome&&!item.attachments?.length&&!item.response_files?.length),'actual preserved internal history markers');
@@ -883,6 +890,7 @@ try {
   await page.wait("!document.querySelector('.peer-conversation-panel')&&document.activeElement?.textContent.includes('Переписка')",'Escape closes peer panel and returns focus');
   await page.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   await page.evaluate("document.querySelector('.peer-panel-toggle').click()");
+  await page.wait("!!document.querySelector('.peer-outgoing')&&!!document.querySelector('.peer-incoming')",'mobile peer conversation loaded after reopening');
   check(await page.evaluate("document.documentElement.scrollWidth<=innerWidth&&getComputedStyle(document.querySelector('.thread')).visibility==='hidden'&&document.querySelector('.peer-conversation-panel').getBoundingClientRect().width<=innerWidth"),'mobile peer panel avoids hidden chat controls and horizontal overflow');
   check(await page.evaluate(peerBubbleLayout),'mobile peer bubbles preserve direction and scroll within the panel');
   check(await page.evaluate("getComputedStyle(document.querySelector('.peer-conversation-panel [role=separator]')).display==='none'"),'mobile peer overlay hides the resize separator');

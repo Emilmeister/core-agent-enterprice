@@ -157,7 +157,7 @@ export function Chat({
     setPeerSelection(undefined);
     requestAnimationFrame(() => {
       const trigger = peerTrigger.current;
-      if (trigger?.isConnected) trigger.focus(); else peerButton.current?.focus();
+      if (trigger?.isConnected && !trigger.closest("details:not([open])")) trigger.focus(); else peerButton.current?.focus();
     });
   }
   useLayoutEffect(() => { messageHandoff.delete(api); }, [api]);
