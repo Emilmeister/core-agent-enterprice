@@ -168,6 +168,12 @@ criterion должны войти в тот же завершённый change. 
   disposable Pod и реальные Keycloak/PostgreSQL. Он обязателен на amd64 с
   `CORE_AGENT_REQUIRE_BROWSER_TESTS=1`: отсутствие Chromium, Node, конфигурации
   или native fixtures завершает проверку ошибкой, без skip.
+- `tests/test_execution_restart_docker.py` использует native image из
+  `CORE_AGENT_RESTART_TEST_IMAGE`. Дополнительный persisted replacement-сценарий
+  требует `TEST_DATABASE_URL` на loopback и соответствующий локальный
+  `TEST_POSTGRES_CONTAINER` в default Docker bridge; он создаёт собственную schema
+  и два контейнера с Bubblewrap. Этот сценарий проверяет общий recovery с POSIX
+  workspace и точным operator stop proof, не Cloud Landlock/S3 replacement.
 - PostgreSQL migration suite использует `TEST_POSTGRES_CONTAINER` для настоящих
   `pg_dump`/`pg_restore` того же server version. Ordinary CI передаёт ID своего
   disposable PostgreSQL service; тест восстанавливает только собственную schema
