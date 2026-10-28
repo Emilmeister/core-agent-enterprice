@@ -16,6 +16,12 @@
 ответ, dedup, полный ответ через SSE и создание/исправление приложения судоку
 с публикацией файлов. Точный deployed digest независимо не прочитан;
 подтверждение владельца и эти функциональные проверки не закрывают всю приёмку.
+Контролируемый restart подтверждён операторскими логами: startup `11:31:33 UTC`,
+application_ready `11:32:04 UTC`. Owner/HITL waits и два таймера сохранились.
+Удалённое ожидание завершилось ошибкой после HTTP 404 на GetTask при restart,
+хотя удалённая Task затем завершилась; active terminal D2 остаётся в
+`WORKING` с `core_agent_execution.state=cleanup_pending`; replay не наблюдался, нет
+доказательства остановки прежнего процесса. Эти два restart-пункта не пройдены.
 Recovery-loop после non-retryable HTTP 404 исправлен локально в `83edd16`:
 известный отказ сохраняется в `FAILED` до освобождения lease; повторный recovery
 не вызывает provider. Подтверждены отмена, cooperative worker stop, incomplete
@@ -58,6 +64,7 @@ native amd64/browser и оставшиеся целевые Cloud release proofs
 | Cloud readback 28 октября | Health/live и ready, owner login, settings revision 22 и FM model discovery вернули HTTP 200; выбранная `Qwen/Qwen3.5-397B-A17B` есть в каталоге; context 128000, structured reasoning off/chat_template, next steps enabled/every=5 | Только чтение настроек и доступность API; не новый model/tool run и не сверка deployed digest. Receipt: `cloudru-current-readiness-20261028.json` |
 | После обновления Cloud 28 октября | Health, owner auth и доступная выбранная Qwen подтверждены; неавторизованный owner GET и wrong-Origin logout отклонены, рабочая сессия сохранилась. Ответ `323` на 17×19 завершён за 2 хода модели с `core_next_steps`; duplicate Send вернул прежнюю Task без расходования budget, изменённый Message с тем же ID дал `MESSAGE_ID_CONFLICT` | Receipts `cloudru-post-rollout-readiness-20261028.json`, `cloudru-post-rollout-simple-20261028.json`; session expiry/rotation и external isolation этим не закрываются |
 | Полный ответ через SSE после обновления | Follow-up в том же чате создал новую Task; stream содержал SUBMITTED, WORKING без текста и COMPLETED с единственным полным ответом 1…30. Ровно 3 события, итог точный, complete=true, 2 хода модели, logout 200 | Receipt `cloudru-post-rollout-stream-20261028.json`; проверены фактические события одного нового stream, не произвольное сетевое разъединение |
+| External isolation после обновления | Собственные owner Task/history/file доступны; canonical и `/a2a/external/` Task GET возвращают A2A `TASK_NOT_FOUND` и с owner cookie, и без неё. Owner history/download без сессии дают `401 AUTHENTICATION_REQUIRED`. Исходный Sudoku snapshot совпал по SHA | 10 checks, receipt `cloudru-post-rollout-external-isolation-20261028.json`. Это разделение owner/external; разных внешних callers профиль Cloud не различает — у них общий platform principal |
 | Судоку после обновления | Исходная задача завершена за 4/10 ходов, 3 tools; файл опубликован. Независимая проверка обнаружила пропущенный `fill_box`. Агент исправил свой код follow-up за 8/10 ходов, 7 tools; syntax, генерация/решение easy/medium/hard, строки/столбцы/блоки и clues прошли независимо. Старое вложение осталось побайтно неизменным | Ошибка была в сгенерированном приложении; прежний runtime budget/recovery сбой не повторился в обоих запусках. GUI не запускался. Receipts `cloudru-post-rollout-sudoku-20261028.json` и `cloudru-post-rollout-sudoku-repair-20261028.json`; глобальные settings и guardrails не менялись |
 | Cloud restart proofs | Owner/HITL waits и memory пережили rollout; peer context сохранился между двумя операциями, файлы совпали по bytes/digest | Timer и background command завершились до прежнего rollout: активное execution через замену ими не проверено |
 | Локальные durability/security proofs | 174 storage/recovery проверки, ещё 56 security/config/restart проверок; coordinated PostgreSQL/S3 restore и runtime role grants | ARM64 VM/source overlay, инъекция S3 errors и disposable restore не заменяют native matrix, Cloud outage или target restore |
@@ -65,6 +72,12 @@ native amd64/browser и оставшиеся целевые Cloud release proofs
 | Native ARM64 Compose и restart 28 октября | Кандидат из исходного Dockerfile, linux/arm64, user `agent`, revision `83edd16`; все 138 source/UI hashes совпали с опубликованным пакетом. Существующий CI composition-root test terminal/Python/background прошёл за 23,601 s; restart identity — 1 test за 2,095 s. Exit 0, без skips и source overlay | Локальные ARM64 Compose/Bubblewrap и restart subsets. Image не опубликован; собственные containers/volumes/network удалены. Receipt и log: `cloudru-recovery-arm64-compose-20261028.{json,log}` |
 | Native ARM64 Kubernetes sandbox 28 октября | 15 tests за 160,095 s, без skips; Pod Succeeded/exit 0, `hostUsers: false`, node readback `pids.max=512`. Сохранены исходные node digest, dual-stack fixture, OCI profile, ресурсы и test command; установлен точный проверенный image | Адаптация fixture ограничена Darwin CLI той же версии с официальными checksums и уникальным image reference. Собственные cluster/receiver/network удалены. Receipt и log: `cloudru-recovery-arm64-kind-20261028.{json,log}`; это локальный Pod, не Cloud deployment |
 | Native ARM64 Landlock 28 октября | Неизменный `deploy/landlock-native.sh`: 40 tests за 9,004 s, exit 0, zero skips. Изолированная Apple VZ VM, aarch64 Linux 7.0.0-34, Docker 29.9.2, Landlock ABI 8; точный image ID и test/profile archive SHA совпали. Только tests mount, исходный Moby profile, без runtime overlay | Аппаратная виртуализация ARM64, не QEMU TCG. Локальная guest proxy ошибка установки Docker устранена до gate без изменения host proxy. Собственные VM/state/transfer archives удалены; Lima 2.2.1 осталась установлена. Receipt и log: `cloudru-recovery-arm64-landlock-20261028.{json,log}`. Kernel и outer profile целевого Cloud этим не проверены |
+| Restart: owner/HITL и память | Сохранились прежняя owner cookie, настройки, точные owner-question/HITL wait IDs и содержимое revision-1 canary. B завершилась полностью, проверила read и один CAS delete | A сохранила и прочитала note, но завершилась `complete=false / budget_exhausted` после невалидных/недоступных planning calls; вся A/B recipe не объявляется пройденной. Receipt: `cloudru-rollout-ab-final-readback-20261028.json` |
+| Restart: таймеры | C и R сохранили единственный исходный `core_wait_until`; deadline 11:38:01 UTC, woke_at 11:38:02.083576 и 11:38:01.520273 соответственно; обе Task COMPLETED | Это восстановление таймеров, не доказательство remote GetTask continuity. Receipt: `cloudru-rollout-final-readback-20261028.json` |
+| Restart: удалённое ожидание — дефект/незакрытый gate | Одна отправка, без replay; operation `26475d52-7279-5bb1-8ed3-362e1f02e9bb` получила GetTask HTTP 404 в 11:31:50 UTC и стала failed с unknown remote outcome. Удалённая R позднее завершилась | Происхождение 404 от ingress — гипотеза: body не сохранён. Требуются различение transport/typed A2A errors и bounded read recovery. Receipt: `cloudru-rollout-operator-log-facts-20261028.json` |
+| Restart: active terminal D2 — незакрытый gate | START в 11:29:39.606495 UTC, ready нового экземпляра в 11:32:04 UTC до планового конца 11:38:39.606495; один исходный terminal call, replay не наблюдался. Поздний Task GET показывает `cleanup_pending` | Остановка старого процесса не доказана. Отсутствие START/DONE после замены не является доказательством остановки или потери уже committed checkpoint. Receipt: `cloudru-rollout-d2-late-readback-20261028.json` |
+| JSON control после restart | Новый запрос с точным JSON-примером вернул весь требуемый объект без fences, сохранил `PENDING; NOT RELEASED`; complete=true, 2 model turns | Короткий control не доказывает compaction. Receipt: `cloudru-post-restart-json-control-20261028.json` |
+
 | Cloud idle cron 28 октября | Один automatic root создан в 09:07:01.599 UTC, через 1,599 s после due и до первого reconnect в 09:08:30 UTC. Наша тишина — 11m57s; владелец подтвердил закрытый UI к 09:00:38 UTC. Постоянно включённый 1 экземпляр подтверждён владельцем | Initial-input classifier за 0,507 s дал `suspicious`, поэтому unattended completion не доказан; timeout/provider error отсутствовал. Собственное расписание удалено, Task отменена. Receipt: `cloudru-cron-idle-20261028.json`; фактический HTTP-трафик платформы независимо не захватывался |
 
 Последний опубликованный image:
@@ -168,11 +181,11 @@ amd64 browser gate. Это доступ к репозиторию CI, не к Cl
 | Проверка | Уже есть | Что ещё должно быть в итоговом receipt |
 |---|---|---|
 | Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools и успешный repair follow-up; optional planning локально и фактический `core_next_steps` в новых запусках | Planning off/on и cadence; provider failure становится terminal в Cloud; два подтверждённых compactions сохраняют факты и выполненные действия |
-| Формат ответа | Короткий strict JSON control прошёл; длинные Qwen controls дали fences/`PENDING` | Отдельная проверка с однозначно заданным JSON-примером и точным literal; отрицательные старые exact checks сохраняются, их причина не приписывается compaction без evidence |
-| Memory/skills | CRUD, vector/NER, child allowlist, activation/resources; memory после rollout | Применимые permission negatives и сохранность индексов/настроек на итоговом deployment |
+| Формат ответа | После restart точный JSON-пример и literal `PENDING; NOT RELEASED` прошли; прежние длинные controls дали fences/`PENDING` | Сохранить факты через два подтверждённых compactions; отрицательные старые exact checks не приписывать compaction без evidence |
+| Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs | Исправить/проверить соответствие embedding dimension 2048 и configured index 1024; startup vector_index=true и отсутствие degraded_channels не доказывают подходящий индекс. Применимые permission negatives остаются |
 | MCP | Публичный Microsoft Learn discovery/call и локальные policy/storage tests | Контролируемый HTTPS peer с credentials, deny/HITL и reconnect после rollout |
 | A2A и файлы | Прежние 0.3/1.0 и remote proofs; после обновления — dedup/conflict, terminal SSE, новый follow-up, download/raw A2A bytes и immutable старое вложение после исправления | Применимые reconnect/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
-| Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial и wrong-Origin denial без потери сессии | Итоговые settings/peer/material cards, session expiry/rotation и external isolation |
+| Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial, wrong-Origin denial без потери сессии, owner/external Task isolation | Итоговые settings/peer/material cards, session expiry/rotation; общий external principal остаётся утверждённым ограничением Cloud-профиля |
 | Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial | Два одновременно работающих чата, root/child cancellation/checkpoint и cleanup при замене экземпляра |
 
 - [x] Оператор сообщил об обновлении image; readiness, owner login и успешные model/tool runs после обновления подтверждены. Точный deployed digest остаётся явно непроверенным: Agent Card version `1.0.0` не идентифицирует сборку.
@@ -217,21 +230,52 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   нельзя. Перед повтором используются новый candidate и подтверждённое окно без UI.
 - [ ] Подготовить owner/HITL/time/remote waits и активную ограниченную команду; оператор запускает обновление через UI до их завершения. Проверить deadlines, единственный результат и сохранность данных. Команда не replay-ится; неизвестная остановка остаётся честным `SIDE_EFFECT_UNKNOWN` и barrier.
 
-  Ограниченный сценарий подготовлен локально, но ещё не отправлен в Cloud:
-  `cloudru-rollout-payloads-20261028.json`,
-  `cloudru-rollout-ab-20261028.py`, `cloudru-rollout-ced-20261028.py`
-  в ignored `.enterprise-work/`. Оба driver прошли `--help` и `--dry-run`
-  без live requests. Точный порядок запуска сохранён в `execution_status`
-  пакета: A/B, затем C/E, затем D только при готовности оператора.
-  До сигнала на обновление обязателен успешный `--check-ready`: точные bytes
-  START, возраст не больше 120 s и не меньше 360 s до окончания команды.
-  START читается через owner files API; запуск дополнительного terminal/Python
-  в том же чате не нужен. При S3 backend checkpoint ожидает остановки всех
-  процессов чата, поэтому видимый START сам по себе не доказывает durable snapshot.
-  Неожиданный material требует отдельного разбора; глобальные settings/policies
-  не меняются. Cleanup ограничен собственными Task IDs, memory revisions и одним
-  временным self-peer. Проверка фактической замены, единственного исполнения и
-  конечной остановки остаётся отдельным шагом после rollout.
+  Выполнен контролируемый restart 28 октября. Операторские логи фиксируют
+  новый startup 11:31:33 UTC и application_ready 11:32:04 UTC. Owner/HITL
+  continuity и таймеры C/R подтверждены, исходные receipts сохранены.
+  Исходная D завершилась до restart и исключена из active-command proof.
+  Свежая D2 прошла readiness START<=120 s / remaining>=360 s перед сигналом;
+  новый startup произошёл до её планового окончания. Поздний API readback показывает
+  `cleanup_pending`, а не подтверждённый terminal outcome. Обычный owner API
+  не предоставляет stop attestation; новый экземпляр/истёкший timeout/нет файла
+  не доказывают остановку старого процесса. Не replay-ить и не снимать barrier
+  без точного доказательства.
+
+  E сделала один remote Send; GetTask получил nonretryable HTTP 404 во время
+  restart, operation стала failed с unknown remote outcome. R затем завершилась,
+  но handle E остался failed. Исправление read classification требует отдельного
+  regression proof; typed A2A TaskNotFound и Send/Cancel не должны стать blind retry.
+  Локальное воспроизведение существующим wire fixture подтвердило различие:
+  503 даёт Send/Get/Get → completed, замена только статуса на 404 даёт
+  failed/remote_read_failed в JSONRPC и HTTP+JSON. HTTP error body сейчас
+  закрывается без чтения; причина реального Cloud 404 остаётся неизвестной.
+  Receipt: `cloudru-remote-404-reproduction-20261028.json`.
+  Запрошена новая узкая директива на frozen tests/spec для различения
+  неоднозначного HTTP 404 и типизированного A2A TaskNotFound.
+  Временный self-peer удалён по exact ID/revision, B note удалена одним CAS.
+  A note после truthful partial удалена отдельной Task
+  `27254e97-ef26-4f60-9b6c-b0139d257c02`: exact revision-1 read,
+  один committed CAS delete, затем marker search без результатов на index
+  revision13, complete=true. Обе canary notes и self-peer очищены; исходная
+  A recipe остаётся partial. Receipt: `cloudru-rollout-a-cleanup-continuation-20261028.json`.
+
+  Дополнительные сообщения разобраны по source: `run_prefetched:125` означает
+  30-секундный timeout ожидания единственного process-wide prefetch semaphore
+  до запуска projection. Причина долгого удержания слота неизвестна; это не
+  прямое свидетельство отсутствующего S3 object. Provider вернул embeddings 2048
+  при configured 1024; векторы сохраняются, SQL search использует фактическую
+  размерность, но индекс 1024 их не покрывает. Простая смена ENV на 2048 не
+  доказывает HNSW index: pgvector `vector` HNSW ограничен 2000 измерений,
+  при отказе создания код использует in-process cosine. Пересчёт всех прежних
+  embeddings автоматически не выполняется. Источник ограничения:
+  [официальный pgvector](https://github.com/pgvector/pgvector#hnsw).
+  Receipt `cloudru-restart-memory-prefetch-diagnosis-20261028.json`.
+  Эти отдельные проблемы не объявляются причиной D2 или remote 404. Перекрытие процессов в общих логах
+  без instance identity не закрывает overlap gate. Доказательства:
+  `cloudru-rollout-operator-log-facts-20261028.json`,
+  `cloudru-rollout-ab-final-readback-20261028.json`,
+  `cloudru-rollout-final-readback-20261028.json`,
+  `cloudru-rollout-d2-late-readback-20261028.json`.
 - [ ] При доступном rolling update зафиксировать перекрытие старого/нового экземпляров и проверить общие sessions, одного cron leader, workspace/execution fencing и отсутствие повторных side effects. Просто два последовательных health 200 не подтверждают overlap.
 - [ ] Выполнить ограниченные target sandbox/network проверки через agent tools на собственных контрольных данных: соседний workspace/контрольные секреты, private/metadata egress и IPv4/IPv6, broker isolation, timeout/cancel/process cleanup. Native CI остаётся отдельным обязательным доказательством.
 - [ ] Через UI проверить отзыв собственного тестового platform key и согласованную owner password rotation; исходные рабочие credentials не публиковать и не отзывать.
