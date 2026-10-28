@@ -606,6 +606,33 @@ assertion до сети (0 provider calls). Product source, frozen spec/tests,
 deployment settings и опубликованный image не менялись. Исходный gate точного
 сохранения фактов и final output остаётся открытым.
 
+Причина последующего идентичного 90-секундного replay подтверждена:
+`MODEL_UNAVAILABLE` с cause `TimeoutError`, 90078 ms, без HTTP-статуса
+(`summary-inherit-thinking-diagnostic.json`). Это не доказательство HTTP 404
+или несовместимости JSON Schema с reasoning. Единственный контроль с timeout
+180 s вернул структурно допустимую summary за 112171 ms: 702 rendered tokens,
+5429 reasoning tokens по metadata, без записи скрытого reasoning.
+Однако её содержание противоречиво: полное `PENDING; NOT RELEASED` осталось
+только у Batch 1, а у придуманного обновлённого Batch 2 вновь записано `PENDING`.
+`literal_retained=true` в `summary-thinking-180s-control.json` обозначает только
+наличие substring, не сохранность текущего значения и не пройденный gate.
+
+Отдельный bounded draft-review control использовал те же source records,
+неверную summary как untrusted draft и общую инструкцию сверить пропуски,
+противоречия и области исправлений; ожидаемые значения в инструкцию не
+подставлялись. Один дополнительный запрос с reasoning off за 19491 ms вернул
+побайтово ту же canonical summary (757 tokens), включая неверное `release`.
+Receipt: `summary-review-control.json`. Этот дополнительный проход не принят
+как исправление и в runtime не добавлен. Нормативный optional verifier MAY
+существует в `spec/context.md`, но его счётчик вызовов, recovery и проверки
+нельзя молча обойти; текущий неудачный control не обосновывает новую реализацию.
+Прежние отрицательные результаты и критерий exact output сохранены.
+DSH researcher получил отдельные замечания по подмене fidelity проверкой
+substring и по слишком широкому выводу о verifier MAY. Он сохранил исправленный
+частичный отчёт, но correction session завершилась timeout 60 s и не объявляется
+завершённым review. Ведущий проверил сохранённые поправки и сопоставил реальные
+Artifacts и байты draft/review; receipt `semantic-controls-lead-audit.json`.
+
 Сборка `99a5de6` использует immutable опубликованный `174dec5` как base и
 проверенный `core_agent/context.py` как новый image layer; зависимости, остальные
 runtime-файлы и UI совпадают. Это не полный rebuild исходного Dockerfile.
