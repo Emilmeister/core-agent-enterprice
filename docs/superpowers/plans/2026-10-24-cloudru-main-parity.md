@@ -576,6 +576,36 @@ DSH researcher проверил путь и после конкретных за
 неподтверждённые утверждения про обязательную answer phase и ordinary reasoning.
 Исходный strict gate не ослаблен, fences/лишние поля не нормализуются в pass.
 
+Следующий локальный control проверил существующий `AgentProfilePrompt`, без
+изменения kernel или schema: общий профиль требует только запрошенные поля,
+точные значения и отсутствие Markdown/планирования в JSON-ответе. При прежнем
+сохранённом context финальный вызов вернул точный raw JSON без response_format.
+`KernelCompiler.from_snapshot` подтвердил прежние protected layers; изменён
+только process-local profile segment. Независимый DSH researcher подтвердил
+допустимость этого места настройки и сохранение admission/recovery semantics;
+это не гарантия качества модели и не применённая Cloud-настройка.
+Receipt: `profile-format-control.json`; research — `profile-format-research.md`
+в той же локальной diagnostic-папке.
+
+Повтор исходного, не переписанного в quoted JSON, input с двумя новыми
+compactions и этим профилем **не прошёл**: 8071→804 и 8715→976 при W=8016;
+первая summary сохранила `PENDING; NOT RELEASED`, вторая оставила `PENDING`
+и оформила исправление как вторую batch-запись. Final вернул массив из двух
+записей вместо ожидаемого объекта. Receipt `profile-full-original/run.json`,
+3 provider calls, exit 3. Это локальный replay с declared fixed budget и
+реальными Compactor/StructuredSummarizer, но без полного runtime/tool catalog.
+Успешный final-only control не закрывает этот отказ; профиль не принят как fix.
+
+Узкий replay того же второго summary request с `reasoning=inherit` и явным
+`chat_template_kwargs.enable_thinking=true` дошёл до одного provider call,
+но завершился `MODEL_UNAVAILABLE`; ответа для оценки качества нет. Схема,
+context, instructions и output budget сохранены. Причина HTTP/timeout в receipt
+не зафиксирована и не выводится из времени ожидания. Сохранены
+`summary-inherit-thinking-control-2.json` и отдельный первый локальный отказ
+assertion до сети (0 provider calls). Product source, frozen spec/tests,
+deployment settings и опубликованный image не менялись. Исходный gate точного
+сохранения фактов и final output остаётся открытым.
+
 Сборка `99a5de6` использует immutable опубликованный `174dec5` как base и
 проверенный `core_agent/context.py` как новый image layer; зависимости, остальные
 runtime-файлы и UI совпадают. Это не полный rebuild исходного Dockerfile.
