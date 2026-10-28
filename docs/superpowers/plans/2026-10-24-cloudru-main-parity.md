@@ -396,6 +396,10 @@ credentials не найдены, SSH с проверенными официал�
 предложенные ключи. После сохранения исправлений нужен авторизованный push этой
 ветки; существующий push-trigger запускает `verify`, затем обе native jobs и
 amd64 browser gate. Это доступ к репозиторию CI, не к Cloud Kubernetes/БД.
+Повторная проверка transport 28 октября: `git ls-remote` читает ветку на
+`410a646`, но `git push --dry-run` завершается 128 из-за отсутствия GitHub
+credentials. Remote refs не менялись, CI не запускался. Receipt:
+`deepseek-team-20261028/github-transport-check.json`.
 
 #### 3. Закрыть функциональную матрицу на согласованном candidate
 
@@ -494,6 +498,19 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   подтверждены. Это live proof обработки 404, без перезапуска Cloud и без доступа
   к private deadline: `cloudru-remote404-live-proof-20261028.json`.
   Отдельное operator evidence: `cloudru-remote404-rollout-attestation-20261028.json`.
+
+  После rollout `174dec5` подготовлен отдельный повтор с контролируемым HTTPS
+  peer: Task `ec450dbb-4eec-4588-b80f-3408b74cfd04`, один Send и один
+  незавершённый `core_task_wait` без pending owner decisions подтверждены двумя
+  чтениями 19:07:04 / 19:07:36 UTC. До restart рабочий `sudoku_app.py` и его
+  immutable artifact совпали: 10744 bytes, SHA-256 `6e9b994b96ec2a1cbf6d11a20529fb47fa8b7af12afb2840aa2e4e0b3dcdcc6f`.
+  Peer удерживает WORKING до явного сигнала после operator restart, затем
+  возвращает один plain404 и COMPLETED; новый execution не запускается.
+  Оператору передан сигнал; сам restart и итог ещё не подтверждены.
+  Это public observation, не чтение private durable checkpoint. Подготовка:
+  `cloudru-restart-wait-20261028/prepared.json`; сценарий проверен через
+  `deepseek-team` и независимо локально ведущим агентом
+  (`deepseek-team-20261028/lead-fixture-check.json`). Старый D2 не изменялся.
   Временный self-peer удалён по exact ID/revision, B note удалена одним CAS.
   A note после truthful partial удалена отдельной Task
   `27254e97-ef26-4f60-9b6c-b0139d257c02`: exact revision-1 read,
