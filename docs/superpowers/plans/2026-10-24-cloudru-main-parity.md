@@ -11,11 +11,12 @@
 ## Актуальный план — 28 октября 2026
 
 **Статус:** version candidate `948bae1` с исправлением неоднозначного GetTask HTTP 404
-опубликован и проверен локально; rollout в Cloud ещё не выполнен. `latest` и
-проверяемый Cloud deployment пока соответствуют предыдущему `83edd16`
-с исправлением recovery,
-приватной диагностикой ошибок и обычным output limit 16384. Владелец подтвердил
-его обновление в Cloud 28 октября. После этого прошли readiness/auth, обычный
+опубликован и проверен локально. После публикации владелец сообщил об обновлении
+образа в Cloud. Контролируемый live GetTask 404 → COMPLETED прошёл без повторной
+отправки; фактический deployed tag/digest ещё не прочитан. `latest` при
+нашей публикации оставался на `83edd16`. Ранее владелец подтвердил обновление
+этого предыдущего образа с recovery, приватной диагностикой и output limit 16384.
+На предыдущем образе прошли readiness/auth, обычный
 ответ, dedup, полный ответ через SSE и создание/исправление приложения судоку
 с публикацией файлов. Точный deployed digest независимо не прочитан;
 подтверждение владельца и эти функциональные проверки не закрывают всю приёмку.
@@ -77,18 +78,21 @@ native amd64/browser и оставшиеся целевые Cloud release proofs
 | Native ARM64 Landlock 28 октября | Неизменный `deploy/landlock-native.sh`: 40 tests за 9,004 s, exit 0, zero skips. Изолированная Apple VZ VM, aarch64 Linux 7.0.0-34, Docker 29.9.2, Landlock ABI 8; точный image ID и test/profile archive SHA совпали. Только tests mount, исходный Moby profile, без runtime overlay | Аппаратная виртуализация ARM64, не QEMU TCG. Локальная guest proxy ошибка установки Docker устранена до gate без изменения host proxy. Собственные VM/state/transfer archives удалены; Lima 2.2.1 осталась установлена. Receipt и log: `cloudru-recovery-arm64-landlock-20261028.{json,log}`. Kernel и outer profile целевого Cloud этим не проверены |
 | Restart: owner/HITL и память | Сохранились прежняя owner cookie, настройки, точные owner-question/HITL wait IDs и содержимое revision-1 canary. B завершилась полностью, проверила read и один CAS delete | A сохранила и прочитала note, но завершилась `complete=false / budget_exhausted` после невалидных/недоступных planning calls; вся A/B recipe не объявляется пройденной. Receipt: `cloudru-rollout-ab-final-readback-20261028.json` |
 | Restart: таймеры | C и R сохранили единственный исходный `core_wait_until`; deadline 11:38:01 UTC, woke_at 11:38:02.083576 и 11:38:01.520273 соответственно; обе Task COMPLETED | Это восстановление таймеров, не доказательство remote GetTask continuity. Receipt: `cloudru-rollout-final-readback-20261028.json` |
-| Restart: удалённое ожидание — локальное исправление, Cloud gate открыт | Одна отправка, без replay; operation `26475d52-7279-5bb1-8ed3-362e1f02e9bb` получила GetTask HTTP 404 в 11:31:50 UTC и стала failed с unknown remote outcome. Удалённая R позднее завершилась. В 948bae1 неоднозначный 404 повторяется в рамках исходного poll interval/deadline; typed A2A error остаётся окончательным | Происхождение реального 404 от ingress — гипотеза: body не сохранён. Локальный ordinary suite 2505 tests, image 82 tests прошли; version image опубликован. Нужен rollout и повторное remote-wait evidence. Receipt: `cloudru-rollout-operator-log-facts-20261028.json` и `cloudru-remote404-image-20261028-948bae1.json` |
+| Restart: удалённое ожидание — локальное исправление, Cloud gate открыт | Одна отправка, без replay; operation `26475d52-7279-5bb1-8ed3-362e1f02e9bb` получила GetTask HTTP 404 в 11:31:50 UTC и стала failed с unknown remote outcome. Удалённая R позднее завершилась. В 948bae1 неоднозначный 404 повторяется в рамках исходного poll interval/deadline; typed A2A error остаётся окончательным | Происхождение реального 404 от ingress — гипотеза: body не сохранён. Локальный ordinary suite 2505 tests, image 82 tests прошли; version image опубликован. После сообщения об обновлении пройден отдельный live 404 → COMPLETED; реальное remote-wait через restart требует повторного evidence. Receipt: `cloudru-rollout-operator-log-facts-20261028.json` и `cloudru-remote404-image-20261028-948bae1.json` |
 | Restart: active terminal D2 — незакрытый gate | START в 11:29:39.606495 UTC, ready нового экземпляра в 11:32:04 UTC до планового конца 11:38:39.606495; один исходный terminal call, replay не наблюдался. Поздний Task GET показывает `cleanup_pending` | Остановка старого процесса не доказана. Отсутствие START/DONE после замены не является доказательством остановки или потери уже committed checkpoint. Receipt: `cloudru-rollout-d2-late-readback-20261028.json` |
 | JSON control после restart | Новый запрос с точным JSON-примером вернул весь требуемый объект без fences, сохранил `PENDING; NOT RELEASED`; complete=true, 2 model turns | Короткий control не доказывает compaction. Receipt: `cloudru-post-restart-json-control-20261028.json` |
+| Контролируемый GetTask 404 после сообщённого обновления — пройдено | Task `6f1de1ae-15a3-4e0e-a609-a78db64e1bae`, operation `45eb67cb-ea9a-552f-8ce8-f410c27e28a0`: один Send, Get plain HTTP 404, следующий Get той же remote Task — COMPLETED. Интервалы 11,649 s и 10,658 s; operation completed, outcome_unknown=false. Ровно один успешный send и wait; parent COMPLETED/complete=true с точным контрольным marker | Первое окно 180 s закончилось до разрешения собственного wait; последующее точное HITL approval завершило тот же root без новой отправки. Peer удалён по исходной revision 1, отсутствие подтверждено, logout 200; fixture/tunnel остановлены, временный ключ удалён. Это проверка поведения на текущем Cloud, не actual restart, сверка image digest или наблюдение private deadline. Receipt: `cloudru-remote404-live-proof-20261028.json` |
+| Проверка после сообщённого обновления образа | В 13:00:56–13:01:31 UTC live/ready 200, owner API 401 без session и успешный login. Обе compaction Task сохранили прежние конечные состояния и все 14 history items каждая. Новая Task `e1362104-4cab-4339-bb4b-140b29da9181` вернула точно 323, complete=true, 2/10 model turns. Logout 200, settings не менялись | D2 по-прежнему WORKING; только чтение, без cancel/replay/stop attestation. Это проверка доступности и сохранности после сообщения владельца, не независимый proof deployed digest или GetTask 404 recovery. Receipt: `cloudru-post-user-rollout-verification-20261028.json` |
 | Planning OFF/ON после restart | OFF: Python→Python, ноль planning calls. ON/every2: next_steps→Python→Python→next_steps. Обе Task completed/complete=true, точный ответ72, failed calls0. Исходный next_steps=null восстановлен сразу после admission и до initial-material allow, revisions24/26 | Проверены pinned settings обеих задач и cadence; два compactions ещё отдельный gate. Receipt: `cloudru-next-steps-live-20261028.json` |
 | Две pressure-порции после restart — не пройдено | Task `709d2ff2-8c0a-4938-abd5-223930d7842e` приняла две порции по 14100 bytes и ответы на оба owner question. Native logs подтверждают: после первой порции сжатия нет; после второй две попытки, turns 6/7, обе `summary_too_large`, затем `FAILED / CONTEXT_UNRECOVERABLE` в 12:21:56 UTC. Успешных `context.compacted` нет | Реальная working_capacity 8016: порог 7214,4, pinned 900, лимит summary 302 и 241 при повторе. Исходный расчёт probe был неточен: первая порция не создала pressure. Timeout/provider failure отсутствует. context_window 128000 восстановлено при admission, revision 28; logout 200. Receipt: `cloudru-two-compactions-live-20261028.json`; native events — предоставленные оператором логи |
-| Исправленный pressure probe — строгая приёмка не пройдена | Task `a97f12e0-6038-4c52-bdac-92970e70275b`, run `5f0acff8-b861-4567-8acb-f8efaddc9a43`: короткий prompt 655 bytes и две порции по 22800 bytes. COMPLETED/complete=true в 12:47:12 UTC, 8/10 model turns, 5 successful tool calls; оба question/call IDs сохранены, повторных вопросов нет | Final содержит fences и batch_1/batch_2/final вместо одного требуемого объекта; release=PENDING вместо точного `PENDING; NOT RELEASED`. Route/artifact/amount верны. Число успешных compactions требует native events за 15:42–15:48 МСК. Не доказано, что значение утрачено именно summary: исходное значение не заключено в кавычки и содержит delimiter. Settings восстановлены при admission, revision 30; logout 200. Receipt: `cloudru-two-compactions-valid-live-20261028.json` |
+| Исправленный pressure probe — два сжатия подтверждены, строгий ответ не прошёл | Task `a97f12e0-6038-4c52-bdac-92970e70275b`, run `5f0acff8-b861-4567-8acb-f8efaddc9a43`: native `context.compacted` в 12:45:02 UTC — 8402→853, диапазон [1,6]; в 12:46:48 UTC — 8977→902, диапазон [1,11]. W=8016, итог 10,64% и 11,25%; обе первые попытки, ошибок сжатия в предоставленном интервале нет. COMPLETED/complete=true, 8/10 model turns, оба question/call IDs сохранены без повторов | Final содержит fences и batch_1/batch_2/final вместо одного требуемого объекта; release=PENDING вместо точного `PENDING; NOT RELEASED`. Route/artifact/amount верны. Это отрицательный результат конкретного строгого output check, не установленный дефект миграции или потери данных при сжатии: summary content не доступен, а исходное значение содержит некавыченный delimiter. Settings восстановлены при admission, revision 30; logout 200. Receipts: `cloudru-two-compactions-valid-live-20261028.json`, `cloudru-two-compactions-valid-native-events-20261028.json` |
 
 
 
 | Cloud idle cron 28 октября | Один automatic root создан в 09:07:01.599 UTC, через 1,599 s после due и до первого reconnect в 09:08:30 UTC. Наша тишина — 11m57s; владелец подтвердил закрытый UI к 09:00:38 UTC. Постоянно включённый 1 экземпляр подтверждён владельцем | Initial-input classifier за 0,507 s дал `suspicious`, поэтому unattended completion не доказан; timeout/provider error отсутствовал. Собственное расписание удалено, Task отменена. Receipt: `cloudru-cron-idle-20261028.json`; фактический HTTP-трафик платформы независимо не захватывался |
 
-Новый candidate опубликован отдельным version tag; Cloud на него ещё не обновлялся:
+Новый candidate опубликован отдельным version tag. Владелец сообщил об обновлении
+образа в Cloud; точная revision пока не подтверждена независимо:
 
 ```text
 blockchain.cr.cloud.ru/core-agent-gn:cloudru-remote404-20261028-948bae1
@@ -217,7 +221,7 @@ amd64 browser gate. Это доступ к репозиторию CI, не к Cl
 
 | Проверка | Уже есть | Что ещё должно быть в итоговом receipt |
 |---|---|---|
-| Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot при немедленном восстановлении настроек | Provider failure становится terminal в Cloud; два подтверждённых compactions сохраняют факты и выполненные действия |
+| Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot; native logs подтвердили два compactions с итогом 10,64% и 11,25% W, без повторных owner questions | Provider failure становится terminal в Cloud; строгий final format и точное сохранение всех полей пока не прошли; содержание summary отдельно не наблюдалось |
 | Формат ответа | После restart точный JSON-пример и literal `PENDING; NOT RELEASED` прошли; прежние длинные controls дали fences/`PENDING` | Сохранить факты через два подтверждённых compactions; отрицательные старые exact checks не приписывать compaction без evidence |
 | Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs | Исправить/проверить соответствие embedding dimension 2048 и configured index 1024; startup vector_index=true и отсутствие degraded_channels не доказывают подходящий индекс. Применимые permission negatives остаются |
 | MCP | Публичный Microsoft Learn discovery/call и локальные policy/storage tests | Контролируемый HTTPS peer с credentials, deny/HITL и reconnect после rollout |
@@ -299,7 +303,14 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   во время финального прогона; `cloudru-remote404-full-20261028.log` и
   `cloudru-remote404-source-frozen-20261028.json` сохраняют evidence.
   Новый version image опубликован и проверен отдельно (см. выше), `latest`
-  не перемещался. Повторная Cloud restart-проверка исправления ещё не выполнена.
+  не перемещался. Владелец сообщил об обновлении образа; повторная Cloud
+  restart-проверка исправления ещё не выполнена. Контролируемый HTTPS fixture
+  подтвердил один Send, plain GetTask 404 и последующий COMPLETED той же remote
+  Task. Parent после одного разрешения собственного wait завершился полностью;
+  Send/Cancel не повторялись. Точное удаление peer и остановка fixture/tunnel
+  подтверждены. Это live proof обработки 404, без перезапуска Cloud и без доступа
+  к private deadline: `cloudru-remote404-live-proof-20261028.json`.
+  Отдельное operator evidence: `cloudru-remote404-rollout-attestation-20261028.json`.
   Временный self-peer удалён по exact ID/revision, B note удалена одним CAS.
   A note после truthful partial удалена отдельной Task
   `27254e97-ef26-4f60-9b6c-b0139d257c02`: exact revision-1 read,
