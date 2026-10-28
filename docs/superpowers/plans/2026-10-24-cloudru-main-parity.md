@@ -410,7 +410,7 @@ credentials. Remote refs не менялись, CI не запускался. Re
 |---|---|---|
 | Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot; native logs подтвердили два compactions с итогом 10,64% и 11,25% W, без повторных owner questions | Provider failure становится terminal в Cloud; строгий final format и точное сохранение всех полей пока не прошли; содержание summary отдельно не наблюдалось |
 | Формат ответа | После restart точный JSON-пример и literal `PENDING; NOT RELEASED` прошли; прежние длинные controls дали fences/`PENDING` | Сохранить факты через два подтверждённых compactions; отрицательные старые exact checks не приписывать compaction без evidence |
-| Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs | Исправить/проверить соответствие embedding dimension 2048 и configured index 1024; startup vector_index=true и отсутствие degraded_channels не доказывают подходящий индекс. Применимые permission negatives остаются |
+| Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs; текущий provider из `.env` отдельно вернул 1024 | Проверить модель и размерности сохранённого target corpus после прежнего ответа 2048, соответствие реального индекса и query plan; startup vector_index=true и отсутствие degraded_channels этого не доказывают. Применимые permission negatives остаются |
 | MCP | Публичный Microsoft Learn discovery/call и локальные policy/storage tests | Контролируемый HTTPS peer с credentials, deny/HITL и reconnect после rollout |
 | A2A и файлы | Прежние 0.3/1.0 и remote proofs; после обновления — dedup/conflict, terminal SSE, новый follow-up, download/raw A2A bytes и immutable старое вложение после исправления | Применимые reconnect/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
 | Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial, wrong-Origin denial без потери сессии, owner/external Task isolation | Итоговые settings/peer/material cards, session expiry/rotation; общий external principal остаётся утверждённым ограничением Cloud-профиля |
@@ -504,9 +504,16 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   незавершённый `core_task_wait` без pending owner decisions подтверждены двумя
   чтениями 19:07:04 / 19:07:36 UTC. До restart рабочий `sudoku_app.py` и его
   immutable artifact совпали: 10744 bytes, SHA-256 `6e9b994b96ec2a1cbf6d11a20529fb47fa8b7af12afb2840aa2e4e0b3dcdcc6f`.
-  Peer удерживает WORKING до явного сигнала после operator restart, затем
-  возвращает один plain404 и COMPLETED; новый execution не запускается.
-  Оператору передан сигнал; сам restart и итог ещё не подтверждены.
+  Peer удерживал WORKING до сигнала после operator restart; новый execution
+  не запускался. Подтверждение оператора в ограниченном окне не пришло:
+  release не выполнялся, fixture/tunnel завершились по TTL. Прогон restart
+  не засчитан. После остановки fixture remote operation перешла в `failed`
+  с `REMOTE_AGENT_UNAVAILABLE`, root — в `TASK_STATE_COMPLETED`; этот статус
+  root не означает успешную проверку восстановления. Собственный peer удалён
+  по exact ID/revision только после обоих terminal states, отсутствие записи
+  подтверждено; повторных Send/Cancel не было. Cleanup receipt:
+  `cloudru-restart-wait-20261028/expired-probe-cleanup.json`.
+  Для повторной проверки требуется новое согласованное окно перезапуска.
   Это public observation, не чтение private durable checkpoint. Подготовка:
   `cloudru-restart-wait-20261028/prepared.json`; сценарий проверен через
   `deepseek-team` и независимо локально ведущим агентом
@@ -538,9 +545,30 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   Это локальная проверка ограничения и возможного решения, не закрытый target
   index gate: текущий adapter использует `vector`, а внедрение `halfvec` требует
   согласованного query/index expression и оценки точности отбора кандидатов.
-  Перед выбором запрошены фактические `EMBEDDING_MODEL` / `EMBEDDING_API_BASE`
-  целевого агента. Смена модели требует оценки пересчёта corpus даже при той же
-  размерности: per-vector provenance модели сейчас не сохраняется.
+  Пользователь указал текущий `.env` как источник конфигурации: в нём
+  `Qwen/Qwen3-Embedding-0.6B`, `https://foundation-models.api.cloud.ru/v1`
+  и размерность 1024. Эти значения не объясняют прежний ответ 2048 сами по себе;
+  фактическую конфигурацию deployed process и состав сохранённых векторов
+  независимо не читали. Смена модели требует оценки пересчёта corpus даже
+  при той же размерности: per-vector provenance модели сейчас не сохраняется.
+  Через существующий `HttpEmbeddingProvider` один синтетический запрос к текущему
+  провайдеру вернул 1024, norm=1.0, без warning. Первоначальный локальный TLS
+  отказ объяснён отсутствующим default CA bundle; воркер использовал установленный
+  certifi только через process-local `SSL_CERT_FILE`, сохранив `CERT_REQUIRED`
+  и hostname verification. Независимая проверка ведущего подтвердила trust setup,
+  отсутствие секретов в receipts и границы доказательства. Артефакты:
+  worktree `.enterprise-work/embedding-provider-worker-proof.json` и
+  `deepseek-team-20261028/embedding-provider-lead-review.json`.
+  Проверка возражения reviewer через локальный `EXPLAIN` показала: параметр
+  размерности не запрещает partial HNSW при custom plan; принудительный generic
+  plan использует seq scan. Это доказательство eligibility на временной таблице,
+  не план целевого запроса или измерение production performance. Receipt:
+  `deepseek-team-20261028/memory-partial-index-lead-check.json`.
+  Применён workflow «исполнитель + self-check → отдельный reviewer → проверка
+  ведущего». Reviewer оставил частичные артефакты и дважды вышел по timeout;
+  его процесс не считается успешным review. Ведущий завершил разбор, приняв
+  только подтверждённые source/SQL/provider выводы и сохранив опровержения:
+  worktree `.enterprise-work/memory-review-lead-disposition.txt`.
   Эти отдельные проблемы не объявляются причиной D2 или remote 404. Перекрытие процессов в общих логах
   без instance identity не закрывает overlap gate. Доказательства:
   `cloudru-rollout-operator-log-facts-20261028.json`,
