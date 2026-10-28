@@ -11,10 +11,11 @@
 ## Актуальный план — 28 октября 2026
 
 **Статус:** опубликован новый candidate `83edd16` с исправлением recovery,
-приватной диагностикой ошибок и обычным output limit 16384. Его rollout в Cloud
-ещё не выполнен. Предыдущие пользовательские логи и успешный FM readback
-относятся к прежнему deployment; это не прохождение всей приёмки или независимая
-сверка deployed digest.
+приватной диагностикой ошибок и обычным output limit 16384. Владелец подтвердил
+его обновление в Cloud 28 октября. После этого прошли readiness/auth, обычный
+ответ, dedup, полный ответ через SSE и создание/исправление приложения судоку
+с публикацией файлов. Точный deployed digest независимо не прочитан;
+подтверждение владельца и эти функциональные проверки не закрывают всю приёмку.
 Recovery-loop после non-retryable HTTP 404 исправлен локально в `83edd16`:
 известный отказ сохраняется в `FAILED` до освобождения lease; повторный recovery
 не вызывает provider. Подтверждены отмена, cooperative worker stop, incomplete
@@ -52,9 +53,12 @@ native amd64/browser и оставшиеся целевые Cloud release proofs
 | Ordinary suite пакета `18cafd6` | 2498 tests за 432,598 s, exit 0, 16 skips; `error-logs-full.log` | Локальные fixtures; skips не закрывают обязательные native/browser проверки |
 | Recovery fix 28 октября | `83edd16`: 293 targeted tests; 2503 tests полного ordinary suite за 715,572 s, exit 0, 16 skips; Ruff и 6 spec/lock checks прошли. Независимый review нашёл два дополнительных edge case, оба исправлены и покрыты проверками | Все новые regression proofs входят в ordinary suite; native/browser и Cloud rollout нового пакета остаются отдельными gates |
 | Image `18cafd6` | linux/amd64; 17 diagnostic tests без skips; совпали 138 source/UI hashes, default 16384 проверен в image; version tag и `latest` прочитаны из registry | Проверка прежнего опубликованного пакета, а не digest работающего Cloud deployment |
-| Новый image `83edd16` | linux/amd64, user `agent`, revision label проверен; 23 diagnostic/recovery tests; совпали 138 source/UI hashes; изменён только `core_agent/runtime.py` поверх pinned `18cafd6`; immutable version tag прочитан из registry | Пакет для следующего Cloud rollout; native/browser gates и runtime deployment ещё не подтверждены |
+| Новый image `83edd16` | linux/amd64, user `agent`, revision label проверен; 23 diagnostic/recovery tests; совпали 138 source/UI hashes; изменён только `core_agent/runtime.py` поверх pinned `18cafd6`; immutable version tag прочитан из registry | Обновление Cloud подтверждено владельцем; точный deployed digest, native amd64/browser и оставшиеся platform gates ещё не подтверждены |
 | Cloud functional proofs | A2A 0.3/1.0, owner login/history/download, оригиналы и immutable results, MCP discovery/call, memory/NER, skills, terminal/Python, root/child workspace, background cancel и remote Send/Get/Cancel | Подробные сценарии и ограничения сохранены в архиве; полной матрицы на последнем image ещё нет |
 | Cloud readback 28 октября | Health/live и ready, owner login, settings revision 22 и FM model discovery вернули HTTP 200; выбранная `Qwen/Qwen3.5-397B-A17B` есть в каталоге; context 128000, structured reasoning off/chat_template, next steps enabled/every=5 | Только чтение настроек и доступность API; не новый model/tool run и не сверка deployed digest. Receipt: `cloudru-current-readiness-20261028.json` |
+| После обновления Cloud 28 октября | Health, owner auth и доступная выбранная Qwen подтверждены; неавторизованный owner GET и wrong-Origin logout отклонены, рабочая сессия сохранилась. Ответ `323` на 17×19 завершён за 2 хода модели с `core_next_steps`; duplicate Send вернул прежнюю Task без расходования budget, изменённый Message с тем же ID дал `MESSAGE_ID_CONFLICT` | Receipts `cloudru-post-rollout-readiness-20261028.json`, `cloudru-post-rollout-simple-20261028.json`; session expiry/rotation и external isolation этим не закрываются |
+| Полный ответ через SSE после обновления | Follow-up в том же чате создал новую Task; stream содержал SUBMITTED, WORKING без текста и COMPLETED с единственным полным ответом 1…30. Ровно 3 события, итог точный, complete=true, 2 хода модели, logout 200 | Receipt `cloudru-post-rollout-stream-20261028.json`; проверены фактические события одного нового stream, не произвольное сетевое разъединение |
+| Судоку после обновления | Исходная задача завершена за 4/10 ходов, 3 tools; файл опубликован. Независимая проверка обнаружила пропущенный `fill_box`. Агент исправил свой код follow-up за 8/10 ходов, 7 tools; syntax, генерация/решение easy/medium/hard, строки/столбцы/блоки и clues прошли независимо. Старое вложение осталось побайтно неизменным | Ошибка была в сгенерированном приложении; прежний runtime budget/recovery сбой не повторился в обоих запусках. GUI не запускался. Receipts `cloudru-post-rollout-sudoku-20261028.json` и `cloudru-post-rollout-sudoku-repair-20261028.json`; глобальные settings и guardrails не менялись |
 | Cloud restart proofs | Owner/HITL waits и memory пережили rollout; peer context сохранился между двумя операциями, файлы совпали по bytes/digest | Timer и background command завершились до прежнего rollout: активное execution через замену ими не проверено |
 | Локальные durability/security proofs | 174 storage/recovery проверки, ещё 56 security/config/restart проверок; coordinated PostgreSQL/S3 restore и runtime role grants | ARM64 VM/source overlay, инъекция S3 errors и disposable restore не заменяют native matrix, Cloud outage или target restore |
 | Дополнительные image gates 28 октября | Exact `18cafd6` Docker restart identity: 1 test passed. Дополнительная amd64 QEMU VM: 34 tests, zero skips, одна ошибка preflight после 10,027 s; cleanup подтверждён, OOM отсутствует | Native gate на ARM64 Docker отказал из-за несовпадения архитектуры; QEMU-прогон не прошёл и не заменяет native proof. Browser fixture пока отсутствует. Receipt: `cloudru-remaining-local-gates-20261028.json` |
@@ -74,8 +78,9 @@ sha256:cdc92975968525ef2d6b9a31cfcca31c0bc526f2012e41db73d58bd2043e3746
 `cloudru-recovery-image-smoke-20261028.json`,
 `cloudru-recovery-image-tests-20261028.log`,
 `cloudru-recovery-version-registry-20261028.txt`.
-Version tag и `latest` прочитаны из registry с одинаковым указанным digest;
-live Cloud deployment этим не менялся.
+Version tag и `latest` прочитаны из registry с одинаковым указанным digest.
+После публикации владелец сообщил об обновлении Cloud через UI платформы;
+независимая сверка digest запущенного экземпляра остаётся открытой.
 
 Публикация предыдущего `18cafd6` подтверждена 27 октября в `19:00:23 UTC`.
 Receipts находятся в
@@ -162,16 +167,26 @@ amd64 browser gate. Это доступ к репозиторию CI, не к Cl
 
 | Проверка | Уже есть | Что ещё должно быть в итоговом receipt |
 |---|---|---|
-| Модель, контекст, next steps | Прежние обычные ответы, два owner question без повторения; optional planning локально | Обычный/streaming/tool ответ на новом image; planning off/on и cadence; provider failure становится terminal; два подтверждённых compactions сохраняют факты и выполненные действия |
+| Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools и успешный repair follow-up; optional planning локально и фактический `core_next_steps` в новых запусках | Planning off/on и cadence; provider failure становится terminal в Cloud; два подтверждённых compactions сохраняют факты и выполненные действия |
 | Формат ответа | Короткий strict JSON control прошёл; длинные Qwen controls дали fences/`PENDING` | Отдельная проверка с однозначно заданным JSON-примером и точным literal; отрицательные старые exact checks сохраняются, их причина не приписывается compaction без evidence |
 | Memory/skills | CRUD, vector/NER, child allowlist, activation/resources; memory после rollout | Применимые permission negatives и сохранность индексов/настроек на итоговом deployment |
 | MCP | Публичный Microsoft Learn discovery/call и локальные policy/storage tests | Контролируемый HTTPS peer с credentials, deny/HITL и reconnect после rollout |
-| A2A и файлы | 0.3/1.0, dedup, SSE cases, Send/Get/Cancel, peer context/files и cold originals | Применимые reconnect/follow-up/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
-| Owner UI и доступ | Login/logout/history/download, scoped owner API | Итоговые settings/peer/material cards, session expiry/rotation, Origin/CSRF и external isolation |
+| A2A и файлы | Прежние 0.3/1.0 и remote proofs; после обновления — dedup/conflict, terminal SSE, новый follow-up, download/raw A2A bytes и immutable старое вложение после исправления | Применимые reconnect/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
+| Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial и wrong-Origin denial без потери сессии | Итоговые settings/peer/material cards, session expiry/rotation и external isolation |
 | Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial | Два одновременно работающих чата, root/child cancellation/checkpoint и cleanup при замене экземпляра |
 
-- [ ] После опубликованного исправления попросить оператора выбрать candidate в UI платформы; подтвердить readiness, owner login и один успешный model/tool run. Точный deployed digest фиксировать по доступным данным UI, а при их отсутствии оставить явно непроверенным.
+- [x] Оператор сообщил об обновлении image; readiness, owner login и успешные model/tool runs после обновления подтверждены. Точный deployed digest остаётся явно непроверенным: Agent Card version `1.0.0` не идентифицирует сборку.
 - [ ] Для каждой строки сохранить результат «прошло / воспроизводимый дефект / ограничение профиля» с Task IDs, версией candidate и безопасными receipts; исправлять только выявленные дефекты в общей точке.
+
+Task IDs нового функционального прогона: обычный ответ
+`fcaf582d-ce96-472e-abae-44551b7c990d`, streaming follow-up
+`d9861256-9aa9-4c80-b90e-abea36fa6caa`, судоку
+`70cd023c-512d-4d18-8e5c-6ded8e4fb35c`, исправление судоку
+`09913c8c-163e-4b2d-bfd2-89e4c7ae6635`. Исходный файл: 10387 bytes,
+SHA-256 `881b37a6cf48447e95b161f245de2df231c0a305434371054d8564a02cfa72b2`;
+исправленный: 10744 bytes,
+SHA-256 `6e9b994b96ec2a1cbf6d11a20529fb47fa8b7af12afb2840aa2e4e0b3dcdcc6f`.
+Оба опубликованных snapshot прочитаны после исправления и проверены независимо.
 
 #### 4. Получить оставшиеся platform proofs через UI оператора
 
