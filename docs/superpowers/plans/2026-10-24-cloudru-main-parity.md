@@ -529,6 +529,18 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   embeddings автоматически не выполняется. Источник ограничения:
   [официальный pgvector](https://github.com/pgvector/pgvector#hnsw).
   Receipt `cloudru-restart-memory-prefetch-diagnosis-20261028.json`.
+  Дополнительный разбор через `deepseek-team` проверен ведущим агентом по source
+  и на локальных PostgreSQL 17.10 / pgvector 0.8.6: смешанные `real[]` 1024/2048
+  сохраняются, SQL cosine выбирает 2048-строку; HNSW `vector(2048)` отклоняется,
+  HNSW `halfvec(2048)` создаётся без изменения исходных векторов. Временная
+  таблица и оба индекса откатились одной транзакцией. Receipt:
+  `deepseek-team-20261028/memory-index-postgres-lead-check.json`.
+  Это локальная проверка ограничения и возможного решения, не закрытый target
+  index gate: текущий adapter использует `vector`, а внедрение `halfvec` требует
+  согласованного query/index expression и оценки точности отбора кандидатов.
+  Перед выбором запрошены фактические `EMBEDDING_MODEL` / `EMBEDDING_API_BASE`
+  целевого агента. Смена модели требует оценки пересчёта corpus даже при той же
+  размерности: per-vector provenance модели сейчас не сохраняется.
   Эти отдельные проблемы не объявляются причиной D2 или remote 404. Перекрытие процессов в общих логах
   без instance identity не закрывает overlap gate. Доказательства:
   `cloudru-rollout-operator-log-facts-20261028.json`,
