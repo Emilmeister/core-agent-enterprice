@@ -181,6 +181,11 @@ criterion должны войти в тот же завершённый change. 
   disposable PostgreSQL service; тест восстанавливает только собственную schema
   и копию test blobs, сохраняя encryption key вне dump. Это proof отката до новых
   application writes, а не разрешение восстановить старый backup поверх новых данных.
+- `deploy/cloudru-memory-readback.sql` — read-only psql inventory памяти с
+  обязательным tenant/app/user/namespace scope; возвращает размерности и index
+  definitions без содержимого документов и значений векторов. Запуск и границы
+  доказательства описаны в `docs/cloudru-memory-readback.md`; это не миграция,
+  не query-plan proof и не автоматическое закрытие Cloud memory gate.
 - `docker-compose.yml` — локальный PostgreSQL, migration job, agent и Phoenix.
   Профиль `local-ui` добавляет development Keycloak; `keycloak-init` запускает
   `deploy/local-keycloak.py`, создавая initial realm import из `.env` в private

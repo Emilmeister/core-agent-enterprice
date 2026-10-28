@@ -712,6 +712,14 @@ restart/checkpoint и native CI этим прогоном не закрываю�
 worktree: `.enterprise-work/concurrent-cancel-20261028/report.json`, SHA-256
 `6fcb32d5aa82ab13accd7e4d9321de9e81e58d8cffbd0dd0ada0f105b60182ec`.
 
+Read-only readback 29 октября снова получил parent/history HTTP 200, отдельный
+child GetTask — HTTP 404; terminal child receipt в доступной истории не найден.
+Новых задач, cancel/approval или settings mutations не было, logout — 200.
+Receipt `concurrent-cancel-20261028/late-terminal-readback-20261029.json` не
+закрывает child-state gate. Новый root не может прочитать старого child через
+`core_task_get`: scheduler проверяет точный `owner_run_id`, а owner peer projection
+выбирает только `remote_a2a`. Эти границы доступа не обходятся ради доказательства.
+
 Подготовка использовала исполнителя с самопроверкой и отдельного reviewer.
 Первый self-check пропустил ошибки approval binding, cleanup и criteria;
 reviewer завершился на provider HTTP 404 без отчёта. Повтор автора сохранил
@@ -909,6 +917,21 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   его процесс не считается успешным review. Ведущий завершил разбор, приняв
   только подтверждённые source/SQL/provider выводы и сохранив опровержения:
   worktree `.enterprise-work/memory-review-lead-disposition.txt`.
+  Для конкретного operator readback подготовлены
+  `deploy/cloudru-memory-readback.sql` и `docs/cloudru-memory-readback.md`:
+  один JSON inventory в read-only repeatable-read transaction, обязательные
+  tenant/app/user/namespace filters, размерности и реальные index definitions,
+  без content/paths/document IDs/vector values. На отдельном PostgreSQL 17.11 /
+  pgvector 0.8.6 после текущих migrations проверены mixed 1024/2048/null, четыре
+  scope boundaries, SELECT-only role, missing-variable exit 3, quoted/backslash
+  values и неизменность corpus. Actual table schema включена в receipt.
+  Локальный контейнер и его volumes удалены после проверки; evidence находится
+  в worktree `.enterprise-work/memory-readback-20261029/`. Свежий DSH reviewer
+  завершил static review и correction session; реальные SQL checks выполнил
+  ведущий, финальные hashes и границы зафиксированы в `lead-validation.json`.
+  Это проверка самого SQL,
+  не целевого corpus или реального query plan. Подключения к целевой PostgreSQL
+  в локальном `.env` нет; способ operator execution запрошен отдельно.
   Эти отдельные проблемы не объявляются причиной D2 или remote 404. Перекрытие процессов в общих логах
   без instance identity не закрывает overlap gate. Доказательства:
   `cloudru-rollout-operator-log-facts-20261028.json`,
