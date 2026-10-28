@@ -47,10 +47,26 @@ jobs:
           echo "$RUNNER_TEMP/core-sandbox/bin" >> "$GITHUB_PATH"
       - name: Build native application image
         run: docker build -t core-agent:sandbox .
-      - name: Verify native container restart identity
+      - name: Verify native restart identity and persisted replacement
         env:
           CORE_AGENT_RESTART_TEST_IMAGE: core-agent:sandbox
-        run: uv run python -m unittest tests.test_execution_restart_docker -v
+        run: |
+          TEST_POSTGRES_CONTAINER=$(docker run -d --network bridge \
+            -p 127.0.0.1::5432 -e POSTGRES_DB=core_agent \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=test \
+            pgvector/pgvector:pg17@sha256:7ae6051efd0e60444282c27c7e141af07f322ce033300e727a49c3dd11075e38)
+          trap 'docker rm -fv "$TEST_POSTGRES_CONTAINER" >/dev/null' EXIT
+          export TEST_POSTGRES_CONTAINER
+          for attempt in {1..30}; do
+            if docker exec "$TEST_POSTGRES_CONTAINER" pg_isready -U postgres -d core_agent; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec "$TEST_POSTGRES_CONTAINER" pg_isready -U postgres -d core_agent
+          restart_pg_address=$(docker port "$TEST_POSTGRES_CONTAINER" 5432/tcp)
+          export TEST_DATABASE_URL="postgresql://postgres:test@${restart_pg_address}/core_agent"
+          uv run python -m unittest tests.test_execution_restart_docker -v
       - name: Verify required native Landlock and seccomp against the candidate image
         env:
           LANDLOCK_TEST_IMAGE: core-agent:sandbox

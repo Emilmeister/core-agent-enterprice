@@ -86,6 +86,23 @@ Runtime остаётся на `948bae1`: после него до начала �
 сохранён. Ruff, 6 spec/lock checks и whitespace checks прошли. Frozen spec и
 hash lock не менялись; пользователь разрешил изменения этих существующих tests.
 
+Выявлен и закрыт пробел CI wiring: persisted replacement method требовал обе
+PostgreSQL переменные, а прежний native restart step передавал только image,
+поэтому новый method пропускался. Теперь этот же шаг в обоих native jobs
+создаёт отдельный pinned PostgreSQL 17 в default Docker bridge с динамическим
+loopback-портом, ограниченно ждёт readiness и передаёт `TEST_DATABASE_URL` /
+`TEST_POSTGRES_CONTAINER`. EXIT trap удаляет только созданный container ID
+и его anonymous volume; пользовательские сервисы не выбираются по имени.
+
+Точный shell body этого CI-шага выполнен локально с итоговым ARM64 образом
+`b50b6eb1`: оба restart/replacement tests прошли за 22,570 s, exit 0, без skips.
+Docker readback подтвердил отсутствие нового PostgreSQL fixture; прежние
+контейнеры сохранены. YAML parse, `bash -n`, actionlint 1.7.12 и whitespace
+checks прошли; встроенные shellcheck/pyflakes не запускались из-за отсутствия
+этих отдельных инструментов. Receipt: `local-first-restart-ci-20261028/result.json`.
+Это локальное исполнение CI-команд, а не результат GitHub matrix: native amd64
+и особенности Ubuntu hosts ещё должны пройти обязательный CI gate.
+
 Браузерный прогон нашёл дефект `Chat.closePeer`: подключённая к DOM кнопка
 открытия внутри закрытого `details` не может получить фокус. В `d85744e`
 используется уже существующая видимая кнопка панели как fallback; свёрнутая
