@@ -633,6 +633,37 @@ substring и по слишком широкому выводу о verifier MAY. 
 завершённым review. Ведущий проверил сохранённые поправки и сопоставил реальные
 Artifacts и байты draft/review; receipt `semantic-controls-lead-audit.json`.
 
+Следующий process-local instruction control также **не прошёл** исходный gate.
+DSH author сохранил черновик, но завершился timeout 120 s без законченной
+самопроверки. Ведущий убрал неоднозначное «до разделителя поля» и ограничение
+слияния по ID/name, сохранив требования provenance/security; кандидат 1774 chars
+сохранён отдельно в `current-state-instruction-lead.txt`, product source не менялся.
+На неизменённом original input получены два compactions 8071→974 и 8885→1191
+при W=8016, затем один JSON-объект с правильными ключами и route, но неверным
+`release: "PENDING"`. Уже первая summary разделила исходное значение на
+`release="PENDING"; status="NOT RELEASED"`, хотя поля `status` в исходных данных
+нет; вторая сохранила это разделение. Отдельная inference попала в запись
+`basis: fact`. Receipt `current-state-original/run.json`, 3 calls, exit 3.
+
+Контроль **без compaction**, с полными original context/messages и теми же
+protected kernel/profile layers, тоже вернул `release: "PENDING"`: один запрос,
+7090 ms, exit 3, `no-compaction-original-profile-control.json`. Trusted clock
+annotations между контролями отличаются; это не полностью идентичные запросы
+и не доказательство внутренней причины поведения модели. Однако ошибка final
+наблюдается также без summary; её нельзя считать исключительно следствием
+compaction. Сохранность данных в самих summary при этом отдельно нарушена.
+Успех прежнего quoted control относится к другому представлению input и другой
+инструкции; он не закрывает original gate и не подтверждает новый кандидат.
+Сравнение остаётся `json.loads(raw) == expected`: whitespace/key order допустимы,
+fences, лишние поля и изменённые значения — нет. Проверки ведущего сохранены
+в `current-state-lead-audit.json`. Кандидат не принят: дальнейшая настройка только
+summary не обоснована этим результатом; нужен exact original-data result с
+действующим полным runtime. Frozen spec/tests, Cloud settings и image не менялись.
+Свежий DSH reviewer завершил отдельное ревью и correction session с exit 0.
+Ведущий проверил исправленные выводы: отсутствие compaction в одном control не
+оправдывает неверную summary в другом; schema acceptance и exact fidelity — разные
+проверки. Отчёт `current-state-evidence-review.md`, hash/session — в lead audit.
+
 Сборка `99a5de6` использует immutable опубликованный `174dec5` как base и
 проверенный `core_agent/context.py` как новый image layer; зависимости, остальные
 runtime-файлы и UI совпадают. Это не полный rebuild исходного Dockerfile.
