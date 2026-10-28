@@ -10,15 +10,22 @@
 
 ## Актуальный план — 29 октября 2026
 
-**Статус:** по отдельному поручению владельца после локальных проверок опубликован
+**Статус:** 29 октября опубликован новый linux/amd64 candidate
+`blockchain.cr.cloud.ru/core-agent-gn:cloudru-local-verified-20261029-99a5de6`,
+digest `sha256:8194612c9f7cb0f6da2fcbc40f3bb1a71d59e56264ea5d3a6a576a5b731bd80e`.
+Registry readback подтвердил revision, user и layers; `latest` не изменялся.
+Развёртывание этой версии в Cloud ещё не подтверждено. Подготовлен свежий
+контролируемый MCP-сценарий; окно обновления ожидает ответа оператора.
+
+Ранее по отдельному поручению владельца после локальных проверок опубликован
 linux/amd64 candidate `174dec5` с исправлениями UI; version tag и digest подтверждены
 registry readback. Владелец сообщил об обновлении; последующие readiness/auth,
 сохранность прежних задач, новый ответ модели и bytes основных UI assets
 подтверждены на Cloud.ru. Полный deployed OCI digest публичный API не раскрывает;
 `latest` при публикации не обновлялся.
 После этой публикации локально исправлен выбор целых записей для короткой summary
-и уточнено сохранение точных значений при повторном сжатии. Эти изменения ещё
-не входят в опубликованный candidate. Контроль с JSON-значениями сохранил данные
+и уточнено сохранение точных значений при повторном сжатии. Эти изменения включены
+в новый candidate `99a5de6`. Контроль с JSON-значениями сохранил данные
 через два сжатия и вернул точный JSON; с полными инструкциями ядра вновь появилась
 Markdown-обёртка. Общая проверка final format и исходный текстовый pressure case
 остаются открытыми; новые результаты и ограничения приведены ниже.
@@ -548,6 +555,48 @@ Artifacts: `.enterprise-work/compaction-provider-local-20261029/concise-original
 полный runtime/restart/Cloud gate. Следующий шаг по этому пункту — добиться
 соблюдения полного output contract с действующими инструкциями ядра, сохраняя
 отрицательные исходные результаты; затем повторить целевой сценарий на candidate.
+
+Дополнительный bounded control с действующими app kernel/host/safety инструкциями
+и явно заданной provider JSON Schema вернул точный raw JSON. Схема требовала
+ровно четыре string-поля, без constants/enum, поэтому не подставляла ожидаемые
+значения. Использованы существующие `CompatibleHttpModel.extra_body.response_format`
+и явное отключение reasoning для этого диагностического запроса; выполнен один
+model call. Receipt: `provider-schema-control.json` в той же папке.
+Это подтверждает возможность провайдера, но не закрывает первоначальный gate
+без схемы и не доказывает совместимость схемы с непустым каталогом tools.
+
+Source review установил границы существующего решения: `LLM_EXTRA_BODY_JSON`
+допускает deployment-wide `response_format`, влияющий на все ordinary turns.
+Служебные summary/guardrails/NER задают собственные схемы. Настройка owner
+`structured_output` регулирует их reasoning; на normal-turn model composition
+root её не переносит. Отдельного per-task schema field в API/snapshot нет;
+добавление такого режима является новым согласуемым контрактом, а не исправлением
+compaction. Глобальная конфигурация и kernel instructions не менялись.
+DSH researcher проверил путь и после конкретных замечаний ведущего исправил
+неподтверждённые утверждения про обязательную answer phase и ordinary reasoning.
+Исходный strict gate не ослаблен, fences/лишние поля не нормализуются в pass.
+
+Сборка `99a5de6` использует immutable опубликованный `174dec5` как base и
+проверенный `core_agent/context.py` как новый image layer; зависимости, остальные
+runtime-файлы и UI совпадают. Это не полный rebuild исходного Dockerfile.
+Внутри packaged image совпал полный набор SHA-256 всех 138 runtime/UI файлов и
+реально импортированная инструкция summary; прошли 35 существующих context/runtime
+tests без skips. Проверены linux/amd64, user `agent`, revision и сохранение base layers.
+Это AMD64 smoke через ARM64 emulation, не native AMD64 release gate. Push выполнен
+только в новый version tag после подтверждения его отсутствия; readback OCI index
+и image config совпал с проверенным образом, `latest` до/после совпал.
+Receipt: `.enterprise-work/cloudru-local-verified-image-20261029-99a5de6/published.json`
+в основном репозитории; рядом `inputs.json`, `candidate-check.json`, build/push logs
+и registry readback. Cloud deployment агентом не изменялся.
+
+В Cloud worktree подготовлена `.enterprise-work/controlled-mcp-rollout-20261029/`:
+owner/peer scripts побайтово скопированы из ранее проверенного стенда, новая
+конфигурация и nonce появятся только при запуске. Peer/tunnel и Cloud operations
+не запускались. Критерии: до сигнала обновления — pending точного MCP approval и
+ноль tool calls; после подтверждённой замены — reconnect/new session, та же Task,
+однократный разрешённый вызов и terminal receipt; затем точная очистка собственных
+settings/policy и процессов. `prepared.json` фиксирует только подготовку,
+не прохождение сценария. Старый D2 не затрагивается.
 
 28 октября, 20:05–20:11 UTC, выполнен ограниченный сценарий двух чатов через
 owner API без изменения settings/policies. Parent A
