@@ -33,7 +33,88 @@ fallback budget finalizer и PostgreSQL reopen. В image прошли 23 regress
 checks; совпали 138 source/UI hashes; registry readback подтвердил version tag.
 Локальные native ARM64 Compose, restart, Kubernetes sandbox и Landlock gates
 пройдены на том же коде candidate без source overlay. GitHub CI matrix,
-native amd64/browser и оставшиеся целевые Cloud release proofs открыты.
+native amd64 (включая обязательный browser job) и оставшиеся целевые Cloud
+release proofs открыты. Дополнительный локальный ARM64 browser gate пройден
+после исправления фокуса `d85744e`; подробности ниже.
+
+### Очередность: сначала локальные проверки
+
+28 октября владелец уточнил порядок: сначала закрыть доступные локальные
+проверки, затем возвращаться к Cloud.ru. Новые Cloud API-прогоны, обновления
+и запросы перезапуска в этом локальном этапе не выполняются. Сравнительный
+DOCX больше не обновляется по отдельному указанию владельца.
+
+Проверяется текущий код `948bae1`: recovery активной команды, ожидания,
+полный цикл cron без HTTP, изоляция, PostgreSQL/S3 restore и настоящий browser
+flow. Уже прошедшие проверки неизменного кода используются как evidence;
+устраняются конкретные пробелы и прежние platform skips. Локальная среда —
+ARM64; emulation не выдаётся за обязательный native amd64 gate.
+Cloud-специфичными остаются фактическая замена экземпляра, ingress, idle CPU,
+платформенные credentials и восстановление ресурсов самого развёртывания.
+
+### Локальная проверка текущего кода — 28 октября
+
+Runtime остаётся на `948bae1`: после него до начала этого этапа менялся только
+план. Поэтому полный ordinary suite этого кода (2505 tests, exit 0, 16 skips)
+и прежние неизменные native proofs используются повторно. Новые проверки
+закрывают конкретные пропуски; skips не считаются пройденными gates.
+
+| Проверка | Результат | Граница |
+|---|---|---|
+| Runtime-образ до исправления UI | Native linux/arm64, `core-agent-local-first-native:948bae1-arm64-20261028`, ID `sha256:b651e03b829e0eb5173a20a7fac0d0c1e47bee988c220d812a79aab2411f69f4`; совпали все 138 runtime/UI файлов | Только локальная сборка, не опубликована; no runtime overlay |
+| Linux startup diagnostics | 4 прежних Linux-only теста прошли за 0,789 s, без skips; network none, dropped capabilities/read-only root, текущий образ | Проверка изоляции probes, ограничений вывода/времени и cleanup дочерних процессов; не proof enforcement Landlock |
+| SGID и restore workspace | 3 прежних Linux-only теста прошли за 2,059 s, без skips; текущий образ, собственные PostgreSQL/MinIO | Сохранение режима каталогов и checkpoint/restore; portable test launcher не подменяет native sandbox gate |
+| Полный automatic cron без HTTP | Реальный календарь и PostgreSQL coordinator приняли ровно одну Task, выполнили один model call и сохранили точный конечный ответ; после создания расписания HTTP отсутствовал | `ScriptedModel` и существующий classifier fixture, проверки включены, без policy changes/ручных решений; это локальный background proof, не проверка idle CPU Cloud |
+| Recovery и checkpoint fencing | 37 существующих тестов прошли за 2,319 s, без skips, включая реальные PostgreSQL fences; отдельный Docker restart identity — 1 test за 2,232 s | 37 тестов используют текущий source; identity run использовал прежний ARM64 образ `83edd16` и mount текущего identity module, совпадающего с установленным. Не объявляется 38 проверками нового образа |
+| Замена активного execution | Новый сценарий `test_replacement_waits_for_exact_stop_confirmation_without_replay` прошёл за 21,548 s, exit 0, без skips. A реально выполняет команду; при замене B прежний точный процесс ещё жив, B сохраняет cleanup_pending. Чужая generation отвергнута; после SIGKILL и Docker stopped-state точный CLI proof принят один раз, Task завершена `FAILED / SIDE_EFFECT_UNKNOWN`, replay отсутствует | Текущий packaged ARM64 runtime, только tests mount, реальные PostgreSQL и Bubblewrap/POSIX. HTTPS Origin и подписанная cookie проверяются; локальный HTTP представляет post-TLS hop, TLS этим не проверяется. Это общий recovery contract, не Cloud replacement/Landlock/S3 |
+| Полный браузерный сценарий | `CORE_AGENT_REQUIRE_BROWSER_TESTS=1`: 1 test, 194 проверки, 253,282 s, exit 0, без skips; реальные native ARM64 Pod, PostgreSQL, Keycloak и Mac Chromium. Пройдены файлы, согласования, история, peer panel, мобильная раскладка и logout | Дополнительный ARM64 proof; не заменяет обязательный native amd64 CI. В одном предыдущем прогоне просмотр guardrail-материала не появился за 45 s; причина не доказана и не объявляется исправленной |
+
+Приватные receipts/logs находятся в `.enterprise-work/` основного репозитория:
+`local-first-startup-linux-20261028.{json,log}`,
+`local-first-storage-scheduler-20261028.json`,
+`local-first-recovery-20261028.json`,
+`local-first-native-browser-20261028/result.json`,
+`local-first-native-browser-20261028/focus-source-ui-hashes.json`.
+Собственные storage/cron fixtures удалены; существующие пользовательские сервисы
+не затронуты. Ошибки промежуточных cron fixtures сохранены отдельно от зелёного
+результата; они не объявляются runtime-дефектами.
+
+Единый native replacement-сценарий сохранён в `503433a`; prerequisites
+добавлены в `AGENTS.md`. Повтор прежнего identity method на текущем образе
+также прошёл: 1 test за 2,276 s, без skips; существующий mount identity module
+сохранён. Ruff, 6 spec/lock checks и whitespace checks прошли. Frozen spec и
+hash lock не менялись; пользователь разрешил изменения этих существующих tests.
+
+Браузерный прогон нашёл дефект `Chat.closePeer`: подключённая к DOM кнопка
+открытия внутри закрытого `details` не может получить фокус. В `d85744e`
+используется уже существующая видимая кнопка панели как fallback; свёрнутая
+группа не раскрывается. Точная прежняя проверка Escape сохранена и прошла.
+Также исправлены три предпосылки browser fixture: выбирать только Open/Download
+при проверке busy, открывать сохранённый чат после reload и дождаться сообщений
+после мобильного remount. Outcome, security и layout assertions не ослаблялись.
+Нормативный UI-контракт не менялся; стабильные сведения `AGENTS.md` актуальны.
+
+На Node 24.8.0 прошли `npm ci`, `npm test`, `npm run typecheck`, `npm run build`;
+lockfile не изменился. Для браузера собран отдельный локальный образ
+`core-agent-local-first-native:peer-focus-arm64-20261028`, ID
+`sha256:b79effc6b8846f0c3262b46764800019429c4857d50456dd3285d4e183e7fe0f`.
+Это derived image от `b651e03`, с удалением прежнего `ui_dist` и полной заменой
+пересобранным UI; не полный rebuild исходного Dockerfile. Полный набор и bytes
+138 packaged Python/policy/UI файлов совпали, старые assets отсутствуют.
+Runtime overlay не применялся. Образы сохранены локально, не опубликованы;
+собственные browser cluster/services/network удалены.
+
+Отрицательные результаты browser attempts 1–5 сохранены. Причина одиночного
+сбоя Inspect в attempt 5 остаётся открытой: исходники допускают перемонтирование
+карточки при связывании с историей, но этот переход в упавшем прогоне не записан.
+В успешном attempt 6 read-only observer увидел GET 200 и тот же DOM-узел до
+просмотра/решения. Поэтому итоговый gate пройден, но устойчивость этого сценария
+не доказана серией повторов; успех не выдаётся за исправление неизвестной причины.
+
+До объявления полной миграции завершённой остаются разбор этой локальной
+диагностики, native amd64 CI и перечисленные ниже платформенные proofs.
+Локальные проверки не подтверждают фактическую остановку старого Cloud execution,
+deployed digest, ingress, idle CPU, production credentials или Cloud backup/restore.
 
 ### Границы текущей работы
 
@@ -46,8 +127,9 @@ native amd64/browser и оставшиеся целевые Cloud release proofs
 - Telemetry исключена пользователем из этого этапа. Существующие доказательства
   доставки OTLP не дополняются догадками. Native события compaction нужны только
   как доказательство соответствующего runtime-сценария из доступных журналов.
-- Свежие изменения frozen tests/spec ограничены согласованным recovery fix и его
-  regression proof; этот план не разрешает перенос остальных SGR-контрактов или
+- Изменения frozen tests/spec ограничены согласованными recovery/diagnostics
+  исправлениями и отдельно разрешёнными локальными browser/replacement тестами;
+  этот план не разрешает перенос остальных SGR-контрактов или
   изменение любых других замороженных требований ради зелёной проверки.
 - Оператор управляет Cloud deployment через UI платформы. План не требует от него
   `kubectl`, shell в Pod, прямого SQL или доступа к серверу БД. Проверки приложения
@@ -190,7 +272,7 @@ skip обязательного PostgreSQL proof не является успе�
 - [x] Дополнительно выполнить неизменный CI Compose command на native ARM64 Docker с локальной сборкой исходного Dockerfile и установленным кодом `83edd16`: composition-root terminal/Python/background test прошёл без skips. Локальный ARM64 image `sha256:58755bc69f28eb2619077a0f8d9a18da47bc23c453a78ac4f7d4114b33bf749e`; only-test mount, код образа не подменялся, все 138 source/UI hashes совпали. Это отдельный subset, не закрытие всей matrix.
 - [x] На том же ARM64 image выполнить restart identity (1 test), полный required sandbox Pod gate (15 tests, `pids.max=512`) и исходный required Landlock gate (40 tests) в аппаратной VZ Linux VM. Все exit 0, без skips; provenance и cleanup записаны в receipts выше. Эти локальные результаты не объявляются GitHub CI run или native amd64/Cloud proof.
 - [ ] Выполнить существующую CI matrix `sandbox-linux` на native amd64/arm64 с candidate image: Landlock/seccomp, restart identity, Compose Bubblewrap и sandbox gates; на amd64 — dedicated browser/Keycloak/PostgreSQL gate. Сохранить результаты каждой архитектуры без замены required flags на skips.
-- [ ] Для изменений UI выполнить из `ui/` `npm ci`, `npm test`, `npm run typecheck`, `npm run build` с Node.js 24; после изменения упаковки — `uv build --no-sources` и image smoke. Проверенные неизменные части не прогонять заново без причины.
+- [x] Для UI fix `d85744e` выполнены из `ui/` `npm ci`, `npm test`, `npm run typecheck`, `npm run build` с Node.js 24.8.0, lock неизменён. Dedicated browser сценарий дополнительно прошёл на локальном ARM64 image: 194 checks, без skips; это не amd64 CI. Packaging contract не менялся; точные image/UI bytes сверены. Одиночный предыдущий Inspect failure сохранён как открытая диагностика.
 
 Команды существующих gates на подготовленных fixtures из `.github/workflows/ci.yml`:
 
