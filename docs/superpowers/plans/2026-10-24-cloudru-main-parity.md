@@ -420,6 +420,24 @@ host checking сохранён. Remote refs не менялись. Receipt в Cl
 | Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial, wrong-Origin denial без потери сессии, owner/external Task isolation | Итоговые settings/peer/material cards, session expiry/rotation; общий external principal остаётся утверждённым ограничением Cloud-профиля |
 | Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial; 28 октября два собственных чата работали одновременно, отмена parent A не помешала завершению B, отложенный файл descendant A не появился | Прямое подтверждение terminal state child после parent cancel, root/child checkpoint и cleanup при замене экземпляра |
 
+Локальная сверка сохранённых receipts 29 октября сохранила отрицательный exact
+check: raw JSON не разбирается из-за fences; даже диагностическое снятие fences
+оставляет неверную структуру batch_1/batch_2/final и сокращённое release.
+Три остальных значения совпадают. Снятие fences не применяется к pass criterion.
+Два native compaction events и их границы подтверждены прежними логами повторно;
+новых обращений к Cloud или provider эта сверка не выполняла.
+
+Следующий шаг для этого пункта — локальный прогон с настоящим provider и записью
+обеих промежуточных summaries и входа финального model call. Существующий
+`PostgresOwnerAnswerCompactionTests.test_two_answered_questions_survive_pressure_compaction_and_restart_on_model_wire`
+подставляет и summaries, и конечный JSON; его зелёный результат доказывает
+dataflow/restart, но не качество сохранения фактов моделью. Повторять его для
+закрытия этого пробела не требуется. Исходный pressure case сохраняется;
+отдельный control с однозначно заданными JSON-значениями не заменяет прежний
+отрицательный результат. Отсутствие `NOT RELEASED` в промежуточном planning text
+до сжатия тоже не доказывает потерю исходного значения или причину ошибки.
+Проверенные критерии и ограничения: `.enterprise-work/compaction-facts-audit-20261028/lead-evidence.json`.
+
 28 октября, 20:05–20:11 UTC, выполнен ограниченный сценарий двух чатов через
 owner API без изменения settings/policies. Parent A
 `9075c6b2-dc35-4958-95c4-624c09cf06bb` запустил background child
