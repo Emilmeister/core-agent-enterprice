@@ -1,14 +1,214 @@
 # Core Agent: завершение адаптации main для Cloud.ru AI Agents
 
-> **For agentic workers:** После согласования использовать `subagent-driven-development` для независимых проверок или `executing-plans` для последовательных этапов. План согласован пользователем; связанные spec/tests/frozen hashes разрешены. Выполнение пакетное: весь код и документация, затем общий прогон и один candidate image. Документ не утверждает готовность выпуска.
+> **For agentic workers:** Использовать `subagent-driven-development` для независимых проверок или `executing-plans` для последовательных этапов. Пользователь поручил обновить этот план и выполнить его до конца. Актуальный порядок и границы разрешения приведены в разделе от 28 октября; прежние разрешения в архиве не расширяют текущую задачу. Документ не утверждает готовность выпуска.
 
-**Goal:** Довести `feat/cloudru-ai-agents` до рабочей поставки возможностей текущего `main` на Cloud.ru AI Agents, сохранив согласованные отличия платформенного профиля.
+**Goal:** Довести `feat/cloudru-ai-agents` до рабочей поставки согласованного среза возможностей `main` на Cloud.ru AI Agents, сохранив утверждённые отличия платформенного профиля.
 
 **Architecture:** Общие runtime, инструменты, UI, PostgreSQL и основной A2A 1.0 остаются едиными с main. Cloud.ru использует платформенный ingress, пароль владельца, совместимый внешний A2A 0.3, Landlock/seccomp и S3 для файлов; управление кластером не требуется.
 
 **Tech Stack:** Python/uv, PostgreSQL, S3, Landlock/seccomp, официальный A2A SDK, React/TypeScript, существующие unittest и native/browser проверки.
 
-**Статус:** после подтверждённого пользователем rollout batch3 проверены Cloud owner/HITL waits, память, peer files и завершение Qwen-задачи без повторного вопроса; её exact-format checks не прошли. 27 октября подтверждены 174 разные локальные PostgreSQL/S3/recovery проверки и ещё 56 security/config/restart проверок с указанными ниже границами. После исправления прежних fixtures полный suite batch4 v3 прошёл: 2451 tests, exit 0, 16 skips, исходники за прогон не изменились. Batch4 опубликован под version tag и `latest`, одинаковый digest подтверждён registry readback. Rollout batch4 в Cloud ещё не подтверждён. Native amd64/browser, целевые Cloud replacement/overlap и остальные release proofs не закрыты; digest работающего Cloud image публично не проверен.
+## Актуальный план — 28 октября 2026
+
+**Статус:** опубликован новый candidate `83edd16` с исправлением recovery,
+приватной диагностикой ошибок и обычным output limit 16384. Его rollout в Cloud
+ещё не выполнен. Предыдущие пользовательские логи и успешный FM readback
+относятся к прежнему deployment; это не прохождение всей приёмки или независимая
+сверка deployed digest.
+Recovery-loop после non-retryable HTTP 404 исправлен локально в `83edd16`:
+известный отказ сохраняется в `FAILED` до освобождения lease; повторный recovery
+не вызывает provider. Подтверждены отмена, cooperative worker stop, incomplete
+fallback budget finalizer и PostgreSQL reopen. В image прошли 23 regression
+checks; совпали 138 source/UI hashes; registry readback подтвердил version tag.
+Native/browser и оставшиеся целевые Cloud release proofs открыты.
+
+### Границы текущей работы
+
+- Рабочая копия: постоянный `.enterprise-work/cloudru-ai-agents`, ветка
+  `feat/cloudru-ai-agents`. Существующие реализации и receipts используются повторно.
+- Из SGR перенесён только `core_next_steps`, включая policy/HITL, cadence и owner UI
+  (`410a646`, `55ab58c`). Пункты 2/3 SGR не перенесены и не включаются автоматически.
+  На исходном `18cafd6` сравнение `main...HEAD` даёт `5 50`; старое утверждение
+  «весь текущий main входит в Cloud» больше не описывает состояние веток.
+- Telemetry исключена пользователем из этого этапа. Существующие доказательства
+  доставки OTLP не дополняются догадками. Native события compaction нужны только
+  как доказательство соответствующего runtime-сценария из доступных журналов.
+- Свежие изменения frozen tests/spec ограничены согласованным recovery fix и его
+  regression proof; этот план не разрешает перенос остальных SGR-контрактов или
+  изменение любых других замороженных требований ради зелёной проверки.
+- Оператор управляет Cloud deployment через UI платформы. План не требует от него
+  `kubectl`, shell в Pod, прямого SQL или доступа к серверу БД. Проверки приложения
+  выполняются через существующие owner UI/API и ограниченные agent tools; отдельные
+  native CI fixtures относятся к среде разработки, а не к управлению Cloud-кластером.
+
+### Что уже завершено и чем подтверждено
+
+| Слой | Подтверждённый результат | Граница доказательства |
+|---|---|---|
+| Код и конфигурация | Persistent memory gate, production Cloud/PostgreSQL/S3/Landlock config, required native CI wiring (`cbfca2d`); S3 cancellation fencing, cold file projections, peer discovery/polling, compaction framing и pinned kernel recovery (`619f157`) сохранены в ветке | Наличие кода и CI gate не подтверждает выполнение gate на целевой платформе |
+| Последующие изменения | Полный финальный ответ без response-control tool (`547cb98`), optional `core_next_steps` и UI, output default 16384 (`a481655`), private error causes (`18cafd6`) | Новые изменения после batch4 требуют своих proofs; прежние Cloud receipts относятся к своим версиям |
+| Ordinary suite пакета `18cafd6` | 2498 tests за 432,598 s, exit 0, 16 skips; `error-logs-full.log` | Локальные fixtures; skips не закрывают обязательные native/browser проверки |
+| Recovery fix 28 октября | `83edd16`: 293 targeted tests; 2503 tests полного ordinary suite за 715,572 s, exit 0, 16 skips; Ruff и 6 spec/lock checks прошли. Независимый review нашёл два дополнительных edge case, оба исправлены и покрыты проверками | Все новые regression proofs входят в ordinary suite; native/browser и Cloud rollout нового пакета остаются отдельными gates |
+| Image `18cafd6` | linux/amd64; 17 diagnostic tests без skips; совпали 138 source/UI hashes, default 16384 проверен в image; version tag и `latest` прочитаны из registry | Проверка прежнего опубликованного пакета, а не digest работающего Cloud deployment |
+| Новый image `83edd16` | linux/amd64, user `agent`, revision label проверен; 23 diagnostic/recovery tests; совпали 138 source/UI hashes; изменён только `core_agent/runtime.py` поверх pinned `18cafd6`; immutable version tag прочитан из registry | Пакет для следующего Cloud rollout; native/browser gates и runtime deployment ещё не подтверждены |
+| Cloud functional proofs | A2A 0.3/1.0, owner login/history/download, оригиналы и immutable results, MCP discovery/call, memory/NER, skills, terminal/Python, root/child workspace, background cancel и remote Send/Get/Cancel | Подробные сценарии и ограничения сохранены в архиве; полной матрицы на последнем image ещё нет |
+| Cloud readback 28 октября | Health/live и ready, owner login, settings revision 22 и FM model discovery вернули HTTP 200; выбранная `Qwen/Qwen3.5-397B-A17B` есть в каталоге; context 128000, structured reasoning off/chat_template, next steps enabled/every=5 | Только чтение настроек и доступность API; не новый model/tool run и не сверка deployed digest. Receipt: `cloudru-current-readiness-20261028.json` |
+| Cloud restart proofs | Owner/HITL waits и memory пережили rollout; peer context сохранился между двумя операциями, файлы совпали по bytes/digest | Timer и background command завершились до прежнего rollout: активное execution через замену ими не проверено |
+| Локальные durability/security proofs | 174 storage/recovery проверки, ещё 56 security/config/restart проверок; coordinated PostgreSQL/S3 restore и runtime role grants | ARM64 VM/source overlay, инъекция S3 errors и disposable restore не заменяют native matrix, Cloud outage или target restore |
+| Дополнительные image gates 28 октября | Exact `18cafd6` Docker restart identity: 1 test passed. Дополнительная amd64 QEMU VM: 34 tests, zero skips, одна ошибка preflight после 10,027 s; cleanup подтверждён, OOM отсутствует | Native gate на ARM64 Docker отказал из-за несовпадения архитектуры; QEMU-прогон не прошёл и не заменяет native proof. Browser fixture пока отсутствует. Receipt: `cloudru-remaining-local-gates-20261028.json` |
+| Cloud idle cron 28 октября | Один automatic root создан в 09:07:01.599 UTC, через 1,599 s после due и до первого reconnect в 09:08:30 UTC. Наша тишина — 11m57s; владелец подтвердил закрытый UI к 09:00:38 UTC. Постоянно включённый 1 экземпляр подтверждён владельцем | Initial-input classifier за 0,507 s дал `suspicious`, поэтому unattended completion не доказан; timeout/provider error отсутствовал. Собственное расписание удалено, Task отменена. Receipt: `cloudru-cron-idle-20261028.json`; фактический HTTP-трафик платформы независимо не захватывался |
+
+Последний опубликованный image:
+
+```text
+blockchain.cr.cloud.ru/core-agent-gn:cloudru-recovery-20261028-83edd16
+sha256:cdc92975968525ef2d6b9a31cfcca31c0bc526f2012e41db73d58bd2043e3746
+```
+
+Новые receipts: `cloudru-recovery-image-20261028.json`,
+`cloudru-recovery-image-smoke-20261028.json`,
+`cloudru-recovery-image-tests-20261028.log`,
+`cloudru-recovery-version-registry-20261028.txt`.
+Version tag и `latest` прочитаны из registry с одинаковым указанным digest;
+live Cloud deployment этим не менялся.
+
+Публикация предыдущего `18cafd6` подтверждена 27 октября в `19:00:23 UTC`.
+Receipts находятся в
+ignored `.enterprise-work/` основного репозитория, рядом с Cloud worktree:
+`cloudru-error-diagnostics-image-20261027-18cafd6.json`,
+`cloudru-error-diagnostics-image-smoke-20261027-18cafd6.json`,
+`cloudru-error-diagnostics-image-tests-20261027-18cafd6.log`,
+`cloudru-error-diagnostics-version-registry-20261027-18cafd6.txt` и
+`cloudru-error-diagnostics-latest-registry-20261027-18cafd6.txt`.
+
+- [x] Сохранить реализованные Cloud configuration/memory/native CI изменения и их локальные proofs (`cbfca2d`).
+- [x] Перенести согласованный `core_next_steps`, UI-настройку и проверить ordinary suite соответствующего пакета.
+- [x] Проверить и опубликовать пакет `18cafd6` с output default 16384 и приватной диагностикой.
+- [x] Сохранить прежние Cloud receipts с их фактическими ограничениями; не переносить результаты между версиями автоматически.
+
+### Оставшийся порядок выполнения
+
+#### 1. Завершить recovery fix и локальную регрессию
+
+Файлы: общие model/recovery paths в `core_agent/runtime.py`; существующие
+`tests/test_runtime_observability.py`, `tests/test_postgres_persistence.py`,
+`tests/test_interactions.py`. Связанное требование RUN-05 и точный spec lock
+обновляются только в пределах разрешённого исправления.
+
+- [x] Воспроизвести non-retryable model failure через recovery, включая повторное открытие PostgreSQL state; проверить число model calls и конечное состояние Task.
+- [x] Исправить общую точку завершения: окончательный provider failure сохраняется и освобождает чат; следующие recovery scans не запускают тот же model call. Сохранить действующие retryable budgets, cancellation, lease fencing и запрет повторного исполнения tools. Cooperative shutdown не теряет уже полученную ошибку; malformed budget finalizer сохраняет incomplete fallback.
+- [x] Выполнить targeted proof, затем Ruff, полный ordinary suite и spec checks на итоговых исходниках. Проверенное изменение сохранено в `83edd16`.
+
+Логи: `cloudru-recovery-targeted-final-20261028.log` (293),
+`cloudru-recovery-full-final-20261028.log` (2503, 16 skips),
+`cloudru-recovery-ruff-all-20261028.log`, `cloudru-recovery-spec-final-20261028.log`.
+Предыдущий полный прогон был прерван ради исправления найденных review edge cases;
+он не используется как доказательство готовности.
+
+Команды из Cloud worktree с существующими локальными disposable fixtures:
+
+```sh
+uv run --env-file ../cloudru-next-steps-fixtures-20261027.env python -m unittest tests.test_runtime_observability tests.test_postgres_persistence tests.test_interactions -v
+uv run ruff check core_agent tests
+uv run --env-file ../cloudru-next-steps-fixtures-20261027.env python -m unittest discover -s tests -v
+uv run python -m unittest tests.test_spec_quality tests.test_spec_lock -v
+git diff --check
+```
+
+Fixture ENV остаётся локальным, credentials не копируются в план или журнал.
+При недоступности fixture сначала восстановить собственную тестовую среду;
+skip обязательного PostgreSQL proof не является успешной проверкой.
+
+#### 2. Проверить новый пакет и обязательные native/browser gates
+
+- [x] Устранить ошибку workflow, мешавшую запуску jobs: job-level `env` использовал недопустимый контекст `runner.temp`; путь `KUBECONFIG` теперь задаётся первым runner step через `GITHUB_ENV` (`873de0d`). Checksum-verified actionlint 1.7.12 воспроизвёл ошибку до изменения и прошёл после. Проверены выражения/YAML и shell-вывод пути с пробелом; embedded shell/python linters и сами native jobs этим не заменяются.
+- [x] После исправления собрать один candidate `83edd16`, сверить runtime/UI bytes, выполнить image checks и сохранить immutable tag/digest. Образ `18cafd6` не содержит recovery fix; новый candidate опубликован отдельным version tag.
+- [ ] Выполнить существующую CI matrix `sandbox-linux` на native amd64/arm64 с candidate image: Landlock/seccomp, restart identity, Compose Bubblewrap и sandbox gates; на amd64 — dedicated browser/Keycloak/PostgreSQL gate. Сохранить результаты каждой архитектуры без замены required flags на skips.
+- [ ] Для изменений UI выполнить из `ui/` `npm ci`, `npm test`, `npm run typecheck`, `npm run build` с Node.js 24; после изменения упаковки — `uv build --no-sources` и image smoke. Проверенные неизменные части не прогонять заново без причины.
+
+Команды существующих gates на подготовленных fixtures из `.github/workflows/ci.yml`:
+
+```sh
+LANDLOCK_TEST_IMAGE=core-agent:sandbox bash deploy/landlock-native.sh
+CORE_AGENT_RESTART_TEST_IMAGE=core-agent:sandbox uv run python -m unittest tests.test_execution_restart_docker -v
+CORE_AGENT_REQUIRE_BROWSER_TESTS=1 uv run python -m unittest tests.test_owner_ui_files_browser -v
+```
+
+Первая команда сама включает required Landlock/seccomp flags. Browser-команда
+использует disposable Pod, Chromium, PostgreSQL и Keycloak, подготовленные CI.
+Docker LinuxKit без Landlock уже отклонил required gate; повторение той же среды
+не заменяет native Linux runner. Эти prerequisites обеспечиваются в CI/локальной
+среде разработчика без запроса доступа к Kubernetes целевого Cloud deployment.
+
+28 октября проверен удалённый CI: последние запуски завершались до создания jobs;
+последний исторический успешный запуск содержал только `verify`. Свежего native
+proof нет. В этой сессии отсутствует авторизованный GitHub transport: HTTPS
+credentials не найдены, SSH с проверенными официальными host keys отклонил
+предложенные ключи. После сохранения исправлений нужен авторизованный push этой
+ветки; существующий push-trigger запускает `verify`, затем обе native jobs и
+amd64 browser gate. Это доступ к репозиторию CI, не к Cloud Kubernetes/БД.
+
+#### 3. Закрыть функциональную матрицу на согласованном candidate
+
+Через owner UI/API использовать только собственные чаты, записи и временные
+подключения; сохранить исходные settings и восстановить их после проверки.
+
+| Проверка | Уже есть | Что ещё должно быть в итоговом receipt |
+|---|---|---|
+| Модель, контекст, next steps | Прежние обычные ответы, два owner question без повторения; optional planning локально | Обычный/streaming/tool ответ на новом image; planning off/on и cadence; provider failure становится terminal; два подтверждённых compactions сохраняют факты и выполненные действия |
+| Формат ответа | Короткий strict JSON control прошёл; длинные Qwen controls дали fences/`PENDING` | Отдельная проверка с однозначно заданным JSON-примером и точным literal; отрицательные старые exact checks сохраняются, их причина не приписывается compaction без evidence |
+| Memory/skills | CRUD, vector/NER, child allowlist, activation/resources; memory после rollout | Применимые permission negatives и сохранность индексов/настроек на итоговом deployment |
+| MCP | Публичный Microsoft Learn discovery/call и локальные policy/storage tests | Контролируемый HTTPS peer с credentials, deny/HITL и reconnect после rollout |
+| A2A и файлы | 0.3/1.0, dedup, SSE cases, Send/Get/Cancel, peer context/files и cold originals | Применимые reconnect/follow-up/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
+| Owner UI и доступ | Login/logout/history/download, scoped owner API | Итоговые settings/peer/material cards, session expiry/rotation, Origin/CSRF и external isolation |
+| Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial | Два одновременно работающих чата, root/child cancellation/checkpoint и cleanup при замене экземпляра |
+
+- [ ] После опубликованного исправления попросить оператора выбрать candidate в UI платформы; подтвердить readiness, owner login и один успешный model/tool run. Точный deployed digest фиксировать по доступным данным UI, а при их отсутствии оставить явно непроверенным.
+- [ ] Для каждой строки сохранить результат «прошло / воспроизводимый дефект / ограничение профиля» с Task IDs, версией candidate и безопасными receipts; исправлять только выявленные дефекты в общей точке.
+
+#### 4. Получить оставшиеся platform proofs через UI оператора
+
+Эти пункты требуют действий или evidence оператора платформы. Агент заранее
+готовит ограниченный сценарий и собственные тестовые данные; оператор выполняет
+доступное действие в Cloud UI. Недоступная функция UI остаётся конкретным
+platform blocker, её нельзя считать выполненной или обходить прямым доступом к БД.
+
+- [ ] Проверить длительный idle и фактическое выделение CPU без HTTP. 28 октября владелец подтвердил для нашего deployment: «всегда 1 включен». Это подтверждение настройки владельцем, не независимое API readback. В [официальной инструкции создания](https://cloud.ru/docs/ai-agents/ug/topics/guides__create-agent) есть опция «Не выключать агента»; [описание масштабирования](https://cloud.ru/docs/ai-agents/ug/topics/concepts__scaling) связывает постоянную работу с минимумом экземпляров больше нуля. Cron, background и durable waits должны завершиться без запроса, запускающего работу. Прежние 3/5 минут тишины не подтверждают длительный idle или непрерывное выделение CPU.
+
+  Прогон 28 октября подтвердил автоматический старт cron после почти 12 минут
+  без наших запросов. Task `e4048e24-52de-49e2-81e7-832978ca75ca` ожидала решения
+  по материалу: `suspicious`, 1 call, 215 prompt / 9 completion tokens, 0,507 s.
+  Это настоящий результат classifier, не его timeout. Для полного unattended
+  proof нужен обычный безопасный запрос без требования literal-marker/запрета
+  tools; обходить проверку или автоматически разрешать подозрительный material
+  нельзя. Перед повтором используются новый candidate и подтверждённое окно без UI.
+- [ ] Подготовить owner/HITL/time/remote waits и активную ограниченную команду; оператор запускает обновление через UI до их завершения. Проверить deadlines, единственный результат и сохранность данных. Команда не replay-ится; неизвестная остановка остаётся честным `SIDE_EFFECT_UNKNOWN` и barrier.
+- [ ] При доступном rolling update зафиксировать перекрытие старого/нового экземпляров и проверить общие sessions, одного cron leader, workspace/execution fencing и отсутствие повторных side effects. Просто два последовательных health 200 не подтверждают overlap.
+- [ ] Выполнить ограниченные target sandbox/network проверки через agent tools на собственных контрольных данных: соседний workspace/контрольные секреты, private/metadata egress и IPv4/IPv6, broker isolation, timeout/cancel/process cleanup. Native CI остаётся отдельным обязательным доказательством.
+- [ ] Через UI проверить отзыв собственного тестового platform key и согласованную owner password rotation; исходные рабочие credentials не публиковать и не отзывать.
+- [ ] Через доступные platform UI workflows подтвердить schema/runtime role, S3 Put/Get/Delete/limits и подготовку production. Отдельную миграцию запускать поддержанным платформой способом до serving; отсутствие такого workflow блокирует production switch, а не разрешает auto-migration существующей БД.
+- [ ] На отдельной восстановленной копии подтвердить согласованный backup PostgreSQL + referenced S3 objects с отдельно сохранённым encryption key и пустым cache. Оператор использует UI backup/restore/job workflow; действующие данные не заменяются старым backup. Локальный restore proof уже есть, target restore остаётся открытым.
+- [ ] Подтвердить применимые storage outage/cache-full/GC/resource-limit сценарии на контролируемой копии; injected SDK errors не выдавать за физический отказ платформы.
+
+#### 5. Зафиксировать границу завершения
+
+- [ ] Сопоставить финальную матрицу, ordinary/native/browser results и platform receipts с одним candidate; обновить этот план и эксплуатационные документы по фактам. Frozen implementation status менять только при разрешении и наличии требуемого обычного CI proof.
+- [ ] Проверить актуальность `AGENTS.md`, сохранить reviewable commits и итоговые ссылки на image/receipts. Невыполненные platform gates перечислить явно с требуемым действием в UI.
+
+Текущий этап завершён, когда выполнены разрешённые изменения и проверки этого
+раздела. Полную готовность Cloud production нельзя объявлять по одному успешному
+FM-запросу, локальному suite или пользовательскому сообщению о запуске.
+Исключение telemetry из текущей работы не снимает нормативные release obligations.
+
+## Архив исходного плана и доказательств — 24–27 октября 2026
+
+Следующие разделы сохраняют прежние задачи, разрешения и результаты на дату
+каждого этапа. Их слова «сейчас», «следующий пакет», «открыто» и исторические
+checkboxes не задают актуальный список работ: он находится выше. В частности,
+позднее уже исправлен kernel snapshot gap, batch4 сменился новыми images, а
+полный перенос текущего main и широкое разрешение на frozen edits не предполагаются.
+
+**Исторический статус после batch4:** после подтверждённого пользователем rollout batch3 проверены Cloud owner/HITL waits, память, peer files и завершение Qwen-задачи без повторного вопроса; её exact-format checks не прошли. 27 октября подтверждены 174 разные локальные PostgreSQL/S3/recovery проверки и ещё 56 security/config/restart проверок с указанными ниже границами. После исправления прежних fixtures полный suite batch4 v3 прошёл: 2451 tests, exit 0, 16 skips, исходники за прогон не изменились. Batch4 опубликован под version tag и `latest`, одинаковый digest подтверждён registry readback. Rollout batch4 в Cloud ещё не подтверждён. Native amd64/browser, целевые Cloud replacement/overlap и остальные release proofs не закрыты; digest работающего Cloud image публично не проверен.
 
 **Исключение текущего этапа:** 27 октября пользователь исключил telemetry из работ. Её проверки и изменения не выполняются; прежняя неопределённость доставки не объявляется устранённой. Native `context.compacted` events остаются отдельным ожидаемым operator evidence.
 
@@ -68,7 +268,7 @@ digest `sha256:539c38fa73bd38ba14331f09f916bb29bea2c991e8ccf0a189864835ae824f7b`
 изоляцию, это отдельный блокер готовности с конкретным решением на согласование.
 Успешный чат не заменяет эти гарантии.
 
-## 3. Оставшаяся работа — по порядку
+## 3. Историческая разбивка работы на этапы
 
 | Этап | Тип работы | Что сделать | Условие завершения |
 |---|---|---|---|
@@ -92,7 +292,7 @@ digest `sha256:539c38fa73bd38ba14331f09f916bb29bea2c991e8ccf0a189864835ae824f7b`
 - [x] Добавить регрессию для включённой памяти Cloud с отсутствующим/неверным backend, корректного PostgreSQL и полностью отключённой памяти.
 - [x] В общей точке startup потребовать поддерживаемый persistent backend без изменения поведения Keycloak/development вне Cloud.
 - [ ] Проверить реальную запись, чтение, поиск, embeddings/NER и сохранение после замены Pod.
-- [ ] Сохранить изменение отдельным коммитом с соответствующим proof.
+- [x] Сохранить изменение отдельным коммитом с соответствующим proof: `cbfca2d`.
 
 ### Этап 2. Landlock: CI и целевая среда
 
