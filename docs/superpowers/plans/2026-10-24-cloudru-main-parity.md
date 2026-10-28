@@ -400,6 +400,10 @@ amd64 browser gate. Это доступ к репозиторию CI, не к Cl
 `410a646`, но `git push --dry-run` завершается 128 из-за отсутствия GitHub
 credentials. Remote refs не менялись, CI не запускался. Receipt:
 `deepseek-team-20261028/github-transport-check.json`.
+Дополнительная SSH-проверка с отдельным `known_hosts` и официально сверенным
+Ed25519 fingerprint также завершилась `Permission denied (publickey)`; strict
+host checking сохранён. Remote refs не менялись. Receipt в Cloud worktree:
+`.enterprise-work/concurrent-cancel-20261028/ssh-check.json`.
 
 #### 3. Закрыть функциональную матрицу на согласованном candidate
 
@@ -414,7 +418,44 @@ credentials. Remote refs не менялись, CI не запускался. Re
 | MCP | Публичный Microsoft Learn discovery/call и локальные policy/storage tests | Контролируемый HTTPS peer с credentials, deny/HITL и reconnect после rollout |
 | A2A и файлы | Прежние 0.3/1.0 и remote proofs; после обновления — dedup/conflict, terminal SSE, новый follow-up, download/raw A2A bytes и immutable старое вложение после исправления | Применимые reconnect/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
 | Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial, wrong-Origin denial без потери сессии, owner/external Task isolation | Итоговые settings/peer/material cards, session expiry/rotation; общий external principal остаётся утверждённым ограничением Cloud-профиля |
-| Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial | Два одновременно работающих чата, root/child cancellation/checkpoint и cleanup при замене экземпляра |
+| Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial; 28 октября два собственных чата работали одновременно, отмена parent A не помешала завершению B, отложенный файл descendant A не появился | Прямое подтверждение terminal state child после parent cancel, root/child checkpoint и cleanup при замене экземпляра |
+
+28 октября, 20:05–20:11 UTC, выполнен ограниченный сценарий двух чатов через
+owner API без изменения settings/policies. Parent A
+`9075c6b2-dc35-4958-95c4-624c09cf06bb` запустил background child
+`93c8a3e0-7112-5f9f-8ec3-ad1127d7d3be`; его Python-команда создала descendant,
+который записал start marker и должен был записать done marker через 240 s.
+Чат B `71f274b5-81ec-41c4-bdf9-2ae3a3a1811e` выполнял отдельную 90 s команду.
+В 20:08:06 UTC обе root Tasks были WORKING, оба done-файла отсутствовали;
+по записанным command start timestamps оставалось 145,2 s у A и 71,1 s у B.
+Отправлен ровно один cancel parent A, B не отменялся.
+
+Parent A перешёл в CANCELED без `cleanup_pending`, B — в COMPLETED с успешным
+terminal receipt и точными bytes своего done-файла. При позднем чтении,
+более чем через 250 s после первого наблюдения start A, его start-файл сохранил
+SHA-256, а done-файл вернул 404. Pending owner interactions отсутствовали;
+logout завершился HTTP 200. Старый D2 не затрагивался.
+
+Это подтверждает ограниченное наблюдение отмены процесса и независимость второго
+чата. Public GetTask для внутреннего child отсутствует, а interactions query
+возвращает всю budget family. Успешного `core_task_wait` receipt со state=canceled
+для child в истории не оказалось, поэтому его terminal state **не доказан**.
+Driver завершился exit 1 с `bounded_observation_passed=true`,
+`child_state_proven=false`, `probe_passed=false`; полный cancellation gate,
+restart/checkpoint и native CI этим прогоном не закрываются. Receipt в Cloud
+worktree: `.enterprise-work/concurrent-cancel-20261028/report.json`, SHA-256
+`6fcb32d5aa82ab13accd7e4d9321de9e81e58d8cffbd0dd0ada0f105b60182ec`.
+
+Подготовка использовала исполнителя с самопроверкой и отдельного reviewer.
+Первый self-check пропустил ошибки approval binding, cleanup и criteria;
+reviewer завершился на provider HTTP 404 без отчёта. Повтор автора сохранил
+правки, но вышел по timeout. Ведущий завершил проверку и исправления до live:
+py_compile, Ruff, describe/embedded compile и три локальных MockTransport
+сценария (read failure, unplanned arguments, uncertain send) прошли. Подтверждены
+однократный own-task cancel, отсутствие повторного send при неопределённом
+ответе, отсутствие непредусмотренных approvals и logout до закрытия клиента.
+Доказательства: `lead-review.txt`, `lead-local-checks.json` рядом с receipt;
+отчёт исполнителя и process exit сами по себе не считались review approval.
 
 - [x] Оператор сообщил об обновлении image; readiness, owner login и успешные model/tool runs после обновления подтверждены. Точный deployed digest остаётся явно непроверенным: Agent Card version `1.0.0` не идентифицирует сборку.
 - [ ] Для каждой строки сохранить результат «прошло / воспроизводимый дефект / ограничение профиля» с Task IDs, версией candidate и безопасными receipts; исправлять только выявленные дефекты в общей точке.
