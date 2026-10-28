@@ -30,6 +30,7 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FILE_RESPONSE_BYTES = 40_000_000
 MAX_STREAM_FRAMES = 10_000
 MAX_ERROR_MESSAGE_CHARS = 200
+MAX_HTTP_ERROR_BYTES = 4096
 STREAM_DONE_SENTINEL = "[DONE]"
 
 # 4xx are permanent except these two, which the peer itself marks as retryable.
@@ -596,14 +597,17 @@ def _decode_rpc(payload):
     return _normalize(message.get("result"))
 
 
-def _open(request, timeout, *, retryable_status_codes=()):
+def _open(request, timeout, *, retryable_status_codes=(), a2a_read=None):
     try:
         return _OPENER.open(request, timeout=timeout)
     except HTTPError as error:
-        error.close()
-        retryable = error.code in retryable_status_codes or (
-            error.code in RETRYABLE_CLIENT_STATUS_CODES
-        )
+        try:
+            retryable = error.code in retryable_status_codes or error.code in RETRYABLE_CLIENT_STATUS_CODES
+            if error.code == 404 and a2a_read is not None:
+                # A routing 404 cannot establish that a known remote Task is gone.
+                retryable = not _is_a2a_http_error(error, *a2a_read)
+        finally:
+            error.close()
         raise CoreError(
             "REMOTE_AGENT_UNAVAILABLE",
             f"remote agent responded with status {error.code}",
@@ -629,6 +633,38 @@ def _read_body(response, limit=None):
     if len(body) > limit:
         raise CoreError("REMOTE_AGENT_RESPONSE_TOO_LARGE")
     return body
+
+
+def _is_a2a_http_error(response, binding, request_id):
+    """Recognize an explicit protocol error without retaining its private body."""
+    if response.fp is None:
+        return False
+    try:
+        body = _read_body(response, MAX_HTTP_ERROR_BYTES)
+        content_length = (response.headers or {}).get("Content-Length")
+        if content_length is not None and int(content_length) != len(body):
+            return False
+        value = json.loads(body.decode("utf-8"),
+                           object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
+        _check_depth(value)
+    except (CoreError, ValueError, TypeError, RecursionError):
+        return False
+    if not isinstance(value, dict) or "result" in value:
+        return False
+    error = value.get("error")
+    if not isinstance(error, dict) or type(error.get("code")) is not int or not isinstance(error.get("message"), str):
+        return False
+    if binding == "JSONRPC":
+        return value.get("jsonrpc") == "2.0" and value.get("id") == request_id
+    if binding != "HTTP+JSON" or "jsonrpc" in value or error["code"] != 404 or error.get("status") != "NOT_FOUND":
+        return False
+    details = error.get("details")
+    return isinstance(details, list) and any(
+        isinstance(detail, dict) and detail.get("@type") == "type.googleapis.com/google.rpc.ErrorInfo"
+        and detail.get("domain") == "a2a-protocol.org"
+        and isinstance(detail.get("reason"), str) and bool(detail["reason"].strip())
+        for detail in details
+    )
 
 
 class RemoteAgentConnection:
@@ -693,7 +729,8 @@ class RemoteAgentConnection:
             error_type = ExecutionNotStarted if method == "SendMessage" else CoreError
             raise error_type("INVALID_REQUEST") from None
         try:
-            with _open(request, timeout, retryable_status_codes=(500, 502, 503, 504) if method == "GetTask" else ()) as response:
+            with _open(request, timeout, retryable_status_codes=(500, 502, 503, 504) if method == "GetTask" else (),
+                       a2a_read=(self.card.binding, request_id) if method == "GetTask" else None) as response:
                 body = _read_body(response, body_limit)
         except CoreError as error:
             # Mutation retryability belongs to the durable intent owner, never this adapter.

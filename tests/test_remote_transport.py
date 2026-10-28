@@ -5,11 +5,12 @@ import io
 import json
 import threading
 import unittest
+from http.client import HTTPResponse
 from urllib.error import HTTPError, URLError
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from core_agent.errors import CoreError, ExecutionNotStarted
+from core_agent.errors import CoreError, ExecutionNotStarted, error_log_fields
 from core_agent.remote_agents import RemoteAgentCard, RemoteAgentConnection, RemoteAgentRegistry, connect_peer
 from tests.test_auth import AuthAppTestCase
 
@@ -270,9 +271,85 @@ class RemoteTransportTests(unittest.TestCase):
                             side_effect=HTTPError("https://peer.test", status, "PRIVATE", {}, None)) as opened:
                         with self.assertRaises(CoreError) as caught:
                             getattr(self.connection(binding), method)(headers={"Authorization": "PRIVATE"}, **arguments)
-                        self.assertEqual(caught.exception.retryable, method == "get_task" and status in {408, 429, 500, 502, 503, 504})
+                        self.assertEqual(caught.exception.retryable, method == "get_task" and status in {404, 408, 429, 500, 502, 503, 504})
                         self.assertNotIn("PRIVATE", str(caught.exception))
                         self.assertEqual(opened.call_count, 1)
+
+    def test_get_404_distinguishes_bounded_a2a_errors_from_ambiguous_transport(self):
+        from a2a.utils.error_handlers import build_rest_error_payload
+        from a2a.utils.errors import TaskNotFoundError
+
+        rest = build_rest_error_payload(TaskNotFoundError(message="PRIVATE"))
+        rpc = {"jsonrpc": "2.0", "id": "read-id", "error": {"code": -32001, "message": "PRIVATE"}}
+        for binding in ("JSONRPC", "HTTP+JSON"):
+            typed = rpc if binding == "JSONRPC" else rest
+            wrong_binding = rest if binding == "JSONRPC" else rpc
+            malformed = json.loads(json.dumps(typed))
+            if binding == "JSONRPC":
+                malformed["id"] = "another-request"
+            else:
+                malformed["error"]["details"][0]["domain"] = "another-protocol.test"
+            cases = [("typed", json.dumps(typed).encode(), False),
+                     ("content-length", json.dumps(typed).encode(), False),
+                     ("short-content-length", json.dumps(typed).encode(), True),
+                     ("wrong-binding", json.dumps(wrong_binding).encode(), True),
+                     ("wrong-identity", json.dumps(malformed).encode(), True),
+                     ("empty", b"", True), ("html", b"<h1>PRIVATE not found</h1>", True),
+                     ("arbitrary-json", b'{"error":{"code":404,"message":"PRIVATE"}}', True),
+                     ("broken-json", b'{"error":', True), ("invalid-utf8", b"\xffPRIVATE", True),
+                     ("duplicate", b'{"error":{},"error":{}}', True),
+                     ("deep", b"[" * 102 + b"0" + b"]" * 102, True),
+                     ("oversize", json.dumps(typed).encode() + b" " * 4096, True)]
+            variants = (("other-error", {"error": {"code": -32603, "message": "PRIVATE"}}, False),
+                        ("wrong-version", {"jsonrpc": "1.0"}, True),
+                        ("boolean-code", {"error": {"code": True, "message": "PRIVATE"}}, True),
+                        ("result-and-error", {"result": {}}, True)) if binding == "JSONRPC" else (
+                            ("other-reason", {"reason": "PEER_EXTENSION_NOT_FOUND"}, False),
+                            ("missing-reason", {"reason": ""}, True),
+                            ("wrong-type", {"@type": "another.ErrorInfo"}, True))
+            for label, changes, retryable in variants:
+                value = json.loads(json.dumps(typed))
+                target = value if binding == "JSONRPC" else value["error"]["details"][0]
+                target.update(changes)
+                cases.append((label, json.dumps(value).encode(), retryable))
+            for label, payload, retryable in cases:
+                body = io.BytesIO(payload)
+                if label in {"content-length", "short-content-length"}:
+                    length = len(payload) + (20 if label == "short-content-length" else 0)
+                    stream = io.BytesIO(f"HTTP/1.1 404 Not Found\r\nContent-Length: {length}\r\n\r\n".encode() + payload)
+                    body = HTTPResponse(Mock(makefile=Mock(return_value=stream)))
+                    body.begin()
+                with self.subTest(binding=binding, body=label), patch.object(body, "read", wraps=body.read) as read, patch(
+                        "core_agent.remote_agents._OPENER.open",
+                        side_effect=HTTPError("https://peer.test", 404, "PRIVATE", getattr(body, "headers", {}), body)) as opened:
+                    with self.assertRaises(CoreError) as caught:
+                        self.connection(binding)._task_request("GetTask", {"id": "id"},
+                            headers={}, timeout=1, request_id="read-id")
+                    self.assertEqual(caught.exception.retryable, retryable)
+                    self.assertEqual(caught.exception.code, "REMOTE_AGENT_UNAVAILABLE")
+                    self.assertNotIn("PRIVATE", json.dumps(error_log_fields(caught.exception)))
+                    self.assertEqual(opened.call_count, 1)
+                    read.assert_called_once_with(4097)
+                    self.assertTrue(body.closed)
+        with patch("core_agent.remote_agents._OPENER.open", return_value=io.BytesIO(json.dumps(rpc).encode())):
+            with self.assertRaises(CoreError) as caught:
+                self.connection()._task_request("GetTask", {"id": "id"}, headers={}, timeout=1, request_id="read-id")
+            self.assertEqual(caught.exception.code, "REMOTE_AGENT_FAILED")
+            self.assertFalse(caught.exception.retryable)
+
+    def test_get_404_body_read_failure_is_retryable_but_mutations_do_not_read_it(self):
+        for method, arguments in (("get_task", {"task_id": "id"}),
+                ("send_task", {"task": "Task", "message_id": "m"}), ("cancel_task", {"task_id": "id"})):
+            body = io.BytesIO(b"PRIVATE")
+            with self.subTest(method=method), patch.object(body, "read", side_effect=TimeoutError("PRIVATE")) as read, patch(
+                    "core_agent.remote_agents._OPENER.open",
+                    side_effect=HTTPError("https://peer.test", 404, "PRIVATE", {}, body)) as opened:
+                with self.assertRaises(CoreError) as caught:
+                    getattr(self.connection(), method)(**arguments)
+                self.assertEqual(caught.exception.retryable, method == "get_task")
+                self.assertEqual(read.call_count, int(method == "get_task"))
+                self.assertTrue(body.closed)
+                self.assertEqual(opened.call_count, 1)
 
     def test_malformed_wire_payloads_are_bounded_generic_errors_without_fallback(self):
         for payload in (b"not json PRIVATE", b"\xff", b"[" * 10000 + b"]" * 10000,

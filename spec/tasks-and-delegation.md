@@ -439,6 +439,19 @@ marker: первые 180 секунд — каждые 10 секунд, след
 меньше раннего интервала, используется меньший. Следующая проверка ограничена
 ближайшей границей фазы и окончательным deadline. Временная ошибка GetTask
 использует тот же график; Send/Cancel не получают повторов.
+HTTP 404 при GetTask без корректного A2A error envelope считается неоднозначным
+transport-отказом и MUST сохранять ожидание по этому графику до исходного deadline.
+Только для этого read-only случая adapter читает не более 4096 bytes error body
+плюс один byte для проверки размера. Пустое, некорректное, слишком большое или
+недочитанное тело не доказывает отсутствие remote Task. Корректный JSONRPC error
+требует version 2.0, совпадающего request ID, integer code и string message;
+HTTP+JSON error требует code 404, status NOT_FOUND и typed google.rpc.ErrorInfo
+с domain a2a-protocol.org и непустым reason. Envelope другого binding не подходит.
+Такая типизированная A2A ошибка, включая TASK_NOT_FOUND, остаётся окончательной;
+401/403 и обработка Send/Cancel не меняются. Error body, message и metadata
+не попадают в публичный результат или логи. HTTP response всегда закрывается.
+Цена неоднозначности — ожидание неверного URL до deadline вместо преждевременного
+отказа живой remote Task; автоматическая повторная отправка задания запрещена.
 Возраст вычисляется по сохранённым `deadline - timeout_seconds` и текущему
 server/DB clock, поэтому restart, повторный wait и смена worker не начинают
 раннюю фазу заново. Изменение company settings не меняет закреплённый интервал.

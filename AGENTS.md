@@ -941,8 +941,10 @@ run получает отдельные MCP session и negotiated version; пе�
 - Новые методы `RemoteAgentConnection.send_task/get_task/cancel_task` работают
   с обоими A2A1.0 bindings. `connect_peer` сверяет объявленный Card interface
   с зарегистрированным полным URL path/params; redirects запрещены. Только
-  read-only discovery имеет bounded retry; Get temporary5xx планирует следующую
-  проверку в пределах deadline; Send/Cancel имеют одну attempt.
+  read-only discovery имеет bounded retry; Get temporary5xx и неоднозначный
+  HTTP404 без корректного A2A error envelope планируют следующую проверку
+  в пределах исходного deadline. Только Get404 читает bounded error body;
+  typed protocol errors остаются окончательными. Send/Cancel имеют одну attempt.
   Per-peer headers передаются на один request без хранения в connection;
   caller/root identifiers и legacy auth не наследуются. Parts и remote IDs
   сохраняются executor-ом для durable operation. Enterprise Send принимает

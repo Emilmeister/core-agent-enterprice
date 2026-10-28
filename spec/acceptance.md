@@ -816,6 +816,15 @@ Recovery до `next_poll_at` не отправляет GetTask; новый Postg
 Deadline не продлевается, проверка не назначается позже него; после terminal
 outcome новых сетевых запросов нет. Изменение не расходует model/tool budget.
 
+RMT-01, неоднозначный HTTP 404: после одного подтверждённого Send известной Task
+GetTask с plain/empty/malformed/oversize 404 сохраняет handle и next_poll_at,
+не продлевает deadline и не повторяет Send. Следующий корректный GetTask завершает
+handle; повторяющийся 404 заканчивается исходным timeout без новых запросов.
+Оба bindings сохраняют окончательный исход для корректного A2A error envelope,
+включая TASK_NOT_FOUND. Проверяются request ID/binding, typed REST domain/reason,
+bounded body read/close, read failure, 401/403 и отсутствие retry Send/Cancel.
+Приватный body/message не отражается в error/result/log diagnostics.
+
 Remote progress proof: working/input-required/auth-required metadata появляются
 в текущем root Task и scoped Get/List/Subscribe/push без raw peer data и чужих
 операций. Pending wait, workflow version и model/tool usage не меняются;

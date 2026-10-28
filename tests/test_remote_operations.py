@@ -844,7 +844,8 @@ class RemoteOperationTests(unittest.TestCase):
         self.assertNotIn("private-key", repr(task.result))
 
     def test_actual_wire_send_get_and_temporary_http_retry_in_both_bindings(self):
-        for binding in ("JSONRPC", "HTTP+JSON"):
+        for binding, status, expire in ((binding, status, expire) for binding in ("JSONRPC", "HTTP+JSON")
+                                        for status, expire in ((503, False), (404, False), (404, True))):
             wire = []
             def response(request, timeout):
                 payload = json.loads(request.data) if request.data else {}
@@ -856,7 +857,7 @@ class RemoteOperationTests(unittest.TestCase):
                 self.assertTrue(checkpoint["send_started"], "Intent must be durable before physical Send")
                 self.assertEqual(checkpoint["deadline"], self.now - (len(wire) - 1) * 5 + 30)
                 if len(wire) == 2:
-                    raise HTTPError(request.full_url, 503, "PRIVATE failure", {}, None)
+                    raise HTTPError(request.full_url, status, "PRIVATE failure", {}, io.BytesIO(b"Not Found"))
                 remote = {"id": "wire-task", "contextId": "wire-context",
                           "status": {"state": "TASK_STATE_WORKING" if method == "SendMessage" else "TASK_STATE_COMPLETED"}}
                 if method == "SendMessage":
@@ -876,15 +877,25 @@ class RemoteOperationTests(unittest.TestCase):
                 if binding == "JSONRPC":
                     result = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
                 return io.BytesIO(json.dumps(result).encode())
-            with self.subTest(binding=binding), patch("core_agent.remote_operations.RemoteAgentConnection", RemoteAgentConnection), patch(
+            with self.subTest(binding=binding, status=status, expire=expire), patch("core_agent.remote_operations.RemoteAgentConnection", RemoteAgentConnection), patch(
                     "core_agent.remote_agents._OPENER.open", side_effect=response):
                 task = self.start(binding=binding, message_id=str(uuid.uuid4()))
                 self.recover()
                 self.assertEqual(task.state, "working")
-                self.recover()
-                self.assertEqual((task.state, task.result["text"]), ("completed", "Delivered"))
-                self.assertEqual([call[0] for call in wire], ["SendMessage", "GetTask", "GetTask"])
-                self.assertEqual(self.scheduler._remote[task.id]["checkpoint"]["deadline"], self.now + 20)
+                checkpoint = self.scheduler._remote[task.id]["checkpoint"]
+                self.assertEqual((checkpoint["next_poll_at"], checkpoint["deadline"]), (self.now + 5, self.now + 25))
+                self.assertEqual(self.recover(0), 0)
+                self.assertEqual([call[0] for call in wire], ["SendMessage", "GetTask"])
+                if expire:
+                    self.recover(25)
+                    self.assertEqual((task.state, task.error.code), ("failed", "REMOTE_OPERATION_TIMEOUT"))
+                    self.assertEqual([call[0] for call in wire], ["SendMessage", "GetTask"])
+                else:
+                    self.recover()
+                    self.assertEqual((task.state, task.result["text"]), ("completed", "Delivered"))
+                    self.assertEqual([call[0] for call in wire], ["SendMessage", "GetTask", "GetTask"])
+                    self.assertEqual(self.scheduler._remote[task.id]["checkpoint"]["deadline"], self.now + 20)
+                self.assertEqual(self.recover(), 0)
 
 
 @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "TEST_DATABASE_URL required for remote outbound durability")
