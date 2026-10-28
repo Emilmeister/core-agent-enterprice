@@ -104,6 +104,7 @@ async function ownerAction(tab,path,method,action){
 }
 let bearer,rootTask,lostReceipt,loseNext=false,dropped=0,pkce=false,pauseDownload=false,pausedDownload;
 let breakStreams=false,breakTaskReads=false,failedStreams=0;
+let guardrailWaitId,pausedGuardrailMaterial,holdGuardrailMaterial=false,omitGuardrailReview=false;
 try {
   await page.call('Page.enable');await page.call('Runtime.enable');
   observeOwnerAPI(page);
@@ -134,6 +135,15 @@ try {
     if((breakStreams&&path.endsWith(':subscribe'))||(breakTaskReads&&/^\/a2a\/owner\/tasks\/[^:]+$/.test(path))){
       if(path.endsWith(':subscribe'))failedStreams++;
       await page.call('Fetch.failRequest',{requestId:event.requestId,errorReason:'ConnectionClosed'});
+    }else if(holdGuardrailMaterial&&path===`/api/guardrails/${guardrailWaitId}/material`&&event.responseStatusCode===200){
+      holdGuardrailMaterial=false;pausedGuardrailMaterial=event;
+    }else if(omitGuardrailReview&&path.endsWith('/history')&&event.responseStatusCode===200){
+      const response=await page.call('Fetch.getResponseBody',{requestId:event.requestId});
+      const body=JSON.parse(response.base64Encoded?Buffer.from(response.body,'base64').toString():response.body);
+      for(const item of body.items)if(item.review?.wait_id===guardrailWaitId)delete item.review;
+      await page.call('Fetch.fulfillRequest',{requestId:event.requestId,responseCode:200,
+        responseHeaders:(event.responseHeaders??[]).filter(header=>!['content-length','content-encoding','transfer-encoding'].includes(header.name.toLowerCase())),
+        body:Buffer.from(JSON.stringify(body)).toString('base64')});
     }else if(pauseDownload&&event.responseStatusCode===200){pauseDownload=false;pausedDownload=event;}
     else if(loseNext&&event.responseStatusCode===200){loseNext=false;dropped++;
       const response=await page.call('Fetch.getResponseBody',{requestId:event.requestId});const body=JSON.parse(response.base64Encoded?Buffer.from(response.body,'base64').toString():response.body);
@@ -575,8 +585,35 @@ try {
   await page.field('.composer textarea','Browser guardrail review proof');
   await page.click('Отправить ↑');
   await page.wait("[...document.querySelectorAll('.interaction:not(.resolved) h3')].some(h=>h.textContent==='Проверка материала')",'actual suspicious input owner guardrail request');
+  guardrailWaitId=await page.evaluate("document.querySelector('.interaction[data-kind=guardrail]:not(.resolved)').id.slice('interaction-'.length)");
+  const guardrailHistoryStart=history.length;
+  await page.wait("!document.querySelector('.history-refresh').disabled",'guardrail history ready to refresh');
+  await page.click('Обновить историю');
+  await waitFor(()=>history.slice(guardrailHistoryStart).some(items=>items.some(item=>item.review?.wait_id===guardrailWaitId)),'actual guardrail is linked in canonical history');
+  await page.wait("!document.querySelector('.history-refresh').disabled",'canonical guardrail history rendered');
+  const guardrailAnchorId=history.at(-1).find(item=>item.review?.wait_id===guardrailWaitId).id;
+  holdGuardrailMaterial=true;
+  await page.call('Fetch.enable',{patterns:[{urlPattern:config.origin+`/api/guardrails/${guardrailWaitId}/material`,requestStage:'Response'},
+    {urlPattern:config.origin+'/api/chats/*/history*',requestStage:'Response'}]});
   await page.click('Просмотреть материал','.interaction:not(.resolved) button');
+  await waitFor(()=>!!pausedGuardrailMaterial,'actual private material response held');
+  await page.call('Page.bringToFront');
+  await page.evaluate("window.guardrailInspectCard=document.querySelector('.interaction[data-kind=guardrail]:not(.resolved)');window.guardrailInspectCard.focus()");
+  for(const omit of [true,false]){
+    omitGuardrailReview=omit;const before=history.length;
+    await page.click('Обновить историю');
+    await waitFor(()=>history.slice(before).some(items=>items.some(item=>item.id===guardrailAnchorId&&(omit?!item.review:item.review?.wait_id===guardrailWaitId))),
+      omit?'guardrail history link temporarily omitted':'original canonical guardrail history restored');
+    await page.wait("!document.querySelector('.history-refresh').disabled",'guardrail history projection rendered');
+    check(pausedGuardrailMaterial.networkId&&!cancelledDownloads.has(pausedGuardrailMaterial.networkId)
+      &&await page.evaluate("window.guardrailInspectCard.isConnected&&document.getElementById(window.guardrailInspectCard.id)===window.guardrailInspectCard&&document.activeElement===window.guardrailInspectCard"),
+      'held material read, active card and focus survive '+(omit?'unlinked':'linked')+' history projection');
+  }
+  await page.call('Fetch.continueRequest',{requestId:pausedGuardrailMaterial.requestId});
   await page.wait("!!document.querySelector('.interaction .material-content')",'private material becomes readable after explicit inspect');
+  check(!cancelledDownloads.has(pausedGuardrailMaterial.networkId),'original material request completes after history projection changes');
+  await page.call('Fetch.disable');
+  await page.evaluate('delete window.guardrailInspectCard');
   check(await page.evaluate("document.querySelector('.material-content').textContent.includes('Browser guardrail review proof') && !document.querySelector('.interaction[data-kind=guardrail] [aria-label=\"Технические данные\"]') && !/review_id|completion_tokens|subject_digest/.test(document.querySelector('.material').textContent)"),'guardrail exposes actual input without technical envelope or gear');
   await page.click('Отклонить','.interaction:not(.resolved) button');
   await page.wait("document.querySelectorAll('.interaction:not(.resolved) .owner-answer-options input').length===3",'durable owner clarification with suggested answers after withheld input');

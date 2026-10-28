@@ -35,7 +35,8 @@ checks; совпали 138 source/UI hashes; registry readback подтверд�
 пройдены на том же коде candidate без source overlay. GitHub CI matrix,
 native amd64 (включая обязательный browser job) и оставшиеся целевые Cloud
 release proofs открыты. Дополнительный локальный ARM64 browser gate пройден
-после исправления фокуса `d85744e`; подробности ниже.
+после исправления фокуса `d85744e` и затем повторно после исправления
+перемонтирования карточек согласования; подробности ниже.
 
 ### Очередность: сначала локальные проверки
 
@@ -67,7 +68,7 @@ Runtime остаётся на `948bae1`: после него до начала �
 | Полный automatic cron без HTTP | Реальный календарь и PostgreSQL coordinator приняли ровно одну Task, выполнили один model call и сохранили точный конечный ответ; после создания расписания HTTP отсутствовал | `ScriptedModel` и существующий classifier fixture, проверки включены, без policy changes/ручных решений; это локальный background proof, не проверка idle CPU Cloud |
 | Recovery и checkpoint fencing | 37 существующих тестов прошли за 2,319 s, без skips, включая реальные PostgreSQL fences; отдельный Docker restart identity — 1 test за 2,232 s | 37 тестов используют текущий source; identity run использовал прежний ARM64 образ `83edd16` и mount текущего identity module, совпадающего с установленным. Не объявляется 38 проверками нового образа |
 | Замена активного execution | Новый сценарий `test_replacement_waits_for_exact_stop_confirmation_without_replay` прошёл за 21,548 s, exit 0, без skips. A реально выполняет команду; при замене B прежний точный процесс ещё жив, B сохраняет cleanup_pending. Чужая generation отвергнута; после SIGKILL и Docker stopped-state точный CLI proof принят один раз, Task завершена `FAILED / SIDE_EFFECT_UNKNOWN`, replay отсутствует | Текущий packaged ARM64 runtime, только tests mount, реальные PostgreSQL и Bubblewrap/POSIX. HTTPS Origin и подписанная cookie проверяются; локальный HTTP представляет post-TLS hop, TLS этим не проверяется. Это общий recovery contract, не Cloud replacement/Landlock/S3 |
-| Полный браузерный сценарий | `CORE_AGENT_REQUIRE_BROWSER_TESTS=1`: 1 test, 194 проверки, 253,282 s, exit 0, без skips; реальные native ARM64 Pod, PostgreSQL, Keycloak и Mac Chromium. Пройдены файлы, согласования, история, peer panel, мобильная раскладка и logout | Дополнительный ARM64 proof; не заменяет обязательный native amd64 CI. В одном предыдущем прогоне просмотр guardrail-материала не появился за 45 s; причина не доказана и не объявляется исправленной |
+| Полный браузерный сценарий | Последний `CORE_AGENT_REQUIRE_BROWSER_TESTS=1`: 1 test, 197 проверок, 248,658 s, exit 0, без skips; реальные native ARM64 Pod, PostgreSQL, Keycloak и Mac Chromium. Пройдены файлы, согласования, история, peer panel, мобильная раскладка, logout и новый сценарий задержанного private material GET при изменении связи карточки с историей | Дополнительный ARM64 proof; не заменяет обязательный native amd64 CI. Контролируемое воспроизведение и границы вывода о прежнем сбое Inspect приведены ниже |
 
 Приватные receipts/logs находятся в `.enterprise-work/` основного репозитория:
 `local-first-startup-linux-20261028.{json,log}`,
@@ -104,15 +105,47 @@ lockfile не изменился. Для браузера собран отде�
 Runtime overlay не применялся. Образы сохранены локально, не опубликованы;
 собственные browser cluster/services/network удалены.
 
-Отрицательные результаты browser attempts 1–5 сохранены. Причина одиночного
-сбоя Inspect в attempt 5 остаётся открытой: исходники допускают перемонтирование
-карточки при связывании с историей, но этот переход в упавшем прогоне не записан.
-В успешном attempt 6 read-only observer увидел GET 200 и тот же DOM-узел до
-просмотра/решения. Поэтому итоговый gate пройден, но устойчивость этого сценария
-не доказана серией повторов; успех не выдаётся за исправление неизвестной причины.
+Отрицательные результаты browser attempts 1–5 сохранены. Для прежнего Inspect
+failure точное чередование событий не записано. Последующий контролируемый
+прогон настоящих `History`/`InteractionCard` воспроизвёл тот же симптом:
+при появлении или исчезновении связи review с историей карточка с тем же wait ID
+перемонтировалась, отменяя private GET и сбрасывая состояние. Загрузка более
+ранней записи того же root также меняла ключ section и сбрасывала карточку.
+Это доказательство дефекта и механизма, а не ретроспективное доказательство
+точного чередования событий в историческом attempt 5.
 
-До объявления полной миграции завершённой остаются разбор этой локальной
-диагностики, native amd64 CI и перечисленные ниже платформенные proofs.
+Карточки теперь имеют один уровень React siblings и стабильные ключи wait ID;
+section использует root и номер его сегмента, сохраняя различимость A/B/A
+при локальном echo. Anchor pending approval перенесён на существующий article.
+Состояние private material и ответа остаётся внутри `InteractionCard`, без кэша
+или переноса authority. Контролируемые проверки подтвердили сохранение GET,
+материала, черновика и фокуса при связывании/отвязывании и старой pagination;
+закрытие wait очищает материал, настоящий unmount отменяет запрос.
+
+В существующий разрешённый browser test добавлена задержка настоящего material
+response и временное удаление только ссылки этого wait из настоящего history
+response с последующим восстановлением. Проверяются тот же DOM-узел, фокус,
+отсутствие отмены запроса и отображение исходного материала после release.
+Первый полный прогон новой версии выявил пустую обёртку после закрытия карточки;
+обёртка удалена в коде, исходная проверка доступности итогового ответа сохранена.
+Второй полный прогон прошёл за 248,658 s. Прежние outcome/security/layout
+assertions не ослаблялись; нормативный контракт и frozen spec не менялись.
+
+На Node 24.8.0 прошли `npm ci`, `npm test`, `npm run typecheck`, `npm run build`;
+после удаления обёртки test/typecheck/build повторены, lockfile не менялся.
+Итоговый локальный образ `core-agent-local-first-native:guardrail-direct-arm64-20261028`,
+ID `sha256:b50b6eb1fdd814d5d1477df1ac1a7ffad1c542544a91a210b55f943a5196f344`,
+собран от `b651e03` полной заменой `ui_dist`. Совпали набор и bytes всех 138
+packaged Python/policy/UI файлов; source inputs не менялись при сборке.
+Это derived image без runtime overlay, не полный rebuild исходного Dockerfile;
+образ не опубликован. Evidence: `local-first-native-browser-20261028/guardrail-final/`,
+`guardrail-controlled-reproduction.json`, `guardrail-controlled-green-direct.json`
+и `owner-question-pagination-green-direct.json` в родительском evidence-каталоге.
+Собственные browser cluster/services/network и диагностические Storybook/Chrome
+остановлены и удалены; существующие пользовательские сервисы не затронуты.
+
+До объявления полной миграции завершённой остаются native amd64 CI
+и перечисленные ниже платформенные proofs.
 Локальные проверки не подтверждают фактическую остановку старого Cloud execution,
 deployed digest, ingress, idle CPU, production credentials или Cloud backup/restore.
 

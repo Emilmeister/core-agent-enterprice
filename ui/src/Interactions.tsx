@@ -11,11 +11,13 @@ export function InteractionCard({
   item,
   refresh,
   source,
+  historyId,
 }: {
   api: Api;
   item: Interaction;
   refresh: () => Promise<void>;
   source?: MaterialSource;
+  historyId?: string;
 }) {
   const [answer, setAnswer] = useState("");
   const [selectedOption, setSelectedOption] = useState<number | "custom" | null>(null);
@@ -152,7 +154,7 @@ export function InteractionCard({
     </details>;
   }
   return (
-    <article id={`interaction-${item.wait_id}`} tabIndex={-1} data-kind={item.kind}
+    <article id={`interaction-${item.wait_id}`} tabIndex={-1} data-kind={item.kind} data-history-id={historyId}
       className={`interaction ${closed ? "resolved" : ""}`}>
       <div className="interaction-status">
         {expired

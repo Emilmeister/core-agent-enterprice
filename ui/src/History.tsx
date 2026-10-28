@@ -319,6 +319,7 @@ export function History({
         </div>
       )}
       {groups.map(({ root, entries }, index) => {
+        const segment = groups.slice(0, index).filter((group) => group.root === root).length;
         const waits = root ? history.waits[root] ?? [] : [];
         const terminal = history.page.items.find((item) => item.task_id === root && item.outcome);
         const interactions = root && !groups.slice(index + 1).some((group) => group.root === root)
@@ -329,18 +330,20 @@ export function History({
           if (entry.action && previous?.at(-1)?.action) previous.push(entry);
           else blocks.push([entry]);
         }
+        function renderWait(item: Interaction, historyId?: string) {
+          return <InteractionCard key={`interaction:${item.wait_id}`} api={api} item={item}
+            refresh={refresh} source={materialSource(item, root)} historyId={historyId} />;
+        }
         function renderInteraction({ item, action }: HistoryEntry) {
           const pending = action && !action.result && !terminal?.outcome
             ? matchingActionWait(action.callId, waits) : undefined;
           if (pending?.kind === "tool_approval" && pending.deadline * 1000 > Date.now() && !rendered.has(pending.wait_id)) {
             rendered.add(pending.wait_id);
-            return <div key={action!.key} data-history-id={item.id}>
-              <InteractionCard api={api} item={pending} refresh={refresh} />
-            </div>;
+            return renderWait(pending, item.id);
           }
           const review = item.review && !rendered.has(item.review.wait_id) ? reviews.get(item.review.wait_id) : undefined;
           if (review) rendered.add(review.wait_id);
-          return review ? <InteractionCard key={review.wait_id} api={api} item={review} refresh={refresh} source={materialSource(review, root)} /> : null;
+          return review ? renderWait(review) : null;
         }
         function renderEntry({ item, action }: HistoryEntry) {
           const peer = onPeerOpen && peerConversations.find((value) => value.operation_id === peerOperationId(action));
@@ -355,15 +358,17 @@ export function History({
                   ? { ...item, text: publicMessageText(item, task) } : item} />}
           </Fragment>;
         }
+        // Linking a wait to history must not remount its private read or answer draft.
         return (
-          <section key={entries[0].action?.key ?? entries[0].item.id} className="history-run" aria-label="Обращение">
-            {blocks.map((block) => {
+          <section key={root ? `run:${root}:${segment}` : `entry:${entries[0].action?.key ?? entries[0].item.id}`} className="history-run" aria-label="Обращение">
+            {[
+            ...blocks.flatMap((block) => {
               const states = block.flatMap(({ action }) => action ? [{ action, ...actionState(action, terminal, waits) }] : []);
               const current = states.find((state) => !state.action.result && (state.kind === "active" || state.kind === "waiting"));
               const succeeded = states.filter((state) => state.kind === "success").length;
               const errors = states.filter((state) => state.kind === "error").length;
               const unknown = states.filter((state) => state.kind === "unknown").length;
-              return <Fragment key={block[0].action?.key ?? block[0].item.id}>
+              return [<Fragment key={`block:${block[0].action?.key ?? block[0].item.id}`}>
               {states.length ? <details className="execution-group">
                 <summary>
                   <svg className="disclosure-chevron" viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m11 8 6 6-6 6" /></svg>
@@ -379,20 +384,11 @@ export function History({
                   {block.map(renderEntry)}
                 </div>
               </details> : renderEntry(block[0])}
-              {block.map(renderInteraction)}
-              </Fragment>;
-            })}
-            {interactions
+              </Fragment>, ...block.map(renderInteraction)];
+            }),
+            ...interactions
               .filter((item) => !linked.has(item.wait_id) && !rendered.has(item.wait_id))
-              .map((item) => (
-                <InteractionCard
-                  key={item.wait_id}
-                  api={api}
-                  item={item}
-                  source={materialSource(item, root)}
-                  refresh={refresh}
-                />
-              ))}
+              .map((item) => renderWait(item))]}
           </section>
         );
       })}
