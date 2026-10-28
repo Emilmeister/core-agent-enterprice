@@ -415,7 +415,7 @@ host checking сохранён. Remote refs не менялись. Receipt в Cl
 | Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot; native logs подтвердили два compactions с итогом 10,64% и 11,25% W, без повторных owner questions | Provider failure становится terminal в Cloud; строгий final format и точное сохранение всех полей пока не прошли; содержание summary отдельно не наблюдалось |
 | Формат ответа | После restart точный JSON-пример и literal `PENDING; NOT RELEASED` прошли; прежние длинные controls дали fences/`PENDING` | Сохранить факты через два подтверждённых compactions; отрицательные старые exact checks не приписывать compaction без evidence |
 | Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs; текущий provider из `.env` отдельно вернул 1024 | Проверить модель и размерности сохранённого target corpus после прежнего ответа 2048, соответствие реального индекса и query plan; startup vector_index=true и отсутствие degraded_channels этого не доказывают. Применимые permission negatives остаются |
-| MCP | Публичный Microsoft Learn discovery/call и локальные policy/storage tests | Контролируемый HTTPS peer с credentials, deny/HITL и reconnect после rollout |
+| MCP | Microsoft Learn и локальные policy/storage tests; 28 октября — контролируемый HTTPS/SSE peer, закрытый auth header, HITL до единственного вызова и deny ожидающего вызова с POLICY_DENIED | Переподключение к контролируемому peer после rollout; повторные initialize без доказанного restart этот пункт не закрывают |
 | A2A и файлы | Прежние 0.3/1.0 и remote proofs; после обновления — dedup/conflict, terminal SSE, новый follow-up, download/raw A2A bytes и immutable старое вложение после исправления | Применимые reconnect/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
 | Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial, wrong-Origin denial без потери сессии, owner/external Task isolation | Итоговые settings/peer/material cards, session expiry/rotation; общий external principal остаётся утверждённым ограничением Cloud-профиля |
 | Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial; 28 октября два собственных чата работали одновременно, отмена parent A не помешала завершению B, отложенный файл descendant A не появился | Прямое подтверждение terminal state child после parent cancel, root/child checkpoint и cleanup при замене экземпляра |
@@ -456,6 +456,39 @@ py_compile, Ruff, describe/embedded compile и три локальных MockTra
 ответе, отсутствие непредусмотренных approvals и logout до закрытия клиента.
 Доказательства: `lead-review.txt`, `lead-local-checks.json` рядом с receipt;
 отчёт исполнителя и process exit сами по себе не считались review approval.
+
+28 октября, итоговый readback в 20:53 UTC: контролируемый MCP peer подтвердил
+authenticated discovery и SSE-вызов из Cloud.ru. Task
+`f5ab270a-c968-4f7e-b63d-08685e8b9310` до HITL-разрешения не отправила ни одного
+tool call на сервер; после разрешения точного вызова сервер получил ровно один
+`echo`, receipt содержал ожидаемый nonce, Task завершилась COMPLETED.
+У Task `099b467a-8052-47bb-a317-0151d7b9d9d8` ожидающий HITL-вызов `denied`
+был отклонён изменением политики только собственного временного инструмента:
+wait outcome и tool receipt содержали POLICY_DENIED. Task завершилась COMPLETED,
+а сервер не получил ни одного вызова `denied`.
+
+Исходные agent settings восстановлены полностью, кроме монотонной revision;
+MCP снова наследуется, список пуст, company settings не изменились. Исходная
+tool policy восстановлена и прочитана до удаления подключения. Оба процесса
+стенда — peer и HTTPS tunnel supervisor — завершились с exit 0. Проверка receipts
+не обнаружила платформенный ключ, owner password или MCP token. Initial input
+guardrails в обоих случаях потребовали решения: разрешены только материалы,
+точно совпавшие с собственными проверенными синтетическими запросами. Это не
+unattended proof и не изменение общих защитных настроек.
+
+Локально настоящий MCP connector прошёл 9 проверок стенда; HTTPS-preflight
+с локального клиента подтвердил 401 при неверном токене. Последнее не является
+проверкой ошибочных credentials из Cloud runtime. Независимый reviewer оставил
+частичный отчёт и вышел по timeout; ведущий подтвердил и исправил несовпадение
+формата public interactions, проверил exact approval binding, запрет повторного
+Send/decision и logout на ошибочных путях. Четыре новые MCP sessions в live-прогоне
+не доказывают reconnect после замены экземпляра: этот platform gate остаётся
+открытым, как и независимая проверка deployed digest.
+
+Receipt в Cloud worktree: `.enterprise-work/controlled-mcp-20261028/proof.json`,
+SHA-256 `5021cd472a4db9bdca7da7c20999d535960e48b172837218fb479f8aa771561b`.
+Рядом сохранены owner history/interactions, ограниченный серверный ledger,
+локальный proof и результаты очистки. Frozen spec/tests этим прогоном не менялись.
 
 - [x] Оператор сообщил об обновлении image; readiness, owner login и успешные model/tool runs после обновления подтверждены. Точный deployed digest остаётся явно непроверенным: Agent Card version `1.0.0` не идентифицирует сборку.
 - [ ] Для каждой строки сохранить результат «прошло / воспроизводимый дефект / ограничение профиля» с Task IDs, версией candidate и безопасными receipts; исправлять только выявленные дефекты в общей точке.
