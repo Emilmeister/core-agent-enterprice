@@ -12,7 +12,10 @@
 
 **Статус:** по отдельному поручению владельца после локальных проверок опубликован
 linux/amd64 candidate `174dec5` с исправлениями UI; version tag и digest подтверждены
-registry readback. Его развёртывание владелец выполнит позже; `latest` не обновлялся.
+registry readback. Владелец сообщил об обновлении; последующие readiness/auth,
+сохранность прежних задач, новый ответ модели и bytes основных UI assets
+подтверждены на Cloud.ru. Полный deployed OCI digest публичный API не раскрывает;
+`latest` при публикации не обновлялся.
 Предыдущий version candidate `948bae1` с исправлением неоднозначного GetTask HTTP 404
 опубликован и проверен локально. После той публикации владелец сообщил об обновлении
 образа в Cloud. Контролируемый live GetTask 404 → COMPLETED прошёл без повторной
@@ -50,6 +53,9 @@ DOCX больше не обновляется по отдельному указ
 Позднее владелец отдельно поручил опубликовать готовый образ для самостоятельного
 развёртывания. Это разрешение на публикацию version tag, без нового live-прогона
 или изменения Cloud deployment со стороны агента.
+После сообщения владельца об обновлении выполнена ограниченная проверка
+готовности, основных UI assets, owner auth, сохранности собственных старых задач
+и одного нового арифметического запроса. Настройки и policies не менялись.
 
 Проверяется текущий код `948bae1`: recovery активной команды, ожидания,
 полный цикл cron без HTTP, изоляция, PostgreSQL/S3 restore и настоящий browser
@@ -248,6 +254,25 @@ Registry readback подтвердил linux/amd64, revision `174dec5`, user `ag
 Cloud deployment не изменялся. Receipt и build/push/readback logs:
 `cloudru-local-verified-image-20261028-174dec5/published.json` и соседние файлы
 в приватном `.enterprise-work/` основного репозитория.
+
+После сообщения владельца об обновлении в `18:36–18:37 UTC` 28 октября:
+
+- `/health/live` и `/health/ready` вернули 200. HTML `/ui/`, основной JS
+  `index-Mm6REKve.js` и CSS `index-Mom53h2n.css` побайтно совпали с опубликованным
+  inventory. Это подтверждает обновлённый UI, но не полный OCI digest runtime.
+- Owner identity до входа вернул 401; login, авторизованное чтение identity и
+  logout прошли. У двух собственных прежних compaction-задач сохранились ID,
+  состояния, финальные тексты и все ранее сохранённые строки истории.
+- Новая Task `eee9574c-b49c-481b-b874-409d5ca7cf06` завершена `COMPLETED` с точным
+  ответом `323`, `complete=true` и одним `core_next_steps`; повторный Send,
+  изменение настроек, policies или ручные решения не потребовались.
+- Старый execution D2 по read-only проверке остаётся `WORKING / cleanup_pending`.
+  Ни replay, ни cancel, ни stop attestation для него не выполнялись; этот
+  платформенный recovery proof по-прежнему открыт.
+
+Receipts: `cloudru-local-verified-image-20261028-174dec5/rollout-readiness-assets.json`
+и `cloudru-post-update-174dec5-20261028.json`. Этот короткий post-rollout smoke
+не заменяет native amd64, реальный restart/overlap и остальные Cloud release gates.
 
 Предыдущий candidate опубликован отдельным version tag. Владелец сообщил об обновлении
 образа в Cloud; точная revision пока не подтверждена независимо:
