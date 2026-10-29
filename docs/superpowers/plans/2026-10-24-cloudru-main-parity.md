@@ -38,8 +38,11 @@ registry readback. Владелец сообщил об обновлении; п
 через два сжатия и вернул точный JSON; с полными инструкциями ядра вновь появилась
 Markdown-обёртка. По уточнению владельца миграционная проверка упрощена до
 сохранения трёх фактов и одной правки после двух сжатий, без требования raw JSON.
-Новый сценарий пока не выполнен; прежний pressure case остаётся отрицательным
-диагностическим результатом, а не автоматически назначенным исправлением runtime.
+Новый сценарий локально пройден: два сжатия, исправленный город Казань,
+сумма 427.50 EUR и запрет отправки сохранены в конечном ответе. Первая попытка
+summary получила 90-секундный timeout; следующая штатная попытка сработала.
+Прежний pressure case остаётся отрицательным диагностическим результатом,
+а не автоматически назначенным исправлением runtime.
 Предыдущий version candidate `948bae1` с исправлением неоднозначного GetTask HTTP 404
 опубликован и проверен локально. После той публикации владелец сообщил об обновлении
 образа в Cloud. Контролируемый live GetTask 404 → COMPLETED прошёл без повторной
@@ -438,7 +441,7 @@ host checking сохранён. Remote refs не менялись. Receipt в Cl
 
 | Проверка | Уже есть | Что ещё должно быть в итоговом receipt |
 |---|---|---|
-| Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot; native logs подтвердили два compactions с итогом 10,64% и 11,25% W, без повторных owner questions | Provider failure становится terminal в Cloud; выполнить простой сценарий сохранения фактов после двух сжатий, описанный ниже. Старый строгий JSON stress-test не объявляется пройденным |
+| Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot; native logs подтвердили два compactions с итогом 10,64% и 11,25% W, без повторных owner questions. 29 октября простой сценарий сохранения фактов после двух сжатий пройден локально с настоящим provider | Provider failure становится terminal в Cloud; подтвердить простой сценарий на согласованном Cloud candidate. Старый строгий JSON stress-test не объявляется пройденным |
 | Качество ответа | После restart точный JSON-пример и literal `PENDING; NOT RELEASED` прошли; прежний synthetic stress-test дал fences/`PENDING` | В новой миграционной проверке оцениваются актуальные значения, единицы и запрет действия; обычный текст или Markdown допустимы. Обязательный машинный JSON этим сценарием не проверяется |
 | Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs; текущий provider из `.env` отдельно вернул 1024 | Проверить модель и размерности сохранённого target corpus после прежнего ответа 2048, соответствие реального индекса и query plan; startup vector_index=true и отсутствие degraded_channels этого не доказывают. Применимые permission negatives остаются |
 | MCP | Microsoft Learn и локальные policy/storage tests; 28 октября — контролируемый HTTPS/SSE peer, закрытый auth header, HITL до единственного вызова и deny ожидающего вызова с POLICY_DENIED | Переподключение к контролируемому peer после rollout; повторные initialize без доказанного restart этот пункт не закрывают |
@@ -446,7 +449,7 @@ host checking сохранён. Remote refs не менялись. Receipt в Cl
 | Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial, wrong-Origin denial без потери сессии, owner/external Task isolation | Итоговые settings/peer/material cards, session expiry/rotation; общий external principal остаётся утверждённым ограничением Cloud-профиля |
 | Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial; 28 октября два собственных чата работали одновременно, отмена parent A не помешала завершению B, отложенный файл descendant A не появился | Прямое подтверждение terminal state child после parent cancel, root/child checkpoint и cleanup при замене экземпляра |
 
-**Простой сценарий вместо смешанного stress-test (29 октября; ещё не выполнен).**
+**Простой сценарий вместо смешанного stress-test (29 октября; локально пройден).**
 Это локальная сквозная проверка настоящего provider и runtime, не unit test.
 Существующие unit/integration tests бюджетов, pinned data, истории и recovery
 сохраняются без изменения. Product code и frozen tests/spec ради нового сценария
@@ -470,6 +473,36 @@ Raw JSON и Markdown fences не являются критерием этой п
 реальный потребитель машинного JSON, его формат проверяется отдельным сценарием
 с явным контрактом. Ниже сохранена история прежних более строгих экспериментов:
 их отрицательные результаты не переписываются и не выдаются за исправленные.
+
+Локальный прогон использовал настоящий CoreAgent loop, отдельный PostgreSQL и
+Foundation Models `Qwen/Qwen3.5-397B-A17B`. Исходный pinned prompt содержал только
+порядок действий; значения переданы follow-up сообщениями. Второе сообщение с
+исправлением города поступило после первого подтверждённого сжатия.
+При `working_capacity=8018` события показали `8374 → 904` (sequence 1–6) и
+`9336 → 964` (sequence 1–11). Task `9f989c35-7add-4404-aea2-0f6c4b1a6f59`
+завершилась `COMPLETED`, exit 0; полный конечный ответ:
+
+```text
+Город: Казань
+Сумма: 427.50 EUR
+Отправка: не разрешена
+```
+
+Ведущий и отдельный DSH reviewer проверили ответ целиком: прежний город не
+выдан за текущий, сумма/валюта и запрет сохранены, противоречий нет. Всего
+9 provider calls: первая summary попытка закончилась `provider_unavailable`
+по timeout 90071 ms, вторая успешно завершилась за 80,945 s; второе сжатие —
+за 83,196 s. Это восстановление в пределах штатного compaction budget;
+`REFLECT_AND_RETRY` был выключен. Отказ не скрыт и отсутствие задержек не заявляется.
+Артефакты в worktree: `.enterprise-work/compaction-provider-local-20261029/`
+`smoke-20261029/` — `inputs.json`, `run-1/result.json`, `run-1.log`, `run-1.exit`,
+`post-review.md`, `semantic-review.json`, `cleanup.json`. Собственный PostgreSQL
+container удалён, отсутствие проверено. Product code, tests и spec не менялись.
+Это один локальный диагностический прогон с ограниченными tools, тестовым
+auth/guardrail fixture и окном 27120, не проверка Cloud, ingress, restart или
+универсальная гарантия сохранения любых значений. Локальный пункт закрыт;
+следующий Cloud шаг — контролируемый MCP reconnect при согласованном обновлении
+экземпляра на опубликованный candidate `99a5de6`.
 
 Локальная сверка сохранённых receipts 29 октября сохранила отрицательный exact
 check: raw JSON не разбирается из-за fences; даже диагностическое снятие fences
