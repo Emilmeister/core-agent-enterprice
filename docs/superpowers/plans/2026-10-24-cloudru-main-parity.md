@@ -21,8 +21,8 @@
 |---|---|---|
 | 1. Простой сценарий двух сжатий | Cloud Task `1c32d3b3-816d-45f1-9948-a92edb435d48` завершилась; два вопроса и оба ответа сохранены. Итог: «Город — Казань, сумма — 427.50 EUR, отправка не разрешена.» | Для полного pass нужны два native `context.compacted` именно нового run `782b9784-4aaf-46a8-a9b3-e7242cc0a8f4`; они запрошены у оператора. API этого не показывает; прежние события 28 октября не подменяют новый run |
 | 2. Отмена parent и состояние child | Прежний Cloud cancel/cross-chat proof сохранён. Разбор текущего public flow подтвердил отсутствие публичного чтения internal child Task и stop receipt | Прямой terminal/stop proof недоступен через разрешённый API. Повтор того же непрозрачного сценария не закрывает пункт; новый API или прямой доступ к БД не добавляем |
-| 3. Mixed/large файлы | Пять файлов, 4194517 исходных bytes; raw A2A, immutable download и workspace сверены. После изменения notes опубликованный snapshot сохранил исходные bytes. Все 34 проверки до restart прошли | Повторно прочитать те же artifact/file IDs и сверить все bytes после согласованного restart |
-| 4. Remote wait через restart | Собственная Task `ced68f82-9b39-4282-9200-bff04b2013bf` ожидает; fixture принял ровно один Send. Один `core_task_wait` и operation `8b8ae9b0-4ed1-5000-9ebe-047b3161682c` сохранены до сигнала оператору | Ожидается подтверждение restart. Затем сверить тот же вызов/operation, выпустить fixture через plain GetTask 404 → COMPLETED и исключить повторный Send. Private wait identity/deadline API не раскрывает |
+| 3. Mixed/large файлы | Пять файлов, 4194517 исходных bytes; raw A2A, immutable download и workspace сверены. После изменения notes опубликованный snapshot сохранил исходные bytes. Прошли 34 проверки до restart и 31 после: тот же artifact ID, все десять downloads совпали | Scoped PASS после подтверждённого владельцем restart. Независимой boot identity/deployed OCI digest нет |
+| 4. Remote wait через restart | После подтверждённого владельцем restart та же Task `ced68f82-9b39-4282-9200-bff04b2013bf`, wait call и operation `8b8ae9b0-4ed1-5000-9ebe-047b3161682c` сохранились. Plain GetTask 404 → COMPLETED, ровно один Send, wait succeeded и root COMPLETED; семь публичных проверок прошли. Peer/стенд удалены | Scoped PASS публичного flow. Private wait identity/deadline, boot identity и deployed OCI digest API не раскрывает; полным доказательством этих внутренних свойств результат не считается |
 | 5. Cron без HTTP | Подготовлен один ограниченный собственный schedule с обычным вопросом, без требования повторять маркер или запрета инструментов; live-прогон ещё не начат | После restart и очистки peer: новое подтверждение закрытого UI, 28–29 минут без запросов команды к deployment, автоматическое COMPLETED до первого reconnect |
 | 6. Доступ и sandbox | Wrong-chat download 404; без owner session 401; wrong-Origin logout 403 с сохранением сессии; после обычного logout identity 401. Sandbox: соседний контрольный файл закрыт, шесть private/metadata IPv4/IPv6 HTTP адресов вернули 403, публичный fixture — ожидаемый 401; шесть проверенных секретных ENV отсутствуют | Это ограниченные target proofs. Они не подменяют native amd64/browser, проверку всех протоколов/секретов или platform credential rotation |
 | 7. Итоговая матрица | Подтверждённые результаты и ограничения сохраняются в этом плане; продуктовый код, frozen spec/tests не менялись | После шагов 4–5 сверить cleanup и итоговые receipts, отдельно перечислить недоступные platform proofs |
@@ -39,6 +39,39 @@ binary 1 MiB, text около 3 MiB и пустой файл; один `core_res
 рабочий `notes.txt` изменён со 104 до 27 bytes; immutable версия осталась
 исходной. Все SHA-256 сверены с локальными originals, manifest и raw A2A.
 Task завершена полностью; logout 200, последующая identity 401.
+
+После сообщения владельца «перезапустил» 29 октября повторены чтение той же
+Task, raw A2A Parts и десять downloads (пять immutable, пять workspace).
+Все bytes, SHA-256 и artifact ID совпали с сохранёнными значениями до restart;
+прошла 31 проверка. Собственная сессия завершена logout 200, identity после
+него вернула 401. Результат: `files-after-restart.json` и
+`files-restart-proof.json`; основание факта restart —
+`restart-operator-attestation.json`, без независимой проверки boot identity.
+
+Remote run `1803ebde-1f29-4332-8623-f9760987243e` сохранил тот же незавершённый
+wait call `chatcmpl-tool-9ad4fb530f6f0317` и remote Task
+`d0e5afaa-7ed8-41ff-a4f8-d94613be6f8f`. Прежний локальный observer завершился
+в 11:12:15 UTC по таймеру ожидания подтверждения оператора; сам Cloud run не
+отменялся, fixture оставался WORKING. После сообщения владельца в 11:50 UTC
+новый observer продолжил чтение того же run, сохранив исходный baseline и
+ledger, без нового admission, Send или повторного разрешения прежних вызовов.
+После сверки публичных идентификаторов fixture выпущен в 11:52:28 UTC.
+Штатные Get с прежним интервалом 300 s получили один plain 404, затем
+COMPLETED; повторного Send/Cancel не было. Получены успешный результат wait,
+полный terminal ответ root и точная контрольная строка результата peer.
+Семь публичных проверок истинны; private wait ID/generation/deadline намеренно
+не помечены доказанными. Свой registry peer удалён по exact ID/revision после
+завершения, отсутствие проверено; logout 200. Fixture и tunnel остановлены,
+оба PID отсутствуют, файл с временным bearer удалён. Company settings совпали
+с исходными. Receipts: `remote-owner-after-restart.json`,
+`remote-restart-proof.json`, `remote-fixture-cleanup.json`.
+Свежий независимый DSH reviewer (`qwen3-8-flash-next2`, xhigh) завершил сверку
+restart/files за 120,1 s с exit 0; нарушений согласованных публичных критериев
+не выявлено. Ведущий через `uv` повторно сверил неизменность исходного baseline,
+семь source hashes, семь публичных checks и отсутствие неожиданных authenticated
+путей fixture. Отчёт и уточнения: `restart-independent-review.md`,
+`restart-review-disposition.json`. Первоначальный timeout observer и недоступные
+внутренние поля не скрыты и не объявляются runtime-дефектами.
 
 Sandbox Task `dbf1e1a9-1195-4b4a-97d0-38177fd07373` выполнила один Python
 вызов: exit 0, `sandbox_terminated`, без timeout/truncation. Свой файл совпал,
@@ -131,7 +164,9 @@ application_ready `11:32:04 UTC`. Owner/HITL waits и два таймера со
 Удалённое ожидание завершилось ошибкой после HTTP 404 на GetTask при restart,
 хотя удалённая Task затем завершилась; active terminal D2 остаётся в
 `WORKING` с `core_agent_execution.state=cleanup_pending`; replay не наблюдался, нет
-доказательства остановки прежнего процесса. Эти два restart-пункта не пройдены.
+доказательства остановки прежнего процесса. В том прогоне оба restart-пункта
+не были пройдены; публичный remote wait повторно проверен 29 октября после
+нового operator restart (см. завершающий прогон выше). D2 остаётся открытым.
 Recovery-loop после non-retryable HTTP 404 исправлен локально в `83edd16`:
 известный отказ сохраняется в `FAILED` до освобождения lease; повторный recovery
 не вызывает provider. Подтверждены отмена, cooperative worker stop, incomplete
@@ -1174,8 +1209,8 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   во время финального прогона; `cloudru-remote404-full-20261028.log` и
   `cloudru-remote404-source-frozen-20261028.json` сохраняют evidence.
   Новый version image опубликован и проверен отдельно (см. выше), `latest`
-  не перемещался. Владелец сообщил об обновлении образа; повторная Cloud
-  restart-проверка исправления ещё не выполнена. Контролируемый HTTPS fixture
+  не перемещался. Владелец сообщил об обновлении образа; на том этапе повторная
+  Cloud restart-проверка исправления ещё не была выполнена. Контролируемый HTTPS fixture
   подтвердил один Send, plain GetTask 404 и последующий COMPLETED той же remote
   Task. Parent после одного разрешения собственного wait завершился полностью;
   Send/Cancel не повторялись. Точное удаление peer и остановка fixture/tunnel
