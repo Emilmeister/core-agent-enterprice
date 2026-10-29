@@ -10,6 +10,57 @@
 
 ## Актуальный план — 29 октября 2026
 
+### Согласованный завершающий прогон — 29 октября
+
+Владелец поручил выполнить следующие семь шагов до конца. Проверяем текущий
+развёрнутый candidate по доступным owner API и собственным fixtures; прямого
+подключения к платформенной БД нет. Уже пройденные локальные gates неизменного
+кода не повторяем. Отсутствие прямого proof не заменяем косвенным признаком.
+
+| Шаг | Текущий результат | Что осталось |
+|---|---|---|
+| 1. Простой сценарий двух сжатий | Cloud Task `1c32d3b3-816d-45f1-9948-a92edb435d48` завершилась; два вопроса и оба ответа сохранены. Итог: «Город — Казань, сумма — 427.50 EUR, отправка не разрешена.» | Для полного pass нужны два native `context.compacted` именно нового run `782b9784-4aaf-46a8-a9b3-e7242cc0a8f4`; они запрошены у оператора. API этого не показывает; прежние события 28 октября не подменяют новый run |
+| 2. Отмена parent и состояние child | Прежний Cloud cancel/cross-chat proof сохранён. Разбор текущего public flow подтвердил отсутствие публичного чтения internal child Task и stop receipt | Прямой terminal/stop proof недоступен через разрешённый API. Повтор того же непрозрачного сценария не закрывает пункт; новый API или прямой доступ к БД не добавляем |
+| 3. Mixed/large файлы | Пять файлов, 4194517 исходных bytes; raw A2A, immutable download и workspace сверены. После изменения notes опубликованный snapshot сохранил исходные bytes. Все 34 проверки до restart прошли | Повторно прочитать те же artifact/file IDs и сверить все bytes после согласованного restart |
+| 4. Remote wait через restart | Собственная Task `ced68f82-9b39-4282-9200-bff04b2013bf` ожидает; fixture принял ровно один Send. Один `core_task_wait` и operation `8b8ae9b0-4ed1-5000-9ebe-047b3161682c` сохранены до сигнала оператору | Ожидается подтверждение restart. Затем сверить тот же вызов/operation, выпустить fixture через plain GetTask 404 → COMPLETED и исключить повторный Send. Private wait identity/deadline API не раскрывает |
+| 5. Cron без HTTP | Подготовлен один ограниченный собственный schedule с обычным вопросом, без literal-marker и запрета инструментов | После restart и очистки peer: новое подтверждение закрытого UI, 28–29 минут без запросов команды к deployment, автоматическое COMPLETED до первого reconnect |
+| 6. Доступ и sandbox | Wrong-chat download 404; без owner session 401; wrong-Origin logout 403 с сохранением сессии; после обычного logout identity 401. Sandbox: соседний контрольный файл закрыт, шесть private/metadata IPv4/IPv6 HTTP адресов вернули 403, публичный fixture — ожидаемый 401; шесть проверенных секретных ENV отсутствуют | Это ограниченные target proofs. Они не подменяют native amd64/browser, проверку всех протоколов/секретов или platform credential rotation |
+| 7. Итоговая матрица | Подтверждённые результаты и ограничения сохраняются в этом плане; продуктовый код, frozen spec/tests не менялись | После шагов 4–5 сверить cleanup и итоговые receipts, отдельно перечислить недоступные platform proofs |
+
+Проверка фактов использовала временный `context_window=32768` в snapshot новой
+Task; company setting сразу восстановлен с 128000, revision 36 → 37 → 38,
+остальные поля совпали. Task завершена с `complete=true`, восемью model turns
+и пятью tool calls (два вопроса, три next steps). Ведущий и свежий DSH reviewer
+проверили ответ целиком; строгий JSON не является условием этого сценария.
+
+Файловая Task `9d5a38b5-3f17-4c9d-99c6-4e660e2fc755` создала text, JSON,
+binary 1 MiB, text около 3 MiB и пустой файл; один `core_response_files`
+сохранил artifact `f7fbd48787455bc4bb1ad45e33e9ed9c`. После публикации только
+рабочий `notes.txt` изменён со 104 до 27 bytes; immutable версия осталась
+исходной. Все SHA-256 сверены с локальными originals, manifest и raw A2A.
+Task завершена полностью; logout 200, последующая identity 401.
+
+Sandbox Task `dbf1e1a9-1195-4b4a-97d0-38177fd07373` выполнила один Python
+вызов: exit 0, `sandbox_terminated`, без timeout/truncation. Свой файл совпал,
+чтение одного заранее проверенного чужого чата отклонено `PermissionError(13)`;
+исходный контрольный файл сохранил hash. Проверены loopback IPv4/IPv6,
+IPv4-mapped loopback, RFC1918, metadata link-local и IPv6 ULA через HTTP.
+Это egress-проверка шести адресов, не полный сетевой/kernel audit; содержимое
+секретов не читалось. Settings/policies не менялись. Ведущий подтвердил 13
+проверок и единственное отличие model tool arguments: удалён последний newline
+из Python-кода, остальной код и аргументы совпали.
+
+Receipts в ignored worktree `.enterprise-work/parity-finish-20261029/`:
+`compaction.json`, `compaction-semantic-proof.json`, `files-owner.json`,
+`files-before-restart.json`, `files-inputs.json`, `file-originals/`,
+`sandbox-owner.json`, `sandbox-proof.json`, `child-research.md`.
+Свежий независимый DSH review (`qwen3-8-flash-next2`, xhigh) результатов
+compaction/files завершён с exit 0; его выводы проверены ведущим по receipts
+и bytes (`completed-stage-review.md`). Native compaction и restart этим review
+ещё не подтверждены. Remote fixture отдельно прошёл локальный wire check;
+ошибочная первая адресация проверяющего клиента и её исправленный повтор
+сохранены в `remote-local-check*.json`, не выдаются за дефект runtime.
+
 **Уточнение владельца:** GitHub и push в него не являются условиями переноса.
 `.github/workflows/ci.yml` задаёт существующие команды и fixtures проверок,
 но GitHub Actions — только один из способов их выполнения. Применимые native
