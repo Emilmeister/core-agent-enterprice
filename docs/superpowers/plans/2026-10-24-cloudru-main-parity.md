@@ -27,10 +27,13 @@ Registry readback подтвердил revision, user и layers; `latest` не �
 health/ready, owner login/identity/settings/logout вернули 200; до входа owner
 identity вернул 401. Readback показывает модель `Qwen/Qwen3.5-397B-A17B` и
 исходный пустой список MCP. Фактический deployed OCI digest публичным API не подтверждён.
-После сообщённого владельцем перезапуска та же MCP Task и точное pending
-approval сохранились, но временный peer уже истёк по TTL: reconnect не засчитан.
-Первый стенд очищен; повтор подготовлен с двухчасовым сроком и ожидает нового
-перезапуска после сигнала готовности.
+Контролируемый MCP reconnect пройден во втором сценарии: после сообщённого
+владельцем перезапуска сохранились та же Task и точное pending approval,
+появилась новая authenticated MCP session, echo выполнен ровно один раз,
+Task завершилась `COMPLETED`. Собственное подключение и процессы удалены.
+Перезапуск подтверждён владельцем; boot identity и deployed OCI digest
+независимо не прочитаны. Первый истёкший стенд остаётся отдельным частичным
+результатом, не смешивается с успешным повтором.
 
 Ранее по отдельному поручению владельца после локальных проверок опубликован
 linux/amd64 candidate `174dec5` с исправлениями UI; version tag и digest подтверждены
@@ -230,6 +233,12 @@ deployed digest, ingress, idle CPU, production credentials или Cloud backup/r
   `kubectl`, shell в Pod, прямого SQL или доступа к серверу БД. Проверки приложения
   выполняются через существующие owner UI/API и ограниченные agent tools; отдельные
   native CI fixtures относятся к среде разработки, а не к управлению Cloud-кластером.
+- 29 октября владелец подтвердил отсутствие прямого подключения к управляемой БД.
+  Проверка памяти продолжается через agent tools: запись, поиск по смыслу и чтение
+  собственного контрольного документа. Существующие подтверждения используются
+  повторно; SQL inventory не становится условием продолжения этих проверок.
+  Размерности всего target corpus и использование индекса таким способом не
+  подтверждаются и остаются явно отмеченным ограничением доказательства.
 
 ### Что уже завершено и чем подтверждено
 
@@ -449,8 +458,8 @@ host checking сохранён. Remote refs не менялись. Receipt в Cl
 |---|---|---|
 | Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot; native logs подтвердили два compactions с итогом 10,64% и 11,25% W, без повторных owner questions. 29 октября простой сценарий сохранения фактов после двух сжатий пройден локально с настоящим provider | Provider failure становится terminal в Cloud; подтвердить простой сценарий на согласованном Cloud candidate. Старый строгий JSON stress-test не объявляется пройденным |
 | Качество ответа | После restart точный JSON-пример и literal `PENDING; NOT RELEASED` прошли; прежний synthetic stress-test дал fences/`PENDING` | В новой миграционной проверке оцениваются актуальные значения, единицы и запрет действия; обычный текст или Markdown допустимы. Обязательный машинный JSON этим сценарием не проверяется |
-| Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs; текущий provider из `.env` отдельно вернул 1024 | Проверить модель и размерности сохранённого target corpus после прежнего ответа 2048, соответствие реального индекса и query plan; startup vector_index=true и отсутствие degraded_channels этого не доказывают. Применимые permission negatives остаются |
-| MCP | Microsoft Learn и локальные policy/storage tests; 28 октября — контролируемый HTTPS/SSE peer, закрытый auth header, HITL до единственного вызова и deny ожидающего вызова с POLICY_DENIED | Переподключение к контролируемому peer после rollout; повторные initialize без доказанного restart этот пункт не закрывают |
+| Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs; текущий provider из `.env` отдельно вернул 1024 | На текущем candidate проверить доступное через agent tools поведение записи, поиска и чтения; применимые permission negatives остаются. Прямого доступа к БД нет: размерности всего target corpus после прежнего ответа 2048, покрытие индексом и query plan не подтверждены; startup vector_index=true и отсутствие degraded_channels этого не доказывают |
+| MCP | Microsoft Learn и локальные policy/storage tests; 28 октября — контролируемый HTTPS/SSE peer, закрытый auth header, HITL до единственного вызова и deny ожидающего вызова с POLICY_DENIED. 29 октября — сохранение точного approval, новая authenticated session и единственный echo после подтверждённого владельцем restart; Task COMPLETED, стенд очищен | Сценарий reconnect пройден с операторским подтверждением restart; независимые boot identity и deployed OCI digest не получены. Это один контролируемый вызов, не универсальная гарантия exactly-once |
 | A2A и файлы | Прежние 0.3/1.0 и remote proofs; после обновления — dedup/conflict, terminal SSE, новый follow-up, download/raw A2A bytes и immutable старое вложение после исправления | Применимые reconnect/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
 | Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial, wrong-Origin denial без потери сессии, owner/external Task isolation | Итоговые settings/peer/material cards, session expiry/rotation; общий external principal остаётся утверждённым ограничением Cloud-профиля |
 | Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial; 28 октября два собственных чата работали одновременно, отмена parent A не помешала завершению B, отложенный файл descendant A не появился | Прямое подтверждение terminal state child после parent cancel, root/child checkpoint и cleanup при замене экземпляра |
@@ -921,8 +930,33 @@ exit 2. HTTPS discovery/SSE и 401 без ключа подтверждены о
 `d3354381-24e4-4ef5-b6f6-fe5896d02e6a`. До сигнала оператору подтверждены
 Cloud initialize/tools/list и ноль tools/call; срок стенда — до 13:53:46 МСК.
 Исходные binding и журнал сохранены в `before-rollout*.json`, сигнал — в
-`ready-signal.json`. Повторный restart и разрешение вызова ещё не выполнены.
-Это изменения только диагностики; product code, frozen tests/spec не менялись.
+`ready-signal.json`. Контрольный снимок перед allow содержит ту же Task, context
+и все binding поля pending approval; до разрешения в журнале ноль tools/call.
+Снимок снят примерно за 40 секунд до записанного времени получения подтверждения
+restart. После подтверждения одно решение allow успешно применено к исходному
+wait ID; оно подтверждает, что исходное согласование всё ещё ожидало решения.
+В `09:17:24.598 UTC` peer записал новый authenticated initialize/session
+`fa46853d70021d03`, отличный от preflight и прежнего Cloud session; в
+`09:17:27.582 UTC` — единственный authenticated echo с исходным nonce. Сохранённый
+tool receipt имеет `status=succeeded`, `isError=false` и точный ответ echo/nonce;
+Task завершилась `TASK_STATE_COMPLETED`, повторных echo нет.
+После этого собственный descriptor удалён через CAS: revision 36, исходный
+пустой список MCP снова наследуется, policies не менялись, logout вернул 200.
+Оба собственных процесса остановлены и их отсутствие проверено; peer завершён
+намеренным SIGTERM (exit -15), tunnel — exit 0. `post-restart-before-allow*.json`,
+`completed-owner.json`, `completion-proof.json`, `proof.json`, `tunnel.json` и
+`live/events.jsonl` сохраняют отдельные стадии, terminal outcome и hashes.
+Перезапуск и выбор версии подтверждены владельцем; отдельной startup-строки,
+boot identity или readback deployed OCI digest нет. Этот manual proof закрывает
+конкретный сценарий MCP reconnect, не всю миграцию и не произвольные повторы tools.
+Отдельный DSH reviewer завершил первичное ревью и обнаружил пропущенный в его
+read scope post-cleanup `owner.json`. Дополнительный запуск сохранил отчёт со
+снятым замечанием, но завершился timeout 100 s / exit 124; этот запуск не считается
+полностью завершённым ревью. Ведущий отдельно сверил все семь hashes, CAS receipt,
+GET/readback path, terminal tool receipt и единственный dispatch. Оба отчёта и
+статусы находятся в `independent-review*.md` и `review-disposition.json` рядом
+с доказательствами сценария.
+Product code и frozen tests/spec не менялись.
 
 28 октября, 20:05–20:11 UTC, выполнен ограниченный сценарий двух чатов через
 owner API без изменения settings/policies. Parent A
@@ -1167,9 +1201,12 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   в worktree `.enterprise-work/memory-readback-20261029/`. Свежий DSH reviewer
   завершил static review и correction session; реальные SQL checks выполнил
   ведущий, финальные hashes и границы зафиксированы в `lead-validation.json`.
-  Это проверка самого SQL,
-  не целевого corpus или реального query plan. Подключения к целевой PostgreSQL
-  в локальном `.env` нет; способ operator execution запрошен отдельно.
+  Это проверка самого SQL, не целевого corpus или реального query plan.
+  29 октября владелец подтвердил, что прямое подключение к целевой БД недоступно.
+  SQL остаётся подготовленным диагностическим инструментом, его выполнение
+  от владельца не требуется. Следующий доступный шаг — проверка памяти через
+  agent tools на текущем candidate; её результат не подменяет inventory всего
+  corpus, доказательство совместимости исторических векторов или query plan.
   Эти отдельные проблемы не объявляются причиной D2 или remote 404. Перекрытие процессов в общих логах
   без instance identity не закрывает overlap gate. Доказательства:
   `cloudru-rollout-operator-log-facts-20261028.json`,
