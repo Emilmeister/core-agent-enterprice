@@ -22,9 +22,9 @@
 | 1. Простой сценарий двух сжатий | Cloud Task `1c32d3b3-816d-45f1-9948-a92edb435d48` завершилась; два вопроса и оба ответа сохранены. Итог: «Город — Казань, сумма — 427.50 EUR, отправка не разрешена.» | Для полного pass нужны два native `context.compacted` именно нового run `782b9784-4aaf-46a8-a9b3-e7242cc0a8f4`; они запрошены у оператора. API этого не показывает; прежние события 28 октября не подменяют новый run |
 | 2. Отмена parent и состояние child | Прежний Cloud cancel/cross-chat proof сохранён. Разбор текущего public flow подтвердил отсутствие публичного чтения internal child Task и stop receipt | Прямой terminal/stop proof недоступен через разрешённый API. Повтор того же непрозрачного сценария не закрывает пункт; новый API или прямой доступ к БД не добавляем |
 | 3. Mixed/large файлы | Пять файлов, 4194517 исходных bytes; raw A2A, immutable download и workspace сверены. После изменения notes опубликованный snapshot сохранил исходные bytes. Прошли 34 проверки до restart и 31 после: тот же artifact ID, все десять downloads совпали | Scoped PASS после подтверждённого владельцем restart. Независимой boot identity/deployed OCI digest нет |
-| 4. Remote wait через restart | После подтверждённого владельцем restart та же Task `ced68f82-9b39-4282-9200-bff04b2013bf`, wait call и operation `8b8ae9b0-4ed1-5000-9ebe-047b3161682c` сохранились. Plain GetTask 404 → COMPLETED, ровно один Send, wait succeeded и root COMPLETED; семь публичных проверок прошли. Peer/стенд удалены | Scoped PASS публичного flow. Private wait identity/deadline, boot identity и deployed OCI digest API не раскрывает; полным доказательством этих внутренних свойств результат не считается |
-| 5. Cron без HTTP | Подготовлен один ограниченный собственный schedule с обычным вопросом, без требования повторять маркер или запрета инструментов; live-прогон ещё не начат | После restart и очистки peer: новое подтверждение закрытого UI, 28–29 минут без запросов команды к deployment, автоматическое COMPLETED до первого reconnect |
-| 6. Доступ и sandbox | Wrong-chat download 404; без owner session 401; wrong-Origin logout 403 с сохранением сессии; после обычного logout identity 401. Sandbox: соседний контрольный файл закрыт, шесть private/metadata IPv4/IPv6 HTTP адресов вернули 403, публичный fixture — ожидаемый 401; шесть проверенных секретных ENV отсутствуют | Это ограниченные target proofs. Они не подменяют native amd64/browser, проверку всех протоколов/секретов или platform credential rotation |
+| 4. Remote wait через restart | После подтверждённого владельцем restart та же Task `ced68f82-9b39-4282-9200-bff04b2013bf`, wait call и operation `8b8ae9b0-4ed1-5000-9ebe-047b3161682c` сохранились. Тестовый peer намеренно вернул plain GetTask 404, затем COMPLETED; ровно один Send, wait succeeded и root COMPLETED; семь публичных проверок прошли. Peer/стенд удалены | Scoped PASS публичного flow. Причину реального 404 от 28 октября этот fixture не устанавливает. Private wait identity/deadline, boot identity и deployed OCI digest API не раскрывает |
+| 5. Cron без HTTP | Идёт один live-прогон schedule `68fd7900-8a3d-467f-963b-d79f5baa0df3`: владелец подтвердил закрытый UI, logout выполнен; тишина с 12:16:23 UTC, due 12:42 UTC, первое чтение запланировано на 12:45 UTC | До первого reconnect результат неизвестен. Проверить автоматическое COMPLETED до reconnect и очистить только своё расписание; guardrail/HITL не разрешать ради положительного результата |
+| 6. Доступ и sandbox | До restart файлов: wrong-chat download 404; без owner session 401; wrong-Origin logout 403 с сохранением сессии. Обычный logout → identity 401 проверен до и после restart. Отдельный sandbox-прогон: соседний контрольный файл закрыт, шесть private/metadata IPv4/IPv6 HTTP адресов вернули 403, публичный fixture — ожидаемый 401; шесть проверенных секретных ENV отсутствуют | Это ограниченные target proofs. Они не подменяют native amd64/browser, проверку всех протоколов/секретов или platform credential rotation |
 | 7. Итоговая матрица | Подтверждённые результаты и ограничения сохраняются в этом плане; продуктовый код, frozen spec/tests не менялись | После шагов 4–5 сверить cleanup и итоговые receipts, отдельно перечислить недоступные platform proofs |
 
 Проверка фактов использовала временный `context_window=32768` в snapshot новой
@@ -47,6 +47,10 @@ Task, raw A2A Parts и десять downloads (пять immutable, пять work
 него вернула 401. Результат: `files-after-restart.json` и
 `files-restart-proof.json`; основание факта restart —
 `restart-operator-attestation.json`, без независимой проверки boot identity.
+Разница 34 → 31 объясняется четырьмя access-проверками только до restart
+(`file_denied_without_owner_session`, `wrong_chat_denied`, `wrong_origin_denied`,
+`session_preserved_after_wrong_origin`) и новой `same_snapshot_after_restart`.
+Проверки bytes/hash не исключались; это 34 − 4 + 1, не ослабление файлового proof.
 
 Remote run `1803ebde-1f29-4332-8623-f9760987243e` сохранил тот же незавершённый
 wait call `chatcmpl-tool-9ad4fb530f6f0317` и remote Task
@@ -56,8 +60,11 @@ wait call `chatcmpl-tool-9ad4fb530f6f0317` и remote Task
 новый observer продолжил чтение того же run, сохранив исходный baseline и
 ledger, без нового admission, Send или повторного разрешения прежних вызовов.
 После сверки публичных идентификаторов fixture выпущен в 11:52:28 UTC.
-Штатные Get с прежним интервалом 300 s получили один plain 404, затем
-COMPLETED; повторного Send/Cancel не было. Получены успешный результат wait,
+Штатные Get с прежним интервалом 300 s получили один намеренно выданный нашим
+fixture plain 404, затем COMPLETED; повторного Send/Cancel не было. Это отдельная
+проверка обработки 404 после restart, а не доказательство, что restart вызвал
+404; причина исходного Cloud 404 от 28 октября остаётся неизвестной.
+Получены успешный результат wait,
 полный terminal ответ root и точная контрольная строка результата peer.
 Семь публичных проверок истинны; private wait ID/generation/deadline намеренно
 не помечены доказанными. Свой registry peer удалён по exact ID/revision после
@@ -106,6 +113,14 @@ session сохранило выводы и вышло 0 за 23,2 s. Ведущ�
 `cron-review.md` / `cron-local-check.json` сохраняют границы этого proof.
 Сравнение времени terminal Task и первого reconnect зависит от согласованности
 часов сервера и клиента; независимой проверки их синхронизации нет.
+
+Свежий DSH reviewer (`qwen3-8-flash-next2`, xhigh, 73,4 s, exit 0) сверил
+итоговые scope/receipts без HTTP к агенту во время cron-окна. Подтверждены
+ограниченные результаты шагов 3, 4 и 6; шаги 1 и 2 не объявлены полными,
+активный cron не оценивался. Замечания о происхождении fixture 404 и access
+проверок учтены выше. В `cron-local-check.json` четыре сценария для двух cleanup
+функций; формулировка reviewer «two cleanup branches» неточна. Отчёт и disposition:
+`final-scope-review.md`, `final-scope-review-disposition.json`.
 
 **Уточнение владельца:** GitHub и push в него не являются условиями переноса.
 `.github/workflows/ci.yml` задаёт существующие команды и fixtures проверок,
