@@ -234,9 +234,9 @@ deployed digest, ingress, idle CPU, production credentials или Cloud backup/r
   выполняются через существующие owner UI/API и ограниченные agent tools; отдельные
   native CI fixtures относятся к среде разработки, а не к управлению Cloud-кластером.
 - 29 октября владелец подтвердил отсутствие прямого подключения к управляемой БД.
-  Проверка памяти продолжается через agent tools: запись, поиск по смыслу и чтение
-  собственного контрольного документа. Существующие подтверждения используются
-  повторно; SQL inventory не становится условием продолжения этих проверок.
+  Через agent tools пройдены запись, поиск по смыслу и точное чтение собственного
+  контрольного документа в новом чате, затем удаление и проверка его отсутствия.
+  SQL inventory не становится условием продолжения этих проверок.
   Размерности всего target corpus и использование индекса таким способом не
   подтверждаются и остаются явно отмеченным ограничением доказательства.
 
@@ -458,7 +458,7 @@ host checking сохранён. Remote refs не менялись. Receipt в Cl
 |---|---|---|
 | Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot; native logs подтвердили два compactions с итогом 10,64% и 11,25% W, без повторных owner questions. 29 октября простой сценарий сохранения фактов после двух сжатий пройден локально с настоящим provider | Provider failure становится terminal в Cloud; подтвердить простой сценарий на согласованном Cloud candidate. Старый строгий JSON stress-test не объявляется пройденным |
 | Качество ответа | После restart точный JSON-пример и literal `PENDING; NOT RELEASED` прошли; прежний synthetic stress-test дал fences/`PENDING` | В новой миграционной проверке оцениваются актуальные значения, единицы и запрет действия; обычный текст или Markdown допустимы. Обязательный машинный JSON этим сценарием не проверяется |
-| Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs; текущий provider из `.env` отдельно вернул 1024 | На текущем candidate проверить доступное через agent tools поведение записи, поиска и чтения; применимые permission negatives остаются. Прямого доступа к БД нет: размерности всего target corpus после прежнего ответа 2048, покрытие индексом и query plan не подтверждены; startup vector_index=true и отсутствие degraded_channels этого не доказывают |
+| Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; текущий provider из `.env` отдельно вернул 1024. 29 октября через Cloud owner API: одна запись, поиск по перефразированному запросу в новом чате (vector 0,4162; BM25/graph 0), точное чтение, удаление, пустой поиск и NOT_FOUND при повторном чтении; три Tasks COMPLETED | Один документ с отдельным kind-фильтром, не benchmark качества поиска. Применимые permission negatives остаются. Прямого доступа к БД нет: размерности всего target corpus после прежнего ответа 2048, покрытие индексом и query plan не подтверждены; startup vector_index=true и отсутствие degraded_channels этого не доказывают |
 | MCP | Microsoft Learn и локальные policy/storage tests; 28 октября — контролируемый HTTPS/SSE peer, закрытый auth header, HITL до единственного вызова и deny ожидающего вызова с POLICY_DENIED. 29 октября — сохранение точного approval, новая authenticated session и единственный echo после подтверждённого владельцем restart; Task COMPLETED, стенд очищен | Сценарий reconnect пройден с операторским подтверждением restart; независимые boot identity и deployed OCI digest не получены. Это один контролируемый вызов, не универсальная гарантия exactly-once |
 | A2A и файлы | Прежние 0.3/1.0 и remote proofs; после обновления — dedup/conflict, terminal SSE, новый follow-up, download/raw A2A bytes и immutable старое вложение после исправления | Применимые reconnect/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
 | Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial, wrong-Origin denial без потери сессии, owner/external Task isolation | Итоговые settings/peer/material cards, session expiry/rotation; общий external principal остаётся утверждённым ограничением Cloud-профиля |
@@ -1204,9 +1204,33 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   Это проверка самого SQL, не целевого corpus или реального query plan.
   29 октября владелец подтвердил, что прямое подключение к целевой БД недоступно.
   SQL остаётся подготовленным диагностическим инструментом, его выполнение
-  от владельца не требуется. Следующий доступный шаг — проверка памяти через
-  agent tools на текущем candidate; её результат не подменяет inventory всего
+  от владельца не требуется. Проверка памяти через agent tools на работающем
+  Cloud агенте выполнена; её результат не подменяет inventory всего
   corpus, доказательство совместимости исторических векторов или query plan.
+  В сценарии `.enterprise-work/memory-api-20261029/` создана ровно одна
+  user-memory заметка `mem_9a124fd682a148d6b50a` с revision 1 / repository revision 14.
+  Task записи — `9c7f199f-893c-4949-8332-3ac7670d8b47`; Task поиска/чтения в другом
+  чате — `f675d676-3fda-4d34-8ca4-5c9161f5d547`. Во второй prompt не передавались
+  memory_id, тело или ответ; переданы перефразированный вопрос и отдельный
+  kind-фильтр (маркер совпадает с заголовком заметки). Поиск вернул исходный ID:
+  vector `0.41622483230977325`, BM25/graph `0`, degraded_channels `[]`, index revision 14.
+  Read вернул точное тело и исходную revision. Защитный фильтр отметил этот
+  tool result как suspicious; runner остановился без blanket approval, ведущий
+  прочитал exact material, сверил его с синтетической заметкой и разрешил только
+  связанный результат, после чего продолжена та же Task без повторного Send.
+  Task очистки `b1acd626-0dd3-4ebb-83f2-56e746317aaa` удалила только этот ID с
+  expected_revision 1; commit поднял repository revision до 15. Последующие
+  search/read дали пустой результат с index revision 15 и `NOT_FOUND`.
+  Все три Tasks завершились `COMPLETED`, незавершённых взаимодействий нет,
+  logout 200; settings/policies не менялись. Ведущий проверил raw receipts,
+  аргументы вызовов и последовательность history; `owner.json` и `proof.json`
+  сохраняют результат и SHA256. Этот сценарий подтверждает доступное API
+  поведение одного документа; не доказывает совместимость всего старого corpus,
+  использование индекса, сохранность при новом restart или deployed OCI digest.
+  Свежий независимый DSH reviewer (`qwen3-8-flash-next2`, xhigh) завершил проверку
+  receipts за 75,2 s / exit 0: scoped PASS. Его отчёт и проверенные ведущим
+  уточнения сохранены в `independent-review.md` и `review.json`; сравнение
+  релевантности нескольких документов этим сценарием не проверялось.
   Эти отдельные проблемы не объявляются причиной D2 или remote 404. Перекрытие процессов в общих логах
   без instance identity не закрывает overlap gate. Доказательства:
   `cloudru-rollout-operator-log-facts-20261028.json`,
