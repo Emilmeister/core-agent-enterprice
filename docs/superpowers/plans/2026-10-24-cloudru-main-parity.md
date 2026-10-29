@@ -741,12 +741,32 @@ identity и активная замена с exact stop confirmation без repl
 Собственные Compose volumes/network и restart containers удалены штатными
 cleanup. Receipts и logs: `.enterprise-work/native-current-arm64-20261029/`
 основного репозитория (`inputs.json`, `candidate-check.json`, `compose.json`,
-`restart.json`). Native Landlock/kind/browser для этой сборки, native AMD64,
+`restart.json`). Native browser для этой сборки, native AMD64,
 original-data provider fidelity и Cloud rollout остаются отдельными открытыми gates.
 Отдельный DSH reviewer завершил разбор после одного timeout; подтверждённых
 нарушений не нашёл. Ведущий уточнил provenance ARM64 Compose environment и
 расчёт SHA-256 импортированного текста инструкции (это не hash manifest файлов).
 Отчёт и проверка замечаний сохранены в `review.md` и `lead-verification.json`.
+
+На этом же ARM64 image 29 октября завершены штатные native security gates:
+Landlock — 40 tests за 9,843 s; Kubernetes sandbox — 15 tests за 161,126 s.
+Оба exit 0, без skips; Pod Succeeded/exit 0, aggregate `pids.max=512` прочитан
+из node cgroup. Landlock выполнялся в собственной аппаратной VZ VM:
+Ubuntu 26.04.1, kernel 7.0.0-34-generic/aarch64, Docker 29.1.3.
+Runtime взят из образа без source overlay; mounts/configmaps содержали только
+tests. Gate scripts и security profiles не менялись, Pod manifest отличается
+только image reference; host kind/kubectl — прежние checksum-verified ARM64 CLI.
+Pod imageID `103c7649…` — hash корневого `index.json` Docker archive, который
+ссылается на image index `f84620f4…`, ARM64 manifest `17e18bf5…` и config
+`e994a6f9…`; вся цепочка сверена по bytes, разные уровни digest не смешиваются.
+Собственные VM, node, receiver и созданная пустая kind network удалены.
+Evidence: `.enterprise-work/native-current-security-arm64-20261029/` основного
+репозитория, `results.json` и raw gate logs; фактическая Landlock-команда и
+полученный tool exit 0 записаны ведущим отдельно после выполнения.
+Свежий DSH review и correction завершены: ошибок в итоговых claims не найдено,
+отмечено отличие post-run записи от автоматически записанного exit receipt.
+Это локальные native ARM64 proofs, не запуск GitHub jobs, native AMD64/browser
+или проверка целевой Cloud среды. Полная CI matrix остаётся открытой.
 
 В Cloud worktree подготовлена `.enterprise-work/controlled-mcp-rollout-20261029/`:
 owner/peer scripts побайтово скопированы из ранее проверенного стенда, новая
