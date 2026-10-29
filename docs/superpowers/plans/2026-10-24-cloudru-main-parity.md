@@ -36,8 +36,10 @@ registry readback. Владелец сообщил об обновлении; п
 и уточнено сохранение точных значений при повторном сжатии. Эти изменения включены
 в новый candidate `99a5de6`. Контроль с JSON-значениями сохранил данные
 через два сжатия и вернул точный JSON; с полными инструкциями ядра вновь появилась
-Markdown-обёртка. Общая проверка final format и исходный текстовый pressure case
-остаются открытыми; новые результаты и ограничения приведены ниже.
+Markdown-обёртка. По уточнению владельца миграционная проверка упрощена до
+сохранения трёх фактов и одной правки после двух сжатий, без требования raw JSON.
+Новый сценарий пока не выполнен; прежний pressure case остаётся отрицательным
+диагностическим результатом, а не автоматически назначенным исправлением runtime.
 Предыдущий version candidate `948bae1` с исправлением неоднозначного GetTask HTTP 404
 опубликован и проверен локально. После той публикации владелец сообщил об обновлении
 образа в Cloud. Контролируемый live GetTask 404 → COMPLETED прошёл без повторной
@@ -436,13 +438,38 @@ host checking сохранён. Remote refs не менялись. Receipt в Cl
 
 | Проверка | Уже есть | Что ещё должно быть в итоговом receipt |
 |---|---|---|
-| Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot; native logs подтвердили два compactions с итогом 10,64% и 11,25% W, без повторных owner questions | Provider failure становится terminal в Cloud; строгий final format и точное сохранение всех полей пока не прошли; содержание summary отдельно не наблюдалось |
-| Формат ответа | После restart точный JSON-пример и literal `PENDING; NOT RELEASED` прошли; прежние длинные controls дали fences/`PENDING` | Сохранить факты через два подтверждённых compactions; отрицательные старые exact checks не приписывать compaction без evidence |
+| Модель, контекст, next steps | После обновления: обычный ответ, SSE без частичного текста, Python/file tools, repair follow-up; live planning OFF/ON every2, cadence и snapshot; native logs подтвердили два compactions с итогом 10,64% и 11,25% W, без повторных owner questions | Provider failure становится terminal в Cloud; выполнить простой сценарий сохранения фактов после двух сжатий, описанный ниже. Старый строгий JSON stress-test не объявляется пройденным |
+| Качество ответа | После restart точный JSON-пример и literal `PENDING; NOT RELEASED` прошли; прежний synthetic stress-test дал fences/`PENDING` | В новой миграционной проверке оцениваются актуальные значения, единицы и запрет действия; обычный текст или Markdown допустимы. Обязательный машинный JSON этим сценарием не проверяется |
 | Memory/skills | CRUD/read после restart, NER, child allowlist, activation/resources; прежние search proofs; текущий provider из `.env` отдельно вернул 1024 | Проверить модель и размерности сохранённого target corpus после прежнего ответа 2048, соответствие реального индекса и query plan; startup vector_index=true и отсутствие degraded_channels этого не доказывают. Применимые permission negatives остаются |
 | MCP | Microsoft Learn и локальные policy/storage tests; 28 октября — контролируемый HTTPS/SSE peer, закрытый auth header, HITL до единственного вызова и deny ожидающего вызова с POLICY_DENIED | Переподключение к контролируемому peer после rollout; повторные initialize без доказанного restart этот пункт не закрывают |
 | A2A и файлы | Прежние 0.3/1.0 и remote proofs; после обновления — dedup/conflict, terminal SSE, новый follow-up, download/raw A2A bytes и immutable старое вложение после исправления | Применимые reconnect/push и холодные mixed/large artifacts на новом candidate; push — только если включён |
 | Owner UI и доступ | После обновления — login/logout/history/download, unauthenticated owner denial, wrong-Origin denial без потери сессии, owner/external Task isolation | Итоговые settings/peer/material cards, session expiry/rotation; общий external principal остаётся утверждённым ограничением Cloud-профиля |
 | Local agents/terminal | Shared root/child workspace, Python broker, timeout/cancel и отдельный cross-chat denial; 28 октября два собственных чата работали одновременно, отмена parent A не помешала завершению B, отложенный файл descendant A не появился | Прямое подтверждение terminal state child после parent cancel, root/child checkpoint и cleanup при замене экземпляра |
+
+**Простой сценарий вместо смешанного stress-test (29 октября; ещё не выполнен).**
+Это локальная сквозная проверка настоящего provider и runtime, не unit test.
+Существующие unit/integration tests бюджетов, pinned data, истории и recovery
+сохраняются без изменения. Product code и frozen tests/spec ради нового сценария
+не изменяются.
+
+1. Передать три однозначных факта: город Москва; сумма 427.50 EUR;
+   отправка не разрешена. Явно попросить запомнить их для последующего вопроса.
+2. Добавить ограниченный нейтральный материал без новых инструкций/значений этих
+   полей и дождаться первого подтверждённого `context.compacted`.
+3. Исправить только город на Казань, явно оставив остальные факты прежними;
+   затем тем же способом получить второе подтверждённое сжатие.
+4. Спросить текущие город, сумму и разрешение отправки. Ожидаются Казань,
+   427.50 EUR и запрет отправки, без противоречащих актуальных значений.
+   Форма свободная; эквивалентная запись числа допустима. Проверяется смысл
+   ответа целиком, а не одно присутствие нужных подстрок.
+5. Сохранить входы, оба события сжатия, конечный ответ и terminal state.
+   Без двух реальных событий сценарий не засчитывается. Успех закрывает только
+   этот простой smoke case, не гарантию безошибочной памяти модели.
+
+Raw JSON и Markdown fences не являются критерием этой проверки. Если появится
+реальный потребитель машинного JSON, его формат проверяется отдельным сценарием
+с явным контрактом. Ниже сохранена история прежних более строгих экспериментов:
+их отрицательные результаты не переписываются и не выдаются за исправленные.
 
 Локальная сверка сохранённых receipts 29 октября сохранила отрицательный exact
 check: raw JSON не разбирается из-за fences; даже диагностическое снятие fences
