@@ -23,9 +23,9 @@
 | 2. Отмена parent и состояние child | Прежний Cloud cancel/cross-chat proof сохранён. Разбор текущего public flow подтвердил отсутствие публичного чтения internal child Task и stop receipt | Прямой terminal/stop proof недоступен через разрешённый API. Повтор того же непрозрачного сценария не закрывает пункт; новый API или прямой доступ к БД не добавляем |
 | 3. Mixed/large файлы | Пять файлов, 4194517 исходных bytes; raw A2A, immutable download и workspace сверены. После изменения notes опубликованный snapshot сохранил исходные bytes. Прошли 34 проверки до restart и 31 после: тот же artifact ID, все десять downloads совпали | Scoped PASS после подтверждённого владельцем restart. Независимой boot identity/deployed OCI digest нет |
 | 4. Remote wait через restart | После подтверждённого владельцем restart та же Task `ced68f82-9b39-4282-9200-bff04b2013bf`, wait call и operation `8b8ae9b0-4ed1-5000-9ebe-047b3161682c` сохранились. Тестовый peer намеренно вернул plain GetTask 404, затем COMPLETED; ровно один Send, wait succeeded и root COMPLETED; семь публичных проверок прошли. Peer/стенд удалены | Scoped PASS публичного flow. Причину реального 404 от 28 октября этот fixture не устанавливает. Private wait identity/deadline, boot identity и deployed OCI digest API не раскрывает |
-| 5. Cron без HTTP | Идёт один live-прогон schedule `68fd7900-8a3d-467f-963b-d79f5baa0df3`: владелец подтвердил закрытый UI, logout выполнен; тишина с 12:16:23 UTC, due 12:42 UTC, первое чтение запланировано на 12:45 UTC | До первого reconnect результат неизвестен. Проверить автоматическое COMPLETED до reconnect и очистить только своё расписание; guardrail/HITL не разрешать ради положительного результата |
+| 5. Cron без HTTP | Scoped PASS: 28m36,642s без запросов команды, один automatic root `75ccf94f-ba2b-4821-91a8-8f7cd8e6e1aa`, COMPLETED/complete=true в 12:42:21,625 UTC; первый reconnect в 12:45:00 UTC. Свой schedule удалён по CAS, readback 404, logout 200 | Guardrail/HITL не разрешались, ручного запуска не было. Общий трафик платформы, непрерывное выделение CPU и синхронизация часов независимо не измерялись |
 | 6. Доступ и sandbox | До restart файлов: wrong-chat download 404; без owner session 401; wrong-Origin logout 403 с сохранением сессии. Обычный logout → identity 401 проверен до и после restart. Отдельный sandbox-прогон: соседний контрольный файл закрыт, шесть private/metadata IPv4/IPv6 HTTP адресов вернули 403, публичный fixture — ожидаемый 401; шесть проверенных секретных ENV отсутствуют | Это ограниченные target proofs. Они не подменяют native amd64/browser, проверку всех протоколов/секретов или platform credential rotation |
-| 7. Итоговая матрица | Подтверждённые результаты и ограничения сохраняются в этом плане; продуктовый код, frozen spec/tests не менялись | После шагов 4–5 сверить cleanup и итоговые receipts, отдельно перечислить недоступные platform proofs |
+| 7. Итоговая матрица | Результаты всех семи шагов и cleanup сверены; доступная через текущий API часть прогона завершена. Продуктовый код, frozen spec/tests не менялись | Пункты без доступного proof перечислены ниже; они не переводятся в PASS и не означают подтверждённый дефект сами по себе |
 
 Проверка фактов использовала временный `context_window=32768` в snapshot новой
 Task; company setting сразу восстановлен с 128000, revision 36 → 37 → 38,
@@ -121,6 +121,47 @@ session сохранило выводы и вышло 0 за 23,2 s. Ведущ�
 проверок учтены выше. В `cron-local-check.json` четыре сценария для двух cleanup
 функций; формулировка reviewer «two cleanup branches» неточна. Отчёт и disposition:
 `final-scope-review.md`, `final-scope-review-disposition.json`.
+
+Окно cron завершено 29 октября: с 12:16:23,358330 до первого reconnect
+12:45:00,000467 UTC прошло 1716,642137 s. Владелец подтвердил закрытый UI;
+других HTTP-клиентов команды к deployment в этом окне не было. Schedule
+`68fd7900-8a3d-467f-963b-d79f5baa0df3` имел due 12:42 UTC и обычный вопрос
+о противоположных временах года в полушариях. Единственный automatic root
+`75ccf94f-ba2b-4821-91a8-8f7cd8e6e1aa` / run
+`167c8d12-ce2d-4807-be64-753482870a9e` завершился в 12:42:21,624844 UTC:
+21,625 s после due и 158,376 s до первого POST login, а не только до GET.
+Финальный ответ доступен целиком, `complete=true`, два model turns и один
+успешный `core_next_steps`; ручных запусков, решений guardrail/HITL и follow-up
+не было. Ведущий выполнил 19 сверок по raw receipts, все прошли; принадлежность
+root расписанию подтверждена вычислением полного `cron:automatic:` message ID
+из schedule ID, revision и due, а не константным флагом observer.
+Свой schedule удалён один раз по exact ID/context/revision 1, ответ 200,
+revision 2 и `deleted=true`; следующий GET дал 404, logout — 200.
+Источники: `cron.json`, `cron-proof.json`, `cron-operator-attestation.json`.
+Ответ правильно объясняет механизм через наклон оси и длительность дня, но
+содержит неточную формулировку угла: 23,5° указаны к плоскости орбиты вместо
+нормали к ней. Это ограничение качества ответа модели; критерий самостоятельного
+запуска и завершения cron выполнен. Независимое измерение часов, чужого трафика,
+постоянного CPU или единственного leader при overlap этим прогоном не получено.
+Свежий DSH reviewer (`qwen3-8-flash-next2`, xhigh) независимо сверил исходные
+receipts и привязку automatic message ID: scoped PASS, 144,1 s, exit 0,
+без HTTP к агенту. Observer тоже завершился с exit 0; его raw report не менялся.
+Отчёт: `cron-result-review.md`, disposition и hashes — в `cron-proof.json`.
+
+### Что остаётся без полного доказательства после доступного прогона
+
+| Пункт | Недостающее доказательство / граница |
+|---|---|
+| Два сжатия нового run | Native `context.compacted` для `782b9784-4aaf-46a8-a9b3-e7242cc0a8f4` уже запрошены у оператора; содержательный конечный ответ проверен. Повторно присылать старые логи 28 октября не нужно |
+| Остановка child и прежней D2 | Internal child terminal/stop receipt не доступен owner API. Для старой D2 по последнему сохранённому чтению остаётся `cleanup_pending`; без exact stop evidence команда не replay-ится и barrier не снимается |
+| Целевая PostgreSQL и S3 | API lifecycle одной записи памяти пройден; inventory старых векторов, фактический индекс/query plan, runtime-role/migration и согласованный backup/restore целевой БД/S3 не проверены из-за отсутствия прямого доступа |
+| Native amd64 и платформенные свойства | Локальные native ARM64/browser gates пройдены; required native amd64/browser, rolling overlap/leader, platform credential rotation, storage outage/GC limits и независимо прочитанный deployed digest остаются отдельными неподтверждёнными пунктами |
+| Внутренние recovery-поля | Публичное восстановление remote/MCP и файлов пройдено после сообщения владельца о restart; private wait identity/generation/deadline и независимая boot identity не прочитаны |
+
+Это завершение доступного операционного прогона с явными ограничениями,
+а не объявление полного production release или изменения нормативного scope.
+Повтор уже зелёных проверок, новый image, GitHub push или новый API только ради
+внутреннего proof для фиксации этого результата не требуются.
 
 **Уточнение владельца:** GitHub и push в него не являются условиями переноса.
 `.github/workflows/ci.yml` задаёт существующие команды и fixtures проверок,
@@ -1190,6 +1231,13 @@ PostgreSQL, а тип нашего DB resource не установлен. Поэ
   proof нужен обычный безопасный запрос без требования literal-marker/запрета
   tools; обходить проверку или автоматически разрешать подозрительный material
   нельзя. Перед повтором используются новый candidate и подтверждённое окно без UI.
+
+  Повтор 29 октября завершён успешно: 28m36,642s без запросов команды, один
+  automatic root COMPLETED/complete=true за 158,376s до первого reconnect;
+  собственный schedule удалён, logout выполнен (`cron-proof.json` в
+  `.enterprise-work/parity-finish-20261029/`). Это закрывает unattended cron
+  данного сценария. Общий пункт о непрерывном CPU, других background/wait
+  сценариях и платформенном трафике не считается доказанным этим одним запуском.
 - [ ] Подготовить owner/HITL/time/remote waits и активную ограниченную команду; оператор запускает обновление через UI до их завершения. Проверить deadlines, единственный результат и сохранность данных. Команда не replay-ится; неизвестная остановка остаётся честным `SIDE_EFFECT_UNKNOWN` и barrier.
 
   Выполнен контролируемый restart 28 октября. Операторские логи фиксируют
