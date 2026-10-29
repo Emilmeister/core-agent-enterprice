@@ -23,8 +23,12 @@
 `blockchain.cr.cloud.ru/core-agent-gn:cloudru-local-verified-20261029-99a5de6`,
 digest `sha256:8194612c9f7cb0f6da2fcbc40f3bb1a71d59e56264ea5d3a6a576a5b731bd80e`.
 Registry readback подтвердил revision, user и layers; `latest` не изменялся.
-Развёртывание этой версии в Cloud ещё не подтверждено. Подготовлен свежий
-контролируемый MCP-сценарий; окно обновления ожидает ответа оператора.
+Владелец подтвердил повторное развёртывание этой версии. После него health/live,
+health/ready, owner login/identity/settings/logout вернули 200; до входа owner
+identity вернул 401. Readback показывает модель `Qwen/Qwen3.5-397B-A17B` и
+исходный пустой список MCP. Фактический deployed OCI digest публичным API не подтверждён.
+Свежий контролируемый MCP-сценарий подготовлен до точного pending approval;
+для проверки reconnect нужен отдельный перезапуск после сигнала готовности.
 
 Ранее по отдельному поручению владельца после локальных проверок опубликован
 linux/amd64 candidate `174dec5` с исправлениями UI; version tag и digest подтверждены
@@ -872,13 +876,26 @@ container IDs (включая первый Keycloak), kind network и kubeconfig
 в worktree. Эти ограничения не заменяют остающиеся AMD64/CI/Cloud gates.
 
 В Cloud worktree подготовлена `.enterprise-work/controlled-mcp-rollout-20261029/`:
-owner/peer scripts побайтово скопированы из ранее проверенного стенда, новая
-конфигурация и nonce появятся только при запуске. Peer/tunnel и Cloud operations
-не запускались. Критерии: до сигнала обновления — pending точного MCP approval и
-ноль tool calls; после подтверждённой замены — reconnect/new session, та же Task,
+owner/peer scripts побайтово скопированы из ранее проверенного стенда. После
+подтверждения развёртывания 29 октября запущен отдельный peer с TTL 1800 секунд
+и HTTPS tunnel; discovery/SSE прошли, отсутствие auth header даёт 401, tools/call
+при preflight не выполнялся. Через CAS добавлен только собственный descriptor
+`migration_mcp_577765b9`; создана Task `3fa1b3db-2b74-4804-ba2a-34a303fb6e06`,
+context `4ad5f9c7-b7f4-46c8-bf2c-e7e32ce29b1b`. Она ожидает approval
+`ba3b6d50-e51d-4269-a080-ea1707821384` для точного echo с nonce; проверены
+source call, origin и schema digest. Peer подтвердил Cloud initialize/tools/list
+и ноль tools/call. `before-rollout.json` и `before-rollout-owner.json` сохраняют
+состояние перед отдельным перезапуском; `post-deploy.json` — health/auth readback.
+Первая локальная проверка receipt ошибочно ожидала только два поля subject;
+её исправили по канонической структуре с origin/schema_digest, без изменения
+runtime, policy или approval. Это не отказ продукта.
+Отдельный DSH preflight reviewer завершён по timeout 150,1 s (exit 124), без
+сохранённого отчёта; независимое ревью не заявляется. Ведущий проверил точный
+approval и журнал сам. `ready-signal.json` фиксирует ноль tools/call перед
+сигналом оператору и ожидание перезапуска; TTL стенда — до 11:40:48 МСК.
+Критерии после подтверждённой замены: reconnect/new session, та же Task и binding,
 однократный разрешённый вызов и terminal receipt; затем точная очистка собственных
-settings/policy и процессов. `prepared.json` фиксирует только подготовку,
-не прохождение сценария. Старый D2 не затрагивается.
+settings/policy и процессов. Reconnect пока не засчитан. Старый D2 не затрагивается.
 
 28 октября, 20:05–20:11 UTC, выполнен ограниченный сценарий двух чатов через
 owner API без изменения settings/policies. Parent A
