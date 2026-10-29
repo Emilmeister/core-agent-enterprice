@@ -27,8 +27,10 @@ Registry readback подтвердил revision, user и layers; `latest` не �
 health/ready, owner login/identity/settings/logout вернули 200; до входа owner
 identity вернул 401. Readback показывает модель `Qwen/Qwen3.5-397B-A17B` и
 исходный пустой список MCP. Фактический deployed OCI digest публичным API не подтверждён.
-Свежий контролируемый MCP-сценарий подготовлен до точного pending approval;
-для проверки reconnect нужен отдельный перезапуск после сигнала готовности.
+После сообщённого владельцем перезапуска та же MCP Task и точное pending
+approval сохранились, но временный peer уже истёк по TTL: reconnect не засчитан.
+Первый стенд очищен; повтор подготовлен с двухчасовым сроком и ожидает нового
+перезапуска после сигнала готовности.
 
 Ранее по отдельному поручению владельца после локальных проверок опубликован
 linux/amd64 candidate `174dec5` с исправлениями UI; version tag и digest подтверждены
@@ -896,6 +898,31 @@ approval и журнал сам. `ready-signal.json` фиксирует ноль
 Критерии после подтверждённой замены: reconnect/new session, та же Task и binding,
 однократный разрешённый вызов и terminal receipt; затем точная очистка собственных
 settings/policy и процессов. Reconnect пока не засчитан. Старый D2 не затрагивается.
+
+29 октября, readback `08:49 UTC` после сообщения владельца о перезапуске:
+сохранились та же Task и pending approval, включая generation, source call,
+origin/schema digest, nonce и deadline. Время самого restart независимо не
+получено. Peer и tunnel уже завершились по своему 1800-секундному TTL в
+`08:40:49 UTC`; в журнале ноль tools/call и нет нового initialize после сигнала.
+Вызов к истёкшему peer не разрешали. Собственная Task отменена, readback подтвердил
+`TASK_STATE_CANCELED`; descriptor удалён через CAS, список MCP снова пуст и
+наследуется, revision 34. Оба собственных процесса завершились с exit 0.
+`post-restart-expired.json`, `post-restart-expired-owner.json` и `proof.json`
+фиксируют частичный результат: сохранность ожидания есть, успешного reconnect нет.
+
+Повтор подготовлен в `.enterprise-work/controlled-mcp-rollout-20261029-b/`.
+В копии диагностического peer изменён только верхний предел CLI TTL с 1800 до
+7200 секунд; предел 200 запросов, auth, schema и обработка вызовов сохранены.
+Существующий local selfcheck прошёл 9/9; значения TTL 0 и 7201 отклоняются с
+exit 2. HTTPS discovery/SSE и 401 без ключа подтверждены отдельно.
+Новый descriptor `migration_mcp_ebe32133`, Task
+`eab64e41-53fb-49f6-8219-f9b9f332fe23`, context
+`4db29bae-fa4c-46d7-8bae-01195da86626` ожидают точного approval
+`d3354381-24e4-4ef5-b6f6-fe5896d02e6a`. До сигнала оператору подтверждены
+Cloud initialize/tools/list и ноль tools/call; срок стенда — до 13:53:46 МСК.
+Исходные binding и журнал сохранены в `before-rollout*.json`, сигнал — в
+`ready-signal.json`. Повторный restart и разрешение вызова ещё не выполнены.
+Это изменения только диагностики; product code, frozen tests/spec не менялись.
 
 28 октября, 20:05–20:11 UTC, выполнен ограниченный сценарий двух чатов через
 owner API без изменения settings/policies. Parent A
