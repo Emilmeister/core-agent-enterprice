@@ -10,6 +10,15 @@
 
 ## Актуальный план — 29 октября 2026
 
+**Уточнение владельца:** GitHub и push в него не являются условиями переноса.
+`.github/workflows/ci.yml` задаёт существующие команды и fixtures проверок,
+но GitHub Actions — только один из способов их выполнения. Применимые native
+проверки выполняются на подходящем Linux runner локально или в доступном CI;
+требования к архитектуре, kernel enforcement, required flags и сохранению
+результатов остаются. Отсутствие GitHub-авторизации не блокирует весь план и
+не требует от владельца push. Прежнее объявление этого доступа обязательным
+условием было ошибкой исполнителя.
+
 **Статус:** 29 октября опубликован новый linux/amd64 candidate
 `blockchain.cr.cloud.ru/core-agent-gn:cloudru-local-verified-20261029-99a5de6`,
 digest `sha256:8194612c9f7cb0f6da2fcbc40f3bb1a71d59e56264ea5d3a6a576a5b731bd80e`.
@@ -51,8 +60,8 @@ Recovery-loop после non-retryable HTTP 404 исправлен локаль�
 fallback budget finalizer и PostgreSQL reopen. В image прошли 23 regression
 checks; совпали 138 source/UI hashes; registry readback подтвердил version tag.
 Локальные native ARM64 Compose, restart, Kubernetes sandbox и Landlock gates
-пройдены на том же коде candidate без source overlay. GitHub CI matrix,
-native amd64 (включая обязательный browser job) и оставшиеся целевые Cloud
+пройдены на том же коде candidate без source overlay. Проверки native amd64
+(включая обязательный браузерный сценарий) и оставшиеся целевые Cloud
 release proofs открыты. Дополнительный локальный ARM64 browser gate пройден
 после исправления фокуса `d85744e` и затем повторно после исправления
 перемонтирования карточек согласования; подробности ниже.
@@ -186,7 +195,7 @@ packaged Python/policy/UI файлов; source inputs не менялись пр
 Собственные browser cluster/services/network и диагностические Storybook/Chrome
 остановлены и удалены; существующие пользовательские сервисы не затронуты.
 
-До объявления полной миграции завершённой остаются native amd64 CI
+До объявления полной миграции завершённой остаются применимые native amd64 проверки
 и перечисленные ниже платформенные proofs.
 Локальные проверки не подтверждают фактическую остановку старого Cloud execution,
 deployed digest, ingress, idle CPU, production credentials или Cloud backup/restore.
@@ -385,7 +394,7 @@ skip обязательного PostgreSQL proof не является успе�
 - [x] После исправления собрать один candidate `83edd16`, сверить runtime/UI bytes, выполнить image checks и сохранить immutable tag/digest. Образ `18cafd6` не содержит recovery fix; новый candidate опубликован отдельным version tag.
 - [x] Дополнительно выполнить неизменный CI Compose command на native ARM64 Docker с локальной сборкой исходного Dockerfile и установленным кодом `83edd16`: composition-root terminal/Python/background test прошёл без skips. Локальный ARM64 image `sha256:58755bc69f28eb2619077a0f8d9a18da47bc23c453a78ac4f7d4114b33bf749e`; only-test mount, код образа не подменялся, все 138 source/UI hashes совпали. Это отдельный subset, не закрытие всей matrix.
 - [x] На том же ARM64 image выполнить restart identity (1 test), полный required sandbox Pod gate (15 tests, `pids.max=512`) и исходный required Landlock gate (40 tests) в аппаратной VZ Linux VM. Все exit 0, без skips; provenance и cleanup записаны в receipts выше. Эти локальные результаты не объявляются GitHub CI run или native amd64/Cloud proof.
-- [ ] Выполнить существующую CI matrix `sandbox-linux` на native amd64/arm64 с candidate image: Landlock/seccomp, restart identity, Compose Bubblewrap и sandbox gates; на amd64 — dedicated browser/Keycloak/PostgreSQL gate. Сохранить результаты каждой архитектуры без замены required flags на skips.
+- [ ] Закрыть существующий набор native проверок `sandbox-linux` на amd64/arm64 с candidate image: Landlock/seccomp, restart identity, Compose Bubblewrap и sandbox gates; на amd64 — dedicated browser/Keycloak/PostgreSQL gate. Использовать подходящие Linux runners локально или в доступном CI, без обязательного GitHub Actions/push. Сохранить результаты каждой архитектуры без замены required flags на skips; уже подтверждённые проверки неизменного кода повторно не запускать без новой причины.
 - [x] Для UI fix `d85744e` выполнены из `ui/` `npm ci`, `npm test`, `npm run typecheck`, `npm run build` с Node.js 24.8.0, lock неизменён. Dedicated browser сценарий дополнительно прошёл на локальном ARM64 image: 194 checks, без skips; это не amd64 CI. Packaging contract не менялся; точные image/UI bytes сверены. Одиночный предыдущий Inspect failure сохранён как открытая диагностика.
 
 Команды существующих gates на подготовленных fixtures из `.github/workflows/ci.yml`:
@@ -402,13 +411,15 @@ Docker LinuxKit без Landlock уже отклонил required gate; повт�
 не заменяет native Linux runner. Эти prerequisites обеспечиваются в CI/локальной
 среде разработчика без запроса доступа к Kubernetes целевого Cloud deployment.
 
+Историческая проверка доступности GitHub ниже описывает только этот необязательный
+способ запуска. Его недоступность не является условием остановки остальных работ.
 28 октября проверен удалённый CI: последние запуски завершались до создания jobs;
 последний исторический успешный запуск содержал только `verify`. Свежего native
 proof нет. В этой сессии отсутствует авторизованный GitHub transport: HTTPS
 credentials не найдены, SSH с проверенными официальными host keys отклонил
-предложенные ключи. После сохранения исправлений нужен авторизованный push этой
-ветки; существующий push-trigger запускает `verify`, затем обе native jobs и
-amd64 browser gate. Это доступ к репозиторию CI, не к Cloud Kubernetes/БД.
+предложенные ключи. При выборе GitHub существующий push-trigger запускает
+`verify`, затем обе native jobs и amd64 browser gate. Такой push не требуется
+для переноса агента; другой runner может выполнить те же команды и fixtures.
 Повторная проверка transport 28 октября: `git ls-remote` читает ветку на
 `410a646`, но `git push --dry-run` завершается 128 из-за отсутствия GitHub
 credentials. Remote refs не менялись, CI не запускался. Receipt:
@@ -765,15 +776,16 @@ Evidence: `.enterprise-work/native-current-security-arm64-20261029/` основ�
 полученный tool exit 0 записаны ведущим отдельно после выполнения.
 Свежий DSH review и correction завершены: ошибок в итоговых claims не найдено,
 отмечено отличие post-run записи от автоматически записанного exit receipt.
-Это локальные native ARM64 proofs, не запуск GitHub jobs, обязательного native
-AMD64 browser job или проверка целевой Cloud среды. Полная CI matrix остаётся открытой.
+Это локальные native ARM64 proofs; они не подтверждают native AMD64 browser
+или целевую Cloud среду. Проверки AMD64 остаются открытыми независимо от выбора
+платформы CI; отдельный запуск GitHub jobs не является критерием переноса.
 
 На том же ARM64 image выполнен текущий обязательный браузерный сценарий:
 `CORE_AGENT_REQUIRE_BROWSER_TESTS=1 uv run python -m unittest
 tests.test_owner_ui_files_browser -v` — 1 test за 245,310 s, exit 0, без skips;
 browser log содержит 197 отметок PASS с 190 уникальными названиями. Использованы
 Chrome на macOS, Linux ARM64 Pod, Keycloak и PostgreSQL, packaged runtime/UI и штатные controlled
-model fixtures. Это дополнительный локальный proof, не обязательный AMD64 CI job
+model fixtures. Это дополнительный локальный proof, не проверка native AMD64
 и не browser check через Cloud proxy. Неизменённый тест проверяет файлы/историю,
 HITL/guardrails, UI-состояния и реальный Keycloak logout/revocation.
 Оба Pod imageID сверены по полной сохранённой цепочке `103c7649…` → `f84620f4…`
