@@ -741,8 +741,8 @@ identity и активная замена с exact stop confirmation без repl
 Собственные Compose volumes/network и restart containers удалены штатными
 cleanup. Receipts и logs: `.enterprise-work/native-current-arm64-20261029/`
 основного репозитория (`inputs.json`, `candidate-check.json`, `compose.json`,
-`restart.json`). Native browser для этой сборки, native AMD64,
-original-data provider fidelity и Cloud rollout остаются отдельными открытыми gates.
+`restart.json`). Native browser для этой сборки дополнительно проверен ниже;
+native AMD64, original-data provider fidelity и Cloud rollout остаются открытыми gates.
 Отдельный DSH reviewer завершил разбор после одного timeout; подтверждённых
 нарушений не нашёл. Ведущий уточнил provenance ARM64 Compose environment и
 расчёт SHA-256 импортированного текста инструкции (это не hash manifest файлов).
@@ -765,8 +765,39 @@ Evidence: `.enterprise-work/native-current-security-arm64-20261029/` основ�
 полученный tool exit 0 записаны ведущим отдельно после выполнения.
 Свежий DSH review и correction завершены: ошибок в итоговых claims не найдено,
 отмечено отличие post-run записи от автоматически записанного exit receipt.
-Это локальные native ARM64 proofs, не запуск GitHub jobs, native AMD64/browser
-или проверка целевой Cloud среды. Полная CI matrix остаётся открытой.
+Это локальные native ARM64 proofs, не запуск GitHub jobs, обязательного native
+AMD64 browser job или проверка целевой Cloud среды. Полная CI matrix остаётся открытой.
+
+На том же ARM64 image выполнен текущий обязательный браузерный сценарий:
+`CORE_AGENT_REQUIRE_BROWSER_TESTS=1 uv run python -m unittest
+tests.test_owner_ui_files_browser -v` — 1 test за 245,310 s, exit 0, без skips;
+browser log содержит 197 отметок PASS с 190 уникальными названиями. Использованы
+Chrome на macOS, Linux ARM64 Pod, Keycloak и PostgreSQL, packaged runtime/UI и штатные controlled
+model fixtures. Это дополнительный локальный proof, не обязательный AMD64 CI job
+и не browser check через Cloud proxy. Неизменённый тест проверяет файлы/историю,
+HITL/guardrails, UI-состояния и реальный Keycloak logout/revocation.
+Оба Pod imageID сверены по полной сохранённой цепочке `103c7649…` → `f84620f4…`
+→ `17e18bf5…` → `e994a6f9…`; hash frozen test совпал с входным receipt.
+
+Первоначальная подготовка стенда остановилась на curl exit 52 при холодном
+старте Keycloak; после подтверждения готовности первый test invocation завершился
+exit 1 до запуска Pod/browser: выбранный порт 53031 нарушал требование issuer
+`127.0.0.1:49737`. Пересоздан только собственный Keycloak и исправлен порт в копии
+runner; следующий полный прогон прошёл. Product code, tests и spec не менялись.
+Обе неуспешные попытки сохранены отдельно; этот результат не является first-pass.
+Собственные receiver/PostgreSQL/Keycloak, kind cluster, созданная пустая kind network
+и kubeconfig удалены. Evidence: `.enterprise-work/native-current-browser-arm64-20261029/`
+основного репозитория (`results.json`, raw test/browser logs, `image-provenance.json`,
+`fixture-correction.json`, `attempt-1/`, `cleanup.json`). `results.json` — производный
+post-run receipt; исходные logs сохранены отдельно. `inputs.json` описывает первую
+попытку, окончательные порты записаны в `image-provenance.json`.
+Свежий DSH reviewer подтвердил прохождение с оговорками: архитектура процесса
+Chrome отдельно не зафиксирована; команда пересоздания Keycloak выполнена ведущим
+через tool и описана post-run, а не сохранена исходным shell log. После review
+ведущий уточнил число PASS labels и отдельно записал отсутствие всех пяти собственных
+container IDs (включая первый Keycloak), kind network и kubeconfig в
+`cleanup-readback.json`. Отчёт: `.enterprise-work/native-current-browser-review-20261029.md`
+в worktree. Эти ограничения не заменяют остающиеся AMD64/CI/Cloud gates.
 
 В Cloud worktree подготовлена `.enterprise-work/controlled-mcp-rollout-20261029/`:
 owner/peer scripts побайтово скопированы из ранее проверенного стенда, новая
