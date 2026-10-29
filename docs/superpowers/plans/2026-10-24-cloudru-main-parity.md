@@ -150,6 +150,31 @@ receipts и привязку automatic message ID: scoped PASS, 144,1 s, exit 0,
 
 ### Что остаётся без полного доказательства после доступного прогона
 
+По отдельному запросу владельца 29 октября выполнена дополнительная локальная
+проверка сжатия и child: 2 budget tests, 24 проверки compaction/semantic summary/
+cancellation и 3 существующих интеграционных сценария — всего 29, exit 0,
+без skips. Интеграционный тест child использовал реальный OS process,
+собственный disposable PostgreSQL и новый bucket существующего loopback S3:
+child workflow `CANCELLED`, scheduler `canceled`, `cleanup_confirmed=true`,
+у всех процессов launcher есть returncode; контрольный файл восстановлен
+после перезапуска приложения. Это `UnsandboxedTestLauncher`, не доказательство
+Landlock. Отдельный сценарий подтвердил отмену child/grandchild waits при отмене
+parent без следующих model calls. PostgreSQL compaction-сценарий с контролируемой
+моделью сохранил две summary, исходные source IDs и восстановление после restart.
+Свой container и bucket удалены; прежние сервисы не останавливались.
+Receipts: `local-deep-check.json`, `local-deep-check.log`, `followup-checks-proof.json`.
+
+Повторный readback Cloud сохранил прежний результат: compaction Task COMPLETED,
+parent CANCELED, internal child GET 404, logout 200. A2A projection не содержит
+native compaction events или private child cleanup receipt. Ранее настроенный
+observability endpoint без авторизации вернул 401, с имеющимся Cloud.ru Api-Key —
+403; доступ к его данным не получен. По [документации клиентских логов AI Agents](https://cloud.ru/docs/ai-agents/ug/topics/monitoring__client-logging)
+оператор может просмотреть и выгрузить логи в личном кабинете; существующие
+запросы operator evidence остаются актуальны. Новый непрозрачный Cloud-прогон
+не запускался. Исследователь DSH сначала вышел по timeout 180 s; ограниченное
+завершение той же session сохранило source findings за 54,2 s с exit 0.
+Все указанные tests выполнены ведущим, не исследователем.
+
 | Пункт | Недостающее доказательство / граница |
 |---|---|
 | Два сжатия нового run | Native `context.compacted` для `782b9784-4aaf-46a8-a9b3-e7242cc0a8f4` уже запрошены у оператора; содержательный конечный ответ проверен. Повторно присылать старые логи 28 октября не нужно |
