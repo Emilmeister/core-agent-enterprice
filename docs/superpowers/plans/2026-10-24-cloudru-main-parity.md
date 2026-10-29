@@ -664,6 +664,49 @@ summary не обоснована этим результатом; нужен ex
 оправдывает неверную summary в другом; schema acceptance и exact fidelity — разные
 проверки. Отчёт `current-state-evidence-review.md`, hash/session — в lead audit.
 
+29 октября исходный pressure case воспроизведён через настоящий локальный
+CoreAgent loop: admission, PostgreSQL workflow/waits, оба owner answers,
+`core_next_steps`, compaction и final использовали штатные пути. Реальные normal
+и summary calls шли в `Qwen/Qwen3.5-397B-A17B` через проверенный FM transport;
+prompt и оба пакета по 22800 bytes взяты из исходного receipt без переписывания.
+Только `core_ask_owner`/`core_next_steps` разрешены; guardrails и authenticated
+principal — тестовые, process tools не запускались. Это local runtime diagnostic,
+не Cloud, HTTP auth, sandbox или restart proof.
+
+В первом полном запуске при C=32768 сокращённый каталог оставил W=13664:
+одно сжатие `16029 → 1537`, семь provider calls, terminal COMPLETED, но fenced
+JSON и сокращённый `release=PENDING`; точная проверка завершилась exit 3.
+Во втором запуске C уменьшен до 27120 для прежнего W=8016, данные не менялись:
+восемь provider calls, два `context.compacted` — `8105 → 955` ([1,6]) и
+`8897 → 928` ([1,11]), без compaction failures и повторных вопросов.
+Первая summary содержала `release=PENDING; NOT RELEASED`, вторая уже записала
+`release=PENDING` для обоих batch. Final вернул fenced объект с batch_1/batch_2
+вместо одного актуального набора полей. `two_compactions=true`,
+`terminal_completed=true`, `exact_final=false`, exit 3: COMPLETED не принят за
+доказательство точности. Вызовы ограничены 12, timeout 90 s, provider retries
+отключены. Отличие общего окна/каталога от Cloud явно записано в receipts;
+совпадение W не означает полного равенства конфигураций. Предыдущий контроль
+без сжатия тоже не прошёл, поэтому все final ошибки исключительно compaction
+не приписываются. Нужна защита сохранности значений и исполнения final contract;
+повторное изменение только размера summary не обосновано этим результатом.
+
+Evidence в Cloud worktree: `.enterprise-work/compaction-provider-local-20261029/`
+(`runtime-original-4/result.json`, `runtime-original-5/result.json` и исполненный
+`driver.py`, `runtime-fixture-cleanup.json`, `runtime-original-review.md`).
+Три первоначальных setup failures сохранены, provider calls в них отсутствуют.
+Собственный PostgreSQL container удалён после проверки точного ID/label.
+Production code, frozen spec/tests, Cloud settings и опубликованный образ не менялись.
+Независимый DSH reviewer (`cloudru/qwen3-8-flash-next2`, xhigh, session
+`ee13ef67-5312-4447-8768-8c8f2e0eff9f`) проверил оба полных запуска; correction
+review завершён за 46,8 s, exit 0. В receipts после запуска добавлены
+`comparison_limits` и заменены только синтетические fixture credentials;
+это аннотированные результаты, не неизменённый raw output процесса. Наблюдения
+`calls/events/checks/final_raw` не редактировались. Исполненный run-5 driver
+сохранён отдельно (SHA-256 `a77f2f55ee518dbb33607c0a5d54e15f4ca6f92a3cc6fcc5e3705a06fb4d1a68`);
+его отличие от текущего receipt writer и отсутствие первоначальных raw receipts
+ограничивают воспроизводимость метаданных, но не превращают отрицательный
+результат в pass. Lead audit отдельно сверил исходные input hashes и два события.
+
 Сборка `99a5de6` использует immutable опубликованный `174dec5` как base и
 проверенный `core_agent/context.py` как новый image layer; зависимости, остальные
 runtime-файлы и UI совпадают. Это не полный rebuild исходного Dockerfile.
