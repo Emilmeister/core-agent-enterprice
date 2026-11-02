@@ -728,7 +728,10 @@ Destination mTLS identity не загружается в отдельный HTTP
   `SANDBOX_DNS_SERVERS` и `SANDBOX_DENIED_CIDRS` обязательны и дополняют закреплённую
   `core_agent/sandbox-policy.json`, которая входит в wheel и root-owned image.
   Cloud.ru Docker-образ предоставляет переопределяемый DNS ENV default
-  `1.1.1.1,2606:4700:4700::1111`; `SANDBOX_DENIED_CIDRS` задаётся deployment.
+  `1.1.1.1,2606:4700:4700::1111`; target `cloudru` также задаёт
+  `SANDBOX_DENIED_CIDRS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`.
+  CIDR override заменяет этот список, но не закреплённые запреты политики;
+  пустой/невалидный список по-прежнему отклоняется.
   Для Cloud.ru публикации использовать `docker build --target cloudru`: эта цель
   задаёт production/cloudru/S3/Landlock, три отдельных `/tmp/core-agent/` каталога,
   INFO logging, выключенные startup diagnostics/next_steps и период next_steps 5.

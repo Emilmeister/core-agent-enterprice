@@ -8,11 +8,11 @@ SPEC_ROOT = Path(__file__).resolve().parents[1] / "spec"
 EXPECTED_SHA256 = {
     "README.md": "3fbd47e36fe7f2ee3830afec0ec86f929fa06ee85d20581ef111402845449786",
     "a2a-protocol.md": "b7b8d4eb7167d98ae9e5713b18575e85708676506118a7845492ebcd2e5d565e",
-    "acceptance.md": "e82badc9ac752a9ed561da4a8a4018ab8c42492b362f0ecab146284c816b488c",
+    "acceptance.md": "efa0ba79fe422558800d666850e45810c5fc648122688693ed3421b781a3d338",
     "agent-configuration.md": "63ce3fe39cbb1251a4373a8c010806e35af066f6791eeab9f979bcc60baecf01",
     "architecture.md": "e455a067f6be33932ae35149ec8be522e89bc939c84764c1c94ae0aac8c04f37",
     "artifacts.md": "93112c7f43a7823aa6bc4607d0215006a287a2fae120cdd3b2e4ca235fd2f8d3",
-    "cloudru.md": "011acba6a2d1cabab87e9b3c9d85025c1905756bf36c422c456b092a2b675b3b",
+    "cloudru.md": "65075e688e45196c9f0e8da2cb6b66ad1185637b91957be636b1dac205170462",
     "context.md": "775883c92d5365a6476d2dab38e7428b8f5c1c1d98d67c0a7e6f20306f83d23d",
     "development-process.md": "8898fb1b105bfefe4777e3b078ae777c067720a0790df194b5d39e357f9fcea9",
     "execution-environment.md": "4b2f780d7689a6e47d53ac141c557b8ecf1d144d2f73e4d8d8d472e4dfae9077",

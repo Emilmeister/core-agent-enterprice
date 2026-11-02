@@ -34,7 +34,11 @@ default `in-memory` отклоняется до serving. `disabled` не соз�
 Cloud.ru Docker-образ задаёт `SANDBOX_DNS_SERVERS=1.1.1.1,2606:4700:4700::1111`
 как переопределяемый ENV default. Явное значение deployment заменяет весь список;
 пустой, невалидный или запрещённый resolver по-прежнему отклоняется SandboxPolicy.
-`SANDBOX_DENIED_CIDRS` остаётся обязательной настройкой deployment.
+Цель `cloudru` также задаёт
+`SANDBOX_DENIED_CIDRS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`.
+Deployment MAY заменить этот список через ENV; пустое/невалидное значение
+отклоняется. Закреплённые запреты `sandbox-policy.json` всегда добавляются
+к списку независимо от override. Обычный target требует CIDR от deployment.
 
 Цель Docker-сборки `cloudru` (`docker build --target cloudru .`) дополнительно
 задаёт переопределяемые ENV defaults: `CORE_AGENT_AUTH_MODE=cloudru`,
@@ -46,7 +50,7 @@ Cloud.ru Docker-образ задаёт `SANDBOX_DNS_SERVERS=1.1.1.1,2606:4700:4
 `CORE_AGENT_NEXT_STEPS_EVERY=5`. Эти локальные каталоги — рабочие копии и кэш,
 а постоянные данные остаются в PostgreSQL/S3. Явные deployment ENV имеют приоритет;
 validation и обязательный native preflight сохраняются. Tenant ID, password,
-encryption key, origin, DB/S3 credentials и защищённые CIDR не входят в образ.
+encryption key, origin и DB/S3 credentials не входят в образ.
 Обычная сборка без `--target cloudru` сохраняет прежние runtime defaults, включая
 выбор Keycloak/Bubblewrap и требование явного environment. `main` не меняется.
 

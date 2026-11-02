@@ -53,7 +53,7 @@ Keycloak-specific ENT-AC-01/03, browser/provisioning ENT-AC-72/85 и спосо�
 Landlock profile. CLD-AC-31 обязателен и для development с включённой памятью.
 Остальные security, policy и lifecycle guarantees сохраняются.
 
-- [ ] Cloud.ru image без override предоставляет `SANDBOX_DNS_SERVERS=1.1.1.1,2606:4700:4700::1111`; deployment override заменяет список, а пустой/запрещённый resolver и отсутствующий `SANDBOX_DENIED_CIDRS` отклоняются.
+- [ ] Cloud.ru image без override предоставляет `SANDBOX_DNS_SERVERS=1.1.1.1,2606:4700:4700::1111`; deployment override заменяет список, а пустой/запрещённый resolver отклоняется. Target `cloudru` предоставляет `SANDBOX_DENIED_CIDRS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`; override заменяет список, сохраняя sealed denies. Пустой/невалидный CIDR отклоняется; обычный target требует явного CIDR.
 - [ ] Docker target `cloudru` задаёт Cloud production/S3/Landlock, отдельные writable рабочие каталоги и documented logging/planning defaults; runtime ENV переопределяет их. Обычный target сохраняет прежнюю конфигурацию; ни один image не содержит tenant/password/encryption key или подключения к реальной БД/S3.
 
 | ID | Дано / действие | Наблюдаемый результат |

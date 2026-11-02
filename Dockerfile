@@ -106,6 +106,7 @@ ENV CORE_AGENT_AUTH_MODE=cloudru \
     CORE_AGENT_ENVIRONMENT=production \
     WORKSPACE_STORAGE_TYPE=s3 \
     SANDBOX_BACKEND=landlock \
+    SANDBOX_DENIED_CIDRS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 \
     CHAT_WORKSPACE_ROOT=/tmp/core-agent/chats \
     DURABLE_STORAGE_ROOT=/tmp/core-agent/durable \
     LOCAL_WORKSPACE_ROOT=/tmp/core-agent/runs \
