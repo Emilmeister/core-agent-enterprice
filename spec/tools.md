@@ -388,6 +388,15 @@ call и не расходуют соответствующие budgets.
 Такой конфликт MUST завершить startup ошибкой `CONFIG_INVALID`, а не нарушить
 изоляцию session или согласование протокола.
 
+Discovery MUST читать все страницы `tools/list`, передавая непустой строковый
+`nextCursor` как `cursor` следующего запроса. Отсутствующий либо `null`
+`nextCursor` завершает список. Все страницы сохраняют session/protocol version
+и один общий discovery deadline; частичный catalog никогда не публикуется.
+Повторный, пустой, нестроковый или превышающий 4096 UTF-8 bytes cursor,
+повторное имя tool, невалидный descriptor, превышение 128 страниц или 10000
+tools дают `MCP_PROTOCOL_ERROR`. Ошибка/отмена/timeout на любой странице
+отменяет весь результат; существующие cold-start правила определяют retry.
+
 После истечения deadline optional server исключается из effective catalog с
 наблюдаемым `MCP_CONNECTION_FAILED`; run продолжается без его capabilities.
 Required server возвращает тот же structured error. Уже отправленный

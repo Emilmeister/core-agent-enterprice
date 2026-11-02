@@ -16,12 +16,16 @@ from urllib.parse import urlparse
 import httpx
 
 from .errors import CoreError
+from .mcp_transport import http_client_options
 from .security import redact
 
 
 # Published MCP revisions this client interoperates with, newest first: the first
 # entry is what we propose, the rest are what we still accept from a server.
 MCP_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+MAX_DISCOVERY_PAGES = 128
+MAX_DISCOVERY_TOOLS = 10000
+MAX_CURSOR_BYTES = 4096
 RETRYABLE_HTTP_STATUSES = frozenset({408, 429, *range(500, 600)})
 RESERVED_MCP_HEADERS = frozenset(
     {
@@ -39,9 +43,15 @@ def _cancel_error(cancel_event):
     return getattr(cancel_event, "error_code", "TASK_CANCELLED")
 
 
-def _credential_safe(value, headers):
-    secrets = tuple({secret for item in headers.values() if isinstance(item, str)
-                     for secret in (item, item.removeprefix("Bearer ")) if secret})
+def _credential_safe(value, headers, extra_secrets=()):
+    secrets = {
+        secret
+        for item in headers.values()
+        if isinstance(item, str)
+        for secret in (item, item.removeprefix("Bearer "))
+        if secret
+    } | {secret for secret in extra_secrets if isinstance(secret, str) and secret}
+
     def clean(item):
         if isinstance(item, dict):
             return {redact(key, secrets): clean(content) for key, content in item.items()}
@@ -341,6 +351,7 @@ class StreamableHttpMcpConnector:
             )
         self._servers = {}
         self._connections = []
+        self._client_options = {}
         self.protocol_versions = tuple(protocol_versions)
         self._negotiated_versions = {}
         # Streamable HTTP servers hand out a session on initialize and
@@ -441,6 +452,12 @@ class StreamableHttpMcpConnector:
         ):
             raise CoreError("MCP_PROTOCOL_ERROR", f"{method}: invalid JSON-RPC error")
 
+    def _transport_options(self, server):
+        """Client kwargs for one server, rebuilt whenever its connection (re)opens."""
+        if server not in self._client_options:
+            self._client_options[server] = http_client_options(self._servers[server])
+        return self._client_options[server]
+
     def _rpc(
         self,
         server,
@@ -516,7 +533,10 @@ class StreamableHttpMcpConnector:
                     write=request_timeout,
                     pool=request_timeout,
                 )
-                async with httpx.AsyncClient(timeout=transport_timeout) as client:
+                options = self._transport_options(server)[0]
+                async with httpx.AsyncClient(
+                    timeout=transport_timeout, **options
+                ) as client:
                     async with client.stream(
                         "POST",
                         endpoint,
@@ -603,7 +623,9 @@ class StreamableHttpMcpConnector:
         if notification:
             return None
         self._validate_envelope(value, payload["id"], method)
-        value = _credential_safe(value, declaration.get("headers", self.headers))
+        value = _credential_safe(
+            value, declaration.get("headers", self.headers), self._transport_options(server)[1]
+        )
         if "error" in value:
             raise CoreError("MCP_PROTOCOL_ERROR", data=value["error"])
         return value["result"]
@@ -639,24 +661,65 @@ class StreamableHttpMcpConnector:
             deadline=deadline,
             cancel_event=cancel_event,
         )
-        result = self._rpc(
-            name, "tools/list", deadline=deadline, cancel_event=cancel_event
-        )
-        if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
-            raise CoreError("MCP_PROTOCOL_ERROR", "tools/list: tools must be an array")
+        # Discovery reads every page: `nextCursor` (absent or null ends the
+        # list) becomes the `cursor` of the next request while the session,
+        # negotiated version and the one discovery deadline stay shared.  A
+        # failure anywhere discards the whole result — a partial catalog is
+        # never published — and the existing cold-start rules decide retry.
         catalog = {}
-        for tool in result["tools"]:
-            if (
-                not isinstance(tool, dict)
-                or not isinstance(tool.get("name"), str)
-                or not tool["name"]
-                or not isinstance(tool.get("inputSchema", {}), dict)
+        seen_cursors = set()
+        cursor = None
+        pages_read = 0
+        while True:
+            pages_read += 1
+            result = self._rpc(
+                name,
+                "tools/list",
+                None if cursor is None else {"cursor": cursor},
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
+            if not isinstance(result, dict) or not isinstance(
+                result.get("tools"), list
             ):
                 raise CoreError(
-                    "MCP_PROTOCOL_ERROR", "tools/list: invalid tool descriptor"
+                    "MCP_PROTOCOL_ERROR", "tools/list: tools must be an array"
                 )
-            catalog[tool["name"]] = tool.get("inputSchema", {})
-        return catalog
+            for tool in result["tools"]:
+                if (
+                    not isinstance(tool, dict)
+                    or not isinstance(tool.get("name"), str)
+                    or not tool["name"]
+                    or not isinstance(tool.get("inputSchema", {}), dict)
+                ):
+                    raise CoreError(
+                        "MCP_PROTOCOL_ERROR", "tools/list: invalid tool descriptor"
+                    )
+                if tool["name"] in catalog:
+                    raise CoreError(
+                        "MCP_PROTOCOL_ERROR", "tools/list: duplicate tool name"
+                    )
+                catalog[tool["name"]] = tool.get("inputSchema", {})
+            if len(catalog) > MAX_DISCOVERY_TOOLS:
+                raise CoreError("MCP_PROTOCOL_ERROR", "tools/list: too many tools")
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
+                return catalog
+            try:
+                cursor_size = len(next_cursor.encode("utf-8")) if isinstance(next_cursor, str) else 0
+            except UnicodeError:
+                raise CoreError("MCP_PROTOCOL_ERROR", "tools/list: invalid nextCursor") from None
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or cursor_size > MAX_CURSOR_BYTES
+                or next_cursor in seen_cursors
+            ):
+                raise CoreError("MCP_PROTOCOL_ERROR", "tools/list: invalid nextCursor")
+            if pages_read >= MAX_DISCOVERY_PAGES:
+                raise CoreError("MCP_PROTOCOL_ERROR", "tools/list: too many pages")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
 
     def _cold_start_failure(self, name, error, *, timeout_seconds=None):
         timeout_seconds = (
@@ -690,6 +753,8 @@ class StreamableHttpMcpConnector:
             self._raise_if_cancelled(cancel_event)
             self._sessions.pop(name, None)
             self._negotiated_versions.pop(name, None)
+            # Identity contexts and their temporary files belong to one attempt.
+            self._client_options.pop(name, None)
             try:
                 catalog = self._connect_once(
                     name,

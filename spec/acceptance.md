@@ -413,6 +413,10 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
 
 ## Tools и MCP
 
+- [ ] MCP discovery собирает полный JSON/SSE catalog по `nextCursor` в одном deadline; повторные/невалидные cursors, duplicate tools, page/tool limits и ошибка поздней страницы не публикуют частичный список.
+- [ ] Два MCP имеют независимые optional HTTP/HTTPS proxy и mTLS identities; без proxy соединение прямое независимо от process ENV. Реальные локальные TLS/CONNECT fixtures проверяют доверие CA, client authentication и отсутствие origin identity на HTTPS proxy.
+- [ ] Owner settings принимают PKCS12/PEM и пароль только на запись, проверяют key match/expiry/bounds, шифруют normalized identity/proxy credentials и сохраняют literal auth header. Preserve/replace/clear и URL binding проверены; root/child/recovery используют закреплённую revision без secrets в snapshots/read/audit/errors. Version1 envelopes остаются читаемыми.
+
 - [ ] Tool arguments валидируются до policy и execution.
 - [ ] Отказ валидации называет путь аргумента, ожидаемый тип и фактический; переданное значение в сообщение не попадает.
 - [ ] Каноническое имя tool не содержит точки, совпадает с именем в каталоге модели и с именем в аргументах `core_delegate`; alias появляется только при коллизии или превышении длины.

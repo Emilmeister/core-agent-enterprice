@@ -297,6 +297,7 @@ actor `migration:<database current_user>`; повторный import не зам
 | `core_agent/streaming.py` | Stream chunk merge, snapshot buffer и ADK metadata keys |
 | `core_agent/durability.py`, `core_agent/lifecycle.py` | Events, checkpoints, leases, recovery и retention |
 | `core_agent/mcp.py` | MCP discovery/calls, canonical tool naming и Streamable HTTP connector |
+| `core_agent/mcp_transport.py`, `core_agent/mcp_credentials.py` | Per-MCP proxy/mTLS, общий packaged CA trust, private key loading и валидация owner certificate uploads |
 | `core_agent/security.py` | Redaction, safe paths, retry и tenant helpers |
 | `core_agent/skills.py` | Обнаружение, закрепление и безопасное чтение ресурсов навыков |
 | `core_agent/observability.py` | OpenTelemetry/OpenInference spans и exporters |
@@ -678,6 +679,12 @@ run получает отдельные MCP session и negotiated version; пе�
 очищаются. Ожидание не расходует model/tool budget. Permanent auth/protocol
 ошибки и неоднозначный mutating `tools/call` не повторяются; cancel прерывает
 ожидание.
+Discovery собирает все страницы `tools/list` в том же deadline; невалидные или
+повторные cursors, duplicate tools и превышение 128 страниц/10000 tools не дают
+частичного catalog. MCP transport не использует process proxy/CA ENV: optional
+HTTP/HTTPS proxy задаётся на connection. Общий trust — certifi и публичный CA
+из `core_agent/certs/`, включённый в package/image; TLS verification обязательна.
+Destination mTLS identity не загружается в отдельный HTTPS proxy SSL context.
 При recovery сохранённый MCP catalog задаёт неизменный ceiling и digest, а
 текущая discovery — доступность и schema внутри него. Исчезнувший tool скрыт;
 изменение schema/origin после HITL возвращает `TOOL_APPROVAL_STALE` без dispatch.
@@ -884,6 +891,10 @@ run получает отдельные MCP session и negotiated version; пе�
   списка deployment provider; UI не меняет provider URL или credentials.
   MCP-секреты шифруются в исторических revisions, читаются только runtime и не
   возвращаются в owner GET. Новое подключение не наследует auth другого сервера.
+  Proxy credentials и PKCS12/PEM client identity проходят тот же pinned encrypted
+  revision flow. Upload passwords не сохраняются; header value передаётся
+  буквально, без добавления Bearer. Version2 secret envelopes читаются вместе
+  с legacy version1; snapshots не содержат proxy auth/private key.
   Сохранённый profile prompt не заменяет protected kernel или safety rules.
   `guardrails_enabled` — boolean, default true, пропуск поля сохраняет значение.
   Оно закрепляется в новых root/cron runs и наследуется child/background/recovery;

@@ -626,6 +626,48 @@ Schema migration создаёт current pointer и immutable version1 revision r
 serving role не изменяет/удаляет revisions. Откат после новых settings records
 требует совместимого reader либо согласованного восстановления БД.
 
+Каждое MCP connection MAY отдельно задавать `proxy_url` (HTTP или HTTPS,
+до 4096 bytes, без userinfo/query/fragment и без пути кроме `/`). Отсутствие
+поля сохраняет прежний адрес; `null` удаляет proxy вместе с его credentials.
+Новый connection без proxy подключается напрямую: переменные окружения proxy
+MUST NOT влиять на MCP transport. `proxy_username`/`proxy_password` — write-only
+пара: оба отсутствуют — сохранить, оба `null` — удалить, оба строки — заменить.
+Смена proxy URL требует явно заменить или удалить прежние credentials.
+Логин непустой и не содержит `:`; пароль MAY быть пустым. Каждое поле ограничено
+4096 UTF-8 bytes без control characters. Credentials требуют реального proxy URL,
+в том числе при ссылке на deployment connection. Смена destination URL также
+требует явного решения о прежних proxy credentials.
+Proxy authentication MUST NOT передаваться целевому MCP как обычный header.
+
+Write-only `client_certificate` MAY содержать PKCS12
+`{format: "pkcs12", data: "base64", password: "..."}` либо PEM
+`{format: "pem", certificate: "PEM chain", private_key: "PEM key", password: "..."}`.
+Пароль optional для незашифрованного входа. Отсутствие поля сохраняет identity,
+`null` удаляет её; смена MCP URL требует явно заменить либо удалить identity.
+Каждая загрузка ограничена 128 KiB decoded PKCS12 или суммой UTF-8 bytes PEM.
+Нормализованные chain и key вместе ограничены теми же 128 KiB.
+Сохранение MUST проверять формат, соответствие ключа сертификату и текущий срок
+действия leaf certificate. Нормализованные chain/key шифруются вместе с
+credentials immutable revision; пароль загрузки не сохраняется. Read возвращает
+только `proxy_url`, `has_proxy_credentials`, `has_client_certificate` и
+`certificate_info` (subject, issuer, expiry, SHA256), никогда key/password/PEM.
+Version1 header-only encrypted envelopes остаются читаемыми; новые credentials
+используют version2 envelope в существующей revision row. Откат reader до
+version1 после записи version2 требует совместимой версии приложения.
+Admission snapshots MUST NOT содержать proxy credentials или client identity;
+root, child и recovery восстанавливают их только из закреплённой company revision.
+
+TLS verification MUST оставаться включённой. Общий для всех MCP набор CA
+поставляется с образом: стандартные roots дополнены Russian Trusted Root CA
+(SHA256 `d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31`).
+Per-MCP CA и отключение проверки TLS не являются настройками владельца.
+HTTPS proxy и destination используют отдельные TLS contexts с общим trust;
+client identity MUST NOT предлагаться proxy. Временные key files private,
+удаляются после загрузки SSL context, включая ошибку.
+Ошибка удаления не скрывается: соединение не продолжается.
+MCP auth header value передаётся буквально: runtime и UI MUST NOT добавлять
+`Bearer`, `Api-Key` или другой prefix.
+
 ### UI-02. Настройки
 
 В UI владельцы управляют политикой каждого инструмента, исключением инструмента

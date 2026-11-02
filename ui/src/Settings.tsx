@@ -128,6 +128,20 @@ export function Settings({ api }: { api: Api }) {
   );
 }
 
+type McpDraft = McpConnection & {
+  original_name?: string;
+  header_value?: string | null;
+  proxy_username?: string | null;
+  proxy_password?: string | null;
+  certificate_format?: "pkcs12" | "pem";
+  certificate_data?: string;
+  private_key_data?: string;
+  certificate_password?: string;
+  certificate_filename?: string;
+  private_key_filename?: string;
+  remove_certificate?: boolean;
+};
+
 function AgentConfiguration({ api }: { api: Api }) {
   const [current, setCurrent] = useState<AgentSettings | null>(null);
   const [profile, setProfile] = useState("");
@@ -138,7 +152,7 @@ function AgentConfiguration({ api }: { api: Api }) {
   const [guardrailsEnabled, setGuardrailsEnabled] = useState<boolean | null>(null);
   const [nextStepsEnabled, setNextStepsEnabled] = useState<boolean | null>(null);
   const [nextStepsEvery, setNextStepsEvery] = useState<string | null>(null);
-  const [servers, setServers] = useState<(McpConnection & { header_value?: string | null; original_name?: string })[]>([]);
+  const [servers, setServers] = useState<McpDraft[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [modelError, setModelError] = useState("");
@@ -209,16 +223,51 @@ function AgentConfiguration({ api }: { api: Api }) {
       setBusy("");
     }
   }
-  function updateServer(index: number, values: Partial<McpConnection & { header_value?: string | null }>) {
+  function updateServer(index: number, values: Partial<McpDraft>) {
     setServers((previous) => previous.map((server, position) => position === index ? { ...server, ...values } : server));
   }
-  function connectionPayload(server: McpConnection & { header_value?: string | null }) {
+  async function readCertificate(index: number, file: File | undefined, privateKey = false) {
+    if (!file || busy) return;
+    if (file.size > 128 * 1024) { setError("Размер сертификата или ключа не должен превышать 128 КиБ."); return; }
+    setBusy("mcp-file");
+    setError("");
+    try {
+      const isPem = servers[index].certificate_format === "pem";
+      const data = isPem ? await file.text() : btoa(Array.from(new Uint8Array(await file.arrayBuffer()), (byte) => String.fromCharCode(byte)).join(""));
+      updateServer(index, privateKey ? { private_key_data: data, private_key_filename: file.name, remove_certificate: false }
+        : { certificate_data: data, certificate_filename: file.name, remove_certificate: false });
+    } catch {
+      setError("Не удалось прочитать файл сертификата или ключа.");
+    } finally { setBusy(""); }
+  }
+  function connectionPayload(server: McpDraft) {
+    const identity = server.remove_certificate ? null : server.certificate_data
+      ? server.certificate_format === "pem"
+        ? { format: "pem", certificate: server.certificate_data, private_key: server.private_key_data, password: server.certificate_password }
+        : { format: "pkcs12", data: server.certificate_data, password: server.certificate_password }
+      : undefined;
     return { name: server.name, url: server.url, enabled: server.enabled, header_name: server.header_name,
+      ...(server.proxy_url !== undefined ? { proxy_url: server.proxy_url } : {}),
+      ...(server.proxy_username !== undefined || server.proxy_password !== undefined
+        ? { proxy_username: server.proxy_username, proxy_password: server.proxy_password } : {}),
+      ...(identity !== undefined ? { client_certificate: identity } : {}),
       ...(server.header_value !== undefined ? { header_value: server.header_value } : {}) };
   }
   async function saveConnection(index: number) {
     if (!current) return;
     const server = servers[index];
+    const editingProxyAuth = server.proxy_username !== undefined || server.proxy_password !== undefined;
+    const clearingProxyAuth = server.proxy_username === null && server.proxy_password === null;
+    if (server.proxy_url && editingProxyAuth && !clearingProxyAuth
+      && (!server.proxy_username || typeof server.proxy_password !== "string")) {
+      setError("Для замены авторизации прокси укажите новый логин и пароль. Если пароль не нужен, отметьте «Использовать пустой пароль».");
+      return;
+    }
+    if (!server.remove_certificate && ((server.private_key_data || server.certificate_password) && !server.certificate_data
+      || server.certificate_data && server.certificate_format === "pem" && !server.private_key_data)) {
+      setError("Выберите сертификат, а для PEM — также файл закрытого ключа.");
+      return;
+    }
     if (!server.original_name && current.mcp_servers.some((item) => item.name === server.name)) {
       setError("Подключение с таким именем уже существует. Выберите другое имя.");
       return;
@@ -388,11 +437,69 @@ function AgentConfiguration({ api }: { api: Api }) {
               placeholder={server.has_header_value ? "Сохранённое значение" : "Не задано"}
               onChange={(event) => updateServer(index, { header_value: event.target.value || undefined })} />
           </label>
+          <p className="muted">Значение передаётся как введено: например, Bearer …, Api-Key … или сам токен.</p>
           <label className="check"><input type="checkbox" checked={server.enabled}
             onChange={(event) => updateServer(index, { enabled: event.target.checked })} />Подключён</label>
           <label className="check"><input type="checkbox" checked={server.header_value === null}
             onChange={(event) => updateServer(index, { header_value: event.target.checked ? null : undefined })} />Удалить сохранённый ключ</label>
         </div>
+        <details>
+          <summary>Прокси и клиентский сертификат</summary>
+          <div className="form-grid">
+            <label>HTTP/HTTPS прокси
+              <input type="url" maxLength={4096} value={server.proxy_url ?? ""} placeholder="http://proxy.example:8080"
+                onChange={(event) => updateServer(index, { proxy_url: event.target.value || null,
+                  ...(!event.target.value ? { proxy_username: undefined, proxy_password: undefined } : {}) })} />
+            </label>
+            <p className="muted">Пустое поле — прямое подключение. Настройка действует только для этого MCP.</p>
+            <label>Логин прокси
+              <input autoComplete="off" disabled={!server.proxy_url} value={server.proxy_username ?? ""}
+                placeholder={server.has_proxy_credentials ? "Сохранён" : "Не задан"}
+                onChange={(event) => updateServer(index, { proxy_username: event.target.value })} />
+            </label>
+            <label>Пароль прокси
+              <input type="password" autoComplete="new-password" disabled={!server.proxy_url} value={server.proxy_password ?? ""}
+                placeholder={server.proxy_username !== undefined ? "Укажите новый пароль" : server.has_proxy_credentials ? "Сохранён" : "Не задан"}
+                onChange={(event) => updateServer(index, { proxy_password: event.target.value })} />
+            </label>
+            <label className="check"><input type="checkbox" checked={server.proxy_password === ""} disabled={!server.proxy_url}
+              onChange={(event) => updateServer(index, { proxy_password: event.target.checked ? "" : undefined })} />Использовать пустой пароль</label>
+            <label className="check"><input type="checkbox" checked={server.proxy_username === null} disabled={!server.proxy_url}
+              onChange={(event) => updateServer(index, { proxy_username: event.target.checked ? null : undefined,
+                proxy_password: event.target.checked ? null : undefined })} />Удалить логин и пароль прокси</label>
+            <label>Формат клиентского сертификата
+              <select value={server.certificate_format ?? "pkcs12"} onChange={(event) => updateServer(index, {
+                certificate_format: event.target.value as "pkcs12" | "pem", certificate_data: undefined, private_key_data: undefined,
+                certificate_password: undefined, certificate_filename: undefined, private_key_filename: undefined,
+              })}>
+                <option value="pkcs12">PKCS12 (.p12 / .pfx)</option><option value="pem">PEM: сертификат и ключ</option>
+              </select>
+            </label>
+            <label>Файл клиентского сертификата
+              <input key={`cert-${server.certificate_format}-${server.certificate_filename ?? ""}`} type="file"
+                accept={server.certificate_format === "pem" ? ".pem,.crt" : ".p12,.pfx"}
+                onChange={(event) => void readCertificate(index, event.target.files?.[0])} />
+              {server.certificate_filename && <span>{server.certificate_filename}</span>}
+            </label>
+            {server.certificate_format === "pem" && <label>Файл закрытого ключа
+              <input key={`key-${server.private_key_filename ?? ""}`} type="file" accept=".pem,.key"
+                onChange={(event) => void readCertificate(index, event.target.files?.[0], true)} />
+              {server.private_key_filename && <span>{server.private_key_filename}</span>}
+            </label>}
+            <label>Пароль файла сертификата / ключа
+              <input type="password" autoComplete="new-password" value={server.certificate_password ?? ""}
+                onChange={(event) => updateServer(index, { certificate_password: event.target.value || undefined })} />
+            </label>
+            <label className="check"><input type="checkbox" checked={!!server.remove_certificate}
+              onChange={(event) => updateServer(index, { remove_certificate: event.target.checked,
+                certificate_data: undefined, private_key_data: undefined, certificate_password: undefined,
+                certificate_filename: undefined, private_key_filename: undefined })} />Удалить клиентский сертификат</label>
+          </div>
+          {server.has_client_certificate && <p className="muted">Клиентский сертификат сохранён.
+            {server.certificate_info && <> {server.certificate_info.subject}. Действует до {server.certificate_info.expiry}.</>}</p>}
+          <p className="muted">При изменении адреса MCP замените или удалите его сертификат. При смене прокси замените или удалите его логин и пароль.
+            {" "}Доверенные CA общие для всех MCP и поставляются с образом; проверка TLS включена.</p>
+        </details>
         <div className="actions">
           <button disabled={!!busy}>{busy === "mcp" ? "Сохраняем…" : "Сохранить подключение"}</button>
           <button type="button" className="secondary" onClick={() => void removeConnection(index)}>Удалить подключение</button>
