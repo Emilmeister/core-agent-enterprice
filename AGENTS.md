@@ -727,6 +727,8 @@ Destination mTLS identity не загружается в отдельный HTTP
   Ошибка teardown блокирует snapshot/delete; unhealthy launcher закрывает readiness.
   `SANDBOX_DNS_SERVERS` и `SANDBOX_DENIED_CIDRS` обязательны и дополняют закреплённую
   `core_agent/sandbox-policy.json`, которая входит в wheel и root-owned image.
+  Cloud.ru Docker-образ предоставляет переопределяемый DNS ENV default
+  `1.1.1.1,2606:4700:4700::1111`; `SANDBOX_DENIED_CIDRS` задаётся deployment.
   Slirp входит только в owned user namespace, сохраняя Pod netns для egress;
   target gate ждёт IPv6 address/default route до исходного startup deadline.
   Base default-deny и TTY injection deny — отдельные sealed seccomp filters,

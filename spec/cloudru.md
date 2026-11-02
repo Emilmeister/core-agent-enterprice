@@ -31,6 +31,11 @@ default `in-memory` отклоняется до serving. `disabled` не соз�
 либо `DATABASE_URL`, так как migration CLI не собирает `SESSION_POSTGRES_*`.
 Нет fallback к in-memory/SQLite при ошибке БД или несовместимой схеме.
 
+Cloud.ru Docker-образ задаёт `SANDBOX_DNS_SERVERS=1.1.1.1,2606:4700:4700::1111`
+как переопределяемый ENV default. Явное значение deployment заменяет весь список;
+пустой, невалидный или запрещённый resolver по-прежнему отклоняется SandboxPolicy.
+`SANDBOX_DENIED_CIDRS` остаётся обязательной настройкой deployment.
+
 `CORE_AGENT_ENVIRONMENT=production` поддерживает этот профиль только с
 `WORKSPACE_STORAGE_TYPE=s3`, полной валидной S3 configuration, отдельными
 `CHAT_WORKSPACE_ROOT`, `DURABLE_STORAGE_ROOT`, `LOCAL_WORKSPACE_ROOT`,

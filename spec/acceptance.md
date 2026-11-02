@@ -53,6 +53,8 @@ Keycloak-specific ENT-AC-01/03, browser/provisioning ENT-AC-72/85 и спосо�
 Landlock profile. CLD-AC-31 обязателен и для development с включённой памятью.
 Остальные security, policy и lifecycle guarantees сохраняются.
 
+- [ ] Cloud.ru image без override предоставляет `SANDBOX_DNS_SERVERS=1.1.1.1,2606:4700:4700::1111`; deployment override заменяет список, а пустой/запрещённый resolver и отсутствующий `SANDBOX_DENIED_CIDRS` отклоняются.
+
 | ID | Дано / действие | Наблюдаемый результат |
 |---|---|---|
 | CLD-AC-01 | Default/unknown mode, неполный Cloud config, platform PostgreSQL ENV и автоматически переданный `MCP_URL` | Default сохраняет Keycloak; unknown/incomplete fail closed; Cloud использует общий PostgreSQL pool и только persisted UI MCP settings; отсутствующая БД не включает in-memory fallback |

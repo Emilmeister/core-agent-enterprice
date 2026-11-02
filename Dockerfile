@@ -93,6 +93,7 @@ RUN cd /opt/core-agent/security && \
     bwrap --version && slirp4netns --version && nft --version && git --version
 
 ENV SKILLS_ROOT=/opt/core-agent/skills \
+    SANDBOX_DNS_SERVERS=1.1.1.1,2606:4700:4700::1111 \
     CORE_AGENT_ALLOWED_SKILLS=systematic-debugging,verification-before-completion,knowledge-synthesis,explore-data,validate-data,statistical-analysis,sql-queries
 
 USER agent
