@@ -9,7 +9,7 @@ FROM ghcr.io/astral-sh/uv:0.11.6 AS uv
 
 FROM mikefarah/yq:4.53.3 AS yq
 
-FROM python:3.12-slim
+FROM python:3.12-slim AS runtime
 COPY --from=uv /uv /uvx /bin/
 COPY --from=yq /usr/bin/yq /usr/local/bin/yq
 
@@ -100,3 +100,19 @@ USER agent
 STOPSIGNAL SIGTERM
 EXPOSE 8000
 CMD ["core-agent"]
+
+FROM runtime AS cloudru
+ENV CORE_AGENT_AUTH_MODE=cloudru \
+    CORE_AGENT_ENVIRONMENT=production \
+    WORKSPACE_STORAGE_TYPE=s3 \
+    SANDBOX_BACKEND=landlock \
+    CHAT_WORKSPACE_ROOT=/tmp/core-agent/chats \
+    DURABLE_STORAGE_ROOT=/tmp/core-agent/durable \
+    LOCAL_WORKSPACE_ROOT=/tmp/core-agent/runs \
+    LOG_LEVEL=INFO \
+    CORE_AGENT_STARTUP_DIAGNOSTICS=false \
+    CORE_AGENT_NEXT_STEPS=false \
+    CORE_AGENT_NEXT_STEPS_EVERY=5
+
+# Keep unqualified builds compatible with the generic runtime and native CI.
+FROM runtime AS default

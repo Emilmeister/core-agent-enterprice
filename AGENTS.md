@@ -729,6 +729,11 @@ Destination mTLS identity не загружается в отдельный HTTP
   `core_agent/sandbox-policy.json`, которая входит в wheel и root-owned image.
   Cloud.ru Docker-образ предоставляет переопределяемый DNS ENV default
   `1.1.1.1,2606:4700:4700::1111`; `SANDBOX_DENIED_CIDRS` задаётся deployment.
+  Для Cloud.ru публикации использовать `docker build --target cloudru`: эта цель
+  задаёт production/cloudru/S3/Landlock, три отдельных `/tmp/core-agent/` каталога,
+  INFO logging, выключенные startup diagnostics/next_steps и период next_steps 5.
+  Все значения переопределяются deployment ENV; secrets/tenant остаются внешними.
+  Сборка без target сохраняет общий runtime для Keycloak/Compose/native CI.
   Slirp входит только в owned user namespace, сохраняя Pod netns для egress;
   target gate ждёт IPv6 address/default route до исходного startup deadline.
   Base default-deny и TTY injection deny — отдельные sealed seccomp filters,

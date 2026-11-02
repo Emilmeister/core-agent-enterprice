@@ -36,6 +36,20 @@ Cloud.ru Docker-образ задаёт `SANDBOX_DNS_SERVERS=1.1.1.1,2606:4700:4
 пустой, невалидный или запрещённый resolver по-прежнему отклоняется SandboxPolicy.
 `SANDBOX_DENIED_CIDRS` остаётся обязательной настройкой deployment.
 
+Цель Docker-сборки `cloudru` (`docker build --target cloudru .`) дополнительно
+задаёт переопределяемые ENV defaults: `CORE_AGENT_AUTH_MODE=cloudru`,
+`CORE_AGENT_ENVIRONMENT=production`, `WORKSPACE_STORAGE_TYPE=s3`,
+`SANDBOX_BACKEND=landlock`, `CHAT_WORKSPACE_ROOT=/tmp/core-agent/chats`,
+`DURABLE_STORAGE_ROOT=/tmp/core-agent/durable`,
+`LOCAL_WORKSPACE_ROOT=/tmp/core-agent/runs`, `LOG_LEVEL=INFO`,
+`CORE_AGENT_STARTUP_DIAGNOSTICS=false`, `CORE_AGENT_NEXT_STEPS=false` и
+`CORE_AGENT_NEXT_STEPS_EVERY=5`. Эти локальные каталоги — рабочие копии и кэш,
+а постоянные данные остаются в PostgreSQL/S3. Явные deployment ENV имеют приоритет;
+validation и обязательный native preflight сохраняются. Tenant ID, password,
+encryption key, origin, DB/S3 credentials и защищённые CIDR не входят в образ.
+Обычная сборка без `--target cloudru` сохраняет прежние runtime defaults, включая
+выбор Keycloak/Bubblewrap и требование явного environment. `main` не меняется.
+
 `CORE_AGENT_ENVIRONMENT=production` поддерживает этот профиль только с
 `WORKSPACE_STORAGE_TYPE=s3`, полной валидной S3 configuration, отдельными
 `CHAT_WORKSPACE_ROOT`, `DURABLE_STORAGE_ROOT`, `LOCAL_WORKSPACE_ROOT`,

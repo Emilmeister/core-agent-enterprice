@@ -54,6 +54,7 @@ Landlock profile. CLD-AC-31 обязателен и для development с вкл
 Остальные security, policy и lifecycle guarantees сохраняются.
 
 - [ ] Cloud.ru image без override предоставляет `SANDBOX_DNS_SERVERS=1.1.1.1,2606:4700:4700::1111`; deployment override заменяет список, а пустой/запрещённый resolver и отсутствующий `SANDBOX_DENIED_CIDRS` отклоняются.
+- [ ] Docker target `cloudru` задаёт Cloud production/S3/Landlock, отдельные writable рабочие каталоги и documented logging/planning defaults; runtime ENV переопределяет их. Обычный target сохраняет прежнюю конфигурацию; ни один image не содержит tenant/password/encryption key или подключения к реальной БД/S3.
 
 | ID | Дано / действие | Наблюдаемый результат |
 |---|---|---|
