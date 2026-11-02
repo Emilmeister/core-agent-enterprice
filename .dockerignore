@@ -1,4 +1,6 @@
 .git
+.enterprise-work
+.idea
 .venv
 .cache
 .local-evidence

@@ -284,6 +284,10 @@ export interface McpConnection {
   enabled: boolean;
   header_name: string;
   has_header_value: boolean;
+  proxy_url?: string | null;
+  has_proxy_credentials?: boolean;
+  has_client_certificate?: boolean;
+  certificate_info?: { subject: string; issuer: string; expiry: string; sha256: string } | null;
 }
 export interface AgentSettings {
   revision: number;

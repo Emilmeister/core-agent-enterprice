@@ -12,6 +12,14 @@ from psycopg.types.json import Jsonb
 
 from .errors import CoreError
 from .mcp import RESERVED_MCP_HEADERS
+from .mcp_credentials import (
+    certificate_info as public_certificate_info,
+    normalize_client_certificate,
+    validate_proxy_credentials,
+    validate_proxy_url,
+    validate_stored_client_certificate,
+    validate_stored_proxy_credentials,
+)
 from .remote_agents import _validate_endpoint
 from .remote_registry import _header_value, _text
 from .security import safe_url
@@ -19,6 +27,9 @@ from .structured_output import STRUCTURED_OUTPUT_DEFAULT, validate_structured_ou
 
 
 CONFIG_FIELDS = frozenset({"profile_prompt", "model_id", "mcp_servers", "context_window", "structured_output", "guardrails_enabled"})
+# Read-only display fields: a client may echo them back, and the server derives them again.
+DERIVED_FIELDS = frozenset({"has_header_value", "has_proxy_credentials",
+                            "has_client_certificate", "certificate_info"})
 RESERVED_HEADERS = RESERVED_MCP_HEADERS | frozenset({
     "host", "content-length", "connection", "transfer-encoding", "upgrade", "trailer", "te",
     "proxy-authorization", "traceparent", "tracestate", "baggage",
@@ -78,24 +89,103 @@ class AgentSettingsStore:
             return row
 
     def _secrets(self, row):
+        """Header-only version1 envelopes stay readable; new writes use the bound version2 envelope."""
         if row["encrypted_payload"] is None:
             return {}
         if self._cipher is None:
             raise CoreError("SETTINGS_CREDENTIAL_UNAVAILABLE")
         try:
             envelope = json.loads(self._cipher.decrypt(bytes(row["encrypted_payload"])))
-            if (set(envelope) != {"version", "tenant_id", "revision", "headers"} or envelope["version"] != 1
+            version, field = envelope["version"], ("headers" if envelope["version"] == 1 else "servers")
+            if (version not in (1, 2) or set(envelope) != {"version", "tenant_id", "revision", field}
                     or envelope["tenant_id"] != row["tenant_id"] or envelope["revision"] != row["revision"]
-                    or not isinstance(envelope["headers"], dict)):
+                    or not isinstance(envelope[field], dict)):
                 raise ValueError()
+            entries = envelope[field]
             servers = {item["name"]: item for item in row["config"]["mcp_servers"] or ()}
-            for name, value in envelope["headers"].items():
-                if set(value) != {"header_name", "header_value"} or value["header_name"] != servers[name]["header_name"]:
+            for name, value in entries.items():
+                if (not isinstance(name, str) or not isinstance(value, dict) or not value
+                        or name not in servers):
                     raise ValueError()
-                _header_value(value["header_value"])
-            return envelope["headers"]
+                if not set(value) <= ({"header_name", "header_value"} if version == 1 else {
+                        "header_name", "header_value", "proxy_auth", "client_certificate"}):
+                    raise ValueError()
+                header = {key for key in ("header_name", "header_value") if key in value}
+                if header and header != {"header_name", "header_value"}:
+                    raise ValueError()
+                if header:
+                    if (not isinstance(value["header_name"], str)
+                            or value["header_name"] != servers[name]["header_name"]):
+                        raise ValueError()
+                    _header_value(value["header_value"])
+                if version == 1 and (set(value) != {"header_name", "header_value"}):
+                    raise ValueError()
+                if "proxy_auth" in value and not validate_stored_proxy_credentials(value["proxy_auth"]):
+                    raise ValueError()
+                if ("client_certificate" in value
+                        and not validate_stored_client_certificate(value["client_certificate"])):
+                    raise ValueError()
+            return entries
         except (InvalidToken, ValueError, TypeError, KeyError, CoreError, UnicodeError):
             raise CoreError("SETTINGS_CREDENTIAL_UNAVAILABLE") from None
+
+    def _identity(self, item, previous, previous_secrets, *, inherited):
+        """Resolve the per-connection proxy address and write-only secret material.
+
+        Every field is write-only in the same way the auth header already is: absent
+        preserves, ``null`` clears, and a value replaces. Carrying proxy credentials or
+        a client identity across a changed proxy or destination URL is refused, because
+        that would transplant one connection's secret onto another endpoint.
+        """
+        invalid = CoreError("SETTINGS_INVALID")
+        previous = previous or {}
+        previous_proxy = previous_secrets.get("proxy_auth")
+        previous_certificate = previous_secrets.get("client_certificate")
+        proxy_url = previous.get("proxy_url")
+        # An explicit null has to stay distinguishable from "never configured": on a link to a
+        # deployment connection it is the only thing that may clear the trusted proxy address.
+        proxy_declared = "proxy_url" in item or bool(previous.get("proxy_declared"))
+        if "proxy_url" in item:
+            proxy_url = validate_proxy_url(item["proxy_url"]) if item["proxy_url"] is not None else None
+        elif proxy_url is None and not proxy_declared and inherited:
+            original = next(server for server in self._deployment_mcp if server["name"] == item["name"])
+            proxy_url = original["transport"].get("proxy_url")
+        pair = {key for key in ("proxy_username", "proxy_password") if key in item}
+        if pair and pair != {"proxy_username", "proxy_password"}:
+            raise invalid
+        proxy_preserved = not pair
+        proxy_auth = previous_proxy
+        if pair:
+            username, password = item["proxy_username"], item["proxy_password"]
+            if username is None and password is None:
+                proxy_auth = None
+            elif not isinstance(username, str) or not isinstance(password, str):
+                raise invalid
+            else:
+                proxy_auth = validate_proxy_credentials(username, password)
+        if "proxy_url" in item and item["proxy_url"] is None:
+            if not proxy_preserved and proxy_auth is not None:
+                raise invalid
+            proxy_auth = None
+        if proxy_auth is not None and proxy_url is None:
+            raise invalid
+        address_changed = "proxy_url" in item and previous.get("proxy_url") != proxy_url
+        destination_changed = bool(previous) and previous.get("url") != item["url"]
+        if proxy_preserved and proxy_auth is not None and (address_changed or destination_changed):
+            raise invalid
+        certificate_preserved = "client_certificate" not in item
+        certificate = previous_certificate
+        info = previous.get("certificate_info")
+        if not certificate_preserved:
+            supplied = item["client_certificate"]
+            if supplied is None:
+                certificate, info = None, None
+            else:
+                certificate = normalize_client_certificate(supplied)
+                info = public_certificate_info(certificate["certificate_pem"])
+        if certificate_preserved and certificate is not None and destination_changed:
+            raise invalid
+        return proxy_url, proxy_auth, certificate, info, proxy_declared
 
     def _updated(self, previous, values, actor_id):
         config = copy.deepcopy(previous["config"])
@@ -129,7 +219,9 @@ class AgentSettingsStore:
             updated, new_secrets = [], {}
             for item in supplied or ():
                 required = {"name", "url", "enabled", "header_name"}
-                if not isinstance(item, dict) or not required <= item.keys() <= required | {"header_value"}:
+                optional = required | {"header_value", "proxy_url", "proxy_username", "proxy_password",
+                                       "client_certificate"}
+                if not isinstance(item, dict) or not required <= item.keys() <= optional | DERIVED_FIELDS:
                     raise CoreError("SETTINGS_INVALID")
                 name, url, header = item["name"], item["url"], item["header_name"]
                 if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
@@ -150,11 +242,13 @@ class AgentSettingsStore:
                 if (not isinstance(header, str) or (header and not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", header))
                         or header.lower() in RESERVED_HEADERS):
                     raise CoreError("SETTINGS_INVALID")
+                prior, prior_secrets = old.get(name), secrets.get(name) or {}
                 secret = item.get("header_value")
-                if "header_value" not in item and name in secrets:
-                    if old[name]["url"] != url or old[name]["header_name"] != header:
+                if "header_value" not in item and "header_value" in prior_secrets:
+                    if prior["url"] != url or prior["header_name"] != header:
                         raise CoreError("SETTINGS_INVALID")
-                    secret = secrets[name]["header_value"]
+                    secret = prior_secrets["header_value"]
+                entry = {}
                 if secret is not None:
                     if not header:
                         raise CoreError("SETTINGS_INVALID")
@@ -162,8 +256,20 @@ class AgentSettingsStore:
                         _header_value(secret)
                     except CoreError:
                         raise CoreError("SETTINGS_INVALID") from None
-                    new_secrets[name] = {"header_name": header, "header_value": secret}
-                updated.append({**{key: item[key] for key in required}, "has_header_value": secret is not None})
+                    entry = {"header_name": header, "header_value": secret}
+                proxy_url, proxy_auth, certificate, certificate_info, proxy_declared = self._identity(
+                    item, prior, prior_secrets, inherited=inherited)
+                if proxy_auth is not None:
+                    entry["proxy_auth"] = proxy_auth
+                if certificate is not None:
+                    entry["client_certificate"] = certificate
+                if entry:
+                    new_secrets[name] = entry
+                updated.append({**{key: item[key] for key in required}, "has_header_value": secret is not None,
+                                "proxy_url": proxy_url, "proxy_declared": proxy_declared,
+                                "has_proxy_credentials": proxy_auth is not None,
+                                "has_client_certificate": certificate is not None,
+                                "certificate_info": certificate_info})
             config["mcp_servers"] = updated if supplied is not None else None
             secrets = new_secrets
         row = {"tenant_id": previous["tenant_id"], "revision": previous["revision"] + 1,
@@ -171,8 +277,8 @@ class AgentSettingsStore:
         if secrets:
             if self._cipher is None:
                 raise CoreError("SETTINGS_CREDENTIAL_UNAVAILABLE")
-            row["encrypted_payload"] = self._cipher.encrypt(json.dumps({"version": 1,
-                "tenant_id": row["tenant_id"], "revision": row["revision"], "headers": secrets},
+            row["encrypted_payload"] = self._cipher.encrypt(json.dumps({"version": 2,
+                "tenant_id": row["tenant_id"], "revision": row["revision"], "servers": secrets},
                 sort_keys=True, separators=(",", ":")).encode())
         return row
 
@@ -206,9 +312,20 @@ class AgentSettingsStore:
         servers = config["mcp_servers"]
         if servers is None:
             servers = [{"name": item["name"], "url": safe_url(item["transport"]["url"]), "enabled": True,
-                        "header_name": "", "has_header_value": False} for item in agent.platform_mcp]
+                        "header_name": "", "has_header_value": False,
+                        "proxy_url": (safe_url(item["transport"]["proxy_url"])
+                                      if item["transport"].get("proxy_url") else None),
+                        "has_proxy_credentials": False,
+                        "has_client_certificate": False, "certificate_info": None}
+                       for item in agent.platform_mcp]
         else:
-            servers = [{**item, "has_header_value": item.get("has_header_value", False)} for item in servers]
+            servers = [{**{key: value for key, value in item.items() if key != "proxy_declared"},
+                        "has_header_value": item.get("has_header_value", False),
+                        "proxy_url": item.get("proxy_url"),
+                        "has_proxy_credentials": item.get("has_proxy_credentials", False),
+                        "has_client_certificate": item.get("has_client_certificate", False),
+                        "certificate_info": copy.deepcopy(item.get("certificate_info"))}
+                       for item in servers]
         return {"revision": row["revision"], "profile_prompt": config["profile_prompt"] if config["profile_prompt"] is not None
                 else agent.agent_config.agent.get("profile_prompt", ""), "model_id": config["model_id"] if config["model_id"] is not None
                 else agent.agent_config.model["route"], "mcp_servers": servers,
@@ -265,9 +382,25 @@ class AgentSettingsStore:
                 "name": server["name"], "transport": {"type": "streamable_http", "url": server["url"]},
                 "required": False, "owner_configured": True,
             }
-            if credentials and not inherited:
-                secret = secrets.get(server["name"])
-                declaration["headers"] = {secret["header_name"]: secret["header_value"]} if secret else {}
+            transport = declaration.setdefault("transport", {})
+            if server.get("proxy_url"):
+                transport["proxy_url"] = server["proxy_url"]
+            elif server.get("proxy_declared"):
+                transport.pop("proxy_url", None)
+            if server.get("has_proxy_credentials") or server.get("has_client_certificate"):
+                # A secret-free marker: an inherited deployment connection keeps its own headers and
+                # tool semantics, yet still has to be rehydrated from the pinned revision. Only real
+                # secret material needs that, so a plain deployment link stays byte-identical.
+                declaration["owner_transport_configured"] = True
+            if credentials:
+                secret = secrets.get(server["name"]) or {}
+                if not inherited:
+                    declaration["headers"] = ({secret["header_name"]: secret["header_value"]}
+                                              if "header_value" in secret else {})
+                if secret.get("proxy_auth"):
+                    declaration["proxy_auth"] = copy.deepcopy(secret["proxy_auth"])
+                if secret.get("client_certificate"):
+                    declaration["client_certificate"] = copy.deepcopy(secret["client_certificate"])
             selected.append(declaration)
         platform = replace(platform, allowed_mcp_servers=platform.allowed_mcp_servers | {item["name"] for item in selected})
         if profile:
