@@ -961,12 +961,23 @@ class CoreAgent:
             settings = self.agent_settings_store.get(record.tenant_id, revision)
             _, _, hydrated = self.agent_settings_store.configure(settings, raw, self.platform_config,
                 self.platform_mcp, profile=False, credentials=True)
-            headers = {item["name"]: item.get("headers") for item in hydrated}
+            identity = {item["name"]: item for item in hydrated}
             for declaration in declarations:
-                if declaration.get("owner_configured"):
-                    if declaration["name"] not in headers or headers[declaration["name"]] is None:
+                owner_configured = bool(declaration.get("owner_configured"))
+                if not owner_configured and not declaration.get("owner_transport_configured"):
+                    continue
+                source = identity.get(declaration["name"])
+                if source is None:
+                    raise CoreError("CHECKPOINT_INVALID")
+                if owner_configured:
+                    if source.get("headers") is None:
                         raise CoreError("CHECKPOINT_INVALID")
-                    declaration["headers"] = headers[declaration["name"]]
+                    declaration["headers"] = source["headers"]
+                for secret in ("proxy_auth", "client_certificate"):
+                    if secret in source:
+                        declaration[secret] = copy.deepcopy(source[secret])
+                    else:
+                        declaration.pop(secret, None)
         return (
             raw,
             AgentConfig.from_dict(raw),
