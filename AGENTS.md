@@ -684,6 +684,9 @@ Discovery собирает все страницы `tools/list` в том же d
 частичного catalog. MCP transport не использует process proxy/CA ENV: optional
 HTTP/HTTPS proxy задаётся на connection. Общий trust — certifi и публичный CA
 из `core_agent/certs/`, включённый в package/image; TLS verification обязательна.
+Публичный CA не хранится в Git: `sh deploy/fetch-mcp-ca.sh` скачивает его по
+HTTPS с проверкой закреплённого SHA-256 до source-run, тестов и `uv build`.
+Docker и CI выполняют этот шаг автоматически; runtime не скачивает CA.
 Destination mTLS identity не загружается в отдельный HTTPS proxy SSL context.
 При recovery сохранённый MCP catalog задаёт неизменный ceiling и digest, а
 текущая discovery — доступность и schema внутри него. Исчезнувший tool скрыт;
@@ -1482,6 +1485,7 @@ Destination mTLS identity не загружается в отдельный HTTP
 Setup:
 
 ```bash
+sh deploy/fetch-mcp-ca.sh
 uv sync --frozen
 ```
 

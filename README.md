@@ -388,6 +388,7 @@ Production-конфигурация требует постоянного S3-х�
 через Docker Desktop; установка Python-зависимостей не заменяет sandbox.
 
 ```bash
+sh deploy/fetch-mcp-ca.sh
 uv sync --frozen
 
 CORE_AGENT_ENVIRONMENT=development \
@@ -716,6 +717,7 @@ uv run core-agent-db check
 Основные команды проверок:
 
 ```bash
+sh deploy/fetch-mcp-ca.sh
 uv sync --frozen
 cd ui
 npm ci
