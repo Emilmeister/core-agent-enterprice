@@ -5,6 +5,7 @@
 deploy/local/
 dist/
 core_agent/ui_dist/
+core_agent/certs/*.pem*
 __pycache__/
 *.py[cod]
 .env

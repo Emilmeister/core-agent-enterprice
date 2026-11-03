@@ -71,6 +71,8 @@ RUN uv sync --frozen --no-dev --no-install-project && \
     uv cache clean
 
 COPY core_agent ./core_agent
+COPY deploy/fetch-mcp-ca.sh ./deploy/fetch-mcp-ca.sh
+RUN sh deploy/fetch-mcp-ca.sh
 COPY --from=owner-ui /app/core_agent/ui_dist ./core_agent/ui_dist
 RUN uv sync --frozen --no-dev && \
     uv cache clean && \

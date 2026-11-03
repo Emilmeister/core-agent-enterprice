@@ -14,5 +14,6 @@ dist
 node_modules
 **/node_modules
 core_agent/ui_dist
+core_agent/certs/*.pem*
 
 storybook
